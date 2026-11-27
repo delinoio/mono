@@ -24,6 +24,8 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
+	"github.com/delinoio/mono/go/ownsand"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/claude"
@@ -353,6 +355,146 @@ func TestClaudeWorkOrderExpiry(t *testing.T) {
 	}
 	if c := w.storedWorkOrder(t, req.GetRequestId()); c != nil {
 		t.Fatal("the work order is still stored after the request ended")
+	}
+}
+
+func TestClaudeWorkOrderExpiryBeforeLaunch(t *testing.T) {
+	const expectedSpawn = 2 * time.Minute
+	const runnerCommand = "'claude' 'self-hosted-runner'"
+	for _, scenario := range []string{"during credential write", "during order consumption", "already consumed", "on time"} {
+		t.Run(scenario, func(t *testing.T) {
+			w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, expectedSpawn)
+			allowCreate := make(chan struct{})
+			releaseCreate := sync.OnceFunc(func() { close(allowCreate) })
+			t.Cleanup(releaseCreate)
+			w.fake.SetCreateHook(func(ctx context.Context) error {
+				select {
+				case <-allowCreate:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+
+			writing, allowWrite := make(chan struct{}), make(chan struct{})
+			beginWrite := sync.OnceFunc(func() { close(writing) })
+			releaseWrite := sync.OnceFunc(func() { close(allowWrite) })
+			t.Cleanup(releaseWrite)
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.OnFileWriteFinish = func(ctx context.Context, _ ownsand.FileWriteParams) error {
+					beginWrite()
+					select {
+					case <-allowWrite:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			})
+
+			const order = "order-launch-exp"
+			if code, _ := w.proc(t).Spawn(claudefake.Spawn{OrderID: order, SessionID: "session_03", WorkOrder: claudeWorkOrder}); code != 0 {
+				t.Fatal(code)
+			}
+			req := w.requestBySource(t, order)
+			id := req.GetRequestId()
+			var launches atomic.Int32
+			exec, attach := w.fake.Exec, w.fake.Attach
+			w.fake.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+				if strings.Contains(p.Command[len(p.Command)-1], runnerCommand) {
+					launches.Add(1)
+					var cleared bool
+					if err := w.env.DB.Pool.QueryRow(ctx, `SELECT work_order_key_id IS NULL AND work_order_ciphertext IS NULL
+						FROM requests WHERE request_id = $1`, id).Scan(&cleared); err != nil {
+						return nil, err
+					}
+					if !cleared {
+						t.Error("the work order is still stored at runner exec")
+					}
+				}
+				return exec(ctx, sandboxID, p)
+			}, attach)
+			w.env.Clock.Advance(expectedSpawn - time.Second)
+			releaseCreate()
+			select {
+			case <-writing:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the runner did not reach the credential write")
+			}
+			w.waitRequest(t, id, sandrunv1.RequestState_REQUEST_STATE_STARTING)
+
+			wantState := sandrunv1.RequestState_REQUEST_STATE_EXPIRED
+			wantReason := sandrunv1.RequestEndReason_REQUEST_END_REASON_MAX_QUEUE_WAIT
+			switch scenario {
+			case "during credential write":
+				w.env.Clock.Advance(time.Second)
+				releaseWrite()
+			case "during order consumption":
+				ctx := t.Context()
+				tx, err := w.env.DB.Pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(context.Background())
+				var blocker int32
+				if err := tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM requests WHERE request_id = $1 FOR NO KEY UPDATE`, id).Scan(&blocker); err != nil {
+					t.Fatal(err)
+				}
+				releaseWrite()
+				eventually(t, "the order consumption waits for the request row lock", func() bool {
+					var waiting bool
+					err := w.env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
+						SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+							AND strpos(query, 'UPDATE requests SET work_order_key_id = NULL') = 1
+							AND $1 = ANY(pg_blocking_pids(pid))
+					)`, blocker).Scan(&waiting)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return waiting
+				})
+				w.env.Clock.Advance(2 * time.Second)
+				if err := tx.Rollback(ctx); err != nil {
+					t.Fatal(err)
+				}
+			case "already consumed":
+				tag, err := w.env.DB.Pool.Exec(t.Context(), `UPDATE requests SET work_order_key_id = NULL, work_order_ciphertext = NULL
+					WHERE request_id = $1 AND work_order_ciphertext IS NOT NULL`, id)
+				if err != nil || tag.RowsAffected() != 1 {
+					t.Fatalf("consume order before the runner: rows = %d, error = %v", tag.RowsAffected(), err)
+				}
+				w.env.Clock.Advance(time.Second)
+				releaseWrite()
+				wantState = sandrunv1.RequestState_REQUEST_STATE_FAILED
+				wantReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED
+			case "on time":
+				releaseWrite()
+				w.waitRequest(t, id, sandrunv1.RequestState_REQUEST_STATE_RUNNING)
+				if got := launches.Load(); got != 1 {
+					t.Fatalf("runner execs = %d, want 1", got)
+				}
+				return
+			}
+
+			var r *sandrunv1.Request
+			eventually(t, "the request leaves STARTING", func() bool {
+				r = w.request(t, id)
+				return r.GetState() != sandrunv1.RequestState_REQUEST_STATE_STARTING
+			})
+			if r.GetState() != wantState || r.GetEndReason() != wantReason || r.GetStartAttempts() != 1 {
+				t.Fatalf("request state = %v, end reason = %v, attempts = %d, runner execs = %d", r.GetState(), r.GetEndReason(), r.GetStartAttempts(), launches.Load())
+			}
+			eventually(t, "the prepared sandbox is deleted", func() bool {
+				sandboxes := w.fake.Sandboxes(w.osOrg)
+				return len(sandboxes) == 1 && sandboxes[0].GetState() == ownsandv1.SandboxState_SANDBOX_STATE_DELETED
+			})
+			if got := launches.Load(); got != 0 {
+				t.Fatalf("runner execs = %d, want 0", got)
+			}
+			if c := w.storedWorkOrder(t, id); c != nil {
+				t.Fatal("the terminal work order is still stored")
+			}
+		})
 	}
 }
 
