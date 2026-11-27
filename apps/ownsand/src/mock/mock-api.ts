@@ -1934,9 +1934,13 @@ export function createMockTransport(
       },
       deleteTemplate(req) {
         const { org } = membership(req.organizationId);
-        org.templates = org.templates.filter(
+        const remaining = org.templates.filter(
           (t) => t.templateId !== req.templateId,
         );
+        if (remaining.length === org.templates.length) {
+          throw new ConnectError("template not found", Code.NotFound);
+        }
+        org.templates = remaining;
         return {};
       },
     });

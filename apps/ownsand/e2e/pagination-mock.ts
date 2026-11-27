@@ -318,6 +318,15 @@ export function createMockTransport(): Transport {
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
+      const staleTemplateDelete = "ownsand-e2e-stale-template-delete";
+      if (
+        method.name === "DeleteTemplate" &&
+        sessionStorage.getItem(staleTemplateDelete) === "true"
+      ) {
+        sessionStorage.removeItem(staleTemplateDelete);
+        // Simulate another caller deleting the template before confirmation.
+        await base.unary(method, signal, timeout, header, input, contextValues);
+      }
       if (holdTemplateFirstPage && method.name === "ListTemplates") {
         const response = await base.unary(
           method,
