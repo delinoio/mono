@@ -12,9 +12,9 @@ import (
 // tasks.
 const DefaultWorkerInterval = 30 * time.Second
 
-// workerRunTimeout bounds one run of the tasks. The shutdown cancels the run
-// between steps; a Paddle charge that has started is not canceled, so its
-// result is recorded, and the server waits for it.
+// workerRunTimeout bounds one run of the tasks. Shutdown cancels the run.
+// A committed charge can finish the request and attempt to record its outcome
+// under separate deadlines.
 const workerRunTimeout = 2 * time.Minute
 
 // workerTask is one background task.

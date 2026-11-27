@@ -23,9 +23,8 @@ const (
 	// webhook. After it, the top-up fails as timed out; a webhook that
 	// arrives later still adds the credit.
 	TopUpTimeout = time.Hour
-	// paddleCallTimeout bounds one Paddle call of a top-up. The call runs
-	// without the caller's cancellation, so a client that disconnects does
-	// not leave the result unknown.
+	// paddleCallTimeout bounds one Paddle call of a top-up. The call can
+	// continue if the caller disconnects or the worker shuts down.
 	paddleCallTimeout = 20 * time.Second
 	// topUpOutcomeTimeout bounds the transaction that records the outcome
 	// of one Paddle call. It starts after the call returned, so a call that
@@ -33,15 +32,8 @@ const (
 	// billing account lock and the write: the unknown result must not be
 	// lost to a deadline that the call already spent.
 	topUpOutcomeTimeout = 10 * time.Second
-	// autoTopUpBudget is the time that one run of ProcessAutoTopUps may
-	// spend before it starts another top-up. The run shares the 2 minute
-	// deadline of the worker tick with the later tasks, and one top-up may
-	// take up to paddleCallTimeout plus topUpOutcomeTimeout, so without the
-	// budget a long queue would use the whole tick and the later tasks
-	// would not run. The run stops between top-ups only: a charge that has
-	// started is never canceled, so at most one charge ends after the
-	// budget, and a top-up that is not claimed yet stays pending for the
-	// next run.
+	// autoTopUpBudget limits new claims in one run. A committed claim can
+	// still spend up to paddleCallTimeout plus topUpOutcomeTimeout.
 	autoTopUpBudget = 30 * time.Second
 )
 
@@ -280,8 +272,8 @@ func outcomeLabel(o paddle.Outcome) string {
 	}
 }
 
-// charge calls Paddle for a top-up in status charging and records the
-// outcome: accepted (charged; the credit follows with the webhook),
+// charge calls Paddle for a top-up in status charging and attempts to record
+// the outcome: accepted (charged; the credit follows with the webhook),
 // rejected (failed), not applied (a manual top-up is removed so the key can
 // be retried; an automatic one fails without counting) or unknown (the
 // webhook or the timeout decides).
@@ -482,87 +474,139 @@ func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transac
 // also moves the cap time of the top-up to the claim time, so the top-up
 // counts toward the monthly cap of the UTC month of the claim and not of the
 // month in which it was queued. Top-ups that already left pending (charging,
-// charged or unknown) are not touched. A run spends at most autoTopUpBudget
-// before it claims another top-up and then returns nil: the rest stay
-// pending for the next run, so the other worker tasks keep their time.
+// charged or unknown) are not touched. Queue reads and pre-claim database
+// work use the remaining run budget. A committed claim gets its own Paddle
+// request and outcome deadlines.
 func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 	start := s.elapsed()
 	for range 100 {
-		// The budget is checked before a top-up is claimed, never during a
-		// charge, so the pending top-ups that remain are untouched.
-		if spent := s.elapsed().Sub(start); spent >= s.autoTopUpBudget {
-			s.logger.InfoContext(ctx, "billing_auto_top_up_budget_spent",
-				slog.Int64("elapsed_ms", spent.Milliseconds()),
-				slog.Int64("budget_ms", s.autoTopUpBudget.Milliseconds()))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		remaining := s.autoTopUpBudget - s.elapsed().Sub(start)
+		if remaining <= 0 {
+			s.logAutoTopUpBudgetSpent(ctx, start)
 			return nil
 		}
-		candidate, err := scanTopUp(s.db.Pool.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE status = 'pending'
-			ORDER BY create_time LIMIT 1`))
-		if errors.Is(err, pgx.ErrNoRows) {
+		claimCtx, cancel := context.WithTimeoutCause(ctx, remaining, errAutoTopUpBudgetSpent)
+		claimed, err := s.claimAutoTopUp(claimCtx)
+		cancel()
+		switch {
+		case errors.Is(err, errAutoTopUpBudgetSpent):
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			s.logAutoTopUpBudgetSpent(ctx, start)
 			return nil
-		}
-		if err != nil {
+		case err == pgx.ErrNoRows:
+			return nil
+		case err != nil:
 			return err
-		}
-		var claimed topUp
-		var ok bool
-		err = s.db.InTx(ctx, func(tx pgx.Tx) error {
-			acct, err := lockAccount(ctx, tx, candidate.BillingAccountID)
-			if err != nil {
+		case claimed != nil:
+			if _, err := s.charge(ctx, *claimed); err != nil {
 				return err
 			}
-			claimed, err = scanTopUp(tx.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE top_up_id = $1 FOR UPDATE`, candidate.ID))
-			if err != nil || claimed.Status != TopUpPending {
-				return err
-			}
-			// A lock wait can cross a UTC month boundary. Use one timestamp
-			// for the cap check and the charging update.
-			now := s.timestamp()
-			// Charge the current subscription; the one of the time of the
-			// deduction may have been replaced.
-			sub, err := LoadSubscription(ctx, tx, acct.ID, false)
-			if err != nil {
-				return err
-			}
-			if acct.Deleted {
-				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
-			}
-			// Revalidate the settings before the subscription: a top-up
-			// that the current settings no longer allow is not a failed
-			// charge, even when the subscription is canceled too, so it must
-			// not count as a failed automatic top-up or send a failure email.
-			if reason, err := s.obsoleteReason(ctx, tx, acct.ID, claimed, now); err != nil {
-				return err
-			} else if reason != "" {
-				s.logger.InfoContext(ctx, "billing_auto_top_up_obsolete",
-					slog.String("billing_account_id", acct.ID),
-					slog.String("top_up_id", claimed.ID),
-					slog.String("reason", reason),
-					slog.Int64("amount_usd_micros", claimed.Amount))
-				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureSettingsChanged, now)
-			}
-			if sub.PaddleSubscriptionID == "" || !sub.Manageable() {
-				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
-			}
-			claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
-			claimed.Status = TopUpCharging
-			ok = true
-			_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charging', paddle_subscription_id = $2, update_time = $3,
-					cap_time = $3
-				WHERE top_up_id = $1`, claimed.ID, claimed.PaddleSubscriptionID, now)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if _, err := s.charge(ctx, claimed); err != nil {
-			return err
 		}
 	}
-	return nil
+	return ctx.Err()
+}
+
+var errAutoTopUpBudgetSpent = errors.New("automatic top-up claim budget spent")
+
+func (s *Service) logAutoTopUpBudgetSpent(ctx context.Context, start time.Time) {
+	s.logger.InfoContext(ctx, "billing_auto_top_up_budget_spent",
+		slog.Int64("elapsed_ms", s.elapsed().Sub(start).Milliseconds()),
+		slog.Int64("budget_ms", s.autoTopUpBudget.Milliseconds()))
+}
+
+// claimAutoTopUp returns pgx.ErrNoRows for an empty queue and a nil top-up
+// when the candidate needs no charge.
+func (s *Service) claimAutoTopUp(ctx context.Context) (claimed *topUp, err error) {
+	committing := false
+	defer func() {
+		// A failed COMMIT can leave the claim outcome uncertain. Preserve
+		// that error, even if COMMIT used up the remaining budget.
+		if !committing && errors.Is(err, context.DeadlineExceeded) &&
+			context.Cause(ctx) == errAutoTopUpBudgetSpent {
+			err = errAutoTopUpBudgetSpent
+		}
+	}()
+
+	candidate, err := scanTopUp(s.db.Pool.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE status = 'pending'
+		ORDER BY create_time LIMIT 1`))
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	claimed, err = s.claimPendingAutoTopUp(ctx, tx, candidate)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	committing = true
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit automatic top-up claim: %w", err)
+	}
+	return claimed, nil
+}
+
+func (s *Service) claimPendingAutoTopUp(ctx context.Context, tx pgx.Tx, candidate topUp) (*topUp, error) {
+	acct, err := lockAccount(ctx, tx, candidate.BillingAccountID)
+	if err != nil {
+		return nil, err
+	}
+	claimed, err := scanTopUp(tx.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE top_up_id = $1 FOR UPDATE`, candidate.ID))
+	if err != nil {
+		// Keep a missing candidate distinct from an empty queue. This read
+		// follows a successful lookup and should find the same top-up.
+		return nil, fmt.Errorf("lock pending automatic top-up: %w", err)
+	}
+	if claimed.Status != TopUpPending {
+		return nil, nil
+	}
+	// A lock wait can cross a UTC month boundary. Use one timestamp for
+	// the cap check and the charging update.
+	now := s.timestamp()
+	// Charge the current subscription. It may have changed since the deduction.
+	sub, err := LoadSubscription(ctx, tx, acct.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	if acct.Deleted {
+		return nil, s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
+	}
+	// Revalidate the settings before the subscription. A top-up that the
+	// settings no longer allow must not count as a failed charge or send
+	// a failure email, even if the subscription was canceled too.
+	if reason, err := s.obsoleteReason(ctx, tx, acct.ID, claimed, now); err != nil {
+		return nil, err
+	} else if reason != "" {
+		s.logger.InfoContext(ctx, "billing_auto_top_up_obsolete",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("top_up_id", claimed.ID),
+			slog.String("reason", reason),
+			slog.Int64("amount_usd_micros", claimed.Amount))
+		return nil, s.failTopUp(ctx, tx, acct, claimed.ID, FailureSettingsChanged, now)
+	}
+	if sub.PaddleSubscriptionID == "" || !sub.Manageable() {
+		return nil, s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
+	claimed.Status = TopUpCharging
+	_, err = tx.Exec(ctx, `UPDATE top_ups SET status = 'charging', paddle_subscription_id = $2, update_time = $3,
+			cap_time = $3
+		WHERE top_up_id = $1`, claimed.ID, claimed.PaddleSubscriptionID, now)
+	return &claimed, err
 }
 
 // obsoleteReason reports why the current automatic top-up settings no longer
