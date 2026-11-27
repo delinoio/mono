@@ -310,7 +310,7 @@ func (r *Runtime) createOps() vmCreateOps {
 		growFile:  growFile,
 		fitGPT:    gpt.Fit,
 		setClock: func(ctx context.Context, v *vm, now time.Time) error {
-			return guestclient.New(v.Dial).SetClock(ctx, now)
+			return guestclient.SetClockOnce(ctx, v.Dial, now)
 		},
 		stopRestore: r.stopVM,
 	}

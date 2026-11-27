@@ -4,10 +4,37 @@ package hcsrt
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 )
+
+func TestComputeSystemDocMemory(t *testing.T) {
+	for _, guest := range []struct {
+		name    string
+		windows bool
+	}{
+		{name: "Linux"},
+		{name: "Windows", windows: true},
+	} {
+		t.Run(guest.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				request int64
+				want    uint64
+			}{
+				{511, 512},
+				{512, 512},
+				{math.MaxInt64, 1 << 63},
+			} {
+				doc := newComputeSystemDoc(vmSpec{Windows: guest.windows, MemoryMiB: tc.request})
+				if got := doc.VirtualMachine.ComputeTopology.Memory.SizeInMB; got != tc.want {
+					t.Errorf("SizeInMB for %d MiB = %d, want %d", tc.request, got, tc.want)
+				}
+			}
+		})
+	}
+}
 
 func TestComputeSystemDoc(t *testing.T) {
 	link, err := netpolicy.LinkFor(1)

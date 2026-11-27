@@ -100,16 +100,17 @@ func TestRestoreClockLiveRPC(t *testing.T) {
 	go func() { _ = server.Serve(listener) }()
 
 	dialer := &net.Dialer{}
-	client := guestclient.New(func(ctx context.Context) (net.Conn, error) {
+	dial := func(ctx context.Context) (net.Conn, error) {
 		return dialer.DialContext(ctx, "tcp", listener.Addr().String())
-	})
-	t.Cleanup(client.Close)
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var logs bytes.Buffer
 	result := make(chan error, 1)
 	go func() {
-		result <- syncRestoreClock(ctx, slog.New(slog.NewTextHandler(&logs, nil)), "sandbox", client.SetClock)
+		result <- syncRestoreClock(ctx, slog.New(slog.NewTextHandler(&logs, nil)), "sandbox", func(ctx context.Context, now time.Time) error {
+			return guestclient.SetClockOnce(ctx, dial, now)
+		})
 	}()
 	select {
 	case <-gate.entered:

@@ -595,14 +595,18 @@ func (m *Manager) checkLimitsLocked(cmd *ownsandv1.CreateSandboxCommand) error {
 	if res.GetVcpuCount() > l.GetVcpuCount() {
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox vCPU count exceeds the device vCPU limit")
 	}
-	var vcpu, mem, disk int64
+	kind := m.rt.Kind()
+	remainingMemory := uint64(max(0, l.GetMemoryMib()))
+	var vcpu, disk int64
 	macos := 0
 	for _, sb := range m.sandboxes {
 		if !sb.rec.Live() {
 			continue
 		}
 		vcpu += int64(sb.rec.VCPUCount)
-		mem += sb.rec.MemoryMiB
+		// Clamp the remaining budget to zero. Any positive request will
+		// fail the memory check once the existing VMs use the full budget.
+		remainingMemory -= min(remainingMemory, vmruntime.EffectiveMemoryMiB(kind, sb.rec.MemoryMiB))
 		disk += sb.rec.DiskGiB
 		if sb.rec.GuestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
 			macos++
@@ -611,7 +615,7 @@ func (m *Manager) checkLimitsLocked(cmd *ownsandv1.CreateSandboxCommand) error {
 	switch {
 	case vcpu+int64(res.GetVcpuCount()) > validate.EffectiveVCPULimit(l):
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "device vCPU limit reached")
-	case mem+res.GetMemoryMib() > l.GetMemoryMib():
+	case vmruntime.EffectiveMemoryMiB(kind, res.GetMemoryMib()) > remainingMemory:
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "device memory limit reached")
 	case disk+res.GetDiskGib() > l.GetDiskGib():
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "device disk limit reached")
