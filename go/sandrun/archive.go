@@ -14,6 +14,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -114,7 +116,8 @@ type archiveExtractor struct {
 // extractArchive extracts the tar archive r into the directory dir, which
 // must exist and be empty. It rejects entries with absolute paths, entries
 // that resolve outside dir, symbolic links whose targets point outside dir
-// and hard links to paths outside the archive. After the last entry, it
+// and hard links to paths outside the archive. Distinct guest directory
+// names must resolve to distinct directory entries. After the last entry, it
 // checks every symbolic link again with the other links of the tree
 // resolved (verifyLinks). Each regular file may hold at
 // most fileLimit bytes and all files together at most totalLimit bytes.
@@ -129,6 +132,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 	st := &extractStats{}
 	regular := map[string]bool{}
 	fileNames := map[string][]archiveFileName{}
+	directoryNames := archiveDirectoryNames{}
 	tr := tar.NewReader(r)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -151,49 +155,70 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 		mode := fs.FileMode(hdr.Mode).Perm()
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := root.MkdirAll(name, mode|0o700); err != nil {
+			if err := directoryNames.mkdirAll(root, name, mode|0o700); err != nil {
 				return st, err
 			}
 		case tar.TypeReg:
+			entry := archiveFileName{local: name, archive: hdr.Name}
 			key := foldCase(name)
 			names := fileNames[key]
+			var previous int
 			if err := e.writeFile(st, name, hdr.Size, func() error {
-				if err := checkArchiveCaseCollision(root, name, hdr.Name, names); err != nil {
+				var err error
+				previous, err = checkArchiveNameCollision(root, entry, names)
+				if err != nil {
+					return err
+				}
+				if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
 					return err
 				}
 				return writeEntry(root, name, mode, tr, hdr.Size)
 			}); err != nil {
 				return st, err
 			}
-			fileNames[key] = rememberArchiveFileName(names, name, hdr.Name)
+			fileNames[key] = rememberArchiveFileName(names, previous, entry)
 			regular[name] = true
 			st.files++
 		case tar.TypeSymlink:
 			if !confinedLinkTarget(name, hdr.Linkname) {
 				return st, fmt.Errorf("sandrun: the archive entry %s is a symbolic link that points outside the destination", filepath.ToSlash(name))
 			}
-			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			entry := archiveFileName{local: name, archive: hdr.Name, modeType: fs.ModeSymlink}
+			key := foldCase(name)
+			names := fileNames[key]
+			previous, err := checkArchiveNameCollision(root, entry, names)
+			if err != nil {
 				return st, err
 			}
-			_ = root.Remove(name)
+			if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
+				return st, err
+			}
+			if err := root.Remove(name); err == nil && previous >= 0 {
+				names = slices.Delete(names, previous, previous+1)
+				fileNames[key] = names
+				previous = -1
+			}
 			if err := root.Symlink(filepath.FromSlash(hdr.Linkname), name); err != nil {
 				// A Windows account without the symbolic link privilege
 				// cannot create links; the download keeps the rest.
 				st.warnings = append(st.warnings, fmt.Sprintf("%s: the symbolic link could not be created", filepath.ToSlash(name)))
 				continue
 			}
+			fileNames[key] = rememberArchiveFileName(names, previous, entry)
 			st.files++
 		case tar.TypeLink:
 			target, ok, err := entryName(hdr.Linkname)
 			if err != nil || !ok || !regular[target] {
 				return st, fmt.Errorf("sandrun: the archive entry %s is a hard link to a path outside the archive", filepath.ToSlash(name))
 			}
+			entry := archiveFileName{local: name, archive: hdr.Name}
 			key := foldCase(name)
 			names := fileNames[key]
-			if err := checkArchiveCaseCollision(root, name, hdr.Name, names); err != nil {
+			previous, err := checkArchiveNameCollision(root, entry, names)
+			if err != nil {
 				return st, err
 			}
-			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
 				return st, err
 			}
 			_ = root.Remove(name)
@@ -202,7 +227,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 					return st, err
 				}
 			}
-			fileNames[key] = rememberArchiveFileName(names, name, hdr.Name)
+			fileNames[key] = rememberArchiveFileName(names, previous, entry)
 			regular[name] = true
 			st.files++
 		default:
@@ -211,64 +236,143 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 	}
 }
 
-type archiveFileName struct {
-	local   string
-	archive string
+type archiveDirectoryNames map[string]fs.FileInfo
+
+// mkdirAll checks each directory spelling against the staging filesystem.
+// Directory identity catches aliases even when their spellings do not fold
+// to the same case. A newly created directory cannot alias an existing one.
+func (names archiveDirectoryNames) mkdirAll(root *os.Root, dir string, mode fs.FileMode) error {
+	if runtime.GOOS == "windows" {
+		// os.Root cleans Windows paths before looking up their components.
+		dir = filepath.Clean(dir)
+	}
+	var prefix string
+	for _, component := range splitPath(dir) {
+		if component == "." {
+			continue
+		}
+		if prefix == "" {
+			prefix = component
+		} else {
+			// Keep ".." after a symbolic link for os.Root to resolve.
+			prefix += string(filepath.Separator) + component
+		}
+		if component == ".." {
+			continue
+		}
+
+		info, err := root.Lstat(prefix)
+		if errors.Is(err, fs.ErrNotExist) {
+			if err := root.MkdirAll(prefix, mode); err != nil {
+				return err
+			}
+			info, err = root.Lstat(prefix)
+			if err != nil {
+				return err
+			}
+			names[prefix] = info
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.IsDir() && !os.SameFile(names[prefix], info) {
+			if err := names.claim(root, prefix, component, info); err != nil {
+				return err
+			}
+		}
+	}
+	// Let os.Root validate a final symbolic link or navigation component.
+	return root.MkdirAll(dir, mode)
 }
 
-func rememberArchiveFileName(names []archiveFileName, local, archive string) []archiveFileName {
+func (names archiveDirectoryNames) claim(root *os.Root, name, component string, info fs.FileInfo) error {
+	for previous, identity := range names {
+		if !os.SameFile(identity, info) {
+			continue
+		}
+		current, err := root.Lstat(previous)
+		if err != nil || !os.SameFile(current, info) {
+			continue // A later entry can replace an empty directory or a symbolic link to its parent.
+		}
+		if filepath.Base(previous) != component {
+			return &archiveCaseCollision{earlier: filepath.ToSlash(previous), later: filepath.ToSlash(name)}
+		}
+		// A symbolic link can lead to the same directory with the same
+		// final component. Keep the original claim in that case.
+		return nil
+	}
+	names[name] = info
+	return nil
+}
+
+type archiveFileName struct {
+	local    string
+	archive  string
+	modeType fs.FileMode
+}
+
+func rememberArchiveFileName(names []archiveFileName, previous int, entry archiveFileName) []archiveFileName {
+	if previous >= 0 {
+		names = slices.Delete(names, previous, previous+1)
+	}
 	for i, name := range names {
-		if name.local == local {
-			names[i].archive = archive
+		if name.local == entry.local {
+			names[i] = entry
 			return names
 		}
 	}
-	return append(names, archiveFileName{local: local, archive: archive})
+	return append(names, entry)
 }
 
-// A case-folded match is only a candidate. The two archive paths must
-// resolve to the same entry on the staging filesystem.
-func checkArchiveCaseCollision(root *os.Root, name, archivePath string, names []archiveFileName) error {
+// A case-folded match is only a candidate. Use Lstat to identify the staged
+// entry itself, including a symbolic link. Return its record index so an
+// allowed replacement can update the archive name and type in the record.
+// Check entry names before parent aliases so an entry collision reports the
+// full archive names.
+func checkArchiveNameCollision(root *os.Root, entry archiveFileName, names []archiveFileName) (int, error) {
 	if len(names) == 0 {
-		return nil
+		return -1, nil
 	}
-	for _, previous := range names {
-		if previous.local == name {
-			return nil // Repeated entries with the same name may replace one another.
-		}
-	}
-
-	info, err := root.Lstat(name)
+	info, err := root.Lstat(entry.local)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return -1, nil
 	}
 	if err != nil {
-		return err
+		return -1, err
 	}
-	if !info.Mode().IsRegular() {
-		return nil
-	}
+	for i, previous := range names {
+		if previous.modeType != info.Mode().Type() {
+			continue
+		}
+		if previous.local != entry.local {
+			other, err := root.Lstat(previous.local)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return -1, err
+			}
+			if !os.SameFile(info, other) {
+				continue
+			}
+			alias, err := sameArchiveDirectoryEntry(root, entry.local, previous.local)
+			if err != nil {
+				return -1, err
+			}
+			if !alias {
+				continue
+			}
+		}
 
-	for _, previous := range names {
-		other, err := root.Lstat(previous.local)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
+		regularPair := entry.modeType == 0 && previous.modeType == 0
+		mixedCasePair := entry.modeType != previous.modeType && entry.local != previous.local
+		if (regularPair || mixedCasePair) && normalizedArchiveName(entry.archive) != normalizedArchiveName(previous.archive) {
+			return -1, &archiveCaseCollision{earlier: previous.archive, later: entry.archive}
 		}
-		if err != nil {
-			return err
-		}
-		if !os.SameFile(info, other) {
-			continue
-		}
-		alias, err := sameArchiveDirectoryEntry(root, name, previous.local)
-		if err != nil {
-			return err
-		}
-		if alias {
-			return &archiveCaseCollision{earlier: previous.archive, later: archivePath}
-		}
+		return i, nil
 	}
-	return nil
+	return -1, nil
 }
 
 // A hard link can share the file identity of a different directory entry.
@@ -321,8 +425,7 @@ func (e *archiveCaseCollision) Error() string {
 // entryName returns the local form of a tar entry name. ok is false for the
 // root entry. An absolute name or one that leaves the root is an error.
 func entryName(n string) (string, bool, error) {
-	clean := strings.TrimPrefix(n, "./")
-	clean = strings.TrimSuffix(clean, "/")
+	clean := normalizedArchiveName(n)
 	if clean == "" || clean == "." {
 		return "", false, nil
 	}
@@ -336,12 +439,14 @@ func entryName(n string) (string, bool, error) {
 	return local, true, nil
 }
 
-// writeEntry writes one regular file inside root, replacing an existing
-// entry of the same name.
+// normalizedArchiveName keeps the tar spelling before host separator conversion.
+func normalizedArchiveName(name string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(name, "./"), "/")
+}
+
+// writeEntry writes one regular file in an existing directory inside root,
+// replacing an existing entry of the same name.
 func writeEntry(root *os.Root, name string, mode fs.FileMode, r io.Reader, size int64) error {
-	if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
-		return err
-	}
 	_ = root.Remove(name)
 	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode|0o600)
 	if err != nil {

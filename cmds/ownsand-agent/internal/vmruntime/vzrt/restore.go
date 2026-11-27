@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 )
 
 func waitGuestResult(ready <-chan error, exited <-chan struct{}) error {
@@ -18,6 +20,21 @@ func waitGuestResult(ready <-chan error, exited <-chan struct{}) error {
 	case <-exited:
 		return errors.New("vzrt: the VM stopped during boot")
 	}
+}
+
+// syncRestoreClock returns the create context error when it ends during the
+// clock RPC. A clock failure alone does not invalidate a memory restore.
+func syncRestoreClock(ctx context.Context, logger *slog.Logger, sandboxID string, setClock func(context.Context, time.Time) error) error {
+	clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	clockErr := setClock(clockCtx, time.Now())
+	cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if clockErr != nil {
+		logger.Warn("set guest clock after memory restore failed", "sandbox_id", sandboxID, "error", clockErr)
+	}
+	return nil
 }
 
 // finishFailedRestore stops the restore attempt before either discarding it

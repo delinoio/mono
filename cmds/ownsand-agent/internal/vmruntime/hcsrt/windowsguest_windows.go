@@ -109,6 +109,11 @@ func (r *Runtime) prepareWindowsDisk(ctx context.Context, spec vmruntime.Spec, o
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if spec.Snapshot == nil {
+			if err := images.RemoveWindowsVMAccess(srcDir); err != nil {
+				return err
+			}
+		}
 		if err := prepareDir(); err != nil {
 			return err
 		}
@@ -150,9 +155,6 @@ func (r *Runtime) prepareWindowsDisk(ctx context.Context, spec vmruntime.Spec, o
 	}
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
-	}
-	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {
-		return vmSpec{}, 0, err
 	}
 	var fileBytes int64
 	if st, err := os.Stat(disk); err == nil {

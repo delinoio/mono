@@ -28,16 +28,9 @@ func checkMacOSBaseImage(dir string, spec vmruntime.Spec) error {
 	if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
 		return fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
 	}
-	disk, err := os.Stat(filepath.Join(dir, images.MacOSDisk))
+	disk, err := images.MacOSStorage(dir)
 	if err != nil {
 		return fmt.Errorf("%w: the macOS base image is incomplete; build it again: %w", vmruntime.ErrUnsupported, err)
-	}
-	aux, err := os.Stat(filepath.Join(dir, images.MacOSAuxStorage))
-	if err != nil {
-		return fmt.Errorf("%w: the macOS base image is incomplete; build it again: %w", vmruntime.ErrUnsupported, err)
-	}
-	if !disk.Mode().IsRegular() || !aux.Mode().IsRegular() {
-		return fmt.Errorf("%w: the macOS base image is incomplete; build it again", vmruntime.ErrUnsupported)
 	}
 	return checkBaseDiskCapacity(disk.Size(), spec.Resources.GetDiskGib()<<30)
 }

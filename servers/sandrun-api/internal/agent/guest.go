@@ -276,11 +276,20 @@ func StartScript(guest sandrunv1.GuestOs, p Program) string {
 
 var errStarted = errors.New("the runner program started")
 
+const windowsDoubleQuoteMessage = "a runner argument contains a double quote, which Windows PowerShell 5.1 cannot pass to a native program"
+
 // StartProgram starts the runner program with an OwnSand exec and returns
 // as soon as the guest reports the start; the program keeps running and
 // the engine follows the exec with AttachExec. Its output goes to the log
 // file, so the exec stream carries only the exit result.
 func StartProgram(ctx context.Context, g *work.Guest, p Program) (work.StartResult, error) {
+	if IsWindows(g.Runner.GuestOS) {
+		for _, arg := range p.Args {
+			if strings.ContainsRune(arg, '"') {
+				return work.StartResult{}, &StepError{Step: "start the runner program", Code: -1, Msg: windowsDoubleQuoteMessage}
+			}
+		}
+	}
 	execID := api.NewID()
 	ctx, cancel := context.WithTimeout(ctx, stepTimeout)
 	defer cancel()

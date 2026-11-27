@@ -19,9 +19,27 @@ const replaceRetryTimeout = 2 * time.Second
 // replaceRetryInterval is the pause between two replace attempts.
 const replaceRetryInterval = 10 * time.Millisecond
 
-// A load runs without the writer lock. Windows can deny the open while a
-// replacement or another program holds an incompatible handle. Retry only
-// sharing violations, for the same bounded interval as replacements.
+// Load reads the stored credentials under the store lock. Windows can
+// deny replacement while a reader has the destination open, so the reader
+// must close its handle before releasing the lock.
+func (s Store) Load() (*Credentials, error) {
+	return s.loadWithLock(readFile)
+}
+
+func (s Store) loadWithLock(read func(string) ([]byte, error)) (*Credentials, error) {
+	unlock, err := s.lock()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return s.load(read)
+}
+
+// The caller holds the store lock. Another program can still hold an
+// incompatible handle, so retry sharing violations for a bounded interval.
 func readFile(path string) ([]byte, error) {
 	return readFileWithRetry(path, os.ReadFile)
 }

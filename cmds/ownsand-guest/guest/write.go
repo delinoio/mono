@@ -424,6 +424,13 @@ func (e *writeEntry) checkStagingPath() error {
 	}
 }
 
+func (e *writeEntry) closeFile() {
+	if e.file != nil {
+		e.file.Close()
+		e.file = nil
+	}
+}
+
 func (e *writeEntry) closeModeFile() {
 	if e.modeFile != nil {
 		e.modeFile.Close()
@@ -491,6 +498,16 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	return nil
 }
 
+// closeStagingFiles runs after write admission is closed and all admitted
+// writes and sweeps have finished. Leave the files and recovery records
+// on disk so the replacement server can expire them.
+func (m *writeManager) closeStagingFiles() {
+	for _, e := range m.entries {
+		e.closeFile()
+		e.closeModeFile()
+	}
+}
+
 // sweep deletes the temporary files of writes without a chunk for the
 // retention time and forgets finished writes after the retention time. A
 // write whose cleanup fails stays registered, marked gone, and the next sweep
@@ -506,10 +523,7 @@ func (m *writeManager) sweep(now time.Time) {
 			(!e.finished && now.Sub(e.lastChunk) >= m.retention)
 		if expired {
 			e.gone = true
-			if e.file != nil {
-				e.file.Close()
-				e.file = nil
-			}
+			e.closeFile()
 			if err := m.cleanup(e); err != nil {
 				m.logger.Warn("clean up write failed", "write_id", id, "error", sanitizedError(err))
 			} else {

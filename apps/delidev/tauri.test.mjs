@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
   copyFileSync,
   existsSync,
@@ -15,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { test } from "node:test";
 
 function fixture(t, platform = process.platform) {
@@ -99,14 +101,26 @@ console.log(JSON.stringify({ cli: "stock", args }));
     { mode: 0o755 },
   );
 
-  const invoke = (args, env = {}) =>
-    spawnSync(
+  const launch = (spawner, args, env, options) =>
+    spawner(
       process.execPath,
       ["--require", "./platform.cjs", "tauri.mjs", ...args],
       {
         cwd: root,
         encoding: "utf8",
         env: { ...process.env, TMPDIR: staging, ...env },
+        ...options,
+      },
+    );
+  const invoke = (args, env = {}) => launch(spawnSync, args, env);
+  const start = (args) =>
+    launch(
+      spawn,
+      args,
+      {},
+      {
+        detached: true,
+        stdio: ["pipe", "pipe", "inherit"],
       },
     );
   const run = (...args) => {
@@ -114,7 +128,7 @@ console.log(JSON.stringify({ cli: "stock", args }));
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout);
   };
-  return { root, staging, invoke, run };
+  return { root, staging, invoke, run, start };
 }
 
 const linuxOnly = { skip: process.platform !== "linux" };
@@ -411,3 +425,109 @@ test(
     assert.match(restoredBuild.beforeBundleCommand.script, /before-bundle\.sh/);
   },
 );
+
+const debianArgs = (command) => [
+  command,
+  "--config",
+  embedCef,
+  "--bundles",
+  "deb",
+];
+
+test(
+  "cleans Debian notice staging on CLI exit and spawn failure",
+  linuxOnly,
+  (t) => {
+    const { root, staging, invoke } = fixture(t);
+    const cli = join(root, "cargo-tauri");
+    writeFileSync(
+      cli,
+      `#!/usr/bin/env node
+import { existsSync } from "node:fs";
+if (!existsSync(process.env.DELIDEV_CEF_NOTICE_DIR)) process.exit(99);
+process.exitCode = Number(process.env.FIXTURE_STATUS);
+`,
+    );
+    for (const code of [0, 2]) {
+      const result = invoke(debianArgs("build"), {
+        FIXTURE_STATUS: String(code),
+      });
+      assert.equal(result.status, code, result.stderr);
+      assert.deepEqual(readdirSync(staging), []);
+    }
+
+    rmSync(cli);
+    const result = invoke(debianArgs("bundle"));
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /spawn.*cargo-tauri ENOENT/);
+    assert.deepEqual(readdirSync(staging), []);
+  },
+);
+
+for (const [command, signal, status] of [
+  ["build", "SIGTERM", 143],
+  ["bundle", "SIGTERM", 143],
+  ["bundle", "SIGINT", 130],
+]) {
+  test(
+    `waits for Debian ${command} to handle ${signal} before removing notices`,
+    { ...linuxOnly, timeout: 5000 },
+    async (t) => {
+      const { root, staging, start } = fixture(t);
+      writeFileSync(
+        join(root, "cargo-tauri"),
+        `#!/usr/bin/env node
+import { existsSync } from "node:fs";
+const noticeDir = process.env.DELIDEV_CEF_NOTICE_DIR;
+let deliveries = 0;
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    deliveries++;
+    console.log(JSON.stringify({ signal, staged: existsSync(noticeDir) }));
+  });
+}
+process.stdin.resume();
+process.stdin.on("end", () => console.log(JSON.stringify({ deliveries })));
+console.log(JSON.stringify({ noticeDir }));
+`,
+      );
+      const wrapper = start(debianArgs(command));
+      const exited = once(wrapper, "exit");
+      const closed = once(wrapper, "close");
+      t.after(async () => {
+        // Kill the fixture group even if the wrapper exits and leaves its CLI running.
+        if (wrapper.exitCode !== status) {
+          try {
+            process.kill(-wrapper.pid, "SIGKILL");
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        }
+        await closed;
+      });
+
+      const lines = createInterface({ input: wrapper.stdout })[
+        Symbol.asyncIterator
+      ]();
+      const { noticeDir } = JSON.parse((await lines.next()).value);
+      assert.ok(existsSync(noticeDir));
+      // A terminal Ctrl-C goes to the entire foreground process group.
+      process.kill(signal === "SIGINT" ? -wrapper.pid : wrapper.pid, signal);
+      const shutdown = await Promise.race([
+        lines.next(),
+        exited.then(([code, endingSignal]) => {
+          throw new Error(`Wrapper exited early: ${code ?? endingSignal}`);
+        }),
+      ]);
+      assert.deepEqual(JSON.parse(shutdown.value), { signal, staged: true });
+      assert.equal(wrapper.exitCode, null);
+      assert.ok(existsSync(noticeDir));
+      wrapper.stdin.end();
+      assert.deepEqual(JSON.parse((await lines.next()).value), {
+        deliveries: 1,
+      });
+      assert.deepEqual(await closed, [status, null]);
+      assert.deepEqual(readdirSync(staging), []);
+    },
+  );
+}
