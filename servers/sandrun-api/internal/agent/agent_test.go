@@ -168,8 +168,8 @@ func TestStartScriptPOSIX(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := Program{Dir: dir, CredentialEnv: "SANDRUN_TEST_KEY", Env: [][2]string{{"SANDRUN_TEST_WORKER", "sandrun-1"}},
-		Args: []string{"/bin/sh", "-c", `printf '%s|%s|%s|%s|%s' "$SANDRUN_TEST_KEY" "$SANDRUN_TEST_WORKER" "$1" "$(pwd)" "$3"`, "x", "arg 'with' quotes", HomeArg,
-			HomeArg + "/sub dir"}}
+		Args: []string{"/bin/sh", "-c", `[ ! -e "$4" ] || exit 1; printf '%s|%s|%s|%s|%s' "$SANDRUN_TEST_KEY" "$SANDRUN_TEST_WORKER" "$1" "$(pwd)" "$3"`, "x", "arg 'with' quotes", HomeArg,
+			HomeArg + "/sub dir", filepath.Join(dir, CredentialFile)}}
 	script := StartScript(linux, p)
 	if strings.Contains(script, "s3cr") {
 		t.Fatal("the script contains the credential")
@@ -197,6 +197,42 @@ func TestStartScriptPOSIX(t *testing.T) {
 	}
 }
 
+func TestStartScriptPOSIXCleanupFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell test")
+	}
+	const key = "fixture-credential"
+	dir, home := t.TempDir(), t.TempDir()
+	cred := filepath.Join(dir, CredentialFile)
+	if err := os.WriteFile(cred, []byte(key), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a failed removal, even when this test runs as root.
+	if err := os.WriteFile(filepath.Join(bin, "rm"), []byte("#!/bin/sh\nprintf '%s\\n' '"+key+"' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := StartScript(linux, Program{
+		Dir: dir, CredentialEnv: "SANDRUN_TEST_KEY", Args: []string{"/bin/sh", "-c", "echo started"},
+	})
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	out, err := cmd.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 22 || len(out) != 0 {
+		t.Fatalf("want exit 22 and empty output, got %v and %d output bytes", err, len(out))
+	}
+	if _, err := os.Stat(filepath.Join(dir, LogFile)); !os.IsNotExist(err) {
+		t.Fatalf("the runner log should not exist: %v", err)
+	}
+	if _, err := os.Stat(cred); err != nil {
+		t.Fatalf("the credential file should still exist: %v", err)
+	}
+}
+
 func TestStartScriptWindows(t *testing.T) {
 	s := StartScript(windows, Program{
 		Dir:           `C:\ProgramData\sandrun\runners\r1`,
@@ -206,7 +242,7 @@ func TestStartScriptWindows(t *testing.T) {
 	})
 	for _, want := range []string{
 		`$env:CURSOR_API_KEY = [IO.File]::ReadAllText('C:\ProgramData\sandrun\runners\r1\credential')`,
-		`Remove-Item -Force -LiteralPath 'C:\ProgramData\sandrun\runners\r1\credential'`,
+		`try { Remove-Item -Force -LiteralPath 'C:\ProgramData\sandrun\runners\r1\credential' -ErrorAction Stop } catch { exit 22 }`,
 		`$env:CURSOR_AGENT_WORKER_ID = 'sandrun-1'`,
 		`$env:SANDRUN_TEST_LABEL = 'O’’Brien'`,
 		`& 'agent' 'worker' '--pool' 'it''s' '--worker-dir' $env:USERPROFILE '--base' ($env:USERPROFILE + '\w') 'Bob’’s pool' 'start' *>> 'C:\ProgramData\sandrun\runners\r1\runner.log'`,

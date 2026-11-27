@@ -6,6 +6,11 @@ package credstore
 
 import "os"
 
+// Load reads the stored credentials.
+func (s Store) Load() (*Credentials, error) {
+	return s.load(readFile)
+}
+
 func readFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }

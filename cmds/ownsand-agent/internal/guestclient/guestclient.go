@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -110,6 +111,39 @@ func (c *Client) WaitReady(ctx context.Context, interval time.Duration) (*ownsan
 func (c *Client) SetClock(ctx context.Context, t time.Time) error {
 	_, err := c.svc.SetClock(ctx, connect.NewRequest(&ownsandv1.SetClockRequest{Now: timestamppb.New(t)}))
 	return err
+}
+
+// SetClockOnce sets the guest clock on a dedicated client and closes its
+// connections when the call returns.
+func SetClockOnce(ctx context.Context, dial Dialer, t time.Time) error {
+	var mu sync.Mutex
+	var conns []net.Conn
+	var finished bool
+	defer func() {
+		mu.Lock()
+		finished = true
+		mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	client := New(func(ctx context.Context) (net.Conn, error) {
+		conn, err := dial(ctx)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		if !finished {
+			conns = append(conns, conn)
+			mu.Unlock()
+			return conn, nil
+		}
+		mu.Unlock()
+		// The HTTP transport can finish a dial after the RPC returns.
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	})
+	return client.SetClock(ctx, t)
 }
 
 // Serve opens one Serve stream. The agent opens one stream per operation.

@@ -44,18 +44,47 @@ func requireRemoved(t *testing.T, path string) {
 }
 
 func TestWindowsGuestSyncRetryFileToDirectory(t *testing.T) {
-	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", "top/-a with [space]", func(t *testing.T, link, target string) {
-		t.Helper()
-		// A junction is a directory reparse point and needs no symlink privilege.
-		const script = `$ErrorActionPreference = 'Stop'
+	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS, "top/-a with [space]", "top/-a with [space]", createWindowsJunction)
+}
+
+func createWindowsJunction(t *testing.T, link, target string) {
+	t.Helper()
+	// A junction is a directory reparse point and needs no symlink privilege.
+	const script = `$ErrorActionPreference = 'Stop'
 $parent = [System.IO.Path]::GetDirectoryName($env:SANDRUN_TEST_LINK)
 $name = [System.IO.Path]::GetFileName($env:SANDRUN_TEST_LINK)
 New-Item -ItemType Junction -Path $parent -Name $name -Value $env:SANDRUN_TEST_TARGET | Out-Null`
-		cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(script))
-		cmd.Env = append(os.Environ(), "SANDRUN_TEST_LINK="+link, "SANDRUN_TEST_TARGET="+target)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("create junction: %v: %s", err, out)
-		}
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(script))
+	cmd.Env = append(os.Environ(), "SANDRUN_TEST_LINK="+link, "SANDRUN_TEST_TARGET="+target)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create junction: %v: %s", err, out)
+	}
+}
+
+func TestWindowsGuestSyncDirectoryAliasReplacement(t *testing.T) {
+	const osys = sandrunv1.GuestOs_GUEST_OS_WINDOWS
+	t.Run("default", func(t *testing.T) {
+		testSyncDirectoryAliasReplacement(t, osys, "Assets", "assets", nil)
+	})
+	t.Run("exact", func(t *testing.T) {
+		testSyncDirectoryAliasReplacement(t, osys, "Assets", "Assets", nil)
+	})
+	t.Run("case-sensitive", func(t *testing.T) {
+		testSyncDirectoryAliasReplacement(t, osys, "Assets", "assets", func(t *testing.T, ws string) {
+			if out, err := exec.Command("fsutil.exe", "file", "setCaseSensitiveInfo", ws, "enable").CombinedOutput(); err != nil {
+				t.Skipf("enable case-sensitive NTFS lookup: %v: %s", err, out)
+			}
+			probe := filepath.Join(ws, "Probe")
+			if err := os.Mkdir(probe, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(ws, "probe")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("workspace does not distinguish case: %v", err)
+			}
+			if err := os.Remove(probe); err != nil {
+				t.Fatal(err)
+			}
+		})
 	})
 }
 
@@ -203,7 +232,7 @@ func applyWindowsSyncLists(t *testing.T, workspace string, lists map[string][]by
 	cmd.Env = append(os.Environ(), guestEnvWorkspace+"="+workspace,
 		guestEnvStaleManifest+"=", guestEnvArchive+"=")
 	inputs := t.TempDir()
-	for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvLinks} {
+	for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes, guestEnvLinks} {
 		path := ""
 		if data, ok := lists[key]; ok {
 			path = filepath.Join(inputs, key)
@@ -220,8 +249,46 @@ func applyWindowsSyncLists(t *testing.T, workspace string, lists map[string][]by
 	return out
 }
 
+func TestWindowsGuestAliasPruneIdentity(t *testing.T) {
+	root := t.TempDir()
+	ws := filepath.Join(root, "work")
+	target := filepath.Join(root, "target")
+	kept := []string{
+		filepath.Join(ws, "old", "nested"),
+		filepath.Join(ws, "distinct"),
+		filepath.Join(ws, "assets"),
+		filepath.Join(target, "nested"),
+	}
+	for _, p := range kept {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	junction := filepath.Join(ws, "assets", "junction")
+	createWindowsJunction(t, junction, target)
+	same := filepath.Join(ws, "same")
+	if err := os.MkdirAll(filepath.Join(same, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{
+		"old", "distinct", "old/nested",
+		"old", "missing", "old/nested",
+		"assets", "./assets", "assets/junction/nested",
+		"assets", "./assets", "assets/junction",
+		"same", "./same", "same/nested",
+		"same", "./same", "same",
+	}
+	applyWindowsSyncLists(t, ws, map[string][]byte{guestEnvAliasPrunes: pathList(paths, true)})
+	for _, p := range append(kept, junction) {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("alias pruning should preserve %s: %v", p, err)
+		}
+	}
+	requireRemoved(t, same)
+}
+
 func TestWindowsGuestCleanup(t *testing.T) {
-	for _, name := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvLinks, guestEnvLock, guestEnvDLArchive} {
+	for _, name := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes, guestEnvLinks, guestEnvLock, guestEnvDLArchive} {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -244,7 +311,7 @@ func TestWindowsGuestCleanup(t *testing.T) {
 		}
 	}
 
-	for _, blocked := range []string{guestEnvArchive, guestEnvLock, guestEnvDLArchive} {
+	for _, blocked := range []string{guestEnvArchive, guestEnvAliasPrunes, guestEnvLock, guestEnvDLArchive} {
 		t.Run(blocked, func(t *testing.T) {
 			root := t.TempDir()
 			op := opCleanup
@@ -253,7 +320,7 @@ func TestWindowsGuestCleanup(t *testing.T) {
 				op = opRemoveArchive
 				env[guestEnvDLArchive] = filepath.Join(root, "download [archive].tar")
 			} else {
-				for _, key := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvLinks} {
+				for _, key := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes, guestEnvLinks} {
 					env[key] = filepath.Join(root, key)
 				}
 				env[guestEnvLock] = filepath.Join(root, "lock")

@@ -288,7 +288,7 @@ func TestWipeLocalDataKeepsACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WipeLocalData(); err != nil {
+	if err := wipeLocalData(t, s); err != nil {
 		t.Fatal(err)
 	}
 	aces, _ := dacl(t, s.Path(VMsDir))
@@ -517,9 +517,10 @@ func TestWriteFileAtomicGivesUpOnStuckReader(t *testing.T) {
 // Go sharing mode, as `ownsand-agent status` does) never make a write fail
 // and never read an incomplete report.
 func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
+	requireTrustedProcess(t)
 	s, err := Open(t.TempDir())
 	if err != nil {
-		t.Skipf("open the store (needs an elevated administrator): %v", err)
+		t.Fatalf("open the store: %v", err)
 	}
 	type report struct {
 		Seq     int    `json:"seq"`
