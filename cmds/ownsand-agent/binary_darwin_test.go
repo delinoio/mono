@@ -115,9 +115,10 @@ exec "$OWNSAND_TEST_REAL_GUEST" "$@"
 				if res.GetError() != nil || res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 					t.Fatalf("create result %v\n%s", res, agent.logs.String())
 				}
-				if !strings.Contains(agent.logs.String(), `"pid":`+strconv.Itoa(pid)) {
-					t.Fatalf("sandbox log does not report guest PID %d\n%s", pid, agent.logs.String())
+				if err := waitForProcessSandboxStarted(agent.logs, id, pid, binaryAgentTimeout); err != nil {
+					t.Fatal(err)
 				}
+				t.Logf("sandbox %s launch log reports guest PID %d", id, pid)
 			}
 
 			if stage == "paused" || stage == "delete" {
