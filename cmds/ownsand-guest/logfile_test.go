@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // smallLogLimit is a rotation limit that the tests exceed with a few bytes.
@@ -231,6 +233,8 @@ func TestOpenLogFileReportsAnUnopenableLog(t *testing.T) {
 // that cannot rotate: it starts, serves, and writes one rotation warning
 // into the active log.
 func TestRunReportsFailedLogRotationInTheActiveLog(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	processor := &guestLogProcessor{}
 	stateDir := t.TempDir()
 	writeFile(t, filepath.Join(stateDir, logFile), "old log line\n")
 	_, inner := blockArchive(t, stateDir)
@@ -240,7 +244,7 @@ func TestRunReportsFailedLogRotationInTheActiveLog(t *testing.T) {
 	code := make(chan int, 1)
 	go func() {
 		code <- run(ctx, []string{"--listen", "unix://" + sock, "--state-dir", stateDir, "--clock", "ignore"},
-			func(dir string) (logOutput, error) { return openLogFile(dir, smallLogLimit) })
+			func(dir string) (logOutput, error) { return openLogFile(dir, smallLogLimit) }, processor)
 	}()
 	t.Cleanup(cancel)
 	waitServing(t, sock)
@@ -266,6 +270,26 @@ func TestRunReportsFailedLogRotationInTheActiveLog(t *testing.T) {
 	}
 	if warnings != 1 {
 		t.Fatalf("got %d rotation warnings, want 1; log %q", warnings, data)
+	}
+	sdkWarnings := 0
+	for _, record := range processor.records {
+		if record.Body().AsString() != "log rotation failed; appending to the active log" {
+			continue
+		}
+		sdkWarnings++
+		fields := make(map[string]attribute.Value)
+		record.WalkAttributes(func(kv attribute.KeyValue) bool {
+			fields[string(kv.Key)] = kv.Value
+			return true
+		})
+		if record.SeverityText() != "WARN" || len(fields) != 3 ||
+			fields["component"].AsString() != "ownsand-guest" ||
+			fields["operation"].AsString() != "rotate" || fields["limit_bytes"].AsInt64() != smallLogLimit {
+			t.Fatalf("unexpected SDK rotation warning fields: %v", fields)
+		}
+	}
+	if sdkWarnings != 1 || !processor.closed {
+		t.Fatalf("SDK rotation warnings = %d, shutdown called = %t", sdkWarnings, processor.closed)
 	}
 	if !bytes.HasPrefix([]byte(data), []byte("old log line\n")) {
 		t.Fatalf("the active log lost its content: %q", data)
