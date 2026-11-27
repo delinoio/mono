@@ -426,12 +426,14 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 			return nil, s.Internal(ctx, "prepare ownsand link removal", err)
 		}
 	}
-	err = s.DB.InTx(cleanupCtx, func(tx pgx.Tx) error {
-		ctx := cleanupCtx
-		if err := api.LockOrganization(ctx, tx, c.OrganizationID); err != nil {
+	err = db.InTxWithContexts(cleanupCtx, ctx, s.DB.Pool.Begin, func(tx pgx.Tx) error {
+		if err := api.LockOrganization(cleanupCtx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		if err := l.CheckRemoval(ctx, tx, claim); err != nil {
+		if err := l.CheckRemoval(cleanupCtx, tx, claim); err != nil {
+			return err
+		}
+		if err := stop(); err != nil {
 			return err
 		}
 		for _, hook := range l.hooks {
@@ -455,7 +457,6 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 		return nil, s.Internal(ctx, "remove ownsand link", err)
 	}
 	committed = true
-	stop()
 	l.forget(c.OrganizationID)
 	for _, hook := range l.hooks {
 		if hook.AfterCommit != nil {

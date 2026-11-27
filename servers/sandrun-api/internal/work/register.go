@@ -62,23 +62,26 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 			if err != nil {
 				return api.OrganizationDeletionSteps{}, err
 			}
-			ctx, stop := links.WatchRemoval(ctx, claim)
+			cleanupCtx, stop := links.WatchRemoval(ctx, claim)
 			abort := func(ctx context.Context) {
 				stop()
 				links.ReleaseRemoval(ctx, claim)
 			}
 			if claim.HasLink() {
-				if err := e.cleanUpOrganizationRunners(ctx, d.OrganizationID); err != nil {
+				if err := e.cleanUpOrganizationRunners(cleanupCtx, d.OrganizationID); err != nil {
 					abort(ctx)
 					return api.OrganizationDeletionSteps{}, err
 				}
 			}
 			var ended []*Request
 			return api.OrganizationDeletionSteps{
-				PrepareContext: ctx,
+				PrepareContext: cleanupCtx,
 				Abort:          abort,
 				InTx: func(ctx context.Context, tx pgx.Tx) error {
-					if err := links.CheckRemoval(ctx, tx, claim); err != nil {
+					if err := links.CheckRemoval(cleanupCtx, tx, claim); err != nil {
+						return err
+					}
+					if err := stop(); err != nil {
 						return err
 					}
 					var err error
@@ -86,7 +89,6 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 					return err
 				},
 				AfterCommit: func(ctx context.Context) {
-					stop()
 					e.releaseClaims(ctx, ended)
 				},
 			}, nil

@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/link"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
@@ -213,9 +215,245 @@ func TestOwnSandRemovalLeaseRenewsAndCancelsAfterLoss(t *testing.T) {
 	t.Log("Renewal blocked a second RPC beyond the initial expiry. Losing the lease canceled the first provider call. The new owner kept dispatch and key replacement blocked until it completed cleanup.")
 }
 
+func TestOwnSandRemovalLeaseFinalization(t *testing.T) {
+	for _, rpc := range removalFinalizationRPCs {
+		t.Run(rpc.name, func(t *testing.T) {
+			for _, outcome := range []struct {
+				name string
+				code connect.Code
+			}{
+				{name: "commit"},
+				{name: "cancel", code: connect.CodeCanceled},
+				{name: "audit_error", code: connect.CodeInternal},
+			} {
+				t.Run(outcome.name, func(t *testing.T) {
+					w := newRemovalLeaseWorld(t, 3*time.Second, false)
+					ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+					defer cancel()
+					pool := w.env.DB.Pool
+					if outcome.code == connect.CodeInternal {
+						if _, err := pool.Exec(ctx, fmt.Sprintf(`
+							CREATE FUNCTION fail_removal_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+							BEGIN
+								RAISE EXCEPTION 'removal audit unavailable';
+							END $$;
+							CREATE TRIGGER fail_removal_audit BEFORE INSERT ON audit_events
+								FOR EACH ROW WHEN (NEW.action = %d) EXECUTE FUNCTION fail_removal_audit();
+						`, rpc.audit)); err != nil {
+							t.Fatal(err)
+						}
+					}
+
+					afterCommit := make(chan error, 1)
+					recordCommit := func(ctx context.Context) {
+						ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+						defer cancel()
+						var linkExists, auditExists bool
+						err := pool.QueryRow(ctx, `SELECT
+							EXISTS (SELECT 1 FROM ownsand_links WHERE organization_id = $1),
+							EXISTS (SELECT 1 FROM audit_events WHERE organization_id = $1 AND action = $2)`,
+							w.org.ID, int16(rpc.audit)).Scan(&linkExists, &auditExists)
+						if err == nil && (linkExists || !auditExists) {
+							err = errors.New("after-commit callback ran before the link removal and audit were visible")
+						}
+						afterCommit <- err
+					}
+
+					var replicaLayers layers.Layers
+					replica := w.env.NewReplica(t, w.layerOptions(&replicaLayers, false), testenv.WithExtension(func(r *app.Registry) error {
+						replicaLayers.Links.OnRemoval(link.RemovalHook{
+							Name:        "observe_commit",
+							AfterCommit: func(ctx context.Context, _ string) { recordCommit(ctx) },
+						})
+						r.OnOrganizationDeletion(api.OrganizationDeletionHook{
+							Name: "observe_commit",
+							Prepare: func(context.Context, api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
+								return api.OrganizationDeletionSteps{AfterCommit: recordCommit}, nil
+							},
+						})
+						return nil
+					}))
+
+					result := make(chan error, 1)
+					release := holdTx(t, w.env, "SELECT 1 FROM requests WHERE request_id = $1 FOR UPDATE", w.queuedID)
+					if outcome.code == 0 {
+						wait, resume, _ := pauseTeardown(t, w.workWorld)
+						go func() { result <- rpc.call(ctx, replica, w.org) }()
+						wait(ctx)
+						releaseLink := holdTx(t, w.env, "SELECT 1 FROM ownsand_links WHERE organization_id = $1 FOR UPDATE", w.org.ID)
+						resume()
+						w.waitForBlockedQuery(t, "SELECT ownsand_link_id::text FROM ownsand_links")
+						w.waitForBlockedQuery(t, "SELECT removal_expires_at FROM ownsand_links WHERE ownsand_link_id = $1 AND removal_token = $2 FOR UPDATE")
+						releaseLink()
+						t.Log("Finalization and renewal both waited on the link row. Finalization queued first.")
+					} else {
+						go func() { result <- rpc.call(ctx, replica, w.org) }()
+					}
+					w.waitForBlockedQuery(t, "FROM requests WHERE organization_id = $1 AND ($2")
+					t.Log("Finalization is waiting on the queued request row after checking the link claim.")
+
+					if outcome.code == 0 {
+						// The previous watcher timed out within two renewal intervals.
+						timer := time.NewTimer(2*w.duration/3 + 250*time.Millisecond)
+						defer timer.Stop()
+						select {
+						case err := <-result:
+							t.Fatalf("RPC completed while the request row was locked: %v", err)
+						case <-timer.C:
+						case <-ctx.Done():
+							t.Fatal(ctx.Err())
+						}
+						select {
+						case err := <-afterCommit:
+							t.Fatalf("callback ran while finalization was blocked: %v", err)
+						default:
+						}
+					}
+					if outcome.code == connect.CodeCanceled {
+						cancel()
+						wantCode(t, "caller cancellation", <-result, connect.CodeCanceled)
+						// The HTTP caller can return before the server rolls back.
+						eventually(t, "canceled finalization to release its link claim", func() bool {
+							id, removing := teardownLink(t, w.workWorld)
+							return id != "" && !removing
+						})
+					}
+					release()
+					switch outcome.code {
+					case 0:
+						if err := <-result; err != nil {
+							t.Fatalf("finalize after the former renewal timeout: %v", err)
+						}
+						if err := <-afterCommit; err != nil {
+							t.Fatal(err)
+						}
+						w.checkRemoved(t)
+						if rpc.audit == sandrunv1.AuditAction_AUDIT_ACTION_ORGANIZATION_DELETED {
+							wantCode(t, "deleted organization", deleteSandRunOrg(ctx, replica, w.org), connect.CodeNotFound)
+						} else if got := w.session(t, w.queuedID); got.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+							got.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_INTEGRATION_REMOVED {
+							t.Fatalf("queued session after unlink = %v", got)
+						}
+						t.Log("The RPC committed after the former renewal timeout. The callback observed the committed audit and removal.")
+					case connect.CodeInternal:
+						wantCode(t, "forced audit error", <-result, connect.CodeInternal)
+					}
+					if outcome.code != 0 {
+						w.checkFinalizationRollback(t, rpc.audit)
+						if id, removing := teardownLink(t, w.workWorld); id == "" || removing {
+							t.Fatalf("link after rollback = %q, removing = %t", id, removing)
+						}
+						select {
+						case err := <-afterCommit:
+							t.Fatalf("callback ran after rollback: %v", err)
+						default:
+						}
+						t.Log("Finalization rolled back without canceling the queued request, writing an audit, or running the callback.")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestOwnSandRemovalLeaseRejectsBeforeFinalization(t *testing.T) {
+	for _, rpc := range removalFinalizationRPCs {
+		t.Run(rpc.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name     string
+				update   string
+				duration time.Duration
+				code     connect.Code
+			}{
+				{"changed_token", "UPDATE ownsand_links SET removal_token = $2 WHERE organization_id = $1", time.Minute, connect.CodeFailedPrecondition},
+				{"expired_claim", "UPDATE ownsand_links SET removal_expires_at = clock_timestamp() WHERE organization_id = $1", time.Minute, connect.CodeFailedPrecondition},
+				{"renewal_timeout", "SELECT 1 FROM ownsand_links WHERE organization_id = $1 FOR UPDATE", 3 * time.Second, connect.CodeCanceled},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					w := newRemovalLeaseWorld(t, tc.duration, false)
+					ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+					defer cancel()
+					wait, resume, _ := pauseTeardown(t, w.workWorld)
+					result := make(chan error, 1)
+					go func() { result <- rpc.call(ctx, w.env, w.org) }()
+					wait(ctx)
+					token, expiry := w.lease(t)
+					args := []any{w.org.ID}
+					if tc.name == "changed_token" {
+						token = api.NewID()
+						args = append(args, token)
+					}
+
+					// Preparation sees the original claim until the other
+					// transaction commits. Verify which query waits for it.
+					release := holdTx(t, w.env, tc.update, args...)
+					resume()
+					w.waitForBlockedQuery(t, "SELECT ownsand_link_id::text FROM ownsand_links")
+					if tc.code == connect.CodeCanceled {
+						eventually(t, "renewal failure while finalization waits for the link lock", func() bool {
+							return strings.Contains(w.env.Logs.String(), "ownsand_link_removal_claim_lost")
+						})
+						// The original lease must still be live at this failure.
+						var live bool
+						if err := w.env.DB.Pool.QueryRow(ctx, "SELECT clock_timestamp() < $1", expiry).Scan(&live); err != nil || !live {
+							t.Fatalf("original lease was not live after the renewal failure: %v", err)
+						}
+					}
+					release()
+					wantCode(t, "claim rejected before finalization", <-result, tc.code)
+					w.checkFinalizationRollback(t, rpc.audit)
+					if tc.code == connect.CodeFailedPrecondition {
+						if got, _ := w.lease(t); got != token {
+							t.Fatalf("claim after rejection = %q, want %q", got, token)
+						}
+					} else if id, removing := teardownLink(t, w.workWorld); id == "" || removing {
+						t.Fatalf("link after renewal failure = %q, removing = %t", id, removing)
+					}
+					t.Log("The RPC rejected the attempt before finalization and preserved the organization, link, and queued request.")
+				})
+			}
+		})
+	}
+}
+
+var removalFinalizationRPCs = []struct {
+	name  string
+	call  teardownRPC
+	audit sandrunv1.AuditAction
+}{
+	{"unlink", unlinkOwnSand, sandrunv1.AuditAction_AUDIT_ACTION_OWNSAND_LINK_REMOVED},
+	{"delete_organization", deleteSandRunOrg, sandrunv1.AuditAction_AUDIT_ACTION_ORGANIZATION_DELETED},
+}
+
+func (w *removalLeaseWorld) waitForBlockedQuery(t *testing.T, query string) {
+	t.Helper()
+	eventually(t, "lock wait in "+query, func() bool {
+		var waiting bool
+		err := w.env.DB.Pool.QueryRow(t.Context(), `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+				AND wait_event_type = 'Lock' AND strpos(query, $1) > 0
+		)`, query).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waiting
+	})
+}
+
+func (w *removalLeaseWorld) checkFinalizationRollback(t *testing.T, action sandrunv1.AuditAction) {
+	t.Helper()
+	if got := w.session(t, w.queuedID); got.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("queued session did not survive rollback: %v", got)
+	}
+	if count := countAudit(t, w.env, w.org.ID, action); count != 0 {
+		t.Fatalf("removal audit events after rollback = %d", count)
+	}
+}
+
 type removalLeaseWorld struct {
 	*workWorld
 	duration time.Duration
+	queuedID string
 }
 
 func newRemovalLeaseWorld(t *testing.T, duration time.Duration, reclaimLegacy bool) *removalLeaseWorld {
@@ -235,7 +473,7 @@ func newRemovalLeaseWorld(t *testing.T, duration time.Duration, reclaimLegacy bo
 		t.Fatal(err)
 	}
 	profile := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
-	w.createSession(t, w.env.User(w.org.Member), profile)
+	w.queuedID = w.createSession(t, w.env.User(w.org.Member), profile).GetDevSessionId()
 	client, _, err := w.l.Links.Client(ctx, w.org.ID)
 	if err != nil {
 		t.Fatal(err)

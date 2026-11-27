@@ -94,6 +94,20 @@ func (d *DB) InTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	return pgx.BeginTxFunc(ctx, d.Pool, pgx.TxOptions{}, fn)
 }
 
+// InTxWithContexts begins a transaction under beginCtx and ends it under
+// endCtx. The callback chooses the context for each statement.
+func InTxWithContexts(beginCtx, endCtx context.Context, begin func(context.Context) (pgx.Tx, error), fn func(pgx.Tx) error) error {
+	tx, err := begin(beginCtx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(endCtx) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(endCtx)
+}
+
 // Migrations returns the embedded migration files, rooted at the migrations
 // directory.
 func Migrations() fs.FS {
