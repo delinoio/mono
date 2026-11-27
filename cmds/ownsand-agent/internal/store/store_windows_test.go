@@ -288,7 +288,7 @@ func TestWipeLocalDataKeepsACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WipeLocalData(); err != nil {
+	if err := wipeLocalData(t, s); err != nil {
 		t.Fatal(err)
 	}
 	aces, _ := dacl(t, s.Path(VMsDir))
