@@ -8,7 +8,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -35,11 +34,13 @@ const unmountTimeout = 30 * time.Second
 // when the cleanup runs, and a canceled context would leave the disk attached.
 const detachTimeout = 30 * time.Second
 
+const attachmentInfoTimeout = 30 * time.Second
+
 // errNoGUIDPartitionTable reports an attached guest disk without a GUID
 // partition table, which the macOS installer always creates.
 var errNoGUIDPartitionTable = errors.New("imagebuild: the attached guest disk has no GUID partition table")
 
-// hostRunner runs a host tool and returns its standard output.
+// hostRunner runs a host tool and returns its captured standard output, even on failure.
 type hostRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
 // runHostTool is the hostRunner that runs the real tool.
@@ -48,7 +49,7 @@ func runHostTool(ctx context.Context, name string, args ...string) ([]byte, erro
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s %s: %w: %s", filepath.Base(name), strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return stdout.Bytes(), fmt.Errorf("%s %s: %w: %s", filepath.Base(name), strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
 }
@@ -64,13 +65,13 @@ var wholeDiskPattern = regexp.MustCompile(`/dev/(disk[0-9]+)`)
 // tool, so a failure to convert the plist cannot hide a successful attach. A
 // malformed plist falls back to the first device path in the raw output.
 func attachedWholeDisk(out []byte) (whole string, guid bool) {
-	entities, _ := parseAttachEntities(out)
-	for _, e := range entities {
-		m := wholeDiskPattern.FindStringSubmatch(e.devEntry)
+	plist, _ := readDiskImagePlist(out)
+	for _, entity := range plist.array("system-entities") {
+		m := wholeDiskPattern.FindStringSubmatch(entity.dict.text("dev-entry"))
 		if m == nil {
 			continue
 		}
-		if e.contentHint == "GUID_partition_scheme" {
+		if entity.dict.text("content-hint") == "GUID_partition_scheme" {
 			return m[1], true
 		}
 		if whole == "" {
@@ -85,70 +86,91 @@ func attachedWholeDisk(out []byte) (whole string, guid bool) {
 	return whole, false
 }
 
-type attachEntity struct {
-	devEntry    string
-	contentHint string
-}
+// Recovery requires a complete whole-disk entry. A raw match or a partition
+// name is insufficient because the attach command did not succeed.
+var wholeDiskEntryPattern = regexp.MustCompile(`^/dev/(disk[0-9]+)$`)
 
-// parseAttachEntities reads the `system-entities` array of an attach plist.
-// It returns the entities read so far together with the first XML error.
-func parseAttachEntities(out []byte) ([]attachEntity, error) {
-	dec := xml.NewDecoder(bytes.NewReader(out))
-	dec.Strict = false
-	var (
-		entities []attachEntity
-		depth    int // plist=1, root dict=2, system-entities array=3, entity dict=4
-		key      string
-	)
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return entities, nil
-			}
-			return entities, err
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			switch {
-			case t.Name.Local == "key":
-				if err := dec.DecodeElement(&key, &t); err != nil {
-					return entities, err
-				}
-			case t.Name.Local == "string":
-				var value string
-				if err := dec.DecodeElement(&value, &t); err != nil {
-					return entities, err
-				}
-				if depth == 4 && len(entities) > 0 {
-					switch e := &entities[len(entities)-1]; key {
-					case "dev-entry":
-						e.devEntry = value
-					case "content-hint":
-						e.contentHint = value
-					}
-				}
-			default:
-				depth++
-				if t.Name.Local == "dict" && depth == 4 {
-					entities = append(entities, attachEntity{})
-				}
-			}
-		case xml.EndElement:
-			depth--
+func interruptedAttachDevice(out []byte) string {
+	plist, err := readDiskImagePlist(out)
+	if err != nil {
+		var syntaxErr *xml.SyntaxError
+		if !errors.As(err, &syntaxErr) || syntaxErr.Msg != "unexpected EOF" {
+			return ""
 		}
 	}
+	var whole string
+	for _, entity := range plist.array("system-entities") {
+		device := wholeDiskEntryPattern.FindStringSubmatch(entity.dict.text("dev-entry"))
+		if device == nil {
+			continue
+		}
+		if whole != "" && whole != device[1] {
+			return ""
+		}
+		whole = device[1]
+	}
+	return whole
+}
+
+func verifyDiskAttachment(run hostRunner, disk, whole string, logger *slog.Logger) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), attachmentInfoTimeout)
+	defer cancel()
+
+	out, err := run(ctx, hdiutilPath, "info", "-plist")
+	if err != nil {
+		logger.Warn("verify the guest disk attachment failed", "device", whole, "error", err)
+		return false
+	}
+	plist, err := readDiskImagePlist(out)
+	if err != nil {
+		logger.Warn("read the attached disk inventory failed", "device", whole, "error", err)
+		return false
+	}
+
+	dev := "/dev/" + whole
+	var path string
+	found := false
+	for _, image := range plist.array("images") {
+		for _, entity := range image.dict.array("system-entities") {
+			if entity.dict.text("dev-entry") != dev {
+				continue
+			}
+			if found {
+				return false
+			}
+			found = true
+			path = image.dict.text("image-path")
+		}
+	}
+	if !filepath.IsAbs(path) {
+		return false
+	}
+	staged, err := filepath.Abs(disk)
+	if err != nil {
+		return false
+	}
+	if path == staged {
+		return true
+	}
+	// hdiutil can resolve a symlink in the staging directory, such as /var.
+	resolved, err := filepath.EvalSymlinks(staged)
+	return err == nil && resolved == path
 }
 
 // withAttachedDisk attaches the raw disk image without mounting it, calls use
 // with the whole-disk device (for example disk4) and detaches that device
-// before it returns, whichever way use or a later step fails. The cleanup
-// starts as soon as the attach has succeeded and touches only the device that
-// this attach reported. A cleanup failure is reported only when no earlier
-// error exists, so the original error is never replaced.
+// before it returns. If the attach fails after it reports a device, cleanup
+// requires a verified association with the staged image. A cleanup failure
+// is reported only when no earlier error exists.
 func withAttachedDisk(ctx context.Context, run hostRunner, disk string, logger *slog.Logger, use func(whole string) error) (err error) {
 	out, err := run(ctx, hdiutilPath, "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", "-plist", disk)
 	if err != nil {
+		if whole := interruptedAttachDevice(out); whole != "" {
+			verify := func() bool { return verifyDiskAttachment(run, disk, whole, logger) }
+			if detachErr := detachDisk(run, whole, logger, verify); detachErr != nil {
+				logger.Warn("clean up the interrupted guest disk attachment failed", "device", whole, "error", detachErr)
+			}
+		}
 		return fmt.Errorf("imagebuild: attach the guest disk: %w", err)
 	}
 	whole, guid := attachedWholeDisk(out)
@@ -156,7 +178,7 @@ func withAttachedDisk(ctx context.Context, run hostRunner, disk string, logger *
 		return errors.New("imagebuild: the attach output of the guest disk names no device")
 	}
 	defer func() {
-		if derr := detachDisk(run, whole, logger); derr != nil && err == nil {
+		if derr := detachDisk(run, whole, logger, nil); derr != nil && err == nil {
 			err = derr
 		}
 	}()
@@ -192,8 +214,12 @@ func withMountedDataVolume(ctx context.Context, run hostRunner, data, mnt string
 
 // detachDisk detaches the whole-disk device, and forces the detach when the
 // first attempt fails. Each attempt runs on a fresh bounded context that the
-// build context cannot cancel.
-func detachDisk(run hostRunner, whole string, logger *slog.Logger) error {
+// build context cannot cancel. After an interrupted attach, verify must
+// confirm that the device still belongs to the image before each attempt.
+func detachDisk(run hostRunner, whole string, logger *slog.Logger, verify func() bool) error {
+	if verify != nil && !verify() {
+		return nil
+	}
 	dev := "/dev/" + whole
 	attempt := func(args ...string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
@@ -204,6 +230,9 @@ func detachDisk(run hostRunner, whole string, logger *slog.Logger) error {
 	derr := attempt("detach", dev)
 	if derr == nil {
 		return nil
+	}
+	if verify != nil && !verify() {
+		return derr
 	}
 	logger.Warn("detach the guest disk failed; forcing", "device", dev, "error", derr)
 	return attempt("detach", "-force", dev)
