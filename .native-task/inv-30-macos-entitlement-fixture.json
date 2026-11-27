@@ -1,0 +1,41 @@
+{
+  "gid": "inv-30-macos-entitlement-fixture",
+  "commit": "73f63ee0b3acd52959b87aa7e1286234bad01194",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "73f63ee0b3acd52959b87aa7e1286234bad01194",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "setup": "Use a clean macOS checkout of the stated commit and run from the root in Bash with the Go toolchain and macOS Command Line Tools available. Both signed runs use temporary state and a loopback control plane. The test ad hoc signs the child binaries. No guest VM, real image, or production account is required.",
+    "commands": [
+      "set -e -o pipefail",
+      "test \"$(git rev-parse HEAD)\" = 73f63ee0b3acd52959b87aa7e1286234bad01194",
+      "mkdir -p '.t3-tmp/entitlement-validation'",
+      "export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp/entitlement-validation\"",
+      "export COPYFILE_DISABLE=1",
+      "CGO_ENABLED=1 go test -mod=readonly -count=1 -v ./cmds/ownsand-agent -run '^TestBinaryVirtualizationEntitlement$' 2>&1 | tee '.t3-tmp/entitlement-validation/signed.log'",
+      "grep -F -- '--- PASS: TestBinaryVirtualizationEntitlement/disabled' '.t3-tmp/entitlement-validation/signed.log'",
+      "grep -F -- '--- PASS: TestBinaryVirtualizationEntitlement/enabled' '.t3-tmp/entitlement-validation/signed.log'",
+      "CGO_ENABLED=1 go test -mod=readonly -count=1 -v ./cmds/ownsand-agent -run '^TestVirtualizationEntitlementCapabilities$' 2>&1 | tee '.t3-tmp/entitlement-validation/synthetic.log'"
+    ],
+    "expectedResults": [
+      "The signed command builds the agent with cgo and both ad hoc signed subtests pass without skips. The logs confirm the false and true entitlement cases, passing Linux image presence, and the resulting guest and image lists.",
+      "The disabled signature advertises no guests or base images and no macOS guest support. The enabled signature advertises a Linux guest and image when the framework reports available, and no guest or image support when it reports unavailable.",
+      "The synthetic test passes for all four combinations. The two unavailable-framework cases reject missing or wrong entitlement rows, missing or failed image rows, and each unexpected advertisement."
+    ],
+    "files": {
+      "regressionTests": [
+        "cmds/ownsand-agent/binary_entitlement_darwin_test.go",
+        "cmds/ownsand-agent/binary_entitlement_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/entitlement-validation/signed.log",
+        ".t3-tmp/entitlement-validation/synthetic.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-macos-entitlement-fixture/worker/.t3-tmp/validation/ownsand-agent-darwin-arm64.test"
+      ]
+    }
+  }
+}
