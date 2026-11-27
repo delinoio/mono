@@ -176,8 +176,8 @@ type DataPathHooks interface {
 	// HandleEnvelope handles a data path envelope from the agent and reports
 	// whether it was one.
 	HandleEnvelope(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) bool
-	// HandleEvent applies a revocation event.
-	HandleEvent(ctx context.Context, e events.Event)
+	// HandleEvent applies a revocation event to the admitted channel generations.
+	HandleEvent(ctx context.Context, e events.Event, channels channelGenerations)
 	// SweepExpired deletes expired revocations and retries deferred enqueues.
 	SweepExpired(ctx context.Context)
 }
