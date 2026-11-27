@@ -70,6 +70,47 @@ func TestInstallationTokenCache(t *testing.T) {
 	}
 }
 
+func TestInstallationSuspendedUsesAppJWT(t *testing.T) {
+	c, f, _ := newClient(t)
+	f.AddInstallation(1, "acme", "Organization")
+	for _, want := range []bool{false, true, false} {
+		f.SetSuspended(1, want)
+		got, err := c.InstallationSuspended(t.Context(), 1)
+		if err != nil || got != want {
+			t.Fatalf("installation suspended = %v, error = %v, want %v", got, err, want)
+		}
+	}
+	if got := f.Calls("create_installation_token"); got != 0 {
+		t.Fatalf("installation token requests = %d, want 0", got)
+	}
+}
+
+func TestInstallationSuspendedRejectsUnverifiableState(t *testing.T) {
+	_, f, _ := newClient(t)
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"missing state", `{"id":1}`},
+		{"invalid timestamp", `{"id":1,"suspended_at":"invalid"}`},
+		{"invalid type", `{"id":1,"suspended_at":false}`},
+		{"wrong installation", `{"id":2,"suspended_at":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, tc.body)
+			}))
+			defer upstream.Close()
+			cfg := f.Config()
+			cfg.APIOrigin = upstream.URL
+			c := githubapi.New(cfg, upstream.Client(), slog.New(slog.DiscardHandler), nil)
+			if _, err := c.InstallationSuspended(t.Context(), 1); err == nil {
+				t.Fatal("accepted unverifiable installation state")
+			}
+		})
+	}
+}
+
 func TestDelayedUnauthorizedPreservesReplacementInstallationToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
