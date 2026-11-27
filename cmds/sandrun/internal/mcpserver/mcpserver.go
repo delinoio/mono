@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"math"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -598,7 +599,7 @@ func (c *collector) result(execID string, res *sandrun.ExecResult) execResult {
 	defer c.mu.Unlock()
 	r := execResult{
 		ExecID: execID, Stdout: c.out.output(), Stderr: c.err.output(),
-		NextStdoutOffset: c.out.next, NextStderrOffset: c.err.next, OutputTruncated: c.truncated,
+		NextStdoutOffset: c.out.next, NextStderrOffset: c.err.next, OutputTruncated: slices.Clone(c.truncated),
 	}
 	if res == nil {
 		r.Running = true
@@ -627,44 +628,53 @@ type execOutcome struct {
 
 // runWithWait waits for fn to return. After wait, it allows up to
 // confirmationGrace for the first callback or outcome, within MaxWait
-// overall. It then cancels the stream and lets the command keep running
-// in the guest. Without confirmation, it returns errExecUnconfirmed.
+// overall. It then cancels the stream without waiting for SDK cleanup.
+// The command can keep running in the guest. Without confirmation,
+// runWithWait returns errExecUnconfirmed.
 func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *collector, fn func(context.Context) (*sandrun.ExecResult, error)) (*sandrun.ExecResult, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	graceDeadline := time.Now().Add(min(wait+confirmationGrace, s.cfg.maxWait))
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	// A worker that finishes after the tool returns can still send its outcome.
 	done := make(chan execOutcome, 1)
 	go func() {
 		res, err := fn(sctx)
 		done <- execOutcome{res, err}
 	}()
-	start := time.Now()
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
 	select {
 	case o := <-done:
 		return o.res, o.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-timer.C:
 	}
-	grace := min(confirmationGrace, max(s.cfg.maxWait-time.Since(start), 0))
+	timer.Reset(time.Until(graceDeadline))
 	select {
 	case o := <-done:
 		return o.res, o.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-col.confirmed:
-	case <-time.After(grace):
+	case <-timer.C:
 	}
 	cancel()
-	o := <-done
-	if o.err == nil {
-		return o.res, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	// The wait can cancel credential acquisition before the exec stream opens.
-	if errors.Is(o.err, context.Canceled) && ctx.Err() == nil {
-		if !col.hasConfirmation() {
-			return nil, errExecUnconfirmed
+	select {
+	case o := <-done:
+		// The tool's cancellation can interrupt credential acquisition or the stream.
+		if !errors.Is(o.err, context.Canceled) {
+			return o.res, o.err
 		}
-		return nil, nil // still running
+	default:
 	}
-	return nil, o.err
+	if !col.hasConfirmation() {
+		return nil, errExecUnconfirmed
+	}
+	return nil, nil // still running
 }
 
 func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) (*mcp.CallToolResult, execResult, error) {
