@@ -11,13 +11,16 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestsync"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/hcsrt"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"golang.org/x/sys/windows"
 )
 
 // Defaults and limits of the Windows image build.
@@ -242,7 +245,7 @@ func applyImage(ctx context.Context, logger *slog.Logger, disk, scratch, wim str
 		return fmt.Errorf("imagebuild: bcdboot failed: %w: %s", err, out)
 	}
 	logger.Info("boot files written")
-	return installSetupFiles(logger, d.Windows, guestBinary, lang, randomPassword)
+	return installSetupFiles(logger, d.Windows+`\`, guestBinary, lang, randomPassword)
 }
 
 // installSetupFiles writes the answer file, SetupComplete.cmd and the guest
@@ -251,7 +254,6 @@ func applyImage(ctx context.Context, logger *slog.Logger, disk, scratch, wim str
 // randomPassword. It never logs the password. It needs no Windows image,
 // elevation or VM, so a test can run it against a temporary directory.
 func installSetupFiles(logger *slog.Logger, root, guestBinary, lang string, newPassword func() (string, error)) error {
-	win := root + `\Windows`
 	password, err := newPassword()
 	if err != nil {
 		return err
@@ -260,10 +262,23 @@ func installSetupFiles(logger *slog.Logger, root, guestBinary, lang string, newP
 	if err != nil {
 		return err
 	}
-	if err := writeFile(filepath.Join(win, "Panther", "unattend.xml"), answer); err != nil {
+	image, err := openSetupRoot(root)
+	if err != nil {
+		return fmt.Errorf("imagebuild: open the applied image root: %w", err)
+	}
+	defer windows.CloseHandle(image)
+
+	write := func(path string, data []byte) error {
+		err := writeSetupFile(image, path, data)
+		if err != nil {
+			logger.Error("install a Windows setup file failed", "relative_path", path, "reason", err)
+		}
 		return err
 	}
-	if err := writeFile(filepath.Join(win, "Setup", "Scripts", "SetupComplete.cmd"), []byte(setupCompleteCmd())); err != nil {
+	if err := write(`Windows\Panther\unattend.xml`, answer); err != nil {
+		return err
+	}
+	if err := write(`Windows\Setup\Scripts\SetupComplete.cmd`, []byte(setupCompleteCmd())); err != nil {
 		return err
 	}
 	guest, err := os.ReadFile(guestBinary)
@@ -271,30 +286,115 @@ func installSetupFiles(logger *slog.Logger, root, guestBinary, lang string, newP
 		return fmt.Errorf("imagebuild: read the guest helper: %w", err)
 	}
 	// hcsrt.WindowsGuestBinary below the Windows partition root.
-	if err := writeFile(filepath.Join(root+`\`, hcsrt.WindowsGuestBinary[len(`C:\`):]), guest); err != nil {
+	if err := write(hcsrt.WindowsGuestBinary[len(`C:\`):], guest); err != nil {
 		return err
 	}
 	logger.Info("answer file, SetupComplete.cmd and guest helper installed", "guest_binary_bytes", len(guest))
 	return nil
 }
 
-func writeFile(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+const setupDirectoryAccess = windows.FILE_TRAVERSE | windows.FILE_READ_ATTRIBUTES
+
+func openSetupRoot(path string) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
+		return 0, err
+	}
+	handle, err := windows.CreateFile(name, setupDirectoryAccess, windows.FILE_SHARE_READ,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return 0, err
+	}
+	if err := checkSetupEntry(handle, true); err != nil {
+		windows.CloseHandle(handle)
+		return 0, err
+	}
+	return handle, nil
+}
+
+func writeSetupFile(root windows.Handle, path string, data []byte) (err error) {
+	if !filepath.IsLocal(path) || filepath.Clean(path) == "." {
+		return fmt.Errorf("imagebuild: invalid relative setup path %q", path)
+	}
+	parts := strings.Split(filepath.Clean(path), `\`)
+	parent := root
+	for i, name := range parts[:len(parts)-1] {
+		dir, err := openSetupEntry(parent, name, true)
+		if err != nil {
+			return fmt.Errorf("imagebuild: prepare setup directory %q: %w", filepath.Join(parts[:i+1]...), err)
+		}
+		defer windows.CloseHandle(dir)
+		parent = dir
+	}
+	handle, err := openSetupEntry(parent, parts[len(parts)-1], false)
+	if err != nil {
+		return fmt.Errorf("imagebuild: open setup file %q: %w", path, err)
+	}
+	f := os.NewFile(uintptr(handle), path)
+	defer func() {
+		closeErr := f.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
+	// Truncate only after checking the file handle for reparse attributes.
+	if err := f.Truncate(0); err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
+	return f.Sync()
+}
+
+// Resolve each name against a checked directory handle. The caller holds
+// the ancestor handles without write or delete sharing until writing is complete.
+// FILE_OPEN_REPARSE_POINT applies to the single component opened here.
+func openSetupEntry(parent windows.Handle, name string, directory bool) (windows.Handle, error) {
+	objectName, err := windows.NewNTUnicodeString(name)
+	if err != nil {
+		return 0, err
+	}
+	attrs := windows.OBJECT_ATTRIBUTES{
+		RootDirectory: parent,
+		ObjectName:    objectName,
+		Attributes:    windows.OBJ_CASE_INSENSITIVE,
+	}
+	attrs.Length = uint32(unsafe.Sizeof(attrs))
+	access := uint32(windows.FILE_GENERIC_WRITE | windows.FILE_READ_ATTRIBUTES)
+	options := uint32(windows.FILE_OPEN_REPARSE_POINT | windows.FILE_SYNCHRONOUS_IO_NONALERT)
+	if directory {
+		access = setupDirectoryAccess | windows.SYNCHRONIZE
+		options |= windows.FILE_DIRECTORY_FILE
+	}
+	var handle windows.Handle
+	var iosb windows.IO_STATUS_BLOCK
+	if err := windows.NtCreateFile(&handle, access, &attrs, &iosb, nil, windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_SHARE_READ, windows.FILE_OPEN_IF, options, 0, 0); err != nil {
+		return 0, err
+	}
+	if err := checkSetupEntry(handle, directory); err != nil {
+		windows.CloseHandle(handle)
+		return 0, err
+	}
+	return handle, nil
+}
+
+func checkSetupEntry(handle windows.Handle, directory bool) error {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
 		return err
 	}
-	return f.Close()
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errors.New("reparse point")
+	}
+	if directory && info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return errors.New("expected a directory")
+	}
+	if !directory && info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		return errors.New("expected a regular file")
+	}
+	return nil
 }
 
 // runGuest runs a provisioning command and requires exit code 0.
