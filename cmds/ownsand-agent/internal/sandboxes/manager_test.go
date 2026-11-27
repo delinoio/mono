@@ -2852,28 +2852,55 @@ func TestDeleteSnapshotDuringCreate(t *testing.T) {
 // entry and no pending capture, and that a retry on a live context publishes
 // the snapshot.
 func TestSnapshotCanceledDuringCreateNeverYieldsReady(t *testing.T) {
+	const waitTimeout = 5 * time.Second
+
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	snapID, _ := uuidv7.NewString()
 	e.rt.snapStarted = make(chan struct{})
 	e.rt.snapBlock = make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	type result struct {
 		entry *ownsandv1.SnapshotStateEntry
 		err   error
 	}
-	done := make(chan result, 1)
+	results := make(chan result, 1)
+	workerDone := make(chan struct{})
+	release := sync.OnceFunc(func() { close(e.rt.snapBlock) })
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-workerDone:
+		case <-time.After(waitTimeout):
+			t.Errorf("snapshot create worker did not exit during cleanup within %s", waitTimeout)
+		}
+	})
 	go func() {
+		defer close(workerDone)
 		entry, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
-		done <- result{entry, err}
+		results <- result{entry, err}
 	}()
-	<-e.rt.snapStarted
-	// The channel ends while the capture runs; the runtime still succeeds.
-	cancel()
-	close(e.rt.snapBlock)
-	res := <-done
 	var ce *CommandError
+	select {
+	case <-e.rt.snapStarted:
+	case res := <-results:
+		if errors.As(res.err, &ce) {
+			t.Fatalf("snapshot create returned before capture started with %s: %v (entry=%v)", ce.Code, res.err, res.entry)
+		}
+		t.Fatalf("snapshot create returned before capture started: entry=%v, error=%v", res.entry, res.err)
+	case <-time.After(waitTimeout):
+		t.Fatalf("snapshot capture did not start within %s", waitTimeout)
+	}
+	// Cancel while capture runs. The fake runtime still succeeds.
+	cancel()
+	release()
+	var res result
+	select {
+	case res = <-results:
+	case <-time.After(waitTimeout):
+		t.Fatalf("snapshot create did not finish after canceling and releasing capture within %s", waitTimeout)
+	}
 	if res.entry != nil || !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
 		t.Fatalf("create after cancel = %v, %v; want ABORTED and no entry", res.entry, res.err)
 	}
