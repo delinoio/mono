@@ -90,6 +90,7 @@ import {
   RequestSchema,
   type Runner,
   RunnerSchema,
+  RunnerStateCountSchema,
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
@@ -160,6 +161,15 @@ export const MOCK_IDS = {
 const OTHER_ADMIN = "mock-user-ada";
 const OTHER_MEMBER = "mock-user-lin";
 const LATER_MEMBER = "mock-user-nora";
+
+const OPEN_RUNNER_STATES: ReadonlySet<RunnerState> = new Set([
+  RunnerState.CREATING,
+  RunnerState.PREPARING,
+  RunnerState.WARM,
+  RunnerState.WAITING_FOR_WORK,
+  RunnerState.BUSY,
+  RunnerState.DELETING,
+]);
 
 const now = () => Date.now();
 const ts = (offsetSeconds = 0): Timestamp =>
@@ -589,10 +599,6 @@ function seed(
       },
       effectiveVcpuLimit: 24n,
       allocation: { vcpuCount: 8n, memoryMib: 16384n, diskGib: 128n },
-      runners: [
-        { state: RunnerState.BUSY, count: 1 },
-        { state: RunnerState.WARM, count: 1 },
-      ],
     }),
     create(DeviceCapacitySchema, {
       ownsandDeviceId: MOCK_IDS.macDevice,
@@ -1949,7 +1955,27 @@ export function createMockTransport(
             "the OwnSand link is invalid; an admin must set a new OwnSand API key",
             Code.FailedPrecondition,
           );
-        return { devices: org.devices };
+        const countsByDevice = new Map<string, Map<RunnerState, number>>();
+        for (const { ownsandDeviceId, state } of org.runners) {
+          if (ownsandDeviceId === "" || !OPEN_RUNNER_STATES.has(state)) {
+            continue;
+          }
+          const counts = countsByDevice.get(ownsandDeviceId) ?? new Map();
+          counts.set(state, (counts.get(state) ?? 0) + 1);
+          countsByDevice.set(ownsandDeviceId, counts);
+        }
+        return {
+          devices: org.devices.map((device) => ({
+            ...device,
+            runners: Array.from(
+              countsByDevice.get(device.ownsandDeviceId) ?? [],
+            )
+              .sort(([a], [b]) => a - b)
+              .map(([state, count]) =>
+                create(RunnerStateCountSchema, { state, count }),
+              ),
+          })),
+        };
       },
       async *watchQueue(req, ctx: HandlerContext) {
         const { org } = membership(req.organizationId);
