@@ -883,21 +883,79 @@ func TestCreateGateControlCleanupAfterDeleteFailure(t *testing.T) {
 }
 
 func TestDeleteCancelsRunningCreate(t *testing.T) {
+	const timeout = 5 * time.Second
 	e := newEnv(t)
 	e.rt.block = make(chan struct{})
+	e.rt.createStarted = make(chan struct{})
 	cmd := e.createCmd(1, time.Hour, time.Hour)
-	done := make(chan error, 1)
-	go func() {
-		_, err := e.m.Create(context.Background(), cmd)
-		done <- err
-	}()
-	waitState(t, e.m, cmd.GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_CREATING)
-	del, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
-	if err != nil || del.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-		t.Fatalf("delete %v %v", del, err)
+
+	type result struct {
+		entry *ownsandv1.SandboxStateEntry
+		err   error
 	}
-	if err := <-done; err == nil {
-		t.Fatal("canceled create reported success")
+	createResult, deleteResult := make(chan result, 1), make(chan result, 1)
+	createDone := make(chan struct{})
+	var deleteDone chan struct{}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Keep the runtime gate held. Cancel only after the test finishes its
+	// assertions so cleanup cannot satisfy a missing Delete cancellation.
+	t.Cleanup(func() {
+		cancel()
+		join, stop := context.WithTimeout(context.Background(), timeout)
+		defer stop()
+		for _, worker := range []struct {
+			name string
+			done <-chan struct{}
+		}{{"create", createDone}, {"delete", deleteDone}} {
+			if worker.done == nil {
+				continue
+			}
+			select {
+			case <-worker.done:
+			case <-join.Done():
+				t.Errorf("cleanup timed out waiting for the %s worker", worker.name)
+			}
+		}
+	})
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	go func() {
+		defer close(createDone)
+		entry, err := e.m.Create(ctx, cmd)
+		createResult <- result{entry, err}
+	}()
+	select {
+	case <-e.rt.createStarted:
+	case res := <-createResult:
+		t.Fatalf("create returned before runtime entry with entry %v and error %v", res.entry, res.err)
+	case <-deadline.C:
+		t.Fatalf("timed out after %s waiting for create to enter the runtime", timeout)
+	}
+
+	deleteDone = make(chan struct{})
+	go func() {
+		defer close(deleteDone)
+		entry, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
+		deleteResult <- result{entry, err}
+	}()
+	select {
+	case res := <-deleteResult:
+		if res.err != nil || res.entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("delete returned entry %v and error %v, want DELETED", res.entry, res.err)
+		}
+	case <-deadline.C:
+		t.Fatalf("timed out after %s waiting for delete to finish while runtime create is blocked", timeout)
+	}
+
+	select {
+	case res := <-createResult:
+		var ce *CommandError
+		if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+			t.Fatalf("create returned entry %v and error %v, want ABORTED", res.entry, res.err)
+		}
+	case <-deadline.C:
+		t.Fatalf("timed out after %s waiting for create to return after delete", timeout)
 	}
 }
 
