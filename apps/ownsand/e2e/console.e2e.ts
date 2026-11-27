@@ -940,6 +940,46 @@ describe("billing", () => {
 });
 
 describe("agent version policy", () => {
+  test("keeps a rejected pin as a draft and lets the admin save a correction", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+
+    const version = screen.getByRole("textbox", "Pinned version");
+    const save = screen.getByRole("button", "Save policy");
+    const notifications = screen.getByRole("region", "Notifications");
+    const saved = notifications.getByText("The agent version policy is saved.");
+    await screen.getByRole("radio", "Pin a version").tap();
+    await version.fill("1.4.2");
+    await save.tap();
+    await expect(saved).toBeVisible();
+    await expect(saved).toBeHidden();
+
+    await version.fill("1. 4.2");
+    await save.tap();
+    await expect(notifications).toContainText(
+      "invalid pinned_version: a version is required for PIN",
+    );
+    await expect(version).toHaveValue("1. 4.2");
+    await expect(saved).toBeHidden();
+
+    const devices = screen.getByRole("link", "Devices", { exact: true });
+    const settings = screen.getByRole("link", "Settings", { exact: true });
+    await devices.tap();
+    await settings.tap();
+    await expect(version).toHaveValue("1.4.2");
+
+    await version.fill("1.4.3");
+    await save.tap();
+    await expect(saved).toBeVisible();
+    await devices.tap();
+    await settings.tap();
+    await expect(version).toHaveValue("1.4.3");
+  });
+
   test("leaves the saved version in place when the admin leaves an unsaved edit", async ({
     app,
     screen,

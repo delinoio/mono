@@ -10,6 +10,7 @@ import {
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   AgentUpdateState,
+  AgentVersionPolicyMode,
   ApiKeyState,
   Arch,
   BaseImage,
@@ -41,6 +42,56 @@ import {
   type MockBillingAccount,
 } from "./mock-api.ts";
 import { walkFixturePages } from "./walk-fixture-pages.ts";
+
+describe("mock agent version policy", () => {
+  afterEach(() => {
+    rs.useRealTimers();
+  });
+
+  test.each([
+    ["space", " "],
+    ["tab", "\t"],
+    ["carriage return", "\r"],
+    ["line feed", "\n"],
+  ])(
+    "rejects a pin with an embedded %s and preserves the policy",
+    async (_, whitespace) => {
+      rs.useFakeTimers();
+      const savedAt = Date.UTC(2026, 0, 1);
+      rs.setSystemTime(savedAt);
+      const client = createClient(
+        DeviceService,
+        createMockTransport({ userId: "user-admin-jun" }),
+      );
+      const request = { organizationId: MOCK_IDS.acme };
+      const pin = { ...request, mode: AgentVersionPolicyMode.PIN };
+      const { policy } = await client.updateAgentVersionPolicy({
+        ...pin,
+        pinnedVersion: "1.4.2",
+      });
+      expect(policy).toMatchObject({
+        ...pin,
+        pinnedVersion: "1.4.2",
+        updateTime: timestampFromMs(savedAt),
+        updatedBy: { id: "user-admin-jun" },
+      });
+
+      rs.setSystemTime(savedAt + 1000);
+      await expect(
+        client.updateAgentVersionPolicy({
+          ...pin,
+          pinnedVersion: `1.${whitespace}4.2`,
+        }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage: "invalid pinned_version: a version is required for PIN",
+      });
+      expect((await client.getAgentVersionPolicy(request)).policy).toEqual(
+        policy,
+      );
+    },
+  );
+});
 
 describe("mock device list", () => {
   const organizationId = MOCK_IDS.acme;
