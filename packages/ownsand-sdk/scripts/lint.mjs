@@ -5,16 +5,19 @@
 // - the SDK logs nothing by default, so sources do not call `console`;
 // - the SDK never imports code from `servers/`.
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 // URL.pathname is a URL path (percent-encoded, with a leading slash before a
 // Windows drive letter), not a filesystem path, so convert the file URL.
 // An optional first argument replaces the default source root so that tests
 // can lint fixture trees.
-const root = process.argv[2]
-  ? resolve(process.argv[2])
-  : fileURLToPath(new URL("../src/", import.meta.url));
+const sourceRoot = fileURLToPath(new URL("../src/", import.meta.url));
+const root = process.argv[2] ? resolve(process.argv[2]) : sourceRoot;
+const serversRoot = fileURLToPath(
+  new URL("../../../servers/", import.meta.url),
+);
 // The header line ends in LF or CRLF: a checkout with `core.autocrlf=true`
 // converts every source to CRLF.
 const spdxHeader = /^\/\/ SPDX-License-Identifier: Apache-2\.0\r?\n/;
@@ -40,9 +43,45 @@ function check(path) {
   if (!name.endsWith(".test.ts") && /\bconsole\s*\./.test(source)) {
     failures.push(`${name}: the SDK must not log through console`);
   }
-  if (/from\s+["'][^"']*servers\//.test(source)) {
+  if (importsFromServers(name, source)) {
     failures.push(`${name}: the SDK must not import from servers/`);
   }
+}
+
+function importsFromServers(name, source) {
+  const file = ts.createSourceFile(name, source, ts.ScriptTarget.Latest);
+  // Resolve paths as if the fixture tree were under the SDK source root.
+  const sourceDir = dirname(resolve(sourceRoot, name));
+
+  function visit(node) {
+    let specifier;
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      specifier = node.moduleSpecifier;
+    } else if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      specifier = node.arguments[0];
+    }
+
+    if (specifier && ts.isStringLiteralLike(specifier)) {
+      const path = specifier.text;
+      if (path.startsWith("./") || path.startsWith("../") || isAbsolute(path)) {
+        const target = relative(serversRoot, resolve(sourceDir, path));
+        if (
+          target !== ".." &&
+          !target.startsWith(`..${sep}`) &&
+          !isAbsolute(target)
+        ) {
+          return true;
+        }
+      }
+    }
+
+    return ts.forEachChild(node, visit);
+  }
+
+  return visit(file);
 }
 
 walk(root);
