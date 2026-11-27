@@ -250,8 +250,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if custom, ok := body["custom_data"].(map[string]any); ok {
 			txn.CustomData = custom
 		}
+		// Status updates change only the stored copy.
+		stored := txn
 		s.mu.Lock()
-		s.transactions[txn.ID] = &txn
+		s.transactions[txn.ID] = &stored
 		s.mu.Unlock()
 		writeJSON(w, http.StatusCreated, map[string]any{"data": txn})
 	case len(parts) == 3 && parts[0] == "transactions" && parts[2] == "invoice" && r.Method == http.MethodGet:
