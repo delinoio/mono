@@ -396,9 +396,8 @@ func (c *Control) handle(ctx context.Context, e events.Event, channels channelGe
 				return nil
 			}
 			// Any other lookup error is transient (for example a database
-			// error): a skip would advance the cursor past a delete that
-			// no agent received, and a repeated DeleteSandbox writes no
-			// new event while the delete is pending.
+			// error): keep the event pending for another poll so delivery
+			// can recover without another request or a reconnect.
 			return err
 		}
 		if isTerminal(sb.AgentState) || !sb.DeletePending {

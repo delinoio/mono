@@ -398,8 +398,15 @@ func (s *Service) applyExportResultWithRetry(ctx context.Context, conn *hub.Conn
 // export attempt could not be marked EXPORT_FAILED.
 var errExportClaimNotReleased = errors.New("the export claim of an unsent command could not be released")
 
-// failUnsentExport ends the export attempt commandID whose command send
-// failed before the command was queued. It runs the guarded update that sets
+type unsentExportReason string
+
+const (
+	exportClaimCommitFailed unsentExportReason = "claim_commit_failed"
+	exportSendFailed        unsentExportReason = "send_failed"
+)
+
+// failUnsentExport ends an attempt whose command was never queued, after
+// either a claim commit error or a command send failure. It sets
 // EXPORT_FAILED while the row still names the attempt and is EXPORTING, so a
 // concurrent retry that owns the row by now keeps its state; zero affected
 // rows (a newer attempt, a deleted or an already settled snapshot) count as
@@ -417,26 +424,23 @@ var errExportClaimNotReleased = errors.New("the export claim of an unsent comman
 // only while it is still the current channel of its device, so the state
 // report of the replacement channel fails the abandoned attempt (the
 // owner_channel_replaced rule of the reconciliation) and a replacement
-// channel that is already current is never closed. The caller keeps its
-// unavailable response either way.
-func (s *Service) failUnsentExport(ctx context.Context, conn *hub.Conn, snapshotID, commandID string, sendErr error) {
+// channel that is already current is never closed. The caller keeps the
+// original RPC error.
+func (s *Service) failUnsentExport(ctx context.Context, conn *hub.Conn, orgID, snapshotID, commandID string, reason unsentExportReason, cause slog.Attr) {
 	// Keep the context's values but not its cancellation.
 	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.exportFailTimeout())
 	defer cancel()
 	backoff := s.exportApplyRetryBackoff()
 	for attempt := 1; ; attempt++ {
-		// The export fail fault of the tests matches this query text; keep
-		// the predicate order when changing it.
-		tag, err := s.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET export_state = $3 WHERE snapshot_id = $1 AND export_command_id = $2 AND export_state = $4",
-			snapshotID, commandID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING))
+		applied, err := s.releaseUnsentExport(dbCtx, orgID, snapshotID, commandID, reason)
 		if err == nil {
 			s.Logger.WarnContext(dbCtx, "export_failed", slog.String("snapshot_id", snapshotID), slog.String("command_id", commandID), slog.String("channel_id", conn.ID),
-				slog.String("reason", "send_failed"), slog.Any("send_error", sendErr), slog.Bool("applied", tag.RowsAffected() > 0), slog.Int("attempts", attempt))
+				slog.String("reason", string(reason)), cause, slog.Bool("applied", applied), slog.Int("attempts", attempt))
 			return
 		}
 		if isTransientDBError(err) && dbCtx.Err() == nil {
 			s.Logger.WarnContext(dbCtx, "export_fail_transition_retry", slog.String("snapshot_id", snapshotID), slog.String("command_id", commandID),
-				slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", err))
+				slog.String("channel_id", conn.ID), slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", err))
 			timer := time.NewTimer(backoff)
 			select {
 			case <-timer.C:
@@ -450,13 +454,43 @@ func (s *Service) failUnsentExport(ctx context.Context, conn *hub.Conn, snapshot
 		}
 		channelClosed := s.Hub.Get(conn.DeviceID) == conn
 		s.Logger.ErrorContext(dbCtx, "export_fail_transition_failed", slog.String("snapshot_id", snapshotID), slog.String("command_id", commandID), slog.String("channel_id", conn.ID),
-			slog.String("reason", "send_failed"), slog.Any("send_error", sendErr), slog.Bool("applied", false), slog.Int("attempts", attempt),
+			slog.String("reason", string(reason)), cause, slog.Bool("applied", false), slog.Int("attempts", attempt),
 			slog.Bool("channel_closed", channelClosed), slog.Any("error", err))
 		if channelClosed {
 			conn.Close(errExportClaimNotReleased)
 		}
 		return
 	}
+}
+
+func (s *Service) releaseUnsentExport(ctx context.Context, orgID, snapshotID, commandID string, reason unsentExportReason) (bool, error) {
+	var applied bool
+	mark := func(q db.Querier) error {
+		// The export fail fault fixture matches this query's predicate.
+		tag, err := q.Exec(ctx, "UPDATE snapshots SET export_state = $3 WHERE snapshot_id = $1 AND export_command_id = $2 AND export_state = $4",
+			snapshotID, commandID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING))
+		applied = tag.RowsAffected() > 0
+		return err
+	}
+	if reason == exportSendFailed {
+		err := mark(s.DB.Pool)
+		return applied, err
+	}
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// Lock by identity first. An attempt predicate in the locking
+		// statement could miss the old row version without waiting for
+		// the original claim transaction to settle.
+		var exists int
+		err := tx.QueryRow(ctx, "SELECT 1 FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2 FOR UPDATE", orgID, snapshotID).Scan(&exists)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return mark(tx)
+	})
+	return applied, err
 }
 
 // failExportTx sets the EXPORTING snapshot snapshotID to EXPORT_FAILED and
@@ -726,7 +760,7 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 	}
 	var sn *snapshotRow
 	var conn *hub.Conn
-	start := false
+	claimed := false
 	// Every attempt has its own command ID, which the row stores with the
 	// ID of the channel that receives the command.
 	commandID := newID()
@@ -768,13 +802,18 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 		sn, err = scanSnapshot(tx.QueryRow(ctx, `UPDATE snapshots SET export_state = $2, export_part_size_bytes = $3, export_command_id = $4, export_channel_id = $5
 			WHERE snapshot_id = $1 RETURNING `+snapshotColumns,
 			sn.pb.GetSnapshotId(), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING), h.SnapshotPartSizeBytes, commandID, conn.ID))
-		start = err == nil
+		claimed = err == nil
 		return err
 	})
 	if err != nil {
+		if claimed {
+			// The UPDATE succeeded, but the commit may have lost its reply.
+			// Release the claim without dispatching the command.
+			h.failUnsentExport(ctx, conn, orgID, snapshotID, commandID, exportClaimCommitFailed, slog.Any("commit_error", err))
+		}
 		return nil, h.internal(ctx, "export snapshot", err)
 	}
-	if start {
+	if claimed {
 		h.Logger.InfoContext(ctx, "export_started", slog.String("snapshot_id", sn.pb.GetSnapshotId()), slog.String("command_id", commandID), slog.String("channel_id", conn.ID))
 		if _, err := h.sendCommand(ctx, conn, commandInfo{kind: cmdExportSnapshot, orgID: orgID, snapshotID: sn.pb.GetSnapshotId()},
 			&ownsandv1.AgentCommand{CommandId: commandID, Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{
@@ -783,7 +822,7 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 			// The send failed before the command was queued, often because
 			// the request context ended; the helper ends the attempt on a
 			// context that does not depend on it.
-			h.failUnsentExport(ctx, conn, sn.pb.GetSnapshotId(), commandID, err)
+			h.failUnsentExport(ctx, conn, orgID, snapshotID, commandID, exportSendFailed, slog.Any("send_error", err))
 			return nil, errUnavailable("the agent channel closed")
 		}
 	}

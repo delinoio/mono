@@ -30,8 +30,13 @@ type writeResultCall struct {
 	grant     string
 	stream    uint64
 	sandboxID string
+	writeID   string
 	// release makes the fake agent send the write result.
 	release chan struct{}
+	// The callback closes these channels when it receives the write chunk
+	// and when it exits through fixture cleanup, respectively.
+	callbackEntered chan struct{}
+	callbackStopped chan struct{}
 	// done receives the result of the call.
 	done   chan error
 	cancel context.CancelFunc
@@ -58,18 +63,30 @@ func startWriteCall(t *testing.T, deadline time.Duration, initialCredit int64, o
 	})
 	env := testenv.New(t, opts...)
 	org, agent, sandboxID := runningSandbox(t, env)
-	c := &writeResultCall{deadline: deadline, sandboxID: sandboxID, env: env, release: make(chan struct{}), done: make(chan error, 1), resp: make(chan *ownsandv1.WriteFileResponse, 1)}
+	writeID, _ := uuidv7.NewString()
+	c := &writeResultCall{
+		env: env, deadline: deadline, sandboxID: sandboxID, writeID: writeID,
+		release: make(chan struct{}), callbackEntered: make(chan struct{}), callbackStopped: make(chan struct{}),
+		done: make(chan error, 1), resp: make(chan *ownsandv1.WriteFileResponse, 1),
+	}
+	stop := make(chan struct{})
 	c.relay = agent.ConnectRelayWithWindow(initialCredit, func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
 		w := f.GetFileWriteChunk()
-		if w == nil {
+		if w == nil || w.GetWriteId() != writeID {
 			return
 		}
-		<-c.release
-		s.Send(&ownsandv1.WriteFileResponse{WriteId: w.GetWriteId(), Offset: w.GetOffset(), Length: int64(len(w.GetData()))})
+		close(c.callbackEntered)
+		select {
+		case <-stop:
+			close(c.callbackStopped)
+		case <-c.release:
+			s.Send(&ownsandv1.WriteFileResponse{WriteId: w.GetWriteId(), Offset: w.GetOffset(), Length: int64(len(w.GetData()))})
+		}
 	})
+	// This cleanup runs before the relay closes.
+	t.Cleanup(func() { close(stop) })
 	c.relay.WaitFrame("supported frame kinds", func(f *ownsandv1.DataFrame) bool { return f.GetSupportedFrameKinds() != nil })
 
-	writeID, _ := uuidv7.NewString()
 	salt, _ := relaybinding.NewSalt()
 	write := &ownsandv1.WriteFileRequest{OrganizationId: org.ID, SandboxId: sandboxID, WriteId: writeID, Path: "/tmp/x", BindingSalt: salt, Data: []byte("chunk")}
 	c.grant = authorize(t, org.OwnerClient, org.ID, sandboxID, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, writeID, relaybinding.WriteFileDigest(write))
@@ -201,6 +218,26 @@ func (c *writeResultCall) callFrames() (int, bool) {
 	return 0, false
 }
 
+func TestRelayWriteFileResultCallbackStopsOnCleanup(t *testing.T) {
+	var c *writeResultCall
+	if !t.Run("withheld result", func(t *testing.T) {
+		c = startWriteResultCall(t, 15*time.Second)
+		select {
+		case <-c.callbackEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the fake agent did not enter the write-result callback")
+		}
+	}) || c == nil {
+		return
+	}
+
+	select {
+	case <-c.callbackStopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture cleanup did not stop the callback while the result was withheld")
+	}
+}
+
 // TestRelayWriteFileResultCreditReturnHonorsDeadline checks that a credit
 // return that waits for room in a full outbound queue cannot hold a WriteFile
 // call beyond its request deadline: the call fails with deadline_exceeded at
@@ -266,7 +303,7 @@ func TestRelayWriteFileResultWithinBudget(t *testing.T) {
 		t.Fatalf("WriteFile = %v, want success", err)
 	}
 	resp := <-c.resp
-	if resp.GetLength() != int64(len("chunk")) || resp.GetOffset() != 0 {
+	if resp.GetWriteId() != c.writeID || resp.GetOffset() != 0 || resp.GetLength() != int64(len("chunk")) {
 		t.Fatalf("response = %v, want the agent's result for the 5 byte chunk", resp)
 	}
 	testenv.Eventually(t, "relay_rpc record of the call", func() bool { _, ok := c.callFrames(); return ok })
