@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -162,6 +163,8 @@ func (h *rotationHarness) eventKinds() []string {
 			kinds = append(kinds, "accepted")
 		case e.GetStdout() != nil:
 			kinds = append(kinds, "stdout")
+		case e.GetExited() != nil:
+			kinds = append(kinds, "exited")
 		case e.GetKeepalive() != nil:
 			kinds = append(kinds, "keepalive")
 		default:
@@ -325,4 +328,80 @@ func TestRotationWithLiveContextReturnsOK(t *testing.T) {
 		t.Errorf("forwarded %d frames and %d bytes, want none", h.call.frames, h.call.bytes)
 	}
 	h.waitClose()
+}
+
+// queuedReplyContext exposes the error after the response check for the
+// accepted event. This lets the test reach Next with the terminal reply queued.
+type queuedReplyContext struct {
+	context.Context
+	err    error
+	queued atomic.Bool
+	checks atomic.Uint32
+}
+
+func (c *queuedReplyContext) Err() error {
+	if c.queued.Load() && c.checks.Add(1) > 1 {
+		return c.err
+	}
+	return c.Context.Err()
+}
+
+func TestRotationInFutureWithQueuedTerminalReply(t *testing.T) {
+	timing := pastRotation
+	timing.Rotation = 2 * time.Hour // the harness sets Started one hour in the past
+	for _, tc := range []struct {
+		name       string
+		wantErr    error
+		wantCode   string
+		wantEvents []string
+	}{
+		{
+			name:       "canceled",
+			wantErr:    context.Canceled,
+			wantCode:   "canceled",
+			wantEvents: []string{"accepted"},
+		},
+		{
+			name:       "deadline exceeded",
+			wantErr:    context.DeadlineExceeded,
+			wantCode:   "deadline_exceeded",
+			wantEvents: []string{"accepted"},
+		},
+		{
+			name:       "live",
+			wantCode:   "ok",
+			wantEvents: []string{"accepted", "exited"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRotationHarness(t, timing)
+			h.feed(&ownsandv1.RequestAccepted{})
+			ctx := &queuedReplyContext{Context: context.Background(), err: tc.wantErr}
+			exited := &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{
+				Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0},
+			}}}
+			err := h.serve(ctx, func() {
+				h.feed(exited)
+				ctx.queued.Store(tc.wantErr != nil)
+			})
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("serveStream = %v, want %v", err, tc.wantErr)
+			}
+			if got := h.logCode(); got != tc.wantCode {
+				t.Errorf("logged code = %q, want %q", got, tc.wantCode)
+			}
+			if got := h.eventKinds(); !slices.Equal(got, tc.wantEvents) {
+				t.Errorf("events = %v, want %v", got, tc.wantEvents)
+			}
+			wantFrames, wantBytes := 0, int64(0)
+			if tc.wantErr == nil {
+				wantFrames = 1
+				wantBytes = datapath.FrameCost(datapath.MustNewFrame(h.call.stream.ID, "sandbox", exited))
+			}
+			if h.call.frames != wantFrames || h.call.bytes != wantBytes {
+				t.Errorf("forwarded %d frames and %d bytes, want %d frames and %d bytes", h.call.frames, h.call.bytes, wantFrames, wantBytes)
+			}
+			h.waitClose()
+		})
+	}
 }

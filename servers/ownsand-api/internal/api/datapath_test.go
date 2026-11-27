@@ -631,8 +631,58 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	}
 }
 
+func TestAuthorizeRelayRequestBindingAfterAdmissionExpiry(t *testing.T) {
+	env := testenv.New(t, func(o *app.Options) {
+		// Keep the device online when the test advances the grant clock.
+		o.Timing.OfflineSweep = time.Hour
+	})
+	org, agent, sandboxID := runningSandbox(t, env)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	exec := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	request := &ownsandv1.AuthorizeRelayRequest{
+		OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: exec.GetExecId(), RequestDigest: relaybinding.ExecDigest(exec), AuthorizationId: authID,
+	}
+	first, err := org.OwnerClient.DataPath.AuthorizeRelay(ctx, connect.NewRequest(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID := first.Msg.GetGrantId()
+	env.Clock.Advance(grants.Lifetime + grants.AdmissionTolerance)
+	registry := env.App.Plane.Grants
+	original := registry.Get(firstID)
+	if original == nil || registry.Admittable(firstID) != nil {
+		t.Fatal("expected the original grant to be retained past admission expiry")
+	}
+
+	conflict := proto.Clone(request).(*ownsandv1.AuthorizeRelayRequest)
+	conflict.RequestDigest[0] ^= 1
+	if _, err := org.OwnerClient.DataPath.AuthorizeRelay(ctx, connect.NewRequest(conflict)); testenv.Code(err) != connect.CodeInvalidArgument {
+		t.Fatalf("conflict after admission expiry: %v", err)
+	}
+	if registry.Get(firstID) != original || registry.Len() != 1 {
+		t.Fatal("conflict changed the original registration")
+	}
+
+	retry, err := org.OwnerClient.DataPath.AuthorizeRelay(ctx, connect.NewRequest(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryID := retry.Msg.GetGrantId()
+	if retryID == firstID || registry.Admittable(retryID) == nil {
+		t.Fatal("identical retry did not install a fresh grant")
+	}
+	if got := grantsReceived(agent); len(got) != 2 || got[0] != firstID || got[1] != retryID {
+		t.Fatalf("agent received %v, want only the initial and identical-retry grants", got)
+	}
+	t.Log("Connect rejected the conflicting retry with invalid_argument and the agent acknowledged a fresh grant for the identical retry")
+}
+
 // TestAuthorizeRelayChannelLostWhilePending verifies that closing the agent
-// channel removes the pending grant and ends the RPC wait.
+// channel removes its pending grant and ends the RPC with unavailable and
+// no retry delay.
 func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 	env := testenv.New(t, func(o *app.Options) {
 		// Give grant delivery, channel shutdown, and the RPC response time

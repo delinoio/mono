@@ -149,6 +149,71 @@ func TestDeleteSnapshotBeforeCaptureAbortsCreate(t *testing.T) {
 	}
 }
 
+func TestDeleteSnapshotDuringRuntimeError(t *testing.T) {
+	for _, scenario := range []string{"cleanup succeeds", "cleanup retries"} {
+		t.Run(scenario, func(t *testing.T) {
+			e := newEnv(t)
+			sandboxID := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+			snapID, _ := uuidv7.NewString()
+			e.rt.snapStarted = make(chan struct{})
+			e.rt.snapBlock = make(chan struct{})
+			e.rt.snapshotErr = errors.New("injected snapshot runtime error")
+			e.rt.snapshotSourceState = ownsandv1.SandboxState_SANDBOX_STATE_PAUSED
+			if scenario == "cleanup retries" {
+				e.m.SetSnapshotRemovalHookForTest(func(string) error {
+					return errors.New("injected snapshot removal error")
+				})
+			}
+
+			release := sync.OnceFunc(func() { close(e.rt.snapBlock) })
+			defer release()
+			done := make(chan claimedCreateResult, 1)
+			go func() {
+				entry, err := e.m.CreateSnapshot(t.Context(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID})
+				done <- claimedCreateResult{entry, err}
+			}()
+			select {
+			case <-e.rt.snapStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("snapshot did not enter the runtime")
+			}
+			deleteCmd := &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}
+			if err := e.m.DeleteSnapshot(deleteCmd); err != nil {
+				t.Fatalf("delete during capture: %v", err)
+			}
+			release()
+			select {
+			case res := <-done:
+				requireErrCode(t, res.err, ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "capture after delete")
+				if res.entry != nil {
+					t.Fatalf("capture returned a snapshot: %v", res.entry)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("snapshot did not return after the runtime error")
+			}
+			if got, _ := e.m.State(sandboxID); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+				t.Errorf("source state = %s, want PAUSED", got)
+			}
+
+			if scenario == "cleanup retries" {
+				snaps := e.m.StateReport(2, nil).GetSnapshots()
+				if len(snaps) != 1 || snaps[0].GetSnapshotId() != snapID || snaps[0].GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_DELETING {
+					t.Fatalf("snapshot report = %v, want the DELETING snapshot", snaps)
+				}
+				if _, release, ok := e.m.AcquireSnapshot(snapID); ok {
+					release()
+					t.Fatal("capture was available to a reader")
+				}
+				e.m.SetSnapshotRemovalHookForTest(nil)
+				if err := e.m.DeleteSnapshot(deleteCmd); err != nil {
+					t.Fatalf("delete retry: %v", err)
+				}
+			}
+			requireNoSnapshotTrace(t, e, snapID)
+		})
+	}
+}
+
 // TestDeleteCancelsEveryReceivedCreateOfTheSnapshot checks that two create
 // commands of one snapshot, which wait for the sandbox lock, are both
 // canceled by a delete that arrived after both.

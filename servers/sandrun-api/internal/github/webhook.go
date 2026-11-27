@@ -27,6 +27,9 @@ import (
 // maxDeliveryIDLength bounds X-GitHub-Delivery (a GUID).
 const maxDeliveryIDLength = 100
 
+// installationStateTimeout leaves time for the database work within GitHub's 10-second delivery limit.
+const installationStateTimeout = 3 * time.Second
+
 // renameCleanupTimeout bounds the renamed-runner cleanup after a queued event.
 const renameCleanupTimeout = 2 * time.Minute
 
@@ -677,23 +680,39 @@ func (l *Layer) installationEvent(ctx context.Context, tx pgx.Tx, body []byte, o
 		state = sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_DELETED
 	case "suspend":
 		state = sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED
+		if inst.State == state {
+			return o.ignore("installation already suspended")
+		}
 	case "unsuspend":
 		if inst.State != sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED {
 			return o.ignore("installation not suspended")
 		}
-		if _, err := tx.Exec(ctx, "UPDATE github_installations SET state = $2, update_time = $3 WHERE installation_id = $1",
-			inst.ID, int16(sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_ACTIVE), now); err != nil {
-			return err
-		}
-		return nil
+		state = sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_ACTIVE
 	default:
 		return o.ignore("action not handled")
 	}
 	if inst.State == sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_DELETED {
 		return o.ignore("installation already deleted")
 	}
+	if state != sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_DELETED {
+		// A redelivery can arrive after a newer suspension change. Read GitHub
+		// under the installation lock so concurrent deliveries cannot apply
+		// earlier state checks after later ones.
+		lookupCtx, cancel := context.WithTimeout(ctx, installationStateTimeout)
+		suspended, err := l.gh.InstallationSuspended(lookupCtx, inst.GitHubID)
+		cancel()
+		if err != nil {
+			return err
+		}
+		if suspended != (state == sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED) {
+			return o.ignore("suspension action disagrees with GitHub state")
+		}
+	}
 	if _, err := tx.Exec(ctx, "UPDATE github_installations SET state = $2, update_time = $3 WHERE installation_id = $1", inst.ID, int16(state), now); err != nil {
 		return err
+	}
+	if state == sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_ACTIVE {
+		return nil
 	}
 	// GitHub no longer gives the app tokens for the installation, so the
 	// registrations of the deleted runners cannot be removed; GitHub removes

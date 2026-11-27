@@ -207,15 +207,29 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 		m.mu.Unlock()
 		return nil, m.abortedSnapshotError(id)
 	}
-	sb, ok := m.sandboxes[cmd.GetSandboxId()]
-	m.mu.Unlock()
-	if !ok {
+	sandboxID := cmd.GetSandboxId()
+	sb := m.sandboxes[sandboxID]
+	if sb == nil {
+		removing := m.removing
+		m.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return nil, m.canceledSnapshotError(id, err)
+		}
+		if removing {
+			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "device removal is in progress")
+		}
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "sandbox is unknown on this device")
+	}
+	m.mu.Unlock()
+	m.hookMu.Lock()
+	afterLookup := m.afterSnapshotLookup
+	m.hookMu.Unlock()
+	if afterLookup != nil {
+		afterLookup(id)
 	}
 	sb.cmdMu.Lock()
 	defer sb.cmdMu.Unlock()
 	m.mu.Lock()
-	state, vm, rec := sb.rec.State, sb.vm, sb.rec
 	// A duplicate create that waited for the sandbox lock finds the
 	// snapshot that the first create published. A canceled claim can still
 	// see the old entry marked for deletion. It cannot return a ready copy
@@ -234,22 +248,11 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	if deleted {
 		return nil, m.abortedSnapshotError(id)
 	}
-	if state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
-		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is %s", state)
-	}
-	if vm == nil {
-		// A record kept live for a pending restart cleanup has no VM.
-		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox VM is not available")
-	}
-	dir, err := m.st.SnapshotDir(id)
-	if err != nil {
-		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
-	}
 	if m.beforeSnapshotCapture != nil {
 		m.beforeSnapshotCapture()
 	}
-	// Check for deletion under the same lock that marks the capture as
-	// started. A delete that wins this lock prevents any directory changes.
+	// Check cancellation, deletion and device removal before admitting a
+	// fresh capture. Removal waits for sb.cmdMu through capture cleanup.
 	m.mu.Lock()
 	if claim.deleted {
 		m.mu.Unlock()
@@ -259,6 +262,28 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 		entry, err := existingSnapshotEntry(snap)
 		m.mu.Unlock()
 		return entry, err
+	}
+	if err := ctx.Err(); err != nil {
+		m.mu.Unlock()
+		return nil, m.canceledSnapshotError(id, err)
+	}
+	if m.removing {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "device removal is in progress")
+	}
+	if m.sandboxes[sandboxID] != sb || sb.ending {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is no longer available")
+	}
+	state, vm, rec := sb.rec.State, sb.vm, sb.rec
+	if state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is %s", state)
+	}
+	if vm == nil {
+		// A record kept live for a pending restart cleanup has no VM.
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox VM is not available")
 	}
 	pending := m.pending[id]
 	if pending == nil || pending.capturing {
@@ -274,23 +299,31 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 		pending.capturing = false
 		m.mu.Unlock()
 	}()
+	dir, err := m.st.SnapshotDir(id)
+	if err != nil {
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
+	}
 	if err := removeDirIfExists(dir); err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot directory could not be prepared")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot directory could not be created")
 	}
-	m.logger.Info("snapshot creating", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId())
+	m.logger.Info("snapshot creating", "snapshot_id", id, "sandbox_id", sandboxID)
 	info, err := m.rt.Snapshot(ctx, vm, filepath.Join(dir, contentDir))
 	if err != nil {
 		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && info.SourceState == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 			m.recordSourcePausedAfterSnapshot(sb)
 		}
+		if m.snapshotDeletedDuringCreate(claim) {
+			m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", sandboxID, "error", err)
+			return nil, m.abortSnapshotCreate(id)
+		}
 		if ctx.Err() != nil {
 			return nil, m.abortCanceledSnapshotCreate(id, dir, err)
 		}
 		fsutil.RemoveAll(dir)
-		m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId(), "error", err)
+		m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", sandboxID, "error", err)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be taken")
 	}
 	// A runtime can return success after ctx ended, for example when it
@@ -469,12 +502,19 @@ func (m *Manager) snapshotReleaser(snap *snapshot) func() {
 // of a stored snapshot copy deletes anything. The hook may block to hold the
 // removal at that point; a non-nil error fails the removal as a failed
 // deletion of the directory would, and leaves the copy untouched. Pass nil to
-// remove the hook. Only tests of other packages call it, because they cannot
-// reach the unexported test hooks of Manager.
+// remove the hook.
 func (m *Manager) SetSnapshotRemovalHookForTest(hook func(id string) error) {
 	m.hookMu.Lock()
 	defer m.hookMu.Unlock()
 	m.removalHook = hook
+}
+
+// SetSnapshotLookupHookForTest installs a hook that runs after the source
+// lookup and before the snapshot command locks the sandbox.
+func (m *Manager) SetSnapshotLookupHookForTest(hook func(id string)) {
+	m.hookMu.Lock()
+	defer m.hookMu.Unlock()
+	m.afterSnapshotLookup = hook
 }
 
 // SetSnapshotPublishHookForTest installs a hook that runs after staging a
