@@ -407,7 +407,11 @@ if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" != arm64 ]; then exit 15; fi
 if command -v devin >/dev/null 2>&1; then exit 0; fi
 command -v curl >/dev/null 2>&1 || exit 10
 command -v bash >/dev/null 2>&1 || exit 11
-curl -fsSL https://cli.devin.ai/install.sh | bash || exit 12
+# Check the download before Bash can execute any part of it.
+tmp=$(mktemp) || exit 12
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL https://cli.devin.ai/install.sh -o "$tmp" || exit 12
+bash "$tmp" || exit 12
 command -v devin >/dev/null 2>&1 || exit 13
 `
 }

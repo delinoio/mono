@@ -660,6 +660,20 @@ func rejected(err error, code connect.Code) bool {
 func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
 	var ended *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if noDevice && r.RequestID == "" && r.sponsorRequestID != "" {
+			// Profile deletion locks queued requests before runners. Hold the
+			// profile lock before taking those same locks in the reverse order.
+			err := api.LockOrganizationShare(ctx, tx, r.OrganizationID)
+			if err == nil {
+				err = profile.LockShare(ctx, tx, r.OrganizationID, r.ProfileID)
+			}
+			if isCode(err, connect.CodeNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		}
 		cur, err := e.lockRunner(ctx, tx, r.ID)
 		if err != nil || cur.State != runCreating {
 			return err

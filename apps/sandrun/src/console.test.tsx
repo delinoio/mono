@@ -81,6 +81,7 @@ import {
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
 import { QueryClient } from "@tanstack/react-query";
+import { toast } from "delino-ui/toast";
 import { StrictMode } from "react";
 import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
@@ -193,8 +194,7 @@ function failingTransport(
   };
 }
 
-function gatedTransport(methodName: string) {
-  const mock = createMockTransport();
+function gatedTransport(methodName: string, mock = createMockTransport()) {
   const calls: {
     input: unknown;
     settle(error?: ConnectError): void;
@@ -979,6 +979,166 @@ describe("organization member pagination", () => {
     expect(lists).toHaveLength(3);
   });
 }, 20_000);
+
+describe("direct action failures", () => {
+  const membersPath = `/orgs/${MOCK_IDS.acme}/members`;
+  const integrationsPath = `/orgs/${MOCK_IDS.acme}/integrations`;
+  const sessionEnded = "Your session ended. Sign in again.";
+  const signInButton = { name: "Sign in with Delino" };
+  const actions = [
+    {
+      method: "UpdateMemberRole",
+      path: membersPath,
+      list: "Members",
+      async run() {
+        await click(
+          await screen.findByRole("combobox", { name: "Role of Ada Park" }),
+        );
+        await click(await screen.findByRole("option", { name: "Member" }));
+      },
+    },
+    {
+      method: "RevokeInvitation",
+      path: membersPath,
+      list: "Pending invitations",
+      async run() {
+        await click(await screen.findByRole("button", { name: "Revoke" }));
+      },
+    },
+    {
+      method: "CreateGitHubInstallUrl",
+      path: integrationsPath,
+      list: "GitHub installations",
+      async run() {
+        await click(
+          await screen.findByRole("button", { name: "Connect GitHub" }),
+        );
+      },
+    },
+  ];
+
+  async function mockForAction(method: string) {
+    const mock = createMockTransport({
+      failFirstAcmeMemberContinuation: false,
+    });
+    if (method === "RevokeInvitation") {
+      await createClient(MemberService, mock).createInvitation({
+        organizationId: MOCK_IDS.acme,
+        role: Role.MEMBER,
+      });
+    }
+    return mock;
+  }
+
+  test.each(actions)(
+    "offers sign-in after $method rejects the session",
+    async ({ method, path, list, run }) => {
+      const signIn = rs.fn(async () => {});
+      const { transport, calls } = gatedTransport(
+        method,
+        await mockForAction(method),
+      );
+      renderConsole(path, { signIn, transport });
+      const originalList = await screen.findByRole("list", { name: list });
+
+      await run();
+      expect(calls).toHaveLength(1);
+      await act(async () => {
+        calls[0].settle(
+          new ConnectError("Request failed", Code.Unauthenticated),
+        );
+      });
+
+      const notice = await screen.findByText(sessionEnded, {
+        selector: '[role="alert"]',
+      });
+      const signInAction = within(notice.parentElement!).getByRole(
+        "button",
+        signInButton,
+      );
+      expect(within(notice.parentElement!).getAllByRole("button")).toEqual([
+        signInAction,
+      ]);
+      expect(screen.getByRole("list", { name: list })).toBe(originalList);
+      expect(
+        screen.getByRole("combobox", { name: "Organization" }).textContent,
+      ).toContain("Acme Robotics");
+      expect(window.location.pathname).toBe(path);
+      expect(signIn).not.toHaveBeenCalled();
+
+      await click(signInAction);
+      expect(signIn).toHaveBeenCalledTimes(1);
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  test.each(actions)(
+    "keeps the permission toast for $method",
+    async ({ method, path, list, run }) => {
+      const mock = await mockForAction(method);
+      renderConsole(path, {
+        transport: failingTransport(method, Code.PermissionDenied, mock),
+      });
+      const originalList = await screen.findByRole("list", { name: list });
+      const notify = rs.spyOn(toast, "error").mockReturnValue("fixture-toast");
+
+      try {
+        await run();
+        await waitFor(() => {
+          expect(notify).toHaveBeenCalledExactlyOnceWith(
+            "You do not have permission to do this.",
+          );
+        });
+        expect(screen.queryByText(sessionEnded)).toBeNull();
+        expect(screen.queryByRole("button", signInButton)).toBeNull();
+        expect(screen.getByRole("list", { name: list })).toBe(originalList);
+      } finally {
+        notify.mockRestore();
+      }
+    },
+  );
+
+  test("discards a delayed role change failure after switching organizations", async () => {
+    const { transport, calls } = gatedTransport("UpdateMemberRole");
+    const client = renderConsole(membersPath, { transport });
+    await actions[0].run();
+    expect(calls).toHaveLength(1);
+
+    await click(screen.getByRole("combobox", { name: "Organization" }));
+    await click(await screen.findByRole("option", { name: "Globex" }));
+    const nextPath = `/orgs/${MOCK_IDS.globex}/members`;
+    expect(window.location.pathname).toBe(nextPath);
+    await act(async () => {
+      calls[0].settle(new ConnectError("Request failed", Code.Unauthenticated));
+    });
+    await waitFor(() => {
+      expect(client.getMutationCache().getAll()[0]?.state.status).toBe("error");
+    });
+
+    expect(screen.queryByText(sessionEnded)).toBeNull();
+    expect(screen.queryByRole("button", signInButton)).toBeNull();
+  });
+
+  test("clears an existing notice when leaving and returning in one render", async () => {
+    renderConsole(integrationsPath, {
+      transport: failingTransport(
+        "CreateGitHubInstallUrl",
+        Code.Unauthenticated,
+      ),
+    });
+    await actions[2].run();
+    expect(await screen.findByRole("button", signInButton)).toBeTruthy();
+
+    act(() => {
+      fireEvent.click(screen.getByRole("link", { name: "Members" }));
+      fireEvent.click(screen.getByRole("link", { name: "Integrations" }));
+    });
+
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(screen.queryByText(sessionEnded)).toBeNull();
+    expect(screen.queryByRole("button", signInButton)).toBeNull();
+  });
+});
 
 describe("failed requests", () => {
   test.each([

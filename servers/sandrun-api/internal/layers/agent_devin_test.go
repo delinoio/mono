@@ -129,7 +129,7 @@ func TestDevinSessionLifecycle(t *testing.T) {
 	if strings.Contains(all, devinAPIToken) || strings.Contains(all, devinOutpostToken) {
 		t.Fatal("an exec command or environment carries a Devin credential")
 	}
-	if !strings.Contains(all, "curl -fsSL https://cli.devin.ai/install.sh | bash") {
+	if !strings.Contains(all, "https://cli.devin.ai/install.sh") {
 		t.Fatal("no install script")
 	}
 	w.devin.SetSessionStatus("ses-1", "running")
@@ -614,6 +614,37 @@ func TestDevinWatchReconnect(t *testing.T) {
 	}
 }
 
+func TestDevinWatchDefaultPagination(t *testing.T) {
+	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+	sessionIDs := []string{"ses-1", "ses-2"}
+	for _, sid := range sessionIDs {
+		fake.AddSession(sid, false)
+	}
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake)
+	eventually(t, "the Devin watch after the default pages", func() bool {
+		return fake.Streams() == 1 || fake.Lists() > len(sessionIDs)
+	})
+	if got := fake.ClaimAttempts(); !slices.Equal(got, sessionIDs) {
+		t.Fatalf("claim attempts = %q, want %q", got, sessionIDs)
+	}
+	if got := fake.Lists(); got != 2 {
+		t.Fatalf("list requests = %d, want 2", got)
+	}
+	if got := fake.WatchCursors(); !slices.Equal(got, []string{"page-2"}) {
+		t.Fatalf("watch cursors = %q, want [page-2]", got)
+	}
+	var sources []string
+	for _, req := range w.requests(t) {
+		sources = append(sources, req.GetSourceKey())
+	}
+	slices.Sort(sources)
+	if !slices.Equal(sources, sessionIDs) {
+		t.Fatalf("persisted request sources at watch startup = %q, want %q", sources, sessionIDs)
+	}
+	t.Logf("SandRun listed %d pages, claimed %q, persisted requests for %q and opened a watch at %q",
+		fake.Lists(), fake.ClaimAttempts(), sources, fake.WatchCursors())
+}
+
 func TestDevinWatchPagination(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -701,7 +732,7 @@ func TestDevinInstallScripts(t *testing.T) {
 		}
 	}
 	mac := devin.InstallScript(sandrunv1.GuestOs_GUEST_OS_MACOS)
-	for _, want := range []string{"curl -fsSL https://cli.devin.ai/install.sh | bash", `"$(uname -m)" != arm64`, "command -v git"} {
+	for _, want := range []string{`"$(uname -m)" != arm64`, "command -v git"} {
 		if !strings.Contains(mac, want) {
 			t.Fatalf("posix script lacks %q", want)
 		}

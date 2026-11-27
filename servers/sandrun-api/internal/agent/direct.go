@@ -83,6 +83,13 @@ type DirectDemand struct {
 // request. It fails with ErrNoProfile when no profile names the
 // integration. The caller calls Service.WorkChanged after the commit.
 func (h *Hub) CreateDirectTx(ctx context.Context, tx pgx.Tx, v Vendor, in integration.Integration, d DirectDemand) (*work.Request, bool, error) {
+	// Serialize the claim lookup and source-key selection for one demand.
+	// The lock ends with the caller's transaction, after any Store callback.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(
+		hashtextextended('sandrun.direct-demand:' || $1::uuid::text || ':' || $2::smallint::text || ':' || $3::text, 0))`,
+		in.OrganizationID, int16(in.Vendor), d.VendorRequestID); err != nil {
+		return nil, false, err
+	}
 	c, req, err := h.latestClaim(ctx, tx, in.OrganizationID, in.Vendor, d.VendorRequestID)
 	if err != nil {
 		return nil, false, err

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -112,29 +113,35 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, page)
 			return
 		}
-		var items []any
-		for _, id := range f.order {
+		// Use positions in the insertion order so claims and deletions do not shift the cursor.
+		start := 0
+		if c, ok := strings.CutPrefix(q.Get("cursor"), "page-"); ok {
+			if position, err := strconv.Atoi(c); err == nil {
+				start = max(position, 0)
+			}
+		}
+		phase := q.Get("phase")
+		cursor := start
+		total, remaining := 0, 0
+		var page []any
+		for i, id := range f.order {
 			e := f.entries[id]
-			if e == nil {
+			if e == nil || (phase != "" && phase != e.Phase) {
 				continue
 			}
-			if q.Get("phase") == "" || q.Get("phase") == e.Phase {
-				items = append(items, e.object(f.OutpostID))
+			total++
+			if i < start {
+				continue
 			}
+			// Return one item per page so SandRun follows the cursor.
+			if remaining == 0 {
+				page = []any{e.object(f.OutpostID)}
+				cursor = i + 1
+			}
+			remaining++
 		}
 		f.mu.Unlock()
-		// One item per page, so SandRun follows the cursor.
-		page, rest := items, []any(nil)
-		start := 0
-		if c := q.Get("cursor"); strings.HasPrefix(c, "page-") {
-			fmt.Sscanf(c, "page-%d", &start)
-		}
-		if start < len(items) {
-			page, rest = items[start:start+1], items[start+1:]
-		} else {
-			page = nil
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": page, "has_next_page": len(rest) > 0, "cursor": fmt.Sprintf("page-%d", start+1), "total": len(items)})
+		writeJSON(w, http.StatusOK, map[string]any{"items": page, "has_next_page": remaining > 1, "cursor": fmt.Sprintf("page-%d", cursor), "total": total})
 	case strings.HasPrefix(path, "/opbeta/outposts/devins/"):
 		rest := strings.TrimPrefix(path, "/opbeta/outposts/devins/")
 		sid, action, _ := strings.Cut(rest, "/")
