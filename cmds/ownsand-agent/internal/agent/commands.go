@@ -94,31 +94,29 @@ func errorDetail(err error) *ownsandv1.ErrorDetail {
 // order is the update order that dispatch took when it received an update or
 // withdrawal command; it is zero for every other command.
 func (a *Agent) handleCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64) {
-	a.handleClaimedCommand(chanCtx, agentCtx, cmd, order, nil)
+	a.handleReceivedCommand(chanCtx, agentCtx, cmd, order, a.receiveCommand(cmd))
 }
 
-// claimSnapshotCreate registers the receipt of a create_snapshot command in
-// receive order, before its goroutine starts, so that a delete_snapshot
-// command received right after it cancels the create even when the delete
-// goroutine runs first. It returns nil for every other command.
-func (a *Agent) claimSnapshotCreate(cmd *ownsandv1.AgentCommand) *sandboxes.SnapshotCreateClaim {
-	c, ok := cmd.GetCommand().(*ownsandv1.AgentCommand_CreateSnapshot)
-	if !ok {
-		return nil
-	}
-	return a.Sandboxes.ClaimSnapshotCreate(c.CreateSnapshot.GetSnapshotId())
+type commandReceipt struct {
+	snapshotCreate *sandboxes.SnapshotCreateClaim
+	snapshotDelete func() error
 }
 
-// handleClaimedCommand is handleCommand for a command that dispatch already
-// registered: claim is the claim of a create_snapshot command, which this
-// function releases when the command ended. A create_snapshot command without
-// a claim takes its own.
-func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64, claim *sandboxes.SnapshotCreateClaim) {
-	if claim == nil {
-		claim = a.claimSnapshotCreate(cmd)
+// receiveCommand registers snapshot commands before their workers start.
+func (a *Agent) receiveCommand(cmd *ownsandv1.AgentCommand) commandReceipt {
+	switch c := cmd.GetCommand().(type) {
+	case *ownsandv1.AgentCommand_CreateSnapshot:
+		return commandReceipt{snapshotCreate: a.Sandboxes.ClaimSnapshotCreate(c.CreateSnapshot.GetSnapshotId())}
+	case *ownsandv1.AgentCommand_DeleteSnapshot:
+		return commandReceipt{snapshotDelete: a.Sandboxes.ReceiveSnapshotDelete(c.DeleteSnapshot)}
+	default:
+		return commandReceipt{}
 	}
-	if claim != nil {
-		defer claim.Release()
+}
+
+func (a *Agent) handleReceivedCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64, receipt commandReceipt) {
+	if receipt.snapshotCreate != nil {
+		defer receipt.snapshotCreate.Release()
 	}
 	kind := commandKind(cmd)
 	logger := a.logger.With("command_id", cmd.GetCommandId(), "command", kind)
@@ -146,7 +144,7 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 		setSandboxResult(res, e)
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
-		e, err = a.Sandboxes.CreateClaimedSnapshot(chanCtx, c.CreateSnapshot, claim)
+		e, err = a.Sandboxes.CreateClaimedSnapshot(chanCtx, c.CreateSnapshot, receipt.snapshotCreate)
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotResult{Snapshot: e}}
 		}
@@ -173,7 +171,7 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 	case *ownsandv1.AgentCommand_WithdrawAgentUpdate:
 		err = updateCommandError(a.updater.WithdrawOrdered(order))
 	case *ownsandv1.AgentCommand_DeleteSnapshot:
-		err = a.Sandboxes.DeleteSnapshot(c.DeleteSnapshot)
+		err = receipt.snapshotDelete()
 	default:
 		err = &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown command"}
 	}
