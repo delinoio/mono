@@ -267,11 +267,23 @@ func (a *app) printTable(w io.Writer, headers []string, rows [][]string) error {
 	return tw.Flush()
 }
 
-// printList prints a list: JSON as the whole message m (a list response
-// that holds every item), text as a table.
+// printList prints the whole list response as one JSON object or a text table.
 func (a *app) printList(m proto.Message, headers []string, rows [][]string) error {
 	if a.fmt == FormatJSON {
-		return a.printMessage(m)
+		value, err := protoValue(m)
+		if err != nil {
+			return err
+		}
+		// Protobuf JSON omits empty lists. Restore the top-level arrays only.
+		message := m.ProtoReflect()
+		fields := message.Descriptor().Fields()
+		for i := range fields.Len() {
+			field := fields.Get(i)
+			if field.IsList() && !message.Has(field) {
+				value[string(field.Name())] = []any{}
+			}
+		}
+		return writeJSON(a.env.Stdout, value)
 	}
 	if a.color {
 		for i := range headers {
