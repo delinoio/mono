@@ -1044,9 +1044,24 @@ describe("integrations", () => {
     const setupHistoryLength = await browser.evaluate(
       () => window.history.length,
     );
-    await screen.getByRole("combobox", "SandRun organization").tap();
+    const picker = screen.getByRole("combobox", "SandRun organization");
+    const submit = screen.getByRole("button", "Link installation");
+    await expect(submit).toBeDisabled();
+    await browser.evaluate(() => {
+      const form = document.querySelector("main form");
+      if (!(form instanceof HTMLFormElement)) {
+        throw new Error("Expected the GitHub setup form");
+      }
+      form.requestSubmit();
+      return null;
+    });
+    await expect(picker).toBeVisible();
+    await expect(browser).toHaveURL("/github/setup");
+
+    await picker.tap();
     await screen.getByRole("option", "Globex (admin)").tap();
-    await screen.getByRole("button", "Link installation").tap();
+    await expect(submit).toBeEnabled();
+    await submit.tap();
 
     await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
     expect(await browser.evaluate(() => window.history.length)).toBe(
