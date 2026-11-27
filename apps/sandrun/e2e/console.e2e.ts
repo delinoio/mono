@@ -834,6 +834,14 @@ describe("integrations", () => {
     const row = screen.getByRole("listitem").filter({ hasText: updatedName });
     await expect(row).toContainText("Cursor self-hosted pool name: pool-after");
     await expect(row).toContainText("Service account API key: Set at");
+
+    // Globex starts with no integrations, so this event belongs to the one created here.
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(browser).toHaveURL(`/orgs/${GLOBEX}/audit`);
+    const audit = screen.getByRole("table", "Audit events");
+    await expect(
+      audit.getByRole("cell", "Agent integration credentials replaced"),
+    ).toBeVisible();
   });
 
   test("links OwnSand and shows only when the key was set", async ({
