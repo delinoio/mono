@@ -18,17 +18,11 @@ func holdAccountRow(t *testing.T, env *testenv.Env, accountID string) (release f
 	if err != nil {
 		t.Fatal(err)
 	}
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			_ = tx.Rollback(ctx())
-		}
-	})
+	t.Cleanup(func() { rollbackLockHolder(t, tx) })
 	if _, err := tx.Exec(ctx(), `SELECT 1 FROM billing_accounts WHERE billing_account_id = $1 FOR UPDATE`, accountID); err != nil {
 		t.Fatal(err)
 	}
 	return func() {
-		released = true
 		if err := tx.Commit(ctx()); err != nil {
 			t.Fatal(err)
 		}
@@ -39,21 +33,8 @@ func holdAccountRow(t *testing.T, env *testenv.Env, accountID string) (release f
 // wait for a row lock.
 func waitRowLockWaiters(t *testing.T, env *testenv.Env, n int) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		var waiting int
-		if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple')`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting == n {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d sessions wait for a row lock, want %d", waiting, n)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForLockWaiterCount(t, env.DB.Pool, "row lock", n, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple')`)
 }
 
 // linkedThenUnlinked links the organization to the billing account, moves

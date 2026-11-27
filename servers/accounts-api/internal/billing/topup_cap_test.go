@@ -64,27 +64,7 @@ func (f *fixture) claimAfterMonthRollover(acct, lockQuery string) {
 	done := make(chan error, 1)
 	go func() { done <- f.s.ProcessAutoTopUps(ctx) }()
 
-	// Advance the clock only after Postgres confirms the claim is blocked.
-	poll := time.NewTicker(10 * time.Millisecond)
-	defer poll.Stop()
-	for {
-		var waiting bool
-		if err := f.db.Pool.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
-				AND $1 = ANY(pg_blocking_pids(pid)))`, holderPID).Scan(&waiting); err != nil {
-			f.t.Fatalf("observe the claim lock wait: %v", err)
-		}
-		if waiting {
-			break
-		}
-		select {
-		case err := <-done:
-			f.t.Fatalf("claim finished before waiting on the row lock: %v", err)
-		case <-ctx.Done():
-			f.t.Fatal("claim did not wait on the row lock")
-		case <-poll.C:
-		}
-	}
+	waitForClaimLock(f.t, ctx, f, holderPID, done)
 
 	f.clock.Set(afterMonthEnd)
 	if err := tx.Commit(ctx); err != nil {
@@ -98,6 +78,31 @@ func (f *fixture) claimAfterMonthRollover(acct, lockQuery string) {
 	case <-ctx.Done():
 		f.t.Fatal("claim did not finish after releasing the row lock")
 	}
+}
+
+func waitForClaimLock(t *testing.T, ctx context.Context, f *fixture, holderPID int, done <-chan error) {
+	t.Helper()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		var waiting bool
+		if err := f.db.Pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+				AND $1 = ANY(pg_blocking_pids(pid)))`, holderPID).Scan(&waiting); err != nil {
+			t.Fatalf("observe the claim lock wait: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("claim finished before waiting on the row lock: %v", err)
+		case <-ctx.Done():
+			t.Fatal("claim did not wait on the row lock")
+		case <-poll.C:
+		}
+	}
+
 }
 
 func TestAutoTopUpClaimUsesMonthAfterLocks(t *testing.T) {

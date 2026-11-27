@@ -2,10 +2,8 @@
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 
-// Must equal the PUBLIC_API_ORIGIN that `e2e.config.ts` passes to the app
-// command. A value other than the production default proves that the
-// build-time variable reaches the client bundle: the default would also appear
-// if the variable were ignored.
+// Expected origin after the app removes the trailing slash from the value
+// that `e2e.config.ts` passes as PUBLIC_API_ORIGIN.
 const E2E_API_ORIGIN = "http://127.0.0.1:28100";
 
 describe("home", () => {
@@ -23,7 +21,7 @@ describe("home", () => {
     ).toBeVisible();
   });
 
-  test("exposes the configured API origin on the document", async ({
+  test("exposes the normalized API origin on the document", async ({
     app,
     browser,
   }) => {

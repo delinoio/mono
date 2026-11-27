@@ -144,8 +144,8 @@ func run() error {
 // runServers serves the public srv on listener together with the background
 // tasks: the billing worker and, when serveMetrics is not nil, the internal
 // metrics listener. It returns after srv has drained and both tasks have
-// returned, so no task outlives it. The worker finishes the run in progress, so
-// a Paddle call that has started records its result.
+// returned, so no task outlives it. A Paddle charge that has started can
+// finish its request and attempt to record the outcome before shutdown.
 //
 // The metrics listener is not optional infrastructure once it is bound: when
 // serveMetrics fails by itself (for example a permanent Accept error), runServers

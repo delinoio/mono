@@ -2,4 +2,4 @@
 "accounts-api": patch
 ---
 
-Limit each billing worker run to 30 seconds before it claims another queued automatic top-up, so that a long queue of slow Paddle charges cannot use the whole 2-minute tick and starve the later tasks (time-out of top-ups, grant expiry, suspensions, expiry notices, email delivery and metrics). A top-up that the run did not claim stays pending and is charged by a later run. A charge that has started is never canceled: it runs to its end and its result is recorded, so one charge may end after the 30 seconds.
+The billing worker checks its 30-second budget before each automatic top-up claim. A top-up that remains unclaimed stays pending for a later run. One committed charge can continue after the budget expires or the worker is canceled. The Paddle request has its own 20-second deadline, followed by a fresh 10-second deadline to attempt to record the outcome. If the write fails, the worker reports the error and the top-up can remain charging.

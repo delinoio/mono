@@ -818,12 +818,30 @@ func TestNewerEntityAfterCancellationStillApplies(t *testing.T) {
 // with a later updated_at, and that an older entity of the same ID is still
 // ignored.
 func TestDifferentSubscriptionDoesNotReplaceManageableRow(t *testing.T) {
-	for _, status := range []string{paddle.SubscriptionStatusActive, paddle.SubscriptionStatusPastDue} {
-		t.Run(status, func(t *testing.T) {
+	for _, tc := range []struct {
+		paddleStatus string
+		wantStatus   SubscriptionStatus
+	}{
+		{paddle.SubscriptionStatusActive, SubscriptionActive},
+		{paddle.SubscriptionStatusPastDue, SubscriptionPastDue},
+	} {
+		t.Run(tc.paddleStatus, func(t *testing.T) {
 			f := newFixture(t)
 			acct := f.account()
 			cur := f.activate(acct)
-			f.webhook("subscription.updated", map[string]any{"id": cur, "status": status, "updated_at": f.clock.Now()})
+			if got := f.webhookResult("subscription.updated", map[string]any{
+				"id": cur, "status": tc.paddleStatus, "updated_at": f.clock.Now(),
+			}); got != webhookApplied {
+				t.Fatalf("setup event result = %q, want %q", got, webhookApplied)
+			}
+			sub, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if err != nil {
+				t.Fatalf("load subscription after setup: %v", err)
+			}
+			if sub.Status != tc.wantStatus || sub.PaddleSubscriptionID != cur {
+				t.Fatalf("subscription after setup: status = %q, Paddle ID = %q, want %q and %q",
+					sub.Status, sub.PaddleSubscriptionID, tc.wantStatus, cur)
+			}
 			// A subscription event binds the billing account only through a
 			// recorded subscription, never through custom data, so the other
 			// subscription is recorded first, as a late payment of it would.
@@ -840,9 +858,13 @@ func TestDifferentSubscriptionDoesNotReplaceManageableRow(t *testing.T) {
 			if got := f.webhookResult("subscription.canceled", map[string]any{"id": cur, "status": "canceled", "updated_at": f.clock.Now().Add(-time.Hour)}); got != webhookIgnored {
 				t.Fatalf("event result = %q, want %q", got, webhookIgnored)
 			}
-			sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
-			if !sub.Manageable() || sub.PaddleSubscriptionID != cur {
-				t.Fatalf("subscription = %+v", sub)
+			sub, err = LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if err != nil {
+				t.Fatalf("load subscription after ignored events: %v", err)
+			}
+			if sub.Status != tc.wantStatus || sub.PaddleSubscriptionID != cur {
+				t.Fatalf("subscription after ignored events: status = %q, Paddle ID = %q, want %q and %q",
+					sub.Status, sub.PaddleSubscriptionID, tc.wantStatus, cur)
 			}
 		})
 	}

@@ -70,8 +70,8 @@ const tokenFetchTimeout = 10 * time.Second
 type Logto struct {
 	cfg LogtoConfig
 
-	// mu guards accessToken and expiresAt. It is held only for memory
-	// access, never across a network call.
+	// mu guards accessToken, expiresAt and inflight. It is held only for
+	// memory access, never across a network call or logging.
 	mu          sync.Mutex
 	accessToken string
 	expiresAt   time.Time
@@ -157,17 +157,25 @@ func (l *Logto) token(ctx context.Context) (string, error) {
 func (l *Logto) runRefresh(ctx context.Context, refresh *tokenRefresh) {
 	ctx, cancel := context.WithTimeout(ctx, tokenFetchTimeout)
 	defer cancel()
-	token, err := l.fetchToken(ctx)
+	body, err := l.fetchToken(ctx)
 	l.mu.Lock()
-	refresh.token, refresh.err = token, err
+	if err == nil {
+		l.accessToken = body.AccessToken
+		l.expiresAt = l.cfg.Now().Add(time.Duration(body.ExpiresIn) * time.Second)
+	}
+	refresh.token, refresh.err = body.AccessToken, err
+	// Retire the refresh before any lookup can see the new cache entry.
+	// A retry that evicts that entry must not join the completed refresh.
 	l.inflight = nil
 	l.mu.Unlock()
 	close(refresh.done)
+	if err == nil {
+		l.cfg.Logger.Info("logto_management_token_loaded", slog.Int64("expires_in_s", body.ExpiresIn))
+	}
 }
 
-// fetchToken requests a new access token and caches it. It holds no lock
-// during the request.
-func (l *Logto) fetchToken(ctx context.Context) (string, error) {
+// fetchToken requests and decodes a new access token.
+func (l *Logto) fetchToken(ctx context.Context) (tokenResponse, error) {
 	form := url.Values{
 		"grant_type": {"client_credentials"},
 		"resource":   {l.cfg.Endpoint + "/api"},
@@ -175,29 +183,24 @@ func (l *Logto) fetchToken(ctx context.Context) (string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.cfg.Endpoint+"/oidc/token", strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return tokenResponse{}, err
 	}
 	req.SetBasicAuth(url.QueryEscape(l.cfg.ClientID), url.QueryEscape(l.cfg.ClientSecret))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := l.cfg.Client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("logto token request: %w", err)
+		return tokenResponse{}, fmt.Errorf("logto token request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// The body can echo request details; it is not logged.
-		return "", fmt.Errorf("logto token status %d", resp.StatusCode)
+		return tokenResponse{}, fmt.Errorf("logto token status %d", resp.StatusCode)
 	}
 	var body tokenResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&body); err != nil || body.AccessToken == "" {
-		return "", errors.New("logto token response is not valid")
+		return tokenResponse{}, errors.New("logto token response is not valid")
 	}
-	l.mu.Lock()
-	l.accessToken = body.AccessToken
-	l.expiresAt = l.cfg.Now().Add(time.Duration(body.ExpiresIn) * time.Second)
-	l.mu.Unlock()
-	l.cfg.Logger.Info("logto_management_token_loaded", slog.Int64("expires_in_s", body.ExpiresIn))
-	return body.AccessToken, nil
+	return body, nil
 }
 
 // invalidate drops a token that Logto rejected.

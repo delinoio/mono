@@ -64,7 +64,7 @@ func raceLockWait(t *testing.T, env *testenv.Env, lockName string, lock, change 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback(ctx()) }()
+	defer rollbackLockHolder(t, tx)
 	var holderPID int
 	if err := tx.QueryRow(ctx(), `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
 		t.Fatal(err)
@@ -74,27 +74,23 @@ func raceLockWait(t *testing.T, env *testenv.Env, lockName string, lock, change 
 	done := make(chan error, 1)
 	go func() { done <- call() }()
 
-	// Confirm that the RPC waits for the holder's lock.
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		var waiting int
-		if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM pg_stat_activity
+	err = observeLockWaiters(env.DB.Pool, lockObservationTimeout, "observe the RPC waiting for the "+lockName,
+		`SELECT count(*) FROM pg_stat_activity
 			WHERE datname = current_database() AND wait_event_type = 'Lock'
-			AND $1 = ANY(pg_blocking_pids(pid))`, holderPID).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting > 0 {
-			break
-		}
-		select {
-		case err := <-done:
-			t.Fatalf("the RPC returned (%v) before it waited for the %s", err, lockName)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the RPC did not wait for the %s", lockName)
-		}
-		time.Sleep(10 * time.Millisecond)
+			AND $1 = ANY(pg_blocking_pids(pid))`,
+		func(waiting int) (bool, error) {
+			if waiting > 0 {
+				return true, nil
+			}
+			select {
+			case err := <-done:
+				return false, fmt.Errorf("the RPC returned (%v) before it waited", err)
+			default:
+				return false, nil
+			}
+		}, holderPID)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	change(tx)

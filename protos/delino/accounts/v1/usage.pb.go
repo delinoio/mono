@@ -891,11 +891,13 @@ func (x *ReportUsageResponse) GetStatuses() []*OrganizationBillingStatus {
 type ListBillingStatusChangesRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Service ServiceId              `protobuf:"varint,1,opt,name=service,proto3,enum=delino.accounts.v1.ServiceId" json:"service,omitempty"`
-	// Return statuses with a sequence greater than this value. 0 returns
-	// every linked organization. Negative values fail with
-	// `invalid_argument`.
+	// Return statuses with a sequence greater than this value. Set this field
+	// to 0 for the first page of a traversal of current links. Negative values
+	// fail with `invalid_argument`.
 	AfterSequence int64 `protobuf:"varint,2,opt,name=after_sequence,json=afterSequence,proto3" json:"after_sequence,omitempty"`
-	// Default 50, maximum 200.
+	// The effective page size is 50 when this field is omitted or 0, the
+	// requested size for values from 1 through 200, and 200 for larger values.
+	// Negative values fail with `invalid_argument`.
 	PageSize      int32 `protobuf:"varint,3,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -955,9 +957,10 @@ func (x *ListBillingStatusChangesRequest) GetPageSize() int32 {
 type ListBillingStatusChangesResponse struct {
 	state    protoimpl.MessageState       `protogen:"open.v1"`
 	Statuses []*OrganizationBillingStatus `protobuf:"bytes,1,rep,name=statuses,proto3" json:"statuses,omitempty"`
-	// Cursor for the next call: the highest sequence in statuses, or
-	// after_sequence when statuses is empty. Fewer than page_size statuses
-	// mean that the caller is up to date.
+	// The highest sequence in statuses. On an empty page, this field equals
+	// the input after_sequence. Stop when the page contains fewer statuses
+	// than the effective page size. After a full page, set after_sequence to
+	// this value in the next request.
 	NextSequence  int64 `protobuf:"varint,2,opt,name=next_sequence,json=nextSequence,proto3" json:"next_sequence,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

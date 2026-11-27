@@ -52,17 +52,11 @@ func holdKey(t *testing.T, env *testenv.Env, key int) (release func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			_ = tx.Rollback(ctx())
-		}
-	})
+	t.Cleanup(func() { rollbackLockHolder(t, tx) })
 	if _, err := tx.Exec(ctx(), `SELECT pg_advisory_xact_lock($1)`, key); err != nil {
 		t.Fatal(err)
 	}
 	return func() {
-		released = true
 		if err := tx.Commit(ctx()); err != nil {
 			t.Fatal(err)
 		}
@@ -73,22 +67,9 @@ func holdKey(t *testing.T, env *testenv.Env, key int) (release func()) {
 // wait for an advisory lock.
 func waitAdvisoryWaiters(t *testing.T, env *testenv.Env, n int) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		var waiting int
-		if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM pg_locks
+	waitForLockWaiterCount(t, env.DB.Pool, "advisory lock", n, `SELECT count(*) FROM pg_locks
 			WHERE locktype = 'advisory' AND NOT granted
-			AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting == n {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d sessions wait for an advisory lock, want %d", waiting, n)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+			AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`)
 }
 
 // alignToWindowEnd advances the test clock to 30 seconds before the end of a

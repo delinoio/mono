@@ -3,6 +3,90 @@ import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 
 describe("automatic top-up settings", () => {
+  test("shows the limits that apply to the current switch state", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/auto-top-up.html");
+    await screen.getByRole("tab", "Settings").click();
+    const form = screen.getByRole("form", "Automatic top-up");
+    const amount = form.getByRole("textbox", "Top-up amount (USD)");
+    const threshold = form.getByRole("textbox", "Threshold (USD)");
+    const cap = form.getByRole("textbox", "Monthly cap (USD)");
+    const toggle = form.getByRole("switch", "Automatic top-up");
+    const save = form.getByRole("button", "Save");
+    const saves = () => browser.evaluate(() => window.autoTopUpFixture.saves());
+    const disabledGuidance = form.getByText(
+      "Enter amounts of $0.00 or more in whole cents. Blank fields save as $0.00. Saved values are available when you turn automatic top-up on.",
+    );
+    const enabledGuidance = [
+      form.getByText("At least $10.00.", { exact: true }),
+      form.getByText("$25.00 to $10,000.00. Tax is added on top.", {
+        exact: true,
+      }),
+      form.getByText("Required. At least the top-up amount.", { exact: true }),
+    ];
+
+    await toggle.click();
+    await expect(disabledGuidance).toBeVisible();
+    await expect(
+      form.getByText("Tax is added on top.", { exact: true }),
+    ).toBeVisible();
+    for (const guidance of enabledGuidance) {
+      await expect(guidance).toBeHidden();
+    }
+
+    await threshold.fill("");
+    await amount.fill("5");
+    await cap.fill("");
+    await save.click();
+    await expect(amount).toHaveValue("5.00");
+    await expect(save).toBeEnabled();
+
+    await amount.fill("15000");
+    await save.click();
+    await expect(amount).toHaveValue("15000.00");
+    await expect(save).toBeEnabled();
+    expect(await saves()).toEqual([
+      { enabled: false, threshold: "0", amount: "5000000", cap: "0" },
+      { enabled: false, threshold: "0", amount: "15000000000", cap: "0" },
+    ]);
+
+    await toggle.click();
+    await expect(disabledGuidance).toBeHidden();
+    for (const guidance of enabledGuidance) {
+      await expect(guidance).toBeVisible();
+    }
+    await save.click();
+    await expect(form.getByText("Enter at most $10,000.00.")).toBeVisible();
+    expect(await saves()).toHaveLength(2);
+
+    await threshold.fill("10");
+    await amount.fill("25");
+    await save.click();
+    await expect(form.getByText("Enter an amount.")).toBeVisible();
+    expect(await saves()).toHaveLength(2);
+
+    await cap.fill("24.99");
+    await save.click();
+    await expect(
+      form.getByText("Enter at least the top-up amount ($25.00)."),
+    ).toBeVisible();
+    expect(await saves()).toHaveLength(2);
+
+    await cap.fill("25");
+    await save.click();
+    await expect(amount).toHaveValue("25.00");
+    expect(await saves()).toHaveLength(3);
+    expect((await saves())[2]).toEqual({
+      enabled: true,
+      threshold: "10000000",
+      amount: "25000000",
+      cap: "25000000",
+    });
+  });
+
   test("keeps newer edits through the save and confirming read", async ({
     app,
     browser,

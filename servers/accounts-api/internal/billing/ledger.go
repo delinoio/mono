@@ -154,15 +154,22 @@ func (s *Service) expireDue(ctx context.Context, tx pgx.Tx, acct *accountState, 
 		return err
 	}
 	for _, g := range grants {
-		if err := s.forfeitGrant(ctx, tx, acct, g, now); err != nil {
+		if err := s.expireGrant(ctx, tx, acct, g, now); err != nil {
 			return err
 		}
-		s.logger.InfoContext(ctx, "billing_credit_expired",
-			slog.String("billing_account_id", acct.ID),
-			slog.String("credit_grant_id", g.ID),
-			slog.Int64("amount_usd_micros", g.Remaining),
-			slog.Int64("balance_after_usd_micros", acct.Balance))
 	}
+	return nil
+}
+
+func (s *Service) expireGrant(ctx context.Context, tx pgx.Tx, acct *accountState, g grantBalance, now time.Time) error {
+	if err := s.forfeitGrant(ctx, tx, acct, g, now); err != nil {
+		return err
+	}
+	s.logger.InfoContext(ctx, "billing_credit_expired",
+		slog.String("billing_account_id", acct.ID),
+		slog.String("credit_grant_id", g.ID),
+		slog.Int64("amount_usd_micros", g.Remaining),
+		slog.Int64("balance_after_usd_micros", acct.Balance))
 	return nil
 }
 
@@ -211,6 +218,7 @@ type grantInput struct {
 	Kind                LedgerKind
 	Amount              int64
 	PaddleTransactionID string
+	ExpireTime          time.Time
 }
 
 type grantTelemetry struct {
@@ -225,15 +233,16 @@ type grantTelemetry struct {
 // entry, then applies the pending adjustments of the purchase. It returns
 // telemetry only for a new grant. A purchase that already has a grant still
 // applies its pending adjustments, because a release that predates the
-// pending adjustment table creates grants without draining it.
+// pending adjustment table creates grants without draining it. A zero amount
+// reconciles an existing grant and skips creation.
 // A webhook caller holds the purchase lock (lockPurchase) before the lock of
 // acct.
-func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, eventTime time.Time) (grantID string, telemetry *grantTelemetry, err error) {
-	if in.Amount <= 0 {
-		return "", nil, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
+func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, processTime time.Time) (grantID string, telemetry *grantTelemetry, err error) {
+	if in.Amount < 0 {
+		return "", nil, fmt.Errorf("credit grant amount %d is negative", in.Amount)
 	}
-	// Use the time after both locks for credit that expired while the webhook
-	// waited. Keep the original event time for the grant's creation and lifetime.
+	// Use the time after both locks to account for credit that expired while
+	// the webhook waited. Keep the processing time for the grant's creation.
 	accountingTime := s.timestamp()
 	var grantAccountID string
 	err = tx.QueryRow(ctx, `SELECT credit_grant_id::text, billing_account_id::text FROM credit_grants
@@ -251,6 +260,9 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return "", nil, err
 	}
+	if in.Amount == 0 {
+		return "", nil, nil
+	}
 	// The balance before the inline expiry is the baseline of the low-balance
 	// check: an expiry that the new grant does not make up for is a decrease.
 	before := acct.Balance
@@ -264,13 +276,21 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	if _, err := tx.Exec(ctx, `INSERT INTO credit_grants (credit_grant_id, billing_account_id, source, original_usd_micros,
 			remaining_usd_micros, paddle_transaction_id, create_time, expire_time)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		grantID, acct.ID, string(in.Kind), in.Amount, kept, in.PaddleTransactionID, eventTime, GrantExpireTime(eventTime)); err != nil {
+		grantID, acct.ID, string(in.Kind), in.Amount, kept, in.PaddleTransactionID, processTime, in.ExpireTime); err != nil {
 		return "", nil, err
 	}
 	if _, err := writeEntry(ctx, tx, acct, entry{
 		Kind: in.Kind, Amount: in.Amount, PaddleTransactionID: in.PaddleTransactionID, CreditGrantID: grantID,
 	}, accountingTime); err != nil {
 		return "", nil, err
+	}
+	balanceAfterPurchase := acct.Balance
+	// A delayed payment still pays off debt. Any remaining credit that is
+	// already due expires before it can affect alerts or fund a refund.
+	if kept > 0 && !in.ExpireTime.After(accountingTime) {
+		if err := s.expireGrant(ctx, tx, acct, grantBalance{ID: grantID, Remaining: kept}, accountingTime); err != nil {
+			return "", nil, err
+		}
 	}
 	// afterIncrease runs first so that a grant that reaches the threshold
 	// re-arms the alert before afterDecrease reads the settings. A purchase
@@ -281,15 +301,13 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	if _, err := s.afterDecrease(ctx, tx, acct, before, accountingTime, false); err != nil {
 		return "", nil, err
 	}
-	// Capture the balance after the grant, before a pending refund or chargeback.
-	balance := acct.Balance
 	// Approved refunds and chargebacks of this purchase that arrived before
 	// its payment now reduce the new grant, as if they had arrived after it.
 	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
 		return "", nil, err
 	}
 	return grantID, &grantTelemetry{
-		ID: grantID, Kind: in.Kind, Amount: in.Amount, DebtPaid: debtPaid, Balance: balance,
+		ID: grantID, Kind: in.Kind, Amount: in.Amount, DebtPaid: debtPaid, Balance: balanceAfterPurchase,
 	}, nil
 }
 

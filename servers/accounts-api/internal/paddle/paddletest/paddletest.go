@@ -250,8 +250,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if custom, ok := body["custom_data"].(map[string]any); ok {
 			txn.CustomData = custom
 		}
+		// Status updates change only the stored copy.
+		stored := txn
 		s.mu.Lock()
-		s.transactions[txn.ID] = &txn
+		s.transactions[txn.ID] = &stored
 		s.mu.Unlock()
 		writeJSON(w, http.StatusCreated, map[string]any{"data": txn})
 	case len(parts) == 3 && parts[0] == "transactions" && parts[2] == "invoice" && r.Method == http.MethodGet:
@@ -396,6 +398,7 @@ type TransactionData struct {
 	// charges).
 	TopUpID       string
 	SubtotalCents int64
+	DiscountCents int64
 	TaxCents      int64
 	Currency      string
 	PeriodEnd     time.Time
@@ -426,9 +429,9 @@ func Transaction(d TransactionData) map[string]any {
 		"items":         []any{map[string]any{"price": price, "quantity": 1}},
 		"details": map[string]any{"totals": map[string]any{
 			"subtotal":      fmt.Sprint(d.SubtotalCents),
-			"discount":      "0",
+			"discount":      fmt.Sprint(d.DiscountCents),
 			"tax":           fmt.Sprint(d.TaxCents),
-			"total":         fmt.Sprint(d.SubtotalCents + d.TaxCents),
+			"total":         fmt.Sprint(d.SubtotalCents - d.DiscountCents + d.TaxCents),
 			"currency_code": d.Currency,
 		}},
 		"created_at": time.Now().UTC(),

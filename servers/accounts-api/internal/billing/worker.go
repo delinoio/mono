@@ -12,10 +12,15 @@ import (
 // tasks.
 const DefaultWorkerInterval = 30 * time.Second
 
-// workerRunTimeout bounds one run of the tasks. The shutdown cancels the run
-// between steps; a Paddle charge that has started is not canceled, so its
-// result is recorded, and the server waits for it.
+// workerRunTimeout bounds a periodic pass. Shutdown cancels the pass.
+// A committed charge or interrupted notification can still try to record
+// its result under a separate deadline.
 const workerRunTimeout = 2 * time.Minute
+
+const (
+	notificationDeliveryBudget = 30 * time.Second
+	workerMetricsReserve       = 10 * time.Second
+)
 
 // workerTask is one background task.
 type workerTask struct {
@@ -31,15 +36,34 @@ func (s *Service) tasks() []workerTask {
 		{"reconcile_pending_adjustments", s.ReconcilePendingAdjustments},
 		{"suspend_due_organizations", func(ctx context.Context) error { return s.SuspendDue(ctx, SuspendFilter{}) }},
 		{"queue_expiry_notices", s.QueueExpiryNotices},
-		{"deliver_notifications", s.DeliverNotifications},
+		{"deliver_notifications", s.deliverWorkerNotifications},
 		{"refresh_status_metrics", s.RefreshStatusMetrics},
 	}
+}
+
+// deliverWorkerNotifications limits new delivery work and leaves time for
+// settlement and metrics. At the deadline a recipient write can be in
+// progress, followed by a separate write to finish or defer the notice.
+func (s *Service) deliverWorkerNotifications(ctx context.Context) error {
+	budget := s.notificationDeliveryBudget
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(deadline)-2*notificationSettleTimeout-workerMetricsReserve)
+	}
+	if budget <= 0 {
+		return nil
+	}
+	deliveryCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	return s.DeliverNotifications(deliveryCtx)
 }
 
 // RunOnce runs every background task once. A failed task is logged, and the
 // other tasks still run.
 func (s *Service) RunOnce(ctx context.Context) {
 	for _, task := range s.tasks() {
+		if ctx.Err() != nil {
+			return
+		}
 		if err := task.run(ctx); err != nil {
 			if isContextErr(err) && ctx.Err() != nil {
 				return

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError } from "@connectrpc/connect";
-import { useQuery } from "@connectrpc/connect-query";
+import { createQueryOptions, useTransport } from "@connectrpc/connect-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "delino-ui/tabs";
 import { useState } from "react";
 import {
@@ -57,8 +58,17 @@ export function BillingAccountPage({
 }: {
   billingAccountId: string;
 }) {
-  const account = useQuery(BillingAccountService.method.getBillingAccount, {
-    billingAccountId,
+  const transport = useTransport();
+  const queryClient = useQueryClient();
+  const accountQuery = createQueryOptions(
+    BillingAccountService.method.getBillingAccount,
+    { billingAccountId },
+    { transport },
+  );
+  const account = useQuery({
+    ...accountQuery,
+    // Observe fetch completion even when data and its timestamp stay the same.
+    notifyOnChangeProps: "all",
   });
   if (account.isPending) {
     return (
@@ -94,6 +104,10 @@ export function BillingAccountPage({
         billingAccountId: billingAccount.billingAccountId,
         name: billingAccount.name,
         role: billingAccount.callerRole,
+        queryKey: accountQuery.queryKey,
+        readVersion:
+          queryClient.getQueryState(accountQuery.queryKey)?.dataUpdateCount ??
+          0,
       }}
     >
       <Page>
