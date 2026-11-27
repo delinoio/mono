@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 
+	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -74,9 +75,7 @@ func (c *Control) SetLatestIDForTest(fn func(ctx context.Context) (int64, error)
 
 // PollEventsForTest runs one event poll while the lease is held.
 func (c *Control) PollEventsForTest(ctx context.Context) {
-	if c.held() {
-		c.processEvents(ctx)
-	}
+	c.processEvents(ctx)
 }
 
 // SetAfterWriteResponseDequeuedForTest sets a hook that WriteFile runs with
@@ -88,4 +87,9 @@ func (p *DataPlane) SetAfterWriteResponseDequeuedForTest(fn func(cctx context.Co
 		return
 	}
 	p.afterWriteResponseDequeued.Store(&fn)
+}
+
+// HandleEventForTest delivers a revocation event to one channel generation.
+func (p *DataPlane) HandleEventForTest(ctx context.Context, e events.Event, generation uint64) {
+	p.HandleEvent(ctx, e, channelGenerations{first: generation, last: generation})
 }

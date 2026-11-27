@@ -29,6 +29,9 @@ const manifestSchema = 1
 // (update.maxManifestBytes). A larger manifest would stop every update.
 const maxManifestBytes = 1 << 20
 
+// maxArtifactBytes must equal update.MaxArtifactBytes. The tests check it.
+const maxArtifactBytes = 512 << 20
+
 // manifest mirrors update.Manifest. The tool does not import package update,
 // because that package pulls in the generated protocol bindings and their
 // third-party modules, and the tool runs next to the signing key. The tests
@@ -277,8 +280,12 @@ func newRelease(in releaseInput) (release, error) {
 		if err != nil {
 			return release{}, fmt.Errorf("artifact of %s: %w", p, err)
 		}
-		if !info.Mode().IsRegular() || info.Size() == 0 {
+		size := info.Size()
+		if !info.Mode().IsRegular() || size == 0 {
 			return release{}, fmt.Errorf("artifact of %s (%s) is not a nonempty regular file", p, path)
+		}
+		if size > maxArtifactBytes {
+			return release{}, fmt.Errorf("artifact of %s (%q) is %d bytes, exceeds the %d-byte update limit", p, path, size, maxArtifactBytes)
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {

@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -370,7 +371,9 @@ func TestTransferRequestsEachPartURLRightBeforeUse(t *testing.T) {
 	if len(parts) <= 8 {
 		t.Fatalf("parts = %d, want more than 8", len(parts))
 	}
+	b.mu.Lock()
 	exportEvents := slices.Clone(b.events)
+	b.mu.Unlock()
 	dst := filepath.Join(t.TempDir(), "content")
 	if err := tr.Import(context.Background(), "snap", parts, dst); err != nil {
 		t.Fatal(err)
@@ -378,10 +381,15 @@ func TestTransferRequestsEachPartURLRightBeforeUse(t *testing.T) {
 	if got, _ := os.ReadFile(filepath.Join(dst, "disk")); string(got) != content {
 		t.Fatal("imported content differs")
 	}
-	if b.expired != 0 {
-		t.Fatalf("%d requests used an expired URL", b.expired)
+	b.mu.Lock()
+	importEvents := slices.Clone(b.events[len(exportEvents):])
+	expired := b.expired
+	batches := slices.Clone(b.batches)
+	b.mu.Unlock()
+	if expired != 0 {
+		t.Fatalf("%d requests used an expired URL", expired)
 	}
-	for _, n := range b.batches {
+	for _, n := range batches {
 		if n != 1 {
 			t.Fatalf("a URL request named %d parts, want 1", n)
 		}
@@ -399,8 +407,8 @@ func TestTransferRequestsEachPartURLRightBeforeUse(t *testing.T) {
 	for p := 1; p <= len(parts); p++ {
 		wantImport = append(wantImport, "URL "+strconv.Itoa(p), "GET /snap/"+strconv.Itoa(p))
 	}
-	if got := b.events[len(exportEvents):]; !slices.Equal(got, wantImport) {
-		t.Fatalf("import events = %v, want %v", got, wantImport)
+	if !slices.Equal(importEvents, wantImport) {
+		t.Fatalf("import events = %v, want %v", importEvents, wantImport)
 	}
 }
 
@@ -437,7 +445,9 @@ func TestImportRejectsACorruptDownload(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			b, parts := storeSnapshot(t, content, 4096)
 			last := "/snap/" + strconv.Itoa(len(parts))
+			b.mu.Lock()
 			b.objects[last] = tc.mutate(b.objects[last])
+			b.mu.Unlock()
 			tempDir := t.TempDir()
 			tr := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: quietLogger(), TempDir: tempDir}
 			base := t.TempDir()
@@ -896,32 +906,42 @@ func TestLargePartTransferUsesBoundedMemory(t *testing.T) {
 // TestPutSendsAnExactLengthReplayableBody checks the upload request: exact
 // Content-Length, the bytes of the archive and a body that can be replayed.
 func TestPutSendsAnExactLengthReplayableBody(t *testing.T) {
-	data := []byte(strings.Repeat("0123456789", 1000))
+	data := strings.Repeat("0123456789", 1000)
 	f, err := os.CreateTemp(t.TempDir(), "part")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	f.Write(append([]byte("prefix"), data...))
-	var got []byte
-	var length int64
-	var redirected bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/first" {
-			// A 307 makes the client replay the body through GetBody.
-			http.Redirect(w, r, "/second", http.StatusTemporaryRedirect)
-			redirected = true
-			return
-		}
-		length = r.ContentLength
-		got, _ = io.ReadAll(r.Body)
-	}))
-	defer srv.Close()
-	tr := &Transfer{HTTP: srv.Client(), Logger: quietLogger()}
-	if err := tr.put(context.Background(), srv.URL+"/first", f, 6, int64(len(data))); err != nil {
+	if _, err := f.WriteString("prefix" + data); err != nil {
 		t.Fatal(err)
 	}
-	if !redirected || length != int64(len(data)) || !bytes.Equal(got, data) {
-		t.Fatalf("redirected=%v length=%d body ok=%v", redirected, length, bytes.Equal(got, data))
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		got, err := io.ReadAll(r.Body)
+		if r.Method != http.MethodPut || r.ContentLength != int64(len(data)) || string(got) != data || err != nil {
+			t.Errorf("PUT replay: method=%s length=%d body matches=%v err=%v", r.Method, r.ContentLength, string(got) == data, err)
+		}
+		if r.Referer() != "" {
+			t.Error("storage received a Referer header")
+		}
+		switch r.URL.Path {
+		case "/first":
+			http.Redirect(w, r, "/second?sig=next", http.StatusTemporaryRedirect)
+		case "/second":
+			http.Redirect(w, r, "/final?sig=last", http.StatusPermanentRedirect)
+		case "/final":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	tr := &Transfer{HTTP: NewHTTPClient(5 * time.Second), Logger: quietLogger()}
+	if err := tr.put(t.Context(), srv.URL+"/first?sig=initial", f, 6, int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("storage received %d requests, want 3", got)
 	}
 }

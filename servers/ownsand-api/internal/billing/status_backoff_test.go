@@ -19,7 +19,7 @@ import (
 func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	t0 := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
-	ctx := context.Background()
+	ctx := t.Context()
 	f.addOrg(t, org1)
 	f.link(t, org1, accountA)
 	f.addPendingUnlink(t, org1)
@@ -28,12 +28,11 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	// attempt 1: the call takes 2 seconds, the delay is 1 second.
 	gate := f.fake.Hold(accountstest.MethodUnlinkOrganization)
 	t.Cleanup(gate.Release)
-	done := make(chan error, 1)
-	go func() { done <- f.statuses.UnlinkPending(ctx, org1) }()
-	<-gate.Entered
+	done := goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
+	gate.WaitForEntry(t, done)
 	f.clock.Advance(2 * time.Second)
 	gate.Release()
-	if err := <-done; err != nil {
+	if err := gate.WaitForResult(t, done); err != nil {
 		t.Fatal(err)
 	}
 	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 1 || !next.Equal(t0.Add(3*time.Second)) {
@@ -44,11 +43,11 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	f.clock.Advance(time.Second)
 	gate = f.fake.Hold(accountstest.MethodUnlinkOrganization)
 	t.Cleanup(gate.Release)
-	go func() { done <- f.statuses.UnlinkPending(ctx, org1) }()
-	<-gate.Entered
+	done = goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
+	gate.WaitForEntry(t, done)
 	f.clock.Advance(5 * time.Second)
 	gate.Release()
-	if err := <-done; err != nil {
+	if err := gate.WaitForResult(t, done); err != nil {
 		t.Fatal(err)
 	}
 	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 2 || !next.Equal(t0.Add(10*time.Second)) {

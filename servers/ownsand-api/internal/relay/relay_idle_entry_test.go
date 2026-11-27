@@ -11,17 +11,13 @@ import (
 	"time"
 )
 
-// idleSendEntryWait is how long an idle test waits for the writer to enter
-// its blocked fake send. The writer enters it as soon as Run starts, so the
-// bound only matters when something is wrong.
-const idleSendEntryWait = 2 * time.Second
+// sendEntryWait bounds fixture setup while the writer enters the fake send.
+const sendEntryWait = 2 * time.Second
 
-// idleSendEntryError waits until the fake send closes entered. It returns an
-// error that names the failure when Run returns first (done delivers its
-// result) or when neither happens within within. The idle tests need the send
-// to be blocked before the idle interval starts, so they must not wait for
-// it without a bound and must tell these two failures apart.
-func idleSendEntryError(entered <-chan struct{}, done <-chan error, within time.Duration) error {
+// sendEntryError waits for the fake send to close entered. If Run returns
+// first, the error wraps its result. If neither signal arrives by the
+// deadline, the error reports the wait duration.
+func sendEntryError(entered <-chan struct{}, done <-chan error, within time.Duration) error {
 	select {
 	case <-entered:
 		return nil
@@ -39,11 +35,10 @@ func idleSendEntryError(entered <-chan struct{}, done <-chan error, within time.
 	}
 }
 
-// awaitIdleSendEntry fails the test with a specific message unless the fake
-// send is entered, see idleSendEntryError.
-func awaitIdleSendEntry(t *testing.T, entered <-chan struct{}, done <-chan error) {
+// awaitSendEntry fails the test if the fake send does not start.
+func awaitSendEntry(t *testing.T, entered <-chan struct{}, done <-chan error) {
 	t.Helper()
-	if err := idleSendEntryError(entered, done, idleSendEntryWait); err != nil {
+	if err := sendEntryError(entered, done, sendEntryWait); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -62,13 +57,13 @@ func newIdleTestConn(t *testing.T) (*Conn, *stepClock) {
 	return c, clk
 }
 
-func TestIdleSendEntryErrorReportsEntry(t *testing.T) {
+func TestSendEntryErrorReportsEntry(t *testing.T) {
 	entered := make(chan struct{})
 	close(entered)
 	// Entry wins over a result that is also ready.
 	done := make(chan error, 1)
 	done <- ErrIdle
-	if err := idleSendEntryError(entered, done, time.Second); err != nil {
+	if err := sendEntryError(entered, done, time.Second); err != nil {
 		t.Fatalf("entered send: %v", err)
 	}
 	pending := make(chan struct{})
@@ -76,23 +71,23 @@ func TestIdleSendEntryErrorReportsEntry(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		close(pending)
 	}()
-	if err := idleSendEntryError(pending, make(chan error), 2*time.Second); err != nil {
+	if err := sendEntryError(pending, make(chan error), 2*time.Second); err != nil {
 		t.Fatalf("send entered later: %v", err)
 	}
 }
 
-func TestIdleSendEntryErrorReportsRunExitBeforeEntry(t *testing.T) {
+func TestSendEntryErrorReportsRunExitBeforeEntry(t *testing.T) {
 	done := make(chan error, 1)
 	done <- ErrIdle
-	err := idleSendEntryError(make(chan struct{}), done, 2*time.Second)
+	err := sendEntryError(make(chan struct{}), done, 2*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "Run exited before the send was entered") || !errors.Is(err, ErrIdle) {
 		t.Fatalf("Run exit before entry: %v, want a Run-exited error that wraps ErrIdle", err)
 	}
 }
 
-func TestIdleSendEntryErrorReportsMissingEntryAtDeadline(t *testing.T) {
+func TestSendEntryErrorReportsMissingEntryAtDeadline(t *testing.T) {
 	start := time.Now()
-	err := idleSendEntryError(make(chan struct{}), make(chan error), 20*time.Millisecond)
+	err := sendEntryError(make(chan struct{}), make(chan error), 20*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "the send was not entered within 20ms") {
 		t.Fatalf("missing entry: %v, want a not-entered error", err)
 	}
