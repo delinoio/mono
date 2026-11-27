@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -105,6 +106,58 @@ func TestResetWithoutYesLeavesEverything(t *testing.T) {
 	}
 	if _, err := os.Stat(dir + "/marker"); err != nil {
 		t.Fatalf("local data changed: %v", err)
+	}
+}
+
+func TestResetOperands(t *testing.T) {
+	tests := []struct {
+		name           string
+		beforeStateDir []string
+		afterStateDir  []string
+		wantCode       int
+	}{
+		{name: "operand before state directory flag", beforeStateDir: []string{"unexpected"}, wantCode: exitUsage},
+		{name: "operand after terminator", afterStateDir: []string{"--", "unexpected"}, wantCode: exitUsage},
+		{name: "terminator without operands", afterStateDir: []string{"--"}, wantCode: exitOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			envDir := enrolledStateDir(t)
+			explicitDir := t.TempDir()
+			explicitMarker := filepath.Join(explicitDir, "marker")
+			if err := os.WriteFile(explicitMarker, []byte("explicit"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(config.EnvRuntime, "firecracker")
+			calls := stubCleanupHost(t, nil)
+			args := append([]string{"reset", "--yes"}, tt.beforeStateDir...)
+			args = append(args, "--state-dir", explicitDir)
+			args = append(args, tt.afterStateDir...)
+
+			var out, errb bytes.Buffer
+			if code := run(args, nil, &out, &errb); code != tt.wantCode {
+				t.Errorf("reset: exit %d, want %d, stderr %q", code, tt.wantCode, errb.String())
+			}
+			if data, err := os.ReadFile(filepath.Join(envDir, "marker")); err != nil || string(data) != "x" {
+				t.Errorf("environment state marker: got %q, error %v", data, err)
+			}
+			if tt.wantCode == exitOK {
+				if *calls != 1 {
+					t.Errorf("host clean-up calls: got %d, want 1", *calls)
+				}
+				assertEntriesGone(t, explicitDir, "marker")
+				return
+			}
+			if *calls != 0 {
+				t.Errorf("host clean-up ran %d times", *calls)
+			}
+			if !strings.Contains(errb.String(), `unexpected argument "unexpected"`) {
+				t.Errorf("stderr %q misses the unexpected argument diagnostic", errb.String())
+			}
+			if data, err := os.ReadFile(explicitMarker); err != nil || string(data) != "explicit" {
+				t.Errorf("explicit state marker: got %q, error %v", data, err)
+			}
+		})
 	}
 }
 

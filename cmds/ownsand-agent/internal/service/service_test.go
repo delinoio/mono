@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strconv"
 	"strings"
@@ -32,81 +33,163 @@ func TestDefinitions(t *testing.T) {
 	}
 }
 
-// plistValue is a decoded plist value: a string, a bool, an array or a dict.
+type plistValueKind uint8
+
+const (
+	plistBoolean plistValueKind = iota + 1
+	plistString
+	plistArray
+	plistDict
+)
+
 type plistValue struct {
+	kind  plistValueKind
 	text  string
 	flag  bool
 	array []plistValue
 	dict  map[string]plistValue
 }
 
-func decodePlistValue(t *testing.T, d *xml.Decoder, start xml.StartElement) plistValue {
-	t.Helper()
+func decodePlistValue(d *xml.Decoder, start xml.StartElement) (plistValue, error) {
 	switch start.Name.Local {
-	case "true":
-		d.Skip()
-		return plistValue{flag: true}
-	case "false":
-		d.Skip()
-		return plistValue{}
+	case "true", "false":
+		if err := d.Skip(); err != nil {
+			return plistValue{}, err
+		}
+		return plistValue{kind: plistBoolean, flag: start.Name.Local == "true"}, nil
 	case "string":
 		var s string
 		if err := d.DecodeElement(&s, &start); err != nil {
-			t.Fatal(err)
+			return plistValue{}, err
 		}
-		return plistValue{text: s}
+		return plistValue{kind: plistString, text: s}, nil
 	case "array":
-		var v plistValue
+		v := plistValue{kind: plistArray}
 		for {
 			tok, err := d.Token()
 			if err != nil {
-				t.Fatal(err)
+				return plistValue{}, err
 			}
 			switch e := tok.(type) {
 			case xml.StartElement:
-				v.array = append(v.array, decodePlistValue(t, d, e))
+				item, err := decodePlistValue(d, e)
+				if err != nil {
+					return plistValue{}, err
+				}
+				v.array = append(v.array, item)
 			case xml.EndElement:
-				return v
+				return v, nil
 			}
 		}
 	case "dict":
-		v := plistValue{dict: map[string]plistValue{}}
+		v := plistValue{kind: plistDict, dict: map[string]plistValue{}}
 		key := ""
 		for {
 			tok, err := d.Token()
 			if err != nil {
-				t.Fatal(err)
+				return plistValue{}, err
 			}
 			switch e := tok.(type) {
 			case xml.StartElement:
 				if e.Name.Local == "key" {
 					if err := d.DecodeElement(&key, &e); err != nil {
-						t.Fatal(err)
+						return plistValue{}, err
 					}
 					continue
 				}
-				v.dict[key] = decodePlistValue(t, d, e)
+				item, err := decodePlistValue(d, e)
+				if err != nil {
+					return plistValue{}, err
+				}
+				v.dict[key] = item
 			case xml.EndElement:
-				return v
+				return v, nil
 			}
 		}
 	}
-	t.Fatalf("unsupported plist element %q", start.Name.Local)
-	return plistValue{}
+	return plistValue{}, fmt.Errorf("unsupported plist element %q", start.Name.Local)
 }
 
-func decodePlist(t *testing.T, doc string) map[string]plistValue {
-	t.Helper()
-	d := xml.NewDecoder(strings.NewReader(doc))
+// nextPlistToken skips XML whitespace and comments at document boundaries.
+// The prologue can also contain the XML declaration and plist doctype.
+func nextPlistToken(d *xml.Decoder, prologue bool) (xml.Token, error) {
 	for {
 		tok, err := d.Token()
 		if err != nil {
-			t.Fatalf("no plist dict: %v", err)
+			return nil, err
 		}
-		if e, ok := tok.(xml.StartElement); ok && e.Name.Local == "dict" {
-			return decodePlistValue(t, d, e).dict
+		switch e := tok.(type) {
+		case xml.Comment:
+			continue
+		case xml.CharData:
+			if strings.Trim(string(e), " \t\r\n") == "" {
+				continue
+			}
+		case xml.ProcInst:
+			if prologue && e.Target == "xml" {
+				continue
+			}
+		case xml.Directive:
+			if prologue && strings.HasPrefix(string(e), "DOCTYPE plist ") {
+				continue
+			}
 		}
+		return tok, nil
 	}
+}
+
+func decodePlist(doc string) (map[string]plistValue, error) {
+	d := xml.NewDecoder(strings.NewReader(doc))
+	tok, err := nextPlistToken(d, true)
+	if err != nil {
+		return nil, fmt.Errorf("read plist root: %w", err)
+	}
+	root, ok := tok.(xml.StartElement)
+	if !ok || root.Name != (xml.Name{Local: "plist"}) {
+		return nil, errors.New("expected a plist root element")
+	}
+
+	tok, err = nextPlistToken(d, false)
+	if err != nil {
+		return nil, fmt.Errorf("read plist dictionary: %w", err)
+	}
+	dict, ok := tok.(xml.StartElement)
+	if !ok || dict.Name != (xml.Name{Local: "dict"}) {
+		return nil, errors.New("expected a dictionary inside the plist root")
+	}
+	value, err := decodePlistValue(d, dict)
+	if err != nil {
+		return nil, fmt.Errorf("decode plist dictionary: %w", err)
+	}
+
+	tok, err = nextPlistToken(d, false)
+	if err != nil {
+		return nil, fmt.Errorf("read plist root close: %w", err)
+	}
+	end, ok := tok.(xml.EndElement)
+	if !ok || end.Name != root.Name {
+		return nil, errors.New("expected the plist root to close after its dictionary")
+	}
+	_, err = nextPlistToken(d, false)
+	if errors.Is(err, io.EOF) {
+		return value.dict, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read after plist root: %w", err)
+	}
+	return nil, errors.New("unexpected content after the plist root")
+}
+
+func checkLaunchdRestartPolicy(plist map[string]plistValue) error {
+	keepAlive := plist["KeepAlive"].dict
+	successfulExit, ok := keepAlive["SuccessfulExit"]
+	if len(keepAlive) != 1 || !ok {
+		return fmt.Errorf("KeepAlive = %v, want only SuccessfulExit", keepAlive)
+	}
+	if successfulExit.kind != plistBoolean || successfulExit.flag {
+		return errors.New("KeepAlive.SuccessfulExit must be Boolean false")
+	}
+	return nil
 }
 
 func TestLaunchdDaemonRunsWithLaunchdMarker(t *testing.T) {
@@ -114,7 +197,10 @@ func TestLaunchdDaemonRunsWithLaunchdMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plist := decodePlist(t, doc)
+	plist, err := decodePlist(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var args []string
 	for _, a := range plist["ProgramArguments"].array {
 		args = append(args, a.text)
@@ -123,18 +209,59 @@ func TestLaunchdDaemonRunsWithLaunchdMarker(t *testing.T) {
 	if strings.Join(args, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("ProgramArguments = %v, want %v", args, want)
 	}
-	keepAlive := plist["KeepAlive"].dict
-	if len(keepAlive) != 1 {
-		t.Fatalf("KeepAlive = %v, want only SuccessfulExit", keepAlive)
-	}
-	if v, ok := keepAlive["SuccessfulExit"]; !ok || v.flag {
-		t.Fatalf("KeepAlive SuccessfulExit = %v (present %v), want false", v.flag, ok)
+	if err := checkLaunchdRestartPolicy(plist); err != nil {
+		t.Fatal(err)
 	}
 	if got := plist["EnvironmentVariables"].dict["A"].text; got != "<b>" {
 		t.Fatalf("environment A = %q", got)
 	}
-	if !plist["RunAtLoad"].flag {
-		t.Error("RunAtLoad is not true")
+	if runAtLoad := plist["RunAtLoad"]; runAtLoad.kind != plistBoolean || !runAtLoad.flag {
+		t.Error("RunAtLoad must be Boolean true")
+	}
+}
+
+func TestLaunchdDaemonRejectsInvalidPlist(t *testing.T) {
+	doc, err := LaunchdDaemon("/usr/local/bin/ownsand-agent", []string{"A=<b>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const successfulExitKey = "<key>SuccessfulExit</key>\n\t\t"
+	const successfulExit = successfulExitKey + "<false/>"
+	for _, tc := range []struct {
+		name        string
+		old         string
+		replacement string
+		decodeError bool
+	}{
+		{"string false", successfulExit, successfulExitKey + "<string>false</string>", false},
+		{"Boolean true", successfulExit, successfulExitKey + "<true/>", false},
+		{"missing SuccessfulExit", successfulExit, "", false},
+		{"missing plist close", "</plist>", "", true},
+		{"mismatched plist close", "</plist>", "</wrong>", true},
+		{"second root", "</plist>", "</plist>\n<dict/>", true},
+		{"second dictionary", "</plist>", "<dict/>\n</plist>", true},
+		{"trailing text", "</plist>", "</plist>\nextra", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			altered := strings.Replace(doc, tc.old, tc.replacement, 1)
+			if altered == doc {
+				t.Fatalf("renderer output has no %q to replace", tc.old)
+			}
+			plist, err := decodePlist(altered)
+			if tc.decodeError {
+				if err == nil {
+					t.Fatal("decodePlist accepted an invalid document")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodePlist rejected the policy test input: %v", err)
+			}
+			if err := checkLaunchdRestartPolicy(plist); err == nil {
+				t.Fatal("restart policy accepted an invalid SuccessfulExit")
+			}
+		})
 	}
 }
 
@@ -161,7 +288,10 @@ func TestLaunchdDaemonRoundTripsLineBreaksAndSpecials(t *testing.T) {
 		if strings.Contains(doc, "\r") {
 			t.Errorf("plist contains a literal CR for %q:\n%q", v, doc)
 		}
-		plist := decodePlist(t, doc)
+		plist, err := decodePlist(doc)
+		if err != nil {
+			t.Fatalf("decodePlist for %q: %v", v, err)
+		}
 		if got := plist["ProgramArguments"].array[0].text; got != exe {
 			t.Errorf("executable round trip = %q, want %q", got, exe)
 		}
