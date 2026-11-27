@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
@@ -212,6 +213,131 @@ func TestReportUsageUsesBillingLinkHistory(t *testing.T) {
 					}
 				}
 			}
+		})
+	}
+}
+
+func TestReportUsageReplaysOriginalAttribution(t *testing.T) {
+	const (
+		org            = "org-1"
+		user           = "user-1"
+		accountA       = "ba-a"
+		accountB       = "ba-b"
+		service        = accountsv1.ServiceId_SERVICE_ID_OWNSAND
+		meter          = accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC
+		initialBalance = 10_000_000
+	)
+	window := time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, originalAccount string
+	}{
+		{name: "charged", originalAccount: accountA},
+		{name: "unattributed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var minute atomic.Int64
+			f := New(t, func() time.Time { return window.Add(time.Duration(minute.Load()) * time.Minute) })
+			members := map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER}
+			f.AddAccount(accountA, "Account A", members)
+			f.AddAccount(accountB, "Account B", members)
+			client := f.Client()
+			link := func(accountID string) *accountsv1.OrganizationBillingStatus {
+				t.Helper()
+				resp, err := client.LinkOrganization(t.Context(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+					OrganizationId: org, OrganizationName: "Org", BillingAccountId: accountID, UserId: user,
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return resp.Msg.GetStatus()
+			}
+			report := func(reports ...*accountsv1.UsageReport) *accountsv1.ReportUsageResponse {
+				t.Helper()
+				resp, err := client.ReportUsage(t.Context(), connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: reports}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return resp.Msg
+			}
+			assertResponse := func(got *accountsv1.ReportUsageResponse, status *accountsv1.OrganizationBillingStatus, results ...*accountsv1.UsageReportResult) {
+				t.Helper()
+				want := &accountsv1.ReportUsageResponse{Results: results}
+				if status != nil {
+					want.Statuses = []*accountsv1.OrganizationBillingStatus{status}
+				}
+				if !proto.Equal(got, want) {
+					t.Fatalf("ReportUsage = %v, want %v", got, want)
+				}
+			}
+			assertBilling := func(wantA, wantB, quantity, amount int64) {
+				t.Helper()
+				f.mu.Lock()
+				gotA := f.accounts[accountA].balance
+				f.mu.Unlock()
+				if gotA != wantA {
+					t.Fatalf("account A balance = %d, want %d", gotA, wantA)
+				}
+				resp, err := client.GetOrganizationBilling(t.Context(), connect.NewRequest(&accountsv1.GetOrganizationBillingRequest{OrganizationId: org}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.Msg.GetBillingAccountId() != accountB || resp.Msg.GetBalanceUsdMicros() != wantB {
+					t.Fatalf("current account and balance = %s, %d, want %s, %d", resp.Msg.GetBillingAccountId(), resp.Msg.GetBalanceUsdMicros(), accountB, wantB)
+				}
+				want := &accountsv1.MeterUsage{Meter: meter, Quantity: quantity, AmountUsdMicros: amount}
+				for _, usage := range resp.Msg.GetMeterUsages() {
+					if usage.GetMeter() == meter {
+						if !proto.Equal(usage, want) {
+							t.Fatalf("monthly usage = %v, want %v", usage, want)
+						}
+						return
+					}
+				}
+				t.Fatalf("monthly usage has no entry for %s", meter)
+			}
+
+			var firstStatus *accountsv1.OrganizationBillingStatus
+			wantA := int64(initialBalance)
+			if tc.originalAccount != "" {
+				firstStatus = link(tc.originalAccount)
+				wantA -= 30
+			}
+			minute.Store(10)
+			first := &accountsv1.UsageReport{
+				Service: service, OrganizationId: org, Meter: meter, WindowStart: timestamppb.New(window),
+				Quantity: 3, AmountUsdMicros: 30,
+			}
+			firstResult := &accountsv1.UsageReportResult{
+				Service: service, OrganizationId: org, Meter: meter, WindowStart: first.GetWindowStart(),
+				BillingAccountId: tc.originalAccount, Unattributed: tc.originalAccount == "",
+			}
+			assertResponse(report(first), firstStatus, firstResult)
+			firstReplay := proto.CloneOf(firstResult)
+			firstReplay.Duplicate = true
+			assertResponse(report(first), firstStatus, firstReplay)
+
+			if firstStatus != nil {
+				if _, err := client.UnlinkOrganization(t.Context(), connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{OrganizationId: org})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			currentStatus := link(accountB)
+			assertResponse(report(first), currentStatus, firstReplay)
+			assertBilling(wantA, initialBalance, 3, 30)
+
+			minute.Store(20)
+			next := proto.CloneOf(first)
+			next.WindowStart = timestamppb.New(window.Add(10 * time.Minute))
+			changed := proto.CloneOf(next)
+			changed.Quantity = 9
+			changed.AmountUsdMicros = 90
+			nextResult := &accountsv1.UsageReportResult{
+				Service: service, OrganizationId: org, Meter: meter, WindowStart: next.GetWindowStart(), BillingAccountId: accountB,
+			}
+			nextReplay := proto.CloneOf(nextResult)
+			nextReplay.Duplicate = true
+			assertResponse(report(next, first, changed), currentStatus, nextResult, firstReplay, nextReplay)
+			assertBilling(wantA, initialBalance-30, 6, 60)
 		})
 	}
 }
