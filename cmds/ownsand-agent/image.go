@@ -51,15 +51,7 @@ func imageBuild(cfg config.Config, f imageBuildFlags, stdout, stderr io.Writer, 
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitUsage
 	}
-	st, err := store.Open(cfg.StateDir)
-	if err != nil {
-		fmt.Fprintln(stderr, "ownsand-agent:", err)
-		return exitError
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	err = imagebuild.Build(ctx, imagebuild.Options{
-		ImagesDir:   st.Path(store.ImagesDir),
+	prepared, err := imagebuild.Prepare(imagebuild.Options{
 		GuestOS:     guestOS,
 		IPSW:        f.ipsw,
 		ISO:         f.iso,
@@ -68,8 +60,22 @@ func imageBuild(cfg config.Config, f imageBuildFlags, stdout, stderr io.Writer, 
 		CPUCount:    cpus,
 		MemoryMiB:   f.memoryMiB,
 		GuestBinary: f.guestBinary,
-		Logger:      newLogger(cfg),
 	})
+	if err != nil {
+		fmt.Fprintln(stderr, c.bad("image build failed:"), err)
+		if _, ok := errors.AsType[*imagebuild.UsageError](err); ok {
+			return exitUsage
+		}
+		return exitError
+	}
+	st, err := store.Open(cfg.StateDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent:", err)
+		return exitError
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err = prepared.Build(ctx, st.Path(store.ImagesDir), newLogger(cfg))
 	if err != nil {
 		fmt.Fprintln(stderr, c.bad("image build failed:"), err)
 		if errors.Is(err, imagebuild.ErrUnsupported) {
