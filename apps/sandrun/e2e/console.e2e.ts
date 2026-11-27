@@ -719,6 +719,28 @@ describe("requests", () => {
 });
 
 describe("integrations", () => {
+  test("removes the OwnSand link only after confirmation", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+
+    const dialog = screen.getByRole("alertdialog", "Remove the OwnSand link?");
+    const remove = screen.getByRole("button", "Remove link", { exact: true });
+    await remove.tap();
+    await expect(dialog).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+
+    await remove.tap();
+    await dialog.getByRole("button", "Remove link").tap();
+    await expect(dialog).toBeHidden();
+    await expect(screen.getByText("OwnSand is not linked")).toBeVisible();
+  });
+
   test("opens management actions for an integration on the next page", async ({
     app,
     screen,

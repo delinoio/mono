@@ -59,6 +59,7 @@ import {
 } from "@delino/sandrun-protos/v1/organization_pb";
 import {
   OwnSandLinkService,
+  type RemoveOwnSandLinkRequest,
   type SetOwnSandLinkRequest,
 } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import {
@@ -855,9 +856,10 @@ describe("OwnSand link", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  function renderLinkReplacement() {
+  function renderLinkFixture() {
     const mock = createMockTransport();
     let target: string | undefined = MOCK_IDS.ownsandAcme;
+    let createTime = { seconds: 1_700_000_000n, nanos: 0 };
     const readLink = rs.fn(() => {
       if (target === undefined) return {};
       return {
@@ -866,15 +868,22 @@ describe("OwnSand link", () => {
           ownsandOrganizationId: target,
           state: OwnSandLinkState.ACTIVE,
           credentialSet: true,
+          createTime,
         },
       };
     });
     const writes: SetOwnSandLinkRequest[] = [];
+    const removals: RemoveOwnSandLinkRequest[] = [];
     const linkTransport = createRouterTransport((router) => {
       router.service(OwnSandLinkService, {
         getOwnSandLink: readLink,
         setOwnSandLink(request) {
           writes.push(request);
+          return {};
+        },
+        removeOwnSandLink(request) {
+          removals.push(request);
+          target = undefined;
           return {};
         },
       });
@@ -891,9 +900,11 @@ describe("OwnSand link", () => {
     });
     return {
       writes,
+      removals,
       readLink,
-      async refresh(next: string | undefined) {
+      async refresh(next: string | undefined, creationNanos = 0) {
         target = next;
+        createTime = { ...createTime, nanos: creationNanos };
         await act(() => invalidateServices(queryClient, OwnSandLinkService));
       },
     };
@@ -920,7 +931,7 @@ describe("OwnSand link", () => {
   ] as const)(
     "disables a replacement opening when the link is %s",
     async (_, next) => {
-      const { writes, refresh } = renderLinkReplacement();
+      const { writes, refresh } = renderLinkFixture();
       const { dialog, input, submit } = await openReplacement("osk_stale");
 
       await refresh(next);
@@ -960,7 +971,7 @@ describe("OwnSand link", () => {
   );
 
   test("replaces the key for the original organization after an unchanged refresh", async () => {
-    const { writes, readLink, refresh } = renderLinkReplacement();
+    const { writes, readLink, refresh } = renderLinkFixture();
     const { input, submit } = await openReplacement("osk_replacement");
 
     await refresh(MOCK_IDS.ownsandAcme);
@@ -988,6 +999,44 @@ describe("OwnSand link", () => {
     expect(dialog.textContent).toContain("deletes every runner");
     await click(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(screen.getByRole("button", { name: "Remove link" })).toBeTruthy();
+  });
+
+  test.each([
+    ["removed", undefined, 0],
+    ["changed", MOCK_IDS.ownsandNorthwind, 0],
+    ["recreated", MOCK_IDS.ownsandAcme, 1],
+  ] as const)(
+    "clears a removal confirmation when the link is %s",
+    async (_, next, creationNanos) => {
+      const { removals, refresh } = renderLinkFixture();
+      await click(await screen.findByRole("button", { name: "Remove link" }));
+      await screen.findByRole("alertdialog");
+
+      await refresh(next, creationNanos);
+      await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+      expect(removals).toHaveLength(0);
+
+      await refresh(MOCK_IDS.ownsandAcme);
+      const remove = await screen.findByRole("button", { name: "Remove link" });
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(removals).toHaveLength(0);
+      await click(remove);
+      const fresh = await screen.findByRole("alertdialog");
+      await click(within(fresh).getByRole("button", { name: "Remove link" }));
+      expect(removals).toMatchObject([{ organizationId: MOCK_IDS.acme }]);
+    },
+  );
+
+  test("removes the OwnSand link once after an unchanged refresh", async () => {
+    const { removals, refresh } = renderLinkFixture();
+    await click(await screen.findByRole("button", { name: "Remove link" }));
+
+    await refresh(MOCK_IDS.ownsandAcme);
+
+    const dialog = await screen.findByRole("alertdialog");
+    await click(within(dialog).getByRole("button", { name: "Remove link" }));
+    expect(await screen.findByText("OwnSand is not linked")).toBeTruthy();
+    expect(removals).toMatchObject([{ organizationId: MOCK_IDS.acme }]);
   });
 });
 
