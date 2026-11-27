@@ -1499,15 +1499,17 @@ export function createMockTransport(
             Code.FailedPrecondition,
           );
         issuedStates.delete(req.state);
-        if (
-          org.installations.some(
-            (i) => i.githubInstallationId === req.githubInstallationId,
+        for (const linkedOrg of orgs.values()) {
+          if (
+            linkedOrg.installations.some(
+              (i) => i.githubInstallationId === req.githubInstallationId,
+            )
           )
-        )
-          throw new ConnectError(
-            "the installation is already linked",
-            Code.AlreadyExists,
-          );
+            throw new ConnectError(
+              "the installation is already linked",
+              Code.AlreadyExists,
+            );
+        }
         const installation = create(GitHubInstallationSchema, {
           installationId: uuidV7(),
           organizationId: req.organizationId,
