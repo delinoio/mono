@@ -357,6 +357,14 @@ func awaitServe(ctx context.Context, stop func(), srv *http.Server, serveErr <-c
 	if shutdownErr != nil {
 		logger.Error("server_shutdown_failed", slog.Any("error", shutdownErr))
 	}
+	var closeErr error
+	if errors.Is(shutdownErr, context.DeadlineExceeded) {
+		// Shutdown leaves active connections open when the deadline expires.
+		closeErr = srv.Close()
+		if closeErr != nil {
+			logger.Error("server_close_failed", slog.Any("error", closeErr))
+		}
+	}
 
 	// If cancellation won the select, collect the Serve result now to retain
 	// any concurrent listener failure. Shutdown makes Serve return.
@@ -365,7 +373,7 @@ func awaitServe(ctx context.Context, stop func(), srv *http.Server, serveErr <-c
 			listenerErr = err
 		}
 	}
-	if err := errors.Join(shutdownErr, listenerErr); err != nil {
+	if err := errors.Join(shutdownErr, listenerErr, closeErr); err != nil {
 		return err
 	}
 	logger.Info("server_shutdown_completed")
