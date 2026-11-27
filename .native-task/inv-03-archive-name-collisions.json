@@ -1,0 +1,62 @@
+{
+  "gid": "inv-03-archive-name-collisions",
+  "commit": "9f29c9571b4ff0e2e0f199f9d8812fb7ecad0b2a",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "9f29c9571b4ff0e2e0f199f9d8812fb7ecad0b2a",
+    "platform": "Windows with a macOS fallback for symlink-capable case-insensitive validation",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "setup": "Run in PowerShell from the matching repository checkout on a case-insensitive volume. Record the actual checkout SHA and both fixture capability logs. When both process contexts are available, rerun the last command from a context with the opposite symlink capability and save its output under a distinct name.",
+    "commands": [
+      "git rev-parse HEAD",
+      "go env GOOS GOARCH",
+      "New-Item -ItemType Directory -Force .t3-tmp/validation | Out-Null",
+      "$archiveTemp = (Resolve-Path .t3-tmp/validation).Path",
+      "$env:TEMP = $archiveTemp; $env:TMP = $archiveTemp; $env:GOTMPDIR = $archiveTemp",
+      "go test ./go/sandrun -run '^TestDownload(DestinationCaseCollision|Archive(SeparatorCollision|MixedCaseCollision|MixedRepeatedName|RepeatedName))$' -count=1 -v 2>&1 | Tee-Object .t3-tmp/validation/windows-archive-name-collisions.log; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The separator fixture reports that the two spellings map to one local path. Both archive orders with an absent and an existing destination return failed_precondition with both original names. The previous destination state remains, and local staging and the fixture guest archive are removed.",
+      "On a case-insensitive volume, the regular-only case collision and the regular-first mixed case collision return failed_precondition with both original names and preserve both destination states.",
+      "When the process can create a symlink, the mixed symlink-first case gives the same failure and cleanup. The exact-name mixed fixtures pass in both orders.",
+      "When the process cannot create a symlink, the mixed regular-first case still gives the collision error. The noncolliding link produces the warning and preserves both regular files. The reverse-order fixture skips because it cannot stage a symlink.",
+      "The optional ./ prefix continues to allow the last regular entry for a repeated archive name to replace its predecessor."
+    ],
+    "files": {
+      "regressionTests": [
+        "go/sandrun/download_case_test.go",
+        "go/sandrun/download_progress_test.go",
+        "go/sandrun/sync_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/validation/windows-archive-name-collisions.log",
+        ".t3-tmp/validation/macos-archive-name-collisions.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-03-archive-name-collisions/worker/.t3-tmp/validation/sandrun-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-03-archive-name-collisions/worker/.t3-tmp/validation/sandrun-darwin-arm64.test"
+      ]
+    },
+    "macosFallback": {
+      "host": "m3-16",
+      "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+      "setup": "Run from the matching checkout on case-insensitive APFS with symlink support if the Windows process cannot create symlinks. The separator case itself requires Windows.",
+      "commands": [
+        "git rev-parse HEAD",
+        "go env GOOS GOARCH",
+        "mkdir -p \"$PWD/.t3-tmp/validation\"",
+        "(set -o pipefail; TMPDIR=\"$PWD/.t3-tmp/validation\" go test ./go/sandrun -run '^TestDownload(DestinationCaseCollision|Archive(MixedCaseCollision|MixedRepeatedName))$' -count=1 -v 2>&1 | tee \"$PWD/.t3-tmp/validation/macos-archive-name-collisions.log\")"
+      ],
+      "expectedResults": [
+        "The probe reports case-sensitive: false and symlink creation: true. Both mixed orders and both destination states pass with failed_precondition, both archive names, preserved destinations and cleanup.",
+        "The regular-only case collision and exact-name mixed replacement fixtures also pass."
+      ],
+      "files": [
+        "go/sandrun/download_case_test.go",
+        "go/sandrun/download_progress_test.go",
+        "go/sandrun/sync_test.go"
+      ]
+    }
+  }
+}
