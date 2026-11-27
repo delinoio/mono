@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
@@ -371,11 +373,18 @@ func holdResume(agent *testenv.FakeAgent, sandboxID string) *resumeHold {
 // Release answers the withheld resume as the agent would have: it resumes
 // the sandbox and sends the result.
 func (h *resumeHold) Release() {
+	cmd := h.command()
+	h.sendResult(cmd.GetCommandId(), h.agent.DefaultAnswer(cmd))
+}
+
+func (h *resumeHold) command() *ownsandv1.AgentCommand {
 	h.mu.Lock()
-	cmd := h.held
-	h.mu.Unlock()
-	res := h.agent.DefaultAnswer(cmd)
-	res.CommandId = cmd.GetCommandId()
+	defer h.mu.Unlock()
+	return h.held
+}
+
+func (h *resumeHold) sendResult(id string, res *ownsandv1.AgentCommandResult) {
+	res.CommandId = id
 	h.agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: res}})
 }
 
@@ -639,6 +648,181 @@ func TestCallerPauseSurvivesControlPlaneReplacement(t *testing.T) {
 	if s := getSandbox(t, c, f.org.ID, adopted); s.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		t.Fatalf("the adopted sandbox is %v, want PAUSED", s.GetState())
 	}
+}
+
+func TestCallerPauseRejectsUnresolvedBillingResume(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		restart bool
+		fence   bool
+	}{
+		{name: "late result"},
+		{name: "legacy agent after API restart", restart: true},
+		{name: "lost result after API restart", restart: true, fence: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newMarkerFixtureWith(t, func(o *app.Options) {
+				timing := api.DefaultTiming()
+				timing.CommandWait = 300 * time.Millisecond
+				o.Timing = &timing
+			})
+			adopted, control, hold, passDone := startResumeInFlight(t, f)
+			waitPass(t, passDone)
+			waitState(t, f.org.OwnerClient, f.org.ID, control, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+			peer := f.env.StartPeer()
+			pauses := pauseCommands(f.agent, adopted)
+			assertUnresolved := func(c *testenv.Clients) {
+				t.Helper()
+				if _, err := pauseRPC(c, f.org.ID, adopted); connect.CodeOf(err) != connect.CodeUnavailable || !strings.Contains(err.Error(), "automatic billing resume") {
+					t.Fatalf("PauseSandbox = %v, want unresolved billing resume", err)
+				}
+				if !pausedByBilling(t, f.env, adopted) || pauseCommands(f.agent, adopted) != pauses {
+					t.Fatal("the unresolved pause cleared the billing mark or sent a pause")
+				}
+			}
+			assertUnresolved(f.org.OwnerClient)
+			assertUnresolved(peer.User(f.org.Owner))
+
+			if test.restart {
+				f.env.Restart()
+				select {
+				case <-f.agent.Closed():
+				case <-time.After(10 * time.Second):
+					t.Fatal("the original channel is still open")
+				}
+				f.agent.ResumeFenceSupported = test.fence
+				f.agent.Connect()
+				// The replacement channel's PAUSED report is not evidence
+				// that the earlier resume finished.
+				assertUnresolved(f.env.User(f.org.Owner))
+			}
+
+			if test.fence {
+				fenceReceived := make(chan *ownsandv1.AgentCommand, 1)
+				f.agent.SetOnCommand(func(a *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+					if cmd.GetFenceResume().GetSandboxId() == adopted {
+						fenceReceived <- cmd
+						return nil
+					}
+					return a.DefaultAnswer(cmd)
+				})
+				enforceBilling(t, f.env)
+				var fence *ownsandv1.AgentCommand
+				select {
+				case fence = <-fenceReceived:
+				case <-time.After(10 * time.Second):
+					t.Fatal("the replacement API did not send the fence")
+				}
+				if got := fence.GetFenceResume().GetResumeCommandId(); got != hold.command().GetCommandId() {
+					t.Fatalf("fence refers to %s, want %s", got, hold.command().GetCommandId())
+				}
+				assertUnresolved(f.env.User(f.org.Owner))
+				// Apply the resume on the device and drop its original
+				// result. The fence supplies the only RUNNING entry.
+				entry := f.agent.DefaultAnswer(hold.command()).GetSandbox().GetSandbox()
+				hold.sendResult(fence.GetCommandId(), &ownsandv1.AgentCommandResult{
+					Result: &ownsandv1.AgentCommandResult_FenceResume{FenceResume: &ownsandv1.FenceResumeResult{
+						ResumeCommandId: fence.GetFenceResume().GetResumeCommandId(), Sandbox: entry,
+					}},
+				})
+			} else {
+				enforceBilling(t, f.env)
+				assertUnresolved(f.env.User(f.org.Owner))
+				for _, cmd := range f.agent.Commands() {
+					if cmd.GetFenceResume() != nil {
+						t.Fatal("the API sent a fence to a legacy agent")
+					}
+				}
+				hold.Release()
+			}
+
+			c := f.env.User(f.org.Owner)
+			waitState(t, c, f.org.ID, adopted, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+			sb, err := pauseRPC(c, f.org.ID, adopted)
+			if err != nil || sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+				t.Fatalf("retried PauseSandbox = %v, %v", sb.GetState(), err)
+			}
+			enforceBilling(t, f.env)
+			if n := resumeCommands(f.agent, adopted); n != 1 {
+				t.Fatalf("automatic resumes for the adopted sandbox = %d, want 1", n)
+			}
+			if f.agent.Sandbox(adopted).GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED ||
+				getSandbox(t, c, f.org.ID, adopted).GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED ||
+				pausedByBilling(t, f.env, adopted) {
+				t.Fatal("the adopted sandbox did not stay PAUSED with its billing mark cleared")
+			}
+		})
+	}
+}
+
+func TestBillingResumeQueueRejectionClearsAttempt(t *testing.T) {
+	f := newMarkerFixture(t)
+	id := f.create(t)
+	f.suspendAll(t, id)
+	setOrgPhase(t, f.env, f.org, billing.PhaseAllowed)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Hold the row so the resume selects a live channel, but has not
+	// committed its tracking record or called Send yet.
+	lock, err := f.env.DB.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	tx, err := lock.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM sandboxes WHERE sandbox_id = $1 FOR UPDATE", id); err != nil {
+		t.Fatal(err)
+	}
+	passDone := make(chan error, 1)
+	go func() { passDone <- f.env.App.Enforcer.Pass(ctx) }()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		var blocked bool
+		if err := f.env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+			AND query LIKE 'UPDATE sandboxes s SET billing_resume_command_id =%'
+			AND $1 = ANY(pg_blocking_pids(pid)))`, int32(lock.Conn().PgConn().PID())).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case err := <-passDone:
+			t.Fatalf("the billing pass returned before persisting the attempt: %v", err)
+		case <-ctx.Done():
+			t.Fatal("the resume did not wait for the sandbox row")
+		case <-tick.C:
+		}
+	}
+
+	f.env.App.Service.Hub.Live(f.dev.ID).Close(errors.New("test closed the resume channel before queueing"))
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitPass(t, passDone)
+	var pending bool
+	if err := f.env.DB.Pool.QueryRow(ctx, "SELECT billing_resume_command_id IS NOT NULL FROM sandboxes WHERE sandbox_id = $1", id).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending || !pausedByBilling(t, f.env, id) || resumeCommands(f.agent, id) != 0 {
+		t.Fatalf("rejected resume changed ownership, sent a command or left a pending attempt (%v)", pending)
+	}
+	select {
+	case <-f.agent.Closed():
+	case <-ctx.Done():
+		t.Fatal("the original agent channel is still open")
+	}
+	f.agent.Connect()
+	c := f.env.User(f.org.Owner)
+	enforceBilling(t, f.env)
+	waitState(t, c, f.org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 }
 
 const sandboxOrderLockTestKey = "hashtextextended('ownsand.sandbox-order:' || $1::text, 0)"

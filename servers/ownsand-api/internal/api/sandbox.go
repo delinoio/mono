@@ -792,15 +792,9 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 // A caller's pause removes the billing pause mark, so a sandbox that a caller
 // paused stays paused after a billing recovery. It is the only way to take the
 // ownership from billing, which otherwise keeps its mark until the sandbox
-// ends (see BillingEnforcer.resume). This includes a sandbox that
-// billing already paused: the pause succeeds without a command, and it clears
-// the mark before it returns. The caller pause and the billing worker's
-// resume of the same sandbox run one at a time under the sandbox ordering lock
-// (withSandboxOrder), on every instance: a resume that is already in flight
-// finishes, including the reconciliation of the agent's result, before the
-// pause reads the sandbox state, so a sandbox that actually resumed is paused
-// through the normal pause path; a resume that has not started finds the mark
-// removed and sends no command.
+// ends (see BillingEnforcer.resume). The ordering lock serializes caller
+// pauses with automatic resume dispatch on all instances. Even after the
+// command wait expires, an unresolved resume prevents caller adoption.
 func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
 	orgID, err := normalizeID("organization_id", rawOrgID)
 	if err != nil {
@@ -833,9 +827,15 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 	}
 	var sb *sandboxRow
 	err = h.withSandboxOrder(ctx, sandboxID, func(conn *pgx.Conn) error {
-		var err error
+		pending, err := pendingBillingResume(ctx, conn, orgID, sandboxID)
+		if err != nil {
+			return h.internal(ctx, "check pending billing resume", err)
+		}
+		if pending != "" {
+			return errUnavailable("an automatic billing resume is still unresolved; retry the pause")
+		}
 		sb, err = h.pauseOrResumeSandbox(ctx, orgID, sandboxID, true, pauseOrResumeHooks{
-			enqueue: func(send func() error) error {
+			enqueue: func(_ string, send func() error) error {
 				return h.enqueueCallerPause(ctx, conn, orgID, sandboxID, send)
 			},
 			onSettled: func() error { return clearBillingPauseMark(ctx, conn, orgID, sandboxID) },
@@ -894,9 +894,8 @@ type pauseOrResumeHooks struct {
 	// beforeSend rechecks billing eligibility. errBillingStale drops obsolete
 	// work and passes through to the worker.
 	beforeSend func() error
-	// enqueue wraps the send so a caller pause can commit its ownership
-	// change only after the queue accepts the command.
-	enqueue func(send func() error) error
+	// enqueue wraps the send for durable billing ownership and resume tracking.
+	enqueue func(commandID string, send func() error) error
 	// onSettled takes ownership when no command is needed.
 	onSettled func() error
 }
@@ -951,7 +950,7 @@ func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID str
 	}
 	enqueue := send
 	if hooks.enqueue != nil {
-		enqueue = func() error { return hooks.enqueue(send) }
+		enqueue = func() error { return hooks.enqueue(cmd.CommandId, send) }
 	}
 	if err := enqueue(); err != nil {
 		return nil, err

@@ -104,6 +104,7 @@ type billingTarget struct {
 	orgID, sandboxID, deviceID string
 	state                      ownsandv1.SandboxState
 	deletePending              bool
+	resumePending              bool
 }
 
 // Pass runs one suspension and resume pass.
@@ -116,7 +117,7 @@ func (e *BillingEnforcer) Pass(ctx context.Context) error {
 	}
 	now := s.now()
 	suspendedSince := now.Add(-billing.SuspendAfter)
-	pause, err := e.targets(ctx, `SELECT s.organization_id::text, s.sandbox_id::text, s.device_id::text, s.agent_state, s.delete_pending
+	pause, err := e.targets(ctx, `SELECT s.organization_id::text, s.sandbox_id::text, s.device_id::text, s.agent_state, s.delete_pending, false
 		FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
 		WHERE s.agent_state = $1 AND NOT s.delete_pending
 		AND `+pausingPhaseSQL("$2")+`
@@ -126,9 +127,9 @@ func (e *BillingEnforcer) Pass(ctx context.Context) error {
 		s.Logger.WarnContext(ctx, "billing_enforcement_failed", slog.Any("error", err))
 		return err
 	}
-	resume, err := e.targets(ctx, `SELECT s.organization_id::text, s.sandbox_id::text, s.device_id::text, s.agent_state, s.delete_pending
+	resume, err := e.targets(ctx, `SELECT s.organization_id::text, s.sandbox_id::text, s.device_id::text, s.agent_state, s.delete_pending, s.billing_resume_command_id IS NOT NULL
 		FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
-		WHERE s.paused_by_billing AND `+allowedPhaseSQL+`
+		WHERE s.billing_resume_command_id IS NOT NULL OR (s.paused_by_billing AND `+allowedPhaseSQL+`)
 		ORDER BY s.organization_id, s.sandbox_id`)
 	if err != nil {
 		s.Logger.WarnContext(ctx, "billing_enforcement_failed", slog.Any("error", err))
@@ -165,7 +166,7 @@ func (e *BillingEnforcer) targets(ctx context.Context, sql string, args ...any) 
 	for rows.Next() {
 		var t billingTarget
 		var state int16
-		if err := rows.Scan(&t.orgID, &t.sandboxID, &t.deviceID, &state, &t.deletePending); err != nil {
+		if err := rows.Scan(&t.orgID, &t.sandboxID, &t.deviceID, &state, &t.deletePending, &t.resumePending); err != nil {
 			return nil, err
 		}
 		t.state = ownsandv1.SandboxState(state)
@@ -278,15 +279,16 @@ func (e *BillingEnforcer) recheck(ctx context.Context, sql string, args ...any) 
 // RUNNING sandbox or of a successful resume would leave such a late pause
 // without an owner, and no recovery would resume it. The mark is cleared only
 // for an ended sandbox (DELETED or FAILED), which no command can change any
-// more.
+// more. Automatic resumes are tracked separately from that mark.
 //
 // Rollout limit: the retention cannot restore a mark that an earlier
 // version cleared. A PAUSED sandbox without a mark is indistinguishable from
 // a caller's pause, so it is never inferred to belong to billing.
 //
-// A marked, live sandbox that is not PAUSED is left alone: no command, no
-// write and no per-pass log. A marked PAUSED sandbox is resumed only under
-// a confirmed ALLOWED status and when it has no pending delete.
+// Recovery first fences an unresolved automatic resume, even when billing
+// is no longer ALLOWED or the device already reported RUNNING. Otherwise,
+// a marked PAUSED sandbox resumes only under confirmed ALLOWED status and
+// when it has no pending delete.
 //
 // Like pause, it rechecks right before the command is sent (and before the
 // mark of an ended sandbox is cleared) that the organization is still
@@ -297,7 +299,7 @@ func (e *BillingEnforcer) recheck(ctx context.Context, sql string, args ...any) 
 // recheck.
 func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 	s := e.s
-	if t.state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+	if !t.resumePending && t.state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		if isTerminal(t.state) {
 			e.unmarkEnded(ctx, t)
 		}
@@ -305,36 +307,36 @@ func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 		// sent earlier can still complete.
 		return
 	}
-	if t.deletePending {
+	if !t.resumePending && t.deletePending {
 		// A pending delete ends the sandbox; keep the mark until then.
 		return
 	}
-	if s.Hub.Live(t.deviceID) == nil {
+	channel := s.Hub.Live(t.deviceID)
+	if channel == nil {
 		s.Logger.DebugContext(ctx, "billing_sandbox_resume_deferred", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 		return
 	}
-	// The recheck, the command and the reconciliation of the agent's result run
-	// under the sandbox ordering lock. A caller's PauseSandbox of the same
-	// sandbox, on any instance, waits for them, and it cancels this resume when
-	// it ran first: it removes the mark, which the recheck requires. The mark
-	// stays after the resume (see above).
 	var sent, resumed bool
-	err := s.withSandboxOrder(ctx, t.sandboxID, func(_ *pgx.Conn) error {
-		sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, pauseOrResumeHooks{beforeSend: func() error {
-			if err := e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
-			WHERE s.sandbox_id = $1 AND s.paused_by_billing AND s.agent_state = $2 AND NOT s.delete_pending AND `+allowedPhaseSQL+`)`,
-				t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)); err != nil {
-				return err
-			}
-			sent = true
-			return nil
-		}})
+	err := s.withSandboxOrder(ctx, t.sandboxID, func(conn *pgx.Conn) error {
+		pending, err := pendingBillingResume(ctx, conn, t.orgID, t.sandboxID)
 		if err != nil {
 			return err
 		}
-		// Only a command that the agent confirmed counts as a resume. When the
-		// agent has not reported it yet, a later pass finds the sandbox RUNNING
-		// and marked and leaves it alone, or PAUSED and sends the command again.
+		if pending != "" {
+			return s.sendResumeFence(ctx, channel, t, pending)
+		}
+		// A fence or late result may have cleared the pending command since
+		// selection. Recheck current eligibility before dispatching again.
+		sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, pauseOrResumeHooks{
+			enqueue: func(commandID string, send func() error) error {
+				err := s.enqueueBillingResume(ctx, conn, t, commandID, send)
+				sent = err == nil
+				return err
+			},
+		})
+		if err != nil {
+			return err
+		}
 		resumed = sent && sb.AgentState == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
 		return nil
 	})
