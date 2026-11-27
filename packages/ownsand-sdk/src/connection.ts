@@ -55,20 +55,18 @@ export function processEnv(): Env {
 }
 
 /**
- * Reports whether the text after the authority of a special-scheme URL is
- * empty or a single "/". The URL parser removes dot segments, so a path such as
- * "/subdir/.." or "/." reads as "/" after parsing; this check reads the raw
- * text instead. Like the URL parser, it ignores leading and trailing C0
- * control characters and spaces, drops tabs and line breaks, and treats "\\" as
- * a path separator.
+ * Splits the written authority and tail of a special-scheme URL. The URL
+ * parser removes empty userinfo and normalizes dot segments in the path.
+ * Like the parser, this split ignores leading and trailing C0 controls and
+ * spaces, drops tabs and line breaks, and treats "\\" as a path separator.
  */
-function rawPathIsRoot(raw: string): boolean {
+function splitWrittenOrigin(raw: string): [authority: string, tail: string] {
   const text = raw
     .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "")
     .replace(/[\t\n\r]/g, "");
   const afterScheme = text.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:[/\\]*/, "");
-  const tail = afterScheme.slice(afterScheme.search(/[/\\?#]|$/));
-  return tail === "" || tail === "/";
+  const authorityEnd = afterScheme.search(/[/\\?#]|$/);
+  return [afterScheme.slice(0, authorityEnd), afterScheme.slice(authorityEnd)];
 }
 
 /**
@@ -83,10 +81,16 @@ export function resolveApiOrigin(value: string | undefined): string {
   } catch {
     throw new OwnSandConfigError("origin is not a valid URL");
   }
-  if (url.username !== "" || url.password !== "") {
+  const isHttp = url.protocol === "https:" || url.protocol === "http:";
+  const [authority, tail] = splitWrittenOrigin(raw);
+  if (
+    url.username !== "" ||
+    url.password !== "" ||
+    (isHttp && authority.includes("@"))
+  ) {
     throw new OwnSandConfigError("origin must not contain credentials");
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
+  if (!isHttp) {
     throw new OwnSandConfigError("origin must use http or https");
   }
   if (
@@ -95,7 +99,7 @@ export function resolveApiOrigin(value: string | undefined): string {
     url.hash !== "" ||
     raw.includes("?") ||
     raw.includes("#") ||
-    !rawPathIsRoot(raw)
+    (tail !== "" && tail !== "/")
   ) {
     throw new OwnSandConfigError(
       "origin must not have a path, query or fragment",
