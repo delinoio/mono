@@ -49,6 +49,7 @@ import {
 import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import {
+  AcceptInvitationResponseSchema,
   type ListInvitationsRequest,
   type ListMembersRequest,
   MemberService,
@@ -5419,7 +5420,7 @@ describe("invitations", () => {
     ]);
   });
 
-  function holdInvitationAccept() {
+  function holdInvitationAccept(organizationId?: string | null) {
     const mock = createMockTransport();
     let release = () => {};
     const promise = new Promise<void>((resolve) => {
@@ -5433,7 +5434,22 @@ describe("invitations", () => {
           requested();
           await promise;
         }
-        return mock.unary(method, ...args);
+        const response = await mock.unary(method, ...args);
+        if (
+          organizationId !== undefined &&
+          isMessage(response.message, AcceptInvitationResponseSchema)
+        ) {
+          if (organizationId === null) {
+            delete response.message.organization;
+          } else if (response.message.organization) {
+            response.message.organization.organizationId = organizationId;
+          } else {
+            throw new Error(
+              "The seeded acceptance must return an organization.",
+            );
+          }
+        }
+        return response;
       },
     };
     return { transport, release, requested };
@@ -5453,6 +5469,7 @@ describe("invitations", () => {
 
   const invalidInvitationNotice =
     "It was not found, or you no longer have access to it.";
+  const invitationRecoveryNotice = "You may have joined the organization.";
 
   function invitationInput() {
     return screen.getByLabelText<HTMLInputElement>("Invitation link or secret");
@@ -5464,6 +5481,70 @@ describe("invitations", () => {
       window.dispatchEvent(new HashChangeEvent("hashchange"));
     });
   }
+
+  test.each([
+    { response: "an omitted organization", organizationId: null },
+    { response: "an empty organization ID", organizationId: "" },
+    { response: "a whitespace-only organization ID", organizationId: "   " },
+  ])(
+    "offers the organization list after an acceptance with $response",
+    async ({ organizationId }) => {
+      const { transport, release, requested } =
+        holdInvitationAccept(organizationId);
+      const queryClient = renderConsole(
+        `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+        { transport, staleTime: Infinity },
+      );
+      await click(screen.getByRole("button", { name: "Join organization" }));
+      await act(async () => release());
+
+      expect(
+        (await within(screen.getByRole("main")).findByRole("alert"))
+          .textContent,
+      ).toBe(invitationRecoveryNotice);
+      expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+        "success",
+      );
+      expect(window.location.pathname).toBe("/invitations/accept");
+      expect(window.location.hash).toBe("");
+      expect(screen.queryByLabelText("Invitation link or secret")).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Join organization" }),
+      ).toBeNull();
+      expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+      expect(requested).toHaveBeenCalledTimes(1);
+
+      await click(
+        screen.getByRole("link", { name: "Go to your organizations" }),
+      );
+      expect(window.location.pathname).toBe("/");
+      expect(await screen.findByRole("link", { name: /Contoso/ })).toBeTruthy();
+    },
+  );
+
+  test("restores the form when a replacement link opens after recovery", async () => {
+    const { transport, release, requested } = holdInvitationAccept(null);
+    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
+      transport,
+    });
+    await click(screen.getByRole("button", { name: "Join organization" }));
+    await act(async () => release());
+    await screen.findByText(invitationRecoveryNotice);
+
+    await changeInvitationHash("#source=fixture");
+    expect(screen.getByText(invitationRecoveryNotice)).toBeTruthy();
+    await changeInvitationHash("#secret=sri_follow_up_invitation");
+
+    expect(screen.queryByText(invitationRecoveryNotice)).toBeNull();
+    expect(invitationInput().value).toBe("sri_follow_up_invitation");
+    expect(window.location.hash).toBe("");
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", {
+        name: "Join organization",
+      }).disabled,
+    ).toBe(false);
+    expect(requested).toHaveBeenCalledTimes(1);
+  });
 
   test("consumes a replacement link in place and submits only its secret", async () => {
     const path = "/invitations/accept?source=fixture";
@@ -5529,14 +5610,18 @@ describe("invitations", () => {
   });
 
   test.each([
-    { replacement: "link", result: "success" },
-    { replacement: "link", result: "error" },
-    { replacement: "edit", result: "success" },
-    { replacement: "edit", result: "error" },
+    { replacement: "link", result: "success", response: "complete" },
+    { replacement: "link", result: "success", response: "incomplete" },
+    { replacement: "link", result: "error", response: "rejected" },
+    { replacement: "edit", result: "success", response: "complete" },
+    { replacement: "edit", result: "success", response: "incomplete" },
+    { replacement: "edit", result: "error", response: "rejected" },
   ] as const)(
-    "keeps a replacement $replacement active after a late accept $result",
-    async ({ replacement, result }) => {
-      const { transport, release, requested } = holdInvitationAccept();
+    "keeps a replacement $replacement active after a late $response accept",
+    async ({ replacement, result, response }) => {
+      const { transport, release, requested } = holdInvitationAccept(
+        response === "incomplete" ? null : undefined,
+      );
       const queryClient = renderConsole("/", {
         transport,
         staleTime: Infinity,
@@ -5580,6 +5665,7 @@ describe("invitations", () => {
       expect(invitationInput().value).toBe(replacementSecret);
       expect(join.disabled).toBe(false);
       expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
+      expect(screen.queryByText(invitationRecoveryNotice)).toBeNull();
 
       if (result === "success") {
         await click(screen.getByRole("link", { name: "SandRun" }));
@@ -5691,10 +5777,17 @@ describe("invitations", () => {
     expect(window.location.pathname).toBe("/");
   });
 
-  test.each(["the SandRun link", "browser Back"])(
-    "refreshes organizations without navigating after the user leaves via %s",
-    async (departure) => {
-      const { transport, release, requested } = holdInvitationAccept();
+  test.each([
+    { departure: "the SandRun link", response: "complete" },
+    { departure: "the SandRun link", response: "incomplete" },
+    { departure: "browser Back", response: "complete" },
+    { departure: "browser Back", response: "incomplete" },
+  ] as const)(
+    "refreshes organizations after leaving via $departure before a $response response",
+    async ({ departure, response }) => {
+      const { transport, release, requested } = holdInvitationAccept(
+        response === "incomplete" ? null : undefined,
+      );
       renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
         transport,
       });
@@ -5719,6 +5812,7 @@ describe("invitations", () => {
       await act(async () => release());
 
       expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}`);
+      expect(screen.queryByText(invitationRecoveryNotice)).toBeNull();
       expect(
         await screen.findByRole("option", { name: /Contoso/ }),
       ).toBeTruthy();
