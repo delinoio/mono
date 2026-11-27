@@ -81,7 +81,14 @@ func testMacOSImagePublication(t *testing.T, previous, cancelAfterBoot bool, wan
 				cancel()
 			}
 		}}
-		err := withMacOSBuildDir(dir, slog.Default(), func(build string) error {
+		run := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return []byte(emptyDiskInventory), nil
+		}
+		mountPoints := func() ([]string, error) { return nil, nil }
+		err := withMacOSBuildDir(gated, dir, slog.Default(), run, mountPoints, func(build string) error {
 			writeMacOSFixture(t, build, "staged")
 			err := finishMacOSImage(gated, dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
 				if cancelAfterBoot {

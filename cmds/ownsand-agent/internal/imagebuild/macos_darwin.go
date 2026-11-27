@@ -56,7 +56,7 @@ func buildMacOS(ctx context.Context, dir string, opts Options) error {
 		// which only root can write.
 		return errors.New("imagebuild: the macOS image build needs root; run it with sudo")
 	}
-	return withMacOSBuildDir(dir, logger, func(build string) error {
+	return withMacOSBuildDir(ctx, dir, logger, runTool, macOSMountPoints, func(build string) error {
 		return buildAndInstallMacOS(ctx, dir, build, opts, logger)
 	})
 }
@@ -68,7 +68,6 @@ func buildAndInstallMacOS(ctx context.Context, dir, build string, opts Options, 
 		if err := downloadRestoreImage(ctx, ipsw, logger); err != nil {
 			return err
 		}
-		defer os.Remove(ipsw)
 	}
 	restore, err := vz.LoadMacOSRestoreImageFromPath(ipsw)
 	if err != nil {

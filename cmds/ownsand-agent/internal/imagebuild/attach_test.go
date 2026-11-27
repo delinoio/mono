@@ -149,12 +149,14 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 
 func TestWithAttachedDiskDetachesAfterUse(t *testing.T) {
 	useErr := errors.New("convert the volume list: plutil exited")
+	forceErr := errors.New("still busy")
 	for _, tc := range []struct {
 		name       string
 		out        string
 		use        error
 		detachErrs []error
 		wantErr    error
+		wantForce  bool
 		wantDetach [][]string
 		wantUse    bool
 	}{
@@ -169,14 +171,16 @@ func TestWithAttachedDiskDetachesAfterUse(t *testing.T) {
 		},
 		{
 			name: "forced detach fails after a successful use", out: attachPlist, wantUse: true,
-			detachErrs: []error{errors.New("resource busy"), errors.New("still busy")},
-			wantErr:    errors.New("still busy"),
+			detachErrs: []error{errors.New("resource busy"), forceErr},
+			wantErr:    forceErr,
+			wantForce:  true,
 			wantDetach: [][]string{{"detach", "/dev/disk4"}, {"detach", "-force", "/dev/disk4"}},
 		},
 		{
 			name: "forced detach fails but the original error stays", out: attachPlist, use: useErr, wantUse: true,
-			detachErrs: []error{errors.New("resource busy"), errors.New("still busy")},
+			detachErrs: []error{errors.New("resource busy"), forceErr},
 			wantErr:    useErr,
+			wantForce:  true,
 			wantDetach: [][]string{{"detach", "/dev/disk4"}, {"detach", "-force", "/dev/disk4"}},
 		},
 	} {
@@ -187,11 +191,11 @@ func TestWithAttachedDiskDetachesAfterUse(t *testing.T) {
 				used = whole
 				return tc.use
 			})
-			switch {
-			case tc.wantErr == nil && err != nil:
-				t.Fatalf("unexpected error: %v", err)
-			case tc.wantErr != nil && (err == nil || (!errors.Is(err, tc.wantErr) && err.Error() != tc.wantErr.Error())):
+			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if errors.Is(err, errDiskDetachUnconfirmed) != tc.wantForce || errors.Is(err, forceErr) != tc.wantForce {
+				t.Fatalf("error = %v, want forced detach failure = %v", err, tc.wantForce)
 			}
 			if got := f.detaches(); !reflect.DeepEqual(got, tc.wantDetach) {
 				t.Fatalf("detach calls = %v, want %v", got, tc.wantDetach)
@@ -240,17 +244,18 @@ func TestWithAttachedDiskRecoversInterruptedAttach(t *testing.T) {
 	detach := []string{"detach", device}
 	force := []string{"detach", "-force", device}
 	for _, tc := range []struct {
-		name, output string
-		inventories  []string
-		infoErr      error
-		detachErr    error
-		wantCalls    [][]string
+		name, output    string
+		inventories     []string
+		infoErr         error
+		detachErr       error
+		wantCalls       [][]string
+		wantUnconfirmed bool
 	}{
 		{name: "complete output", output: attachPlist, inventories: []string{matched}, wantCalls: [][]string{info, detach}},
 		{name: "tail truncated after complete entry", output: attachPlist[:disk4EntryEnd], inventories: []string{matched}, wantCalls: [][]string{info, detach}},
 		{name: "force retry with fresh verification", output: attachPlist, inventories: []string{matched, matched}, detachErr: errors.New("busy"), wantCalls: [][]string{info, detach, info, force}},
-		{name: "reuse after normal detach error", output: attachPlist, inventories: []string{matched, reused}, detachErr: errors.New("busy"), wantCalls: [][]string{info, detach, info}},
-		{name: "already gone after normal detach error", output: attachPlist, inventories: []string{matched, absent}, detachErr: errors.New("not found"), wantCalls: [][]string{info, detach, info}},
+		{name: "reuse after normal detach error", output: attachPlist, inventories: []string{matched, reused}, detachErr: errors.New("busy"), wantCalls: [][]string{info, detach, info}, wantUnconfirmed: true},
+		{name: "already gone after normal detach error", output: attachPlist, inventories: []string{matched, absent}, detachErr: errors.New("not found"), wantCalls: [][]string{info, detach, info}, wantUnconfirmed: true},
 		{name: "device already gone", output: attachPlist, inventories: []string{absent}, wantCalls: [][]string{info}},
 		{name: "device now belongs to an unrelated image", output: attachPlist, inventories: []string{reused}, wantCalls: [][]string{info}},
 		{name: "same device reported by two images", output: attachPlist, inventories: []string{doubleAssociation}, wantCalls: [][]string{info}},
@@ -294,7 +299,10 @@ func TestWithAttachedDiskRecoversInterruptedAttach(t *testing.T) {
 					tc.inventories = tc.inventories[1:]
 					return []byte(out), tc.infoErr
 				case "detach":
-					return nil, tc.detachErr
+					if len(args) == 2 {
+						return nil, tc.detachErr
+					}
+					return nil, nil
 				default:
 					t.Fatalf("unexpected hdiutil arguments %v", args)
 					return nil, nil
@@ -304,8 +312,11 @@ func TestWithAttachedDiskRecoversInterruptedAttach(t *testing.T) {
 				t.Fatal("use called after a failed attach")
 				return nil
 			})
-			if want := "imagebuild: attach the guest disk: context canceled"; !errors.Is(err, context.Canceled) || err.Error() != want {
+			if want := "imagebuild: attach the guest disk: context canceled"; !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), want) {
 				t.Fatalf("error = %v, want %q", err, want)
+			}
+			if errors.Is(err, errDiskDetachUnconfirmed) != tc.wantUnconfirmed {
+				t.Fatalf("error = %v, want unconfirmed detach = %v", err, tc.wantUnconfirmed)
 			}
 			if !reflect.DeepEqual(calls, tc.wantCalls) {
 				t.Fatalf("cleanup calls = %v, want %v", calls, tc.wantCalls)
@@ -392,19 +403,14 @@ func TestDataVolumeUnmountBeforeDetach(t *testing.T) {
 						return nil
 					})
 				})
-				switch {
-				case tc.cancelBuild:
-					if err != provisionErr {
-						t.Fatalf("error = %v, want the original error %v", err, provisionErr)
-					}
-				case tc.stall:
-					if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "unmount the guest Data volume") {
-						t.Fatalf("error = %v, want a Data volume unmount timeout", err)
-					}
-				default:
-					if err != nil {
-						t.Fatalf("unexpected error: %v", err)
-					}
+				if tc.cancelBuild && !errors.Is(err, provisionErr) {
+					t.Fatalf("error = %v, want the original error %v", err, provisionErr)
+				}
+				if tc.stall && (!errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "unmount the guest Data volume")) {
+					t.Fatalf("error = %v, want a Data volume unmount timeout", err)
+				}
+				if !tc.stall && err != nil {
+					t.Fatalf("unexpected error: %v", err)
 				}
 				want := [][]string{
 					{diskutilPath, "mount", "-mountPoint", mnt, data},

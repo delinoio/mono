@@ -4,34 +4,24 @@ package imagebuild
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"os"
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/vzrt"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // withMacOSBuildDir owns the staging directory through publication and cleanup.
-func withMacOSBuildDir(dir string, logger *slog.Logger, run func(build string) error) error {
+func withMacOSBuildDir(ctx context.Context, dir string, logger *slog.Logger, run hostRunner, mountPoints func() ([]string, error), buildImage func(build string) error) error {
 	build := images.BuildDir(dir)
-	if err := os.RemoveAll(build); err != nil {
+	if err := removeMacOSBuild(ctx, run, mountPoints, build); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(build, 0o700); err != nil {
 		return err
 	}
-	err := run(build)
-	if errors.Is(err, vzrt.ErrVMMayRun) {
-		// The build VM may still use the staged disk, so deleting it
-		// could corrupt a running guest. The next build removes it.
-		logger.Error("keeping the macOS build directory because the build VM may still run", "build_dir", build)
-	} else if err != nil {
-		os.RemoveAll(build)
-	}
-	return err
+	return cleanupFailedMacOSBuild(run, mountPoints, build, logger, buildImage(build))
 }
 
 func finishMacOSImage(ctx context.Context, dir string, metadata images.Metadata, downloadedIPSW string, firstBoot func() (string, error)) error {
