@@ -715,6 +715,7 @@ func TestCloseAfterExecStartFailure(t *testing.T) {
 
 func TestExecRequestPath(t *testing.T) {
 	const tool = "sandruntest-path-tool"
+	t.Chdir(t.TempDir())
 	requestDir, inheritedDir := t.TempDir(), t.TempDir()
 	binary, err := os.Executable()
 	if err != nil {
@@ -745,7 +746,7 @@ func TestExecRequestPath(t *testing.T) {
 	s := New()
 	t.Cleanup(s.Close)
 	client, ds := createExecTestSession(t, t.Context(), s, t.TempDir())
-	run := func(t *testing.T, name string, env map[string]string, wantPath string) {
+	run := func(t *testing.T, name string, env map[string]string, wantPath string) (childPath, childPathExt string) {
 		t.Helper()
 		stream, err := client.ExecDevSession(t.Context(), listTestRequest(&sandrunv1.ExecDevSessionRequest{
 			OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: s.newID(),
@@ -762,7 +763,7 @@ func TestExecRequestPath(t *testing.T) {
 			if final.GetFailed().GetReason() != want {
 				t.Fatalf("got %v, want %v", final, want)
 			}
-			return
+			return "", ""
 		}
 		if !hasExplicitZeroExitCode(final) {
 			t.Fatalf("got %v, want Exited with explicit exit code 0", final)
@@ -771,7 +772,11 @@ func TestExecRequestPath(t *testing.T) {
 		for _, event := range events {
 			stdout.Write(event.GetStdout().GetData())
 		}
-		gotPath, argv0, _ := strings.Cut(stdout.String(), "\n")
+		fields := strings.SplitN(stdout.String(), "\n", 4)
+		if len(fields) != 4 {
+			t.Fatalf("got incomplete child output %q", stdout.String())
+		}
+		gotPath, argv0 := fields[0], fields[1]
 		if argv0 != name {
 			t.Errorf("got argv[0] %q, want %q", argv0, name)
 		}
@@ -786,6 +791,7 @@ func TestExecRequestPath(t *testing.T) {
 		if !os.SameFile(gotFile, wantFile) {
 			t.Errorf("ran %q, want %q", gotPath, wantPath)
 		}
+		return fields[2], fields[3]
 	}
 
 	t.Run("request-only executable", func(t *testing.T) {
@@ -804,9 +810,36 @@ func TestExecRequestPath(t *testing.T) {
 		run(t, inheritedTool, map[string]string{pathKey: requestDir}, inheritedTool)
 	})
 	if runtime.GOOS == "windows" {
+		t.Run("request PATH aliases", func(t *testing.T) {
+			otherDir := t.TempDir()
+			otherTool := install(otherDir, tool+suffix)
+			childPath, _ := run(t, tool, map[string]string{
+				"PATH": requestDir, "Path": otherDir, "PATHEXT": ".EXE",
+			}, otherTool)
+			if childPath != otherDir {
+				t.Errorf("child PATH = %q, want %q", childPath, otherDir)
+			}
+		})
+		t.Run("winning PATH alias is empty", func(t *testing.T) {
+			run(t, tool, map[string]string{"PATH": requestDir, "Path": "", "PATHEXT": ".EXE"}, "")
+		})
+		comTool := install(requestDir, tool+".com")
 		t.Run("request PATHEXT order", func(t *testing.T) {
-			path := install(requestDir, tool+".com")
-			run(t, tool, map[string]string{pathKey: requestDir, "PathExt": ".COM;.EXE"}, path)
+			run(t, tool, map[string]string{pathKey: requestDir, "PathExt": ".COM;.EXE"}, comTool)
+		})
+		t.Run("request PATHEXT aliases", func(t *testing.T) {
+			const wantPathExt = ".COM;.EXE"
+			_, childPathExt := run(t, tool, map[string]string{
+				"PATH": requestDir, "PATHEXT": ".EXE;.COM", "PathExt": wantPathExt,
+			}, comTool)
+			if childPathExt != wantPathExt {
+				t.Errorf("child PATHEXT = %q, want %q", childPathExt, wantPathExt)
+			}
+		})
+	} else {
+		t.Run("PATH is case-sensitive", func(t *testing.T) {
+			run(t, tool, map[string]string{"PATH": requestDir, "Path": inheritedDir}, requestTool)
+			run(t, tool, map[string]string{"Path": requestDir}, inheritedTool)
 		})
 	}
 }
@@ -819,7 +852,7 @@ func TestExecRequestPathProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Printf("%s\n%s", path, os.Args[0])
+	fmt.Printf("%s\n%s\n%s\n%s", path, os.Args[0], os.Getenv("PATH"), os.Getenv("PATHEXT"))
 	os.Exit(0)
 }
 
