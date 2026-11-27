@@ -19,10 +19,13 @@ import {
   type AutoTopUpErrors,
   type AutoTopUpInput,
   type AutoTopUpValues,
+  AUTO_TOP_UP_MIN_AMOUNT_USD_MICROS,
+  AUTO_TOP_UP_MIN_THRESHOLD_USD_MICROS,
   checkAccountName,
   checkAlertThreshold,
   checkAutoTopUp,
   DEFAULT_ALERT_THRESHOLD_USD_MICROS,
+  TOP_UP_MAX_USD_MICROS,
 } from "../../forms.ts";
 import { formatCount } from "../../format.ts";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
@@ -283,13 +286,22 @@ function AutoTopUpForm({
     >
       <Switch
         label="Automatic top-up"
+        description={
+          draft.enabled
+            ? undefined
+            : "Enter amounts of $0.00 or more in whole cents. Blank fields save as $0.00. Saved values are available when you turn automatic top-up on."
+        }
         checked={draft.enabled}
         onCheckedChange={(enabled) => editDraft({ enabled })}
         disabled={!editable}
       />
       <TextField
         label="Threshold (USD)"
-        description="At least $10.00."
+        description={
+          draft.enabled
+            ? `At least ${formatUsd(AUTO_TOP_UP_MIN_THRESHOLD_USD_MICROS)}.`
+            : undefined
+        }
         value={draft.threshold}
         onChange={(event) => editDraft({ threshold: event.target.value })}
         error={errors.threshold}
@@ -299,7 +311,11 @@ function AutoTopUpForm({
       />
       <TextField
         label="Top-up amount (USD)"
-        description="At least $25.00. Tax is added on top."
+        description={
+          draft.enabled
+            ? `${formatUsd(AUTO_TOP_UP_MIN_AMOUNT_USD_MICROS)} to ${formatUsd(TOP_UP_MAX_USD_MICROS)}. Tax is added on top.`
+            : "Tax is added on top."
+        }
         value={draft.amount}
         onChange={(event) => editDraft({ amount: event.target.value })}
         error={errors.amount}
@@ -309,7 +325,9 @@ function AutoTopUpForm({
       />
       <TextField
         label="Monthly cap (USD)"
-        description="Required. At least the top-up amount."
+        description={
+          draft.enabled ? "Required. At least the top-up amount." : undefined
+        }
         value={draft.monthlyCap}
         onChange={(event) => editDraft({ monthlyCap: event.target.value })}
         error={errors.monthlyCap}
