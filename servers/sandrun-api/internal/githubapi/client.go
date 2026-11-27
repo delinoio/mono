@@ -2,8 +2,8 @@
 
 // Package githubapi is the GitHub REST client of sandrun-api for the SandRun
 // GitHub App, on net/http without a third-party client: the app JWT
-// (RS256), installation access tokens (cached until shortly before they
-// expire), the organization self-hosted runner endpoints (runner groups, JIT
+// (RS256), installation state and access tokens (cached until shortly before
+// they expire), the organization self-hosted runner endpoints (runner groups, JIT
 // configurations, runner lookup and removal), the OAuth code exchange with
 // GET /user/installations, and the app webhook deliveries with redelivery.
 // It also verifies webhook signatures.
@@ -227,6 +227,34 @@ func (c *Client) do(ctx context.Context, r request) (http.Header, error) {
 }
 
 func (c *Client) api(path string) string { return c.cfg.APIOrigin + path }
+
+// InstallationSuspended reads the current installation state with the app JWT.
+// GitHub can answer this request even when it refuses to issue an installation token.
+func (c *Client) InstallationSuspended(ctx context.Context, installationID int64) (bool, error) {
+	jwt, err := c.AppJWT()
+	if err != nil {
+		return false, err
+	}
+	var out struct {
+		ID          int64           `json:"id"`
+		SuspendedAt json.RawMessage `json:"suspended_at"`
+	}
+	if _, err := c.do(ctx, request{op: "get_installation", method: http.MethodGet,
+		url: c.api("/app/installations/" + strconv.FormatInt(installationID, 10)), auth: jwt,
+		ok: []int{http.StatusOK}, out: &out}); err != nil {
+		return false, err
+	}
+	if out.ID != installationID {
+		return false, errors.New("github get_installation: unexpected installation ID")
+	}
+	// An explicit null means active. A missing field or invalid timestamp
+	// cannot confirm either state.
+	var suspendedAt *time.Time
+	if len(out.SuspendedAt) == 0 || json.Unmarshal(out.SuspendedAt, &suspendedAt) != nil {
+		return false, errors.New("github get_installation: invalid or missing suspended_at")
+	}
+	return suspendedAt != nil, nil
+}
 
 // InstallationToken returns an installation access token, from the cache
 // while it is valid for more than tokenRefreshMargin.

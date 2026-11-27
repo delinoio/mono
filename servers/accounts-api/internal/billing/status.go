@@ -83,29 +83,31 @@ func (r StatusReason) Proto() accountsv1.BillingStatusReason {
 
 // OrganizationStatus is the billing status of a current link.
 type OrganizationStatus struct {
-	LinkID           string
-	Service          string
-	OrganizationID   string
-	OrganizationName string
-	BillingAccountID string
-	LinkTime         time.Time
-	Status           LinkStatus
-	Reason           StatusReason
-	BlockedSince     *time.Time
-	SuspendTime      *time.Time
-	Sequence         int64
+	LinkID              string
+	Service             string
+	OrganizationID      string
+	OrganizationName    string
+	BillingAccountID    string
+	LinkTime            time.Time
+	Status              LinkStatus
+	Reason              StatusReason
+	BlockedSince        *time.Time
+	SuspendTime         *time.Time
+	Sequence            int64
+	LastAllowedSequence int64
 }
 
 // Proto returns the protobuf message.
 func (o OrganizationStatus) Proto() *accountsv1.OrganizationBillingStatus {
 	service, _ := ServiceFromKey(o.Service)
 	out := &accountsv1.OrganizationBillingStatus{
-		Service:          service,
-		OrganizationId:   o.OrganizationID,
-		BillingAccountId: o.BillingAccountID,
-		Status:           o.Status.Proto(),
-		Reason:           o.Reason.Proto(),
-		Sequence:         o.Sequence,
+		Service:             service,
+		OrganizationId:      o.OrganizationID,
+		BillingAccountId:    o.BillingAccountID,
+		Status:              o.Status.Proto(),
+		Reason:              o.Reason.Proto(),
+		Sequence:            o.Sequence,
+		LastAllowedSequence: o.LastAllowedSequence,
 	}
 	if o.BlockedSince != nil {
 		out.BlockedSince = timestamppb.New(*o.BlockedSince)
@@ -120,13 +122,13 @@ func (o OrganizationStatus) Proto() *accountsv1.OrganizationBillingStatus {
 // as l.
 const statusColumns = `l.organization_link_id::text, l.service, l.organization_id, l.organization_name,
 	l.billing_account_id::text, l.link_time, COALESCE(l.billing_status, ''), COALESCE(l.status_reason, ''),
-	l.blocked_since, l.suspend_time, COALESCE(l.status_sequence, 0)`
+	l.blocked_since, l.suspend_time, COALESCE(l.status_sequence, 0), l.last_allowed_sequence`
 
 func scanStatus(row pgx.Row) (OrganizationStatus, error) {
 	var o OrganizationStatus
 	var status, reason string
 	err := row.Scan(&o.LinkID, &o.Service, &o.OrganizationID, &o.OrganizationName, &o.BillingAccountID, &o.LinkTime,
-		&status, &reason, &o.BlockedSince, &o.SuspendTime, &o.Sequence)
+		&status, &reason, &o.BlockedSince, &o.SuspendTime, &o.Sequence, &o.LastAllowedSequence)
 	o.Status, o.Reason = LinkStatus(status), StatusReason(reason)
 	return o, err
 }
@@ -258,13 +260,18 @@ func (s *Service) syncStatuses(ctx context.Context, tx pgx.Tx, accountID string,
 		if err != nil {
 			return err
 		}
+		lastAllowed := cur.LastAllowedSequence
+		if status == StatusAllowed && (cur.Status == StatusBlocked || cur.Status == StatusSuspended) {
+			lastAllowed = seq
+		}
 		if _, err := tx.Exec(ctx, `UPDATE organization_links SET billing_status = $2, status_reason = $3, blocked_since = $4,
-				suspend_time = $5, status_sequence = $6, status_update_time = $7
-			WHERE organization_link_id = $1`, cur.LinkID, string(status), string(reason), blocked, suspend, seq, now); err != nil {
+				suspend_time = $5, status_sequence = $6, status_update_time = $7, last_allowed_sequence = $8
+			WHERE organization_link_id = $1`, cur.LinkID, string(status), string(reason), blocked, suspend, seq, now, lastAllowed); err != nil {
 			return err
 		}
 		next := cur
 		next.Status, next.Reason, next.BlockedSince, next.SuspendTime, next.Sequence = status, reason, blocked, suspend, seq
+		next.LastAllowedSequence = lastAllowed
 		if err := s.statusChanged(ctx, tx, cur, next, now); err != nil {
 			return err
 		}

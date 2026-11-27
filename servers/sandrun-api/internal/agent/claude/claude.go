@@ -513,9 +513,9 @@ var errWorkOrderUsed = errors.New("the work order of the request was handed to a
 //  2. The work order is written to the runner's credential file. A failure
 //     until here keeps the stored work order, and the engine returns the
 //     request to the queue.
-//  3. The stored work order is deleted, then the runner program starts. A
-//     failure from here on ends the request with FAILED and
-//     RUNNER_START_FAILED instead of a retry.
+//  3. The stored work order is deleted. At the deadline, the request expires.
+//     Before the deadline, the runner program starts. A launch failure ends
+//     the request with FAILED and RUNNER_START_FAILED.
 func (v *Vendor) Start(ctx context.Context, g *work.Guest, in integration.Integration, c *agent.Claim) (work.StartResult, error) {
 	svc := v.hub.Service()
 	req := g.Request
@@ -525,9 +525,13 @@ func (v *Vendor) Start(ctx context.Context, g *work.Guest, in integration.Integr
 		}
 		return work.StartResult{}, err
 	}
-	if !svc.NowUTC().Before(req.QueueTime.Add(v.opts.ExpectedSpawn)) {
+	deadline := req.QueueTime.Add(v.opts.ExpectedSpawn)
+	expire := func() (work.StartResult, error) {
 		return end(sandrunv1.RequestState_REQUEST_STATE_EXPIRED, sandrunv1.RequestEndReason_REQUEST_END_REASON_MAX_QUEUE_WAIT,
 			errors.New("the work order expired before the runner could start"))
+	}
+	if !svc.NowUTC().Before(deadline) {
+		return expire()
 	}
 	var sealed secrets.Sealed
 	var keyID *string
@@ -555,7 +559,11 @@ func (v *Vendor) Start(ctx context.Context, g *work.Guest, in integration.Integr
 	if tag.RowsAffected() != 1 {
 		return end(sandrunv1.RequestState_REQUEST_STATE_FAILED, sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED, errWorkOrderUsed)
 	}
-	res, err := agent.StartProgram(ctx, g, Program(dir, g, svc.NowUTC()))
+	now := svc.NowUTC()
+	if !now.Before(deadline) {
+		return expire()
+	}
+	res, err := agent.StartProgram(ctx, g, Program(dir, g, now))
 	if err != nil {
 		return end(sandrunv1.RequestState_REQUEST_STATE_FAILED, sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED, err)
 	}

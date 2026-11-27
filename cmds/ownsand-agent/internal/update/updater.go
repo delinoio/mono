@@ -380,9 +380,8 @@ func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target str
 		}); err != nil {
 			// A verified revocation must close the gate even if it cannot
 			// survive a restart. Keep any previous recovery target on failure.
-			if revoked && !u.revokedRunning {
-				u.revokedRunning = true
-				u.state, u.target = state, target
+			if revoked {
+				u.keepRunningRevocationLocked(target)
 			}
 			u.mu.Unlock()
 			return fmt.Errorf("update: save running-version revocation: %w", err)
@@ -393,6 +392,15 @@ func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target str
 	u.mu.Unlock()
 	u.opts.Logger.Info("agent update state", "update_state", state.String(), "target_version", target)
 	return nil
+}
+
+// keepRunningRevocationLocked closes the create gate without changing a
+// previously recorded recovery target. The caller holds u.mu.
+func (u *Updater) keepRunningRevocationLocked(target string) {
+	if !u.revokedRunning {
+		u.revokedRunning = true
+		u.state, u.target = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE, target
+	}
 }
 
 type downloadStatusError int
@@ -638,6 +646,78 @@ func (u *Updater) WithdrawOrdered(order uint64) error {
 	return nil
 }
 
+type manifestRejectReason string
+
+const (
+	manifestOlderSequence      manifestRejectReason = "older_sequence"
+	manifestConflictingContent manifestRejectReason = "conflicting_content"
+	manifestMissingSequence    manifestRejectReason = "missing_sequence"
+)
+
+// A callback error skips the atomic write in Store.UpdateAgent.
+var errManifestAlreadyAccepted = errors.New("update: release manifest checkpoint already matches")
+
+func (u *Updater) acceptManifest(raw []byte, m *Manifest, order uint64, target string) error {
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
+	var acceptedSequence uint64
+	var reason manifestRejectReason
+	var writeCheckpoint bool
+
+	// Fence the write against device removal. Command order still governs
+	// revocation and artifact use, but every verified download can advance
+	// the checkpoint.
+	u.mu.Lock()
+	if u.removing {
+		u.mu.Unlock()
+		return ErrRemovalAborted
+	}
+	_, err := u.opts.Store.UpdateAgent(func(st *store.AgentState) error {
+		accepted := st.ReleaseManifest
+		if accepted != nil {
+			acceptedSequence = accepted.Sequence
+		}
+		switch {
+		case m.Sequence == 0:
+			reason = manifestMissingSequence
+			return ErrManifestNoSequence
+		case m.Sequence < acceptedSequence:
+			reason = manifestOlderSequence
+			return ErrManifestRollback
+		case m.Sequence == acceptedSequence:
+			if digest == accepted.SHA256 {
+				return errManifestAlreadyAccepted
+			}
+			reason = manifestConflictingContent
+			return ErrManifestRollback
+		default:
+			st.ReleaseManifest = &store.ManifestCheckpoint{Sequence: m.Sequence, SHA256: digest}
+			writeCheckpoint = true
+			return nil
+		}
+	})
+	// The store checked the sequence but could not save it. A current
+	// command can still close the create gate for a verified revocation.
+	if err != nil && writeCheckpoint && u.commandInvalidationLocked(order) == nil && m.Revoked(u.opts.Running) {
+		u.keepRunningRevocationLocked(target)
+	}
+	u.mu.Unlock()
+
+	switch {
+	case errors.Is(err, errManifestAlreadyAccepted):
+		return nil
+	case reason != "":
+		u.opts.Logger.Error("release manifest rejected", "manifest_sequence", m.Sequence,
+			"accepted_sequence", acceptedSequence, "reason", reason)
+		return err
+	case err != nil:
+		return fmt.Errorf("update: store release manifest checkpoint: %w", err)
+	default:
+		u.opts.Logger.Info("release manifest accepted", "manifest_sequence", m.Sequence)
+		return nil
+	}
+}
+
 func (u *Updater) download(ctx context.Context, target string, order uint64) ([]byte, error) {
 	manifest, err := u.fetch(ctx, u.opts.ManifestURL, maxManifestBytes)
 	if err != nil {
@@ -654,6 +734,9 @@ func (u *Updater) download(ctx context.Context, target string, order uint64) ([]
 	keys := append(append([]ed25519.PublicKey{}, BuiltinKeys...), u.opts.Keys...)
 	m, err := Verify(manifest, sig, keys)
 	if err != nil {
+		return nil, err
+	}
+	if err := u.acceptManifest(manifest, m, order, target); err != nil {
 		return nil, err
 	}
 	if err := u.recordRunningRevocation(order, m.Revoked(u.opts.Running), target); err != nil {

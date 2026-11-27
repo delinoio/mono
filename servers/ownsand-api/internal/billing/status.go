@@ -274,12 +274,10 @@ func LogChange(ctx context.Context, logger *slog.Logger, c Change) {
 // mergeRemote returns st with the delino-accounts status r applied at now.
 // While the organization stays in the same non-payment interval, the earlier
 // block start is kept, so a link, a repeated poll or a BLOCKED to SUSPENDED
-// change never restarts the 3-day period. A reported block start that is
-// later than the one that was last applied for the link
-// (Status.RemoteBlockedSince) is a new interval: delino-accounts started a
-// new non-payment after a recovery that the control plane never saw, because
-// it exposes only the newest status of a link. The new start then replaces
-// the local one. It reports false for a status without a known value.
+// change never restarts the 3-day period. A later reported block start
+// identifies a new interval. If an upgraded row has no remote block start,
+// a recovery between the cached and incoming sequences also identifies a
+// new interval. It reports false for a status without a known value.
 func mergeRemote(st Status, r *accountsv1.OrganizationBillingStatus, now time.Time) (Status, bool) {
 	next := st
 	next.Sequence = r.GetSequence()
@@ -293,9 +291,16 @@ func mergeRemote(st Status, r *accountsv1.OrganizationBillingStatus, now time.Ti
 		newInterval := false
 		if r.GetBlockedSince() != nil {
 			start = r.GetBlockedSince().AsTime().UTC()
-			newInterval = st.RemoteBlockedSince != nil && start.After(*st.RemoteBlockedSince)
-			remote := start
-			next.RemoteBlockedSince = &remote
+			if st.RemoteBlockedSince != nil {
+				newInterval = start.After(*st.RemoteBlockedSince)
+			} else {
+				// Sequence zero is an initial link. It keeps the earlier
+				// local block start even if Accounts reports a past recovery.
+				recovered := r.GetLastAllowedSequence()
+				newInterval = st.Sequence > 0 && st.Sequence < recovered && recovered < next.Sequence
+			}
+			remoteStart := start
+			next.RemoteBlockedSince = &remoteStart
 		}
 		// A status without a block start never counts as a new interval and
 		// leaves the stored reported start unchanged.
@@ -325,9 +330,9 @@ func remoteOrganization(r *accountsv1.OrganizationBillingStatus) (string, bool) 
 // ApplyRemoteTx applies a delino-accounts status of a linked organization
 // in tx. A status of another billing account than the known link (for
 // example one that arrives after an unlink), of an unknown organization or
-// with a sequence below the applied one is ignored; a status with the
-// applied sequence only refreshes the sync time. It returns the change and
-// whether the status was applied.
+// with a sequence below the applied one is ignored. A replay refreshes the
+// sync time and can fill a missing remote block start for the same interval.
+// It returns the change and whether a newer status was applied.
 func ApplyRemoteTx(ctx context.Context, tx pgx.Tx, r *accountsv1.OrganizationBillingStatus, source string, now time.Time) (Change, bool, error) {
 	orgID, ok := remoteOrganization(r)
 	if !ok {
@@ -341,7 +346,16 @@ func ApplyRemoteTx(ctx context.Context, tx pgx.Tx, r *accountsv1.OrganizationBil
 		return Change{}, false, nil
 	}
 	if r.GetSequence() == st.Sequence {
-		_, err := tx.Exec(ctx, "UPDATE organization_billing SET status_sync_time = $2 WHERE organization_id = $1 AND (status_sync_time IS NULL OR status_sync_time < $2)", orgID, now)
+		var remoteStart *time.Time
+		if st.RemoteBlockedSince == nil && st.BlockedSince != nil && r.GetBlockedSince() != nil &&
+			(r.GetStatus() == accountsv1.BillingStatus_BILLING_STATUS_BLOCKED || r.GetStatus() == accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED) {
+			start := r.GetBlockedSince().AsTime().UTC()
+			remoteStart = &start
+		}
+		_, err := tx.Exec(ctx, `UPDATE organization_billing
+			SET status_sync_time = GREATEST(status_sync_time, $2), remote_blocked_since = COALESCE(remote_blocked_since, $3)
+			WHERE organization_id = $1 AND (status_sync_time IS NULL OR status_sync_time < $2 OR $3::timestamptz IS NOT NULL)`,
+			orgID, now, remoteStart)
 		return Change{}, false, err
 	}
 	next, ok := mergeRemote(st, r, now)
