@@ -69,7 +69,7 @@ type harness struct {
 	st    *store.Store
 	id    *store.Identity
 	agent *Agent
-	errc  chan error
+	errc  <-chan error
 	stop  context.CancelFunc
 }
 
@@ -113,12 +113,17 @@ func startWith(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Ident
 	t.Helper()
 	a := newAgent(t, cp, st, id, tweak)
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &harness{t: t, cp: cp, st: st, id: id, agent: a, errc: make(chan error, 1), stop: cancel}
-	go func() { h.errc <- a.Run(ctx) }()
+	errc := make(chan error, 1)
+	done := make(chan struct{})
+	h := &harness{t: t, cp: cp, st: st, id: id, agent: a, errc: errc, stop: cancel}
+	go func() {
+		errc <- a.Run(ctx)
+		close(done)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-h.errc:
+		case <-done:
 		case <-time.After(15 * time.Second):
 			t.Error("agent did not stop")
 		}
@@ -270,7 +275,6 @@ func TestChannelLifecycleCommandsAndRemoval(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the removal")
 	}
@@ -487,7 +491,6 @@ func TestRemovalNoticeAtAuthenticate(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the removal")
 	}
@@ -597,7 +600,6 @@ func TestDeviceRemovalFencesDispatchedCreate(t *testing.T) {
 			close(confirm.resume)
 			select {
 			case err := <-h.errc:
-				h.errc <- err
 				if !errors.Is(err, ErrRemoved) {
 					t.Fatalf("run returned %v, want ErrRemoved", err)
 				}
@@ -663,7 +665,6 @@ func TestRemovalCleansUpHostNetwork(t *testing.T) {
 				if !errors.Is(err, ErrRemoved) {
 					t.Fatalf("run returned %v", err)
 				}
-				h.errc <- err
 			case <-time.After(20 * time.Second):
 				t.Fatal("agent did not finish the removal")
 			}
@@ -729,7 +730,6 @@ func TestRemovalRetriesFailedSandboxDeletion(t *testing.T) {
 		if err == nil || errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v, want the failed deletion", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the first removal attempt")
 	}
@@ -756,7 +756,6 @@ func TestRemovalRetriesFailedSandboxDeletion(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("retry returned %v", err)
 		}
-		h2.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the retried removal")
 	}
@@ -782,7 +781,6 @@ func TestInterruptedRemovalTreatsUnknownDeviceAsConfirmed(t *testing.T) {
 		if !errors.Is(err, ErrRemoved) {
 			t.Fatalf("run returned %v", err)
 		}
-		h.errc <- err
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not finish the removal")
 	}

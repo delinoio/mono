@@ -205,7 +205,6 @@ func TestDeleteSnapshotAfterStagingWithFailedCleanup(t *testing.T) {
 				h.stop()
 				select {
 				case err := <-h.errc:
-					h.errc <- err // The harness cleanup still waits for this result.
 					if err != nil && !errors.Is(err, context.Canceled) {
 						t.Fatalf("agent stopped with an error: %v", err)
 					}
