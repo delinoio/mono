@@ -685,6 +685,140 @@ func TestDevSessionFiles(t *testing.T) {
 	}
 }
 
+func TestDevSessionFilesWriteRanges(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	session, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+
+	type chunk struct {
+		offset int64
+		data   string
+		final  bool
+		code   connect.Code
+	}
+	for _, tc := range []struct {
+		name     string
+		chunks   []chunk
+		existing string
+		want     string
+	}{
+		{
+			name: "equal overlap",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 1, data: "bc"},
+				{offset: 3, final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "equal overlap at finish",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 1, data: "bc", final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "same start extension",
+			chunks: []chunk{
+				{offset: 0, data: "ab"},
+				{offset: 0, data: "abc", final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "overlap bridges ranges",
+			chunks: []chunk{
+				{offset: 4, data: "efg"},
+				{offset: 0, data: "ab"},
+				{offset: 1, data: "bcde"},
+				{offset: 7, final: true},
+			},
+			want: "abcdefg",
+		},
+		{
+			name: "conflict with unpublished target",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 1, data: "XY", code: connect.CodeFailedPrecondition},
+				{offset: 3, final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "conflict in second range preserves target and staged bytes",
+			chunks: []chunk{
+				{offset: 0, data: "ab"},
+				{offset: 4, data: "ef"},
+				{offset: 1, data: "bCDXfg", code: connect.CodeFailedPrecondition},
+				{offset: 2, data: "cd"},
+				{offset: 6, final: true},
+			},
+			existing: "previous file",
+			want:     "abcdef",
+		},
+		{
+			name: "gap",
+			chunks: []chunk{
+				{offset: 0, data: "a"},
+				{offset: 2, data: "c"},
+				{offset: 3, final: true, code: connect.CodeFailedPrecondition},
+			},
+		},
+		{
+			name: "range exceeds final size",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 2, final: true, code: connect.CodeFailedPrecondition},
+			},
+		},
+		{
+			name: "empty file",
+			chunks: []chunk{
+				{offset: 42},
+				{offset: 0, final: true},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeID := api.NewID()
+			path := "/home/dev/work/out/" + writeID
+			content, exists := tc.existing, tc.existing != ""
+			if exists {
+				w.fake.SetFile(w.osOrg, sandboxID, path, []byte(content))
+			}
+			for i, c := range tc.chunks {
+				res, err := owner.DevSession.WriteDevSessionFile(t.Context(), connect.NewRequest(&sandrunv1.WriteDevSessionFileRequest{
+					OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(), WriteId: writeID,
+					Path: path, Offset: c.offset, Data: []byte(c.data), Final: c.final,
+				}))
+				if c.code != 0 {
+					wantCode(t, fmt.Sprintf("chunk %d", i), err, c.code)
+				} else {
+					if err != nil {
+						t.Fatalf("chunk %d: %v", i, err)
+					}
+					ack := res.Msg
+					if ack.GetOffset() != c.offset || ack.GetLength() != int64(len(c.data)) || ack.GetFinished() != c.final {
+						t.Fatalf("chunk %d acknowledgment: %v", i, ack)
+					}
+					if c.final {
+						if ack.GetSizeBytes() != int64(len(tc.want)) {
+							t.Fatalf("finished size %d, want %d", ack.GetSizeBytes(), len(tc.want))
+						}
+						content, exists = tc.want, true
+					}
+				}
+				got, found := w.fake.File(w.osOrg, sandboxID, path)
+				if found != exists || string(got) != content {
+					t.Fatalf("after chunk %d: file exists %t with bytes %q, want exists %t with bytes %q", i, found, got, exists, content)
+				}
+			}
+		})
+	}
+}
+
 func TestDevSessionWindowsUNCPaths(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{})
 	const workspace = `C:\work`

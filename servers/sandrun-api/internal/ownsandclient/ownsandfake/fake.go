@@ -16,6 +16,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -101,7 +103,16 @@ type fakeSandbox struct {
 
 type fakeWrite struct {
 	path   string
-	ranges map[int64][]byte
+	ranges []writeRange // sorted, with overlaps and adjacent ranges merged
+}
+
+type writeRange struct {
+	start int64
+	data  []byte
+}
+
+func (r writeRange) end() int64 {
+	return r.start + int64(len(r.data))
 }
 
 // New returns an empty fake.
@@ -522,38 +533,69 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 	if err := org.FileError; err != nil {
 		return nil, err
 	}
+	if offset < 0 || offset > math.MaxInt64-int64(len(data)) {
+		return nil, connect.NewWireError(connect.CodeInvalidArgument, errors.New("invalid write range"))
+	}
 	s := org.sandboxes[w.sandboxID]
 	fw := s.writes[w.p.WriteID]
 	if fw == nil {
-		fw = &fakeWrite{path: w.p.Path, ranges: map[int64][]byte{}}
+		fw = &fakeWrite{path: w.p.Path}
 		s.writes[w.p.WriteID] = fw
 	}
-	if old, ok := fw.ranges[offset]; ok && !bytes.Equal(old, data) {
-		return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
+	if err := fw.stage(offset, data); err != nil {
+		return nil, err
 	}
-	fw.ranges[offset] = append([]byte(nil), data...)
 	res := &ownsandv1.WriteFileResponse{WriteId: w.p.WriteID, Offset: offset, Length: int64(len(data))}
 	if size != nil {
-		var buf bytes.Buffer
-		offsets := make([]int64, 0, len(fw.ranges))
-		for off := range fw.ranges {
-			offsets = append(offsets, off)
+		var contents []byte
+		switch {
+		case *size == 0 && len(fw.ranges) == 0:
+		case len(fw.ranges) == 1 && fw.ranges[0].start == 0 && fw.ranges[0].end() == *size:
+			contents = fw.ranges[0].data
+		default:
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("written ranges do not cover exactly [0, size_bytes)"))
 		}
-		sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
-		for _, off := range offsets {
-			if off != int64(buf.Len()) {
-				return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the file"))
-			}
-			buf.Write(fw.ranges[off])
-		}
-		if int64(buf.Len()) != *size {
-			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the size"))
-		}
-		s.files[fw.path] = buf.Bytes()
+		s.files[fw.path] = contents
 		res.Finished, res.SizeBytes = true, *size
 		delete(s.writes, w.p.WriteID)
 	}
 	return res, nil
+}
+
+func (fw *fakeWrite) stage(offset int64, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	end := offset + int64(len(data))
+	first := sort.Search(len(fw.ranges), func(i int) bool { return fw.ranges[i].end() >= offset })
+	last := first
+	// Check every overlap before changing any staged bytes.
+	for last < len(fw.ranges) && fw.ranges[last].start <= end {
+		r := fw.ranges[last]
+		lo, hi := max(r.start, offset), min(r.end(), end)
+		if lo < hi && !bytes.Equal(r.data[lo-r.start:hi-r.start], data[lo-offset:hi-offset]) {
+			return connect.NewWireError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
+		}
+		last++
+	}
+
+	var merged writeRange
+	if first < last && fw.ranges[first].start <= offset {
+		merged = fw.ranges[first]
+		if mergedEnd := merged.end(); mergedEnd < end {
+			merged.data = append(merged.data, data[mergedEnd-offset:]...)
+		}
+	} else {
+		merged = writeRange{start: offset, data: bytes.Clone(data)}
+	}
+	if first < last {
+		tail := fw.ranges[last-1]
+		if mergedEnd := merged.end(); mergedEnd < tail.end() {
+			merged.data = append(merged.data, tail.data[mergedEnd-tail.start:]...)
+		}
+	}
+	fw.ranges = slices.Replace(fw.ranges, first, last, merged)
+	return nil
 }
 
 // SlowExec returns an ExecFunc that sends one stdout chunk every interval
