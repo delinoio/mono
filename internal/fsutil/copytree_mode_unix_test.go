@@ -215,6 +215,56 @@ func TestReadTarAppliesExplicitDirectoryModesAfterExtraction(t *testing.T) {
 	}
 }
 
+func TestReadTarUsesLastModeForEquivalentDirectoryNames(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first string
+		last  string
+		path  string
+		from  int64
+		want  int64
+	}{
+		{name: "leading dot", first: "data/", last: "./data/", path: "data", from: 0o755, want: 0o700},
+		{name: "reverse order", first: "./data/", last: "data/", path: "data", from: 0o700, want: 0o755},
+		{name: "repeated separator", first: "parent/child/", last: "parent//./child/", path: "parent/child", from: 0o755, want: 0o700},
+		{name: "restrictive first", first: "./data/", last: "data/", path: "data", from: 0, want: 0o700},
+		{name: "extraction root", first: ".", last: "././", path: ".", from: 0o755, want: 0o700},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Use fresh roots to exercise the old map iteration order.
+			for range 32 {
+				dst := t.TempDir()
+				t.Cleanup(func() { makeDirsWritable(dst) })
+				archive := buildTar(t, []tarEntry{
+					{hdr: tar.Header{Name: tc.first, Typeflag: tar.TypeDir, Mode: tc.from}},
+					{hdr: tar.Header{Name: tc.last, Typeflag: tar.TypeDir, Mode: tc.want}},
+				})
+				if err := ReadTar(archive, dst); err != nil {
+					t.Fatal(err)
+				}
+				requireMode(t, filepath.Join(dst, tc.path), fs.FileMode(tc.want))
+			}
+		})
+	}
+}
+
+func TestReadTarKeepsParentComponentsInDirectoryModePaths(t *testing.T) {
+	requireSymlinks(t)
+	dst := t.TempDir()
+	archive := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "real/deep/", Typeflag: tar.TypeDir, Mode: 0o700}},
+		{hdr: tar.Header{Name: "alias", Typeflag: tar.TypeSymlink, Linkname: "real/deep"}},
+		{hdr: tar.Header{Name: "alias/../child/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "alias//./../child/", Typeflag: tar.TypeDir, Mode: 0o711}},
+		{hdr: tar.Header{Name: "child/", Typeflag: tar.TypeDir, Mode: 0o700}},
+	})
+	if err := ReadTar(archive, dst); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, filepath.Join(dst, "real", "child"), 0o711)
+	requireMode(t, filepath.Join(dst, "child"), 0o700)
+}
+
 func TestReadTarPopulatesThroughConfinedDirectoryLinkUnderUmask(t *testing.T) {
 	requireSymlinks(t)
 	dst := t.TempDir()

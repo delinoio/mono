@@ -383,7 +383,7 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 	// A later entry can turn a path component of an earlier link into
 	// another link, so the links are resolved once, after the last entry.
 	var links []string
-	dirs := make(map[string]fs.FileMode)
+	dirs := make(map[string]dirMode)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -407,7 +407,7 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 			}
 			if runtime.GOOS != "windows" {
 				// A repeated directory header supplies the final mode.
-				dirs[strings.TrimRight(name, string(filepath.Separator))] = mode
+				dirs[tarDirectoryModeKey(name)] = dirMode{path: name, perm: mode}
 			}
 		case tar.TypeReg:
 			if err := mkdirTarDirs(root, filepath.Dir(name), 0); err != nil {
@@ -454,14 +454,15 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 	// A tar can list a directory after its children. Apply the deepest
 	// modes first so that every parent stays searchable until its children
 	// have their final modes.
-	names := slices.SortedFunc(maps.Keys(dirs), func(a, b string) int {
+	keys := slices.SortedFunc(maps.Keys(dirs), func(a, b string) int {
 		return tarDirectoryDepth(b) - tarDirectoryDepth(a)
 	})
-	for _, name := range names {
+	for _, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := setTarDirectoryMode(root, name, dirs[name]); err != nil {
+		dir := dirs[key]
+		if err := setTarDirectoryMode(root, dir.path, dir.perm); err != nil {
 			return err
 		}
 	}
@@ -515,6 +516,18 @@ func mkdirTarDir(root *os.Root, name string, intermediate bool, linksLeft int) e
 		return nil
 	}
 	return chmodNewTarDir(root, name, ownerAccess)
+}
+
+func tarDirectoryModeKey(name string) string {
+	// Keep ".." because its meaning can depend on a preceding symbolic link.
+	separator := string(filepath.Separator)
+	parts := slices.DeleteFunc(strings.Split(name, separator), func(part string) bool {
+		return part == "" || part == "."
+	})
+	if len(parts) == 0 {
+		return "."
+	}
+	return strings.Join(parts, separator)
 }
 
 func tarDirectoryDepth(name string) int {
