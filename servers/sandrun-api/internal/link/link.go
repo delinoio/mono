@@ -397,6 +397,9 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 	if err != nil {
 		return nil, err
 	}
+	if err := s.DB.CheckOwnSandTeardownAdmission(ctx); err != nil {
+		return nil, s.Internal(ctx, "check OwnSand teardown admission", err)
+	}
 	claim, err := l.ClaimRemoval(ctx, c.OrganizationID)
 	if err != nil {
 		return nil, s.Internal(ctx, "claim ownsand link removal", err)
