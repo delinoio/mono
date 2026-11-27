@@ -34,7 +34,11 @@ import { MemberService } from "@delino/sandrun-protos/v1/member_pb";
 import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
 import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
-import { type Request, WorkService } from "@delino/sandrun-protos/v1/work_pb";
+import {
+  type Request,
+  type WatchQueueResponse,
+  WorkService,
+} from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
 import { createMockTransport, MOCK_IDS, MOCK_USER } from "./mock-api.ts";
 
@@ -993,6 +997,144 @@ test.each([0, 1])(
     }
   },
 );
+
+test("unlinking GitHub ends the installation's warm runner and keeps its history", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const work = createClient(WorkService, transport);
+  const audit = createClient(AuditService, transport);
+  const org = { organizationId: MOCK_IDS.acme };
+  const history = { ...org, includeEnded: true };
+  const before = structuredClone((await work.listRunners(history)).runners);
+
+  expect((await work.listRunners(org)).runners).toContainEqual(
+    expect.objectContaining({
+      runnerId: MOCK_IDS.warmRunner,
+      state: RunnerState.WARM,
+    }),
+  );
+  await github.unlinkGitHubInstallation({
+    ...org,
+    installationId: MOCK_IDS.installation,
+  });
+
+  const preserved = before.filter((r) => r.runnerId !== MOCK_IDS.warmRunner);
+  expect((await work.listRunners(org)).runners).toEqual(
+    preserved.filter((r) => r.runnerId === MOCK_IDS.busyRunner),
+  );
+  const { runners } = await work.listRunners(history);
+  expect(runners.filter((r) => r.runnerId !== MOCK_IDS.warmRunner)).toEqual(
+    preserved,
+  );
+  expect(runners.find((r) => r.runnerId === MOCK_IDS.warmRunner)).toMatchObject(
+    {
+      state: RunnerState.DELETED,
+      endReason: RunnerEndReason.CLEAN_UP,
+      endedAt: expect.any(Object),
+    },
+  );
+  expect(
+    (await github.listGitHubInstallations(org)).installations,
+  ).not.toContainEqual(
+    expect.objectContaining({ installationId: MOCK_IDS.installation }),
+  );
+  expect(
+    (await work.getRequest({ ...org, requestId: MOCK_IDS.queuedJob })).request,
+  ).toMatchObject({
+    state: RequestState.CANCELED,
+    endReason: RequestEndReason.INTEGRATION_REMOVED,
+  });
+  expect((await audit.listAuditEvents(org)).events).toContainEqual(
+    expect.objectContaining({
+      action: AuditAction.GITHUB_INSTALLATION_UNLINKED,
+      targetKind: AuditTargetKind.GITHUB_INSTALLATION,
+      targetId: MOCK_IDS.installation,
+    }),
+  );
+});
+
+test("unlinking a second GitHub installation leaves the original warm runner active", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const work = createClient(WorkService, transport);
+  const org = { organizationId: MOCK_IDS.acme };
+  const { installation } = await github.linkGitHubInstallation({
+    ...org,
+    githubInstallationId: 51_000_099n,
+    code: "fixture-code",
+    state: "mock-state",
+  });
+  if (!installation) throw new Error("Expected the second installation");
+
+  await github.unlinkGitHubInstallation({
+    ...org,
+    installationId: installation.installationId,
+  });
+
+  expect((await work.listRunners(org)).runners).toContainEqual(
+    expect.objectContaining({
+      runnerId: MOCK_IDS.warmRunner,
+      state: RunnerState.WARM,
+    }),
+  );
+});
+
+async function readSnapshotRunnerIds(
+  stream: AsyncIterator<WatchQueueResponse, unknown>,
+) {
+  const ids = new Set<string>();
+  for (;;) {
+    const { done, value: message } = await stream.next();
+    if (done) throw new Error("Expected a complete queue snapshot");
+    if (message.event.case === "snapshotComplete") return ids;
+    if (message.event.case === "runner") ids.add(message.event.value.runnerId);
+  }
+}
+
+test("GitHub unlink sends a terminal runner event and omits the runner from fresh queue snapshots", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const work = createClient(WorkService, transport);
+  const org = { organizationId: MOCK_IDS.acme };
+  const stream: AsyncIterator<WatchQueueResponse, unknown> = work
+    .watchQueue(org, { timeoutMs: 2000 })
+    [Symbol.asyncIterator]();
+  try {
+    expect(await readSnapshotRunnerIds(stream)).toContain(MOCK_IDS.warmRunner);
+    await github.unlinkGitHubInstallation({
+      ...org,
+      installationId: MOCK_IDS.installation,
+    });
+    for (;;) {
+      const { done, value: message } = await stream.next();
+      if (done) throw new Error("Expected a runner event after GitHub unlink");
+      if (
+        message.event.case === "runner" &&
+        message.event.value.runnerId === MOCK_IDS.warmRunner
+      ) {
+        expect(message.event.value).toMatchObject({
+          state: RunnerState.DELETED,
+          endReason: RunnerEndReason.CLEAN_UP,
+          endedAt: expect.any(Object),
+        });
+        break;
+      }
+    }
+  } finally {
+    await stream.return?.();
+  }
+
+  const fresh = work
+    .watchQueue(org, { timeoutMs: 2000 })
+    [Symbol.asyncIterator]();
+  try {
+    expect(await readSnapshotRunnerIds(fresh)).toEqual(
+      new Set([MOCK_IDS.busyRunner]),
+    );
+  } finally {
+    await fresh.return?.();
+  }
+});
 
 test("an agent integration name conflict preserves the integration list and audit history", async () => {
   const transport = createMockTransport();
