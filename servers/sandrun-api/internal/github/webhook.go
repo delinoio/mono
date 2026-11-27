@@ -27,8 +27,8 @@ import (
 // maxDeliveryIDLength bounds X-GitHub-Delivery (a GUID).
 const maxDeliveryIDLength = 100
 
-// surplusTimeout bounds the surplus removal after a completed event.
-const surplusTimeout = 2 * time.Minute
+// renameCleanupTimeout bounds the renamed-runner cleanup after a queued event.
+const renameCleanupTimeout = 2 * time.Minute
 
 // RunnerNamePrefix is the prefix of the GitHub runner name sandrun-<runner_id>.
 const RunnerNamePrefix = "sandrun-"
@@ -165,7 +165,7 @@ func (h WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(o.after) == 0 {
 		return
 	}
-	// The follow-up work (kicks, sandbox deletions, surplus removal) runs
+	// The follow-up work (kicks and sandbox deletions) runs
 	// after the answer, because GitHub counts a delivery that takes more
 	// than 10 seconds as failed.
 	after, bgCtx := o.after, context.WithoutCancel(ctx)
@@ -348,7 +348,7 @@ func (l *Layer) workflowJob(ctx context.Context, tx pgx.Tx, body []byte, o *outc
 		o.requestID = req.ID
 		org, profileID, pool := inst.OrganizationID, req.ProfileID, inst.PoolKey()
 		o.after = append(o.after, func(ctx context.Context) {
-			ctx, cancel := context.WithTimeout(ctx, surplusTimeout)
+			ctx, cancel := context.WithTimeout(ctx, renameCleanupTimeout)
 			defer cancel()
 			l.retireRenamed(ctx, org, profileID, pool)
 		})
@@ -411,8 +411,8 @@ func (l *Layer) jobInProgress(ctx context.Context, tx pgx.Tx, inst *Installation
 
 // jobCompleted ends the job's request: ENDED and COMPLETED when the job ran
 // on a SandRun runner, CANCELED and CANCELED_BY_SOURCE when it never started.
-// A job without a request gets an ended request. After the commit, the
-// surplus runners of the pool are removed.
+// A job without a request gets an ended request. The transaction also
+// records a surplus check for the lease holder.
 func (l *Layer) jobCompleted(ctx context.Context, tx pgx.Tx, inst *Installation, ev *workflowJobEvent, o *outcome) error {
 	req, err := l.requestOfJob(ctx, tx, inst.OrganizationID, ev.WorkflowJob.ID)
 	if err != nil {
@@ -452,14 +452,13 @@ func (l *Layer) jobCompleted(ctx context.Context, tx pgx.Tx, inst *Installation,
 			return err
 		}
 	}
-	org, profileID, pool := inst.OrganizationID, req.ProfileID, inst.PoolKey()
-	o.after = append(o.after, func(ctx context.Context) {
-		l.svc.WorkChanged(org)
-		ctx, cancel := context.WithTimeout(ctx, surplusTimeout)
-		defer cancel()
-		l.retireRenamed(ctx, org, profileID, pool)
-		l.removeSurplus(ctx, org, profileID, pool)
-	})
+	if _, err := tx.Exec(ctx, `INSERT INTO github_surplus_checks (installation_id, runner_profile_id, organization_id, generation)
+		VALUES ($1, $2, $3, $4) ON CONFLICT (installation_id, runner_profile_id)
+		DO UPDATE SET generation = EXCLUDED.generation, check_after = EXCLUDED.check_after`,
+		inst.ID, req.ProfileID, inst.OrganizationID, api.NewID()); err != nil {
+		return err
+	}
+	o.after = append(o.after, func(context.Context) { l.svc.WorkChanged(inst.OrganizationID) })
 	return nil
 }
 
@@ -511,45 +510,6 @@ func (l *Layer) retireRenamed(ctx context.Context, orgID, profileID, pool string
 		}
 		if deleted {
 			l.svc.Logger.InfoContext(ctx, "github_renamed_runner_removed", slog.String("organization_id", orgID), slog.String("runner_id", id))
-		}
-	}
-}
-
-// removeSurplus compares the pool's runners in CREATING, PREPARING or
-// WAITING_FOR_WORK with all of its remaining QUEUED requests and removes
-// the newest surplus runners with removeIdleRunner. The profile's warm
-// count is kept as a reserve (recorded decision), so the rule does not
-// delete the warm runners that the dispatcher keeps.
-func (l *Layer) removeSurplus(ctx context.Context, orgID, profileID, pool string) {
-	p, err := l.profiles.Get(ctx, l.svc.DB.Pool, orgID, profileID)
-	if err != nil {
-		l.svc.Logger.WarnContext(ctx, "github_surplus_profile_read_failed",
-			slog.String("organization_id", orgID), slog.String("runner_profile_id", profileID), slog.Any("error", err))
-		return
-	}
-	surplus, err := l.engine.PoolSurplus(ctx, orgID, profileID, pool, int(p.WarmCount))
-	if err != nil {
-		l.svc.Logger.WarnContext(ctx, "github_surplus_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-		return
-	}
-	if len(surplus) == 0 {
-		return
-	}
-	inst, err := l.poolInstallation(ctx, l.svc.DB.Pool, orgID, pool)
-	if err != nil {
-		l.svc.Logger.WarnContext(ctx, "github_surplus_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-		return
-	}
-	for _, r := range surplus {
-		deleted, err := l.removeIdleRunner(ctx, inst, orgID, r.ID, sandrunv1.RunnerEndReason_RUNNER_END_REASON_SURPLUS)
-		if err != nil {
-			// Without a removed registration the runner may still take a
-			// job, so it stays; the next completed event tries again.
-			l.svc.Logger.WarnContext(ctx, "github_surplus_delete_failed", slog.String("organization_id", orgID), slog.String("runner_id", r.ID), slog.Any("error", err))
-			continue
-		}
-		if deleted {
-			l.svc.Logger.InfoContext(ctx, "github_surplus_runner_removed", slog.String("organization_id", orgID), slog.String("runner_id", r.ID))
 		}
 	}
 }
@@ -608,7 +568,11 @@ func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID,
 				return false, nil
 			}
 			l.engine.RunnerChanged(d.ID)
-			l.engine.DeleteSandboxOf(ctx, orgID, d.ID)
+			// The lease-scoped reconciler can finish surplus deletion even
+			// if this instance stops after committing DELETING.
+			if reason != sandrunv1.RunnerEndReason_RUNNER_END_REASON_SURPLUS {
+				l.engine.DeleteSandboxOf(ctx, orgID, d.ID)
+			}
 			l.svc.WorkChanged(orgID)
 			return true, nil
 		}
