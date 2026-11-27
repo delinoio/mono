@@ -34,13 +34,16 @@ const (
 	authorizeRate   = 10 // AuthorizeRelay calls per second per principal
 )
 
-// session is an open peer-to-peer session that the lease holder signaled.
+// session is a pending or answered peer-to-peer session on the lease holder.
 type session struct {
 	id, orgID, sandboxID, deviceID string
 	gen                            uint64
 	principal                      auth.Principal
 	membership                     auth.MembershipSnapshot
 	expireAt                       time.Time
+	// retainUntil is set under DataPlane.mu when OpenSession accepts an answer.
+	// A zero value marks a pending offer.
+	retainUntil time.Time
 }
 
 // revocationTarget is what a pending revocation ends, for logs.
@@ -71,10 +74,9 @@ type revocation struct {
 	target   revocationTarget
 	envelope *ownsandv1.AgentEnvelope
 	delivery revocationDelivery
-	// expireAt is when the revoked session reaches its absolute expiry or the
-	// revoked grant stops being revocable. The agent never needs the
-	// revocation after that, so the sweep deletes it even when no
-	// acknowledgement arrived.
+	// expireAt is the revoked session's retention deadline (nominal expiry
+	// for a pending offer) or the end of the grant's revocable period.
+	// The sweep deletes the record at that deadline even without an acknowledgement.
 	expireAt time.Time
 }
 
@@ -318,10 +320,15 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event, channels ch
 		return
 	}
 	for _, g := range revoked {
-		p.sendRevocation(ctx, g.DeviceID, g.ChannelGen, revocationTargetRelayGrant, g.RevocableUntil(), &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g.ID}})
+		// Keep the wall-clock comparison used for relay-grant revocations.
+		p.sendRevocation(ctx, g.DeviceID, g.ChannelGen, revocationTargetRelayGrant, g.RevocableUntil().Round(0), &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g.ID}})
 	}
 	for _, s := range sessions {
-		p.sendRevocation(ctx, s.deviceID, s.gen, revocationTargetSession, s.expireAt, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: s.id}})
+		deadline := s.retainUntil
+		if deadline.IsZero() {
+			deadline = s.expireAt
+		}
+		p.sendRevocation(ctx, s.deviceID, s.gen, revocationTargetSession, deadline, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: s.id}})
 	}
 }
 
@@ -340,7 +347,7 @@ func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uin
 		deviceID: deviceID, gen: gen, target: target, expireAt: expireAt, delivery: revocationSending,
 		envelope: &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SessionRevocation{SessionRevocation: message}},
 	}
-	if p.S.now().Before(expireAt) {
+	if p.S.Now().Before(expireAt) {
 		p.revocations[id] = r
 	}
 	p.mu.Unlock()
@@ -356,7 +363,7 @@ func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uin
 			p.revocations[id] = r
 		case p.S.Hub.Get(deviceID) != conn:
 			delete(p.revocations, id)
-		case !p.S.now().Before(expireAt):
+		case !p.S.Now().Before(expireAt):
 			delete(p.revocations, id)
 			expired = true
 		default:
@@ -384,10 +391,12 @@ func (p *DataPlane) PendingRevocations() int {
 	return len(p.revocations)
 }
 
-// SweepExpired deletes expired revocations and retries deferred enqueues. It
-// implements DataPathHooks and runs periodically, including on idle channels.
+// SweepExpired reclaims expired sessions and revocations and retries deferred
+// enqueues. It runs periodically, including on idle channels.
 func (p *DataPlane) SweepExpired(ctx context.Context) {
-	p.sweepRevocations(ctx, p.S.now(), true)
+	now := p.S.Now()
+	p.sweepSessions(now)
+	p.sweepRevocations(ctx, now, true)
 }
 
 // RPC paths only need expiry. The periodic sweep also tries each deferred
@@ -423,12 +432,12 @@ func (p *DataPlane) sweepRevocations(ctx context.Context, now time.Time, retry b
 	}
 }
 
-// sweepSessions forgets sessions past their absolute expiry.
+// sweepSessions forgets answered sessions at or after their retention deadline.
 func (p *DataPlane) sweepSessions(now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for id, s := range p.sessions {
-		if !now.Before(s.expireAt) {
+		if !s.retainUntil.IsZero() && !now.Before(s.retainUntil) {
 			delete(p.sessions, id)
 		}
 	}
@@ -497,10 +506,10 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 	if err != nil {
 		return nil, h.S.internal(ctx, "open session", err)
 	}
-	now := h.S.now()
+	now := h.S.Now()
 	h.sweepSessions(now)
 	h.sweepRevocations(ctx, now, false)
-	sess := &session{id: newID(), orgID: sb.OrgID, sandboxID: sb.ID, deviceID: sb.DeviceID, gen: conn.Generation, principal: pr, membership: membership, expireAt: now.Add(sessionLifetime)}
+	sess := &session{id: newID(), orgID: sb.OrgID, sandboxID: sb.ID, deviceID: sb.DeviceID, gen: conn.Generation, principal: pr, membership: membership, expireAt: now.UTC().Add(sessionLifetime)}
 	// Register the session as pending first, so a revocation processed
 	// before the answer ends it as well.
 	h.mu.Lock()
@@ -531,7 +540,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 			defer cancel()
 			h.S.Logger.WarnContext(rctx, "data_path_session_abandoned", slog.String("session_id", sess.id), slog.String("sandbox_id", sb.ID),
 				slog.String("device_id", sess.deviceID), slog.String("cause", cause))
-			h.sweepRevocations(rctx, h.S.now(), false)
+			h.sweepRevocations(rctx, h.S.Now(), false)
 			h.sendRevocation(rctx, sess.deviceID, sess.gen, revocationTargetSession, sess.expireAt, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: sess.id}})
 		}
 		return nil, err
@@ -557,13 +566,18 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		if e := ans.GetError(); e != nil {
 			return fail(errorFromDetail(e))
 		}
-		h.mu.Lock()
-		_, alive := h.sessions[sess.id]
-		h.mu.Unlock()
 		// The select can receive an answer even when the request has ended.
 		if err := ctx.Err(); err != nil {
 			return abandon("request_canceled", err)
 		}
+		h.mu.Lock()
+		_, alive := h.sessions[sess.id]
+		if alive {
+			// The agent starts the advertised duration before it answers.
+			// Keep the monotonic reading for this local deadline.
+			sess.retainUntil = h.S.Now().Add(sessionLifetime)
+		}
+		h.mu.Unlock()
 		if !alive {
 			return fail(errUnavailable("the session ended before it opened"))
 		}

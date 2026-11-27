@@ -639,3 +639,69 @@ func TestLoadAcceptsLoopbackURLs(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadOutboundEndpointPorts(t *testing.T) {
+	endpoints := []struct {
+		name, path string
+		value      func(Config) string
+	}{
+		{EnvLogtoIssuer, "/oidc/", func(cfg Config) string { return cfg.LogtoIssuer }},
+		{EnvLogtoJWKSURL, "/oidc/jwks", func(cfg Config) string { return cfg.LogtoJWKSURL }},
+		{EnvLogtoTokenEndpoint, "/oidc/token", func(cfg Config) string { return cfg.Accounts.TokenEndpoint }},
+		{EnvR2Endpoint, "/", func(cfg Config) string { return cfg.R2.Endpoint }},
+		{EnvAccountsAPIOrigin, "/", func(cfg Config) string { return cfg.Accounts.APIOrigin }},
+	}
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, authority string
+				rejected        bool
+			}{
+				{name: "omitted", authority: "endpoint.example.test"},
+				{name: "empty", authority: "endpoint.example.test:"},
+				{name: "zero", authority: "endpoint.example.test:0"},
+				{name: "max", authority: "endpoint.example.test:65535"},
+				{name: "over max", authority: "endpoint.example.test:65536", rejected: true},
+				{name: "IPv6 max", authority: "[::1]:65535"},
+				{name: "IPv6 oversized", authority: "[::1]:999999999999999999999999", rejected: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					v := minimal()
+					v[EnvR2Endpoint], v[EnvR2Bucket], v[EnvR2AccessKeyID], v[EnvR2SecretAccessKey] = "https://r2.example.test", "b", "k", "s"
+					v[EnvLogtoTokenEndpoint] = "https://logto.example.test/oidc/token"
+					v[EnvAccountsM2MClientID], v[EnvAccountsM2MClientSecret] = "id", "secret"
+					value := "https://" + tc.authority + endpoint.path
+					v[endpoint.name] = value
+
+					cfg, err := Load(env(v))
+					if tc.rejected {
+						want := endpoint.name + " must be an http or https URL"
+						if endpoint.name == EnvAccountsAPIOrigin {
+							want = endpoint.name + " must be an origin such as https://accounts.api.delino.io"
+						}
+						if err == nil || err.Error() != want {
+							t.Fatalf("Load(%q) error = %v, want %q", value, err, want)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("Load(%q) failed: %v", value, err)
+					}
+					want := value
+					if endpoint.name == EnvAccountsAPIOrigin {
+						want = strings.TrimSuffix(value, "/")
+					}
+					if got := endpoint.value(cfg); got != want {
+						t.Errorf("%s = %q, want %q", endpoint.name, got, want)
+					}
+					if endpoint.name == EnvLogtoIssuer {
+						wantJWKS := strings.TrimSuffix(value, "/") + "/jwks"
+						if cfg.LogtoJWKSURL != wantJWKS {
+							t.Errorf("derived JWKS URL = %q, want %q", cfg.LogtoJWKSURL, wantJWKS)
+						}
+					}
+				})
+			}
+		})
+	}
+}
