@@ -1,0 +1,74 @@
+{
+  "gid": "inv-33-win-setup-paths",
+  "commit": "c51addcae8e2c95276dc461b1273d310c2177fae",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "c51addcae8e2c95276dc461b1273d310c2177fae",
+    "setup": "Run in PowerShell at the root of the worker revision in a short checkout path on local NTFS. The focused tests use temporary directories and a synthetic password. They need no elevation, ISO, VM, service control, protected-path ACL changes, tar or symbolic-link privilege.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'c51addcae8e2c95276dc461b1273d310c2177fae') { throw 'Check out the worker revision before running the focused tests' }",
+      "git rev-parse HEAD",
+      "$validationDir = (New-Item -ItemType Directory -Force '.t3-tmp/setup').FullName",
+      "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+      "go test ./cmds/ownsand-agent/internal/imagebuild '-run=^(TestInstallSetupFilesRejectsJunction|TestBuildLogsHoldNoPassword)$' '-count=1' '-v' 2>&1 | Tee-Object \"$validationDir/focused-windows.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The focused command exits 0. TestBuildLogsHoldNoPassword passes and all three setup files contain the expected bytes. Replacing a longer answer file removes the stale bytes.",
+      "All five TestInstallSetupFilesRejectsJunction subtests pass. Each rejected entry reports the offending relative component and a reparse-point reason. Its target stays empty and the logs omit the synthetic password."
+    ],
+    "prebuiltAlternative": {
+      "setup": "On an amd64 Windows host, create the validation directory and copy the executable listed under files.copyFrom to files.copyTo before running the test command. This is the same fixture rebuilt at the clean worker SHA.",
+      "commands": [
+        "$validationDir = (New-Item -ItemType Directory -Force '.t3-tmp/setup').FullName",
+        "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+        "& \"$validationDir/imagebuild-windows-amd64.test.exe\" '-test.run=^(TestInstallSetupFilesRejectsJunction|TestBuildLogsHoldNoPassword)$' '-test.count=1' '-test.v' 2>&1 | Tee-Object \"$validationDir/focused-windows-prebuilt.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+      ],
+      "expectedResults": "The same tests and subtests pass with exit 0."
+    },
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-win-setup-paths/worker/.t3-tmp/imagebuild-windows-amd64.test.exe",
+      "copyTo": ".t3-tmp/setup/imagebuild-windows-amd64.test.exe",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/windows_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/setup/focused-windows.log",
+        ".t3-tmp/setup/focused-windows-prebuilt.log",
+        ".t3-tmp/setup/trusted-image-build.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-win-setup-paths/worker/.t3-tmp/imagebuild-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-win-setup-paths/worker/.t3-tmp/imagebuild-windows-arm64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-win-setup-paths/worker/.t3-tmp/imagebuild-windows-go1.26.1-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-win-setup-paths/worker/.t3-tmp/ownsand-agent-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-win-setup-paths/worker/.t3-tmp/ownsand-agent-windows-arm64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-win-setup-paths/worker/.t3-tmp/ownsand-guest.exe"
+      ]
+    },
+    "privilegedValidation": {
+      "status": "pending",
+      "prerequisites": "Run only in an elevated PowerShell session on a Hyper-V development host with the trusted Windows Server 2025 Standard Evaluation (Desktop Experience) ISO. Set OWNSAND_VALIDATION_ISO to its existing file path. The assigned non-elevated account cannot run this check.",
+      "commands": [
+        "if ((git rev-parse HEAD).Trim() -ne 'c51addcae8e2c95276dc461b1273d310c2177fae') { throw 'Check out the worker revision before running the focused tests' }",
+        "git rev-parse HEAD",
+        "$validationDir = (New-Item -ItemType Directory -Force '.t3-tmp/setup').FullName",
+        "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+        "if (!$env:OWNSAND_VALIDATION_ISO -or !(Test-Path -LiteralPath $env:OWNSAND_VALIDATION_ISO -PathType Leaf)) { throw 'Set OWNSAND_VALIDATION_ISO to the trusted development ISO' }",
+        "go build -mod=readonly -o \"$validationDir/ownsand-agent.exe\" ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "$env:GOARCH = 'amd64'; try { go build -mod=readonly -o \"$validationDir/ownsand-guest.exe\" ./cmds/ownsand-guest; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } finally { Remove-Item Env:GOARCH -ErrorAction SilentlyContinue }",
+        "$stateDir = Join-Path $validationDir ('state-' + [guid]::NewGuid().ToString('N'))",
+        "& \"$validationDir/ownsand-agent.exe\" image build '--no-color' '--os' 'windows' '--state-dir' \"$stateDir\" '--iso' \"$env:OWNSAND_VALIDATION_ISO\" '--edition' '2' '--guest-binary' \"$validationDir/ownsand-guest.exe\" 2>&1 | Tee-Object \"$validationDir/trusted-image-build.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "if (!(Test-Path -LiteralPath \"$stateDir/images/windows/disk.vhdx\" -PathType Leaf) -or !(Test-Path -LiteralPath \"$stateDir/images/windows/image.json\" -PathType Leaf)) { throw 'Windows image files are missing' }"
+      ],
+      "expectedResults": [
+        "The agent logs that setup files were installed, completes first boot and publishes disk.vhdx and image.json in the disposable state directory."
+      ],
+      "coverageLimits": [
+        "The non-elevated host cannot create a separate Windows symbolic-link fixture. The focused test uses junctions and exercises the shared reparse-attribute rejection."
+      ]
+    }
+  }
+}
