@@ -919,6 +919,9 @@ func (s *Server) transferStatus(ctx context.Context, _ *mcp.CallToolRequest, in 
 	t := s.transfers[in.TransferID]
 	s.mu.Unlock()
 	if t == nil {
+		if _, err := s.client(ctx); err != nil {
+			return nil, transferResult{}, err
+		}
 		return nil, transferResult{}, toolError(connect.NewError(connect.CodeNotFound, errors.New("no transfer with this transfer_id runs in this server process; transfers stop when the server exits, so sync again")))
 	}
 	r, err := s.awaitTransfer(ctx, t, wait)
