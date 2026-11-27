@@ -275,9 +275,8 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 		case result == nil || len(result.GetParts()) == 0:
 			reason = "no_parts"
 		default:
-			// A part number that repeats is invalid: the manifest keys its
-			// parts by number, so the database would reject the second
-			// insert and abort the transaction instead of failing the attempt.
+			// Reject duplicate part numbers before the manifest insert so a
+			// part key conflict cannot abort the failure transition.
 			seen := make(map[int32]struct{}, len(result.GetParts()))
 			var highest int32
 			for _, part := range result.GetParts() {
@@ -310,11 +309,18 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 		if _, err := tx.Exec(ctx, "DELETE FROM snapshot_parts WHERE snapshot_id = $1", info.snapshotID); err != nil {
 			return err
 		}
-		for _, part := range result.GetParts() {
-			if _, err := tx.Exec(ctx, "INSERT INTO snapshot_parts (snapshot_id, part_number, size_bytes, sha256) VALUES ($1, $2, $3, $4)",
-				info.snapshotID, part.GetPartNumber(), part.GetSizeBytes(), part.GetSha256()); err != nil {
-				return err
-			}
+		parts := result.GetParts()
+		numbers := make([]int32, len(parts))
+		sizes := make([]int64, len(parts))
+		hashes := make([][]byte, len(parts))
+		for i, part := range parts {
+			numbers[i], sizes[i], hashes[i] = part.GetPartNumber(), part.GetSizeBytes(), part.GetSha256()
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO snapshot_parts (snapshot_id, part_number, size_bytes, sha256)
+			SELECT $1, part_number, size_bytes, sha256
+			FROM unnest($2::integer[], $3::bigint[], $4::bytea[]) AS parts(part_number, size_bytes, sha256)`,
+			info.snapshotID, numbers, sizes, hashes); err != nil {
+			return err
 		}
 		// The snapshot is importable and billed from the reported sizes at
 		// once; the export verifier checks them against R2 after the upload
@@ -323,7 +329,7 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 			info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED), s.now().Add(s.exportVerifyDelay())); err != nil {
 			return err
 		}
-		s.Logger.InfoContext(ctx, "export_completed", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("parts", len(result.GetParts())))
+		s.Logger.InfoContext(ctx, "export_completed", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("parts", len(parts)))
 		return nil
 	})
 }
