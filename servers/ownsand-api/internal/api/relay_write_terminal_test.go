@@ -18,7 +18,7 @@ func TestRelayWriteFileTerminalBeforeCredit(t *testing.T) {
 	for _, terminal := range writeTerminalResponses() {
 		t.Run(terminal.name, func(t *testing.T) {
 			c := startWriteCall(t, 15*time.Second, 0)
-			defer c.sendWriteResult()
+			defer c.releaseWriteResult()
 			grant := c.env.App.Plane.Grants.Get(c.grant)
 			if grant == nil {
 				t.Fatal("the write grant was lost")
@@ -66,7 +66,7 @@ func TestRelayWriteFileNoCreditLocalExit(t *testing.T) {
 	for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeCanceled} {
 		t.Run(code.String(), func(t *testing.T) {
 			c := startWriteCall(t, 2*time.Second, 0)
-			defer c.sendWriteResult()
+			defer c.releaseWriteResult()
 			if code == connect.CodeCanceled {
 				c.cancel()
 			}

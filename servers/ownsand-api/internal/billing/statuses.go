@@ -19,6 +19,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 // staleLogInterval bounds the billing_status_stale warnings to one per
@@ -56,10 +57,15 @@ type StatusOptions struct {
 	// Ownership samples the lease epoch and held state together. A nil
 	// function means the instance always holds the same lease period.
 	Ownership func() (epoch uint64, held bool)
+	// WhileHeld captures the lease period for a presence scan.
+	WhileHeld func(func(*lease.Period)) bool
 	// Client is the delino-accounts UsageService client. Without it, the
 	// poll and the pending unlinks stay idle, and the RPCs that need
 	// delino-accounts fail with unavailable.
 	Client accountsv1connect.UsageServiceClient
+	// WriteOwnerUnlinks allows creation of durable owner unlink intents.
+	// All instances read and retry existing intents during rollout.
+	WriteOwnerUnlinks bool
 	// Metrics provides the meter of the status metrics; nil records none.
 	Metrics metric.MeterProvider
 	// Timing overrides DefaultStatusTiming.
@@ -81,8 +87,14 @@ type Statuses struct {
 	timing    StatusTiming
 	metrics   *statusMetrics
 
+	writeOwnerUnlinks bool
+	whileHeld         func(func(*lease.Period)) bool
+
 	pollMu sync.Mutex
 	kick   chan struct{}
+
+	presenceMu    sync.Mutex
+	presenceAfter string
 
 	hookMu   sync.Mutex
 	onChange []func()
@@ -106,6 +118,7 @@ func NewStatuses(opts StatusOptions) *Statuses {
 	return &Statuses{
 		db: opts.DB, logger: opts.Logger, now: opts.Now, ownership: opts.Ownership, client: opts.Client, timing: timing,
 		metrics: newStatusMetrics(opts.Metrics), kick: make(chan struct{}, 1), staleLogged: map[string]time.Time{},
+		writeOwnerUnlinks: opts.WriteOwnerUnlinks, whileHeld: opts.WhileHeld,
 	}
 }
 
@@ -225,6 +238,7 @@ func (s *Statuses) applyRemote(ctx context.Context, r *accountsv1.OrganizationBi
 // Poll reads the statuses after the stored cursor and checkpoints the
 // results it handles. A status for a pending first link ends the pass.
 // Only a complete pass refreshes the sync time of every linked organization.
+// The feed omits closed links, which the presence scan checks separately.
 func (s *Statuses) Poll(ctx context.Context) error {
 	if s.client == nil {
 		return ErrReportingDisabled
@@ -348,9 +362,10 @@ func (s *Statuses) Advance(ctx context.Context) error {
 
 // UnlinkPending sends UnlinkOrganization for the pending unlink of the
 // organization, if it has one that is due, and deletes it after
-// delino-accounts accepted it. A pending unlink is a link that
-// TransferOwnership or DeleteOrganization removed locally or a link attempt
-// whose outcome is unknown. It takes the organization row lock in the mode
+// delino-accounts accepted it. An owner intent also clears the cached link
+// at commit. Other pending rows come from TransferOwnership,
+// DeleteOrganization or a link attempt with an unknown outcome.
+// It takes the organization row lock in the mode
 // that LinkBillingAccount takes, so a pending unlink never removes a link
 // that the new owner made after it. A link attempt whose call can still be
 // running is left alone.
@@ -365,26 +380,43 @@ func (s *Statuses) UnlinkPending(ctx context.Context, orgID string) error {
 	if s.client == nil {
 		return ErrReportingDisabled
 	}
-	return s.db.InTx(ctx, func(tx pgx.Tx) error {
+	var change Change
+	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR NO KEY UPDATE", orgID); err != nil {
 			return err
 		}
 		now := s.now()
-		var due bool
-		err := tx.QueryRow(ctx, "SELECT next_attempt_time <= $2 FROM billing_pending_unlinks WHERE organization_id = $1", orgID, now).Scan(&due)
-		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !due) {
-			return nil
-		}
+		op, err := loadOwnerUnlink(ctx, tx, orgID)
 		if err != nil {
 			return err
 		}
-		err = s.UnlinkPendingTx(ctx, tx, orgID, now)
+		if op.id != "" {
+			if op.nextAttempt.After(now) {
+				return nil
+			}
+			_, change, err = s.resolveOwnerUnlink(ctx, tx, orgID, op, "")
+		} else {
+			var due bool
+			err = tx.QueryRow(ctx, "SELECT next_attempt_time <= $2 FROM billing_pending_unlinks WHERE organization_id = $1", orgID, now).Scan(&due)
+			if errors.Is(err, pgx.ErrNoRows) || (err == nil && !due) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			err = s.UnlinkPendingTx(ctx, tx, orgID, now)
+		}
 		if errors.Is(err, ErrUnlinkFailed) || errors.Is(err, ErrLinkInProgress) {
-			// The failed attempt is recorded in the transaction; commit it.
+			// Commit the retry schedule after a failed call. A guarded call
+			// leaves the row untouched.
 			return nil
 		}
 		return err
 	})
+	if err == nil {
+		s.Committed(ctx, change)
+	}
+	return err
 }
 
 // ConfirmUnlinkedTx makes sure that delino-accounts has no link for the
@@ -439,13 +471,10 @@ func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string,
 	if (running != nil && running.After(now)) || (guard != nil && guard.After(now)) {
 		return ErrLinkInProgress
 	}
-	if s.client == nil {
-		return ErrReportingDisabled
-	}
-	cctx, cancel := context.WithTimeout(ctx, unlinkCallTimeout)
-	_, cerr := s.client.UnlinkOrganization(cctx, connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{Service: ServiceID, OrganizationId: orgID}))
-	cancel()
-	if cerr != nil {
+	if cerr := s.callUnlink(ctx, orgID); cerr != nil {
+		if errors.Is(cerr, ErrReportingDisabled) {
+			return cerr
+		}
 		// The back-off starts when the call failed, not at the caller's
 		// earlier reading of the clock: the wait for the organization lock
 		// and the call itself must not consume the delay.
@@ -453,8 +482,7 @@ func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string,
 		if _, err := tx.Exec(ctx, "UPDATE billing_pending_unlinks SET attempts = attempts + 1, next_attempt_time = $2 WHERE organization_id = $1", orgID, next); err != nil {
 			return err
 		}
-		s.logger.WarnContext(ctx, "billing_unlink_failed", slog.String("organization_id", orgID), slog.String("billing_account_id", account),
-			slog.Int("attempt", attempts+1), slog.String("code", connect.CodeOf(cerr).String()), slog.String("error", cerr.Error()), slog.Time("next_attempt_time", next))
+		s.logUnlinkFailure(ctx, orgID, account, attempts+1, next, cerr)
 		return errors.Join(ErrUnlinkFailed, cerr)
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM billing_pending_unlinks WHERE organization_id = $1", orgID); err != nil {
@@ -462,6 +490,22 @@ func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string,
 	}
 	s.logger.InfoContext(ctx, "billing_unlink_confirmed", slog.String("organization_id", orgID), slog.String("billing_account_id", account), slog.Int("attempt", attempts+1))
 	return nil
+}
+
+// callUnlink bounds the upstream call used by the cleanup and owner paths.
+func (s *Statuses) callUnlink(ctx context.Context, orgID string) error {
+	if s.client == nil {
+		return ErrReportingDisabled
+	}
+	cctx, cancel := context.WithTimeout(ctx, unlinkCallTimeout)
+	defer cancel()
+	_, err := s.client.UnlinkOrganization(cctx, connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{Service: ServiceID, OrganizationId: orgID}))
+	return err
+}
+
+func (s *Statuses) logUnlinkFailure(ctx context.Context, orgID, accountID string, attempt int, next time.Time, err error) {
+	s.logger.WarnContext(ctx, "billing_unlink_failed", slog.String("organization_id", orgID), slog.String("billing_account_id", accountID),
+		slog.Int("attempt", attempt), slog.String("code", connect.CodeOf(err).String()), slog.Any("error", err), slog.Time("next_attempt_time", next))
 }
 
 // unlinkBackoff returns the retry delay after the attempt-th failure.
@@ -482,7 +526,12 @@ func (s *Statuses) RetryPendingUnlinks(ctx context.Context) error {
 	if s.client == nil {
 		return ErrReportingDisabled
 	}
-	rows, err := s.db.Pool.Query(ctx, "SELECT organization_id::text FROM billing_pending_unlinks WHERE next_attempt_time <= $1 ORDER BY next_attempt_time LIMIT 100", s.now())
+	rows, err := s.db.Pool.Query(ctx, `SELECT organization_id::text FROM (
+		SELECT organization_id, next_attempt_time FROM billing_pending_unlinks p
+		WHERE next_attempt_time <= $1 AND NOT EXISTS (SELECT 1 FROM billing_owner_unlinks u WHERE u.organization_id = p.organization_id)
+		UNION ALL
+		SELECT organization_id, next_attempt_time FROM billing_owner_unlinks WHERE next_attempt_time <= $1
+	) due ORDER BY next_attempt_time, organization_id LIMIT 100`, s.now())
 	if err != nil {
 		return err
 	}
@@ -503,8 +552,11 @@ func (s *Statuses) RetryPendingUnlinks(ctx context.Context) error {
 		if _, held := s.ownership(); !held {
 			return nil
 		}
-		if err := s.UnlinkPending(ctx, orgID); err != nil && ctx.Err() != nil {
-			return err
+		if err := s.UnlinkPending(ctx, orgID); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			s.logger.WarnContext(ctx, "billing_unlink_retry_failed", slog.String("organization_id", orgID), slog.Any("error", err))
 		}
 	}
 	return nil
@@ -536,7 +588,7 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 		s.metrics.organizations.Record(ctx, counts[p], metric.WithAttributes(attribute.String("phase", PhaseName(p))))
 	}
 	var pending int64
-	if err := s.db.Pool.QueryRow(ctx, "SELECT count(*) FROM billing_pending_unlinks").Scan(&pending); err != nil {
+	if err := s.db.Pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM billing_pending_unlinks) + (SELECT count(*) FROM billing_owner_unlinks)").Scan(&pending); err != nil {
 		return err
 	}
 	s.metrics.pendingUnlinks.Record(ctx, pending)
@@ -547,8 +599,8 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 // each lease period and then every Poll interval (measured between poll
 // starts). Every Tick, the lease holder records time-based suspensions and
 // retries due pending unlinks if no retry is running. Every instance
-// refreshes the metrics. Pending unlink retries run independently of
-// these steps. Run waits for an outstanding retry before it returns.
+// refreshes the metrics. Link presence checks and pending unlink retries
+// run independently of these steps. Run waits for both before it returns.
 func (s *Statuses) Run(ctx context.Context) {
 	if s.client == nil {
 		s.logger.Warn("billing_status_sync_disabled",
@@ -562,6 +614,13 @@ func (s *Statuses) Run(ctx context.Context) {
 	// for the running batch before it returns; the batch ends with ctx.
 	var batch sync.WaitGroup
 	defer batch.Wait()
+	if s.client != nil {
+		batch.Add(1)
+		go func() {
+			defer batch.Done()
+			s.runLinkPresence(ctx)
+		}()
+	}
 	var retrying atomic.Bool
 	var lastPoll time.Time
 	var lastPollEpoch uint64
