@@ -1,0 +1,52 @@
+{
+  "gid": "inv-28-windows-runner-acl-verification",
+  "commit": "c749da9ecad08294ca24d331b85ae3ee031fb71b",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "c749da9ecad08294ca24d331b85ae3ee031fb71b",
+    "setup": "Start Windows PowerShell 5.1 from a short disposable NTFS working directory. Run the first command, copy files.copyFrom to files.copyTo, then run the remaining commands in the same session. The binary is tied to the commit by the recorded SHA-256.",
+    "commands": [
+      "New-Item -ItemType Directory -Path '.t3-tmp' -Force | Out-Null",
+      "if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Run Windows PowerShell 5.1' }; if ((Get-FileHash -Algorithm SHA256 -LiteralPath '.\\.t3-tmp\\sandrun-github-windows-amd64.test.exe').Hash -ne '8b5ad1be0e75c5767ff5556b3ca0a1fa1d1c89b262cd7aa53785245ab32b5707') { throw 'Test binary checksum mismatch' }",
+      "$env:TEMP = (Resolve-Path -LiteralPath '.t3-tmp').Path; $env:TMP = $env:TEMP",
+      "& '.\\.t3-tmp\\sandrun-github-windows-amd64.test.exe' -test.v -test.count=1 -test.run '^TestInstallAndStartCommandsWindowsACL$/^scripted$' 2>&1 | Tee-Object -FilePath '.\\.t3-tmp\\windows-acl-scripted.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The SHA-256 matches and all 14 scripted subtests pass with no skips. No service, Hyper-V, or symbolic-link privileges are required.",
+      "Compliant and reordered cached rules read once. An ACL that differs from policy is read, repaired, and read again. No cached path downloads the runner.",
+      "Initial read failure, write failure, read-back failure, and ineffective repair terminate the PowerShell install script."
+    ],
+    "privilegedFollowUp": {
+      "status": "pending",
+      "setup": "Use an elevated Windows PowerShell 5.1 session in the same disposable NTFS working directory and reuse the verified binary. The normal validation account cannot run this step.",
+      "commands": [
+        "if (-not ([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'An elevated token is required for the NTFS ACL assertions' }",
+        "$env:TEMP = (Resolve-Path -LiteralPath '.t3-tmp').Path; $env:TMP = $env:TEMP",
+        "& '.\\.t3-tmp\\sandrun-github-windows-amd64.test.exe' -test.v -test.count=1 -test.run '^TestInstallAndStartCommandsWindowsACL$/^ntfs$' 2>&1 | Tee-Object -FilePath '.\\.t3-tmp\\windows-acl-ntfs.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+      ],
+      "expectedResults": [
+        "Fresh, retry and cached all pass without skips. The fixture confirms Administrators ownership and protected DACL on the runner directory and full-control grants for only SYSTEM and Administrators on the directory and a newly created file. Retry and cache do not download and the compliant cache does not write the ACL."
+      ]
+    },
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-28-windows-runner-acl-verification/worker/.t3-tmp/sandrun-github-windows-amd64.test.exe",
+      "copyTo": ".t3-tmp/sandrun-github-windows-amd64.test.exe",
+      "sha256": "8b5ad1be0e75c5767ff5556b3ca0a1fa1d1c89b262cd7aa53785245ab32b5707",
+      "regressionTests": [
+        "servers/sandrun-api/internal/github/github_test.go",
+        "servers/sandrun-api/internal/github/install_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-acl-scripted.log",
+        ".t3-tmp/windows-acl-ntfs.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-28-windows-runner-acl-verification/worker/.t3-tmp/sandrun-github-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-28-windows-runner-acl-verification/worker/.t3-tmp/sandrun-api-windows-amd64.exe"
+      ]
+    }
+  }
+}
