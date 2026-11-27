@@ -1,0 +1,32 @@
+{
+  "gid": "inv-02-download-directory-aliases",
+  "commit": "75fd8a300b7992bb853ebc3a5ac437c7650bda1f",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "75fd8a300b7992bb853ebc3a5ac437c7650bda1f",
+    "setup": "Use a disposable clean macOS checkout at the stated SHA with the repository Go toolchain. From the checkout root run the first command, copy the script to copyTo, then run the second command. The script creates and detaches a temporary APFS image under .t3-tmp.",
+    "commands": [
+      "mkdir -p '.t3-tmp'",
+      "bash '.t3-tmp/validate-macos-download-directory-aliases.sh' '75fd8a300b7992bb853ebc3a5ac437c7650bda1f'"
+    ],
+    "expectedResults": [
+      "The script prints the exact SHA, macOS and Go versions and APFS volume details. The directory probe confirms that two spellings resolve to the same directory.",
+      "TestDownloadDirectoryCaseCollision logs that the staging volume aliases Reports and reports. All four explicit and implicit collision subtests pass with existing and absent destinations.",
+      "Each collision returns failed_precondition with the two exact guest directory paths, no success result, the expected destination state and complete local and Connect fixture cleanup.",
+      "TestDownloadArchiveRepeatedDirectoryName passes and keeps both children. The script exits 0 and detaches the volume."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-download-directory-aliases/worker/.t3-tmp/download-directory-aliases/validate-macos-download-directory-aliases.sh",
+      "copyTo": ".t3-tmp/validate-macos-download-directory-aliases.sh",
+      "regressionTests": ["go/sandrun/download_case_test.go"],
+      "outputLogs": [".t3-tmp/macos-download-directory-aliases.log"],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-download-directory-aliases/worker/.t3-tmp/download-directory-aliases/sandrun-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-download-directory-aliases/worker/.t3-tmp/download-directory-aliases/sandrun-darwin-arm64"
+      ]
+    }
+  }
+}
