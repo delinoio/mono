@@ -327,7 +327,7 @@ func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
 	// that used its whole budget leaves the full outcome time.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.outcomeTimeout)
 	defer cancel()
-	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+	err := s.inTopUpTx(ctx, func(tx pgx.Tx, observations *topUpObservations) error {
 		now := s.timestamp()
 		acct, err := lockAccount(ctx, tx, t.BillingAccountID)
 		if err != nil {
@@ -350,12 +350,26 @@ func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
 				_, err = tx.Exec(ctx, `DELETE FROM top_ups WHERE top_up_id = $1 AND status = 'charging'`, t.ID)
 				return err
 			}
-			return s.failTopUp(ctx, tx, acct, t.ID, FailureNotApplied, now)
+			return s.failTopUp(ctx, tx, observations, acct, t.ID, FailureNotApplied, now)
 		default:
-			return s.failTopUp(ctx, tx, acct, t.ID, failureReason(outcome, code), now)
+			return s.failTopUp(ctx, tx, observations, acct, t.ID, failureReason(outcome, code), now)
 		}
 	})
 	return outcome, err
+}
+
+// topUpObservations holds the transition telemetry for one transaction.
+type topUpObservations []func()
+
+func (s *Service) inTopUpTx(ctx context.Context, run func(pgx.Tx, *topUpObservations) error) error {
+	var observations topUpObservations
+	if err := s.db.InTx(ctx, func(tx pgx.Tx) error { return run(tx, &observations) }); err != nil {
+		return err
+	}
+	for _, observe := range observations {
+		observe()
+	}
+	return nil
 }
 
 // failTopUp marks an open top-up failed in tx, which holds the billing
@@ -366,8 +380,7 @@ func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
 // top-up off after the second failure in a row. A manual top-up that fails
 // after Paddle accepted it (a failed payment webhook or a timeout) also
 // emails them; a rejection in the response reaches the caller instead.
-func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, topUpID string, reason FailureReason, now time.Time) error {
-	var prev TopUpStatus
+func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, observations *topUpObservations, acct *accountState, topUpID string, reason FailureReason, now time.Time) error {
 	row := tx.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE top_up_id = $1 FOR UPDATE`, topUpID)
 	t, err := scanTopUp(row)
 	if err != nil {
@@ -376,7 +389,6 @@ func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, 
 	if !t.open() {
 		return nil
 	}
-	prev = t.Status
 	// The previous release recorded acceptance of a charged manual top-up
 	// in update_time. Preserve that evidence before writing the timeout.
 	if _, err := tx.Exec(ctx, `UPDATE top_ups SET status = 'failed', failure_reason = $2, update_time = $3,
@@ -389,16 +401,18 @@ func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, 
 	if reason == FailureTimedOut {
 		result = "timed_out"
 	}
-	s.metrics.TopUpResult(string(t.Kind), result)
-	s.logger.WarnContext(ctx, "billing_top_up_failed",
-		slog.String("billing_account_id", acct.ID),
-		slog.String("top_up_id", t.ID),
-		slog.String("kind", string(t.Kind)),
-		slog.String("reason", string(reason)),
-		slog.String("previous_status", string(prev)),
-		slog.Int64("amount_usd_micros", t.Amount))
+	*observations = append(*observations, func() {
+		s.metrics.TopUpResult(string(t.Kind), result)
+		s.logger.WarnContext(ctx, "billing_top_up_failed",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("top_up_id", t.ID),
+			slog.String("kind", string(t.Kind)),
+			slog.String("reason", string(reason)),
+			slog.String("previous_status", string(t.Status)),
+			slog.Int64("amount_usd_micros", t.Amount))
+	})
 
-	asyncFailure := prev == TopUpCharged || prev == TopUpUnknown || reason == FailurePaymentFailed || reason == FailureTimedOut
+	asyncFailure := t.Status == TopUpCharged || t.Status == TopUpUnknown || reason == FailurePaymentFailed || reason == FailureTimedOut
 	if t.Kind == TopUpManual {
 		if !asyncFailure {
 			return nil
@@ -439,11 +453,13 @@ func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, 
 	if !turnOff {
 		return nil
 	}
-	s.metrics.AutoTopUpDisabled()
-	s.logger.WarnContext(ctx, "billing_auto_top_up_disabled",
-		slog.String("billing_account_id", acct.ID),
-		slog.String("top_up_id", t.ID),
-		slog.Int("consecutive_failures", int(count)))
+	*observations = append(*observations, func() {
+		s.metrics.AutoTopUpDisabled()
+		s.logger.WarnContext(ctx, "billing_auto_top_up_disabled",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("top_up_id", t.ID),
+			slog.Int("consecutive_failures", int(count)))
+	})
 	return s.enqueue(ctx, tx, acct.ID, NotifyAutoTopUpDisabled, "auto_top_up_disabled/"+t.ID, map[string]string{
 		notifyDetailAmount: fmt.Sprint(t.Amount),
 	}, now)
@@ -452,7 +468,7 @@ func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, 
 // completeTopUp marks a top-up completed after its verified payment webhook
 // added the credit. A successful automatic top-up resets the failure count,
 // also when it had failed by timeout before the webhook arrived.
-func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transactionID string, now time.Time) error {
+func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, observations *topUpObservations, t topUp, transactionID string, now time.Time) error {
 	if t.Status == TopUpCompleted {
 		return nil
 	}
@@ -466,13 +482,15 @@ func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transac
 			return err
 		}
 	}
-	s.metrics.TopUpResult(string(t.Kind), "completed")
-	s.logger.InfoContext(ctx, "billing_top_up_completed",
-		slog.String("billing_account_id", t.BillingAccountID),
-		slog.String("top_up_id", t.ID),
-		slog.String("kind", string(t.Kind)),
-		slog.String("paddle_transaction_id", transactionID),
-		slog.String("previous_status", string(t.Status)))
+	*observations = append(*observations, func() {
+		s.metrics.TopUpResult(string(t.Kind), "completed")
+		s.logger.InfoContext(ctx, "billing_top_up_completed",
+			slog.String("billing_account_id", t.BillingAccountID),
+			slog.String("top_up_id", t.ID),
+			slog.String("kind", string(t.Kind)),
+			slog.String("paddle_transaction_id", transactionID),
+			slog.String("previous_status", string(t.Status)))
+	})
 	return nil
 }
 
@@ -510,7 +528,7 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 		}
 		var claimed topUp
 		var ok bool
-		err = s.db.InTx(ctx, func(tx pgx.Tx) error {
+		err = s.inTopUpTx(ctx, func(tx pgx.Tx, observations *topUpObservations) error {
 			acct, err := lockAccount(ctx, tx, candidate.BillingAccountID)
 			if err != nil {
 				return err
@@ -529,7 +547,7 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 				return err
 			}
 			if acct.Deleted {
-				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
+				return s.failTopUp(ctx, tx, observations, acct, claimed.ID, FailureNoSubscription, now)
 			}
 			// Revalidate the settings before the subscription: a top-up
 			// that the current settings no longer allow is not a failed
@@ -538,15 +556,17 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 			if reason, err := s.obsoleteReason(ctx, tx, acct.ID, claimed, now); err != nil {
 				return err
 			} else if reason != "" {
-				s.logger.InfoContext(ctx, "billing_auto_top_up_obsolete",
-					slog.String("billing_account_id", acct.ID),
-					slog.String("top_up_id", claimed.ID),
-					slog.String("reason", reason),
-					slog.Int64("amount_usd_micros", claimed.Amount))
-				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureSettingsChanged, now)
+				*observations = append(*observations, func() {
+					s.logger.InfoContext(ctx, "billing_auto_top_up_obsolete",
+						slog.String("billing_account_id", acct.ID),
+						slog.String("top_up_id", claimed.ID),
+						slog.String("reason", reason),
+						slog.Int64("amount_usd_micros", claimed.Amount))
+				})
+				return s.failTopUp(ctx, tx, observations, acct, claimed.ID, FailureSettingsChanged, now)
 			}
 			if sub.PaddleSubscriptionID == "" || !sub.Manageable() {
-				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
+				return s.failTopUp(ctx, tx, observations, acct, claimed.ID, FailureNoSubscription, now)
 			}
 			claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
 			claimed.Status = TopUpCharging
@@ -609,7 +629,7 @@ func (s *Service) TimeOutTopUps(ctx context.Context) error {
 		return err
 	}
 	for _, r := range refs {
-		err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+		err := s.inTopUpTx(ctx, func(tx pgx.Tx, observations *topUpObservations) error {
 			now := s.timestamp()
 			acct, err := lockAccount(ctx, tx, r.AccountID)
 			if err != nil {
@@ -623,7 +643,7 @@ func (s *Service) TimeOutTopUps(ctx context.Context) error {
 			if !stale {
 				return nil
 			}
-			return s.failTopUp(ctx, tx, acct, r.ID, FailureTimedOut, now)
+			return s.failTopUp(ctx, tx, observations, acct, r.ID, FailureTimedOut, now)
 		})
 		if err != nil {
 			return err
