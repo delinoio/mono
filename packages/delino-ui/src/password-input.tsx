@@ -12,7 +12,7 @@ import {
 } from "@ui-sdk/react/password-input";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./panel-autofocus.ts";
+import { useFieldAutoFocus } from "./panel-autofocus.ts";
 
 export type PasswordInputProps = Omit<
   React.ComponentProps<typeof PasswordInputRoot>,
@@ -82,7 +82,10 @@ export function PasswordInput({
   } = props as typeof props & {
     "data-autofocus"?: unknown;
   };
-  const forwardedAutoFocus = useForwardedAutoFocus(autoFocus);
+  const { autoFocus: forwardedAutoFocus, marker } = useFieldAutoFocus(
+    autoFocus,
+    disabled,
+  );
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -103,20 +106,6 @@ export function PasswordInput({
         disabled={disabled}
         {...rootProps}
       >
-        {/*
-          Workaround: the UI SDK Dialog chooses its initial focus target with a
-          `[autofocus], [data-autofocus]` DOM query, but React handles the
-          `autoFocus` prop by calling `focus()` and renders no `autofocus`
-          attribute. Without `data-autofocus` on the control `<input>`, a Dialog
-          focuses its first tabbable element (usually the close button) instead
-          of this input. The attribute must be on the control, not the root:
-          the root `<div>` is not tabbable, so a caller `data-autofocus` is dropped
-          from the root props above.
-          Exception: the caller ARIA props are not dropped but routed to the
-          control (see above), because the root has no role.
-          Scope: only when `autoFocus` is true. Remove when the UI SDK reads the
-          React `autoFocus` prop itself.
-        */}
         <PasswordInputControl
           className="dui-password-input-control"
           placeholder={placeholder}
@@ -124,7 +113,7 @@ export function PasswordInput({
           aria-describedby={ariaDescribedBy}
           aria-label={ariaLabel}
           aria-labelledby={ariaLabelledBy}
-          data-autofocus={autoFocus ? "" : undefined}
+          data-autofocus={marker}
         />
         <PasswordInputToggle
           className="dui-password-input-toggle"

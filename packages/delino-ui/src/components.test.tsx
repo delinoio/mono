@@ -1029,6 +1029,120 @@ describe("panel autofocus boundaries", () => {
     });
   });
 
+  describe("Dialog autofocus across opens", () => {
+    for (const Field of fields) {
+      for (const autoFocus of [true, undefined]) {
+        test(`skips a disabled ${Field.name} marker when the next field has autoFocus=${autoFocus}`, async () => {
+          render(
+            <PanelFixture panel={panels[0]} useTrigger>
+              <Field label="Unavailable" disabled autoFocus />
+              <Field label="Critical" autoFocus={autoFocus} />
+            </PanelFixture>,
+          );
+          const opener = await openPanel();
+          expect(
+            screen.getByLabelText("Unavailable").hasAttribute("data-autofocus"),
+          ).toBe(false);
+          const target = autoFocus
+            ? screen.getByLabelText("Critical")
+            : screen.getByRole("button", { name: "Cancel" });
+          await waitFor(() => expect(document.activeElement).toBe(target));
+
+          await closePanel(autoFocus ? "Escape" : "Cancel");
+          await waitFor(() => expect(document.activeElement).toBe(opener));
+        });
+      }
+    }
+
+    function EditDialog({
+      Field,
+      autoFocus,
+      useTrigger,
+      keepMounted,
+    }: {
+      Field: (typeof fields)[number];
+      autoFocus?: boolean;
+      useTrigger?: boolean;
+      keepMounted?: boolean;
+    }) {
+      const [open, setOpen] = React.useState(false);
+      const [editing, setEditing] = React.useState(false);
+      return (
+        <>
+          {useTrigger ? null : (
+            <button type="button" onClick={() => setOpen(true)}>
+              Open
+            </button>
+          )}
+          <Dialog
+            open={useTrigger ? undefined : open}
+            onOpenChange={(nextOpen) => {
+              setOpen(nextOpen);
+              if (!nextOpen) setEditing(false);
+            }}
+          >
+            {useTrigger ? <DialogTrigger>Open</DialogTrigger> : null}
+            <DialogContent keepMounted={keepMounted}>
+              <DialogTitle>Rename</DialogTitle>
+              <button type="button" onClick={() => setEditing(true)}>
+                Edit
+              </button>
+              {editing && <Field label="Critical" autoFocus={autoFocus} />}
+              <DialogClose>Cancel</DialogClose>
+            </DialogContent>
+          </Dialog>
+        </>
+      );
+    }
+
+    async function revealField() {
+      const edit = screen.getByRole("button", { name: "Edit" });
+      await waitFor(() => expect(document.activeElement).toBe(edit));
+      await act(async () => {
+        fireEvent.click(edit);
+      });
+      return edit;
+    }
+
+    for (const Field of fields) {
+      for (const dismissal of ["Escape", "Cancel"] as const) {
+        test(`focuses a late ${Field.name} and returns focus after ${dismissal}`, async () => {
+          render(<EditDialog Field={Field} autoFocus />);
+          const opener = await openPanel();
+          await revealField();
+          expect(document.activeElement).toBe(
+            screen.getByLabelText("Critical"),
+          );
+
+          await closePanel(dismissal);
+          await waitFor(() => expect(document.activeElement).toBe(opener));
+        });
+      }
+
+      test(`keeps focus on Edit when a late ${Field.name} has no autoFocus`, async () => {
+        render(<EditDialog Field={Field} />);
+        await openPanel();
+        const edit = await revealField();
+        expect(screen.getByLabelText("Critical")).toBeTruthy();
+        expect(document.activeElement).toBe(edit);
+      });
+
+      test(`focuses a late ${Field.name} on successive trigger opens`, async () => {
+        render(<EditDialog Field={Field} autoFocus useTrigger keepMounted />);
+        for (const dismissal of ["Escape", "Cancel"] as const) {
+          const opener = await openPanel();
+          await revealField();
+          expect(document.activeElement).toBe(
+            screen.getByLabelText("Critical"),
+          );
+
+          await closePanel(dismissal);
+          await waitFor(() => expect(document.activeElement).toBe(opener));
+        }
+      });
+    }
+  });
+
   test("defers autofocus for fields created by a custom content render", async () => {
     function CustomDialog() {
       const [open, setOpen] = React.useState(false);

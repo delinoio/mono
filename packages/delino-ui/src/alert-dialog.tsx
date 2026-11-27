@@ -11,7 +11,7 @@ import {
 import type * as React from "react";
 import { ButtonSize, ButtonVariant } from "./button.tsx";
 import { mergeClassName } from "./class-name.ts";
-import { DeferAutoFocusContext } from "./panel-autofocus.ts";
+import { PanelAutoFocus, PanelAutoFocusContext } from "./panel-autofocus.ts";
 
 export {
   createAlertDialogController,
@@ -82,12 +82,12 @@ export function AlertDialogContent({
   return (
     <>
       <AlertDialogBackdrop className="dui-dialog-backdrop" />
-      <DeferAutoFocusContext value={true}>
+      <PanelAutoFocusContext value={PanelAutoFocus.Deferred}>
         <AlertDialogContentPart
           className={mergeClassName("dui-dialog-content", className)}
           {...props}
         />
-      </DeferAutoFocusContext>
+      </PanelAutoFocusContext>
     </>
   );
 }
