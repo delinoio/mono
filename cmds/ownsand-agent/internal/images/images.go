@@ -137,20 +137,30 @@ func requiredFiles(os ownsandv1.GuestOs) []string {
 // guest OS needs. A directory that Complete rejects is never an image that a
 // runtime can boot.
 func Complete(dir string) bool {
+	_, err := readCompleteMetadata(dir)
+	return err == nil
+}
+
+// readCompleteMetadata checks the required regular files for the guest OS.
+func readCompleteMetadata(dir string) (Metadata, error) {
 	m, err := ReadMetadata(dir)
 	if err != nil {
-		return false
+		return Metadata{}, err
 	}
 	files := requiredFiles(m.GuestOS)
 	if files == nil {
-		return false
+		return Metadata{}, fmt.Errorf("%s declares guest OS %v, which has no locally built image", MetadataFile, m.GuestOS)
 	}
 	for _, name := range files {
-		if st, err := os.Stat(filepath.Join(dir, name)); err != nil || !st.Mode().IsRegular() {
-			return false
+		st, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			return Metadata{}, err
+		}
+		if !st.Mode().IsRegular() {
+			return Metadata{}, fmt.Errorf("%s is not a regular file", name)
 		}
 	}
-	return true
+	return m, nil
 }
 
 // RecoverResult is the outcome of Recover.
@@ -301,8 +311,9 @@ func Resolve(dir string) (Metadata, error) {
 }
 
 // Install replaces the image directory dir with the finished build
-// directory. The caller holds the build lock. Install takes exclusive
-// publication access before it performs recovery or exchanges directories.
+// directory for guestOS. The caller holds the build lock. Install takes
+// exclusive publication access before it recovers the previous image,
+// validates the staged image and exchanges directories.
 //
 // The old image moves aside first and stays until the new image is in place,
 // so at every point of the exchange one complete image exists, under dir or
@@ -310,7 +321,7 @@ func Resolve(dir string) (Metadata, error) {
 // earlier process left half done is repaired instead of deleted, and it
 // removes a leftover `<dir>.old` only when dir holds a complete image. When
 // the second rename fails, the old image moves back.
-func Install(ctx context.Context, dir string) error {
+func Install(ctx context.Context, dir string, guestOS ownsandv1.GuestOs) error {
 	lock, err := waitLock(ctx, publicationLockPath(dir), exclusiveLock)
 	if err != nil {
 		return fmt.Errorf("images: install %s: %w", dir, err)
@@ -320,8 +331,12 @@ func Install(ctx context.Context, dir string) error {
 		return err
 	}
 	build := BuildDir(dir)
-	if _, err := os.Stat(filepath.Join(build, MetadataFile)); err != nil {
-		return fmt.Errorf("images: the build directory has no %s: %w", MetadataFile, err)
+	metadata, err := readCompleteMetadata(build)
+	if err != nil {
+		return fmt.Errorf("images: validate staged image %s: %w", build, err)
+	}
+	if metadata.GuestOS != guestOS {
+		return fmt.Errorf("images: validate staged image %s: %s declares guest OS %v, want %v", build, MetadataFile, metadata.GuestOS, guestOS)
 	}
 	old := OldDir(dir)
 	// After recoverLocked, a complete backup implies a complete dir, so
