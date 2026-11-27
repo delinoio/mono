@@ -1611,10 +1611,11 @@ export function createMockTransport(
         requireAdmin(role);
         if (
           req.mode === AgentVersionPolicyMode.PIN &&
-          req.pinnedVersion.trim() === ""
+          (req.pinnedVersion.trim() === "" ||
+            /[ \t\r\n]/.test(req.pinnedVersion))
         ) {
           throw new ConnectError(
-            "pinned_version is required",
+            "invalid pinned_version: a version is required for PIN",
             Code.InvalidArgument,
           );
         }
