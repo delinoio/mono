@@ -47,6 +47,7 @@ const (
 	EnvLogtoTokenEndpoint       = "LOGTO_TOKEN_ENDPOINT"
 	EnvAccountsM2MClientID      = "ACCOUNTS_M2M_CLIENT_ID"
 	EnvAccountsM2MClientSecret  = "ACCOUNTS_M2M_CLIENT_SECRET"
+	EnvWriteOwnerUnlinks        = "BILLING_WRITE_OWNER_UNLINKS"
 	EnvMetricsAddr              = "METRICS_ADDR"
 )
 
@@ -174,11 +175,12 @@ type R2 struct {
 // (development and tests); usage is then still metered into the outbox,
 // and the reporter stays idle.
 type Accounts struct {
-	Enabled       bool
-	APIOrigin     string
-	TokenEndpoint string
-	ClientID      string
-	ClientSecret  string
+	WriteOwnerUnlinks bool
+	Enabled           bool
+	APIOrigin         string
+	TokenEndpoint     string
+	ClientID          string
+	ClientSecret      string
 }
 
 // Config is the validated server configuration. It holds secrets; never log
@@ -425,6 +427,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.Accounts.Enabled = true
 	}
+	if v := get(EnvWriteOwnerUnlinks); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false", EnvWriteOwnerUnlinks)
+		}
+		cfg.Accounts.WriteOwnerUnlinks = b
+	}
+
 	if v := get(EnvMetricsAddr); v != "" {
 		if err := listenaddr.Validate(EnvMetricsAddr, v); err != nil {
 			return Config{}, err
