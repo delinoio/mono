@@ -813,6 +813,8 @@ export interface MockTransportOptions {
   userId?: string;
   /** The Acme runner profile count. Larger lists put linux-build last. */
   runnerProfileCount?: number;
+  /** Fail the first Acme roster continuation for retry tests. Default: true. */
+  failFirstAcmeMemberContinuation?: boolean;
   /** Caps integration pages and seeds a profile that uses the second page. */
   agentIntegrationPageSize?: number;
   /**
@@ -837,7 +839,7 @@ export function createMockTransport(
     options.runnerProfileCount ?? 3,
     options.agentIntegrationPageSize,
   );
-  let failAcmeContinuation = true;
+  let failAcmeContinuation = options.failFirstAcmeMemberContinuation ?? true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
     string,
