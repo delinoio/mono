@@ -10,6 +10,8 @@
 # docs/servers-ownsand-api-foundation.md, Runtime and Language).
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY dist/ownsand-api /usr/local/bin/ownsand-api
+# This worker can retry pending unlinks with a NULL billing account ID.
+LABEL io.delino.ownsand.pending-unlinks=nullable-account-v1
 # FSL-1.1-ALv2 terms and copyright notice (servers/LICENSE).
 COPY LICENSE /usr/share/licenses/ownsand-api/LICENSE
 # BSD-3-Clause notice of the statically linked Go standard library and runtime.

@@ -396,9 +396,8 @@ func (c *Control) handle(ctx context.Context, e events.Event, channels channelGe
 				return nil
 			}
 			// Any other lookup error is transient (for example a database
-			// error): a skip would advance the cursor past a delete that
-			// no agent received, and a repeated DeleteSandbox writes no
-			// new event while the delete is pending.
+			// error): keep the event pending for another poll so delivery
+			// can recover without another request or a reconnect.
 			return err
 		}
 		if isTerminal(sb.AgentState) || !sb.DeletePending {
@@ -459,8 +458,8 @@ func (c *Control) runOfflineSweep(ctx context.Context) {
 		// the lease: a record outlives the lease only when its channel closed
 		// at the lease release, and it must expire then too.
 		c.S.expireCommands(ctx)
-		// Pending revocations are bound to channels of this instance.
-		// Sweep them even when the instance no longer holds the lease.
+		// Sessions and pending revocations are bound to channels of this
+		// instance. Sweep them even when it no longer holds the lease.
 		if c.S.DataPath != nil {
 			c.S.DataPath.SweepExpired(ctx)
 		}

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+import { getEventListeners } from "node:events";
 import { describe, expect, test } from "@rstest/core";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
-import { Disconnect, Eof, Hang, Sleep } from "./fake-api.ts";
+import { Disconnect, Eof, Hang, Sleep, Trickle } from "./fake-api.ts";
 import { ev, execMsg, setup } from "./harness.ts";
 
 const EXEC_URL = `https://ownsand.api.test/${RelayService.typeName}/Exec`;
@@ -183,6 +184,92 @@ describe("FakeApi stream scripts", () => {
     await h.clock.advance(1_000);
     expect(reachedAfterSleeps).toBe(false);
     await pending;
+  });
+
+  test("releases Hang when only the reader cancels", async () => {
+    const h = setup();
+    let enteredHang = false;
+    let advancedScript = false;
+    let cleanups = 0;
+    h.api.stream(RelayService, "Exec", function* () {
+      try {
+        enteredHang = true;
+        yield new Hang();
+        advancedScript = true;
+        yield execMsg(ev.accepted());
+      } finally {
+        cleanups++;
+      }
+    });
+    const { controller, reader } = await open(h);
+    const pending = reader.read();
+    await h.clock.settle();
+    expect(enteredHang).toBe(true);
+
+    await reader.cancel();
+
+    await expect(pending).resolves.toEqual({ done: true, value: undefined });
+    expect(h.clock.now()).toBe(0);
+    expect(controller.signal.aborted).toBe(false);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(advancedScript).toBe(false);
+    expect(cleanups).toBe(1);
+  });
+
+  test("removes a Trickle delay when only the reader cancels", async () => {
+    const h = setup();
+    let advancedScript = false;
+    let cleanups = 0;
+    h.api.stream(RelayService, "Exec", function* () {
+      try {
+        yield new Trickle(execMsg(ev.accepted()), 3, 100);
+        advancedScript = true;
+        yield execMsg(ev.exited(0));
+      } finally {
+        cleanups++;
+      }
+    });
+    const { controller, reader } = await open(h);
+    expect((await reader.read()).done).toBe(false);
+    const pending = reader.read();
+    // A positive timer exists, but a zero budget keeps it from firing.
+    await expect(h.clock.run(pending, 0)).rejects.toThrow("time limit reached");
+
+    await reader.cancel();
+
+    await expect(pending).resolves.toEqual({ done: true, value: undefined });
+    await expect(h.clock.run(new Promise(() => {}), 0)).rejects.toThrow(
+      "no timer is pending",
+    );
+    expect(h.clock.now()).toBe(0);
+    expect(controller.signal.aborted).toBe(false);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(cleanups).toBe(1);
+
+    await h.clock.advance(500);
+    await expect(reader.read()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
+    expect(advancedScript).toBe(false);
+    expect(cleanups).toBe(1);
+  });
+
+  test("rejects a read with the request's exact reason during a Trickle delay", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield new Trickle(execMsg(ev.accepted()), 3, 100);
+    });
+    const { controller, reader } = await open(h);
+    expect((await reader.read()).done).toBe(false);
+    const pending = reader.read();
+    await expect(h.clock.run(pending, 0)).rejects.toThrow("time limit reached");
+    const reason = new Error("caller canceled");
+
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    await expect(reader.read()).rejects.toBe(reason);
   });
 
   test("still ends a Hang step when the call is aborted", async () => {
