@@ -13,7 +13,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"connectrpc.com/connect"
@@ -39,12 +38,6 @@ const (
 
 // syncManifestLimit bounds the encoded manifest that sync reads and writes.
 const syncManifestLimit int64 = 256 << 20
-
-// cleanupTimeout bounds the guest clean-up after a failed sync or download.
-const cleanupTimeout = 30 * time.Second
-
-// syncExecRecoveryWait bounds the wait for a result after sync loses an exec stream.
-const syncExecRecoveryWait = 30 * time.Second
 
 // SyncParams describes a sync of a local working tree into the workspace
 // path of a dev session.
@@ -433,7 +426,7 @@ func (c *Client) cleanupFailedSync(ctx context.Context, s *sandrunv1.DevSession,
 
 // syncLockAcquired requires an explicit exit code that proves ownership.
 func (c *Client) syncLockAcquired(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) bool {
-	result, err := c.recoverSyncExec(ctx, s, streamErr)
+	result, err := c.recoverGuestExec(ctx, s, streamErr)
 	if err != nil {
 		c.logger.DebugContext(ctx, "sandrun sync kept the lock after losing the acquisition stream",
 			"dev_session_id", s.GetDevSessionId(), "exec_id", streamErr.ExecID, "code", codeText(err))
@@ -446,24 +439,12 @@ func (c *Client) syncLockAcquired(ctx context.Context, s *sandrunv1.DevSession, 
 // waitForSyncApply observes the original exec because its command can keep
 // writing after the stream ends. Cleaning up requires a terminal result.
 func (c *Client) waitForSyncApply(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) bool {
-	_, err := c.recoverSyncExec(ctx, s, streamErr)
+	_, err := c.recoverGuestExec(ctx, s, streamErr)
 	if err != nil {
 		c.logger.DebugContext(ctx, "sandrun sync kept the lock and inputs after losing the apply stream",
 			"dev_session_id", s.GetDevSessionId(), "exec_id", streamErr.ExecID, "code", codeText(err))
 	}
 	return err == nil
-}
-
-func (c *Client) recoverSyncExec(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) (*ExecResult, error) {
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncExecRecoveryWait)
-	defer cancel()
-	return c.AttachExec(waitCtx, AttachParams{
-		OrganizationID: s.GetOrganizationId(),
-		DevSessionID:   s.GetDevSessionId(),
-		ExecID:         streamErr.ExecID,
-		StdoutOffset:   streamErr.StdoutOffset,
-		StderrOffset:   streamErr.StderrOffset,
-	})
 }
 
 // readManifest reads the guest manifest. A missing or unreadable manifest

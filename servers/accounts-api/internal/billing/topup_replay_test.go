@@ -58,7 +58,7 @@ func (f *fixture) wantCredit(acct string, grants, entries int) {
 
 func TestManualTopUpReplayAfterAcceptedChargeTimedOutSucceeds(t *testing.T) {
 	f := newFixture(t)
-	telemetry := f.captureGrantTelemetry()
+	telemetry := f.captureBillingTelemetry()
 	acct := f.account()
 	f.activate(acct)
 
@@ -99,7 +99,7 @@ func TestManualTopUpReplayAfterAcceptedChargeTimedOutSucceeds(t *testing.T) {
 	if got := f.balance(acct); got != 25*usd {
 		t.Fatalf("balance = %d, want one credit", got)
 	}
-	telemetry.want(t, f.ledger(acct)[0])
+	telemetry.wantGrants(t, f.ledger(acct)[0])
 	if err := f.manualTopUp(acct, topUpKey); err != nil {
 		t.Fatalf("replay after the completion: %v", err)
 	}
@@ -179,4 +179,64 @@ func TestManualTopUpReplayAfterFailedPaymentIsFailedPrecondition(t *testing.T) {
 	}
 	wantStatuses(t, "after the failed payment", f.topUpStatuses(acct), "failed:payment_failed")
 	wantConnectCode(t, "replay", f.manualTopUp(acct, topUpKey), connect.CodeFailedPrecondition)
+}
+
+func TestManualTopUpReplayAfterLegacyChargeTimesOut(t *testing.T) {
+	for _, status := range []TopUpStatus{TopUpCharged, TopUpUnknown, TopUpCharging} {
+		t.Run(string(status), func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			sub := f.activate(acct)
+			created := f.clock.Now()
+			f.clock.Advance(time.Minute)
+			updated := f.clock.Now()
+			const id = "01900000-0000-7000-8000-0000000000d2"
+			if _, err := f.db.Pool.Exec(ctx(), `INSERT INTO top_ups (top_up_id, billing_account_id, kind, idempotency_key,
+					actor_user_id, amount_usd_micros, status, paddle_subscription_id, create_time, update_time)
+				VALUES ($1, $2, 'manual', $3, 'admin-user', $4, $5, $6, $7, $8)`,
+				id, acct, topUpKey, 25*usd, status, sub, created, updated); err != nil {
+				t.Fatal(err)
+			}
+			f.timeOutTopUps()
+			wantStatuses(t, "after the timeout", f.topUpStatuses(acct), "failed:timed_out")
+			var accepted *time.Time
+			if err := f.db.Pool.QueryRow(ctx(), `SELECT provider_accept_time FROM top_ups WHERE top_up_id = $1`, id).Scan(&accepted); err != nil {
+				t.Fatal(err)
+			}
+			replayErr := f.manualTopUp(acct, topUpKey)
+			if n := len(f.paddle.Charges()); n != 0 {
+				t.Fatalf("replay sent %d charges, want none", n)
+			}
+			f.wantCredit(acct, 0, 0)
+			if status != TopUpCharged {
+				if accepted != nil {
+					t.Fatalf("acceptance time = %v, want nil", accepted)
+				}
+				wantConnectCode(t, "replay without acceptance", replayErr, connect.CodeUnavailable)
+				return
+			}
+			if accepted == nil || !accepted.Equal(updated) {
+				t.Fatalf("acceptance time = %v, want %v", accepted, updated)
+			}
+			if replayErr != nil {
+				t.Fatalf("replay after legacy acceptance: %v", replayErr)
+			}
+			err := f.s.CreateTopUp(ctx(), acct, "admin-user", topUpKey, 50*usd, func(pgx.Tx) error { return nil }, nil, nil)
+			wantConnectCode(t, "replay with another amount", err, connect.CodeInvalidArgument)
+
+			body := paddletest.Event("evt_legacy_top_up", paddle.EventTransactionCompleted, f.clock.Now(),
+				paddletest.Transaction(paddletest.TransactionData{
+					ID: f.paddle.NewID("txn"), Origin: paddle.OriginSubscriptionCharge, TopUpID: id,
+					SubtotalCents: 2500,
+				}))
+			signature := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)
+			for range 2 {
+				if code := f.deliver(body, signature); code != http.StatusOK {
+					t.Fatalf("webhook status %d, want 200", code)
+				}
+			}
+			wantStatuses(t, "after the late webhook", f.topUpStatuses(acct), "completed")
+			f.wantCredit(acct, 1, 1)
+		})
+	}
 }

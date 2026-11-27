@@ -156,8 +156,55 @@ func testAutoTopUpClaimUsesMonthAfterLock(t *testing.T, lockQuery string) {
 	if res := f.deduct(acct, 25*usd); res.AutoTopUpQueued {
 		t.Fatal("a top-up was queued although the claimed top-up used the whole January cap")
 	}
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.paddle.Charges()); got != 1 {
+		t.Fatalf("charges after the second deduction = %d, want 1", got)
+	}
 	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "completed" {
 		t.Fatalf("top-ups = %v", got)
+	}
+}
+
+func TestAutoTopUpClaimCutoverSettlesPriorLegacyChargeOnce(t *testing.T) {
+	f, acct := capFixture(t)
+	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	// Model an automatic top-up claimed by the creation-time binary before
+	// the drain. Its claim updated the status and update time with no cap time.
+	var topUpID string
+	if err := f.db.Pool.QueryRow(ctx(), `UPDATE top_ups SET
+		status = 'charging',
+		paddle_subscription_id = (SELECT paddle_subscription_id FROM subscriptions WHERE billing_account_id = $1),
+		update_time = $2, cap_time = NULL
+		WHERE billing_account_id = $1 AND status = 'pending' RETURNING top_up_id`,
+		acct, beforeMonthEnd.Add(30*time.Second)).Scan(&topUpID); err != nil {
+		t.Fatal(err)
+	}
+
+	f.clock.Set(afterMonthEnd)
+	body := paddletest.Event("evt_legacy_auto_top_up", paddle.EventTransactionCompleted, f.clock.Now(),
+		paddletest.Transaction(paddletest.TransactionData{
+			ID: f.paddle.NewID("txn"), Origin: paddle.OriginSubscriptionCharge, TopUpID: topUpID,
+			SubtotalCents: 2500, TaxCents: 250,
+		}))
+	signature := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)
+	for range 2 {
+		if code := f.deliver(body, signature); code != http.StatusOK {
+			t.Fatalf("webhook status %d", code)
+		}
+	}
+	wantStatuses(t, "after the legacy claim settles", f.topUpStatuses(acct), "completed")
+	if got := f.balance(acct); got != 30*usd {
+		t.Fatalf("balance = %d, want one 25 USD credit after the deduction", got)
+	}
+	if got := f.monthToDate(acct, beforeMonthEnd); got != 25*usd {
+		t.Fatalf("December month to date = %d, want the legacy claim", got)
+	}
+	if got := f.monthToDate(acct, afterMonthEnd); got != 0 {
+		t.Fatalf("January month to date = %d, want 0", got)
 	}
 }
 
@@ -252,7 +299,7 @@ func TestMonthToDateFallsBackToCreateTimeWithoutCapTime(t *testing.T) {
 	f, acct := capFixture(t)
 	// A row that exists before the cap time column has no cap time, and a
 	// manual top-up never has one; the first counts by create_time, the
-	// second not at all.
+	// second not at all. A subscription payment also uses no cap.
 	if _, err := f.db.Pool.Exec(ctx(), `INSERT INTO top_ups (top_up_id, billing_account_id, kind, amount_usd_micros, status,
 			create_time, update_time)
 		VALUES ('01900000-0000-7000-8000-0000000000a1', $1, 'auto', $2, 'completed', $3, $3)`,
@@ -268,7 +315,164 @@ func TestMonthToDateFallsBackToCreateTimeWithoutCapTime(t *testing.T) {
 	if got := f.monthToDate(acct, beforeMonthEnd); got != 25*usd {
 		t.Fatalf("December month to date = %d", got)
 	}
+	f.clock.Set(afterMonthEnd)
+	f.grant(acct, LedgerSubscriptionCredit, 10*usd)
 	if got := f.monthToDate(acct, afterMonthEnd); got != 0 {
-		t.Fatalf("January month to date = %d, want 0 (manual top-ups are outside the cap)", got)
+		t.Fatalf("January month to date = %d, want 0 for manual top-ups and subscription payments", got)
+	}
+}
+
+func TestAutoTopUpTimeoutReservesCapThroughLateCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		cap         int64
+		wantCharges int
+	}{
+		{"cap spent", 25 * usd, 1},
+		{"room for another charge", 50 * usd, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, acct := capFixture(t)
+			f.clock.Set(afterMonthEnd)
+			f.enableAutoTopUp(acct, 10*usd, 25*usd, tc.cap)
+			if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
+				t.Fatal("no initial top-up queued")
+			}
+			if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+				t.Fatal(err)
+			}
+			f.timeOutTopUps()
+			wantStatuses(t, "after the timeout", f.topUpStatuses(acct), "failed:timed_out")
+			if got := f.monthToDate(acct, f.clock.Now()); got != 25*usd {
+				t.Fatalf("cap usage after timeout = %d, want 25 USD", got)
+			}
+			if res := f.deduct(acct, usd); res.AutoTopUpQueued != (tc.wantCharges == 2) {
+				t.Fatalf("queued a second top-up = %v, want %v", res.AutoTopUpQueued, tc.wantCharges == 2)
+			}
+			if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+				t.Fatal(err)
+			}
+			charges := f.paddle.Charges()
+			if len(charges) != tc.wantCharges {
+				t.Fatalf("Paddle calls = %d, want %d", len(charges), tc.wantCharges)
+			}
+			wantCapUsage := int64(tc.wantCharges) * 25 * usd
+			if got := f.monthToDate(acct, f.clock.Now()); got != wantCapUsage {
+				t.Fatalf("cap usage before late completion = %d, want %d", got, wantCapUsage)
+			}
+
+			body := paddletest.Event("evt_late_auto_top_up", paddle.EventTransactionCompleted, f.clock.Now(),
+				paddletest.Transaction(paddletest.TransactionData{
+					ID: f.paddle.NewID("txn"), Origin: paddle.OriginSubscriptionCharge,
+					TopUpID: paddletest.ChargeTopUpID(charges[0]), SubtotalCents: 2500,
+				}))
+			sig := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)
+			for range 2 {
+				if code := f.deliver(body, sig); code != http.StatusOK {
+					t.Fatalf("webhook status %d, want 200", code)
+				}
+			}
+			if statuses := f.topUpStatuses(acct); statuses[0] != "completed" {
+				t.Fatalf("top-ups after late completion = %v", statuses)
+			}
+			if got := f.count(`SELECT count(*) FROM ledger_entries WHERE billing_account_id = $1 AND kind = 'auto_top_up'`, acct); got != 1 {
+				t.Fatalf("automatic top-up ledger entries = %d, want 1", got)
+			}
+			if got := f.balance(acct); got != 29*usd {
+				t.Fatalf("balance after late completion = %d, want 29 USD", got)
+			}
+			st, err := loadSettings(ctx(), f.db.Pool, acct)
+			if err != nil || st.ConsecutiveFailures != 0 {
+				t.Fatalf("settings after completion = %+v, err = %v", st, err)
+			}
+			if got := f.monthToDate(acct, f.clock.Now()); got != wantCapUsage {
+				t.Fatalf("cap usage after late completion = %d, want %d", got, wantCapUsage)
+			}
+		})
+	}
+}
+
+func TestAutoTopUpClaimRespectsTimeoutWithUnknownOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		timeoutCap time.Time
+		wantCalls  int
+		wantStatus string
+	}{
+		{"same UTC month", afterMonthEnd, 0, "failed:settings_changed"},
+		{"prior UTC month", beforeMonthEnd, 1, "charged"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, acct := capFixture(t)
+			f.clock.Set(afterMonthEnd.Add(2 * time.Hour))
+			if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
+				t.Fatal("no pending top-up queued")
+			}
+			// This legacy automatic top-up has neither cap_time nor
+			// provider_accept_time. Its create_time supplies the cap month.
+			if _, err := f.db.Pool.Exec(ctx(), `INSERT INTO top_ups (top_up_id, billing_account_id, kind, amount_usd_micros,
+					status, failure_reason, create_time, update_time)
+				VALUES ('01900000-0000-7000-8000-0000000000c2', $1, 'auto', $2, 'failed', 'timed_out', $3, $4)`,
+				acct, 25*usd, tc.timeoutCap, f.clock.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+				t.Fatal(err)
+			}
+			if calls := len(f.paddle.Charges()); calls != tc.wantCalls {
+				t.Fatalf("Paddle calls = %d, want %d", calls, tc.wantCalls)
+			}
+			wantStatuses(t, "after the claim check", f.topUpStatuses(acct), "failed:timed_out", tc.wantStatus)
+			if got := f.monthToDate(acct, f.clock.Now()); got != 25*usd {
+				t.Fatalf("current-month cap usage = %d, want 25 USD", got)
+			}
+		})
+	}
+}
+
+func TestAutoTopUpTimeoutReleasesCapOnVerifiedPaymentFailure(t *testing.T) {
+	f, acct := capFixture(t)
+	f.clock.Set(afterMonthEnd)
+	f.paddle.FailCharges(&paddletest.Failure{Status: http.StatusBadGateway, Code: "bad_gateway"})
+	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
+		t.Fatal("no initial top-up queued")
+	}
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	wantStatuses(t, "after the unknown result", f.topUpStatuses(acct), "unknown")
+	f.timeOutTopUps()
+	if got := f.monthToDate(acct, f.clock.Now()); got != 25*usd {
+		t.Fatalf("cap usage after unknown result timed out = %d, want 25 USD", got)
+	}
+
+	charges := f.paddle.Charges()
+	if len(charges) != 1 {
+		t.Fatalf("Paddle calls = %d, want 1", len(charges))
+	}
+	data := paddletest.Transaction(paddletest.TransactionData{
+		ID: f.paddle.NewID("txn"), Origin: paddle.OriginSubscriptionCharge,
+		TopUpID: paddletest.ChargeTopUpID(charges[0]), SubtotalCents: 2500,
+	})
+	// Separate event IDs for the same transaction must not repeat the notice
+	// or failure count.
+	for range 2 {
+		if code := f.webhook(paddle.EventTransactionPaymentFailed, data); code != http.StatusOK {
+			t.Fatalf("webhook status %d, want 200", code)
+		}
+	}
+	wantStatuses(t, "after the verified payment failure", f.topUpStatuses(acct), "failed:payment_failed")
+	if got := f.monthToDate(acct, f.clock.Now()); got != 0 {
+		t.Fatalf("cap usage after payment failure = %d, want 0", got)
+	}
+	st, err := loadSettings(ctx(), f.db.Pool, acct)
+	if err != nil || st.ConsecutiveFailures != 1 || !st.AutoEnabled {
+		t.Fatalf("settings after payment failure = %+v, err = %v", st, err)
+	}
+	if got := f.count(`SELECT count(*) FROM billing_notifications WHERE billing_account_id = $1`, acct); got != 1 {
+		t.Fatalf("failure and shutoff notifications = %d, want one timeout notice", got)
+	}
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("payment failure did not free cap room for another top-up")
 	}
 }

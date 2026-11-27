@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -96,18 +97,26 @@ func (l *Links) removalInterval() pgtype.Interval {
 // WatchRemoval renews the claim until the caller stops watching. A failed
 // renewal cancels preparation. At step boundaries the guard also checks the
 // database, so preparation cannot continue during the gap before renewal.
-func (l *Links) WatchRemoval(ctx context.Context, claim RemovalClaim) (context.Context, func()) {
+// The stop function returns any cancellation cause that preceded the stop.
+// Finalization must check that result after verifying the claim under lock.
+func (l *Links) WatchRemoval(ctx context.Context, claim RemovalClaim) (context.Context, func() error) {
 	if !claim.HasLink() {
-		return ctx, func() {}
+		return ctx, func() error { return context.Cause(ctx) }
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	renewEvery := l.removal.LeaseDuration / 3
-	renewCtx, stop := context.WithCancel(ctx)
+	renewCtx, stopRenewing := context.WithCancel(ctx)
+	var mu sync.Mutex
 	fail := func(err error) {
-		if ctx.Err() == nil {
+		mu.Lock()
+		active := renewCtx.Err() == nil
+		if active {
+			cancel(err)
+		}
+		mu.Unlock()
+		if active {
 			l.svc.Logger.WarnContext(ctx, "ownsand_link_removal_claim_lost",
 				slog.String("organization_id", claim.orgID), slog.Any("error", err))
-			cancel(err)
 		}
 	}
 	done := make(chan struct{})
@@ -123,7 +132,7 @@ func (l *Links) WatchRemoval(ctx context.Context, claim RemovalClaim) (context.C
 				step, finish := context.WithTimeout(renewCtx, min(renewEvery, removalDBTimeout))
 				err := l.renewRemoval(step, claim)
 				finish()
-				if err != nil && renewCtx.Err() == nil {
+				if err != nil {
 					fail(err)
 					return
 				}
@@ -149,11 +158,18 @@ func (l *Links) WatchRemoval(ctx context.Context, claim RemovalClaim) (context.C
 		}
 		return err
 	})
-	return guarded, func() {
-		stop()
-		<-done
+	stop := sync.OnceValue(func() error {
+		// A failure and the handoff compete under the same mutex. Cancel
+		// renewal before waiting because it can be blocked on our link lock.
+		mu.Lock()
+		err := context.Cause(ctx)
+		stopRenewing()
 		cancel(nil)
-	}
+		mu.Unlock()
+		<-done
+		return err
+	})
+	return guarded, stop
 }
 
 func (l *Links) renewRemoval(ctx context.Context, claim RemovalClaim) error {

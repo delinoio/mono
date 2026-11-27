@@ -104,7 +104,7 @@ func slowQueueFixture(t *testing.T, n int, onCharge func()) (*fixture, []string)
 func TestRunOnceLeavesTimeForLaterTasksDuringASlowTopUpQueue(t *testing.T) {
 	f, accounts := slowQueueFixture(t, 3, nil)
 	// A later task of the run has work: a due credit expiry notice.
-	notice := f.queueNotice(accounts[0], "credit_expiry/budget-test")
+	notice, _ := f.queueNotice(accounts[0])
 
 	f.s.RunOnce(ctx())
 
@@ -165,7 +165,7 @@ func TestAutoTopUpClaimDeadlineKeepsPending(t *testing.T) {
 			if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
 				t.Fatal("no top-up queued")
 			}
-			notice := f.queueNotice(f.account(), "credit_expiry/claim-lock")
+			notice, _ := f.queueNotice(f.account())
 			snapshot := func() string {
 				t.Helper()
 				var row string

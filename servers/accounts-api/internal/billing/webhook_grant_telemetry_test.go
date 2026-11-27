@@ -30,14 +30,14 @@ type grantLog struct {
 	Balance          int64      `json:"balance_after_usd_micros"`
 }
 
-type grantTelemetryCapture struct {
+type billingTelemetryCapture struct {
 	logs   bytes.Buffer
 	reader *sdkmetric.ManualReader
 }
 
-func (f *fixture) captureGrantTelemetry() *grantTelemetryCapture {
+func (f *fixture) captureBillingTelemetry() *billingTelemetryCapture {
 	f.t.Helper()
-	capture := &grantTelemetryCapture{reader: sdkmetric.NewManualReader()}
+	capture := &billingTelemetryCapture{reader: sdkmetric.NewManualReader()}
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(capture.reader))
 	f.t.Cleanup(func() { _ = provider.Shutdown(ctx()) })
 	m, err := metrics.New(provider)
@@ -49,7 +49,7 @@ func (f *fixture) captureGrantTelemetry() *grantTelemetryCapture {
 	return capture
 }
 
-func (c *grantTelemetryCapture) want(t *testing.T, entries ...LedgerEntry) {
+func (c *billingTelemetryCapture) wantGrants(t *testing.T, entries ...LedgerEntry) {
 	t.Helper()
 	var wantLogs, gotLogs []grantLog
 	wantCounts := map[LedgerKind]int64{}
@@ -105,7 +105,7 @@ func (c *grantTelemetryCapture) want(t *testing.T, entries ...LedgerEntry) {
 
 func TestWebhookCommitFailureDoesNotReportGrant(t *testing.T) {
 	f := newFixture(t)
-	telemetry := f.captureGrantTelemetry()
+	telemetry := f.captureBillingTelemetry()
 	acct := f.account()
 	if _, err := f.db.Pool.Exec(ctx(), `CREATE FUNCTION fail_payment_commit() RETURNS trigger LANGUAGE plpgsql
 		AS $$ BEGIN RAISE EXCEPTION 'injected commit failure'; END $$;
@@ -124,7 +124,7 @@ func TestWebhookCommitFailureDoesNotReportGrant(t *testing.T) {
 	if grants, events, balance := f.count(`SELECT count(*) FROM credit_grants`), f.eventCount(), f.balance(acct); grants != 0 || events != 0 || balance != 0 {
 		t.Fatalf("after failed commit: grants %d, events %d, balance %d", grants, events, balance)
 	}
-	telemetry.want(t)
+	telemetry.wantGrants(t)
 
 	if _, err := f.db.Pool.Exec(ctx(), `DROP TRIGGER fail_payment_commit ON paddle_events`); err != nil {
 		t.Fatal(err)
@@ -136,5 +136,5 @@ func TestWebhookCommitFailureDoesNotReportGrant(t *testing.T) {
 	if grants, events := f.count(`SELECT count(*) FROM credit_grants`), f.eventCount(); grants != 1 || events != 1 {
 		t.Fatalf("after committed retry: grants %d, events %d", grants, events)
 	}
-	telemetry.want(t, f.ledger(acct)[0])
+	telemetry.wantGrants(t, f.ledger(acct)[0])
 }

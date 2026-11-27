@@ -33,9 +33,10 @@ type Options struct {
 	OwnSandRemoval link.RemovalOptions
 	// PublicOrigin is the public origin of sandrun-api (webhook URLs).
 	PublicOrigin string
-	// WorkTiming and DevSessionTiming override the engine and stream
-	// durations (tests); zero values select the production values.
+	// These timing options override the engine and stream durations for
+	// tests. Zero values select the production values.
 	WorkTiming       *work.Timing
+	WatchQueueTiming work.WatchQueueTiming
 	DevSessionTiming devsession.Timing
 	// GitHub configures the GitHub App layer; a nil Client leaves it off.
 	GitHub github.Options
@@ -97,7 +98,7 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 			if opts.WorkTiming != nil {
 				timing = *opts.WorkTiming
 			}
-			out.Engine = work.Register(r, out.Links, out.Profiles, m, timing)
+			out.Engine = work.Register(r, out.Links, out.Profiles, m, timing, opts.WatchQueueTiming)
 			out.DevSessions = devsession.Register(r, out.Engine, opts.DevSessionTiming)
 			out.GitHub = github.Register(r, out.Engine, m, opts.GitHub)
 			out.Agents = agent.Register(r, out.Engine, out.Integrations, opts.AgentTiming)

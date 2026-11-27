@@ -1508,7 +1508,7 @@ describe("Tooltip", () => {
 });
 
 // Helpers that read the authored hex tokens from the stylesheet source. The
-// focus ring, error border and field placeholder contrast tests share them.
+// focus ring, error border, field placeholder and pressed Toggle tests share them.
 const compact = css
   .replace(/\s+/g, " ")
   .replace(/\( /g, "(")
@@ -1567,6 +1567,22 @@ function contrast(first: string, second: string): number {
   );
   return (high! + 0.05) / (low! + 0.05);
 }
+
+test("keeps the pressed Toggle stroke at 3:1 on both surfaces in both schemes", () => {
+  const pressed = block(".dui-toggle[data-pressed]");
+  expect(pressed).toContain("background: var(--dui-color-neutral-hover);");
+  expect(pressed).toContain(
+    "box-shadow: inset 0 0 0 2px var(--dui-color-accent-graphic);",
+  );
+
+  for (const scheme of [[block(":root")], darkRule(":root")]) {
+    const stroke = property(scheme, "--dui-color-accent-graphic");
+    const fill = property(scheme, "--dui-color-neutral-hover");
+    const surface = property(scheme, "--dui-color-surface");
+    expect(contrast(stroke!, fill!)).toBeGreaterThanOrEqual(3);
+    expect(contrast(stroke!, surface!)).toBeGreaterThanOrEqual(3);
+  }
+});
 
 describe("ToastRegion", () => {
   test("shows a toast with its title, description and action", async () => {

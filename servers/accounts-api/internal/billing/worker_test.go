@@ -26,8 +26,9 @@ func TestRunOnceRefreshesMetricsWithDueNotifications(t *testing.T) {
 
 	acct := f.account()
 	var notices []string
-	for i := range 3 {
-		notices = append(notices, f.queueNotice(acct, fmt.Sprintf("credit_expiry/worker-%d", i)))
+	for range 3 {
+		notice, _ := f.queueNotice(acct)
+		notices = append(notices, notice)
 		f.clock.Advance(time.Second)
 	}
 	f.s.notificationDeliveryBudget = 500 * time.Millisecond
@@ -83,7 +84,7 @@ func TestRunOnceCancellationKeepsNotificationProgressAndStopsLaterTasks(t *testi
 	wantLinkedOrganizationGauge(t, scrape, StatusAllowed)
 	setWorkerMetricStatus(t, f, org, StatusBlocked)
 
-	notice := f.queueNotice(f.account(), "credit_expiry/worker-canceled")
+	notice, _ := f.queueNotice(f.account())
 	passCtx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	sends := 0

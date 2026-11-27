@@ -1953,7 +1953,7 @@ export function createMockTransport(
           );
         if (
           req.expiresAt !== undefined &&
-          Number(req.expiresAt.seconds) * 1000 <= now()
+          compareTimestamps(req.expiresAt, timestampFromMs(now())) <= 0
         )
           throw new ConnectError(
             "expires_at must be in the future",

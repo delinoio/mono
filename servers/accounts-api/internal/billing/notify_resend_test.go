@@ -32,8 +32,7 @@ func TestNotificationResendRetry(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			f := newFixture(t)
 			account := f.account()
-			key := "credit_expiry/resend_retry"
-			id := f.queueNotice(account, key)
+			id, key := f.queueNotice(account)
 			first, second := f.resendRecipients(account)
 			provider := &notificationProvider{responses: map[string][]providerResponse{
 				key + "/" + first: {{test.firstStatus, test.firstBody}},
@@ -73,8 +72,7 @@ func TestNotificationResendReceiptRecovery(t *testing.T) {
 		t.Run(test.change, func(t *testing.T) {
 			f := newFixture(t)
 			account := f.account()
-			key := "credit_expiry/resend_receipt"
-			id := f.queueNotice(account, key)
+			id, key := f.queueNotice(account)
 			first, second := f.resendRecipients(account)
 			firstKey, secondKey := key+"/"+first, key+"/"+second
 			provider := &notificationProvider{responses: make(map[string][]providerResponse)}

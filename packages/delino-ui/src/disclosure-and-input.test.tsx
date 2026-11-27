@@ -557,6 +557,140 @@ describe("Slider", () => {
     expect(values).toEqual([[21]]);
   });
 
+  describe("when a controlled Slider changes props", () => {
+    function price(props: Partial<React.ComponentProps<typeof Slider>>) {
+      return (
+        <form>
+          <Slider
+            label="Price"
+            name="price"
+            locale="en-US"
+            showValue
+            {...props}
+          />
+        </form>
+      );
+    }
+
+    const thumbs = () => screen.getAllByRole<HTMLInputElement>("slider");
+    const formValue = () => new FormData(thumbs()[0].form!).get("price");
+
+    test("keeps the focused single thumb when a range is supplied", () => {
+      const { rerender } = render(price({ value: 40 }));
+      const thumb = screen.getByRole<HTMLInputElement>("slider", {
+        name: "Price",
+      });
+      thumb.focus();
+
+      rerender(price({ value: [20, 80] }));
+      expect(thumbs()).toEqual([thumb]);
+      expect(thumb.value).toBe("40");
+      expect(document.activeElement).toBe(thumb);
+      expect(formValue()).toBe("40");
+
+      rerender(price({ value: [50] }));
+      expect(thumb.value).toBe("50");
+      rerender(price({ value: 60 }));
+      expect(thumb.value).toBe("60");
+      expect(document.activeElement).toBe(thumb);
+    });
+
+    test("keeps the last compatible controlled range until a range or empty array arrives", () => {
+      const { rerender } = render(price({ value: [20, 80] }));
+      rerender(price({ value: [20, 50, 80] }));
+      const upper = screen.getByRole("slider", { name: "Price 3 of 3" });
+      upper.focus();
+
+      for (const value of [40, [40]]) {
+        rerender(price({ value }));
+        expect(thumbs().map((thumb) => thumb.value)).toEqual([
+          "20",
+          "50",
+          "80",
+        ]);
+        expect(screen.getByRole("slider", { name: "Price 3 of 3" })).toBe(
+          upper,
+        );
+        expect(document.activeElement).toBe(upper);
+        expect(formValue()).toBe("20/50/80");
+      }
+
+      rerender(price({ value: [25, 75] }));
+      expect(thumbs().map((thumb) => thumb.value)).toEqual(["25", "75"]);
+      expect(screen.getByRole("slider", { name: "Price 2 of 2" })).toBeTruthy();
+
+      rerender(price({ value: [] }));
+      expect(thumbs().map((thumb) => thumb.value)).toEqual(["0"]);
+      rerender(price({ value: 30 }));
+      expect(screen.getByRole("slider", { name: "Price" })).toBeTruthy();
+      expect(formValue()).toBe("30");
+    });
+
+    test.each([
+      {
+        value: [20, 80],
+        uncontrolled: {},
+        thumbLabels: undefined,
+        upperName: "Price 2 of 2",
+      },
+      {
+        value: [20, 50, 80],
+        uncontrolled: { value: undefined },
+        thumbLabels: ["Low", "Middle", "High"],
+        upperName: "High",
+      },
+    ])(
+      "releases control while keeping the $upperName thumb interactive",
+      async ({ value, uncontrolled, thumbLabels, upperName }) => {
+        const { rerender } = render(price({ value, thumbLabels }));
+        const upper = screen.getByRole("slider", { name: upperName });
+        upper.focus();
+        const ids = thumbs().map((thumb) => thumb.id);
+
+        rerender(price({ ...uncontrolled, thumbLabels }));
+        expect(screen.getByRole("group", { name: "Price" })).toBeTruthy();
+        expect(thumbs().map((thumb) => thumb.id)).toEqual(ids);
+        expect(new Set(ids).size).toBe(value.length);
+        expect(screen.getByRole("slider", { name: upperName })).toBe(upper);
+        expect(document.activeElement).toBe(upper);
+        expect(screen.getByText(value.join(" – "))).toBeTruthy();
+        expect(formValue()).toBe(value.join("/"));
+
+        await act(async () => {
+          fireEvent.keyDown(upper, { key: "ArrowRight" });
+        });
+        const edited = [...value.slice(0, -1), 81];
+        expect(thumbs().map((thumb) => thumb.value)).toEqual(
+          edited.map(String),
+        );
+        expect(screen.getByText(edited.join(" – "))).toBeTruthy();
+        expect(formValue()).toBe(edited.join("/"));
+      },
+    );
+
+    test("keeps the original range default as the native reset target on control release", async () => {
+      const defaultValue = [10, 90];
+      const { rerender } = render(price({ value: [20, 80], defaultValue }));
+      rerender(price({ defaultValue }));
+      const lower = screen.getByRole<HTMLInputElement>("slider", {
+        name: "Price 1 of 2",
+      });
+
+      await act(async () => {
+        fireEvent.keyDown(lower, { key: "ArrowRight" });
+      });
+      expect(formValue()).toBe("21/80");
+
+      await act(async () => {
+        lower.form!.reset();
+      });
+      await waitFor(() =>
+        expect(thumbs().map((thumb) => thumb.value)).toEqual(["10", "90"]),
+      );
+      expect(formValue()).toBe("10/90");
+    });
+  });
+
   describe("when a controller changes the range values", () => {
     const thumbs = () =>
       screen.getAllByRole("slider") as unknown as HTMLInputElement[];
@@ -604,6 +738,55 @@ describe("Slider", () => {
       expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
       expect(screen.getByRole("slider", { name: "Price 2 of 2" })).toBeTruthy();
       expect(screen.queryByRole("slider", { name: /of 3/ })).toBeNull();
+    });
+
+    test("rejects incompatible writes after the range grows", async () => {
+      const controller = createSliderController();
+      const { container } = render(
+        <form>
+          <Slider
+            label="Price"
+            name="price"
+            defaultValue={[20, 80]}
+            controller={controller}
+            showValue
+            locale="en-US"
+          />
+        </form>,
+      );
+      const form = container.querySelector("form")!;
+      const indicator = container.querySelector<HTMLElement>(
+        ".dui-slider-indicator",
+      )!;
+
+      await act(async () => {
+        expect(controller.setValue([20, 50, 80])).toBe(true);
+      });
+      const upper = screen.getByRole("slider", { name: "Price 3 of 3" });
+      upper.focus();
+
+      for (const value of [40, [], [40]]) {
+        await act(async () => {
+          expect(controller.setValue(value)).toBe(false);
+        });
+        expect(controller.getValue()).toEqual([20, 50, 80]);
+        expect(thumbValues()).toEqual(["20", "50", "80"]);
+        expect(screen.getByRole("slider", { name: "Price 3 of 3" })).toBe(
+          upper,
+        );
+        expect(document.activeElement).toBe(upper);
+        expect(screen.getByText("20 – 50 – 80")).toBeTruthy();
+        expect(
+          indicator.style.getPropertyValue("--slider-indicator-size"),
+        ).toBe("60%");
+        expect(new FormData(form).get("price")).toBe("20/50/80");
+      }
+
+      await act(async () => {
+        expect(controller.setValue([25, 75])).toBe(true);
+      });
+      expect(thumbValues()).toEqual(["25", "75"]);
+      expect(new FormData(form).get("price")).toBe("25/75");
     });
 
     test("keeps explicit thumb names and numbers the other thumbs by the new total", async () => {
@@ -806,6 +989,73 @@ describe("Slider", () => {
 
       expect(sliderValues()).toEqual(["40"]);
     });
+
+    test.each([
+      {
+        initial: 20,
+        nextDefault: 40,
+        incompatible: [20, 80],
+        firstName: "Price",
+        edited: ["21"],
+        reset: ["40"],
+      },
+      {
+        initial: [20, 80],
+        nextDefault: [30, 70],
+        incompatible: [20, 50, 80],
+        firstName: "Price 1 of 2",
+        edited: ["21", "80"],
+        reset: ["30", "70"],
+      },
+    ])(
+      "uses the last compatible default when a form resets $firstName",
+      async ({
+        initial,
+        nextDefault,
+        incompatible,
+        firstName,
+        edited,
+        reset,
+      }) => {
+        const changes: unknown[] = [];
+        const price = (defaultValue?: number | number[]) => (
+          <form>
+            <Slider
+              label="Price"
+              name="price"
+              defaultValue={defaultValue}
+              onValueChange={(value, details) =>
+                changes.push([value, details.reason])
+              }
+            />
+          </form>
+        );
+        const { rerender } = render(price(initial));
+        const first = screen.getByRole<HTMLInputElement>("slider", {
+          name: firstName,
+        });
+        const form = first.form!;
+        first.focus();
+        await act(async () => {
+          fireEvent.keyDown(first, { key: "ArrowRight" });
+        });
+
+        for (const next of [nextDefault, undefined, [], incompatible]) {
+          rerender(price(next));
+          expect(screen.getByRole("slider", { name: firstName })).toBe(first);
+          expect(document.activeElement).toBe(first);
+          expect(sliderValues()).toEqual(edited);
+          expect(new FormData(form).get("price")).toBe(edited.join("/"));
+        }
+
+        await act(async () => {
+          form.reset();
+        });
+        await waitFor(() => expect(sliderValues()).toEqual(reset));
+        expect(new FormData(form).get("price")).toBe(reset.join("/"));
+        expect(changes.at(-1)).toEqual([nextDefault, "reset"]);
+      },
+    );
 
     test("uses the new default after an empty array value resets the slider", () => {
       const { rerender } = render(
@@ -1442,8 +1692,12 @@ describe("Forced colors", () => {
       forced,
       ".dui-toggle[data-pressed], .dui-pagination-link[data-current]",
     );
+    expect(filled).toContain("forced-color-adjust: none;");
     expect(filled).toContain("background: Highlight;");
     expect(filled).toContain("color: HighlightText;");
+    expect(findRuleBlock(forced, ".dui-toggle[data-pressed]")).toContain(
+      "box-shadow: none;",
+    );
     // A border would widen both controls, so neither gets one.
     expect(findRuleBlock(forced, ".dui-toggle")).toBeNull();
     expect(block(".dui-toggle")).toContain("border: 0;");

@@ -834,6 +834,14 @@ describe("integrations", () => {
     const row = screen.getByRole("listitem").filter({ hasText: updatedName });
     await expect(row).toContainText("Cursor self-hosted pool name: pool-after");
     await expect(row).toContainText("Service account API key: Set at");
+
+    // Globex starts with no integrations, so this event belongs to the one created here.
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(browser).toHaveURL(`/orgs/${GLOBEX}/audit`);
+    const audit = screen.getByRole("table", "Audit events");
+    await expect(
+      audit.getByRole("cell", "Agent integration credentials replaced"),
+    ).toBeVisible();
   });
 
   test("links OwnSand and shows only when the key was set", async ({
@@ -1417,6 +1425,31 @@ describe("personal API keys", () => {
 
     await expect(row).toContainText("expiring-key · Expired");
     await expect(revoke).toBeHidden();
+  });
+
+  test("creates a key without an expiry when Never is selected", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    await screen.getByRole("button", "Create API key").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.type("non-expiring fixture key");
+    await screen.getByLabel("Expires after").tap();
+    await screen.getByRole("option", "Never").tap();
+    await screen.getByRole("button", "Create key").tap();
+
+    const dialog = screen.getByRole("dialog", "Your new personal API key");
+    await expect(dialog).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(
+      screen
+        .getByRole("listitem")
+        .filter({ hasText: "non-expiring fixture key" }),
+    ).toContainText("does not expire");
   });
 });
 

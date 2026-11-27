@@ -119,13 +119,23 @@ func parseDuration(flagName, s string) (time.Duration, error) {
 // readSecret reads a credential from the file of a --*-file flag or from
 // standard input, and removes one trailing line break. Credentials never
 // come from command-line arguments, which other local users can read.
-func (a *app) readSecret(file, what string) (string, error) {
+func (a *app) readSecret(file, what string, rejectOversizedStdin bool) (string, error) {
 	var b []byte
 	var err error
 	if file != "" {
 		b, err = os.ReadFile(file)
 	} else {
-		b, err = io.ReadAll(io.LimitReader(a.env.Stdin, 1<<20))
+		const limitMiB = 1
+		const limitBytes = limitMiB << 20
+		readLimit := int64(limitBytes)
+		if rejectOversizedStdin {
+			// One extra byte distinguishes overflow from an input at the limit.
+			readLimit++
+		}
+		b, err = io.ReadAll(io.LimitReader(a.env.Stdin, readLimit))
+		if len(b) > limitBytes {
+			return "", usageErr("standard input for %s exceeds the %d MiB limit", what, limitMiB)
+		}
 	}
 	if err != nil {
 		return "", fmt.Errorf("read the %s: %w", what, err)
@@ -409,7 +419,7 @@ func (a *app) ownsandLink(ctx context.Context, name string, args []string) error
 	if err != nil {
 		return err
 	}
-	key, err := a.readSecret(*keyFile, "OwnSand API key")
+	key, err := a.readSecret(*keyFile, "OwnSand API key", false)
 	if err != nil {
 		return err
 	}
@@ -610,7 +620,7 @@ func integrationSettings(v sandrunv1.AgentVendor, f *integrationFlags) any {
 // readIntegrationCredentials reads the vendor credentials message as JSON
 // with the protobuf field names, for example {"environment_key": "..."}.
 func (a *app) readIntegrationCredentials(v sandrunv1.AgentVendor, file string) (any, error) {
-	raw, err := a.readSecret(file, "integration credentials")
+	raw, err := a.readSecret(file, "integration credentials", true)
 	if err != nil {
 		return nil, err
 	}
@@ -1233,9 +1243,19 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 	if err != nil {
 		return err
 	}
-	capRes, err := c.Work().GetCapacity(ctx, connect.NewRequest(&sandrunv1.GetCapacityRequest{OrganizationId: org}))
+	linkRes, err := c.OwnSandLinks().GetOwnSandLink(ctx, connect.NewRequest(&sandrunv1.GetOwnSandLinkRequest{OrganizationId: org}))
 	if err != nil {
 		return err
+	}
+	link := linkRes.Msg.GetLink()
+	linkRequired := link.GetState() != sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE
+	var devices []*sandrunv1.DeviceCapacity
+	if !linkRequired {
+		capRes, err := c.Work().GetCapacity(ctx, connect.NewRequest(&sandrunv1.GetCapacityRequest{OrganizationId: org}))
+		if err != nil {
+			return err
+		}
+		devices = capRes.Msg.GetDevices()
 	}
 	byState := map[string]int{}
 	for _, r := range runners {
@@ -1246,11 +1266,15 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 		if err != nil {
 			return err
 		}
-		d, err := protoList(capRes.Msg.GetDevices())
+		d, err := protoList(devices)
 		if err != nil {
 			return err
 		}
-		return writeJSON(a.env.Stdout, map[string]any{"queue": q, "runners_by_state": byState, "devices": d})
+		summary := map[string]any{"queue": q, "runners_by_state": byState, "devices": d}
+		if linkRequired {
+			summary["ownsand_link_required"] = true
+		}
+		return writeJSON(a.env.Stdout, summary)
 	}
 	w := &stickyWriter{w: a.env.Stdout}
 	fmt.Fprintf(w, "%s (%d queued)\n", a.bold("Queue"), len(queued))
@@ -1272,9 +1296,21 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 	for _, s := range states {
 		fmt.Fprintf(w, "  %s: %d\n", s, byState[s])
 	}
-	fmt.Fprintf(w, "\n%s (%d)\n", a.bold("Devices"), len(capRes.Msg.GetDevices()))
-	drows := make([][]string, 0, len(capRes.Msg.GetDevices()))
-	for _, d := range capRes.Msg.GetDevices() {
+	if linkRequired {
+		fmt.Fprintf(w, "\n%s\n", a.bold("Devices"))
+		switch {
+		case link == nil:
+			fmt.Fprintln(w, "  An admin must link an OwnSand organization to see devices.")
+		case link.GetState() == sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID:
+			fmt.Fprintln(w, "  An admin must replace the OwnSand API key to see devices.")
+		default:
+			fmt.Fprintln(w, "  An admin must restore the OwnSand link to see devices.")
+		}
+		return w.err
+	}
+	fmt.Fprintf(w, "\n%s (%d)\n", a.bold("Devices"), len(devices))
+	drows := make([][]string, 0, len(devices))
+	for _, d := range devices {
 		al := d.GetAllocation()
 		drows = append(drows, []string{d.GetName(), enumName(d.GetState()), d.GetHostOs() + "/" + d.GetArch(),
 			fmt.Sprintf("%d/%d", al.GetVcpuCount(), d.GetEffectiveVcpuLimit()),

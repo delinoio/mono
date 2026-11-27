@@ -138,8 +138,11 @@ function fakeGo(t, script) {
 // A fake `go` whose "build" writes a program that prints the variables it
 // received and exits.
 function fakeGoBuildingEnvPrinter(t) {
-  const program = `#!${process.execPath}
+  // A shebang cannot preserve spaces in the Node executable path.
+  const program = `#!/bin/sh
+exec "$FIXTURE_NODE" - <<'JS'
 console.log(JSON.stringify({ event: "env", database: process.env.DATABASE_URL, cors: process.env.CORS_ORIGINS, direct: process.env.ALLOW_DIRECT_CLIENT_ADDRESS, metrics: process.env.METRICS_ADDR }));
+JS
 `;
   return fakeGo(
     t,
@@ -159,6 +162,7 @@ async function runLauncher(t, { env, goDir }) {
     ...process.env,
     PATH: `${goDir}${delimiter}${process.env.PATH}`,
     TMPDIR: tmp,
+    FIXTURE_NODE: process.execPath,
   };
   delete childEnv.DATABASE_URL;
   delete childEnv.CORS_ORIGINS;

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -86,6 +87,88 @@ func TestIntegrationCreateVendorSettingsFlags(t *testing.T) {
 			r := f.run(t, args, unreadIntegrationCredentials{t})
 			checkIntegrationResult(t, r, tc.wantErr)
 			f.checkRequests(t)
+		})
+	}
+}
+
+func TestIntegrationCredentialInputSize(t *testing.T) {
+	const limit = 1 << 20
+	const secret = "synthetic-environment-key"
+	const jsonInput = `{"environment_key":"` + secret + `"}`
+	atLimit := jsonInput + strings.Repeat(" ", limit-len(jsonInput))
+	credentials := &sandrunv1.OpenAiCodexCredentials{EnvironmentKey: secret}
+	vendor := sandrunv1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX
+
+	for _, tc := range []struct {
+		name    string
+		input   string
+		file    bool
+		wantErr string
+	}{
+		{name: "small stdin", input: jsonInput},
+		{name: "exact limit stdin", input: atLimit},
+		{name: "oversized stdin", input: atLimit + "x", wantErr: "exceeds the 1 MiB limit"},
+		{name: "oversized file", input: atLimit + " ", file: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fileArgs []string
+			if tc.file {
+				path := filepath.Join(t.TempDir(), "credentials.json")
+				if err := os.WriteFile(path, []byte(tc.input), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				fileArgs = []string{"--credentials-file", path}
+			}
+
+			t.Run("create", func(t *testing.T) {
+				f := newIntegrationFixture(t, vendor)
+				args := append([]string{"integration", "create", "--vendor", "openai-codex", "--name", "new"}, fileArgs...)
+				var stdin io.Reader = strings.NewReader(tc.input)
+				if tc.file {
+					stdin = unreadIntegrationCredentials{t}
+				}
+				r := f.run(t, args, stdin)
+				if strings.Contains(r.stdout+r.stderr, secret) {
+					t.Fatal("the integration credential was printed")
+				}
+				checkIntegrationResult(t, r, tc.wantErr)
+				if tc.wantErr != "" {
+					f.checkRequests(t)
+					return
+				}
+				f.checkRequests(t, &sandrunv1.CreateAgentIntegrationRequest{
+					OrganizationId: integrationTestOrg, Name: "new", Vendor: vendor,
+					Settings:    &sandrunv1.CreateAgentIntegrationRequest_OpenaiCodex{OpenaiCodex: &sandrunv1.OpenAiCodexSettings{}},
+					Credentials: &sandrunv1.CreateAgentIntegrationRequest_OpenaiCodexCredentials{OpenaiCodexCredentials: credentials},
+				})
+			})
+
+			t.Run("update", func(t *testing.T) {
+				f := newIntegrationFixture(t, vendor)
+				args := []string{"integration", "update", integrationTestID}
+				var stdin io.Reader = strings.NewReader(tc.input)
+				if tc.file {
+					args = append(args, fileArgs...)
+					stdin = unreadIntegrationCredentials{t}
+				} else {
+					args = append(args, "--credentials-stdin")
+				}
+				r := f.run(t, args, stdin)
+				if strings.Contains(r.stdout+r.stderr, secret) {
+					t.Fatal("the integration credential was printed")
+				}
+				checkIntegrationResult(t, r, tc.wantErr)
+				read := &sandrunv1.GetAgentIntegrationRequest{OrganizationId: integrationTestOrg, AgentIntegrationId: integrationTestID}
+				if tc.wantErr != "" {
+					f.checkRequests(t, read)
+					return
+				}
+				f.checkRequests(t, read, &sandrunv1.UpdateAgentIntegrationRequest{
+					OrganizationId: integrationTestOrg, AgentIntegrationId: integrationTestID,
+					UpdateMask:  &fieldmaskpb.FieldMask{Paths: []string{"credentials"}},
+					Credentials: &sandrunv1.UpdateAgentIntegrationRequest_OpenaiCodexCredentials{OpenaiCodexCredentials: credentials},
+				})
+			})
 		})
 	}
 }
