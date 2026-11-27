@@ -1,0 +1,49 @@
+{
+  "gid": "inv-14-windows-service-stop",
+  "commit": "6b46443f75562de1956687e685941b2d4c78b2ed",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "6b46443f75562de1956687e685941b2d4c78b2ed",
+    "setup": "Use an elevated PowerShell session at the stated revision in a short local non-production checkout readable by LocalSystem. Run commands 1 and 2, copy files.copyFrom to files.copyTo, then run the remaining commands in the same session. The probe registers a randomly named manual-start test service and deletes it at the end.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne '6b46443f75562de1956687e685941b2d4c78b2ed') { throw 'Unexpected validation revision' }",
+      "New-Item -ItemType Directory -Path '.t3-tmp' -Force | Out-Null",
+      "$env:TEMP = (Resolve-Path '.t3-tmp').Path; $env:TMP = $env:TEMP; $env:GOTMPDIR = $env:TEMP",
+      "go test -v -count=1 ./cmds/ownsand-agent -run '^(TestLauncherStopsPayloadProcess|TestLauncherForcedStopWaitsForPayloadExit|TestHandlerCompletesAfterPayloadTerminationFails|TestHandlerReportsTheRestartStatus)$' 2>&1 | Tee-Object -FilePath '.t3-tmp/windows-service-stop-tests.log'; if ($LASTEXITCODE -ne 0) { throw 'Windows launcher or handler test failed' }",
+      "$probe = (Resolve-Path '.t3-tmp/scm_stop_probe_windows_test.go').Path; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne '7c78c2c4683d5a401ce840d501b154915660d03836dead93691a6fc30d0cc34f') { throw 'Unexpected SCM probe checksum' }",
+      "$target = Join-Path (Get-Location).Path 'cmds\\ownsand-agent\\scm_stop_probe_windows_test.go'; $replace = @{}; $replace[$target] = $probe; $overlay = Join-Path $env:TEMP 'scm-stop-overlay.json'; [IO.File]::WriteAllText($overlay, (ConvertTo-Json -InputObject @{ Replace = $replace } -Depth 4))",
+      "go test -c -overlay $overlay -o '.t3-tmp/ownsand-agent-scm.test.exe' ./cmds/ownsand-agent; if ($LASTEXITCODE -ne 0) { throw 'SCM probe build failed' }",
+      "& '.\\.t3-tmp\\ownsand-agent-scm.test.exe' -test.v -test.run '^TestLauncherSCMStop$' -test.timeout=2m 2>&1 | Tee-Object -FilePath '.t3-tmp/windows-service-stop-scm.log'; if ($LASTEXITCODE -ne 0) { throw 'SCM probe failed' }"
+    ],
+    "expectedResults": [
+      "The cooperative launcher test exits cleanly after the payload handles the console interrupt.",
+      "The forced-stop control receives a real Ctrl+Break in the fixture, forces the job to exit after its shortened grace period and collects payload exit code 1.",
+      "Both fault-injection subtests preserve the Windows termination error and original stop context, close the job exactly once, and join the waiter before closing the process handle while the fixture is still alive. The Shutdown subtest also preserves the injected close error.",
+      "The handler reports StopPending for Stop and Shutdown and finishes with SCM success while recording a launcher error internally.",
+      "The disposable SCM receives Stop, reaches Stopped with both exit codes zero within eight seconds, and its job close ends the fixture payload. Its log contains the wrapped termination diagnostic and the production handler's successful requested-stop verdict. The test exits zero and deletes its service."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-14-windows-service-stop/worker/.t3-tmp/windows-service-stop/scm_stop_probe_windows_test.go",
+      "copyTo": ".t3-tmp/scm_stop_probe_windows_test.go",
+      "sha256": "7c78c2c4683d5a401ce840d501b154915660d03836dead93691a6fc30d0cc34f",
+      "regressionTests": [
+        "cmds/ownsand-agent/service_process_windows_test.go",
+        "cmds/ownsand-agent/service_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-service-stop-tests.log",
+        ".t3-tmp/windows-service-stop-scm.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-14-windows-service-stop/worker/.t3-tmp/windows-service-stop/ownsand-agent-scm.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-14-windows-service-stop/worker/.t3-tmp/windows-service-stop/ownsand-agent-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-14-windows-service-stop/worker/.t3-tmp/windows-service-stop/ownsand-agent-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-14-windows-service-stop/worker/.t3-tmp/windows-service-stop/ownsand-agent-windows-arm64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-14-windows-service-stop/worker/.t3-tmp/windows-service-stop/ownsand-agent-windows-arm64.test.exe"
+      ]
+    }
+  }
+}
