@@ -18,6 +18,109 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/webhook"
 )
 
+func TestInstallationWebhookIgnoresStaleSuspension(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	w.send(t, "workflow_job", job("queued", 501, 1, sandRunLinux, ""))
+	waiting := sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	eventually(t, "a waiting runner", func() bool { return len(w.runnersIn(t, waiting)) == 1 })
+	runnerID := w.runnersIn(t, waiting)[0].GetRunnerId()
+
+	old := w.gh.SendLost("installation", installationEvent("suspend", 501, "renamed"))
+	w.send(t, "installation", installationEvent("unsuspend", 501, "renamed"))
+	if n := w.l.GitHub.RedeliverOnce(t.Context()); n != 1 {
+		t.Fatalf("redelivery requests = %d, want 1", n)
+	}
+	eventually(t, "successful stale suspension redelivery", func() bool {
+		for _, d := range w.gh.Deliveries() {
+			if d.GUID == old && d.Redelivery && d.StatusCode == http.StatusNoContent {
+				return true
+			}
+		}
+		return false
+	})
+	if req := w.requestOfJob(t, 1); req.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("stale suspension changed queued work: %v", req)
+	}
+	if got := w.runner(t, runnerID).GetState(); got != waiting {
+		t.Fatalf("runner state = %v, want %v", got, waiting)
+	}
+	w.send(t, "workflow_job", job("queued", 501, 2, sandRunLinux, ""))
+	if req := w.requestOfJob(t, 2); req.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("installation did not admit a matching job: %v", req)
+	}
+}
+
+func TestInstallationWebhookLookupFailureCanRetry(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	w.send(t, "workflow_job", job("queued", 501, 1, sandRunLinux, ""))
+
+	w.gh.SetSuspended(501, true)
+	w.gh.Update(func() { w.gh.FailInstallationLookup = http.StatusServiceUnavailable })
+	body, err := json.Marshal(installationEvent("suspend", 501, "renamed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const deliveryID = "suspension-retry"
+	headers := w.gh.Headers("installation", deliveryID, body)
+	if status := w.gh.SendRaw(headers, body); status != http.StatusInternalServerError {
+		t.Fatalf("failed lookup webhook status = %d, want 500", status)
+	}
+	var recorded bool
+	err = w.env.DB.Pool.QueryRow(t.Context(), "SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = $1)", deliveryID).Scan(&recorded)
+	if err != nil || recorded {
+		t.Fatalf("failed delivery recorded = %v, query error = %v", recorded, err)
+	}
+	const active = sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_ACTIVE
+	const suspended = sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED
+	checkLink := func(wantState sandrunv1.GitHubInstallationState, wantLogin string) {
+		t.Helper()
+		var state int16
+		var login string
+		err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT state, github_account_login FROM github_installations WHERE github_installation_id = 501").Scan(&state, &login)
+		if err != nil || state != int16(wantState) || login != wantLogin {
+			t.Fatalf("installation state = %d, login = %q, error = %v, want %v and %q", state, login, err, wantState, wantLogin)
+		}
+	}
+	checkLink(active, "acme")
+	if req := w.requestOfJob(t, 1); req.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("failed lookup changed queued work: %v", req)
+	}
+
+	for range 2 {
+		if status := w.gh.SendRaw(headers, body); status != http.StatusNoContent {
+			t.Fatalf("retry or duplicate status = %d, want 204", status)
+		}
+	}
+	if got := w.webhookCounts(t)[string(webhook.ResultDuplicate)]; got != 1 {
+		t.Errorf("duplicates = %d, want 1", got)
+	}
+	if got := w.gh.Calls("get_installation"); got != 2 {
+		t.Errorf("installation lookups = %d, want 2", got)
+	}
+	checkLink(suspended, "renamed")
+	if req := w.requestOfJob(t, 1); req.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+		req.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_INTEGRATION_REMOVED {
+		t.Fatalf("successful suspension did not cancel queued work: %v", req)
+	}
+	w.send(t, "installation", installationEvent("unsuspend", 501, "renamed"))
+	checkLink(suspended, "renamed")
+	w.send(t, "workflow_job", job("queued", 501, 2, sandRunLinux, ""))
+	if req := w.requestOfJob(t, 2); req != nil {
+		t.Fatalf("suspended installation admitted work: %v", req)
+	}
+	w.gh.SetSuspended(501, false)
+	w.send(t, "installation", installationEvent("unsuspend", 501, "renamed"))
+	checkLink(active, "renamed")
+	w.send(t, "workflow_job", job("queued", 501, 3, sandRunLinux, ""))
+	if req := w.requestOfJob(t, 3); req.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("restored installation did not admit work: %v", req)
+	}
+}
+
 func TestInstallationWebhookConcurrentOrganizationDeletion(t *testing.T) {
 	for _, deletionFirst := range []bool{true, false} {
 		name := "webhook first"
@@ -29,6 +132,7 @@ func TestInstallationWebhookConcurrentOrganizationDeletion(t *testing.T) {
 			w.link(t, 501, "acme")
 			w.createProfile(t, ghProfile("linux", 0))
 			w.send(t, "workflow_job", job("queued", 501, 1, sandRunLinux, ""))
+			w.gh.SetSuspended(501, true)
 			requestID := w.requestOfJob(t, 1).GetRequestId()
 
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -210,6 +314,7 @@ func TestInstallationWebhookRedeliversAfterLockFailure(t *testing.T) {
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
 	w.send(t, "workflow_job", job("queued", 501, 1, sandRunLinux, ""))
+	w.gh.SetSuspended(501, true)
 	ctx := t.Context()
 	pool := w.env.DB.Pool
 	tx, err := pool.Begin(ctx)

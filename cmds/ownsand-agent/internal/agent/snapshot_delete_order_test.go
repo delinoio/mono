@@ -7,9 +7,11 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,6 +46,27 @@ func (r *gatedPauseRuntime) Pause(ctx context.Context, vm vmruntime.VM) error {
 func (r *gatedPauseRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
 	r.snapshots.Add(1)
 	return r.Runtime.Snapshot(ctx, vm, dir)
+}
+
+func waitForPauseEntry(cp *testcp.Server, entered <-chan struct{}, pauseID string, timeout time.Duration) error {
+	// The result waiter can finish after the runtime gate is reached.
+	result := make(chan *ownsandv1.AgentCommandResult, 1)
+	go func() { result <- cp.CommandResult(timeout, pauseID) }()
+	select {
+	case <-entered:
+		return nil
+	case res := <-result:
+		if res == nil {
+			return fmt.Errorf("pause runtime entry timed out after %v", timeout)
+		}
+		// A pause can also return after entering the runtime if its context ends.
+		select {
+		case <-entered:
+			return nil
+		default:
+			return fmt.Errorf("pause command returned before runtime entry: %v", res)
+		}
+	}
 }
 
 type snapshotDeleteLogGate struct {
@@ -230,9 +253,8 @@ func TestDeleteSnapshotReceivedAfterCreateCancelsCreateOnSameChannel(t *testing.
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
 	rt := &gatedPauseRuntime{entered: make(chan struct{}), release: make(chan struct{})}
-	var releaseOnce sync.Once
-	releasePause := func() { releaseOnce.Do(func() { close(rt.release) }) }
-	t.Cleanup(releasePause)
+	releasePause := sync.OnceFunc(func() { close(rt.release) })
+	defer releasePause()
 	h := startWith(t, cp, st, id, func(o *Options) {
 		rt.Runtime = o.Runtime
 		o.Runtime = rt
@@ -248,7 +270,9 @@ func TestDeleteSnapshotReceivedAfterCreateCancelsCreateOnSameChannel(t *testing.
 	// The pause holds the sandbox command lock, so the snapshot create that
 	// follows waits for it.
 	pauseID := h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_PauseSandbox{PauseSandbox: &ownsandv1.PauseSandboxCommand{SandboxId: sandboxID}}})
-	<-rt.entered
+	if err := waitForPauseEntry(cp, rt.entered, pauseID, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
 	snapID, _ := uuidv7.NewString()
 	createID := h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}})
 	deleteID := h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSnapshot{DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}}})
@@ -283,6 +307,33 @@ func TestDeleteSnapshotReceivedAfterCreateCancelsCreateOnSameChannel(t *testing.
 	if got := cp.Channels(); got != channels {
 		t.Errorf("channels = %d, want %d: the agent reconnected", got, channels)
 	}
+}
+
+func TestWaitForPauseEntryReportsResultAndTimeout(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	rt := &gatedPauseRuntime{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(rt.release)
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt.Runtime = o.Runtime
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	unknownID, _ := uuidv7.NewString()
+	pauseID := h.sendCommand(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_PauseSandbox{PauseSandbox: &ownsandv1.PauseSandboxCommand{SandboxId: unknownID}}})
+	err := waitForPauseEntry(cp, rt.entered, pauseID, 10*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "pause command returned before runtime entry:") || !strings.Contains(err.Error(), ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND.String()) {
+		t.Fatalf("pause of unknown sandbox = %v, want early NOT_FOUND result", err)
+	}
+	t.Log(err)
+
+	// The retained result for the first pause must not match the unsent command.
+	unsentID, _ := uuidv7.NewString()
+	err = waitForPauseEntry(cp, rt.entered, unsentID, 20*time.Millisecond)
+	if err == nil || err.Error() != "pause runtime entry timed out after 20ms" {
+		t.Fatalf("missing pause entry and result = %v, want pause-entry timeout", err)
+	}
+	t.Log(err)
 }
 
 func TestDeleteSnapshotAfterStagingWithFailedCleanup(t *testing.T) {

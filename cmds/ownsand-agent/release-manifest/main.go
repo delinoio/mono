@@ -222,8 +222,9 @@ func runAddRelease(args []string, logger *slog.Logger) error {
 		return err
 	}
 	m := emptyManifest()
+	var currentBytes []byte
 	if *current != "" {
-		manifestBytes, err := os.ReadFile(*current)
+		currentBytes, err = os.ReadFile(*current)
 		if err != nil {
 			return err
 		}
@@ -231,12 +232,15 @@ func runAddRelease(args []string, logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		// Never extend a manifest that the agents would reject: a tampered
-		// object in the bucket must not get a valid signature.
-		if err := verifySignature(manifestBytes, sigText, keys); err != nil {
+		if len(currentBytes) > maxManifestBytes {
+			return errManifestTooLong
+		}
+		// Verify the current signature before extending the manifest.
+		// A signed legacy manifest can supply the first sequenced manifest.
+		if err := verifySignature(currentBytes, sigText, keys); err != nil {
 			return err
 		}
-		if m, err = decodeManifest(manifestBytes); err != nil {
+		if m, err = decodeManifest(currentBytes); err != nil {
 			return err
 		}
 	}
@@ -250,12 +254,17 @@ func runAddRelease(args []string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	previousSequence := m.Sequence
 	if err := addRelease(m, r); err != nil {
 		return err
 	}
-	b, err := m.encode()
-	if err != nil {
-		return err
+	// Agents compare the exact signed bytes when the sequence is unchanged.
+	b := currentBytes
+	if m.Sequence != previousSequence {
+		b, err = m.encode()
+		if err != nil {
+			return err
+		}
 	}
 	if err := os.WriteFile(*out, b, 0o644); err != nil {
 		return err
@@ -287,7 +296,11 @@ func runSign(args []string, getenv func(string) string, logger *slog.Logger) err
 	if err != nil {
 		return err
 	}
-	if _, err := decodeManifest(manifestBytes); err != nil {
+	m, err := decodeManifest(manifestBytes)
+	if err != nil {
+		return err
+	}
+	if err := m.requireSequence(); err != nil {
 		return err
 	}
 	if len(manifestBytes) > maxManifestBytes {
@@ -328,6 +341,9 @@ func runVerify(args []string, logger *slog.Logger) error {
 	}
 	m, err := decodeManifest(manifestBytes)
 	if err != nil {
+		return err
+	}
+	if err := m.requireSequence(); err != nil {
 		return err
 	}
 	logger.Info("release manifest verified", "releases", len(m.Releases), "revoked_versions", len(m.RevokedVersions))

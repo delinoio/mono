@@ -84,8 +84,8 @@ func (r Request) sameOperation(g *Grant) bool {
 }
 
 // sameRequest reports whether r repeats the request that created g: the same
-// operation, the same device and the same requested predecessor. Only the
-// existing-grant branch of Reserve uses it. The predecessor check uses
+// operation, the same device and the same requested predecessor. Reserve
+// checks this while it knows the authorization ID. The predecessor check uses
 // sameOperation, because the predecessor's own ReplacesID differs.
 func (r Request) sameRequest(g *Grant) bool {
 	return r.sameOperation(g) && g.DeviceID == r.DeviceID && g.Request.ReplacesID == r.ReplacesID
@@ -230,18 +230,13 @@ func (r *Registry) Reserve(req Request, newID func() string) (g *Grant, existing
 	now := r.Now()
 	r.sweepLocked(now)
 	if old := r.byAuth[req.AuthorizationID]; old != nil {
-		if old.Membership.ID != req.Membership.ID {
+		if !req.sameRequest(old) {
 			return nil, false, ErrReuse
 		}
 		if old.State != Installed || admittable(old, now) {
-			if !req.sameRequest(old) {
-				return nil, false, ErrReuse
-			}
 			return old, true, nil
 		}
-		// The grant of this authorization ID is no longer admittable: a retry
-		// by the same membership gets a new grant.
-		delete(r.byAuth, req.AuthorizationID)
+		// Keep the binding until the matching retry reserves a new grant.
 	}
 	var predecessor *Grant
 	if req.ReplacesID != "" {

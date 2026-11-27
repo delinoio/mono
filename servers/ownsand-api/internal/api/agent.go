@@ -217,14 +217,19 @@ func (s *Service) verifySignedNonce(ctx context.Context, tx pgx.Tx, deviceID str
 		return rec, errUnauthenticated("invalid or expired nonce")
 	}
 	var state int16
-	err = tx.QueryRow(ctx, `SELECT organization_id::text, public_key, state, remove_time FROM devices
+	var tombstoneExpiry *time.Time
+	err = tx.QueryRow(ctx, `SELECT organization_id::text, public_key, state, remove_time, tombstone_expire_time FROM devices
 		WHERE device_id = $1 AND (tombstone_expire_time IS NULL OR tombstone_expire_time > $2) FOR UPDATE`, deviceID, s.now()).
-		Scan(&rec.orgID, &rec.publicKey, &state, &rec.removed)
+		Scan(&rec.orgID, &rec.publicKey, &state, &rec.removed, &tombstoneExpiry)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return rec, errNotFound("device")
 	}
 	if err != nil {
 		return rec, err
+	}
+	// The SQL filter used the time before the row lock wait.
+	if tombstoneExpiry != nil && !s.now().Before(*tombstoneExpiry) {
+		return rec, errNotFound("device")
 	}
 	rec.state = ownsandv1.DeviceState(state)
 	if !auth.VerifyDeviceSignature(rec.publicKey, purpose, nonce, signature) {

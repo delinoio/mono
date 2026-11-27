@@ -40,7 +40,12 @@ import {
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
-import { createMockTransport, MOCK_IDS, MOCK_USER } from "./mock-api.ts";
+import {
+  createMockTransport,
+  MOCK_IDS,
+  MOCK_INVITATION_SECRET,
+  MOCK_USER,
+} from "./mock-api.ts";
 
 test("ends the departing member's queued dev session and publishes one update", async () => {
   const transport = createMockTransport();
@@ -1136,6 +1141,58 @@ test.each([
   },
 );
 
+const missingOwnSandLink = {
+  code: Code.NotFound,
+  rawMessage: "OwnSand link not found",
+};
+
+test("removing an absent OwnSand link leaves work and audit history unchanged", async () => {
+  const request = { organizationId: MOCK_IDS.globex };
+  const listWork = { ...request, includeEnded: true };
+  const transport = createMockTransport({
+    workFixtures: [
+      {
+        ...request,
+        requests: [{ requestId: "queued-job", state: RequestState.QUEUED }],
+        runners: [{ runnerId: "warm-runner", state: RunnerState.WARM }],
+      },
+    ],
+  });
+  const link = createClient(OwnSandLinkService, transport);
+  const work = createClient(WorkService, transport);
+  const audit = createClient(AuditService, transport);
+  const requests = structuredClone(await work.listRequests(listWork));
+  const runners = structuredClone(await work.listRunners(listWork));
+  const events = structuredClone(await audit.listAuditEvents(request));
+
+  await expect(link.removeOwnSandLink(request)).rejects.toMatchObject(
+    missingOwnSandLink,
+  );
+
+  expect(await work.listRequests(listWork)).toEqual(requests);
+  expect(await work.listRunners(listWork)).toEqual(runners);
+  expect(await audit.listAuditEvents(request)).toEqual(events);
+  expect((await link.getOwnSandLink(request)).link).toBeUndefined();
+});
+
+test("removing an absent OwnSand link checks membership and role first", async () => {
+  const transport = createMockTransport();
+  const link = createClient(OwnSandLinkService, transport);
+  const members = createClient(MemberService, transport);
+  const request = { organizationId: MOCK_IDS.contoso };
+
+  await expect(link.removeOwnSandLink(request)).rejects.toMatchObject({
+    code: Code.NotFound,
+    rawMessage: "organization not found",
+  });
+
+  await members.acceptInvitation({ invitationSecret: MOCK_INVITATION_SECRET });
+  await expect(link.removeOwnSandLink(request)).rejects.toMatchObject({
+    code: Code.PermissionDenied,
+    rawMessage: "needs the admin role",
+  });
+});
+
 test("removing OwnSand ends each active request and publishes its terminal outcome once", async () => {
   const organizationId = MOCK_IDS.acme;
   const otherOrgId = MOCK_IDS.globex;
@@ -1326,13 +1383,24 @@ test("removing OwnSand ends each active request and publishes its terminal outco
       state: RunnerState.DELETED,
       endReason: RunnerEndReason.CLEAN_UP,
     });
+    const events = (await audit.listAuditEvents({ organizationId })).events;
     expect(
-      (await audit.listAuditEvents({ organizationId })).events[0],
-    ).toMatchObject({
-      action: AuditAction.OWNSAND_LINK_REMOVED,
-      targetKind: AuditTargetKind.OWNSAND_LINK,
-      targetId: organizationId,
-    });
+      events.filter(
+        (event) => event.action === AuditAction.OWNSAND_LINK_REMOVED,
+      ),
+    ).toMatchObject([
+      {
+        action: AuditAction.OWNSAND_LINK_REMOVED,
+        targetKind: AuditTargetKind.OWNSAND_LINK,
+        targetId: organizationId,
+      },
+    ]);
+    await expect(
+      link.removeOwnSandLink({ organizationId }),
+    ).rejects.toMatchObject(missingOwnSandLink);
+    expect((await audit.listAuditEvents({ organizationId })).events).toEqual(
+      events,
+    );
 
     const snapshot = work
       .watchQueue(
@@ -1453,6 +1521,95 @@ test.each([0, 1])(
     }
   },
 );
+
+test("a cross-organization GitHub installation conflict consumes its issued state without changing either organization", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const audit = createClient(AuditService, transport);
+  const source = { organizationId: MOCK_IDS.acme };
+  const destination = { organizationId: MOCK_IDS.globex };
+  const original = await github.listGitHubInstallations(source);
+  expect(original.installations[0]).toMatchObject({
+    githubInstallationId: 41_000_001n,
+  });
+  const auditBefore = await audit.listAuditEvents(destination);
+  const { url } = await github.createGitHubInstallUrl(destination);
+  const state = new URL(url).searchParams.get("state");
+  if (!state) throw new Error("Expected an issued installation state");
+  const callback = { ...destination, code: "fixture-code", state };
+
+  await expect(
+    github.linkGitHubInstallation({
+      ...callback,
+      githubInstallationId: 41_000_001n,
+    }),
+  ).rejects.toMatchObject({ code: Code.AlreadyExists });
+  await expect(
+    github.linkGitHubInstallation({
+      ...callback,
+      githubInstallationId: 51_000_002n,
+    }),
+  ).rejects.toMatchObject(invalidInstallationState);
+  expect(
+    (await github.listGitHubInstallations(destination)).installations,
+  ).toEqual([]);
+  expect(await github.listGitHubInstallations(source)).toEqual(original);
+  expect(await audit.listAuditEvents(destination)).toEqual(auditBefore);
+});
+
+test("a GitHub installation linked in the mock can move to another organization after unlink", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const audit = createClient(AuditService, transport);
+  const githubInstallationId = 51_000_002n;
+  const link = async (organizationId: string) => {
+    const { url } = await github.createGitHubInstallUrl({ organizationId });
+    const state = new URL(url).searchParams.get("state");
+    if (!state) throw new Error("Expected an issued installation state");
+    return github.linkGitHubInstallation({
+      organizationId,
+      githubInstallationId,
+      code: "fixture-code",
+      state,
+    });
+  };
+  const { installation } = await link(MOCK_IDS.acme);
+  if (!installation) throw new Error("Expected the linked installation");
+
+  for (const organizationId of [MOCK_IDS.acme, MOCK_IDS.globex]) {
+    const request = { organizationId };
+    const installationsBefore = await github.listGitHubInstallations(request);
+    const auditBefore = await audit.listAuditEvents(request);
+    await expect(link(organizationId)).rejects.toMatchObject({
+      code: Code.AlreadyExists,
+    });
+    expect(await github.listGitHubInstallations(request)).toEqual(
+      installationsBefore,
+    );
+    expect(await audit.listAuditEvents(request)).toEqual(auditBefore);
+  }
+
+  await github.unlinkGitHubInstallation({
+    organizationId: MOCK_IDS.acme,
+    installationId: installation.installationId,
+  });
+  await expect(link(MOCK_IDS.globex)).resolves.toMatchObject({
+    installation: { organizationId: MOCK_IDS.globex, githubInstallationId },
+  });
+  await expect(
+    github.linkGitHubInstallation({
+      organizationId: MOCK_IDS.acme,
+      githubInstallationId: 51_000_003n,
+      code: "fixture-code",
+      state: "mock-state",
+    }),
+  ).resolves.toMatchObject({
+    installation: {
+      organizationId: MOCK_IDS.acme,
+      githubInstallationId: 51_000_003n,
+    },
+  });
+});
 
 test("unlinking GitHub ends the installation's warm runner and keeps its history", async () => {
   const transport = createMockTransport();
