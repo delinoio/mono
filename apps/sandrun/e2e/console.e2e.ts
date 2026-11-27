@@ -1369,6 +1369,31 @@ describe("personal API keys", () => {
     await expect(dialog).toBeHidden();
     await expect(screen.getByText(name, { exact: false })).toBeVisible();
   });
+
+  test("creates a key without an expiry when Never is selected", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    await screen.getByRole("button", "Create API key").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.type("non-expiring fixture key");
+    await screen.getByLabel("Expires after").tap();
+    await screen.getByRole("option", "Never").tap();
+    await screen.getByRole("button", "Create key").tap();
+
+    const dialog = screen.getByRole("dialog", "Your new personal API key");
+    await expect(dialog).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(
+      screen
+        .getByRole("listitem")
+        .filter({ hasText: "non-expiring fixture key" }),
+    ).toContainText("does not expire");
+  });
 });
 
 describe("API key revocation", () => {

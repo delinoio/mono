@@ -5,6 +5,7 @@ import {
   AgentCredential,
   AgentIntegrationService,
 } from "@delino/sandrun-protos/v1/agent_integration_pb";
+import { ApiKeyService } from "@delino/sandrun-protos/v1/api_key_pb";
 import {
   AuditAction,
   AuditService,
@@ -20,6 +21,73 @@ const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
 };
+
+const apiKeyClock = Date.UTC(2026, 0, 1) + 250;
+const apiKeyClockTimestamp = timestampFromMs(apiKeyClock);
+
+test.each([
+  {
+    label: "one nanosecond in the future",
+    expiresAt: { ...apiKeyClockTimestamp, nanos: 250_000_001 },
+  },
+  {
+    label: "later in the same second",
+    expiresAt: { ...apiKeyClockTimestamp, nanos: 750_000_000 },
+  },
+  {
+    label: "in the next second",
+    expiresAt: timestampFromMs(Date.UTC(2026, 0, 1) + 1000),
+  },
+  { label: "omitted", expiresAt: undefined },
+])("creates an API key with expiry $label", async ({ expiresAt }) => {
+  const clock = rs.spyOn(Date, "now").mockReturnValue(apiKeyClock);
+  try {
+    const apiKeys = createClient(ApiKeyService, createMockTransport());
+    const organizationId = MOCK_IDS.acme;
+    const name = "new fixture key";
+    const { apiKey } = await apiKeys.createApiKey({
+      organizationId,
+      name,
+      expiresAt,
+    });
+    expect(apiKey?.name).toBe(name);
+    expect(apiKey?.expiresAt).toEqual(expiresAt);
+
+    const listed = await apiKeys.listApiKeys({ organizationId });
+    expect(listed.apiKeys.find((key) => key.name === name)).toEqual(apiKey);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test.each([
+  { label: "at the current time", nanos: 250_000_000 },
+  { label: "one nanosecond in the past", nanos: 249_999_999 },
+])(
+  "rejects an API key expiry $label without creating it",
+  async ({ nanos }) => {
+    const clock = rs.spyOn(Date, "now").mockReturnValue(apiKeyClock);
+    try {
+      const apiKeys = createClient(ApiKeyService, createMockTransport());
+      const organizationId = MOCK_IDS.acme;
+      const before = await apiKeys.listApiKeys({ organizationId });
+
+      await expect(
+        apiKeys.createApiKey({
+          organizationId,
+          name: "rejected fixture key",
+          expiresAt: { ...apiKeyClockTimestamp, nanos },
+        }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage: "expires_at must be in the future",
+      });
+      expect(await apiKeys.listApiKeys({ organizationId })).toEqual(before);
+    } finally {
+      clock.mockRestore();
+    }
+  },
+);
 
 test.each([
   [MOCK_IDS.globex, "the organization has no OwnSand link"],
