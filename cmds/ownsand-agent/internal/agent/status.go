@@ -42,7 +42,7 @@ type StatusCheck struct {
 // setCapabilities records the capabilities of a capability report in the
 // status and writes the status file, so that `ownsand-agent status` shows
 // the checks that decide which sandboxes the device can run.
-func (a *Agent) setCapabilities(c *ownsandv1.DeviceCapabilities) {
+func (a *Agent) setCapabilities(ctx context.Context, c *ownsandv1.DeviceCapabilities) {
 	var guests, images []string
 	for _, g := range c.GetGuestOses() {
 		guests = append(guests, g.String())
@@ -58,23 +58,23 @@ func (a *Agent) setCapabilities(c *ownsandv1.DeviceCapabilities) {
 	a.status.GuestOSes, a.status.BaseImages, a.status.Checks = guests, images, checks
 	a.status.CapabilitiesAt = time.Now()
 	a.mu.Unlock()
-	a.writeStatus()
+	a.writeStatus(ctx)
 }
 
-func (a *Agent) setConnected(connected bool) {
+func (a *Agent) setConnected(ctx context.Context, connected bool) {
 	a.mu.Lock()
 	a.status.Connected = connected
 	if connected {
 		a.status.LastConnected = time.Now()
 	}
 	a.mu.Unlock()
-	a.writeStatus()
+	a.writeStatus(ctx)
 }
 
 // writeStatus writes the status file. It holds statusMu for the whole
 // gather-and-save step, so stopStatusWriter waits for a write that is in
 // flight, and it does nothing once the writer is stopped.
-func (a *Agent) writeStatus() {
+func (a *Agent) writeStatus(ctx context.Context) {
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
 	if a.statusStopped {
@@ -95,7 +95,7 @@ func (a *Agent) writeStatus() {
 	s.UpdateTarget = target
 	s.Sandboxes = len(a.Sandboxes.Entries())
 	s.UpdatedAt = time.Now()
-	if err := a.st.SaveStatus(s); err != nil {
+	if err := a.st.SaveStatusContext(ctx, s); err != nil {
 		a.logger.Warn("write status file failed", "error", err)
 	}
 }
@@ -123,13 +123,13 @@ func (a *Agent) resumeStatusWriter() {
 func (a *Agent) statusLoop(ctx context.Context) {
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
-	a.writeStatus()
+	a.writeStatus(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			a.writeStatus()
+			a.writeStatus(ctx)
 		}
 	}
 }

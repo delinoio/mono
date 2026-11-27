@@ -10,7 +10,7 @@ import (
 	"sync"
 )
 
-// ConsoleLogLimit is the per-sandbox cap of a console log file in bytes: the
+// ConsoleLogLimit is the cap of a console log file in bytes: the
 // first 1 MiB of the guest console output is kept and the rest is discarded.
 // The guest controls this output, so a file without a cap would let a guest
 // fill the host disk for the life of its sandbox.

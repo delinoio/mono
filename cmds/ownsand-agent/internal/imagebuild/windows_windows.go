@@ -208,7 +208,7 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 	if err := images.RemoveWindowsVMAccess(build); err != nil {
 		return fmt.Errorf("imagebuild: clear the build VM access entries: %w", err)
 	}
-	if err := images.Install(ctx, dir); err != nil {
+	if err := images.Install(ctx, dir, ownsandv1.GuestOs_GUEST_OS_WINDOWS); err != nil {
 		return fmt.Errorf("imagebuild: install the image: %w", err)
 	}
 	logger.Info("Windows image installed", "source", meta.Source, "disk_bytes", size, "file_bytes", fileBytes,

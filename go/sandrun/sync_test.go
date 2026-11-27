@@ -144,8 +144,10 @@ func TestTransferWithoutWorkspace(t *testing.T) {
 		force          bool
 		removeManifest bool
 		breakArchive   bool
+		pendingUpdates bool
 	}{
 		{name: "prior manifest"},
+		{name: "prior manifest and pending updates", pendingUpdates: true},
 		{name: "force", force: true},
 		{name: "manifest removed", removeManifest: true},
 		{name: "force and manifest removed", force: true, removeManifest: true},
@@ -166,6 +168,11 @@ func TestTransferWithoutWorkspace(t *testing.T) {
 			}
 			if tc.removeManifest {
 				if err := os.Remove(ws + manifestSuffix); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.pendingUpdates {
+				if err := os.WriteFile(ws+pendingUpdatesSuffix, pathList([]string{"a.txt"}, false), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -208,6 +215,7 @@ func TestTransferWithoutWorkspace(t *testing.T) {
 				t.Fatalf("restored manifest = %+v", m)
 			}
 			requireTransferWorkingDirectories(t, ds, srv)
+			checkPendingUpdates(t, ws)
 		})
 	}
 
@@ -408,9 +416,9 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(ds.GetWorkspacePath(), "old.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("deleted file stayed")
 	}
-	// archive, deletion list and manifest
-	if n := srv.Calls(writeProc) - writesBefore; n != 3 {
-		t.Fatalf("writes of the second sync = %d, want 3", n)
+	// archive, deletion list, pending updates and manifest
+	if n := srv.Calls(writeProc) - writesBefore; n != 4 {
+		t.Fatalf("writes of the second sync = %d, want 4", n)
 	}
 
 	// An unchanged sync takes and releases the lock without writing files.
@@ -618,13 +626,19 @@ func TestSyncGitSymlinkPlaceholder(t *testing.T) {
 	}
 }
 
-func TestSyncRejectsGitSymlinkPlaceholderLineBreakOnWindows(t *testing.T) {
-	c, srv, org := newTestClient(t, "")
-	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
-	dir := newRepo(t, map[string]string{"link": "target\nsecond line"}, nil, "")
+func newGitSymlinkPlaceholder(t *testing.T, target string) string {
+	t.Helper()
+	dir := newRepo(t, map[string]string{"link": target}, nil, "")
 	oid := strings.TrimSpace(git(t, dir, "rev-parse", ":link"))
 	git(t, dir, "update-index", "--cacheinfo", "120000,"+oid+",link")
 	git(t, dir, "config", "core.symlinks", "false")
+	return dir
+}
+
+func TestSyncRejectsGitSymlinkPlaceholderLineBreakOnWindows(t *testing.T) {
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newGitSymlinkPlaceholder(t, "target\nsecond line")
 
 	_, err := c.Sync(t.Context(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
 	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "line break") {
@@ -632,6 +646,112 @@ func TestSyncRejectsGitSymlinkPlaceholderLineBreakOnWindows(t *testing.T) {
 	}
 	if srv.Calls(execProc) != 0 || srv.Calls(writeProc) != 0 {
 		t.Fatal("sync started a guest command or upload for the rejected link")
+	}
+}
+
+func TestSyncRejectsGitSymlinkPlaceholderInvalidUTF8OnWindows(t *testing.T) {
+	const target = "dest-\xff"
+	for _, tc := range []struct {
+		name          string
+		matchingEntry bool
+	}{
+		{name: "missing manifest"},
+		{name: "matching manifest", matchingEntry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+			dir := newGitSymlinkPlaceholder(t, target)
+			if tc.matchingEntry {
+				body, err := json.Marshal(manifest{
+					Version: manifestVersion, PathsValidated: true,
+					Files: map[string]manifestEntry{"link": localSymlink("link", target).entry},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(ds.GetWorkspacePath()+manifestSuffix, body, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res, err := c.Sync(t.Context(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+			if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition ||
+				!strings.Contains(err.Error(), `symbolic link "link"`) || !strings.Contains(err.Error(), "invalid UTF-8") ||
+				strings.Contains(err.Error(), "dest-") {
+				t.Errorf("sync = %+v, %v, want failed precondition naming the link without its target", res, err)
+			}
+			if execs, writes := srv.Calls(execProc), srv.Calls(writeProc); execs != 0 || writes != 0 {
+				t.Errorf("guest execs = %d, writes = %d, want zero for both", execs, writes)
+			}
+		})
+	}
+}
+
+func TestSyncGitSymlinkPlaceholderReplacementRuneOnWindows(t *testing.T) {
+	const target = "dest-\uFFFD"
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newGitSymlinkPlaceholder(t, target)
+	if runtime.GOOS != "windows" {
+		// The fake guest executes locally. On POSIX, emulate the Windows
+		// command outcomes so the test can inspect the staged link list.
+		bin := t.TempDir()
+		script := `#!/bin/sh
+set -eu
+if [ -n "${SANDRUN_SYNC_FORCE-}" ]; then
+    mkdir "$SANDRUN_SYNC_LOCK"
+elif [ -n "${SANDRUN_SYNC_LINK_LIST-}" ] && [ -n "${SANDRUN_SYNC_WORKSPACE-}" ]; then
+    test -s "$SANDRUN_SYNC_LINK_LIST"
+else
+    rm -f "$SANDRUN_SYNC_LINK_LIST"
+    rmdir "$SANDRUN_SYNC_LOCK"
+fi
+`
+		if err := os.WriteFile(filepath.Join(bin, "powershell.exe"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	} else if err := os.WriteFile(filepath.Join(ds.GetWorkspacePath(), target), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var applied atomic.Bool
+	srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+		env := req.GetEnv()
+		if list := env[guestEnvLinks]; list != "" && env[guestEnvWorkspace] != "" {
+			applied.Store(true)
+			body, err := os.ReadFile(list)
+			if want := "\xef\xbb\xbflink\t" + target + "\n"; err != nil || string(body) != want {
+				t.Errorf("staged link list = %x, %v, want %x", body, err, want)
+			}
+		}
+	}
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	if !applied.Load() {
+		t.Fatal("sync did not reach guest apply with the staged link list")
+	}
+}
+
+func TestSyncGitSymlinkPlaceholderPreservesInvalidUTF8OnPOSIX(t *testing.T) {
+	needPOSIX(t)
+	const target = "dest-\xff"
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	dir := newGitSymlinkPlaceholder(t, target)
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), "link")); err != nil || got != target {
+		t.Fatalf("guest link target = %x, %v, want %x", got, err, target)
+	}
+	sum := sha256.Sum256([]byte(target))
+	want := manifestEntry{Size: int64(len(target)), SHA256: hex.EncodeToString(sum[:]), Mode: modeSymlink}
+	if got := guestManifest(t, ds).Files["link"]; got != want {
+		t.Fatalf("guest manifest entry = %+v, want %+v", got, want)
 	}
 }
 
@@ -713,7 +833,7 @@ func TestSyncSkipsStaleSymlinkDescendants(t *testing.T) {
 				t.Fatalf("selection for %q = %+v", replacement, f)
 			}
 
-			plan, err := planSync(local, old)
+			plan, err := planSync(local, old, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -900,6 +1020,33 @@ func TestSyncLimits(t *testing.T) {
 	}
 	if srv.Calls(writeProc) != 0 || srv.Calls(execProc) != 0 {
 		t.Fatal("a sync over the limit uploaded or ran guest commands")
+	}
+}
+
+func TestSyncLimitsIncludePendingUpdates(t *testing.T) {
+	old := manifest{Files: map[string]manifestEntry{}}
+	local := &localList{}
+	pending := map[string]struct{}{}
+	for i := range int(SyncTotalLimit / SyncFileLimit) {
+		name := "file" + strconv.Itoa(i)
+		entry := manifestEntry{Size: SyncFileLimit, Mode: modeFile}
+		old.Files[name] = entry
+		local.files = append(local.files, localFile{rel: name, entry: entry})
+		pending[name] = struct{}{}
+	}
+	name := "large.txt"
+	entry := manifestEntry{Size: SyncFileLimit + 1, Mode: modeFile}
+	old.Files[name] = entry
+	local.files = append(local.files, localFile{rel: name, entry: entry})
+	pending[name] = struct{}{}
+	if plan, err := planSync(local, old, nil); err != nil || !plan.empty() {
+		t.Fatalf("unchanged plan = %+v, %v", plan, err)
+	}
+	_, err := planSync(local, old, pending)
+	var limitErr *LimitError
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !errors.As(err, &limitErr) ||
+		limitErr.Total <= SyncTotalLimit || !slices.Equal(limitErr.Paths, []PathSize{{Path: name, Size: entry.Size}}) {
+		t.Fatalf("plan with pending files = %v, want per-file and total size errors", err)
 	}
 }
 
@@ -1342,6 +1489,280 @@ func TestSyncPOSIXListPaths(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSyncRestoresRevertedFileAfterManifestWriteFailure(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	ws := ds.GetWorkspacePath()
+	const tracked = "tracked.txt"
+	dir := newRepo(t, map[string]string{tracked: "alpha"}, nil, "")
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	before := guestManifest(t, ds)
+	if err := os.WriteFile(filepath.Join(ws, "build.log"), []byte("guest output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setLocal := func(contents string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, tracked), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+		env := req.GetEnv()
+		if env[guestEnvWorkspace] == ws && env[guestEnvLock] == "" {
+			srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
+		}
+	}
+	setLocal("bravo")
+	if res, err := c.Sync(t.Context(), params); res != nil || connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("sync with failed manifest write = %+v, %v", res, err)
+	}
+	if got := readGuest(t, ds, tracked); got != "bravo" {
+		t.Fatalf("guest file after failed manifest write = %q", got)
+	}
+	if got := guestManifest(t, ds); !maps.Equal(got.Files, before.Files) {
+		t.Fatalf("manifest after failed write = %+v, want %+v", got, before)
+	}
+	if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lock after failed manifest write: %v", err)
+	}
+	checkPendingUpdates(t, ws, tracked)
+
+	setLocal("alpha")
+	srv.BeforeExec = nil
+	fresh, err := New(Options{BaseURL: srv.URL, APIKey: srv.AccessToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := fresh.Sync(t.Context(), params)
+	if got := readGuest(t, ds, tracked); err != nil || res == nil || res.Uploaded != 1 || got != "alpha" {
+		t.Fatalf("sync after reverting local bytes = %+v, %v, guest file = %q", res, err, got)
+	}
+	if got := guestManifest(t, ds); !maps.Equal(got.Files, before.Files) {
+		t.Fatalf("manifest after retry = %+v, want %+v", got, before)
+	}
+	if got := readGuest(t, ds, "build.log"); got != "guest output" {
+		t.Fatalf("guest-only file after retry = %q", got)
+	}
+	checkPendingUpdates(t, ws)
+	writes := srv.Calls(writeProc)
+	res, err = fresh.Sync(t.Context(), params)
+	if err != nil || res == nil || res.Uploaded != 0 || res.Skipped != 1 || res.BytesSent != 0 || srv.Calls(writeProc) != writes {
+		t.Fatalf("unchanged sync after repair = %+v, %v", res, err)
+	}
+}
+
+func checkPendingUpdates(t *testing.T, ws string, paths ...string) {
+	t.Helper()
+	got, err := os.ReadFile(ws + pendingUpdatesSuffix)
+	if len(paths) == 0 {
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("pending update file should be absent: %q, %v", got, err)
+		}
+	} else if want := strings.Join(paths, "\x00") + "\x00"; err != nil || string(got) != want {
+		t.Fatalf("pending update file = %q, %v, want %q", got, err, want)
+	}
+}
+
+func TestSyncRetainsPendingUpdatesAcrossManifestWriteFailures(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	ws := ds.GetWorkspacePath()
+	dir := newRepo(t, map[string]string{"a.txt": "alpha", "b.txt": "alpha", "delete.txt": "old"}, nil, "")
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	before := guestManifest(t, ds)
+	setLocal := func(path, contents string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, path), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+		env := req.GetEnv()
+		if env[guestEnvWorkspace] == ws && env[guestEnvLock] == "" {
+			srv.Fail(writeProc, connect.NewError(connect.CodePermissionDenied, errors.New("manifest write denied")))
+		}
+	}
+	setLocal("a.txt", "bravo")
+	if _, err := c.Sync(t.Context(), params); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("first manifest write error = %v", err)
+	}
+	checkPendingUpdates(t, ws, "a.txt")
+
+	setLocal("a.txt", "alpha")
+	setLocal("b.txt", "bravo")
+	git(t, dir, "rm", "-q", "delete.txt")
+	if _, err := c.Sync(t.Context(), params); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("second manifest write error = %v", err)
+	}
+	checkPendingUpdates(t, ws, "a.txt", "b.txt")
+	if readGuest(t, ds, "a.txt") != "alpha" || readGuest(t, ds, "b.txt") != "bravo" {
+		t.Fatal("second apply did not send the reverted file and the new change")
+	}
+	if got := guestManifest(t, ds); !maps.Equal(got.Files, before.Files) {
+		t.Fatalf("manifest after second failure = %+v, want %+v", got, before)
+	}
+
+	srv.BeforeExec = nil
+	setLocal("b.txt", "alpha")
+	res, err := c.Sync(t.Context(), params)
+	if err != nil || res.Uploaded != 2 || res.Deleted != 1 || readGuest(t, ds, "b.txt") != "alpha" {
+		t.Fatalf("sync after two publication failures = %+v, %v", res, err)
+	}
+	delete(before.Files, "delete.txt")
+	if got := guestManifest(t, ds); !maps.Equal(got.Files, before.Files) {
+		t.Fatalf("manifest after recovery = %+v, want %+v", got, before)
+	}
+	checkPendingUpdates(t, ws)
+}
+
+func TestSyncStopsBeforeApplyOnPendingUpdateError(t *testing.T) {
+	needPOSIX(t)
+	for _, tc := range []struct {
+		name string
+		code connect.Code
+		data []byte
+	}{
+		{name: "read denied", code: connect.CodePermissionDenied},
+		{name: "write denied", code: connect.CodePermissionDenied},
+		{name: "malformed list", code: connect.CodeFailedPrecondition, data: []byte("a.txt")},
+		{name: "oversized list", code: connect.CodeFailedPrecondition, data: pathList([]string{strings.Repeat("x", 512)}, false)},
+		{name: "oversized union", code: connect.CodeFailedPrecondition, data: pathList([]string{strings.Repeat("x", 511)}, false)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			ws := ds.GetWorkspacePath()
+			dir := newRepo(t, map[string]string{"a.txt": "alpha"}, nil, "")
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(t.Context(), params); err != nil {
+				t.Fatal(err)
+			}
+			before := guestManifest(t, ds)
+			if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("bravo"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.data != nil {
+				if err := os.WriteFile(ws+pendingUpdatesSuffix, tc.data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			denied := connect.NewError(connect.CodePermissionDenied, errors.New("pending updates denied"))
+			if tc.name == "write denied" {
+				params.Progress = func(p TransferProgress) {
+					if p.Phase == TransferUploading {
+						// The archive fits in one chunk. The pending update list is the next write.
+						srv.Fail(writeProc, denied)
+					}
+				}
+			}
+			srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+				env := req.GetEnv()
+				if env[guestEnvWorkspace] == ws && env[guestEnvLock] == "" {
+					t.Error("sync ran apply with unconfirmed pending updates")
+				}
+				if tc.name == "read denied" && env[guestEnvForce] != "" {
+					// The pending update read follows the manifest read under the lock.
+					srv.Fail(sandrunv1connect.DevSessionServiceReadDevSessionFileProcedure, nil, denied)
+				}
+			}
+			res, err := c.sync(t.Context(), params, 512)
+			if res != nil || connect.CodeOf(err) != tc.code || !strings.Contains(err.Error(), "pending update") {
+				t.Fatalf("sync with pending update error = %+v, %v", res, err)
+			}
+			if got := readGuest(t, ds, "a.txt"); got != "alpha" {
+				t.Fatalf("guest file changed after pending update error: %q", got)
+			}
+			if got := guestManifest(t, ds); !maps.Equal(got.Files, before.Files) {
+				t.Fatalf("manifest changed after pending update error: %+v", got)
+			}
+			if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("lock after pending update error: %v", err)
+			}
+			if tc.data != nil {
+				got, err := os.ReadFile(ws + pendingUpdatesSuffix)
+				if err != nil || !bytes.Equal(got, tc.data) {
+					t.Fatalf("invalid pending file changed: %q, %v", got, err)
+				}
+				if err := os.Remove(ws + pendingUpdatesSuffix); err != nil {
+					t.Fatal(err)
+				}
+			}
+			srv.BeforeExec = nil
+			params.Progress = nil
+			res, err = c.Sync(t.Context(), params)
+			if err != nil || res.Uploaded != 1 || readGuest(t, ds, "a.txt") != "bravo" {
+				t.Fatalf("sync after pending update error = %+v, %v", res, err)
+			}
+			checkPendingUpdates(t, ws)
+			writes := srv.Calls(writeProc)
+			res, err = c.Sync(t.Context(), params)
+			if err != nil || res.Uploaded != 0 || srv.Calls(writeProc) != writes {
+				t.Fatalf("unchanged sync after repair = %+v, %v", res, err)
+			}
+		})
+	}
+}
+
+func TestSyncWarnsWhenPendingUpdatesCannotBeRemoved(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	ws := ds.GetWorkspacePath()
+	dir := newRepo(t, map[string]string{"a.txt": "alpha"}, nil, "")
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("bravo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pending := ws + pendingUpdatesSuffix
+	srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+		if req.GetEnv()[guestEnvPendingUpdates] == pending {
+			if err := os.Rename(pending, pending+".saved"); err != nil {
+				t.Error(err)
+				return
+			}
+			// rm -f fails on a directory even when the test runs as root.
+			if err := os.Mkdir(pending, 0o755); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	res, err := c.Sync(t.Context(), params)
+	const warning = "the guest could not remove the pending sync updates; the next sync may upload those files again"
+	if err != nil || res.Uploaded != 1 || !slices.Equal(res.Warnings, []string{warning}) || readGuest(t, ds, "a.txt") != "bravo" {
+		t.Fatalf("sync with pending update cleanup failure = %+v, %v", res, err)
+	}
+	if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lock after pending update cleanup failure: %v", err)
+	}
+	sum := sha256.Sum256([]byte("bravo"))
+	if got := guestManifest(t, ds).Files["a.txt"].SHA256; got != hex.EncodeToString(sum[:]) {
+		t.Fatalf("manifest after pending update cleanup failure contains digest %q", got)
+	}
+	if err := os.Remove(pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(pending+".saved", pending); err != nil {
+		t.Fatal(err)
+	}
+	srv.BeforeExec = nil
+	res, err = c.Sync(t.Context(), params)
+	if err != nil || res.Uploaded != 1 || len(res.Warnings) != 0 {
+		t.Fatalf("sync after pending update cleanup failure = %+v, %v", res, err)
+	}
+	checkPendingUpdates(t, ws)
 }
 
 func TestSyncRetryFileToDirectory(t *testing.T) {
@@ -1953,8 +2374,8 @@ func TestSyncUnchangedTakesLock(t *testing.T) {
 						srv.Fail(execProc, connect.NewError(connect.CodePermissionDenied, errors.New("cleanup denied")))
 					}
 				case env[guestEnvLock] == lock && env[guestEnvWorkspace] == "":
-					if reads := srv.ReadRequests()[readsBefore:]; len(reads) != 2 || reads[1].GetPath() != ws+manifestSuffix {
-						t.Errorf("expected a second manifest read before cleanup, got %v", reads)
+					if reads := srv.ReadRequests()[readsBefore:]; len(reads) != 3 || reads[1].GetPath() != ws+manifestSuffix || reads[2].GetPath() != ws+pendingUpdatesSuffix {
+						t.Errorf("expected a second manifest read and a pending update read before cleanup, got %v", reads)
 					}
 					if _, err := os.Stat(lock); err != nil {
 						t.Errorf("lock before cleanup: %v", err)
@@ -2210,6 +2631,7 @@ func TestSyncLockAcquisitionStreamLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(guestEnvAliasReplace, unrelated)
+	t.Setenv(guestEnvPendingUpdates, unrelated)
 	for _, tc := range []struct {
 		name     string
 		exitCode int64
@@ -2291,11 +2713,11 @@ func TestSyncLockAcquisitionStreamLoss(t *testing.T) {
 			if len(requests) != wantCommands || requests[0].GetExecId() != streamErr.ExecID {
 				t.Fatalf("sync issued %d commands, want %d starting with the original lock exec", len(requests), wantCommands)
 			}
-			if acquired && !maps.Equal(requests[1].GetEnv(), map[string]string{guestEnvLock: lock, guestEnvAliasReplace: ""}) {
-				t.Fatal("recovery cleanup must target only the lock and ignore an inherited alias list")
+			if acquired && !maps.Equal(requests[1].GetEnv(), map[string]string{guestEnvLock: lock, guestEnvAliasReplace: "", guestEnvPendingUpdates: ""}) {
+				t.Fatal("recovery cleanup must target only the lock and ignore inherited lists")
 			}
 			if got, err := os.ReadFile(unrelated); err != nil || string(got) != "keep" {
-				t.Fatalf("sync touched an inherited alias list: %q, %v", got, err)
+				t.Fatalf("sync touched an inherited list: %q, %v", got, err)
 			}
 			_, statErr := os.Stat(lock)
 			if acquired && !errors.Is(statErr, os.ErrNotExist) || !acquired && statErr != nil {
@@ -3174,6 +3596,36 @@ func TestSyncArchiveRejectsLinkedPaths(t *testing.T) {
 				if header.Typeflag != tar.TypeDir {
 					t.Fatalf("archive emitted a header for %q", header.Name)
 				}
+			}
+		})
+	}
+}
+
+func TestSyncArchiveLinkTargetCharset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		target  string
+		charset string
+	}{
+		{name: "valid UTF-8", target: "dest-\uFFFD"},
+		{name: "invalid UTF-8", target: "dest-\xff", charset: "BINARY"},
+		{name: "long invalid UTF-8", target: strings.Repeat("a", 100) + "\xff", charset: "BINARY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []localFile{{rel: "link", target: tc.target, entry: manifestEntry{Mode: modeSymlink}}}
+			var b bytes.Buffer
+			if err := writeSyncArchive(t.Context(), &b, nil, files, false); err != nil {
+				t.Fatal(err)
+			}
+			header, err := tar.NewReader(&b).Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if header.Typeflag != tar.TypeSymlink || header.Linkname != tc.target {
+				t.Fatalf("tar entry type = %q, link target = %x, want symlink with target %x", header.Typeflag, header.Linkname, tc.target)
+			}
+			if got := header.PAXRecords["hdrcharset"]; got != tc.charset {
+				t.Errorf("PAX hdrcharset = %q, want %q", got, tc.charset)
 			}
 		})
 	}

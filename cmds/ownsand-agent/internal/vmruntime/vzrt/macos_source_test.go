@@ -107,7 +107,7 @@ func testMacOSBaseImageGeneration(t *testing.T, copySource func(context.Context,
 			writeMacOSGeneration(t, images.BuildDir(base), "B", 2, 4096, 2)
 			installCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 			defer cancel()
-			if err := images.Install(installCtx, base); !errors.Is(err, context.DeadlineExceeded) {
+			if err := images.Install(installCtx, base, ownsandv1.GuestOs_GUEST_OS_MACOS); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("install during source copy = %v, want deadline exceeded", err)
 			}
 		}
@@ -119,7 +119,7 @@ func testMacOSBaseImageGeneration(t *testing.T, copySource func(context.Context,
 	checkMacOSGeneration(t, spec, model, "A")
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if err := images.Install(ctx, base); err != nil {
+	if err := images.Install(ctx, base, ownsandv1.GuestOs_GUEST_OS_MACOS); err != nil {
 		t.Fatal(err)
 	}
 	_, err = prepareMacOSSource(t.Context(), spec, base, supportsModel, copySource)
@@ -185,7 +185,7 @@ func TestMacOSBaseImageGenerationRecoveryAndFailedCopy(t *testing.T) {
 			writeMacOSGeneration(t, images.BuildDir(base), "B", 2, 4096, 2)
 			installCtx, stop := context.WithTimeout(t.Context(), 5*time.Second)
 			defer stop()
-			if err := images.Install(installCtx, base); err != nil {
+			if err := images.Install(installCtx, base, ownsandv1.GuestOs_GUEST_OS_MACOS); err != nil {
 				t.Fatalf("install after failed copy: %v", err)
 			}
 		})

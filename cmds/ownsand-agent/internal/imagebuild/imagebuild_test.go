@@ -133,6 +133,10 @@ func TestBuildChecksTheGuestBinary(t *testing.T) {
 			if !strings.HasPrefix(err.Error(), tt.wantPrefix) {
 				t.Fatalf("Build error = %q; want prefix %q", err.Error(), tt.wantPrefix)
 			}
+			entries, err := os.ReadDir(tt.opts.ImagesDir)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("invalid input touched the images directory: %v, %v", entries, err)
+			}
 		})
 	}
 }
