@@ -73,11 +73,11 @@ func capAllows(monthToDate, amount, monthlyCap int64) bool {
 	return amount <= monthlyCap-monthToDate
 }
 
-// MonthToDate returns the sum of the automatic top-ups of the UTC calendar
-// month of now that were not failed: completed ones and those in flight. A
-// top-up belongs to the month of its cap time, which is the queue time of a
-// pending top-up and the claim time of a claimed one; a row without cap time
-// belongs to the month of its create_time.
+// MonthToDate returns the automatic top-up amount reserved or completed in
+// the UTC calendar month of now. A timeout keeps its reservation because
+// Paddle can still complete the charge. A top-up belongs to the month of its
+// cap time, which is the queue time of a pending top-up and the claim time
+// of a claimed one. A row without cap time uses create_time.
 func MonthToDate(ctx context.Context, q db.Querier, accountID string, now time.Time) (int64, error) {
 	return monthToDateExcept(ctx, q, accountID, now, "")
 }
@@ -89,7 +89,8 @@ func monthToDateExcept(ctx context.Context, q db.Querier, accountID string, now 
 	start := MonthStart(now)
 	var sum int64
 	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(amount_usd_micros), 0) FROM top_ups
-		WHERE billing_account_id = $1 AND kind = 'auto' AND status <> 'failed'
+		WHERE billing_account_id = $1 AND kind = 'auto'
+			AND (status <> 'failed' OR failure_reason = 'timed_out')
 			AND COALESCE(cap_time, create_time) >= $2 AND COALESCE(cap_time, create_time) < $3
 			AND ($4::text = '' OR top_up_id::text <> $4::text)`,
 		accountID, start, start.AddDate(0, 1, 0), exceptID).Scan(&sum)

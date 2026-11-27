@@ -454,7 +454,14 @@ func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, ev paddle.Even
 			out.Result = webhookIgnored
 			return out, nil
 		}
-		if err := s.failTopUp(ctx, tx, acct, t.ID, FailurePaymentFailed, now); err != nil {
+		if t.Kind == TopUpAuto && t.Status == TopUpFailed && t.FailureReason == FailureTimedOut {
+			// Release the cap reservation. The timeout already counted the
+			// failure and queued the notice.
+			if _, err := tx.Exec(ctx, `UPDATE top_ups SET failure_reason = $2, update_time = $3
+				WHERE top_up_id = $1`, t.ID, FailurePaymentFailed, now); err != nil {
+				return out, err
+			}
+		} else if err := s.failTopUp(ctx, tx, acct, t.ID, FailurePaymentFailed, now); err != nil {
 			return out, err
 		}
 	case txn.Origin == paddle.OriginWeb || txn.Origin == paddle.OriginAPI || acct.Deleted:
