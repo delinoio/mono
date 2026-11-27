@@ -70,6 +70,7 @@ describe("Slider range group name in static markup", () => {
         <Slider
           label="Price"
           defaultValue={[20, 80]}
+          aria-label="Nightly"
           aria-labelledby="budget-label"
         />
       </>,
@@ -81,20 +82,44 @@ describe("Slider range group name in static markup", () => {
     expect(danglingIds(markup, "aria-labelledby")).toEqual([]);
   });
 
-  test("does not point the group at the label next to a caller aria-label", () => {
-    const markup = renderToStaticMarkup(
-      <Slider label="Price" defaultValue={[20, 80]} aria-label="Nightly" />,
-    );
+  test.each([undefined, "", " "])(
+    "uses aria-label without a group ID reference when aria-labelledby is %j",
+    (ariaLabelledBy) => {
+      const markup = renderToStaticMarkup(
+        <Slider
+          label="Price"
+          defaultValue={[20, 80]}
+          aria-label="Nightly"
+          aria-labelledby={ariaLabelledBy}
+        />,
+      );
 
-    // The UI SDK still adds its own predicted reference, which no element
-    // has, so the name comes from `aria-label`. The wrapper must not add the
-    // label id, because `aria-labelledby` would override `aria-label`.
-    const group = openingTag(markup, "slider");
-    expect(attribute(group, "aria-label")).toBe("Nightly");
-    const labelId = attribute(openingTag(markup, "field-label"), "id");
-    expect(labelId).toBeTruthy();
-    expect(attribute(group, "aria-labelledby")).not.toBe(labelId);
-  });
+      const group = openingTag(markup, "slider");
+      expect(attribute(group, "aria-label")).toBe("Nightly");
+      expect(attribute(group, "aria-labelledby")?.trim() ?? "").toBe("");
+      expect(danglingIds(markup, "aria-labelledby")).toEqual([]);
+    },
+  );
+
+  test.each([undefined, "", " "])(
+    "references the visible label when aria-label is %j",
+    (ariaLabel) => {
+      const markup = renderToStaticMarkup(
+        <Slider
+          label={<span>Price</span>}
+          defaultValue={[20, 80]}
+          aria-label={ariaLabel}
+          aria-labelledby=" "
+        />,
+      );
+
+      const group = openingTag(markup, "slider");
+      expect(attribute(group, "aria-labelledby")).toBe(
+        attribute(openingTag(markup, "field-label"), "id"),
+      );
+      expect(danglingIds(markup, "aria-labelledby")).toEqual([]);
+    },
+  );
 
   test("keeps the single-thumb group reference of the UI SDK label", () => {
     const markup = renderToStaticMarkup(
@@ -128,6 +153,7 @@ describe("Slider range group name after mount", () => {
         <Slider
           label="Price"
           defaultValue={[20, 80]}
+          aria-label="Nightly"
           aria-labelledby="budget-label"
         />
       </>,
@@ -138,13 +164,28 @@ describe("Slider range group name after mount", () => {
     expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
   });
 
-  test("keeps the name of a caller aria-label", () => {
-    render(
-      <Slider label="Price" defaultValue={[20, 80]} aria-label="Nightly" />,
-    );
+  test.each([
+    [undefined, undefined, "Price"],
+    ["", "", "Price"],
+    [" ", " ", "Price"],
+    ["Nightly", undefined, "Nightly"],
+    ["Nightly", " ", "Nightly"],
+  ])(
+    "names the group with aria-label %j and aria-labelledby %j",
+    (ariaLabel, ariaLabelledBy, name) => {
+      render(
+        <Slider
+          label={<span>Price</span>}
+          defaultValue={[20, 80]}
+          aria-label={ariaLabel}
+          aria-labelledby={ariaLabelledBy}
+        />,
+      );
 
-    expect(screen.getByRole("group", { name: "Nightly" })).toBeTruthy();
-  });
+      expect(screen.getByRole("group", { name })).toBeTruthy();
+      expect(screen.getByRole("slider", { name: "Price 2 of 2" })).toBeTruthy();
+    },
+  );
 
   test("keeps the name of a single thumb", () => {
     render(<Slider label="Volume" defaultValue={40} />);
