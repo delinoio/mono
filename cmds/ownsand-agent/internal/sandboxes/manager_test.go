@@ -1301,23 +1301,73 @@ func TestCallerDeleteEndsFailedTTLEnd(t *testing.T) {
 // ends that Tick started have written their records, and that a Tick after
 // Close starts no end.
 func TestCloseWaitsForTTLEnds(t *testing.T) {
-	e := newEnv(t)
-	first := e.create(time.Minute, time.Hour).GetSandboxId()
-	second := e.create(time.Minute, time.Hour).GetSandboxId()
-	e.clk.Advance(2 * time.Minute)
-	e.m.Tick(context.Background(), false)
-	e.m.Close()
-	for _, id := range []string{first, second} {
-		if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-			t.Fatalf("sandbox %s state %v after Close", id, s)
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		block := make(chan struct{})
+		e.rt.deleteBlock = block
+		release := sync.OnceFunc(func() { close(block) })
+		defer func() {
+			release()
+			// Let the VM watchers exit even if an assertion fails.
+			e.rt.mu.Lock()
+			for _, vm := range e.rt.vms {
+				vm.stop()
+			}
+			e.rt.mu.Unlock()
+		}()
+
+		first := e.create(time.Minute, time.Hour).GetSandboxId()
+		second := e.create(time.Minute, time.Hour).GetSandboxId()
+		third := e.create(3*time.Minute, time.Hour).GetSandboxId()
+		e.clk.Advance(2 * time.Minute)
+		e.m.Tick(t.Context(), false)
+		synctest.Wait()
+		if calls := e.rt.deleteCallCount(); calls != 2 {
+			t.Fatalf("Delete calls while the gate is closed = %d, want 2", calls)
 		}
-	}
-	third := e.create(time.Minute, time.Hour).GetSandboxId()
-	e.clk.Advance(2 * time.Minute)
-	e.m.Tick(context.Background(), false)
-	if s, _ := e.m.State(third); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		t.Fatalf("Tick after Close ended sandbox: %v", s)
-	}
+
+		closeDone := make(chan struct{})
+		go func() {
+			e.m.Close()
+			close(closeDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-closeDone:
+			t.Fatal("Close returned while both TTL deletes were blocked")
+		default:
+		}
+
+		release()
+		synctest.Wait()
+		select {
+		case <-closeDone:
+		default:
+			t.Fatal("Close did not return after the delete gate opened")
+		}
+		for _, id := range []string{first, second} {
+			if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				t.Errorf("sandbox %s state after Close = %v, want DELETED", id, state)
+			}
+		}
+
+		e.clk.Advance(2 * time.Minute)
+		e.m.Tick(t.Context(), false)
+		synctest.Wait()
+		e.m.mu.Lock()
+		sb := e.m.sandboxes[third]
+		ending := sb != nil && sb.ending
+		e.m.mu.Unlock()
+		if ending {
+			t.Error("Tick after Close marked the due sandbox as ending")
+		}
+		if state, _ := e.m.State(third); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Errorf("due sandbox state after post-close Tick = %v, want RUNNING", state)
+		}
+		if calls := e.rt.deleteCallCount(); calls != 2 {
+			t.Errorf("Delete calls after post-close Tick = %d, want 2", calls)
+		}
+	})
 }
 
 func TestEqualDeadlinesGiveMaxTTL(t *testing.T) {
