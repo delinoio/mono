@@ -28,5 +28,9 @@ func descendantGroups(context.Context, int) ([]int, error) { return nil, errors.
 
 func signalGroupID(int, syscall.Signal) error { return errors.ErrUnsupported }
 
-// helperStopped exists only so that this package compiles on Windows.
-func helperStopped(context.Context, int) (bool, error) { return false, errors.ErrUnsupported }
+// processStopped exists only so that this package compiles on Windows.
+func processStopped(context.Context, int) (bool, error) { return false, errors.ErrUnsupported }
+
+func workerGroupsStopped(context.Context, map[int]bool, func(context.Context, int) (bool, error)) (bool, error) {
+	return false, errors.ErrUnsupported
+}

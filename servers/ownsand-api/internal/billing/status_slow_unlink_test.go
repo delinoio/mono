@@ -38,14 +38,13 @@ func TestRunSlowPendingUnlinkDoesNotDelayWorker(t *testing.T) {
 			// Advance stores the suspension.
 			f.addOrg(t, org2)
 			gate := f.fake.Hold(accountstest.MethodUnlinkOrganization)
-			timing := billing.StatusTiming{Poll: tc.poll, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}
-			statuses, stop := f.runStatuses(timing, f.fake.Client(), nil)
-			defer stop()
-			// Registered after stop, so it runs first: the held call must end
-			// before the worker is stopped.
+			// Release the held call before the stop cleanup waits for Run.
 			defer gate.Release()
+			timing := billing.StatusTiming{Poll: tc.poll, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}
+			statuses, stop, done := f.runStatuses(timing, f.fake.Client(), nil)
+			t.Cleanup(stop)
 
-			<-gate.Entered
+			gate.WaitForEntry(t, done)
 			polls := func() int { return f.fake.Calls(accountstest.MethodListBillingStatusChanges) }
 			eventually(t, "the poll of the first step", func() bool { return polls() >= 1 })
 			base := polls()
@@ -93,16 +92,17 @@ func TestRunStopsWithSlowPendingUnlink(t *testing.T) {
 	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(),
 		Timing: &billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}})
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	t.Cleanup(cancel)
+	done := make(chan error)
 	go func() { statuses.Run(ctx); close(done) }()
-	<-gate.Entered
+	gate.WaitForEntry(t, done)
 	cancel()
 	// The call is held by the fake, but the client call ends with the
 	// context; Run returns after the batch did.
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("Run did not return after its context ended while an unlink was in flight")
+		t.Fatal("timed out waiting for Run to return after cancellation while UnlinkOrganization was held")
 	}
 }
 
@@ -112,7 +112,7 @@ func TestRunStopsWithSlowPendingUnlink(t *testing.T) {
 func TestRetryPendingUnlinksStopsWithoutLease(t *testing.T) {
 	t0 := time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
-	ctx := context.Background()
+	ctx := t.Context()
 	f.addOrg(t, org1)
 	f.addOrg(t, org2)
 	f.link(t, org1, accountA)
@@ -138,12 +138,12 @@ func TestRetryPendingUnlinksStopsWithoutLease(t *testing.T) {
 
 	setHeld(true)
 	gate := f.fake.Hold(accountstest.MethodUnlinkOrganization)
-	defer gate.Release()
-	wait := goErr(func() error { return statuses.RetryPendingUnlinks(ctx) })
-	<-gate.Entered
+	t.Cleanup(gate.Release)
+	done := goErr(func() error { return statuses.RetryPendingUnlinks(ctx) })
+	gate.WaitForEntry(t, done)
 	setHeld(false)
 	gate.Release()
-	if err := wait(); err != nil {
+	if err := gate.WaitForResult(t, done); err != nil {
 		t.Fatal(err)
 	}
 	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 1 {
