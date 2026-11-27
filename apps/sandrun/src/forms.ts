@@ -24,6 +24,7 @@ import {
   RunnerProfileSchema,
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import { durationMs } from "./format.ts";
+import { getVerifiedCodexGuestOses } from "./verified-codex-guest-oses.ts";
 
 export const MINUTE_MS = 60_000;
 export const HOUR_MS = 60 * MINUTE_MS;
@@ -31,6 +32,8 @@ export const MAX_TTL_MS = 7 * 24 * HOUR_MS;
 export const MAX_QUEUE_WAIT_MS = 24 * HOUR_MS;
 export const OPENAI_MAX_QUEUE_WAIT_MS = 5 * MINUTE_MS;
 export const MAX_WARM_COUNT = 10;
+export const CODEX_GUEST_OS_UNAVAILABLE =
+  "SandRun has not verified a guest OS for OpenAI Codex. You cannot save this profile yet.";
 
 // Runner profile resource limits from servers/sandrun-api/internal/profile/validate.go.
 export const MAX_VCPU_COUNT = 1024;
@@ -88,14 +91,13 @@ export function emptyProfileForm(): ProfileFormValues {
   };
 }
 
-/** The guest OSes on which a vendor runs its runner program. */
-export const VENDOR_GUEST_OSES: Readonly<
-  Record<AgentVendor, readonly GuestOs[]>
+/** The guest OSes supported by vendors other than OpenAI Codex. */
+const VENDOR_GUEST_OSES: Readonly<
+  Record<Exclude<AgentVendor, AgentVendor.OPENAI_CODEX>, readonly GuestOs[]>
 > = {
   [AgentVendor.UNSPECIFIED]: [],
   [AgentVendor.CLAUDE_CODE]: [GuestOs.LINUX, GuestOs.MACOS],
   [AgentVendor.CURSOR]: [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS],
-  [AgentVendor.OPENAI_CODEX]: [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS],
   [AgentVendor.DEVIN]: [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS],
 };
 
@@ -128,6 +130,14 @@ export function profileErrors(
   vendor: AgentVendor | undefined,
 ): ProfileErrors {
   const errors: ProfileErrors = {};
+  const agentVendor =
+    values.workloadKind === WorkloadKind.AGENT_SESSION ? vendor : undefined;
+  const codex = agentVendor === AgentVendor.OPENAI_CODEX;
+  const guestOses = codex
+    ? getVerifiedCodexGuestOses()
+    : agentVendor === undefined
+      ? undefined
+      : VENDOR_GUEST_OSES[agentVendor];
   if (
     values.name.length < 1 ||
     values.name.length > 40 ||
@@ -153,13 +163,14 @@ export function profileErrors(
           : "Enter an absolute path, for example /home/dev/work.";
     }
   }
-  if (
-    values.workloadKind === WorkloadKind.AGENT_SESSION &&
-    vendor !== undefined &&
-    !VENDOR_GUEST_OSES[vendor].includes(values.guestOs)
-  ) {
-    errors.guestOs =
-      "The vendor of this integration does not run on this guest OS.";
+  if (codex && guestOses?.length === 0) {
+    errors.guestOs = CODEX_GUEST_OS_UNAVAILABLE;
+  } else if (values.guestOs === GuestOs.UNSPECIFIED) {
+    errors.guestOs = "Select a guest OS.";
+  } else if (guestOses && !guestOses.includes(values.guestOs)) {
+    errors.guestOs = codex
+      ? "Select a guest OS that SandRun has verified for OpenAI Codex."
+      : "The vendor of this integration does not run on this guest OS.";
   }
   if (
     values.sourceKind === SourceKind.Template &&
@@ -212,11 +223,7 @@ export function profileErrors(
     errors.idleTtlMinutes =
       "The idle TTL must not be longer than the maximum TTL.";
   }
-  const limit =
-    vendor === AgentVendor.OPENAI_CODEX &&
-    values.workloadKind === WorkloadKind.AGENT_SESSION
-      ? OPENAI_MAX_QUEUE_WAIT_MS
-      : MAX_QUEUE_WAIT_MS;
+  const limit = codex ? OPENAI_MAX_QUEUE_WAIT_MS : MAX_QUEUE_WAIT_MS;
   if (!positive(values.maxQueueWaitMinutes)) {
     errors.maxQueueWaitMinutes =
       "Enter a maximum queue wait greater than zero.";

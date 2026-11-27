@@ -11,6 +11,7 @@ import {
 import * as React from "react";
 import { ButtonSize, ButtonVariant } from "./button.tsx";
 import { mergeClassName } from "./class-name.ts";
+import { DeferAutoFocusContext } from "./panel-autofocus.ts";
 
 export { createDrawerController } from "@ui-sdk/react/drawer";
 export type { DrawerController, DrawerSide } from "@ui-sdk/react/drawer";
@@ -34,7 +35,7 @@ const DrawerModalContext = React.createContext<DrawerProps["modal"]>(undefined);
  * A sheet that slides in from an edge of the screen, built from UI SDK
  * `Drawer`. It opens from the bottom by default (`side`). It traps focus,
  * closes with Escape, a press outside or a swipe toward its edge, and
- * returns focus to its trigger.
+ * returns focus to its opener.
  */
 export function Drawer(props: DrawerProps) {
   // The type already omits `dismissible`, but types do not stop JS callers or
@@ -92,10 +93,12 @@ export function DrawerContent({ className, ...props }: DrawerContentProps) {
       {modal === undefined || modal === true ? (
         <DrawerBackdrop className="dui-drawer-backdrop" />
       ) : null}
-      <DrawerContentPart
-        className={mergeClassName("dui-drawer-content", className)}
-        {...props}
-      />
+      <DeferAutoFocusContext value={true}>
+        <DrawerContentPart
+          className={mergeClassName("dui-drawer-content", className)}
+          {...props}
+        />
+      </DeferAutoFocusContext>
     </>
   );
 }
