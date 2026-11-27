@@ -1729,6 +1729,78 @@ describe("API key revocation", () => {
 });
 
 describe("invitations", () => {
+  test("shows the canceled dev session after leaving and rejoining an organization", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+    const queue = screen.getByRole("table", "Waiting requests");
+    await expect(queue).toContainText("Dev session");
+    await screen.getByRole("link", "Members").tap();
+
+    await screen.getByRole("button", "Invite someone").tap();
+    await screen.getByRole("button", "Create link").tap();
+    const invitation = screen.getByRole("dialog", "Your invitation link");
+    await expect(invitation).toBeVisible();
+    const link = await browser.evaluate(
+      () =>
+        document.querySelector('code[aria-label="Invitation link"]')
+          ?.textContent ?? "",
+    );
+    expect(link).toContain("/invitations/accept#secret=");
+    await invitation.getByRole("button", "Done").tap();
+
+    await screen.getByRole("link", "Settings").tap();
+    await screen.getByRole("combobox", "New owner").tap();
+    await screen.getByRole("option", "Ada Park").tap();
+    await screen.getByRole("button", "Transfer", { exact: true }).tap();
+    await screen
+      .getByRole("alertdialog", "Make Ada Park the owner?")
+      .getByRole("button", "Transfer ownership")
+      .tap();
+    await expect(
+      screen.getByRole("heading", "Transfer ownership"),
+    ).toBeHidden();
+
+    await screen.getByRole("link", "Members").tap();
+    await screen.getByRole("button", "Leave organization").tap();
+    await screen
+      .getByRole("alertdialog", "Leave this organization?")
+      .getByRole("button", "Leave organization")
+      .tap();
+    await expect(browser).toHaveURL("/");
+    await expect(
+      screen.getByRole("link", "Northwind Labs Member"),
+    ).toBeVisible();
+    await expect(screen.getByRole("link", /Acme Robotics/)).toBeHidden();
+
+    await screen.getByLabel("Invitation link or secret").tap();
+    await browser.keyboard.type(link);
+    await screen.getByRole("button", "Continue").tap();
+    await screen.getByRole("button", "Join organization").tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}`);
+    await expect(queue).toContainText("GitHub job");
+    await expect(queue).not.toContainText("Dev session");
+    await app.screenshot("queue-after-membership-rejoin");
+
+    await screen.getByRole("link", "Dev sessions").tap();
+    await screen.getByRole("checkbox", "Show ended dev sessions").tap();
+    const sessions = screen.getByRole("table", "Dev sessions");
+    const canceled = sessions
+      .getByRole("row")
+      .filter({ hasText: "msvc build" });
+    await expect(canceled).toContainText("Canceled");
+    await expect(canceled).toContainText("Member removed");
+    const ended = sessions
+      .getByRole("row")
+      .filter({ hasText: "compiler check" });
+    await expect(ended).toContainText("Session TTL ended");
+    await app.screenshot("dev-sessions-after-membership-rejoin");
+  });
+
   test("creates and revokes an invitation as an admin and hides the controls from members", async ({
     app,
     screen,
