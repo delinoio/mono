@@ -215,7 +215,10 @@ func (f *Server) AddAccount(id, name string, members map[string]accountsv1.Billi
 func (f *Server) SetAccountStatus(id string, status accountsv1.BillingStatus, blockedSince time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	a := f.accounts[id]
+	f.setAccountStatusLocked(f.accounts[id], status, blockedSince)
+}
+
+func (f *Server) setAccountStatusLocked(a *account, status accountsv1.BillingStatus, blockedSince time.Time) {
 	a.status, a.blockedSince = status, blockedSince
 	a.reason = accountsv1.BillingStatusReason_BILLING_STATUS_REASON_NONE
 	if status != accountsv1.BillingStatus_BILLING_STATUS_ALLOWED {
@@ -223,7 +226,7 @@ func (f *Server) SetAccountStatus(id string, status accountsv1.BillingStatus, bl
 	}
 	orgs := make([]string, 0, len(f.links))
 	for org, l := range f.links {
-		if l.account == id {
+		if l.account == a.id {
 			orgs = append(orgs, org)
 		}
 	}
@@ -377,7 +380,12 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 			f.usage[k] = [2]int64{u[0] + r.GetQuantity(), u[1] + r.GetAmountUsdMicros()}
 			if l := f.usageLinkLocked(org, windowStart); l != nil {
 				attribution.billingAccountID = l.account
-				f.accounts[l.account].balance -= r.GetAmountUsdMicros()
+				a := f.accounts[l.account]
+				previousBalance := a.balance
+				a.balance -= r.GetAmountUsdMicros()
+				if a.status == accountsv1.BillingStatus_BILLING_STATUS_ALLOWED && previousBalance > 0 && a.balance <= 0 {
+					f.setAccountStatusLocked(a, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, f.now().UTC())
+				}
 			} else {
 				attribution.unattributed = true
 			}

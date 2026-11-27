@@ -47,6 +47,7 @@ func billingEnvWith(t *testing.T, extra ...testenv.Option) (*testenv.Env, *accou
 	var env *testenv.Env
 	fake := accountstest.New(t, func() time.Time { return env.Clock.Now() })
 	opts := append([]testenv.Option{testenv.WithAccounts(fake), func(o *app.Options) {
+		o.WriteOwnerUnlinks = true
 		o.BillingStatusTiming = &billing.StatusTiming{Poll: time.Hour, Tick: time.Hour, UnlinkBackoffMin: time.Second, UnlinkBackoffMax: 5 * time.Minute}
 		o.BillingEnforceInterval = time.Hour
 		// No usage report in the background: its statuses would refresh the

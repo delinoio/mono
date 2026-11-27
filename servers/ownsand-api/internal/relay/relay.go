@@ -39,6 +39,9 @@ type Limits struct {
 	Keepalive time.Duration
 	// IdleTimeout closes a connection that received nothing.
 	IdleTimeout time.Duration
+	// MaxQueuedFrames bounds the frames that consume credit and wait in
+	// one stream queue. Zero selects the default.
+	MaxQueuedFrames int
 	// MaxQueuedControlFrames bounds the frames that carry no credit (request
 	// accepted, session end, error, stream close and stream open frames) that
 	// wait in one stream queue for the handler. Zero selects the default.
@@ -50,6 +53,7 @@ type Limits struct {
 }
 
 const (
+	defaultMaxQueuedFrames              = 4096
 	defaultMaxQueuedControlFrames       = 4
 	defaultMaxQueuedControlBytes  int64 = 64 << 10
 )
@@ -63,6 +67,7 @@ func DefaultLimits() Limits {
 		Keepalive:          30 * time.Second,
 		IdleTimeout:        90 * time.Second,
 
+		MaxQueuedFrames:        defaultMaxQueuedFrames,
 		MaxQueuedControlFrames: defaultMaxQueuedControlFrames,
 		MaxQueuedControlBytes:  defaultMaxQueuedControlBytes,
 	}
@@ -87,6 +92,7 @@ var (
 	ErrTooManyStreams = errors.New("too many relay streams")
 	ErrWindowExceeded = errors.New("the agent sent beyond its credit window")
 	ErrControlFlood   = errors.New("the agent queued too many frames without credit on one stream")
+	ErrQueueLimit     = errors.New("the agent queued too many frames on one stream")
 	ErrStreamClosed   = errors.New("the relay stream closed")
 	ErrIdle           = errors.New("no byte received for the idle timeout")
 	ErrUnknownKind    = errors.New("unknown frame kind on a stream")
@@ -165,6 +171,22 @@ type Conn struct {
 	// which the writer reports the result of its send (see sendMeasured).
 	// The queue and the outFrame stay unchanged for every other sender.
 	writeWaiters sync.Map // *ownsandv1.DataFrame -> *confirmedWrite
+
+	windowUpdateWait atomic.Pointer[windowUpdateWaitProbe]
+}
+
+type windowUpdateWaitProbe struct {
+	streamID uint64
+	reached  chan struct{}
+}
+
+// WatchWindowUpdateWaitForTest signals the first window update for streamID
+// that needs to wait for an ordinary outbound slot. The fixture must keep
+// the queue full until its call ends.
+func (c *Conn) WatchWindowUpdateWaitForTest(streamID uint64) <-chan struct{} {
+	probe := &windowUpdateWaitProbe{streamID: streamID, reached: make(chan struct{})}
+	c.windowUpdateWait.Store(probe)
+	return probe.reached
 }
 
 // outFrame is a frame in the outbound queue. final marks a stream's final
@@ -189,6 +211,9 @@ func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits)
 func NewConnWithClock(parent context.Context, deviceID string, gen uint64, limits Limits, clk Clock) *Conn {
 	if clk == nil {
 		clk = newSystemClock()
+	}
+	if limits.MaxQueuedFrames <= 0 {
+		limits.MaxQueuedFrames = defaultMaxQueuedFrames
 	}
 	if limits.MaxQueuedControlFrames <= 0 {
 		limits.MaxQueuedControlFrames = defaultMaxQueuedControlFrames
@@ -560,11 +585,11 @@ type Stream struct {
 	recv      *datapath.ReceiveWindow
 	send      *datapath.SendWindow
 
-	acceptance streamAcceptance // guarded by conn.mu
-	mu         sync.Mutex
-	queue      []*ownsandv1.DataFrame
-	// controlFrames and controlBytes count the queued frames that carry no
-	// credit. The receive credit window bounds every other queued frame.
+	acceptance   streamAcceptance // guarded by conn.mu
+	mu           sync.Mutex
+	queue        []*ownsandv1.DataFrame
+	queuedFrames int // queued frames that consume credit
+	// controlFrames and controlBytes count the queued frames without credit.
 	controlFrames int
 	controlBytes  int64
 	notify        chan struct{}
@@ -665,14 +690,14 @@ func (s *Stream) SendMetered(ctx context.Context, f *ownsandv1.DataFrame, onWrit
 }
 
 // SendWriteRequest waits for the relay to queue the unary write request or
-// receive an agent error or session-end frame. The caller reads the terminal
-// frame with Next after this returns. The stream has one write request.
+// for the agent or the queue limit to end the stream. The caller reads the
+// result with Next after this returns. The stream has one write request.
 func (s *Stream) SendWriteRequest(ctx context.Context, f *ownsandv1.DataFrame, onWritten func(int64)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	s.mu.Lock()
-	if s.agentEnded {
+	if s.agentEnded || s.err == ErrQueueLimit {
 		s.mu.Unlock()
 		return nil
 	}
@@ -682,7 +707,7 @@ func (s *Stream) SendWriteRequest(ctx context.Context, f *ownsandv1.DataFrame, o
 	err := s.SendMetered(ctx, f, onWritten)
 	s.mu.Lock()
 	s.cancelWrite = nil
-	ended := s.agentEnded
+	ended := s.agentEnded || s.err == ErrQueueLimit
 	s.mu.Unlock()
 	if ended {
 		return nil
@@ -702,6 +727,12 @@ func (s *Stream) enqueueFrame(ctx context.Context, of outFrame) error {
 	c := s.conn
 	if s.isClosed() {
 		return ErrStreamClosed
+	}
+	if probe := c.windowUpdateWait.Load(); probe != nil &&
+		probe.streamID == s.ID && of.frame.GetRelayWindowUpdate() != nil &&
+		len(c.slots) == cap(c.slots) && ctx.Err() == nil && c.ctx.Err() == nil &&
+		c.windowUpdateWait.CompareAndSwap(probe, nil) {
+		close(probe.reached)
 	}
 	select {
 	case c.slots <- struct{}{}:
@@ -735,19 +766,44 @@ func (s *Stream) isClosed() bool {
 	return s.closed
 }
 
-// push queues a frame from the agent. Frames that consume credit are bounded
-// by the receive window. Frames that carry no credit bypass it, so push
-// bounds them by count and by bytes and returns ErrControlFlood beyond a
-// limit; dispatch then closes the connection, like a window violation. A
-// compliant agent sends one request accepted frame and one terminal frame
-// per stream, which never reaches the limits even when the handler is slow.
+// push queues a frame from the agent. For frames that consume credit, the
+// receive window bounds the encoded size and the queue limit bounds the
+// decoded message count. Exceeding the count ends only this stream. For
+// frames without credit, exceeding the count or byte limit returns
+// ErrControlFlood and ends the connection.
 func (s *Stream) push(f *ownsandv1.DataFrame) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return nil
 	}
-	if !datapath.ConsumesCredit(f.GetKind()) {
+	if datapath.ConsumesCredit(f.GetKind()) {
+		if s.queuedFrames >= s.conn.limits.MaxQueuedFrames {
+			queued, count := s.queue, s.queuedFrames
+			// Publish the error and drop the queue together so Next
+			// cannot deliver a frame from the discarded queue.
+			s.markClosedLocked()
+			if s.err == nil {
+				s.err = ErrQueueLimit
+			}
+			if s.cancelWrite != nil {
+				s.cancelWrite()
+			}
+			close(s.notify)
+			s.notify = make(chan struct{})
+			s.mu.Unlock()
+			s.finishClose(datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayStreamClose{}))
+			queuedBytes := 0
+			for _, frame := range queued {
+				queuedBytes += datapath.EncodedSize(frame)
+			}
+			slog.WarnContext(s.conn.ctx, "relay_stream_queue_limit",
+				slog.String("device_id", s.conn.DeviceID), slog.Uint64("stream_id", s.ID), slog.String("grant_id", s.GrantID),
+				slog.Int("queued_frames", count), slog.Int("queued_bytes", queuedBytes))
+			return nil
+		}
+		s.queuedFrames++
+	} else {
 		size := int64(datapath.EncodedSize(f))
 		if s.controlFrames+1 > s.conn.limits.MaxQueuedControlFrames || s.controlBytes+size > s.conn.limits.MaxQueuedControlBytes {
 			s.mu.Unlock()
@@ -792,7 +848,9 @@ func (s *Stream) Next(ctx context.Context, wake <-chan time.Time) (*ownsandv1.Da
 			f := s.queue[0]
 			s.queue[0] = nil
 			s.queue = s.queue[1:]
-			if !datapath.ConsumesCredit(f.GetKind()) {
+			if datapath.ConsumesCredit(f.GetKind()) {
+				s.queuedFrames--
+			} else {
 				s.controlFrames--
 				s.controlBytes -= int64(datapath.EncodedSize(f))
 			}
@@ -856,10 +914,20 @@ func (s *Stream) closeWith(final *ownsandv1.DataFrame) {
 		s.mu.Unlock()
 		return
 	}
+	s.markClosedLocked()
+	s.mu.Unlock()
+	s.finishClose(final)
+}
+
+func (s *Stream) markClosedLocked() {
 	s.closed = true
 	s.queue = nil
-	s.controlFrames, s.controlBytes = 0, 0
-	s.mu.Unlock()
+	s.queuedFrames, s.controlFrames, s.controlBytes = 0, 0, 0
+}
+
+// finishClose finalizes the close after the caller releases s.mu. The
+// connection's receive path can hold c.mu while checking if a stream closed.
+func (s *Stream) finishClose(final *ownsandv1.DataFrame) {
 	c := s.conn
 	c.mu.Lock()
 	if c.streams[s.ID] == s {

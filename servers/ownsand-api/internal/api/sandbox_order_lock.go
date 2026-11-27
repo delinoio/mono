@@ -61,9 +61,10 @@ func (e *orderLockError) Unwrap() error { return e.err }
 // not interleave: the resume checks that the billing mark still authorizes
 // it, sends the command and waits for the agent's result under the lock,
 // and the caller pause clears the mark and reads the sandbox state under the
-// same lock. A pause that starts while a resume is in flight therefore waits
-// until the resume result is reconciled. A resume that starts after a caller
-// pause took ownership finds the mark gone and sends nothing.
+// same lock. A pause that starts while the billing worker waits for a
+// resume result waits for the lock. The durable command ID still prevents
+// caller adoption if the result is unresolved when the lock is released.
+// A resume that starts after a caller pause took ownership finds no mark.
 //
 // The callback can use the connection that holds the lock for a short
 // transaction. When the lock cannot be released, the connection is closed
