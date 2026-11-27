@@ -767,7 +767,14 @@ describe("keyboard scrolling in tables", () => {
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${GLOBEX}`);
 
+    await expect(screen.getByRole("status", "Queue updates")).toContainText(
+      "Live",
+    );
     await expect(screen.getByText("No request is waiting")).toBeVisible();
+    await expect(screen.getByRole("status", "Loading the queue")).toBeHidden();
+    await expect(
+      screen.getByRole("status", "Loading the runners"),
+    ).toBeHidden();
     await expect(
       screen.getByText("OwnSand link required", { exact: true }),
     ).toBeVisible();

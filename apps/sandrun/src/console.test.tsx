@@ -3195,6 +3195,100 @@ describe("overview", () => {
   });
 
   test.each([false, true])(
+    "recovers from a terminal error before the first snapshot (partial data: %s)",
+    async (withPartialData) => {
+      let failStream!: () => void;
+      const streamFailure = new Promise<void>((resolve) => {
+        failStream = resolve;
+      });
+      let completeSnapshot!: () => void;
+      const replacementSnapshot = new Promise<void>((resolve) => {
+        completeSnapshot = resolve;
+      });
+      let streams = 0;
+      const queue = createRouterTransport((router) => {
+        router.service(WorkService, {
+          async *watchQueue(): AsyncGenerator<
+            MessageInitShape<typeof WatchQueueResponseSchema>
+          > {
+            if (++streams === 1) {
+              if (withPartialData) {
+                yield {
+                  event: {
+                    case: "request",
+                    value: { requestId: "partial", state: RequestState.QUEUED },
+                  },
+                };
+                yield {
+                  event: {
+                    case: "runner",
+                    value: { runnerId: "partial", state: RunnerState.WARM },
+                  },
+                };
+              }
+              await streamFailure;
+              throw new ConnectError("internal error", Code.Internal);
+            }
+            await replacementSnapshot;
+            yield { event: { case: "snapshotComplete", value: {} } };
+          },
+        });
+      });
+      const mock = createMockTransport();
+      const transport: Transport = {
+        ...mock,
+        stream: (method, ...rest) =>
+          (method.name === "WatchQueue" ? queue : mock).stream(method, ...rest),
+      };
+      renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
+
+      const status = within(
+        await screen.findByRole("status", { name: "Queue updates" }),
+      );
+      const queueLoading = { name: "Loading the queue" };
+      const runnersLoading = { name: "Loading the runners" };
+      expect(status.getByText("Connecting")).toBeTruthy();
+      expect(screen.getByRole("status", queueLoading)).toBeTruthy();
+      expect(screen.getByRole("status", runnersLoading)).toBeTruthy();
+      expect(
+        screen.queryByRole("region", { name: "Waiting requests table" }),
+      ).toBeNull();
+
+      await act(async () => failStream());
+      const disconnected = await status.findByText("Disconnected");
+      expect(disconnected.getAttribute("data-variant")).toBe("neutral");
+      const errorMessage = "Something went wrong. Try again.";
+      expect(screen.getByText(errorMessage)).toBeTruthy();
+      const retry = screen.getByRole("button", { name: "Try again" });
+      expect(screen.queryByRole("status", queueLoading)).toBeNull();
+      expect(screen.queryByRole("status", runnersLoading)).toBeNull();
+      expect(
+        screen.queryByRole("region", { name: "Waiting requests table" }),
+      ).toBeNull();
+      expect(screen.queryByText("No request is waiting")).toBeNull();
+      expect(screen.queryByText("Warm", { selector: "dt" })).toBeNull();
+      expect(streams).toBe(1);
+
+      await click(retry);
+      expect(streams).toBe(2);
+      expect(status.getByText("Connecting")).toBeTruthy();
+      expect(screen.getByRole("status", queueLoading)).toBeTruthy();
+      expect(screen.getByRole("status", runnersLoading)).toBeTruthy();
+      expect(screen.queryByText(errorMessage)).toBeNull();
+
+      await act(async () => completeSnapshot());
+      expect(status.getByText("Live").getAttribute("data-variant")).toBe(
+        "accent",
+      );
+      expect(screen.getByText("No request is waiting")).toBeTruthy();
+      expect(
+        screen.getByText("Warm", { selector: "dt" }).nextElementSibling
+          ?.textContent,
+      ).toBe("0");
+    },
+  );
+
+  test.each([false, true])(
     "keeps the last snapshot after a terminal stream error (after an automatic reconnect: %s)",
     async (afterReconnect) => {
       let failStream!: () => void;
@@ -3720,43 +3814,6 @@ describe("table scroll regions without data", () => {
       expect(screen.queryByRole("region", { name })).toBeNull();
     },
   );
-
-  test("omits the waiting requests region when the first queue snapshot fails", async () => {
-    let failStream!: () => void;
-    const streamFailure = new Promise<void>((resolve) => {
-      failStream = resolve;
-    });
-    const queue = createRouterTransport((router) => {
-      router.service(WorkService, {
-        async *watchQueue() {
-          await streamFailure;
-          throw new ConnectError("Queue failed", Code.Internal);
-        },
-      });
-    });
-    const mock = createMockTransport();
-    const transport: Transport = {
-      ...mock,
-      stream: (method, ...args) =>
-        (method.name === "WatchQueue" ? queue : mock).stream(method, ...args),
-    };
-    renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
-
-    const name = "Waiting requests table";
-    expect(
-      await screen.findByRole("status", { name: "Loading the queue" }),
-    ).toBeTruthy();
-    expect(screen.queryByRole("region", { name })).toBeNull();
-
-    await act(async () => failStream());
-    expect(
-      await screen.findByRole("button", { name: "Try again" }),
-    ).toBeTruthy();
-    expect(
-      screen.getByRole("status", { name: "Loading the queue" }),
-    ).toBeTruthy();
-    expect(screen.queryByRole("region", { name })).toBeNull();
-  });
 });
 
 describe("audit", () => {

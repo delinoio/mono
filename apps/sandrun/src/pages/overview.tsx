@@ -151,7 +151,7 @@ export function OverviewPage() {
         <RunnerProfileNotice query={profiles} />
         {view.live === LiveState.Connecting ? (
           <Loading label="Loading the queue" />
-        ) : waiting.length === 0 ? (
+        ) : !view.hasSnapshot ? null : waiting.length === 0 ? (
           <Empty title="No request is waiting">
             New GitHub jobs, agent sessions and dev sessions appear here in
             queue order.
@@ -195,7 +195,7 @@ export function OverviewPage() {
             </table>
           </div>
         )}
-        {running.length > 0 ? (
+        {view.hasSnapshot && running.length > 0 ? (
           <p className="muted">
             {running.length}{" "}
             {running.length === 1 ? "request is" : "requests are"} starting or
@@ -207,7 +207,7 @@ export function OverviewPage() {
         <h2 id="runners-title">Runners by state</h2>
         {view.live === LiveState.Connecting ? (
           <Loading label="Loading the runners" />
-        ) : (
+        ) : view.hasSnapshot ? (
           <dl className="details details-flat">
             {runnersByState.map(({ state, runners }) => (
               <div className="detail" key={state}>
@@ -216,7 +216,7 @@ export function OverviewPage() {
               </div>
             ))}
           </dl>
-        )}
+        ) : null}
       </section>
       <section className="section" aria-labelledby="devices-title">
         <h2 id="devices-title">Device pool</h2>

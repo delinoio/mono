@@ -625,11 +625,25 @@ describe("queue view", () => {
     expect(view.requests.size).toBe(0);
   });
 
-  test("keeps the loading state when the stream fails before the first snapshot", () => {
-    const view = initialQueueView();
-    expect(
-      applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed }),
-    ).toBe(view);
+  test("discards an incomplete first snapshot when the stream fails", () => {
+    let view = applyQueueEvent(initialQueueView(), {
+      kind: WatchQueueEventKind.Request,
+      request: request("partial", RequestState.QUEUED),
+    });
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed });
+    expect(view.live).toBe(LiveState.Disconnected);
+    expect(view.hasSnapshot).toBe(false);
+    expect(view.pending).toBeUndefined();
+    expect(view.requests.size).toBe(0);
+
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.Restart });
+    expect(view.live).toBe(LiveState.Connecting);
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    expect(view.live).toBe(LiveState.Live);
+    expect(view.hasSnapshot).toBe(true);
+    expect(view.requests.size).toBe(0);
   });
 
   test("keeps the last state across a gap and replaces it with the new snapshot", () => {
