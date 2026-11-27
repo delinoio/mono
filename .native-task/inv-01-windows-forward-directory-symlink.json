@@ -1,0 +1,61 @@
+{
+  "gid": "inv-01-windows-forward-directory-symlink",
+  "commit": "530907e23fb4602305c67cbb3e22b1ab5802e1c6",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "530907e23fb4602305c67cbb3e22b1ab5802e1c6",
+    "setup": "Use PowerShell at the root of a clean checkout containing the worker commit. Record the actual revision. On a volume and account that permit os.Root.Symlink, run the commands below. Copy the standalone Go CLI probe to its listed path after creating the validation directory. Run the denied commands in a separate session with a writable checkout and an account or volume where os.Root.Symlink is denied. Copy the same probe there.",
+    "commands": [
+      "git rev-parse HEAD",
+      "New-Item -ItemType Directory -Force .t3-tmp/symlink-validation | Out-Null",
+      "$validationDir = (Resolve-Path .t3-tmp/symlink-validation).Path",
+      "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+      "$env:SANDRUN_TEST_SYMLINKS = 'required'",
+      "go test -count=1 -v ./go/sandrun -run '^(TestDownloadArchiveSymlinks|TestExtractArchiveDirectorySymlinkRepairFailure|TestExtractRejectsPathTraversal)$' 2>&1 | Tee-Object \"$validationDir/windows-enabled-tests.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go test -count=1 ./go/sandrun/... 2>&1 | Tee-Object \"$validationDir/windows-sdk-tests.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go build -o \"$validationDir/sandrun.exe\" ./cmds/sandrun; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go version -m \"$validationDir/sandrun.exe\" | Select-String \"vcs.revision|vcs.modified\"",
+      "go run \"$validationDir/verify-download-cli.go\" \"$validationDir/sandrun.exe\" 2>&1 | Tee-Object \"$validationDir/windows-enabled-cli.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "deniedCommands": [
+      "git rev-parse HEAD",
+      "New-Item -ItemType Directory -Force .t3-tmp/symlink-validation | Out-Null",
+      "$validationDir = (Resolve-Path .t3-tmp/symlink-validation).Path",
+      "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+      "$env:SANDRUN_TEST_SYMLINKS = 'denied'",
+      "go test -count=1 -v ./go/sandrun -run '^TestDownloadArchiveSymlinkDenied$' 2>&1 | Tee-Object \"$validationDir/windows-denied-tests.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go build -o \"$validationDir/sandrun.exe\" ./cmds/sandrun; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go run \"$validationDir/verify-download-cli.go\" \"$validationDir/sandrun.exe\" denied 2>&1 | Tee-Object \"$validationDir/windows-denied-cli.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The directory symlink probe succeeds in the enabled session. The focused test, correction-failure test, traversal test and SandRun SDK suite pass.",
+      "The CLI build records the tested checkout revision with vcs.modified=false. The enabled CLI exits 0 and logs forward and backward cases with 2 files and 1 byte each, and the chain case with 7 writes and 3 bytes. All three preserve relative link text and return x through the link paths. The replacement is a regular file with xx and the dangling target stays missing.",
+      "The injected correction failure removes link, warns with its path and counts the one remaining file and byte.",
+      "Under denial, the os.Root.Symlink probe reports failure, the denied test and CLI exit 0, dir/file.txt remains readable with x, link is absent and the result reports 1 file, 1 byte and 'link: the symbolic link could not be created'."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-forward-directory-symlink/worker/.t3-tmp/verify-download-cli.go",
+      "copyTo": ".t3-tmp/symlink-validation/verify-download-cli.go",
+      "regressionTests": [
+        "go/sandrun/download_symlink_test.go",
+        "go/sandrun/archive_windows_test.go",
+        "go/sandrun/sync_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/symlink-validation/windows-enabled-tests.log",
+        ".t3-tmp/symlink-validation/windows-sdk-tests.log",
+        ".t3-tmp/symlink-validation/windows-enabled-cli.log",
+        ".t3-tmp/symlink-validation/windows-denied-tests.log",
+        ".t3-tmp/symlink-validation/windows-denied-cli.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-forward-directory-symlink/worker/.t3-tmp/sandrun-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-forward-directory-symlink/worker/.t3-tmp/sandrun-windows-go1.26.1-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-01-windows-forward-directory-symlink/worker/.t3-tmp/sandrun-windows-amd64.exe"
+      ]
+    }
+  }
+}
