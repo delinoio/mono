@@ -1813,6 +1813,13 @@ describe("Tabs", () => {
 });
 
 describe("Tooltip", () => {
+  // happy-dom does not compute layout. Check the authored wrapping rule.
+  test("allows long unbroken text to wrap inside the tooltip width", () => {
+    const tooltip = block(".dui-tooltip");
+    expect(tooltip).toContain("max-width: 280px");
+    expect(tooltip).toContain("overflow-wrap: anywhere");
+  });
+
   test("describes its trigger with hidden content", () => {
     render(
       <Tooltip>
