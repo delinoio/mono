@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"syscall"
@@ -55,13 +56,7 @@ func signalGroupID(pgid int, sig syscall.Signal) error {
 // `ps -A -o pid=,ppid=,pgid=` lists the same columns on Linux (procps) and
 // macOS.
 func descendantGroups(ctx context.Context, rootPID int) ([]int, error) {
-	ctx, cancel := context.WithTimeout(ctx, psTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "ps", "-A", "-o", "pid=,ppid=,pgid=").Output()
-	if err != nil {
-		return nil, fmt.Errorf("ps: %w", err)
-	}
-	procs, err := parseProcessList(out)
+	procs, err := listProcesses(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -74,18 +69,90 @@ func descendantGroups(ctx context.Context, rootPID int) ([]int, error) {
 	return groupsBelow(procs, rootPID, exclude), nil
 }
 
-// helperStopped reports whether the process pid is stopped (by SIGSTOP) or
+func listProcesses(ctx context.Context) ([]process, error) {
+	ctx, cancel := context.WithTimeout(ctx, psTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-A", "-o", "pid=,ppid=,pgid=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("ps: %w", err)
+	}
+	return parseProcessList(out)
+}
+
+func workerGroupsStopped(ctx context.Context, groups map[int]bool, observe func(context.Context, int) (bool, error)) (bool, error) {
+	if len(groups) == 0 {
+		return true, nil
+	}
+	procs, err := listProcesses(ctx)
+	if err != nil {
+		return false, err
+	}
+	confirmed := make(map[int]int)
+	for _, p := range procs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if !groups[p.pgid] {
+			continue
+		}
+		member, err := p.stillInGroup()
+		if err != nil {
+			return false, err
+		}
+		if !member {
+			continue
+		}
+		stopped, err := observe(ctx, p.pid)
+		if err != nil {
+			return false, fmt.Errorf("observe worker PID %d in group %d: %w", p.pid, p.pgid, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if !stopped {
+			member, err := p.stillInGroup()
+			if err != nil || !member {
+				return false, err
+			}
+			// A child forked after the first signal can still be running
+			// in a discovered group. Send the stop again to reach it.
+			if err := signalGroupID(p.pgid, sigStop); err != nil {
+				return false, fmt.Errorf("stop exec worker group %d again: %w", p.pgid, err)
+			}
+			return false, nil
+		}
+		confirmed[p.pid] = p.pgid
+	}
+
+	// A member could fork after the first listing and before we observed it
+	// stop. Check for members that did not appear in the confirmed set.
+	procs, err = listProcesses(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range procs {
+		if !groups[p.pgid] || confirmed[p.pid] == p.pgid {
+			continue
+		}
+		member, err := p.stillInGroup()
+		if err != nil || member {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// processStopped reports whether the process pid is stopped (by SIGSTOP) or
 // dead, so that it starts no further child. A process that no longer exists
 // counts as stopped.
 //
-// On Linux it reads the state of every thread of the process from /proc: the
-// helper is multi-threaded, and a group stop is complete only when every
-// thread stopped, although the main thread can report the stop first. On
-// macOS, and on a Linux host without a readable /proc, it reads the state of
-// the process from `ps`. ctx bounds the `ps` command.
-func helperStopped(ctx context.Context, pid int) (bool, error) {
+// On Linux it reads the state of every thread from /proc. The main thread
+// can report the stop before other threads stop. On macOS, and on Linux
+// without a readable /proc, it reads the process state from `ps`. ctx bounds
+// the `ps` command.
+func processStopped(ctx context.Context, pid int) (bool, error) {
 	if runtime.GOOS == "linux" {
-		if stopped, err := procThreadsStopped(pid); err == nil {
+		if stopped, err := procThreadsStopped(ctx, pid); err == nil {
 			return stopped, nil
 		} else if !errors.Is(err, errProcUnavailable) {
 			return false, err
@@ -99,7 +166,7 @@ var errProcUnavailable = errors.New("/proc is unavailable")
 
 // procThreadsStopped reports whether every thread of pid is stopped or dead
 // according to /proc. A process that does not exist is stopped.
-func procThreadsStopped(pid int) (bool, error) {
+func procThreadsStopped(ctx context.Context, pid int) (bool, error) {
 	if _, err := os.Stat("/proc/self/stat"); err != nil {
 		return false, errProcUnavailable
 	}
@@ -112,6 +179,9 @@ func procThreadsStopped(pid int) (bool, error) {
 		return false, fmt.Errorf("read %s: %w", taskDir, err)
 	}
 	for _, tid := range tids {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		data, err := os.ReadFile(taskDir + "/" + tid.Name() + "/stat")
 		if errors.Is(err, os.ErrNotExist) {
 			// The thread ended between the listing and the read.
@@ -128,7 +198,17 @@ func procThreadsStopped(pid int) (bool, error) {
 			return false, nil
 		}
 	}
-	return true, nil
+	// A thread can start after the first listing and before its parent stops.
+	current, err := os.ReadDir(taskDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", taskDir, err)
+	}
+	return slices.EqualFunc(tids, current, func(a, b os.DirEntry) bool {
+		return a.Name() == b.Name()
+	}), nil
 }
 
 // parseProcStatState returns the state letter of the contents of
@@ -184,6 +264,18 @@ func psStopped(ctx context.Context, pid int) (bool, error) {
 
 // process is one row of the process listing.
 type process struct{ pid, ppid, pgid int }
+
+// stillInGroup verifies membership after the process listing.
+func (p process) stillInGroup() (bool, error) {
+	pgid, err := syscall.Getpgid(p.pid)
+	if errors.Is(err, syscall.ESRCH) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get process group of PID %d: %w", p.pid, err)
+	}
+	return pgid == p.pgid, nil
+}
 
 // parseProcessList parses the output of `ps -A -o pid=,ppid=,pgid=`: three
 // integer columns per line. A malformed line is an error, so that a changed

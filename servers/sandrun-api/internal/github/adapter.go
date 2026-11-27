@@ -21,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/githubapi"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/profile"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/work"
 )
 
@@ -85,10 +86,7 @@ func (a *Adapter) Start(ctx context.Context, g *work.Guest) (work.StartResult, e
 	if !l.Configured() {
 		return work.StartResult{}, errors.New("the GitHub App is not configured")
 	}
-	if g.Profile == nil {
-		return work.StartResult{}, errors.New("the runner profile was deleted")
-	}
-	jit, err := l.startRegistration(ctx, r, g.Profile.GitHubLabel())
+	jit, err := l.startRegistration(ctx, r)
 	if err != nil {
 		return work.StartResult{}, err
 	}
@@ -128,7 +126,7 @@ var errDeletedWhileStarting = errors.New("the runner was deleted while it starte
 
 // startRegistration holds a share lock on the installation until it publishes
 // the runner ID. Unlink holds the exclusive lock before reading runner IDs.
-func (l *Layer) startRegistration(ctx context.Context, r *work.Runner, label string) (*githubapi.JITConfig, error) {
+func (l *Layer) startRegistration(ctx context.Context, r *work.Runner) (*githubapi.JITConfig, error) {
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	inst, err := l.poolInstallation(ctx, l.svc.DB.Pool, r.OrganizationID, r.PoolKey)
@@ -139,10 +137,8 @@ func (l *Layer) startRegistration(ctx context.Context, r *work.Runner, label str
 	if inst == nil || !inst.Active() {
 		return nil, unavailable
 	}
-	// Keep the placeholder's foreign-key locks out of the JIT transaction.
-	// A retry must keep the previous ID visible until its replacement commits.
-	if _, err := l.svc.DB.Pool.Exec(ctx, `INSERT INTO github_runners (runner_id, organization_id, github_installation_id, github_label) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (runner_id) DO NOTHING`, r.ID, r.OrganizationID, inst.GitHubID, label); err != nil {
+	label, err := l.publishRegistrationLabel(ctx, r, inst.GitHubID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -208,6 +204,39 @@ func (l *Layer) startRegistration(ctx context.Context, r *work.Runner, label str
 	return jit, nil
 }
 
+// publishRegistrationLabel serializes the label read and write with profile
+// updates. A rename that follows this commit can see the old label while
+// the GitHub request is still in flight.
+func (l *Layer) publishRegistrationLabel(ctx context.Context, r *work.Runner, installationID int64) (string, error) {
+	var label string
+	err := l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if err := api.LockOrganizationShare(ctx, tx, r.OrganizationID); err != nil {
+			return err
+		}
+		if err := profile.LockShare(ctx, tx, r.OrganizationID, r.ProfileID); err != nil {
+			return err
+		}
+		p, err := l.profiles.Get(ctx, tx, r.OrganizationID, r.ProfileID)
+		if err != nil {
+			return err
+		}
+		starting, err := lockRunnerForRegistration(ctx, tx, r.ID)
+		if err != nil {
+			return err
+		}
+		if !starting {
+			return errDeletedWhileStarting
+		}
+		label = p.GitHubLabel()
+		// A retry keeps the previous ID visible to cleanup until the new
+		// registration commits.
+		_, err = tx.Exec(ctx, `INSERT INTO github_runners (runner_id, organization_id, github_installation_id, github_label) VALUES ($1, $2, $3, $4)
+			ON CONFLICT (runner_id) DO UPDATE SET github_label = EXCLUDED.github_label`, r.ID, r.OrganizationID, installationID, label)
+		return err
+	})
+	return label, err
+}
+
 func (l *Layer) generateJITConfig(ctx context.Context, inst *Installation, runnerID, label string) (*githubapi.JITConfig, error) {
 	name := RunnerNamePrefix + runnerID
 	labels := []string{label}
@@ -233,12 +262,18 @@ func (l *Layer) generateJITConfig(ctx context.Context, inst *Installation, runne
 // removal. If deletion has already started, the caller removes the late
 // registration and skips starting the runner program.
 func recordRegistration(ctx context.Context, tx pgx.Tx, runnerID, label string, githubRunnerID int64) (bool, error) {
-	var state int16
-	if err := tx.QueryRow(ctx, "SELECT state FROM runners WHERE runner_id = $1 FOR UPDATE", runnerID).Scan(&state); err != nil {
+	starting, err := lockRunnerForRegistration(ctx, tx, runnerID)
+	if err != nil {
 		return false, err
 	}
-	if _, err := tx.Exec(ctx, "UPDATE github_runners SET github_runner_id = $2, github_label = $3, registration_removed = false WHERE runner_id = $1",
-		runnerID, githubRunnerID, label); err != nil {
+	_, err = tx.Exec(ctx, "UPDATE github_runners SET github_runner_id = $2, github_label = $3, registration_removed = false WHERE runner_id = $1",
+		runnerID, githubRunnerID, label)
+	return starting, err
+}
+
+func lockRunnerForRegistration(ctx context.Context, tx pgx.Tx, runnerID string) (bool, error) {
+	var state int16
+	if err := tx.QueryRow(ctx, "SELECT state FROM runners WHERE runner_id = $1 FOR UPDATE", runnerID).Scan(&state); err != nil {
 		return false, err
 	}
 	s := sandrunv1.RunnerState(state)

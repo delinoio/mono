@@ -20,6 +20,7 @@ import (
 	"time"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"golang.org/x/sys/unix"
 )
 
 // helperEnv makes the test binary act as a long-running stand-in for
@@ -713,14 +714,49 @@ func processAlive(pid int) bool {
 	return !strings.Contains(string(raw[strings.LastIndexByte(string(raw), ')'):]), " Z ")
 }
 
+func requireOrphanCleanupPrerequisites(t *testing.T) {
+	t.Helper()
+	checkProcAccess := func(operation, path string, err error) {
+		t.Helper()
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+			t.Skipf("cannot %s %s: %v", operation, path, err)
+		}
+		if err != nil {
+			t.Fatalf("probe: cannot %s %s: %v", operation, path, err)
+		}
+	}
+
+	pid := os.Getpid()
+	procDir := filepath.Join("/proc", strconv.Itoa(pid))
+	for _, path := range []string{
+		"/proc/sys/kernel/random/boot_id",
+		filepath.Join(procDir, "stat"),
+		filepath.Join(procDir, "cmdline"),
+	} {
+		_, err := os.ReadFile(path)
+		checkProcAccess("read", path, err)
+	}
+	_, err := os.ReadDir("/proc")
+	checkProcAccess("enumerate", "/proc", err)
+
+	fd, err := unix.PidfdOpen(pid, 0)
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, os.ErrPermission) {
+		t.Skipf("pidfd_open unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("probe pidfd_open: %v", err)
+	}
+	if err := unix.Close(fd); err != nil {
+		t.Fatalf("close probe pidfd: %v", err)
+	}
+}
+
 // Against real processes and the live /proc: a launch record written like
 // startProcess writes it proves a stand-in firecracker, Running reports it
 // and Delete kills it through its pidfd and waits for the exit, while a
 // process that merely carries the same --id convention stays untouched.
 func TestRealProcessOrphanCleanup(t *testing.T) {
-	if _, err := os.Stat("/proc/self/stat"); err != nil {
-		t.Skip("no /proc")
-	}
+	requireOrphanCleanupPrerequisites(t)
 	bin := helperBinary(t)
 	vms := t.TempDir()
 	r, err := newRuntime(Options{Binary: bin, VMsDir: vms, Logger: quiet()}, func() error { return nil })
@@ -735,13 +771,13 @@ func TestRealProcessOrphanCleanup(t *testing.T) {
 	owned := startHelper(t, bin, filepath.Join(vms, "owned"), "owned")
 	foreign := startHelper(t, bin, filepath.Join(vms, "foreign"), "foreign") // no launch record
 	if err := writeLaunchRecord(r.host, filepath.Join(vms, "owned"), "owned", owned.Process.Pid); err != nil {
-		t.Skipf("pidfd or /proc unavailable: %v", err)
+		t.Fatalf("write owned launch record: %v", err)
 	}
-	if p, reason, err := verifyLaunch(r.host, filepath.Join(vms, "owned"), "owned"); p == nil {
-		t.Skipf("process not verifiable here (%q %v)", reason, err)
-	} else {
-		p.handle.close()
+	p, reason, err := verifyLaunch(r.host, filepath.Join(vms, "owned"), "owned")
+	if p == nil {
+		t.Fatalf("verify owned launch record: reason %q, error %v", reason, err)
 	}
+	p.handle.close()
 	ids, err := r.Running(context.Background())
 	if err != nil {
 		t.Fatalf("Running: %v (ids %v)", err, ids)

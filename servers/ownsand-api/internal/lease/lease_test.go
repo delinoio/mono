@@ -266,6 +266,11 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 		renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
 	b := &Lease{DB: database, InstanceID: "b", DeadlineNow: clock.Now, Logger: logger}
 
+	type acquisitionResult struct {
+		held bool
+		err  error
+	}
+	firstAcquisition := make(chan acquisitionResult, 1)
 	var calls atomic.Int32
 	blocked := make(chan struct{})
 	unblock := make(chan struct{})
@@ -273,7 +278,9 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	a.renew = func(ctx context.Context) (bool, error) {
 		switch calls.Add(1) {
 		case 1:
-			return a.TryAcquire(ctx)
+			held, err := a.TryAcquire(ctx)
+			firstAcquisition <- acquisitionResult{held: held, err: err}
+			return held, err
 		case 2:
 			// A renewal that does not return and ignores its context.
 			close(blocked)
@@ -289,17 +296,31 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); a.Run(ctx) }()
 	var once sync.Once
 	release := func() { once.Do(func() { close(unblock) }) }
 	t.Cleanup(func() {
-		release()
 		cancel()
+		release()
 		<-done
 	})
 
-	if err := a.Wait(ctx); err != nil {
-		t.Fatal(err)
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelStartup()
+	go func() { defer close(done); a.Run(ctx) }()
+
+	select {
+	case result := <-firstAcquisition:
+		if result.err != nil {
+			t.Fatalf("first lease acquisition failed: %v", result.err)
+		}
+		if !result.held {
+			t.Fatal("first lease acquisition was refused")
+		}
+	case <-startupCtx.Done():
+		t.Fatalf("timed out waiting for the first lease acquisition: %v", startupCtx.Err())
+	}
+	if err := a.Wait(startupCtx); err != nil {
+		t.Fatalf("timed out waiting for local lease ownership: %v", err)
 	}
 	<-blocked
 	if !a.Held() {

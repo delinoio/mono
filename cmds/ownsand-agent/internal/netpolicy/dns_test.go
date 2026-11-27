@@ -842,16 +842,16 @@ func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
 	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
 	hook, paused, resume := pauseAfterAdmit()
 	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, afterAdmit: hook})
-	// Release the hook before Close: Close waits for serveTCP, which stays
-	// blocked in the hook until resume runs, so a t.Fatal between "paused" and
-	// the explicit resume would otherwise hang the test in Close.
+	var done <-chan struct{}
 	defer func() {
+		// Close waits for serveTCP, so release the hook even on failure.
 		resume()
-		f.Close()
+		if done == nil {
+			f.Close()
+		}
 	}()
 
-	// The only slot is held by the paused connection; a second connection is
-	// refused at capacity and does not disturb the paused one.
+	// The paused connection holds the only TCP slot.
 	first, err := net.Dial("tcp", f.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -862,15 +862,18 @@ func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("serveTCP did not admit the connection")
 	}
-	// serveTCP is paused, so it does not even accept the second connection;
-	// it waits in the kernel queue until the loop resumes and refuses it.
+	// The second connection stays in the listener's queue until shutdown.
 	second, err := net.Dial("tcp", f.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	done := closeInBackground(f)
-	time.Sleep(50 * time.Millisecond)
+	done = closeInBackground(f)
+	select {
+	case <-f.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not start")
+	}
 	resume()
 	select {
 	case <-done:

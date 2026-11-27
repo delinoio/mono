@@ -54,7 +54,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 tmp="$stage/$out_name"
 curl -fsSL -o "$tmp" "$url"
-echo "$sha256  $tmp" | sha256sum -c --quiet -
+# Hash standard input so a newline in the path cannot affect verification.
+if ! checksum="$(sha256sum < "$tmp")" || [ "${checksum%% *}" != "$sha256" ]; then
+  echo "could not verify the downloaded kernel against SHA-256 $sha256" >&2
+  exit 1
+fi
 chmod 0644 "$tmp"
 
 # Let mv append the basename to the parent directory. The rename then fails
