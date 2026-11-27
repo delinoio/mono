@@ -4,6 +4,9 @@
 
 package sandruntest
 
-import "os/exec"
+import (
+	"context"
+	"os/exec"
+)
 
-func configureExecCommand(*exec.Cmd) {}
+func configureExecCommand(context.Context, *exec.Cmd) {}

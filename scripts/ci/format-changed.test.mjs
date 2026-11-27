@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { delimiter, dirname, join } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
@@ -50,6 +50,33 @@ function writeFormatterScripts(write) {
   }
 }
 
+function formatterEnvironment(parentEnv, platform = process.platform) {
+  // Isolation removes LEFTHOOK_BIN along with every other LEFTHOOK* variable.
+  const env = isolateGitEnvironment({ ...parentEnv }, platform);
+  env.LEFTHOOK_BIN = lefthook;
+  delete env.CI;
+  delete env.TURBO_SCM_BASE;
+  delete env.TURBO_SCM_HEAD;
+  let inheritedPath = env.PATH;
+  if (platform === "win32") {
+    // Node passes the first case-insensitive match in lexical order on Windows.
+    const keys = Object.keys(env)
+      .filter((name) => name.toUpperCase() === "PATH")
+      .sort();
+    inheritedPath = env[keys[0] ?? "PATH"];
+    for (const key of keys) {
+      delete env[key];
+    }
+  }
+  const { delimiter } = platform === "win32" ? win32 : posix;
+  env.PATH = [
+    dirname(process.execPath),
+    join(root, "node_modules/.bin"),
+    inheritedPath,
+  ].join(delimiter);
+  return env;
+}
+
 function fixture(
   t,
   initialCommit = true,
@@ -74,18 +101,7 @@ function fixture(
     cwd = join(parent, directoryName);
     mkdirSync(cwd);
   }
-  // Set LEFTHOOK_BIN after isolation: the helper removes every LEFTHOOK*
-  // variable from the inherited environment, including a caller-provided one.
-  const env = isolateGitEnvironment({ ...parentEnv });
-  env.LEFTHOOK_BIN = lefthook;
-  delete env.CI;
-  delete env.TURBO_SCM_BASE;
-  delete env.TURBO_SCM_HEAD;
-  env.PATH = [
-    dirname(process.execPath),
-    join(root, "node_modules/.bin"),
-    env.PATH,
-  ].join(delimiter);
+  const env = formatterEnvironment(parentEnv);
   const git = (...args) =>
     execFileSync("git", args, { cwd, env, encoding: "utf8" }).trim();
   git("init", "--quiet");
@@ -136,6 +152,46 @@ function outsideDirectory(t, fileName = "b.ts") {
   writeFileSync(join(outside, fileName), outsideSource);
   return outside;
 }
+
+test("fixture preserves inherited search directories for Windows PATH spellings", () => {
+  const inheritedPath = "C:\\first;D:\\second";
+  const expectedPath = [
+    dirname(process.execPath),
+    join(root, "node_modules/.bin"),
+    inheritedPath,
+  ].join(";");
+  for (const parentEnv of [
+    { PATH: inheritedPath },
+    { Path: inheritedPath },
+    { pAtH: inheritedPath },
+    { Path: "C:\\ignored", PATH: inheritedPath },
+    { Path: "C:\\ignored", PaTh: inheritedPath },
+  ]) {
+    const env = formatterEnvironment(parentEnv, "win32");
+    assert.deepEqual(
+      Object.keys(env).filter((name) => name.toUpperCase() === "PATH"),
+      ["PATH"],
+    );
+    assert.equal(env.PATH, expectedPath);
+  }
+});
+
+test("fixture uses case-sensitive PATH handling on Unix", () => {
+  const inheritedPath = "/first:/second";
+  const env = formatterEnvironment(
+    { Path: "/separate", PATH: inheritedPath },
+    "linux",
+  );
+  assert.equal(env.Path, "/separate");
+  assert.equal(
+    env.PATH,
+    [
+      dirname(process.execPath),
+      join(root, "node_modules/.bin"),
+      inheritedPath,
+    ].join(":"),
+  );
+});
 
 test("fixture ignores hostile global Git configuration and GIT_* variables", (t) => {
   const hostile = mkdtempSync(join(tmpdir(), "rstack-hostile-"));

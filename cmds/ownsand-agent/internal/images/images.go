@@ -119,17 +119,28 @@ func invalidDir(dir string) string { return dir + ".invalid" }
 // interruption between the two renames of Install.
 var rename = os.Rename
 
-// requiredFiles returns the files, besides image.json, that a complete image
-// of the guest OS holds. It is nil for a guest OS with no locally built
-// image.
-func requiredFiles(os ownsandv1.GuestOs) []string {
-	switch os {
-	case ownsandv1.GuestOs_GUEST_OS_MACOS:
-		return []string{MacOSDisk, MacOSAuxStorage, MacOSHardwareModel}
-	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
-		return []string{WindowsDisk}
+// MacOSStorage checks that the installed disk and auxiliary storage are
+// regular files at their expected names. It returns the disk's file info
+// so create can also check its logical size.
+func MacOSStorage(dir string) (os.FileInfo, error) {
+	regularFile := func(name string) (os.FileInfo, error) {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is not a regular file", name)
+		}
+		return info, nil
 	}
-	return nil
+	disk, err := regularFile(MacOSDisk)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := regularFile(MacOSAuxStorage); err != nil {
+		return nil, err
+	}
+	return disk, nil
 }
 
 // Complete reports whether dir holds a complete locally built image: a
@@ -141,16 +152,20 @@ func Complete(dir string) bool {
 	if err != nil {
 		return false
 	}
-	files := requiredFiles(m.GuestOS)
-	if files == nil {
-		return false
-	}
-	for _, name := range files {
-		if st, err := os.Stat(filepath.Join(dir, name)); err != nil || !st.Mode().IsRegular() {
+	var name string
+	switch m.GuestOS {
+	case ownsandv1.GuestOs_GUEST_OS_MACOS:
+		if _, err := MacOSStorage(dir); err != nil {
 			return false
 		}
+		name = MacOSHardwareModel
+	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
+		name = WindowsDisk
+	default:
+		return false
 	}
-	return true
+	info, err := os.Stat(filepath.Join(dir, name))
+	return err == nil && info.Mode().IsRegular()
 }
 
 // RecoverResult is the outcome of Recover.
@@ -309,7 +324,10 @@ func Resolve(dir string) (Metadata, error) {
 // under `<dir>.old`. Install first recovers the backup, so an exchange that an
 // earlier process left half done is repaired instead of deleted, and it
 // removes a leftover `<dir>.old` only when dir holds a complete image. When
-// the second rename fails, the old image moves back.
+// the second rename fails, the old image moves back. Canceling ctx before
+// the exchange leaves the current image (including any recovered backup) in
+// place. Once the exchange starts, Install follows the recovery rules above
+// even if ctx ends.
 func Install(ctx context.Context, dir string) error {
 	lock, err := waitLock(ctx, publicationLockPath(dir), exclusiveLock)
 	if err != nil {
@@ -328,6 +346,9 @@ func Install(ctx context.Context, dir string) error {
 	// whatever is left in old is stale and the only complete generation is
 	// not at risk.
 	if err := os.RemoveAll(old); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	moved := true

@@ -9,13 +9,17 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"testing/synctest"
 	"time"
 )
 
-const lockHelperDirEnv = "OWNSAND_STORE_LOCK_HELPER_DIR"
+const (
+	lockHelperDirEnv   = "OWNSAND_STORE_LOCK_HELPER_DIR"
+	lockHelperBuildEnv = "OWNSAND_STORE_LOCK_HELPER_BUILD"
+)
 
 // openStore returns a Store on dir without Open: the lock needs only the
 // directory, and on Windows Open fails in a process that is not an elevated
@@ -87,8 +91,8 @@ func TestEnrollmentLockReleasesAcquisitionAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	attempts := 0
-	err = waitEnrollmentLock(ctx, f, func(f *os.File) (bool, error) {
-		ok, err := tryLockFile(f)
+	err = waitEnrollmentLock(ctx, f, enrollmentExclusive, func(f *os.File, mode enrollmentLockAccess) (bool, error) {
+		ok, err := tryLockFile(f, mode)
 		attempts++
 		if attempts == 1 {
 			if ok || err != nil {
@@ -131,12 +135,12 @@ func TestEnrollmentLockChecksDeadlineBeforeRetry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := deadlineBeforeSignal{t.Context(), time.Now().Add(enrollmentLockPoll / 2)}
 		attempts := 0
-		err := waitEnrollmentLock(ctx, f, func(f *os.File) (bool, error) {
+		err := waitEnrollmentLock(ctx, f, enrollmentExclusive, func(f *os.File, mode enrollmentLockAccess) (bool, error) {
 			attempts++
 			if attempts != 1 {
 				t.Fatal("retried after the deadline")
 			}
-			ok, err := tryLockFile(f)
+			ok, err := tryLockFile(f, mode)
 			releaseHolder()
 			return ok, err
 		})
@@ -212,10 +216,9 @@ func TestEnrollmentLockFileMode(t *testing.T) {
 	}
 }
 
-// TestEnrollmentLockHelperProcess is the child of
-// TestEnrollmentLockAcrossProcesses, not a test: it takes the enrollment
-// lock of the directory in lockHelperDirEnv, prints "locked", and holds the
-// lock until its standard input closes.
+// TestEnrollmentLockHelperProcess takes the enrollment or image build lock
+// of the directory in lockHelperDirEnv, prints "locked", and holds it until
+// its standard input closes.
 func TestEnrollmentLockHelperProcess(t *testing.T) {
 	dir := os.Getenv(lockHelperDirEnv)
 	if dir == "" {
@@ -224,7 +227,11 @@ func TestEnrollmentLockHelperProcess(t *testing.T) {
 	s := &Store{dir: dir}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	unlock, err := s.LockEnrollment(ctx)
+	lock := s.LockEnrollment
+	if os.Getenv(lockHelperBuildEnv) == "yes" {
+		lock = s.LockImageBuild
+	}
+	unlock, err := lock(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,8 +248,53 @@ func TestEnrollmentLockAcrossProcesses(t *testing.T) {
 	dir := t.TempDir()
 	s := openStore(t, dir)
 
+	release := holdEnrollmentInChild(t, dir, "no")
+	requireBusy(t, s)
+	release()
+	lockEnrollment(t, s)()
+}
+
+func TestImageBuildLockAcrossProcesses(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "fresh")
+	release := holdEnrollmentInChild(t, dir, "yes")
+	s := openStore(t, dir)
+	second, err := s.LockImageBuild(t.Context())
+	if err != nil {
+		t.Fatalf("second shared lock: %v", err)
+	}
+	second()
+	independent, err := openStore(t, t.TempDir()).LockImageBuild(t.Context())
+	if err != nil {
+		t.Fatalf("shared lock for an independent state directory: %v", err)
+	}
+	independent()
+
+	stage := s.Path(ImagesDir, "macos.build")
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if err := resetDir(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("reset with an active build: %v, want ErrEnrollmentBusy and DeadlineExceeded", err)
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatalf("reset removed active staging: %v", err)
+	}
+	release()
+	if err := ResetDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != EnrollmentLockFile {
+		t.Fatalf("reset left entries %v, error %v", entries, err)
+	}
+}
+
+func holdEnrollmentInChild(t *testing.T, dir, build string) (release func()) {
+	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestEnrollmentLockHelperProcess$", "-test.v")
-	cmd.Env = append(os.Environ(), lockHelperDirEnv+"="+dir)
+	cmd.Env = append(os.Environ(), lockHelperDirEnv+"="+dir, lockHelperBuildEnv+"="+build)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -261,7 +313,7 @@ func TestEnrollmentLockAcrossProcesses(t *testing.T) {
 		cmd.Wait()
 	})
 	watchdog := time.AfterFunc(20*time.Second, func() { cmd.Process.Kill() })
-	defer watchdog.Stop()
+	t.Cleanup(func() { watchdog.Stop() })
 
 	lines := bufio.NewScanner(stdout)
 	for {
@@ -272,13 +324,12 @@ func TestEnrollmentLockAcrossProcesses(t *testing.T) {
 			break
 		}
 	}
-	requireBusy(t, s)
-
-	stdin.Close()
-	// Drain the output so the child can exit, then wait for it.
-	io.Copy(io.Discard, stdout)
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("helper process: %v", err)
+	return func() {
+		stdin.Close()
+		// Drain the output so the child can exit, then wait for it.
+		io.Copy(io.Discard, stdout)
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("helper process: %v", err)
+		}
 	}
-	lockEnrollment(t, s)()
 }

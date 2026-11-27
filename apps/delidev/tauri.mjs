@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "@tauri-apps/cli";
@@ -40,15 +40,13 @@ function requestedBundles(options) {
   return formats;
 }
 
-function targetsLinux(options) {
+function requestedTarget(options) {
   for (const [index, option] of options.entries()) {
     const target = /^(?:--target(?:=(.*))?|-[dv]*t(?:=?(.*))?)$/.exec(option);
     if (target) {
-      const triple = (target[1] ?? target[2]) || options[index + 1];
-      return triple?.includes("-linux-") && !triple.includes("android");
+      return (target[1] ?? target[2]) || options[index + 1];
     }
   }
-  return true;
 }
 
 function mergeConfig(base, patch, deleteNulls) {
@@ -118,7 +116,7 @@ function readConfig(value, getProbeDir) {
   return JSON.parse(stdout);
 }
 
-function resolveConfig() {
+function resolveConfig(platformName) {
   let probeDir;
   const getProbeDir = () =>
     (probeDir ??= mkdtempSync(join(tmpdir(), "delidev-config-")));
@@ -128,9 +126,9 @@ function resolveConfig() {
       .map((file) => join(tauriDir, file))
       .find(existsSync);
     const platform = [
-      "tauri.linux.conf.json",
-      "tauri.linux.conf.json5",
-      "Tauri.linux.toml",
+      `tauri.${platformName}.conf.json`,
+      `tauri.${platformName}.conf.json5`,
+      `Tauri.${platformName}.toml`,
     ]
       .map((file) => join(tauriDir, file))
       .find(existsSync);
@@ -158,8 +156,8 @@ function resolveConfig() {
     }
     return {
       config: mergeConfig(baseConfig, overrides, true),
-      clearedBuildKeys:
-        overrides?.build === null ? Object.keys(baseConfig?.build ?? {}) : [],
+      baseConfig,
+      overrides,
       configIndex,
     };
   } finally {
@@ -167,48 +165,117 @@ function resolveConfig() {
   }
 }
 
-function configIncludesDebian(targets) {
-  if (Array.isArray(targets)) {
-    return targets.some(
-      (target) => typeof target === "string" && target.toLowerCase() === "deb",
-    );
-  }
-  return (
-    typeof targets === "string" &&
-    ["all", "deb"].includes(targets.toLowerCase())
-  );
-}
-
-function embeddedDebianConfig() {
+function embeddedNoticeConfig() {
   if (
-    process.platform !== "linux" ||
     (command !== "build" && command !== "bundle") ||
     tauriOptions.some(
       (option) => option === "--help" || /^-[dv]*h$/.test(option),
     ) ||
-    tauriOptions.includes("--no-bundle") ||
-    !targetsLinux(tauriOptions)
+    tauriOptions.includes("--no-bundle")
   ) {
     return;
   }
 
-  const formats = requestedBundles(tauriOptions);
-  if (formats && !formats.includes("deb")) return;
+  const target = requestedTarget(tauriOptions);
+  let platformName;
+  let noticeFormats;
+  if (
+    process.platform === "linux" &&
+    (!target || (target.includes("-linux-") && !target.includes("android")))
+  ) {
+    platformName = "linux";
+    noticeFormats = ["deb"];
+  } else if (
+    process.platform === "darwin" &&
+    (!target || target.endsWith("-apple-darwin"))
+  ) {
+    platformName = "macos";
+    noticeFormats = ["app", "dmg"];
+  } else {
+    return;
+  }
 
-  const resolved = resolveConfig();
+  const includesNotices = (formats) =>
+    formats.some(
+      (format) =>
+        typeof format === "string" &&
+        noticeFormats.includes(format.toLowerCase()),
+    );
+  const formats = requestedBundles(tauriOptions);
+  if (formats && !includesNotices(formats)) return;
+
+  const resolved = resolveConfig(platformName);
   const bundle = resolved.config?.bundle;
   if (bundle?.cef?.embed === false) return;
   if (!formats && command === "build" && bundle?.active !== true) return;
-  if (!formats && !configIncludesDebian(bundle?.targets ?? "all")) return;
-  return resolved;
+  const targets = bundle?.targets ?? "all";
+  if (
+    !formats &&
+    !(typeof targets === "string" && targets.toLowerCase() === "all") &&
+    !includesNotices([targets].flat())
+  ) {
+    return;
+  }
+  return { ...resolved, platformName };
 }
 
 function shellQuote(value) {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-async function runDebianBuild({ config, clearedBuildKeys, configIndex }) {
-  const cli = await debianCli();
+// Adding a nested object to a CLI patch can replace an earlier null.
+// Clear the corresponding base fields explicitly in that case.
+function preserveClears(base, override, additions) {
+  if (typeof additions !== "object" || additions === null) return additions;
+  const patch =
+    override === null
+      ? Object.fromEntries(Object.keys(base ?? {}).map((key) => [key, null]))
+      : Object.create(null);
+  for (const [key, value] of Object.entries(additions)) {
+    patch[key] = preserveClears(
+      base?.[key],
+      override === null ? null : override?.[key],
+      value,
+    );
+  }
+  return patch;
+}
+
+async function runDebianCli(cli, args, options) {
+  const child = spawn(cli, args, options);
+  let interrupted;
+  const onSignal = (signal) => {
+    interrupted ??= signal;
+    // Terminal Ctrl-C already reaches the CLI in the shared process group.
+    if (signal === "SIGTERM" && !child.killed) child.kill(signal);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    let failure;
+    child.on("error", (error) => {
+      failure = error;
+    });
+    const [code, signal] = await new Promise((resolve) => {
+      child.once("close", (code, signal) => resolve([code, signal]));
+    });
+    if (failure) throw failure;
+    const stoppingSignal = interrupted ?? signal;
+    return stoppingSignal ? 128 + constants.signals[stoppingSignal] : code;
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
+async function runNoticeBuild({
+  config,
+  baseConfig,
+  overrides,
+  configIndex,
+  platformName,
+}) {
+  const cli = platformName === "linux" ? await debianCli() : process.execPath;
   // Tauri reads its file mappings before Cargo downloads CEF. Stage the files
   // in a private directory after the download and before Tauri bundles the app.
   const noticeDir = mkdtempSync(join(tmpdir(), "delidev-cef-"));
@@ -218,9 +285,7 @@ async function runDebianBuild({ config, clearedBuildKeys, configIndex }) {
       ? "before-bundle-command"
       : "beforeBundleCommand";
     const hook = build[key];
-    const helper = fileURLToPath(
-      new URL("./cef-deb-notices.mjs", import.meta.url),
-    );
+    const helper = fileURLToPath(new URL("./cef-notices.mjs", import.meta.url));
     const stage = `${shellQuote(process.execPath)} ${shellQuote(helper)}`;
     const custom = typeof hook === "string" ? hook : hook?.script;
     let script = stage;
@@ -229,44 +294,61 @@ async function runDebianBuild({ config, clearedBuildKeys, configIndex }) {
       writeFileSync(hookPath, `${stage} && exec sh -c ${shellQuote(custom)}\n`);
       script = `exec sh ${shellQuote(hookPath)}`;
     }
-    const docDir = "/usr/share/doc/delidev/cef";
+    const docDir =
+      platformName === "linux" ? "/usr/share/doc/delidev/cef" : "Resources/cef";
     const files = {
       [`${docDir}/LICENSE.txt`]: join(noticeDir, "LICENSE.txt"),
       [`${docDir}/CREDITS.html`]: join(noticeDir, "CREDITS.html"),
     };
     const composedHook =
       hook?.cwd === undefined ? script : { script, cwd: hook.cwd };
-    // Adding a hook turns a CLI build:null into an object. Preserve the
-    // deletion by explicitly clearing the fields from the base and platform.
-    const hookPatch = Object.fromEntries(
-      clearedBuildKeys.map((field) => [field, null]),
+    const additions = { build: { [key]: composedHook } };
+    if (platformName === "macos") {
+      // The macOS files map is relative to Contents and is only read during
+      // bundling. Leave the caller's bundle.resources list or map intact.
+      const macKey = Object.hasOwn(config?.bundle ?? {}, "macos")
+        ? "macos"
+        : "macOS";
+      additions.bundle = { [macKey]: { files } };
+    }
+    const patch = preserveClears(baseConfig, overrides, additions);
+    args.splice(
+      commandIndex + 1 + configIndex,
+      0,
+      "--config",
+      JSON.stringify(patch),
     );
-    hookPatch[key] = composedHook;
-    const hookConfig = JSON.stringify({ build: hookPatch });
-    // Put the hook after the user overrides. Keep the Debian mapping at its
-    // original precedence so other file mappings still merge as before.
-    args.splice(commandIndex + 1 + configIndex, 0, "--config", hookConfig);
-    const fileConfig = JSON.stringify({
-      bundle: { linux: { deb: { files } } },
-    });
-    args.splice(commandIndex + 1, 0, "--config", fileConfig);
+    if (platformName === "linux") {
+      // Preserve the precedence of the Debian file mapping.
+      const fileConfig = JSON.stringify({
+        bundle: { linux: { deb: { files } } },
+      });
+      args.splice(commandIndex + 1, 0, "--config", fileConfig);
+    }
 
     // A CLI subprocess lets us clean up even when Tauri exits during argument parsing.
-    const { error, status } = spawnSync(cli, args, {
+    const options = {
       env: { ...process.env, DELIDEV_CEF_NOTICE_DIR: noticeDir },
       stdio: "inherit",
-    });
-    if (error) throw error;
-    process.exitCode = status ?? 1;
+      shell: false,
+    };
+    if (platformName === "linux") {
+      process.exitCode = await runDebianCli(cli, args, options);
+    } else {
+      const cliArgs = [require.resolve("@tauri-apps/cli/tauri.js"), ...args];
+      const { error, status } = spawnSync(cli, cliArgs, options);
+      if (error) throw error;
+      process.exitCode = status ?? 1;
+    }
   } finally {
     rmSync(noticeDir, { recursive: true, force: true });
   }
 }
 
 try {
-  const resolved = embeddedDebianConfig();
+  const resolved = embeddedNoticeConfig();
   if (resolved) {
-    await runDebianBuild(resolved);
+    await runNoticeBuild(resolved);
   } else {
     await run(args, "pnpm tauri");
   }

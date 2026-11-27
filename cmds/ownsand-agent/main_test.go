@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -231,21 +232,39 @@ func TestCLIMisc(t *testing.T) {
 	if code := run(nil, nil, &out, &errb); code != exitUsage {
 		t.Fatal("no command")
 	}
-	// An explicit --state-dir reaches the service definition and wins over a
-	// conflicting environment variable; without the flag the environment
-	// value stays.
-	flagDir := filepath.Join(t.TempDir(), "from-flag")
-	envDir := filepath.Join(t.TempDir(), "from-env")
-	t.Setenv(config.EnvStateDir, envDir)
-	out.Reset()
-	if code := run([]string{"service", "print", "--state-dir", flagDir}, nil, &out, &errb); code != exitOK ||
-		!strings.Contains(out.String(), flagDir) || strings.Contains(out.String(), envDir) {
-		t.Fatalf("service print --state-dir: %q", out.String())
+	type statePathComponent struct{ name, path string }
+	components := []statePathComponent{{"ordinary", "state"}}
+	switch runtime.GOOS {
+	case "linux":
+		components = append(components, statePathComponent{"escaped", "percent%h"})
+	case "darwin":
+		components = append(components, statePathComponent{"escaped", "ampersand&state"})
 	}
-	out.Reset()
-	if code := run([]string{"service", "print"}, nil, &out, &errb); code != exitOK ||
-		!strings.Contains(out.String(), envDir) || strings.Contains(out.String(), flagDir) {
-		t.Fatalf("service print without --state-dir: %q", out.String())
+	for _, component := range components {
+		t.Run("service-print-"+component.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), component.path)
+			flagDir := filepath.Join(root, "from-flag")
+			envDir := filepath.Join(root, "from-env")
+			t.Setenv(config.EnvStateDir, envDir)
+			for _, tc := range []struct {
+				name string
+				args []string
+				want string
+			}{
+				{"explicit", []string{"service", "print", "--state-dir", flagDir}, flagDir},
+				{"fallback", []string{"service", "print"}, envDir},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var stdout, stderr bytes.Buffer
+					if code := run(tc.args, nil, &stdout, &stderr); code != exitOK {
+						t.Fatalf("service print exit code = %d, stderr = %q", code, stderr.String())
+					}
+					if err := checkServiceEnvironment(stdout.String(), config.EnvStateDir, tc.want); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		})
 	}
 	// Linux base images are not built by the agent, and an unknown guest
 	// OS is a usage error; neither touches the state directory.

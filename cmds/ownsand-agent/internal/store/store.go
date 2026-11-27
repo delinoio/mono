@@ -8,7 +8,7 @@
 // Layout:
 //
 //	identity.json             device ID, organization ID, private key (0600)
-//	enrollment.lock           lock file of the enrollment sequence (0600)
+//	enrollment.lock           lock for enrollment, builds and cleanup (0600)
 //	agent.json                control plane origin, state epoch, revision
 //	                          counter, removal record, pending update
 //	status.json               last status of the running agent (for `status`)
@@ -505,26 +505,6 @@ func (s *Store) SaveExecs(v any) error {
 // LoadExecs reads the exec records into v.
 func (s *Store) LoadExecs(v any) error {
 	return s.readJSON(s.Path(ExecsFile), v)
-}
-
-// WipeLocalData deletes the sandbox records, cleanup markers, snapshots, VM
-// files, base images, update downloads and exec records. It keeps the identity
-// and agent.json.
-func (s *Store) WipeLocalData() error {
-	for _, sub := range []string{SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
-		if err := removeAll(s.Path(sub)); err != nil {
-			return err
-		}
-		if err := os.MkdirAll(s.Path(sub), 0o700); err != nil {
-			return err
-		}
-	}
-	for _, f := range []string{ExecsFile, StatusFile} {
-		if err := os.Remove(s.Path(f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
 }
 
 // Reset deletes local state, including the identity, under the enrollment
