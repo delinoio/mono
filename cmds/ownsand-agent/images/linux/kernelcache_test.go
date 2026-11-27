@@ -237,6 +237,15 @@ func (f *fill) requireNoLeftovers() {
 	}
 }
 
+// The checksum command prints a matching digest but reports an error.
+func writeFailingSHA256Sum(t *testing.T, stub, digest string) {
+	t.Helper()
+	script := "#!/usr/bin/env bash\nprintf '%s  -\\n' '" + digest + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(stub, "sha256sum"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestColdCacheDownloadsAndPublishesOnce(t *testing.T) {
 	f := newFill(t)
 	body := f.body("good", goodBody)
@@ -261,6 +270,65 @@ func TestValidCachedArchiveIsReusedWithoutDownload(t *testing.T) {
 	f.requireArchiveMode(0o600)
 	if got := f.callCount(); got != 0 {
 		t.Fatalf("downloader calls = %d, want 0", got)
+	}
+}
+
+func TestCachePathWithNewlineAcceptsUppercaseDigest(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		warm      bool
+		wantCalls int
+		wantMode  os.FileMode
+	}{
+		{name: "warm", warm: true, wantCalls: 0, wantMode: 0o600},
+		{name: "cold", wantCalls: 1, wantMode: 0o644},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFill(t)
+			f.cache = filepath.Join(filepath.Dir(f.cache), "cache\npath")
+			f.sum = strings.ToUpper(f.sum)
+			if test.warm {
+				f.seedMode(goodBody, test.wantMode)
+			}
+			if out, err := f.run(f.body("good", goodBody)); err != nil {
+				t.Fatalf("fill: %v\n%s", err, out)
+			}
+			f.requireArchive(goodBody)
+			f.requireArchiveMode(test.wantMode)
+			if got := f.callCount(); got != test.wantCalls {
+				t.Fatalf("downloader calls = %d, want %d", got, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestCachePathWithNewlinePreservesArchiveAfterVerificationFailure(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		body     []byte
+		hashFail bool
+	}{
+		{name: "digest mismatch", body: []byte("wrong bytes")},
+		{name: "hash command fails", body: goodBody, hashFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFill(t)
+			f.cache = filepath.Join(filepath.Dir(f.cache), "cache\npath")
+			older := []byte("a truncated archive")
+			f.seed(older)
+			if test.hashFail {
+				writeFailingSHA256Sum(t, f.stub, f.sum)
+			}
+			out, err := f.run(f.body("fixture", test.body))
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Fatalf("fill with failed verification: err = %v, want nonzero exit\n%s", err, out)
+			}
+			f.requireArchive(older)
+			if got := f.callCount(); got != 1 {
+				t.Fatalf("downloader calls = %d, want 1", got)
+			}
+		})
 	}
 }
 
