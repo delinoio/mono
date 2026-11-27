@@ -166,23 +166,61 @@ func waitLossBlockedOnOwnership(t *testing.T) {
 // a running fn and runs OnLose only after it, so OnLose sees the effects of
 // fn, and that a call after the transition does not run fn.
 func TestWhileHeldSerializesWithLoss(t *testing.T) {
+	const waitTimeout = 5 * time.Second
+
 	l, lost := newTestLease()
 	acquireFor(t, l, time.Now().Add(time.Hour))
 
 	inFn := make(chan struct{})
 	releaseFn := make(chan struct{})
-	whileHeldDone := make(chan bool, 1)
+	release := sync.OnceFunc(func() { close(releaseFn) })
+	whileHeldDone := make(chan struct{})
+	var lossDone chan struct{}
+	t.Cleanup(func() {
+		release()
+		ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+		defer cancel()
+		for _, worker := range []struct {
+			name string
+			done <-chan struct{}
+		}{
+			{"WhileHeld", whileHeldDone},
+			{"loss transition", lossDone},
+		} {
+			if worker.done == nil {
+				continue
+			}
+			select {
+			case <-worker.done:
+			case <-ctx.Done():
+				select {
+				case <-worker.done:
+				default:
+					t.Errorf("%s worker did not exit before the cleanup deadline", worker.name)
+				}
+			}
+		}
+	})
+
+	var whileHeldRan bool
 	go func() {
-		whileHeldDone <- l.WhileHeld(func(*Period) {
+		defer close(whileHeldDone)
+		whileHeldRan = l.WhileHeld(func(*Period) {
 			close(inFn)
 			<-releaseFn
 		})
 	}()
-	<-inFn
+	select {
+	case <-inFn:
+	case <-whileHeldDone:
+		t.Fatal("WhileHeld returned before the callback started")
+	case <-time.After(waitTimeout):
+		t.Fatal("timed out waiting for the WhileHeld callback to start")
+	}
 
-	setDone := make(chan struct{})
+	lossDone = make(chan struct{})
 	go func() {
-		defer close(setDone)
+		defer close(lossDone)
 		l.lose(reasonReleased)
 	}()
 	// Wait until the loss transition is blocked on the ownership lock that fn
@@ -190,7 +228,7 @@ func TestWhileHeldSerializesWithLoss(t *testing.T) {
 	// goroutine to start.
 	waitLossBlockedOnOwnership(t)
 	select {
-	case <-setDone:
+	case <-lossDone:
 		t.Fatal("the loss transition did not wait for the running fn")
 	default:
 	}
@@ -198,13 +236,18 @@ func TestWhileHeldSerializesWithLoss(t *testing.T) {
 		t.Fatalf("OnLose ran %d times before fn returned", got)
 	}
 
-	close(releaseFn)
-	if !<-whileHeldDone {
+	release()
+	select {
+	case <-whileHeldDone:
+	case <-time.After(waitTimeout):
+		t.Fatal("WhileHeld did not return after the callback was released")
+	}
+	if !whileHeldRan {
 		t.Fatal("WhileHeld reported that fn did not run")
 	}
 	select {
-	case <-setDone:
-	case <-time.After(5 * time.Second):
+	case <-lossDone:
+	case <-time.After(waitTimeout):
 		t.Fatal("the loss transition stayed blocked")
 	}
 	if got := lost.Load(); got != 1 {
