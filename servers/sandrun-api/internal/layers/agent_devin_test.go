@@ -6,13 +6,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -20,6 +25,7 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/devin/devinfake"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
@@ -47,7 +53,13 @@ func newDevinWorld(t *testing.T, guest sandrunv1.GuestOs) *devinWorld {
 
 func createDevinWorld(t *testing.T, guest sandrunv1.GuestOs, fake *devinfake.Fake, extra ...testenv.Option) *devinWorld {
 	t.Helper()
-	w := newAgentWorld(t, layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}}, extra...)
+	return createDevinWorldWithOptions(t, guest, fake,
+		layers.Options{Devin: devin.Options{BaseURL: fake.Server.URL, ReleaseGrace: time.Minute}}, extra...)
+}
+
+func createDevinWorldWithOptions(t *testing.T, guest sandrunv1.GuestOs, fake *devinfake.Fake, opts layers.Options, extra ...testenv.Option) *devinWorld {
+	t.Helper()
+	w := newAgentWorld(t, opts, extra...)
 	dw := &devinWorld{agentWorld: w, devin: fake}
 	id := w.createIntegration(t, &sandrunv1.CreateAgentIntegrationRequest{
 		Vendor: sandrunv1.AgentVendor_AGENT_VENDOR_DEVIN, Name: "devin",
@@ -129,7 +141,7 @@ func TestDevinSessionLifecycle(t *testing.T) {
 	if strings.Contains(all, devinAPIToken) || strings.Contains(all, devinOutpostToken) {
 		t.Fatal("an exec command or environment carries a Devin credential")
 	}
-	if !strings.Contains(all, "curl -fsSL https://cli.devin.ai/install.sh | bash") {
+	if !strings.Contains(all, "https://cli.devin.ai/install.sh") {
 		t.Fatal("no install script")
 	}
 	w.devin.SetSessionStatus("ses-1", "running")
@@ -488,6 +500,60 @@ func TestDevinCancelReleasedByPoller(t *testing.T) {
 	})
 }
 
+func TestDevinLookupFailureReleaseGrace(t *testing.T) {
+	const sid = "ses-release-grace"
+	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	w.full()
+	w.devin.AddSession(sid, true)
+	requestID := w.requestBySource(t, sid).GetRequestId()
+	// Stop background polling so each test step owns one round of release.
+	w.env.Stop()
+	ctx := t.Context()
+	endedAt := w.env.Clock.Now()
+	if _, err := w.env.DB.Pool.Exec(ctx, `
+		UPDATE requests SET state = $2, end_reason = $3, start_time = $4
+		WHERE request_id = $1`, requestID, sandrunv1.RequestState_REQUEST_STATE_ENDED,
+		sandrunv1.RequestEndReason_REQUEST_END_REASON_COMPLETED, endedAt.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	w.devin.FailLookups(true)
+
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimHeld)
+	w.assertNoRelease(t, sid)
+	if !strings.Contains(w.env.Logs.String(), "agent_claim_release_failed") {
+		t.Fatal("the poller did not report the lookup error")
+	}
+
+	if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE requests SET end_time = $2 WHERE request_id = $1", requestID, endedAt); err != nil {
+		t.Fatal(err)
+	}
+	// The test world configures one minute of release grace.
+	w.env.Clock.Advance(time.Minute - time.Microsecond)
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimHeld)
+	w.assertNoRelease(t, sid)
+
+	w.env.Clock.Advance(time.Microsecond)
+	w.devin.FailReleases(true)
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimHeld)
+	if attempts := w.devin.ReleaseAttempts(sid); attempts != 1 {
+		t.Fatalf("release attempts at grace = %d, want 1", attempts)
+	}
+
+	w.devin.FailReleases(false)
+	w.l.Agents.Poll(ctx)
+	w.assertClaim(t, requestID, agent.ClaimReleased)
+	// The fake only accepts release with the original acceptor ID.
+	if attempts, releases := w.devin.ReleaseAttempts(sid), w.devin.Releases(sid); attempts != 2 || releases != 1 {
+		t.Fatalf("release attempts = %d and successes = %d, want 2 and 1", attempts, releases)
+	}
+	if len(w.devin.Messages(sid)) != 0 {
+		t.Fatal("operator message for a served session")
+	}
+}
+
 // TestDevinStartCheckPartialFailure: when the poller cannot read the queue
 // entry of one STARTING session, it still marks the runner of another
 // session BUSY when that session runs (a missed watch event).
@@ -534,30 +600,211 @@ func testDevinStartCheckPartialFailure(t *testing.T, failLookup func(*devinfake.
 	}
 }
 
-// TestDevinWatchReconnect: a stream end (scheduled, at most 5 minutes) and
-// failing watch calls (backoff) both lead to a new list, so a session whose
-// event SandRun missed is claimed; repeated events create no second request.
 func TestDevinWatchReconnect(t *testing.T) {
-	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
-	w.full()
-	lists := w.devin.Lists()
-	w.devin.FailWatches(2)
-	w.devin.EndStreams()
-	w.devin.AddSession("ses-missed", false)
-	req := w.requestBySource(t, "ses-missed")
-	// One list after the scheduled end and one after each failed watch.
-	eventually(t, "the watch is back", func() bool { return w.devin.Streams() == 1 && w.devin.Lists() >= lists+3 })
-	logs := w.env.Logs.String()
-	if !strings.Contains(logs, `"cause":"scheduled"`) || !strings.Contains(logs, `"cause":"error"`) {
-		t.Fatal("reconnects were not logged")
+	for _, protoMajor := range []int{1, 2} {
+		t.Run(fmt.Sprintf("HTTP%d", protoMajor), func(t *testing.T) {
+			const (
+				headerBudget = 300 * time.Millisecond
+				bodyBudget   = 200 * time.Millisecond
+				refresh      = 1500 * time.Millisecond
+				firstBackoff = 50 * time.Millisecond
+			)
+			fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+			lists := make(chan time.Time, 32)
+			watches := make(chan time.Time, 32)
+			canceled := make(chan time.Time, 32)
+			var attempts atomic.Int32
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				query := r.URL.Query()
+				if r.Method == http.MethodGet && r.URL.Path == "/opbeta/outposts/devins" {
+					if query.Get("phase") == "pending" {
+						lists <- time.Now()
+					}
+					if query.Get("watch") == "true" {
+						if r.ProtoMajor != protoMajor {
+							t.Errorf("watch used %s, want HTTP/%d", r.Proto, protoMajor)
+						}
+						attempt := attempts.Add(1)
+						watches <- time.Now()
+						switch attempt {
+						case 1:
+							<-r.Context().Done()
+							canceled <- time.Now()
+							return
+						case 2:
+							w.Header().Set("Retry-After", "7")
+							w.WriteHeader(http.StatusServiceUnavailable)
+							fmt.Fprint(w, "incomplete diagnostic")
+							w.(http.Flusher).Flush()
+							<-r.Context().Done()
+							canceled <- time.Now()
+							return
+						case 3:
+							w.WriteHeader(http.StatusServiceUnavailable)
+							return
+						case 4, 5:
+							w.Header().Set("Content-Type", "text/event-stream")
+							w.WriteHeader(http.StatusOK)
+							return
+						case 7:
+							if protoMajor == 1 {
+								<-r.Context().Done()
+								canceled <- time.Now()
+								return
+							}
+						}
+					}
+				}
+				fake.Server.Config.Handler.ServeHTTP(w, r)
+			}))
+			if protoMajor == 2 {
+				server.EnableHTTP2 = true
+				server.StartTLS()
+			} else {
+				server.Start()
+			}
+			t.Cleanup(server.Close)
+			transport := server.Client().Transport.(*http.Transport).Clone()
+			transport.ResponseHeaderTimeout = headerBudget
+			t.Cleanup(transport.CloseIdleConnections)
+
+			reader := sdkmetric.NewManualReader()
+			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+			timing := fastAgentTiming()
+			timing.BackoffMin, timing.BackoffMax = firstBackoff, 2*time.Second
+			opts := layers.Options{AgentTiming: timing, Devin: devin.Options{
+				BaseURL: server.URL, HTTP: &http.Client{Transport: transport}, WatchRefreshInterval: refresh, WatchErrorBodyTimeout: bodyBudget,
+			}}
+			w := createDevinWorldWithOptions(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake, opts,
+				func(o *app.Options) { o.Metrics = provider })
+			w.full()
+			receiveDevinWatchTime(t, lists, "initial list")
+			for i, failure := range []struct {
+				budget time.Duration
+				missed string
+			}{{headerBudget, "ses-headers"}, {bodyBudget, "ses-body"}, {}, {}, {}} {
+				start := receiveDevinWatchTime(t, watches, "failing watch")
+				if failure.missed != "" {
+					fake.AddSession(failure.missed, false)
+					receiveDevinWatchTime(t, canceled, "stalled request cancellation")
+				}
+				relist := receiveDevinWatchTime(t, lists, "relist after failure")
+				backoff := firstBackoff << i
+				if elapsed := relist.Sub(start); elapsed < failure.budget+backoff {
+					t.Fatalf("attempt %d relisted after %s, want at least %s", i+1, elapsed, failure.budget+backoff)
+				}
+				if failure.missed != "" {
+					w.requestBySource(t, failure.missed)
+				}
+				t.Logf("attempt %d relisted after %s (timeout budget %s, backoff %s)", i+1, relist.Sub(start), failure.budget, backoff)
+			}
+
+			opened := receiveDevinWatchTime(t, watches, "healthy watch")
+			eventually(t, "healthy stream", func() bool { return fake.Streams() == 1 })
+			time.Sleep(time.Until(opened.Add(headerBudget + bodyBudget)))
+			fake.AddSession("ses-event", true)
+			w.requestBySource(t, "ses-event")
+			fake.Announce("ses-event")
+			fake.AddSession("ses-rotation", false)
+			rotated := receiveDevinWatchTime(t, lists, "scheduled relist")
+			receiveDevinWatchTime(t, watches, "watch after rotation")
+			if protoMajor == 2 {
+				eventually(t, "stream after rotation", func() bool { return fake.Streams() == 1 })
+			}
+			w.env.Stop()
+			if protoMajor == 1 {
+				receiveDevinWatchTime(t, canceled, "parent canceled while awaiting headers")
+			}
+			if len(lists) != 0 || attempts.Load() != 7 {
+				t.Fatalf("extra requests after cancellation: %d lists, %d total watch attempts", len(lists), attempts.Load())
+			}
+			want := []string{"ses-body", "ses-event", "ses-headers", "ses-rotation"}
+			for _, sid := range want {
+				if claims := fake.Claims(sid); claims != 1 {
+					t.Errorf("%s has %d claims, want one", sid, claims)
+				}
+			}
+			rows, err := w.env.DB.Pool.Query(t.Context(), "SELECT source_key FROM requests WHERE organization_id = $1 ORDER BY source_key", w.org.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, want) {
+				t.Fatalf("persisted request keys = %q, want %q, error %v", got, want, err)
+			}
+			logs := w.env.Logs.String()
+			if failed, scheduled := strings.Count(logs, `"cause":"error"`), strings.Count(logs, `"cause":"scheduled"`); failed != 5 || scheduled != 1 {
+				t.Fatalf("reconnect causes: %d errors and %d scheduled, want 5 and 1", failed, scheduled)
+			}
+			if !strings.Contains(logs, "timeout awaiting response headers") ||
+				strings.Count(logs, `"error":"the Devin queue stream ended before scheduled rotation"`) != 2 ||
+				strings.Count(logs, `"op":"watch_queue","status":503`) != 2 {
+				t.Fatal("missing reconnect or vendor status diagnostics")
+			}
+			var metrics metricdata.ResourceMetrics
+			if err := reader.Collect(t.Context(), &metrics); err != nil {
+				t.Fatal(err)
+			}
+			var reconnects int64
+			for _, scope := range metrics.ScopeMetrics {
+				for _, m := range scope.Metrics {
+					if m.Name == "sandrun_vendor_watch_reconnects" {
+						for _, point := range m.Data.(metricdata.Sum[int64]).DataPoints {
+							if vendor, _ := point.Attributes.Value("vendor"); vendor.AsString() == "DEVIN" {
+								reconnects += point.Value
+							}
+						}
+					}
+				}
+			}
+			if reconnects != 5 {
+				t.Fatalf("DEVIN reconnect count = %d, want 5", reconnects)
+			}
+			t.Logf("scheduled relist after %s, no retry on shutdown, %d failure reconnects, one claim and one stored request per session", rotated.Sub(opened), reconnects)
+		})
 	}
-	for range 3 {
-		w.devin.Announce("ses-missed")
+}
+
+func receiveDevinWatchTime(t *testing.T, observations <-chan time.Time, what string) time.Time {
+	t.Helper()
+	select {
+	case at := <-observations:
+		return at
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		return time.Time{}
 	}
-	stays(t, "one request", func() bool { return len(w.requests(t)) == 1 && w.devin.Claims("ses-missed") == 1 })
-	if w.request(t, req.GetRequestId()).GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
-		t.Fatal("the request left the queue")
+}
+
+func TestDevinWatchDefaultPagination(t *testing.T) {
+	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
+	sessionIDs := []string{"ses-1", "ses-2"}
+	for _, sid := range sessionIDs {
+		fake.AddSession(sid, false)
 	}
+	w := createDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, fake)
+	eventually(t, "the Devin watch after the default pages", func() bool {
+		return fake.Streams() == 1 || fake.Lists() > len(sessionIDs)
+	})
+	if got := fake.ClaimAttempts(); !slices.Equal(got, sessionIDs) {
+		t.Fatalf("claim attempts = %q, want %q", got, sessionIDs)
+	}
+	if got := fake.Lists(); got != 2 {
+		t.Fatalf("list requests = %d, want 2", got)
+	}
+	if got := fake.WatchCursors(); !slices.Equal(got, []string{"page-2"}) {
+		t.Fatalf("watch cursors = %q, want [page-2]", got)
+	}
+	var sources []string
+	for _, req := range w.requests(t) {
+		sources = append(sources, req.GetSourceKey())
+	}
+	slices.Sort(sources)
+	if !slices.Equal(sources, sessionIDs) {
+		t.Fatalf("persisted request sources at watch startup = %q, want %q", sources, sessionIDs)
+	}
+	t.Logf("SandRun listed %d pages, claimed %q, persisted requests for %q and opened a watch at %q",
+		fake.Lists(), fake.ClaimAttempts(), sources, fake.WatchCursors())
 }
 
 func TestDevinWatchPagination(t *testing.T) {
@@ -647,7 +894,7 @@ func TestDevinInstallScripts(t *testing.T) {
 		}
 	}
 	mac := devin.InstallScript(sandrunv1.GuestOs_GUEST_OS_MACOS)
-	for _, want := range []string{"curl -fsSL https://cli.devin.ai/install.sh | bash", `"$(uname -m)" != arm64`, "command -v git"} {
+	for _, want := range []string{`"$(uname -m)" != arm64`, "command -v git"} {
 		if !strings.Contains(mac, want) {
 			t.Fatalf("posix script lacks %q", want)
 		}

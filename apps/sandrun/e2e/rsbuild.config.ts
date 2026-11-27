@@ -11,4 +11,10 @@ export default mergeRsbuildConfig(consoleConfig, {
       ),
     },
   },
+  source: {
+    entry: {
+      index: "./src/index.tsx",
+      "direct-action-fixture": "./e2e/direct-action-fixture.tsx",
+    },
+  },
 });

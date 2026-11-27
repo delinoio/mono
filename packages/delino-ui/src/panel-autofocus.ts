@@ -1,21 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 import * as React from "react";
 
-export const DeferAutoFocusContext = React.createContext(false);
+export enum PanelAutoFocus {
+  Default,
+  Deferred,
+  DialogOpening,
+  DialogOpen,
+}
+
+export const PanelAutoFocusContext = React.createContext(
+  PanelAutoFocus.Default,
+);
 
 /**
- * Returns the `autoFocus` value to forward to the DOM input.
- *
- * React focuses an input with `autoFocus` before the UI SDK captures the
- * opener for focus return. Inside Dialog, AlertDialog and Drawer panels,
- * defer autofocus to the SDK, which reads the input's `data-autofocus` marker
- * after it captures the opener. Fields outside the panels can focus on mount.
- * Remove this workaround when the SDK captures the opener before React
- * commits autofocus and preserves its initial focus policy.
+ * The SDK selects initial focus by querying for `[autofocus], [data-autofocus]`.
+ * React normally calls focus() at mount without emitting that attribute. During
+ * opening, the marker lets the SDK select the field after capturing the opener.
+ * Remove this workaround when the SDK can use React autofocus and still capture
+ * the opener and honor its initial focus policy.
  */
-export function useForwardedAutoFocus(
+export function useFieldAutoFocus(
   autoFocus: boolean | undefined,
-): boolean | undefined {
-  const deferAutoFocus = React.useContext(DeferAutoFocusContext);
-  return deferAutoFocus ? undefined : autoFocus;
+  disabled: boolean | undefined,
+) {
+  const mode = React.useContext(PanelAutoFocusContext);
+  const inDialog =
+    mode === PanelAutoFocus.DialogOpening || mode === PanelAutoFocus.DialogOpen;
+
+  return {
+    autoFocus:
+      mode === PanelAutoFocus.Default ||
+      (mode === PanelAutoFocus.DialogOpen && !disabled)
+        ? autoFocus
+        : undefined,
+    // The SDK only checks the first marker, so a disabled Dialog control can
+    // hide the next eligible target. Callers can still supply their own marker.
+    marker: autoFocus && !(inDialog && disabled) ? "" : undefined,
+  };
 }
