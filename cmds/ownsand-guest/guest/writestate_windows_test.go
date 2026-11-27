@@ -13,6 +13,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func TestWriteExpiryOfPrefixedLongStagingPath(t *testing.T) {
+	testWriteExpiryOfLongStagingPath(t, extendedPath)
+}
+
 func TestWriteRecoveryRecordHandleBlocksPromotionAndCleanup(t *testing.T) {
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
