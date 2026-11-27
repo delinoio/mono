@@ -7,6 +7,8 @@ This contract owns two components of [`ownsand`](project-ownsand.md):
 - `cmds/ownsand-agent/`: the device agent `ownsand-agent`. It runs as a system service on each enrolled Linux, macOS or Windows host, keeps an outbound channel to the control plane, runs sandboxes in VMs, enforces the network policy and TTLs, takes and moves snapshots, serves the data path and updates itself.
 - `cmds/ownsand-guest/`: the guest helper `ownsand-guest`. It runs inside every sandbox guest and serves exec and file requests from the agent. Packages: `guest` (the `GuestService`), `guestlisten` (the listener abstraction) and `execlog` (kept exec output and the exec event sequence, shared with the agent).
 
+The agent and guest helper share the runtime Logs SDK bridge in `cmds/ownsand-agent/runtimelog/`.
+
 Both components use `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md#fsl-11-alv2-directories); `cmds/ownsand-agent/LICENSE` and `cmds/ownsand-guest/LICENSE` contain the terms. They must not import code from `servers/`, and the OwnSand CLI and the SDKs must not import code from them.
 
 ## Runtime and Language
@@ -298,6 +300,7 @@ When `Authenticate` reports that the device is unknown and the agent has no reco
 - When the Windows service cannot create its state directory or open `agent.log`, it attempts to write one startup error to the Windows Application Event Log under source `ownsand-agent`. The event identifies the failed operation and includes the invalid setting and its validation reason if configuration parsing failed. Both the event and the normal `invalid configuration` record in `agent.log` omit environment values. The standard service account registers the event source on demand, including for existing installations. Event Log failures leave the reported service status and recovery actions unaffected.
 - Events: enrollment result, authentication result, channel connect and disconnect, capability report, command ID and result, sandbox state change, TTL expiry, network setup result, snapshot export and import progress, data path transport selection, update verification and installation, and removal of abandoned update downloads.
 - Never log enrollment tokens, session credentials, private keys, signed URLs, SDP bodies, exec commands, environment values, exec output or file contents.
+- The agent run path and the guest server each own a Logs SDK provider. The bridge applies the local log level and sends only reviewed static events and approved structured values to the SDK. Raw errors, arbitrary attributes, and any resource with extra environment metadata stay out of the processor. Shipped binaries register no processor or network exporter. Tests can supply a processor in process. SDK shutdown has a one-second deadline and leaves the process exit result intact.
 
 ## Build and Test
 
