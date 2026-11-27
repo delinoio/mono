@@ -66,10 +66,50 @@ func TestLookPathInWindows(t *testing.T) {
 		})
 	}
 
-	t.Run("a match in a relative directory returns ErrDot", func(t *testing.T) {
+	t.Run("implicit current directory match", func(t *testing.T) {
 		t.Chdir(dir)
-		if _, err := lookPathIn("mytool", []string{"PATH=" + empty}); !errors.Is(err, exec.ErrDot) {
-			t.Fatalf("current directory: error %v", err)
+		other := t.TempDir()
+		touch(t, other, "mytool.exe")
+		alias := t.TempDir()
+		if err := os.Link(filepath.Join(dir, "mytool.exe"), filepath.Join(alias, "mytool.exe")); err != nil {
+			t.Fatal(err)
+		}
+		cases := []struct {
+			name string
+			path string
+			want string // absolute path, or empty when the implicit match must return ErrDot
+		}{
+			{"same directory", dir, filepath.Join(dir, "mytool.exe")},
+			{"same file through a hard link", alias, filepath.Join(alias, "mytool.exe")},
+			{"empty PATH component", ";" + dir, filepath.Join(dir, "mytool.exe")},
+			{"same relative match before absolute match", ".;" + dir, filepath.Join(dir, "mytool.exe")},
+			{"no explicit match", empty, ""},
+			{"only a relative match", ".", ""},
+			{"different file before same file", other + ";" + dir, ""},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := lookPathIn("mytool", []string{"PATH=" + tc.path, "PATHEXT=.EXE"})
+				if tc.want == "" {
+					if got != "mytool.exe" || !errors.Is(err, exec.ErrDot) {
+						t.Fatalf("got %q, %v; want the implicit match with ErrDot", got, err)
+					}
+				} else if got != tc.want || err != nil {
+					t.Fatalf("got %q, %v; want %q", got, err, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("relative request match without an implicit match", func(t *testing.T) {
+		t.Chdir(empty)
+		const sub = "bin"
+		if err := os.Mkdir(sub, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		touch(t, sub, "mytool.exe")
+		if got, err := lookPathIn("mytool", []string{"PATH=" + sub}); got != filepath.Join(sub, "mytool.exe") || !errors.Is(err, exec.ErrDot) {
+			t.Fatalf("got %q, %v; want the relative match with ErrDot", got, err)
 		}
 	})
 }
@@ -129,4 +169,15 @@ func TestExecBareNameUsesRequestPathWindows(t *testing.T) {
 	if got := evs[len(evs)-1].GetFailed().GetReason(); got != ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND {
 		t.Fatalf("events %v", evs)
 	}
+
+	t.Run("absolute request PATH names the helper current directory", func(t *testing.T) {
+		t.Chdir(dir)
+		req := helperExecReq(t, "exit", "", 30*time.Second)
+		req.Command = []string{"mytool", "-test.run=^TestHelperProcess$"}
+		req.Env["Path"] = ";" + dir + ";" + helperPath
+		evs := h.runExec(req)
+		if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+			t.Fatalf("events %v: %v", evs, err)
+		}
+	})
 }
