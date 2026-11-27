@@ -15,6 +15,7 @@ require (
 	github.com/pion/webrtc/v4 v4.2.26
 	github.com/pressly/goose/v3 v3.30.1
 	github.com/prometheus/client_golang v1.25.0
+	github.com/prometheus/common v0.72.0
 	github.com/resend/resend-go/v3 v3.17.0
 	github.com/sirupsen/logrus v1.10.2
 	go.opentelemetry.io/contrib/bridges/otelslog v0.21.0
@@ -71,7 +72,6 @@ require (
 	github.com/pion/transport/v5 v5.1.4 // indirect
 	github.com/pion/turn/v5 v5.1.3 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
-	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.23.0 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
