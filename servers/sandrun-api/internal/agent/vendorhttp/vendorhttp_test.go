@@ -5,6 +5,7 @@ package vendorhttp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -119,6 +120,51 @@ func TestReadEventsReaderErrorAndLineLimit(t *testing.T) {
 	}
 }
 
+func TestClientRequiresJSONForDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"empty 200", http.StatusOK, ""},
+		{"whitespace 200", http.StatusOK, " \t\r\n"},
+		{"bodyless 204", http.StatusNoContent, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					fmt.Fprint(w, tc.body)
+				}
+			}))
+			defer srv.Close()
+			c := &Client{Vendor: "TEST", BaseURL: srv.URL}
+			var out struct{ Value string }
+			err := c.Do(t.Context(), "get", http.MethodGet, "/", nil, nil, &out)
+			if err == nil || err.Error() != "TEST get: decode response: empty body" {
+				t.Fatalf("required JSON: got %v, want an empty-body decode error", err)
+			}
+			if err := c.Do(t.Context(), "release", http.MethodPost, "/", nil, nil, nil); err != nil {
+				t.Fatalf("no destination: %v", err)
+			}
+		})
+	}
+}
+
+func TestClientMalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"value":`)
+	}))
+	defer srv.Close()
+	c := &Client{Vendor: "TEST", BaseURL: srv.URL}
+	var out struct{ Value string }
+	err := c.Do(t.Context(), "get", http.MethodGet, "/", nil, nil, &out)
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || !strings.HasPrefix(err.Error(), "TEST get: decode response: ") {
+		t.Fatalf("malformed JSON: got %v, want a wrapped JSON syntax error", err)
+	}
+}
+
 // TestClientErrorsAndLogs: a non-2xx answer is a StatusError with the code
 // and error text, it is logged with the status, and neither the credential
 // nor the request body nor query values reach the log.
@@ -152,6 +198,9 @@ func TestClientErrorsAndLogs(t *testing.T) {
 	se, ok := AsStatus(err)
 	if !ok || se.Status != http.StatusConflict || se.Code != "worker_in_use" || se.Text != "Worker in use: turn running" || se.RetryAfter != 7*time.Second || Status(err) != 409 {
 		t.Fatalf("status error %#v", err)
+	}
+	if err := c.Do(ctx, "get", http.MethodGet, "/conflict", nil, nil, &out); Status(err) != http.StatusConflict {
+		t.Fatalf("non-2xx with JSON destination: got %v, want a status error", err)
 	}
 	for _, secret := range []string{"secret-token", "body-secret", "query-value", "leaked-token"} {
 		if strings.Contains(logs.String(), secret) || strings.Contains(err.Error(), secret) {

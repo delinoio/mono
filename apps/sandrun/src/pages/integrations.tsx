@@ -2,9 +2,12 @@
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
 import {
+  createConnectQueryKey,
+  createQueryOptions,
   useInfiniteQuery,
   useMutation,
   useQuery,
+  useTransport,
 } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { BadgeVariant } from "delino-ui/badge";
@@ -28,7 +31,11 @@ import {
   type GitHubInstallation,
   GitHubService,
 } from "@delino/sandrun-protos/v1/github_pb";
-import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
+import {
+  type GetOwnSandLinkResponse,
+  type OwnSandLink,
+  OwnSandLinkService,
+} from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { useLayoutEffect, useRef, useState } from "react";
 import {
@@ -84,13 +91,32 @@ type OwnSandLinkDialog =
   | { kind: "link" | "stale-replacement" }
   | { kind: "replace"; ownsandOrganizationId: string };
 
+type OwnSandLinkIdentity = Pick<
+  OwnSandLink,
+  "organizationId" | "ownsandOrganizationId" | "createTime"
+>;
+
+function isSameOwnSandLink(
+  target: OwnSandLinkIdentity | undefined,
+  current: OwnSandLink | undefined,
+): boolean {
+  return (
+    target !== undefined &&
+    current !== undefined &&
+    target.organizationId === current.organizationId &&
+    target.ownsandOrganizationId === current.ownsandOrganizationId &&
+    target.createTime?.seconds === current.createTime?.seconds &&
+    target.createTime?.nanos === current.createTime?.nanos
+  );
+}
+
 function OwnSandLinkSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
+  const transport = useTransport();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, OwnSandLinkService);
-  const link = useQuery(OwnSandLinkService.method.getOwnSandLink, {
-    organizationId,
-  });
+  const getLink = OwnSandLinkService.method.getOwnSandLink;
+  const link = useQuery(getLink, { organizationId });
   const setLink = useMutation(OwnSandLinkService.method.setOwnSandLink, {
     onSuccess: refresh,
   });
@@ -101,7 +127,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
   const [ownsandOrg, setOwnsandOrg] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [errors, setErrors] = useState<{ org?: string; key?: string }>({});
-  const [removing, setRemoving] = useState(false);
+  const [removalTarget, setRemovalTarget] = useState<OwnSandLinkIdentity>();
   const close = () => {
     setDialog(undefined);
     // Credential inputs are cleared, so the value exists only until it is sent.
@@ -110,6 +136,13 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
     setErrors({});
   };
   const current = link.data?.link;
+  if (
+    removalTarget !== undefined &&
+    link.data !== undefined &&
+    !isSameOwnSandLink(removalTarget, current)
+  ) {
+    setRemovalTarget(undefined);
+  }
   // Only a returned link result can invalidate this opening.
   if (
     dialog?.kind === "replace" &&
@@ -192,7 +225,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
                   </Button>
                   <Button
                     variant={ButtonVariant.Danger}
-                    onClick={() => setRemoving(true)}
+                    onClick={() => setRemovalTarget(current)}
                   >
                     Remove link
                   </Button>
@@ -269,12 +302,28 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
         />
       </FormDialog>
       <ConfirmDialog
-        open={removing}
-        onOpenChange={setRemoving}
+        open={removalTarget !== undefined}
+        onOpenChange={(open) => {
+          if (!open) setRemovalTarget(undefined);
+        }}
         title="Remove the OwnSand link?"
         description="SandRun stops dispatch, ends every queued request with Canceled, deletes every runner of this organization and then deletes the stored API key."
         confirmLabel="Remove link"
-        onConfirm={() => removeLink.mutateAsync({ organizationId })}
+        onConfirm={async () => {
+          // A refresh may update the cache before React displays the result.
+          const { queryKey } = createQueryOptions(
+            getLink,
+            { organizationId },
+            { transport },
+          );
+          const latest =
+            queryClient.getQueryData<GetOwnSandLinkResponse>(queryKey);
+          if (!isSameOwnSandLink(removalTarget, latest?.link)) {
+            setRemovalTarget(undefined);
+            return;
+          }
+          await removeLink.mutateAsync({ organizationId });
+        }}
       />
     </section>
   );
@@ -750,7 +799,22 @@ function IntegrationDialog({
     invalidateServices(queryClient, AgentIntegrationService);
   const createIntegration = useMutation(
     AgentIntegrationService.method.createAgentIntegration,
-    { onSuccess: refresh },
+    {
+      onSuccess: async (_, { organizationId }) => {
+        // Invalidation alone reuses an in-flight fetch when no page is cached.
+        // That first response may contain the list from before creation.
+        await queryClient.cancelQueries({
+          queryKey: createConnectQueryKey({
+            schema: AgentIntegrationService.method.listAgentIntegrations,
+            input: { organizationId },
+            cardinality: "infinite",
+          }),
+          fetchStatus: "fetching",
+          predicate: (query) => query.state.data === undefined,
+        });
+        await refresh();
+      },
+    },
   );
   const updateIntegration = useMutation(
     AgentIntegrationService.method.updateAgentIntegration,

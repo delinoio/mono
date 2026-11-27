@@ -81,9 +81,17 @@ export function resolveOrigin(
   }
   // URL parsing can remove dot segments and treat backslashes as slashes.
   // Check the written form so a value that hides a path still fails.
-  if (url.pathname !== "/" || !/^https?:\/\/[^/?#\\]+\/?$/i.test(raw.trim())) {
+  const authority = /^https?:\/\/([^/?#\\]+)\/?$/i.exec(raw.trim())?.[1];
+  if (url.pathname !== "/" || authority === undefined) {
     throw new Error(
       `${name} must be an origin without a path, query or fragment`,
+    );
+  }
+  // The URL parser drops empty user information and embedded ASCII tabs and
+  // line breaks. Reject them in the written authority.
+  if (/[@\t\r\n]/.test(authority)) {
+    throw new Error(
+      `${name} must use an authority without @, tabs or line breaks`,
     );
   }
   return url.origin;

@@ -37,6 +37,8 @@ export default {
             "--no-env",
             "--mode",
             "development",
+            "--config",
+            "e2e/rsbuild.config.ts",
             "--host",
             "127.0.0.1",
             "--port",
