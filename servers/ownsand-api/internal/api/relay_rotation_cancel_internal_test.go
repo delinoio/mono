@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -162,6 +163,8 @@ func (h *rotationHarness) eventKinds() []string {
 			kinds = append(kinds, "accepted")
 		case e.GetStdout() != nil:
 			kinds = append(kinds, "stdout")
+		case e.GetExited() != nil:
+			kinds = append(kinds, "exited")
 		case e.GetKeepalive() != nil:
 			kinds = append(kinds, "keepalive")
 		default:
@@ -217,11 +220,9 @@ func stdout(data string) *ownsandv1.ExecEvent {
 // TestRotationAfterRequestCancelReturnsContextError checks that a rotation
 // that finds the request context ended does not return OK. The agent frame
 // behind the accepted event is already queued, and Next returns a queued
-// frame before it looks at the context, so only the check in the rotation
-// branch sees the cancellation. A canceled call must not count as a completed
-// billable stream (the call meter counts only an OK result) and must be logged
-// as canceled; the queued frame is not forwarded and the agent still gets its
-// stream close frame.
+// frame before it looks at the context. The handler must return the
+// cancellation after the receive, before it rotates. The handler logs the
+// cancellation and sends the agent a stream close frame.
 func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
 	h := newRotationHarness(t, pastRotation)
 	h.feed(&ownsandv1.RequestAccepted{})
@@ -247,9 +248,8 @@ func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
 }
 
 // expiringContext reports context.DeadlineExceeded from Err once expire ran.
-// A real deadline would also end the request upload and the first Next before
-// the handler reaches the rotation branch, and Done stays open here for the
-// same reason; the rotation branch reads only Err.
+// The accepted event callback controls when the deadline is reached. The
+// fixture keeps Done open to exercise the check of Err after a receive.
 type expiringContext struct {
 	context.Context
 	expired atomic.Bool
@@ -330,4 +330,71 @@ func TestRotationWithLiveContextReturnsOK(t *testing.T) {
 		t.Errorf("forwarded %d frames and %d bytes, want none", h.call.frames, h.call.bytes)
 	}
 	h.waitClose()
+}
+
+func TestRotationInFutureWithQueuedTerminalReply(t *testing.T) {
+	timing := pastRotation
+	timing.Rotation = 2 * time.Hour // the harness sets Started one hour in the past
+	for _, tc := range []struct {
+		name       string
+		wantErr    error
+		wantCode   string
+		wantEvents []string
+	}{
+		{
+			name:       "canceled",
+			wantErr:    context.Canceled,
+			wantCode:   "canceled",
+			wantEvents: []string{"accepted"},
+		},
+		{
+			name:       "deadline exceeded",
+			wantErr:    context.DeadlineExceeded,
+			wantCode:   "deadline_exceeded",
+			wantEvents: []string{"accepted"},
+		},
+		{
+			name:       "live",
+			wantCode:   "ok",
+			wantEvents: []string{"accepted", "exited"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRotationHarness(t, timing)
+			h.feed(&ownsandv1.RequestAccepted{})
+			parent, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx := &expiringContext{Context: parent}
+			exited := &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{
+				Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0},
+			}}}
+			err := h.serve(ctx, func() {
+				h.feed(exited)
+				switch tc.wantErr {
+				case context.Canceled:
+					cancel()
+				case context.DeadlineExceeded:
+					ctx.expire()
+				}
+			})
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("serveStream = %v, want %v", err, tc.wantErr)
+			}
+			if got := h.logCode(); got != tc.wantCode {
+				t.Errorf("logged code = %q, want %q", got, tc.wantCode)
+			}
+			if got := h.eventKinds(); !slices.Equal(got, tc.wantEvents) {
+				t.Errorf("events = %v, want %v", got, tc.wantEvents)
+			}
+			wantFrames, wantBytes := 0, int64(0)
+			if tc.wantErr == nil {
+				wantFrames = 1
+				wantBytes = datapath.FrameCost(datapath.MustNewFrame(h.call.stream.ID, "sandbox", exited))
+			}
+			if h.call.frames != wantFrames || h.call.bytes != wantBytes {
+				t.Errorf("forwarded %d frames and %d bytes, want %d frames and %d bytes", h.call.frames, h.call.bytes, wantFrames, wantBytes)
+			}
+			h.waitClose()
+		})
+	}
 }
