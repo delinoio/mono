@@ -437,7 +437,7 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	}
 	data, err := u.download(ctx, target, order)
 	if err == nil {
-		err = u.queueVerified(order, target, data)
+		err = u.queueVerified(ctx, order, target, data)
 	}
 	if err != nil {
 		// Keep the last verified revocation after any download or
@@ -463,19 +463,31 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	return nil
 }
 
-// queueVerified holds the removal fence lock from the final admission check
-// through the disk write and queue publication.
-func (u *Updater) queueVerified(order uint64, target string, data []byte) error {
+// queueVerified holds the updater lock through the disk write and queue
+// publication. The last context check decides whether the update can pass
+// from the channel command to the process-level installer.
+func (u *Updater) queueVerified(ctx context.Context, order uint64, target string, data []byte) error {
 	u.mu.Lock()
 	if err := u.commandInvalidationLocked(order); err != nil {
 		u.mu.Unlock()
 		u.opts.Logger.Info("agent update download discarded", "target_version", target, "order", order)
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		u.mu.Unlock()
+		return err
+	}
 	// Each command has a unique artifact path.
 	path := u.opts.Store.Path(store.UpdateDir, fmt.Sprintf("ownsand-agent-%s-%d", target, order))
 	if err := store.WriteFileAtomic(path, data, 0o700); err != nil {
 		u.mu.Unlock()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		u.mu.Unlock()
+		if cleanupErr := os.Remove(path); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
+			u.opts.Logger.Warn("canceled update artifact removal failed", "target_version", target, "order", order, "error", cleanupErr)
+		}
 		return err
 	}
 	u.artifact = path
