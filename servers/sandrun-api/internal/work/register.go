@@ -3,6 +3,7 @@
 package work
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -25,9 +26,19 @@ import (
 // retention of ended requests and runners (30 days) and the clean-up hooks
 // of OwnSand link removal, runner profile deletion and organization
 // deletion, and returns the engine for the adapters of later layers.
-func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m *metrics.Metrics, timing Timing) *Engine {
+func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m *metrics.Metrics, timing Timing, watch WatchQueueTiming) *Engine {
 	e := New(r.Service, links, profiles, m, timing)
-	r.Handle(sandrunv1connect.NewWorkServiceHandler(&Handler{e: e}, r.HandlerOptions()...))
+	watch = WatchQueueTiming{
+		Keepalive:  cmp.Or(watch.Keepalive, watchKeepalive),
+		Lifetime:   cmp.Or(watch.Lifetime, watchLifetime),
+		WriteGrace: cmp.Or(watch.WriteGrace, watchWriteGrace),
+		Poll:       cmp.Or(watch.Poll, watchPoll),
+	}
+	h := &Handler{e: e, watch: watch}
+	opts := r.HandlerOptions()
+	path, handler := sandrunv1connect.NewWorkServiceHandler(h, opts...)
+	r.Handle(path, handler)
+	r.Handle(sandrunv1connect.WorkServiceWatchQueueProcedure, h.withWatchQueueDeadline(handler, connect.NewErrorWriter(opts...)))
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "dispatcher", RunFunc: e.RunDispatcher})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "runner_reconciler", RunFunc: e.RunReconciler})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "work_gauges", RunFunc: e.RunGauges})
