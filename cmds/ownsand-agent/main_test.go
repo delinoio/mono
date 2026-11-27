@@ -450,11 +450,15 @@ func TestStatusControlPlaneURL(t *testing.T) {
 	}
 }
 
-// A status.json that cannot be decoded or read is an error: a diagnostic on
-// standard error, exit 1 and never the first-run line. The other sections
-// still print.
+// An invalid status record or a read error produces a diagnostic and exit 1.
+// Both inventory counts still print.
 func TestStatusUnreadableStatusFile(t *testing.T) {
 	tests := map[string]func(t *testing.T, path string){
+		"null": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("null"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
 		"malformed": func(t *testing.T, path string) {
 			if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 				t.Fatal(err)
@@ -483,8 +487,8 @@ func TestStatusUnreadableStatusFile(t *testing.T) {
 			if !strings.Contains(errb.String(), "ownsand-agent: read status.json:") {
 				t.Fatalf("stderr = %q, want a read status.json diagnostic", errb.String())
 			}
-			if strings.Contains(out.String(), "has not run") || strings.Contains(out.String(), "Connection:") {
-				t.Fatalf("stdout = %q, must not report a connection state", out.String())
+			if strings.Contains(out.String(), "Connection:") || strings.Contains(out.String(), "Capabilities:") {
+				t.Fatalf("stdout = %q, must not report connection state or capabilities", out.String())
 			}
 			if !strings.Contains(out.String(), "Sandboxes: 0 records") || !strings.Contains(out.String(), "Snapshots: 0") {
 				t.Fatalf("stdout = %q, want the other sections", out.String())
