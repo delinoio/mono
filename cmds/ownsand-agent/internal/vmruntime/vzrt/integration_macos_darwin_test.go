@@ -79,17 +79,11 @@ func (e *env) mustCreateMacOS(snapshotID string, network ownsandv1.NetworkMode, 
 	return entry
 }
 
-// waitOutput runs cmd until its output contains want or the timeout passes.
-func (e *env) waitOutput(sandboxID, want string, timeout time.Duration, cmd ...string) string {
-	e.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		out, _ := e.exec(sandboxID, cmd...)
-		if strings.Contains(out, want) || time.Now().After(deadline) {
-			return out
-		}
-		time.Sleep(2 * time.Second)
-	}
+func (e *env) waitOutput(sandboxID, want string, timeout time.Duration, cmd ...string) error {
+	return waitForOutput(want, timeout, func(ctx context.Context) (string, error) {
+		out, _, err := e.execContext(ctx, sandboxID, cmd...)
+		return out, err
+	})
 }
 
 // newMacOSEnv starts a runtime, a sandbox manager and an operation
@@ -179,15 +173,15 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 	}
 	// The guest helper grows the APFS container to the 72 GiB disk after
 	// the boot; the container size is in bytes.
-	out = e.waitOutput(sb.GetSandboxId(), "grown", 3*time.Minute, "/bin/sh", "-c",
-		"s=$(diskutil info -plist / | plutil -extract APFSContainerSize raw -); [ \"$s\" -gt "+strconv.FormatInt(70<<30, 10)+" ] && echo grown $s || echo small $s")
-	if !strings.Contains(out, "grown") {
-		t.Fatalf("APFS container did not grow: %q", out)
+	if err := e.waitOutput(sb.GetSandboxId(), "grown", 3*time.Minute, "/bin/sh", "-c",
+		"s=$(diskutil info -plist / | plutil -extract APFSContainerSize raw -); [ \"$s\" -gt "+strconv.FormatInt(70<<30, 10)+" ] && echo grown $s || echo small $s"); err != nil {
+		t.Fatalf("APFS container did not grow: %v", err)
 	}
 	// A NONE sandbox has no virtio network device, which would carry the
 	// macOS guest MAC address.
-	if out, _ := e.exec(sb.GetSandboxId(), "/sbin/ifconfig", "-a"); strings.Contains(out, vzrt.MacOSGuestMAC.String()) {
-		t.Fatalf("NONE sandbox has a network device: %q", out)
+	out, ex = e.exec(sb.GetSandboxId(), "/sbin/ifconfig", "-a")
+	if err := checkMacOSNoneInterfaces(out, ex, vzrt.MacOSGuestMAC.String()); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
 		t.Fatal(err)
@@ -348,12 +342,12 @@ func TestVirtualizationMacOSOutbound(t *testing.T) {
 	e, _ := newMacOSEnv(t, image)
 	ob := e.mustCreateMacOS("", ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, false)
 	// The guest configures its interface with DHCP from the agent's stack.
-	out := e.waitOutput(ob.GetSandboxId(), "INTERNET_OK", 2*time.Minute, "/bin/sh", "-c",
-		"/usr/bin/curl -s -m 10 -o /dev/null http://example.com/ && echo INTERNET_OK")
-	if !strings.Contains(out, "INTERNET_OK") {
+	if err := e.waitOutput(ob.GetSandboxId(), "INTERNET_OK", 2*time.Minute, "/bin/sh", "-c",
+		"/usr/bin/curl -s -m 10 -o /dev/null http://example.com/ && echo INTERNET_OK"); err != nil {
+		t.Errorf("OUTBOUND macOS sandbox cannot reach the internet: %v", err)
 		diag, _ := e.exec(ob.GetSandboxId(), "/bin/sh", "-c",
 			"/sbin/ifconfig -a; /usr/sbin/networksetup -listallhardwareports; /usr/sbin/ipconfig getpacket en0; /usr/sbin/scutil --dns | head -20; /usr/bin/curl -sS -m 10 -o /dev/null http://example.com/ 2>&1; /usr/bin/curl -sS -m 10 -o /dev/null http://93.184.215.14/ 2>&1")
-		t.Fatalf("OUTBOUND macOS sandbox cannot reach the internet: %q\n%s", out, diag)
+		t.Fatalf("OUTBOUND macOS network diagnostics:\n%s", diag)
 	}
 	lan := hostLANAddress()
 	port := startHostServer(t, lan, "127.0.0.1")

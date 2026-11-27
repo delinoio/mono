@@ -17,25 +17,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { delimiter, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
-const lefthook = require("lefthook/get-exe.js").getExePath();
+const lefthookPackage = dirname(require.resolve("lefthook/package.json"));
 const skipMessage = /skipping Lefthook installation/;
-
-// Shells that can start the installer. bash ignores "set -e" inside a command
-// substitution used as an "if" condition, so the installer must behave the same
-// there as under dash. A shell that is not installed is skipped.
-const shells = [
-  { name: "sh", command: ["sh"] },
-  { name: "dash", command: ["dash"] },
-  { name: "bash", command: ["bash"] },
-  { name: "bash --posix", command: ["bash", "--posix"] },
-];
 
 // Spellings of Git's shared hooks directory that are relative to the repository
 // root and differ from the plain ".git/hooks".
@@ -45,25 +35,15 @@ const sharedHooksSpellings = [
   "./.git/hooks",
   ".git//hooks",
   ".git/./hooks",
+  ".git/hooks/.",
 ];
 
-function shellAvailable([shell]) {
-  const probe = spawnSync(shell, ["-c", "exit 0"], { stdio: "ignore" });
-  return probe.error === undefined && probe.status === 0;
-}
-
-function environment() {
-  // A developer's global core.hooksPath or an enclosing Git hook invocation must
-  // not change which branch of the installer runs.
-  const env = isolateGitEnvironment({ ...process.env });
-  env.PATH = [dirname(lefthook), env.PATH].join(delimiter);
-  return env;
-}
-
 function fixture(t) {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), "install-hooks-")));
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "install hooks ")));
   t.after(() => rmSync(base, { recursive: true, force: true }));
-  const env = environment();
+  // A developer's Git configuration or an enclosing Git hook must not change
+  // which branch of the installer runs.
+  const env = isolateGitEnvironment({ ...process.env });
   const git = (cwd, ...args) =>
     execFileSync("git", args, { cwd, env, encoding: "utf8" }).trim();
   const initRepository = (path) => {
@@ -78,23 +58,40 @@ function fixture(t) {
     mkdirSync(join(path, "scripts"), { recursive: true });
     copyFileSync(join(root, "lefthook.yml"), join(path, "lefthook.yml"));
     copyFileSync(
-      join(root, "scripts/install-git-hooks.sh"),
-      join(path, "scripts/install-git-hooks.sh"),
+      join(root, "scripts/install-git-hooks.mjs"),
+      join(path, "scripts/install-git-hooks.mjs"),
     );
   };
-  const install = (
-    cwd,
-    script = "scripts/install-git-hooks.sh",
-    [shell, ...shellArgs] = ["sh"],
-  ) =>
-    // A shell that is started with a mismatched PWD ignores it and reports the
-    // physical directory, which hides symlink handling in the installer. Give
-    // the shell the logical path a user's "cd" would have left in PWD.
-    spawnSync(shell, [...shellArgs, script], {
+  const linkLefthook = (path) => {
+    mkdirSync(join(path, "node_modules"));
+    symlinkSync(
+      lefthookPackage,
+      join(path, "node_modules/lefthook"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  };
+  const install = (cwd, script = "scripts/install-git-hooks.mjs") =>
+    spawnSync(process.execPath, [script], { cwd, env, encoding: "utf8" });
+  const prepare = (cwd) => {
+    copyFileSync(join(root, "package.json"), join(cwd, "package.json"));
+    const lifecycleEnv = Object.fromEntries(
+      Object.entries(env).filter(
+        ([name]) =>
+          !/^npm_config_(script_shell|shell_emulator|ignore_scripts|userconfig|globalconfig)$/i.test(
+            name,
+          ),
+      ),
+    );
+    lifecycleEnv.npm_config_userconfig = join(base, "empty.npmrc");
+    lifecycleEnv.npm_config_globalconfig = join(base, "empty.npmrc");
+    // Use the host's default shell to start pnpm, including pnpm.cmd on Windows.
+    return spawnSync("pnpm run prepare", {
       cwd,
-      env: { ...env, PWD: cwd },
+      env: lifecycleEnv,
       encoding: "utf8",
+      shell: true,
     });
+  };
   const installedHooks = (hooksDirectory) =>
     existsSync(hooksDirectory)
       ? readdirSync(hooksDirectory).filter((name) => !name.endsWith(".sample"))
@@ -114,42 +111,53 @@ function fixture(t) {
     git,
     initRepository,
     copyProject,
+    linkLefthook,
     install,
+    prepare,
     installedHooks,
     writeHook,
     snapshot,
   };
 }
 
-test("installs hooks in a normal clone", (t) => {
-  const { base, initRepository, copyProject, install } = fixture(t);
+test("pnpm prepare installs a managed hook with the default lifecycle shell", (t) => {
+  const { base, initRepository, copyProject, linkLefthook, prepare } =
+    fixture(t);
   const clone = join(base, "clone");
   initRepository(clone);
   copyProject(clone);
+  linkLefthook(clone);
 
-  const result = install(clone);
+  const result = prepare(clone);
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.ok(existsSync(join(clone, ".git/hooks/pre-commit")));
+  assert.equal(result.status, 0, result.error ?? result.stdout + result.stderr);
+  assert.match(
+    readFileSync(join(clone, ".git/hooks/pre-commit"), "utf8"),
+    /LEFTHOOK/,
+  );
 });
 
 test("installs hooks when run from the scripts directory", (t) => {
-  const { base, initRepository, copyProject, install } = fixture(t);
+  const { base, initRepository, copyProject, linkLefthook, install } =
+    fixture(t);
   const clone = join(base, "clone");
   initRepository(clone);
   copyProject(clone);
+  linkLefthook(clone);
 
-  const result = install(join(clone, "scripts"), "./install-git-hooks.sh");
+  const result = install(join(clone, "scripts"), "./install-git-hooks.mjs");
 
   assert.equal(result.status, 0, result.stderr);
   assert.ok(existsSync(join(clone, ".git/hooks/pre-commit")));
 });
 
 test("installs hooks in a clone reached through a symlinked path", (t) => {
-  const { base, initRepository, copyProject, install } = fixture(t);
+  const { base, initRepository, copyProject, linkLefthook, install } =
+    fixture(t);
   const clone = join(base, "clone");
   initRepository(clone);
   copyProject(clone);
+  linkLefthook(clone);
   const link = join(base, "link");
   symlinkSync(clone, link, process.platform === "win32" ? "junction" : "dir");
 
@@ -161,12 +169,14 @@ test("installs hooks in a clone reached through a symlinked path", (t) => {
 });
 
 test("installs hooks in a linked worktree that uses the shared hooks directory", (t) => {
-  const { base, git, initRepository, copyProject, install } = fixture(t);
+  const { base, git, initRepository, copyProject, linkLefthook, install } =
+    fixture(t);
   const main = join(base, "main");
   initRepository(main);
   const linked = join(base, "linked");
   git(main, "worktree", "add", "--quiet", "-b", "linked", linked);
   copyProject(linked);
+  linkLefthook(linked);
   const sharedHooks = join(main, ".git/hooks");
   git(main, "config", "core.hooksPath", sharedHooks);
 
@@ -178,10 +188,12 @@ test("installs hooks in a linked worktree that uses the shared hooks directory",
 });
 
 test("keeps Lefthook's protection for an unrelated custom hooks path", (t) => {
-  const { base, git, initRepository, copyProject, install } = fixture(t);
+  const { base, git, initRepository, copyProject, linkLefthook, install } =
+    fixture(t);
   const clone = join(base, "clone");
   initRepository(clone);
   copyProject(clone);
+  linkLefthook(clone);
   const customHooks = join(base, "custom-hooks");
   mkdirSync(customHooks);
   git(clone, "config", "core.hooksPath", customHooks);
@@ -192,137 +204,97 @@ test("keeps Lefthook's protection for an unrelated custom hooks path", (t) => {
   assert.equal(existsSync(join(customHooks, "pre-commit")), false);
 });
 
-for (const { name, command } of shells) {
-  const options = {
-    skip: !shellAvailable(command) && `${name} is not installed`,
-  };
-
-  test(
-    `keeps Lefthook's protection for a missing custom hooks path under ${name}`,
-    options,
-    (t) => {
-      const { base, git, initRepository, copyProject, install } = fixture(t);
-      const clone = join(base, "clone");
-      initRepository(clone);
-      copyProject(clone);
-      // Both the configured path and the shared hooks directory must be absent so
-      // that a helper that wrongly succeeds canonicalizes them to the same value.
-      rmSync(join(clone, ".git/hooks"), { recursive: true, force: true });
-      git(clone, "config", "core.hooksPath", ".husky");
-
-      const result = install(clone, undefined, command);
-
-      assert.notEqual(result.status, 0, result.stdout);
-      assert.match(
-        result.stdout + result.stderr,
-        /Custom hooks paths are not supported/,
-      );
-      assert.equal(existsSync(join(clone, ".husky")), false);
-      assert.equal(existsSync(join(clone, ".git/hooks/pre-commit")), false);
-    },
-  );
-
-  test(
-    `forces installation into the shared hooks directory under ${name}`,
-    options,
-    (t) => {
-      const {
-        base,
-        git,
-        initRepository,
-        copyProject,
-        install,
-        installedHooks,
-      } = fixture(t);
-      const clone = join(base, "clone");
-      initRepository(clone);
-      copyProject(clone);
-      const sharedHooks = join(clone, ".git/hooks");
-      git(clone, "config", "core.hooksPath", sharedHooks);
-
-      const result = install(clone, undefined, command);
-
-      assert.equal(result.status, 0, result.stderr);
-      assert.deepEqual(installedHooks(sharedHooks), ["pre-commit"]);
-    },
-  );
-
-  test(`installs hooks without core.hooksPath under ${name}`, options, (t) => {
-    const { base, initRepository, copyProject, install } = fixture(t);
+for (const customPath of [".husky", ".git/hooks-other"]) {
+  test(`protects missing custom hooks path "${customPath}"`, (t) => {
+    const { base, git, initRepository, copyProject, linkLefthook, install } =
+      fixture(t);
     const clone = join(base, "clone");
     initRepository(clone);
     copyProject(clone);
+    linkLefthook(clone);
+    rmSync(join(clone, ".git/hooks"), { recursive: true, force: true });
+    git(clone, "config", "core.hooksPath", customPath);
 
-    const result = install(clone, undefined, command);
+    const result = install(clone);
 
-    assert.equal(result.status, 0, result.stderr);
-    assert.ok(existsSync(join(clone, ".git/hooks/pre-commit")));
-  });
-
-  // Git creates the shared hooks directory by default, but a template-less
-  // "git init" or a cleanup can leave it missing. Every spelling of that
-  // directory must still be recognized as the shared hooks directory.
-  for (const spelling of sharedHooksSpellings) {
-    test(
-      `forces installation for the missing shared hooks directory spelled "${spelling}" under ${name}`,
-      options,
-      (t) => {
-        const {
-          base,
-          git,
-          initRepository,
-          copyProject,
-          install,
-          installedHooks,
-        } = fixture(t);
-        const clone = join(base, "clone");
-        initRepository(clone);
-        copyProject(clone);
-        rmSync(join(clone, ".git/hooks"), { recursive: true, force: true });
-        git(clone, "config", "core.hooksPath", spelling);
-
-        const result = install(clone, undefined, command);
-
-        assert.equal(result.status, 0, result.stdout + result.stderr);
-        assert.deepEqual(installedHooks(join(clone, ".git/hooks")), [
-          "pre-commit",
-        ]);
-      },
+    assert.equal(result.status, 1, result.error ?? result.stdout);
+    assert.match(
+      result.stdout + result.stderr,
+      /Custom hooks paths are not supported/,
     );
-  }
-
-  test(
-    `keeps Lefthook's protection for a missing sibling of the shared hooks directory under ${name}`,
-    options,
-    (t) => {
-      const { base, git, initRepository, copyProject, install } = fixture(t);
-      const clone = join(base, "clone");
-      initRepository(clone);
-      copyProject(clone);
-      rmSync(join(clone, ".git/hooks"), { recursive: true, force: true });
-      git(clone, "config", "core.hooksPath", ".git/hooks-other");
-
-      const result = install(clone, undefined, command);
-
-      assert.notEqual(result.status, 0, result.stdout);
-      assert.match(
-        result.stdout + result.stderr,
-        /Custom hooks paths are not supported/,
-      );
-      assert.equal(existsSync(join(clone, ".git/hooks-other")), false);
-      assert.equal(existsSync(join(clone, ".git/hooks/pre-commit")), false);
-    },
-  );
+    assert.equal(existsSync(join(clone, customPath)), false);
+    assert.equal(existsSync(join(clone, ".git/hooks/pre-commit")), false);
+  });
 }
 
-test("forces installation for a missing shared hooks directory in a linked worktree", (t) => {
-  const { base, git, initRepository, copyProject, install, installedHooks } =
+// Git creates the shared hooks directory by default. A template-less git init
+// or a cleanup can leave it missing, so test each path without that directory.
+for (const spelling of sharedHooksSpellings) {
+  test(`forces installation for missing shared hooks path "${spelling}"`, (t) => {
+    const {
+      base,
+      git,
+      initRepository,
+      copyProject,
+      linkLefthook,
+      install,
+      installedHooks,
+    } = fixture(t);
+    const clone = join(base, "clone");
+    initRepository(clone);
+    copyProject(clone);
+    linkLefthook(clone);
+    rmSync(join(clone, ".git/hooks"), { recursive: true, force: true });
+    git(clone, "config", "core.hooksPath", spelling);
+
+    const result = install(clone);
+
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(installedHooks(join(clone, ".git/hooks")), ["pre-commit"]);
+  });
+}
+
+test("recognizes a symlink to the shared hooks directory", (t) => {
+  const { base, git, initRepository, copyProject, linkLefthook, install } =
     fixture(t);
+  const clone = join(base, "clone");
+  initRepository(clone);
+  copyProject(clone);
+  linkLefthook(clone);
+  const sharedHooks = join(clone, ".git/hooks");
+  const alias = join(clone, "shared-hooks");
+  symlinkSync(
+    sharedHooks,
+    alias,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  git(clone, "config", "core.hooksPath", "shared-hooks");
+
+  const result = install(clone);
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(
+    readFileSync(join(sharedHooks, "pre-commit"), "utf8"),
+    /LEFTHOOK/,
+  );
+});
+
+test("forces installation for a missing shared hooks directory in a linked worktree", (t) => {
+  const {
+    base,
+    git,
+    initRepository,
+    copyProject,
+    linkLefthook,
+    install,
+    installedHooks,
+  } = fixture(t);
   const main = join(base, "main");
   initRepository(main);
   const linked = join(base, "linked");
   git(main, "worktree", "add", "--quiet", "-b", "linked", linked);
   copyProject(linked);
+  linkLefthook(linked);
   const sharedHooks = join(main, ".git/hooks");
   rmSync(sharedHooks, { recursive: true, force: true });
   git(main, "config", "core.hooksPath", `${sharedHooks}/`);
@@ -356,7 +328,7 @@ test("skips an archive nested in another repository when started from the outer 
   initRepository(outer);
   copyProject(join(outer, "archive"));
 
-  const result = install(outer, "archive/scripts/install-git-hooks.sh");
+  const result = install(outer, "archive/scripts/install-git-hooks.mjs");
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, skipMessage);
@@ -374,7 +346,7 @@ test("skips an absolute script path run from an unrelated repository", (t) => {
 
   const result = install(
     unrelated,
-    join(archive, "scripts/install-git-hooks.sh"),
+    join(archive, "scripts/install-git-hooks.mjs"),
   );
 
   assert.equal(result.status, 0, result.stderr);
@@ -407,69 +379,64 @@ function sharedHooksFixture(t) {
   const linked = join(context.base, "linked");
   context.git(main, "worktree", "add", "--quiet", "-b", "linked", linked);
   context.copyProject(linked);
+  context.linkLefthook(linked);
   const sharedHooks = join(main, ".git/hooks");
   context.git(main, "config", "core.hooksPath", sharedHooks);
   return { ...context, main, linked, sharedHooks };
 }
 
-test(
-  "refuses to overwrite an existing backup of a custom hook in the shared hooks directory",
-  posixOnly,
-  (t) => {
-    const { linked, sharedHooks, install, writeHook, snapshot } =
-      sharedHooksFixture(t);
-    const hook = join(sharedHooks, "pre-commit");
-    const backup = join(sharedHooks, "pre-commit.old");
-    writeHook(hook, "#!/bin/sh\n# CUSTOM hook\n");
-    writeHook(backup, "#!/bin/sh\n# ORIGINAL backup\n");
-    const before = { hook: snapshot(hook), backup: snapshot(backup) };
+test("refuses to overwrite an existing backup of a custom hook in the shared hooks directory", (t) => {
+  const { linked, sharedHooks, install, writeHook, snapshot } =
+    sharedHooksFixture(t);
+  const hook = join(sharedHooks, "pre-commit");
+  const backup = join(sharedHooks, "pre-commit.old");
+  writeHook(hook, "#!/bin/sh\n# CUSTOM hook\n");
+  writeHook(backup, "#!/bin/sh\n# ORIGINAL backup\n");
+  const before = { hook: snapshot(hook), backup: snapshot(backup) };
 
-    const result = install(linked);
+  const result = install(linked);
 
-    assert.equal(result.status, 1, result.stdout);
-    assert.ok(result.stderr.includes(hook), result.stderr);
-    assert.ok(result.stderr.includes(backup), result.stderr);
-    assert.equal(
-      result.stdout,
-      "",
-      "the installer must refuse before it starts Lefthook",
-    );
-    assert.deepEqual(snapshot(hook), before.hook);
-    assert.deepEqual(snapshot(backup), before.backup);
-  },
-);
+  assert.equal(result.status, 1, result.stdout);
+  assert.ok(result.stderr.includes(hook), result.stderr);
+  assert.ok(result.stderr.includes(backup), result.stderr);
+  assert.equal(
+    result.stdout,
+    "",
+    "the installer must refuse before it starts Lefthook",
+  );
+  assert.deepEqual(snapshot(hook), before.hook);
+  assert.deepEqual(snapshot(backup), before.backup);
+});
 
-test(
-  "refuses the backup conflict when core.hooksPath is a relative path to the shared directory",
-  posixOnly,
-  (t) => {
-    const {
-      base,
-      git,
-      initRepository,
-      copyProject,
-      install,
-      writeHook,
-      snapshot,
-    } = fixture(t);
-    const clone = join(base, "clone");
-    initRepository(clone);
-    copyProject(clone);
-    git(clone, "config", "core.hooksPath", ".git/../.git/hooks");
-    const hook = join(clone, ".git/hooks/pre-commit");
-    const backup = join(clone, ".git/hooks/pre-commit.old");
-    writeHook(hook, "#!/bin/sh\n# CUSTOM hook\n");
-    writeHook(backup, "#!/bin/sh\n# ORIGINAL backup\n");
-    const before = { hook: snapshot(hook), backup: snapshot(backup) };
+test("refuses the backup conflict when core.hooksPath is a relative path to the shared directory", (t) => {
+  const {
+    base,
+    git,
+    initRepository,
+    copyProject,
+    linkLefthook,
+    install,
+    writeHook,
+    snapshot,
+  } = fixture(t);
+  const clone = join(base, "clone");
+  initRepository(clone);
+  copyProject(clone);
+  linkLefthook(clone);
+  git(clone, "config", "core.hooksPath", ".git/../.git/hooks");
+  const hook = join(clone, ".git/hooks/pre-commit");
+  const backup = join(clone, ".git/hooks/pre-commit.old");
+  writeHook(hook, "#!/bin/sh\n# CUSTOM hook\n");
+  writeHook(backup, "#!/bin/sh\n# ORIGINAL backup\n");
+  const before = { hook: snapshot(hook), backup: snapshot(backup) };
 
-    const result = install(clone);
+  const result = install(clone);
 
-    assert.equal(result.status, 1, result.stdout);
-    assert.ok(result.stderr.includes(backup), result.stderr);
-    assert.deepEqual(snapshot(hook), before.hook);
-    assert.deepEqual(snapshot(backup), before.backup);
-  },
-);
+  assert.equal(result.status, 1, result.stdout);
+  assert.ok(result.stderr.includes(backup), result.stderr);
+  assert.deepEqual(snapshot(hook), before.hook);
+  assert.deepEqual(snapshot(backup), before.backup);
+});
 
 test(
   "backs up a custom hook in the shared hooks directory when no backup exists",
@@ -540,6 +507,7 @@ test(
       git,
       initRepository,
       copyProject,
+      linkLefthook,
       install,
       writeHook,
       snapshot,
@@ -547,6 +515,7 @@ test(
     const clone = join(base, "clone");
     initRepository(clone);
     copyProject(clone);
+    linkLefthook(clone);
     const customHooks = join(base, "custom-hooks");
     mkdirSync(customHooks);
     git(clone, "config", "core.hooksPath", customHooks);

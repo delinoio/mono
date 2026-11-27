@@ -27,6 +27,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmacl"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/hcsrt"
 	"github.com/delinoio/mono/go/ownsand/datapath"
@@ -252,6 +253,11 @@ func testHyperVIntegration(t *testing.T, diskSizing bool) {
 		t.Fatalf("sandbox %v", sb)
 	}
 	checkDiskSize(sb.GetSandboxId())
+	worker := checkSandboxDiskACL(t, filepath.Join(vmsDir, sb.GetSandboxId()), "disk.vhd")
+	aces := vmACEs(t, kernel)
+	if len(aces) != 1 || aces[0].kind != vmacl.WorkerGroup || aces[0].mask != vmacl.ReadExecute {
+		t.Fatalf("shared kernel must have only the VM group read/execute grant: %+v", aces)
+	}
 	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo hello; uname -sm; echo state > /root/marker; df -k / | tail -1; ls /sys/class/net")
 	if !execSucceeded(ex) || !strings.Contains(out, "hello\nLinux x86_64\n") {
 		t.Fatalf("exec output %q exited %q", out, ex)
@@ -307,6 +313,9 @@ func testHyperVIntegration(t *testing.T, diskSizing bool) {
 		t.Fatalf("restore path %v", cold.GetRestorePath())
 	}
 	checkDiskSize(cold.GetSandboxId())
+	if got := checkSandboxDiskACL(t, filepath.Join(vmsDir, cold.GetSandboxId()), "disk.vhd"); got == worker {
+		t.Fatalf("source and restored disk grant the same worker SID %s", got)
+	}
 	if out, _ := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
 		t.Fatalf("sandbox from snapshot %q", out)
 	}

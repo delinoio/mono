@@ -102,8 +102,8 @@ mv "$dir.partial" "$dir"
 `
 }
 
-// windowsInstallScript installs the runner if it is missing and restricts
-// access to the runner directory before SandRun can write the JIT configuration.
+// windowsInstallScript installs the runner if it is missing and verifies
+// the runner directory ACL before SandRun can request the JIT configuration.
 func windowsInstallScript() string {
 	return `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -131,11 +131,32 @@ if (-not $installed) {
   if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
   Move-Item -LiteralPath $partial -Destination $dir
 }
-# Replace the entire DACL, including explicit grants from a template.
-# Set a trusted owner so the previous owner cannot restore those grants.
+function Test-RunnerAcl($acl) {
+  $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+  $rules = $descriptor.DiscretionaryAcl
+  if ($descriptor.Owner.Value -ne 'S-1-5-32-544' -or -not $acl.AreAccessRulesProtected -or
+      $null -eq $rules -or $rules.Count -ne 2) { return $false }
+
+  # Inspect every ACE, including types that GetAccessRules does not return.
+  $flags = [System.Security.AccessControl.AceFlags]'ObjectInherit, ContainerInherit'
+  $fullControl = [int][System.Security.AccessControl.FileSystemRights]::FullControl
+  foreach ($rule in $rules) {
+    if ($rule.AceType -ne 'AccessAllowed' -or $rule.AceFlags -ne $flags -or
+        $rule.AccessMask -ne $fullControl) { return $false }
+  }
+  $sids = @($rules | ForEach-Object { $_.SecurityIdentifier.Value })
+  return ($sids -contains 'S-1-5-18') -and ($sids -contains 'S-1-5-32-544')
+}
+
 $acl = Get-Acl -LiteralPath $dir
-$acl.SetSecurityDescriptorSddlForm('O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)', [System.Security.AccessControl.AccessControlSections]'Owner, Access')
-Set-Acl -LiteralPath $dir -AclObject $acl
+if (-not (Test-RunnerAcl $acl)) {
+  # Replace all grants and set a trusted owner so the previous owner cannot restore them.
+  $acl.SetSecurityDescriptorSddlForm('O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)', [System.Security.AccessControl.AccessControlSections]'Owner, Access')
+  Set-Acl -LiteralPath $dir -AclObject $acl
+  if (-not (Test-RunnerAcl (Get-Acl -LiteralPath $dir))) {
+    throw 'runner directory ACL verification failed after repair'
+  }
+}
 `
 }
 

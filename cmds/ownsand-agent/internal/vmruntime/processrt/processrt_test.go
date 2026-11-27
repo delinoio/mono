@@ -439,12 +439,8 @@ func TestDeleteNeverContinuesHelperBeforeKill(t *testing.T) {
 	}
 }
 
-// TestPauseFailureContinuesHelper checks that a Pause that fails while it
-// lists the exec process groups (a canceled context fails the `ps` command)
-// continues the helper again. The sandbox manager keeps the sandbox in the
-// running state when Pause fails, and a later Resume of that state does not
-// reach the runtime, so a helper that stayed stopped would freeze the sandbox
-// for good.
+// TestPauseFailureContinuesHelper checks that Pause resumes the helper when
+// listing the exec process groups fails after the helper has stopped.
 func TestPauseFailureContinuesHelper(t *testing.T) {
 	rt := newRuntime(t)
 	v := createSandbox(t, rt)
@@ -455,17 +451,26 @@ func TestPauseFailureContinuesHelper(t *testing.T) {
 	}
 	helperPID := helper.helper.pid
 
-	canceled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := rt.Pause(canceled, v); err == nil {
-		t.Fatal("Pause with a canceled context succeeded; want an error")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	useStopSeams(t, helper, func(ctx context.Context, pid int) (bool, error) {
+		stopped, err := processStopped(ctx, pid)
+		// Let the stop wait succeed so cancellation fails the worker listing.
+		if stopped && err == nil {
+			cancel()
+		}
+		return stopped, err
+	}, 0)
+	err = rt.Pause(ctx, v)
+	useStopSeams(t, helper, nil, 0)
+	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "processrt: list exec process groups of sandbox "+v.SandboxID()+":") {
+		t.Fatalf("Pause = %v; want a worker enumeration error wrapping context.Canceled", err)
 	}
 	waitState(t, "helper after the failed Pause", helperPID, "S", "R")
 	for _, pid := range []int{shell, sleeper} {
 		waitState(t, "worker after the failed Pause", pid, "S", "R")
 	}
 
-	// The next Pause works, which shows that the sandbox is not frozen.
 	if err := rt.Pause(context.Background(), v); err != nil {
 		t.Fatal(err)
 	}
@@ -477,6 +482,9 @@ func TestPauseFailureContinuesHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitState(t, "helper after Resume", helperPID, "S", "R")
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after Resume", pid, "S", "R")
+	}
 }
 
 // TestResumeFailureKeepsSandboxStopped checks that a Resume that fails while
@@ -1616,6 +1624,69 @@ func TestDeleteUntrackedRemovesRecordedSocketDirectory(t *testing.T) {
 	mustNotExist(t, socketDir)
 	mustNotExist(t, otherDir)
 	mustExist(t, unrelated)
+}
+
+func TestDeleteUntrackedRetainsUnreadableSocketDirectoryRecord(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("socket record read must run without root privileges")
+	}
+	ctx := t.Context()
+	vmsDir := t.TempDir()
+	id := "0192f4b6-7c3a-7def-8abc-000000000001"
+	dir := writeSandboxFiles(t, vmsDir, id)
+	socketDir, err := os.MkdirTemp(t.TempDir(), socketDirPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(socketDir, "g.sock")
+	if err := os.WriteFile(socket, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordSocketDir(dir, socketDir); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, socketDirFile)
+	if err := os.Chmod(record, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(record); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("read of restricted socket record = %v; want a permission error", err)
+	}
+
+	rt := newRuntimeWithVMsDir(t, vmsDir)
+	if err := rt.Delete(ctx, id); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Delete with an unreadable socket record = %v; want a permission error", err)
+	}
+	mustExist(t, filepath.Join(dir, rootDir, "user-file.txt"))
+	mustExist(t, record)
+	mustExist(t, socket)
+	if err := os.Chmod(record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block external cleanup to verify it happens before sandbox removal.
+	if err := os.Chmod(socketDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(socketDir, 0o700); err != nil && !os.IsNotExist(err) {
+			t.Errorf("restore socket directory permissions: %v", err)
+		}
+	})
+	if err := rt.Delete(ctx, id); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Delete with a read-only socket directory = %v; want a permission error", err)
+	}
+	if data, err := os.ReadFile(record); err != nil || string(data) != socketDir {
+		t.Fatalf("socket directory record after failed cleanup = %q, %v; want %q", data, err, socketDir)
+	}
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Delete(ctx, id); err != nil {
+		t.Fatalf("Delete after restoring access: %v", err)
+	}
+	mustNotExist(t, socketDir)
+	mustNotExist(t, dir)
 }
 
 func TestDeleteRetainsSocketDirectoryRecordOnRemovalFailure(t *testing.T) {

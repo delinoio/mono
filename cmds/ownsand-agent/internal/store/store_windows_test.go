@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmacl"
 )
 
 // requireTrustedProcess skips a test that needs the privileges of the
@@ -170,8 +173,8 @@ func TestOpenRestrictsStateDirACL(t *testing.T) {
 
 // Open corrects a state directory that exists with a wider ACL: inherited
 // entries of the parent, a protected child and an explicit entry of
-// another account on a child. An explicit entry of the Hyper-V worker group
-// stays, and a service log that another process holds open stays deletable.
+// another account on a child. The Hyper-V group's inheritable grant is
+// removed, and a service log that another process holds open stays deletable.
 func TestOpenCorrectsExistingStateDirACL(t *testing.T) {
 	requireTrustedProcess(t)
 	dir := filepath.Join(t.TempDir(), "state")
@@ -179,7 +182,7 @@ func TestOpenCorrectsExistingStateDirACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	everyone := wellKnown(t, windows.WinWorldSid)
-	vmGroup, err := windows.StringToSid(virtualMachinesSID)
+	vmGroup, err := windows.StringToSid(vmacl.GroupSID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,12 +252,9 @@ func TestOpenCorrectsExistingStateDirACL(t *testing.T) {
 		assertOnlyTrusted(t, protectedFile, pAces)
 
 		vmAces, _ := dacl(t, vmDir)
-		if !hasSID(vmAces, vmGroup) {
-			t.Errorf("Open %d: the Virtual Machines group lost its entry on the VM directory", i)
-		}
 		diskAces, _ := dacl(t, disk)
-		if !hasSID(diskAces, vmGroup) {
-			t.Errorf("Open %d: the VM file does not inherit the Virtual Machines entry", i)
+		if hasSID(vmAces, vmGroup) || hasSID(diskAces, vmGroup) {
+			t.Errorf("Open %d: the legacy worker group grant remains on the VM directory or disk", i)
 		}
 		if hasSID(diskAces, everyone) || hasSID(vmAces, everyone) {
 			t.Errorf("Open %d: a VM entry grants Everyone", i)
@@ -288,7 +288,7 @@ func TestWipeLocalDataKeepsACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WipeLocalData(); err != nil {
+	if err := wipeLocalData(t, s); err != nil {
 		t.Fatal(err)
 	}
 	aces, _ := dacl(t, s.Path(VMsDir))
@@ -314,11 +314,125 @@ func TestOwnerAllowed(t *testing.T) {
 		{"everyone", everyone, p.trusted, false},
 		{"nil owner", nil, p.trusted, false},
 		{"virtual machines as root owner", p.vmGroup, p.trusted, false},
-		{"virtual machines as child owner", p.vmGroup, p.retained, true},
+		{"virtual machines as child owner", p.vmGroup, p.childOwners, true},
 	} {
 		if got := ownerAllowed(tc.owner, tc.allowed); got != tc.want {
 			t.Errorf("%s: ownerAllowed = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestOpenKeepsPerVMEntriesAndDropsGroupWrite(t *testing.T) {
+	requireTrustedProcess(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vmGroup, err := windows.StringToSid(vmacl.GroupSID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := windows.StringToSid("S-1-5-83-1-1-2-3-4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := st.Path(ImagesDir, images.WindowsDir)
+	vmDisk := st.Path(VMsDir, "sandbox", "disk.vhdx")
+	imageDisk := filepath.Join(image, images.WindowsDisk)
+	buildDisk := filepath.Join(images.BuildDir(image), images.WindowsDisk)
+	kernel := st.Path(ImagesDir, "linux", "vmlinux")
+	for _, path := range []string{vmDisk, imageDisk, buildDisk, kernel} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	addExplicitACE(t, vmDisk, worker, fileAllAccess, windows.NO_INHERITANCE)
+	addExplicitACE(t, buildDisk, worker, fileAllAccess, windows.NO_INHERITANCE)
+	addExplicitACE(t, imageDisk, worker, fileAllAccess, windows.NO_INHERITANCE)
+	addExplicitACE(t, imageDisk, vmGroup, fileAllAccess, windows.NO_INHERITANCE)
+	addExplicitACE(t, kernel, vmGroup, vmacl.ReadExecute, windows.NO_INHERITANCE)
+	lock, err := images.TryLock(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if lock != nil {
+			_ = lock.Release()
+		}
+	}()
+	checkACE := func(path string, sid *windows.SID, mask windows.ACCESS_MASK, want bool) {
+		t.Helper()
+		aces, _ := dacl(t, path)
+		for _, a := range aces {
+			if a.sid != nil && a.sid.Equals(sid) {
+				if !want || a.aceType != windows.ACCESS_ALLOWED_ACE_TYPE || a.inherited || a.mask != mask {
+					t.Errorf("%s: unexpected ACE for %v with mask %#x", path, sid, a.mask)
+				}
+				return
+			}
+		}
+		if want {
+			t.Errorf("%s: missing ACE for %v", path, sid)
+		}
+	}
+	if _, err := Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	checkACE(vmDisk, worker, fileAllAccess, true)
+	checkACE(buildDisk, worker, fileAllAccess, true)
+	checkACE(imageDisk, worker, 0, false)
+	checkACE(imageDisk, vmGroup, 0, false)
+	checkACE(kernel, vmGroup, vmacl.ReadExecute, true)
+
+	err = lock.Release()
+	lock = nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	checkACE(buildDisk, worker, 0, false)
+	checkACE(vmDisk, worker, fileAllAccess, true)
+}
+
+func TestVMWorkerACERetention(t *testing.T) {
+	p, err := newPrincipals(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := windows.StringToSid("S-1-5-83-1-1-2-3-4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		sid        *windows.SID
+		mask       windows.ACCESS_MASK
+		flags      uint8
+		keepWorker bool
+		want       bool
+	}{
+		{"disk worker", worker, fileAllAccess, 0, true, true},
+		{"worker outside vms", worker, fileAllAccess, 0, false, false},
+		{"kernel group", p.vmGroup, vmacl.ReadExecute, 0, false, true},
+		{"generic read group", p.vmGroup, windows.GENERIC_READ, 0, false, true},
+		{"generic write group", p.vmGroup, windows.GENERIC_WRITE, 0, true, false},
+		{"delete group", p.vmGroup, windows.DELETE, 0, true, false},
+		{"change ACL group", p.vmGroup, windows.WRITE_DAC, 0, true, false},
+		{"inheritable group", p.vmGroup, vmacl.ReadExecute, windows.OBJECT_INHERIT_ACE, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := aceInfo{aceType: windows.ACCESS_ALLOWED_ACE_TYPE, flags: tc.flags, mask: tc.mask, sid: tc.sid}
+			if got := p.keepACE(a, tc.keepWorker); got != tc.want {
+				t.Errorf("keepACE = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -357,7 +471,7 @@ func TestPrincipalsProcessUserOwner(t *testing.T) {
 		}
 		// The owner allowance never adds an entry to a DACL or keeps an
 		// explicit entry of the process user on a child.
-		if sidIn(user, p.trusted) || sidIn(user, p.retained) {
+		if p.keepACE(aceInfo{aceType: windows.ACCESS_ALLOWED_ACE_TYPE, sid: user, mask: fileAllAccess}, true) {
 			t.Errorf("%s: the process user is a trusted or retained principal", tc.name)
 		}
 	}
@@ -517,9 +631,10 @@ func TestWriteFileAtomicGivesUpOnStuckReader(t *testing.T) {
 // Go sharing mode, as `ownsand-agent status` does) never make a write fail
 // and never read an incomplete report.
 func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
+	requireTrustedProcess(t)
 	s, err := Open(t.TempDir())
 	if err != nil {
-		t.Skipf("open the store (needs an elevated administrator): %v", err)
+		t.Fatalf("open the store: %v", err)
 	}
 	type report struct {
 		Seq     int    `json:"seq"`

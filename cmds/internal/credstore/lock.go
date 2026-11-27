@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// LockFileName is the name of the lock file that serializes the changes of
-// the credential file across processes. It never holds a secret.
+// LockFileName is the name of the lock file that serializes access to the
+// credential store across processes. It never holds a secret.
 const LockFileName = "credentials.lock"
 
 // lockTimeout bounds the wait for the store lock. Holders only run local file
@@ -25,7 +25,7 @@ const lockPollInterval = 5 * time.Millisecond
 var ErrLockTimeout = errors.New("credstore: timed out waiting for the credential store lock")
 
 // lock takes the cross-process store lock and returns a function that
-// releases it. The caller must have created the store directory. The lock is
+// releases it. The store directory must exist. The lock is
 // an advisory OS file lock on a separate lock file, so the credential file
 // can still be replaced atomically while the lock is held, and the OS
 // releases the lock when the process exits.
