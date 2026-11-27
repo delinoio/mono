@@ -1,0 +1,48 @@
+{
+  "gid": "inv-35-windows-diskpart-layout",
+  "commit": "48669830ac1f1e77e22aa8b74801fcd3ac6ad308",
+  "nativeValidation": {
+    "platform": "windows",
+    "status": "pending",
+    "sha": "48669830ac1f1e77e22aa8b74801fcd3ac6ad308",
+    "environment": "Native Windows amd64 (delino-win-1), non-elevated PowerShell",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "host": "delino-win-1",
+    "setup": "Use a short disposable checkout of the indicated revision and a non-elevated PowerShell session at its repository root. Run commands 1 and 2, copy the probe from files.copyFrom to files.copyTo, then run the remaining commands in order. The probe uses Go overlays for controlled script-string mutations. It writes scratch files inside the checkout.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne '48669830ac1f1e77e22aa8b74801fcd3ac6ad308') { throw 'Unexpected validation revision' }",
+      "New-Item -ItemType Directory -Path '.t3-tmp/diskpart-layout' -Force | Out-Null",
+      "$probe = (Resolve-Path '.t3-tmp/diskpart-layout/probe.go').Path; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne '78085f1ccc44c8f03636f86239292b456b1adbb66871193cfd7b796a48d02b63') { throw 'Unexpected probe checksum' }",
+      "$env:TEMP = (Resolve-Path '.t3-tmp').Path; $env:TMP = $env:TEMP; $env:TMPDIR = $env:TEMP; $env:GOTMPDIR = $env:TEMP",
+      "go test '-v' '-count=1' '-run' '^TestDiskpartScript$' './cmds/ownsand-agent/internal/imagebuild' 2>&1 | Tee-Object -FilePath '.t3-tmp/diskpart-layout/windows-native.log'; if ($LASTEXITCODE -ne 0) { throw 'Native DiskPart script fixture failed' }",
+      "go run $probe 2>&1 | Tee-Object -FilePath '.t3-tmp/diskpart-layout/windows-mutations.log'; if ($LASTEXITCODE -ne 0) { throw 'Native DiskPart script mutation probe failed' }"
+    ],
+    "expectedResults": [
+      "The direct command exits zero and logs PASS for TestDiskpartScript.",
+      "The mutation probe exits zero. Its summary shows one accepted original script and eight rejected mutations: missing-msr, msr-size, efi-size, msr-before-efi, missing-fat32, formats-swapped, wrong-primary-filesystem, and extra-recovery.",
+      "Each rejected mutation has its own log under the printed probe directory and fails TestDiskpartScript with the diskpartScript commands diagnostic."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-diskpart-layout/worker/.t3-tmp/diskpart-layout/probe.go",
+      "copyTo": ".t3-tmp/diskpart-layout/probe.go",
+      "sha256": "78085f1ccc44c8f03636f86239292b456b1adbb66871193cfd7b796a48d02b63",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/windows_windows_test.go"
+      ],
+      "generator": "cmds/ownsand-agent/internal/imagebuild/windisk_windows.go",
+      "outputLogs": [
+        ".t3-tmp/diskpart-layout/windows-native.log",
+        ".t3-tmp/diskpart-layout/windows-mutations.log",
+        ".t3-tmp/diskpart-layout/probe-*/<scenario>.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-diskpart-layout/worker/.t3-tmp/diskpart-layout/imagebuild.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-diskpart-layout/worker/.t3-tmp/diskpart-layout/probe.exe"
+      ]
+    },
+    "requiresElevation": [],
+    "outOfScope": [
+      "Executing DiskPart, creating a VHDX, and booting a Hyper-V guest require elevated host access and are outside this fixture task."
+    ]
+  }
+}
