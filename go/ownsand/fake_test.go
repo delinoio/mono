@@ -1096,10 +1096,13 @@ type fakeAgent struct {
 	// endSizeDelta is added to the size that serveRead reports in the final
 	// FileReadEnd event. Zero reports the real size.
 	endSizeDelta int64
-	watchers     []chan struct{}
-	writeReqs    []*ownsandv1.WriteFileRequest
-	readReqs     []*ownsandv1.ReadFileRequest
-	execReqs     []*ownsandv1.ExecRequest
+
+	// writeSizeDelta shifts the size in a completed write acknowledgement.
+	writeSizeDelta int64
+	watchers       []chan struct{}
+	writeReqs      []*ownsandv1.WriteFileRequest
+	readReqs       []*ownsandv1.ReadFileRequest
+	execReqs       []*ownsandv1.ExecRequest
 }
 
 type fakeWrite struct {
@@ -1299,7 +1302,7 @@ func (a *fakeAgent) write(req *ownsandv1.WriteFileRequest, grantDigest []byte) (
 			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("ranges do not cover the size"))
 		}
 		a.files[w.path] = append([]byte(nil), w.data...)
-		res.Finished, res.SizeBytes = true, fin.GetSizeBytes()
+		res.Finished, res.SizeBytes = true, fin.GetSizeBytes()+a.writeSizeDelta
 		w.done = res
 	}
 	return res, nil

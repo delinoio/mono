@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
 
 // TestMemberLeaveRefreshesOnce checks that member leave refreshes an
@@ -46,6 +47,9 @@ func TestMemberLeaveRefreshesOnce(t *testing.T) {
 	}
 
 	f.ok("", "--org", f.org, "member", "leave")
+	if calls := f.srv.Calls(sandrunv1connect.MemberServiceRemoveMemberProcedure); calls != 1 {
+		t.Fatalf("RemoveMember calls = %d, want 1", calls)
+	}
 	if refreshes != 1 {
 		t.Fatalf("Logto refreshes = %d, want 1", refreshes)
 	}

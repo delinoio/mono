@@ -77,6 +77,34 @@ var secretFieldNames = map[string]bool{
 	"code":                    true,
 }
 
+func carriesCredential(field protoreflect.FieldDescriptor) bool {
+	if field.Name() == "api_key" {
+		return field.Kind() == protoreflect.StringKind
+	}
+	return secretFieldNames[string(field.Name())]
+}
+
+func TestApiKeyFieldCredentialClassification(t *testing.T) {
+	for _, test := range []struct {
+		message        protoreflect.MessageDescriptor
+		wantCredential bool
+	}{
+		{(&sandrunv1.OpenAiCodexCredentials{}).ProtoReflect().Descriptor(), true},
+		{(&sandrunv1.CreateApiKeyResponse{}).ProtoReflect().Descriptor(), false},
+		{(&sandrunv1.RevokeApiKeyResponse{}).ProtoReflect().Descriptor(), false},
+	} {
+		t.Run(string(test.message.Name()), func(t *testing.T) {
+			field := test.message.Fields().ByName("api_key")
+			if field == nil {
+				t.Fatal("missing api_key field")
+			}
+			if got := carriesCredential(field); got != test.wantCredential {
+				t.Errorf("%s (%s) carries a credential = %t, want %t", field.FullName(), field.Kind(), got, test.wantCredential)
+			}
+		})
+	}
+}
+
 // allowedResponseSecrets are the only response fields that carry a secret:
 // the personal API key secret and the invitation secret, returned once.
 var allowedResponseSecrets = map[protoreflect.FullName]bool{
@@ -96,7 +124,7 @@ func TestResponsesCarryNoCredentials(t *testing.T) {
 		seen[message.FullName()] = true
 		for i := 0; i < message.Fields().Len(); i++ {
 			field := message.Fields().Get(i)
-			if secretFieldNames[string(field.Name())] && !allowedResponseSecrets[field.FullName()] {
+			if carriesCredential(field) && !allowedResponseSecrets[field.FullName()] {
 				t.Errorf("response field %s carries a credential", field.FullName())
 			}
 			if field.Message() != nil {

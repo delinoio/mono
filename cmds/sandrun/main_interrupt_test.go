@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -31,12 +33,42 @@ import (
 // Run main in a subprocess so assertions can use the actual exit status.
 const runSandRunMain = "SANDRUN_TEST_RUN_MAIN"
 
+const (
+	acknowledgeInterrupt      = "acknowledge-interrupt"
+	consumeSecondInterrupt    = "consume-second-interrupt"
+	interruptAcknowledgmentFD = 3
+)
+
 func TestMain(m *testing.M) {
-	if os.Getenv(runSandRunMain) == "1" {
+	mode := os.Getenv(runSandRunMain)
+	switch mode {
+	case "1":
 		main()
-		return
+	case acknowledgeInterrupt, consumeSecondInterrupt:
+		ack := os.NewFile(interruptAcknowledgmentFD, "interrupt acknowledgment")
+		os.Exit(runSandRun(func() {
+			defer ack.Close()
+			if mode == consumeSecondInterrupt {
+				// Catch the second signal before acknowledging the first. Restore
+				// default handling again so only a third signal would end the CLI.
+				interrupts := make(chan os.Signal, 1)
+				signal.Notify(interrupts, os.Interrupt)
+				writeInterruptAcknowledgment(ack)
+				<-interrupts
+				signal.Stop(interrupts)
+			}
+			writeInterruptAcknowledgment(ack)
+		}))
+	default:
+		os.Exit(m.Run())
 	}
-	os.Exit(m.Run())
+}
+
+func writeInterruptAcknowledgment(ack *os.File) {
+	if _, err := ack.Write([]byte{1}); err != nil {
+		fmt.Fprintln(os.Stderr, "write interrupt acknowledgment:", err)
+		os.Exit(1)
+	}
 }
 
 func sandRunCommand(t *testing.T, serverURL string, args ...string) *exec.Cmd {
@@ -100,95 +132,138 @@ func waitingForCredential(pid int, fifo string) bool {
 func TestSecondInterruptEndsBlockedCredentialRead(t *testing.T) {
 	for _, input := range []string{"fifo", "stdin"} {
 		t.Run(input, func(t *testing.T) {
-			var calls atomic.Int32
-			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				calls.Add(1)
-				w.WriteHeader(http.StatusBadRequest)
-			}))
-			srv.Config.Protocols = new(http.Protocols)
-			srv.Config.Protocols.SetHTTP1(true)
-			srv.Config.Protocols.SetUnencryptedHTTP2(true)
-			srv.Start()
-			t.Cleanup(srv.Close)
-			args := []string{"--org", "sandrun-org", "ownsand", "link", "--ownsand-org", "ownsand-org"}
-			var fifo string
-			var stdin *os.File
-			switch input {
-			case "fifo":
-				// Match the resolved path that /proc reports for the open file.
-				dir, err := filepath.EvalSymlinks(t.TempDir())
-				if err != nil {
-					t.Fatal(err)
-				}
-				fifo = filepath.Join(dir, "key.fifo")
-				if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-					t.Fatal(err)
-				}
-				// Keep a writer open without sending data or EOF.
-				hold, err := os.OpenFile(fifo, os.O_RDWR, 0)
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = hold.Close() })
-				args = append(args, "--api-key-file", fifo)
-			case "stdin":
-				r, w, err := os.Pipe()
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() {
-					_ = w.Close()
-					_ = r.Close()
-				})
-				stdin = r
-			}
-			cmd := sandRunCommand(t, srv.URL, args...)
-			if stdin != nil {
-				cmd.Stdin = stdin
-			}
-			ended := startSandRun(t, cmd)
+			testBlockedCredentialInterrupt(t, input, acknowledgeInterrupt, 5*time.Second)
+		})
+	}
+}
 
-			deadline := time.After(10 * time.Second)
-			tick := time.NewTicker(20 * time.Millisecond)
-			defer tick.Stop()
-			for !waitingForCredential(cmd.Process.Pid, fifo) {
-				select {
-				case <-ended:
-					t.Fatalf("SandRun exited before opening credential input: %v", cmd.ProcessState)
-				case <-deadline:
-					t.Fatal("SandRun did not reach the credential read")
-				case <-tick.C:
-				}
-			}
+func TestBlockedCredentialInterruptRejectsThirdSignal(t *testing.T) {
+	testBlockedCredentialInterrupt(t, "stdin", consumeSecondInterrupt, 250*time.Millisecond)
+}
 
-			if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case <-ended:
-				t.Fatalf("the first interrupt ended the process: %v", cmd.ProcessState)
-			case <-time.After(100 * time.Millisecond):
-			}
-
-			// Allow time for the signal handler to unregister before retrying.
-			deadline = time.After(5 * time.Second)
-			for {
-				_ = cmd.Process.Signal(syscall.SIGINT)
-				select {
-				case <-ended:
-					if status := cmd.ProcessState.Sys().(syscall.WaitStatus); status.Signal() != syscall.SIGINT {
-						t.Fatalf("SandRun ended with %v, want SIGINT", cmd.ProcessState)
-					}
-					if got := calls.Load(); got != 0 {
-						t.Fatalf("SandRun sent %d requests during credential input", got)
-					}
-					return
-				case <-deadline:
-					t.Fatal("SandRun did not exit after repeated interrupts")
-				case <-tick.C:
-				}
+func testBlockedCredentialInterrupt(t *testing.T, input, mode string, exitTimeout time.Duration) {
+	t.Helper()
+	var calls atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	srv.Config.Protocols = new(http.Protocols)
+	srv.Config.Protocols.SetHTTP1(true)
+	srv.Config.Protocols.SetUnencryptedHTTP2(true)
+	srv.Start()
+	t.Cleanup(srv.Close)
+	args := []string{"--org", "sandrun-org", "ownsand", "link", "--ownsand-org", "ownsand-org"}
+	var fifo string
+	var stdin *os.File
+	switch input {
+	case "fifo":
+		// Match the resolved path that /proc reports for the open file.
+		dir, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fifo = filepath.Join(dir, "key.fifo")
+		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Keep a writer open without sending data or EOF.
+		hold, err := os.OpenFile(fifo, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = hold.Close() })
+		args = append(args, "--api-key-file", fifo)
+	case "stdin":
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = w.Close()
+			_ = r.Close()
+		})
+		stdin = r
+	}
+	cmd := sandRunCommand(t, srv.URL, args...)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
+	ack, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ack.Close()
+	defer writer.Close()
+	cmd.ExtraFiles = []*os.File{writer}
+	cmd.Env = append(cmd.Env, runSandRunMain+"="+mode)
+	if mode == consumeSecondInterrupt {
+		// startSandRun registers its cleanup after this assertion, so it reaps
+		// the child first. The credential writer stays open until then.
+		t.Cleanup(func() {
+			if cmd.ProcessState == nil || cmd.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+				t.Errorf("cleanup must kill and reap the blocked child, got %v", cmd.ProcessState)
 			}
 		})
+	}
+	ended := startSandRun(t, cmd)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for !waitingForCredential(cmd.Process.Pid, fifo) {
+		select {
+		case <-ended:
+			t.Fatalf("SandRun exited before opening credential input: %v", cmd.ProcessState)
+		case <-deadline:
+			t.Fatal("SandRun did not reach the credential read")
+		case <-tick.C:
+		}
+	}
+
+	sendInterrupt := func(ordinal string) {
+		t.Helper()
+		select {
+		case <-ended:
+			t.Fatalf("SandRun exited before the %s interrupt: %v", ordinal, cmd.ProcessState)
+		default:
+		}
+		if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+			t.Fatalf("send the %s SIGINT: %v", ordinal, err)
+		}
+	}
+	readAcknowledgment := func(ordinal string) {
+		t.Helper()
+		if err := ack.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var marker [1]byte
+		if _, err := io.ReadFull(ack, marker[:]); err != nil {
+			t.Fatalf("wait for acknowledgment of the %s SIGINT: %v", ordinal, err)
+		}
+	}
+	sendInterrupt("first")
+	readAcknowledgment("first")
+	sendInterrupt("second")
+	select {
+	case <-ended:
+		if mode == consumeSecondInterrupt {
+			t.Fatalf("control child exited after two interrupts: %v", cmd.ProcessState)
+		}
+		if status := cmd.ProcessState.Sys().(syscall.WaitStatus); status.Signal() != syscall.SIGINT {
+			t.Fatalf("SandRun ended with %v, want SIGINT", cmd.ProcessState)
+		}
+	case <-time.After(exitTimeout):
+		if mode != consumeSecondInterrupt {
+			t.Fatal("SandRun did not exit after the second SIGINT")
+		}
+		readAcknowledgment("second")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("SandRun sent %d requests during credential input", got)
 	}
 }
 

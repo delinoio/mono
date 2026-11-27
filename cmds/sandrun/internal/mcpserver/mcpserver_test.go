@@ -863,13 +863,11 @@ func TestSyncAndDownloadThroughTransferStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	text, isErr = h.call("download", map[string]any{"session_id": id, "guest_path": "a.out", "local_path": "out/a.out", "wait_seconds": 0}, &r)
-	if isErr {
-		t.Fatalf("download = %q", text)
+	if isErr || r.TransferID == "" || r.Kind != "download" {
+		t.Fatalf("download = %q %+v", text, r)
 	}
-	if r.Running {
-		if text, isErr = h.call("transfer_status", map[string]any{"transfer_id": r.TransferID}, &r); isErr {
-			t.Fatalf("transfer_status = %q", text)
-		}
+	if text, isErr = h.call("transfer_status", map[string]any{"transfer_id": r.TransferID}, &r); isErr || r.Running {
+		t.Fatalf("transfer_status = %q %+v", text, r)
 	}
 	if r.Download == nil || r.Download.Files != 1 || r.Download.LocalPath != filepath.Join(repo, "out/a.out") {
 		t.Fatalf("download result %+v", r)

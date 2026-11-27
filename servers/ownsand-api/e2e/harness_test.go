@@ -337,32 +337,68 @@ func (l *logSink) hasLineContaining(name, text string) bool {
 	return false
 }
 
-// hasStateReport reports whether the process name logged an
-// agent_state_report event for the device. The control plane logs this event
-// after it marked the connection of the device as reconciled, which is when
-// placement can use the device.
+type agentChannelEvent string
+
+const (
+	agentStateReport         agentChannelEvent = "agent_state_report"
+	agentChannelDisconnected agentChannelEvent = "agent_channel_disconnected"
+)
+
+// hasStateReport reports whether the process logged a successful state
+// report for the device. The control plane logs this event after marking
+// the connection as reconciled, which is when placement can use it.
 func (l *logSink) hasStateReport(name, deviceID string) bool {
+	_, found := l.findAgentChannelEvent(name, deviceID, agentStateReport, 0)
+	return found
+}
+
+// position returns the index of the next line that the sink will store.
+func (l *logSink) position() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.lines)
+}
+
+// findAgentChannelEvent searches from position and returns the position
+// immediately after the matching event.
+func (l *logSink) findAgentChannelEvent(name, deviceID string, want agentChannelEvent, position int) (int, bool) {
 	prefix := name + ": "
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, line := range l.lines {
+	for i, line := range l.lines[position:] {
 		text, ok := strings.CutPrefix(line, prefix)
 		if !ok {
 			continue
 		}
 		var event struct {
-			Msg      string `json:"msg"`
-			DeviceID string `json:"device_id"`
+			Msg      agentChannelEvent `json:"msg"`
+			DeviceID string            `json:"device_id"`
+			Current  bool              `json:"current"`
 		}
-		// Lines that are not JSON log records are not events.
-		if json.Unmarshal([]byte(text), &event) != nil {
+		if json.Unmarshal([]byte(text), &event) != nil || event.Msg != want || event.DeviceID != deviceID {
 			continue
 		}
-		if event.Msg == "agent_state_report" && event.DeviceID == deviceID {
-			return true
+		if want == agentChannelDisconnected && !event.Current {
+			continue
+		}
+		return position + i + 1, true
+	}
+	return 0, false
+}
+
+func (l *logSink) waitForAgentChannelEvent(ctx context.Context, name, deviceID string, want agentChannelEvent, position int) (int, error) {
+	ticker := time.NewTicker(logWaitInterval)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		if next, found := l.findAgentChannelEvent(name, deviceID, want, position); found {
+			return next, nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
 		}
 	}
-	return false
+	return 0, fmt.Errorf("waiting for process %s to log %s for device %s from log position %d: %w", name, want, deviceID, position, ctx.Err())
 }
 
 // proc is a child process that startProcess started.
@@ -993,6 +1029,17 @@ func (l *logSink) hasAgentConfiguration(name string, limits *ownsandv1.DeviceLim
 		}
 	}
 	return false
+}
+
+// waitForAgentChannelEvent waits for the current control plane process to
+// log the event for this device and returns the position after that event.
+func (s *stack) waitForAgentChannelEvent(ctx context.Context, deviceID string, want agentChannelEvent, position int) int {
+	s.t.Helper()
+	next, err := s.logs.waitForAgentChannelEvent(ctx, s.api.name, deviceID, want, position)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	return next
 }
 
 // waitDeviceOnline returns the ID of a device that is not in skip, is ONLINE

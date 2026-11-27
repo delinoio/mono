@@ -72,10 +72,9 @@ func exportRecoveryFixture(t *testing.T) (s *stack, c *ownsand.Client, ctx conte
 	return s, c, ctx, snapID, data
 }
 
-// retryAndImport retries the export of a failed snapshot, checks that it
-// reaches EXPORTED with its parts under one attempt prefix, and restores the
-// snapshot on the second device with the original data.
-func retryAndImport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client, snapID string, data []byte) {
+// retryExport retries the export once and checks that it reaches EXPORTED
+// with all parts under one attempt prefix.
+func retryExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client, snapID string) {
 	t.Helper()
 	s.objects.releasePuts()
 	if _, err := c.Snapshots().Export(ctx, &ownsandv1.ExportSnapshotRequest{SnapshotId: snapID}); err != nil {
@@ -97,7 +96,12 @@ func retryAndImport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Clie
 	if complete < 1 {
 		t.Fatalf("no complete export attempt: %v", errors.Join(errs...))
 	}
+}
 
+// importExport restores the snapshot on the second device and checks the
+// restored bytes against the original data.
+func importExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client, snapID string, data []byte) {
+	t.Helper()
 	p := createParams()
 	p.BaseImage = ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED
 	p.SnapshotID = snapID
@@ -128,10 +132,17 @@ func retryAndImport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Clie
 // and an import on a second device restores the data.
 func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 	s, c, ctx, snapID, data := exportRecoveryFixture(t)
+	sourceID := s.agents[0].deviceID
+	position := s.logs.position()
 	s.killAgent(0)
+	// The API process is unchanged. Use the disconnect to exclude reports
+	// from the channel that carried the abandoned export.
+	position = s.waitForAgentChannelEvent(ctx, sourceID, agentChannelDisconnected, position)
 	s.restartAgent(0)
 	waitExportState(ctx, t, c, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
-	retryAndImport(ctx, t, s, c, snapID, data)
+	s.waitForAgentChannelEvent(ctx, sourceID, agentStateReport, position)
+	retryExport(ctx, t, s, c, snapID)
+	importExport(ctx, t, s, c, snapID, data)
 }
 
 // TestSnapshotExportRecoversAfterControlPlaneRestart kills the control plane
@@ -141,7 +152,11 @@ func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 func TestSnapshotExportRecoversAfterControlPlaneRestart(t *testing.T) {
 	s, c, ctx, snapID, data := exportRecoveryFixture(t)
 	s.killAPI()
+	position := s.logs.position()
 	s.restartAPI()
 	waitExportState(ctx, t, c, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
-	retryAndImport(ctx, t, s, c, snapID, data)
+	s.waitForAgentChannelEvent(ctx, s.agents[0].deviceID, agentStateReport, position)
+	retryExport(ctx, t, s, c, snapID)
+	s.waitForAgentChannelEvent(ctx, s.agents[1].deviceID, agentStateReport, position)
+	importExport(ctx, t, s, c, snapID, data)
 }

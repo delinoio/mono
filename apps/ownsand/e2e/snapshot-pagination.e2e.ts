@@ -45,6 +45,54 @@ const pagedSources = test.extend<{
   },
 });
 
+describe("template deletion", () => {
+  const title = "Delete the template node-24-toolchain?";
+  const target = /^Delete template node-24-toolchain from snapshot/;
+
+  pagedSources(
+    "keeps the other templates and source snapshot",
+    async ({ screen, sources }) => {
+      await sources.open("snapshots");
+      const source = screen.getByRole(
+        "button",
+        "Make template from snapshot 0193a000…00b1",
+      );
+      const other = screen.getByRole(
+        "button",
+        /^Delete template Template 002 /,
+      );
+      await expect(source).toBeVisible();
+      await expect(other).toBeVisible();
+
+      await screen.getByRole("button", target).tap();
+      const confirmation = screen.getByRole("alertdialog", title);
+      await confirmation.getByRole("button", "Delete template").tap();
+
+      await expect(confirmation).toBeHidden();
+      await expect(screen.getByRole("button", target)).toHaveCount(0);
+      await expect(source).toBeVisible();
+      await expect(other).toBeVisible();
+    },
+  );
+
+  pagedSources(
+    "shows the missing template error in a stale confirmation",
+    async ({ app, screen, sources }) => {
+      await sources.open("snapshots", { "stale-template-delete": "true" });
+      await screen.getByRole("button", target).tap();
+      const confirmation = screen.getByRole("alertdialog", title);
+      await confirmation.getByRole("button", "Delete template").tap();
+
+      await expect(
+        confirmation
+          .getByRole("alert")
+          .getByText("It was not found, or you no longer have access to it."),
+      ).toBeVisible();
+      await app.screenshot("stale-template-delete");
+    },
+  );
+});
+
 describe("snapshot and template pagination", () => {
   pagedSources(
     "refreshes an uncached Templates page after a dismissed create",

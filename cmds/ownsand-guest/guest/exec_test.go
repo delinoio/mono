@@ -168,15 +168,15 @@ func TestExecTimeoutKillsGroupAfterParentExits(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	// The leader exits on SIGTERM while its background child ignores SIGTERM.
 	// The child has no output pipe, so cmd.Wait returns when the leader exits.
+	// Its 30-second sleep outlasts the escalation check and bounds a failed run.
 	script := `trap 'exit 0' TERM
-sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 0.05; done' sh "$PID_FILE" >/dev/null 2>&1 &
+sh -c 'trap "" TERM; echo $$ > "$1"; exec sleep 30' sh "$PID_FILE" >/dev/null 2>&1 &
 while :; do sleep 0.05; done`
 	req := execReq(t, "/bin/sh", "-c", script)
 	req.Env = map[string]string{"PID_FILE": pidFile}
 	req.Timeout = durationpb.New(500 * time.Millisecond)
 	evs := h.runExec(req)
 	childPid := readPidFile(t, pidFile)
-	t.Cleanup(func() { _ = syscall.Kill(childPid, syscall.SIGKILL) })
 	if err := requireExplicitZeroExit(evs[len(evs)-1], true); err != nil {
 		t.Fatal(err)
 	}
@@ -232,13 +232,18 @@ func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
 	h.srv.execs.mu.Lock()
 	h.srv.execs.killGrace = 100 * time.Millisecond
 	h.srv.execs.mu.Unlock()
-	pidFile := filepath.Join(t.TempDir(), "child.pid")
-	req := execReq(t, "/bin/sh", "-c", `sleep 30 >/dev/null 2>&1 & echo $! > "$PID_FILE"`)
-	req.Env = map[string]string{"PID_FILE": pidFile}
+	pidFile, stopFile := execSurvivorFiles(t)
+	req := execReq(t, "/bin/sh", "-c", `"$@" >/dev/null 2>&1 & echo $! > "$PID_FILE"`,
+		"sh", helperCommand()[0], helperCommand()[1])
+	req.Env = map[string]string{
+		"PID_FILE":        pidFile,
+		helperModeEnv:     "sleep",
+		helperPidFileEnv:  "",
+		helperStopFileEnv: stopFile,
+	}
 	req.Timeout = durationpb.New(200 * time.Millisecond)
 	evs := h.runExec(req)
 	childPid := readPidFile(t, pidFile)
-	t.Cleanup(func() { _ = syscall.Kill(childPid, syscall.SIGKILL) })
 	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
 		t.Fatal(err)
 	}
@@ -254,20 +259,18 @@ func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
 	h.srv.execs.mu.Lock()
 	h.srv.execs.killGrace = 100 * time.Millisecond
 	h.srv.execs.mu.Unlock()
-	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	pidFile, stopFile := execSurvivorFiles(t)
 	// The descendant inherits stdout, so cmd.Wait drains the pipe for
 	// pipeWaitDelay after the foreground shell exited, across the timeout.
-	req := execReq(t, "/bin/sh", "-c", `sleep 30 & echo $! > "$PID_FILE"`)
-	req.Env = map[string]string{"PID_FILE": pidFile}
+	req := execReq(t, "/bin/sh", "-c", `"$@" & echo $! > "$PID_FILE"`,
+		"sh", helperCommand()[0], helperCommand()[1])
+	req.Env = map[string]string{
+		"PID_FILE":        pidFile,
+		helperModeEnv:     "sleep",
+		helperPidFileEnv:  "",
+		helperStopFileEnv: stopFile,
+	}
 	req.Timeout = durationpb.New(300 * time.Millisecond)
-	// Registered before the run so the descendant dies even on a failure.
-	t.Cleanup(func() {
-		if b, err := os.ReadFile(pidFile); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
-	})
 	evs := h.runExec(req)
 	childPid := readPidFile(t, pidFile)
 	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {

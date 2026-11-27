@@ -45,9 +45,10 @@ export function assertTransportAvailable(
 /**
  * Selects the data path of one sandbox handle. With WebRTC available and no
  * forced transport, it opens one peer-to-peer session per handle and moves
- * the handle to the relay after an ICE failure or a session that cannot
- * open. An `OpenSession` `failed_precondition` (a sandbox that is not
- * `RUNNING`) uses the relay for that attempt only. A relay-only handle never calls `OpenSession`.
+ * the handle to the relay after peer setup or channel failure. An
+ * `OpenSession` `failed_precondition` (a sandbox that is not `RUNNING`) uses
+ * the relay for that attempt only. A relay-only handle never calls
+ * `OpenSession`.
  */
 export class DataPathSelector {
   readonly #ctx: OperationContext;
@@ -98,10 +99,19 @@ export class DataPathSelector {
       return undefined;
     }
     throwIfAborted(this.peerCloseSignal);
-    if (this.#session !== undefined && !this.#session.closed) {
-      return this.#session;
+    const session = this.#session;
+    const terminalError = session?.terminalError;
+    if (session !== undefined && terminalError === undefined) {
+      return session;
     }
     throwIfAborted(signal);
+    if (
+      terminalError instanceof PeerUnavailableError &&
+      this.#forced !== DataPathTransport.PEER_TO_PEER
+    ) {
+      this.peerFailed(terminalError, session);
+      return undefined;
+    }
     let setup = this.#setup;
     let run: (() => void) | undefined;
     if (setup === undefined) {
