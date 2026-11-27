@@ -1,0 +1,56 @@
+{
+  "gid": "inv-35-darwin-exact-guest-pid",
+  "commit": "e79f9d36af26d000438156dfc292b77e6d26ed95",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "sha": "e79f9d36af26d000438156dfc292b77e6d26ed95",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "reason": "The implementation worker has no access to the macOS host. Run the four lifecycle stages and the log controls on m3-16.",
+    "host": "m3-16",
+    "setup": "Use bash in a clean checkout of the worker commit. The checkout path and its .t3-tmp directory must fit the native Unix socket bound checked below. The process runtime starts host processes and works with CGO_ENABLED=0. No administrator access, entitlement signing, C toolchain, kernel image or guest disk is required.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"e79f9d36af26d000438156dfc292b77e6d26ed95\"",
+      "test \"$(uname -s):$(uname -m)\" = \"Darwin:arm64\"",
+      "mkdir -p \".t3-tmp/darwin-pid-native\"",
+      "export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp\" COPYFILE_DISABLE=1 CGO_ENABLED=0",
+      "test \"$(printf %s \"$TMPDIR/osb-4294967295/g.sock\" | wc -c)\" -le 103",
+      "go version | tee \".t3-tmp/darwin-pid-native/toolchain.log\"",
+      "go vet ./cmds/ownsand-agent/... ./cmds/ownsand-guest/... 2>&1 | tee \".t3-tmp/darwin-pid-native/vet.log\"",
+      "go test ./cmds/ownsand-agent -run '^TestBinaryWithProcessRuntimeDarwin$' -count=1 -v -timeout=5m 2>&1 | tee \".t3-tmp/darwin-pid-native/lifecycle.log\"",
+      "go test ./cmds/ownsand-agent -run '^TestWaitForProcessSandboxStarted$' -count=1 -v -timeout=1m 2>&1 | tee \".t3-tmp/darwin-pid-native/log-controls.log\"",
+      "for stage in startup running paused delete; do grep -F -- \"--- PASS: TestBinaryWithProcessRuntimeDarwin/$stage\" \".t3-tmp/darwin-pid-native/lifecycle.log\"; done",
+      "test \"$(grep -Ec 'sandbox [[:xdigit:]-]+ launch log reports guest PID [0-9]+$' \".t3-tmp/darwin-pid-native/lifecycle.log\")\" -eq 3",
+      "test \"$(grep -Fc 'guest and supervisor reaped and agent stderr drained before restart' \".t3-tmp/darwin-pid-native/lifecycle.log\")\" -eq 3",
+      "for control in delayed_record split_record delayed_newline unrelated_records_time_out; do grep -F -- \"--- PASS: TestWaitForProcessSandboxStarted/$control\" \".t3-tmp/darwin-pid-native/log-controls.log\"; done"
+    ],
+    "expectedResults": [
+      "Native vet exits zero. All four lifecycle cases and four log control cases pass without skips.",
+      "Startup stops before readiness, opens no readiness socket and produces no early create result.",
+      "Running, paused and delete each receive a successful create result and observe one matching launch record for the actual guest marker PID and assigned sandbox.",
+      "The existing pause, resume, delete, guest and supervisor reaping, and lost-on-device restart assertions all pass.",
+      "The log controls accept a delayed complete record, a split record and a delayed newline only after completion. Unrelated and noninteger records alone reach the deadline and include the expected sandbox, PID and stderr in the error."
+    ],
+    "files": {
+      "copyFrom": [],
+      "regressionTests": [
+        "cmds/ownsand-agent/binary_darwin_test.go",
+        "cmds/ownsand-agent/binary_process_log_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/darwin-pid-native/toolchain.log",
+        ".t3-tmp/darwin-pid-native/vet.log",
+        ".t3-tmp/darwin-pid-native/lifecycle.log",
+        ".t3-tmp/darwin-pid-native/log-controls.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-darwin-exact-guest-pid/worker/.t3-tmp/darwin-pid/ownsand-agent-darwin-amd64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-darwin-exact-guest-pid/worker/.t3-tmp/darwin-pid/ownsand-agent-darwin-arm64",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-darwin-exact-guest-pid/worker/.t3-tmp/darwin-pid/ownsand-agent-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-darwin-exact-guest-pid/worker/.t3-tmp/darwin-pid/ownsand-guest-darwin-arm64"
+      ]
+    },
+    "unavailableScenarios": []
+  }
+}
