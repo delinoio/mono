@@ -20,6 +20,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/internal/dbtesturl"
@@ -65,14 +66,9 @@ func newURL(t testing.TB, version int64) string {
 	admin := URL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	createConfig, err := pgx.ParseConfig(admin)
-	if err != nil {
-		t.Fatalf("connect to test database: %v", err)
-	}
 	// Close on a server error so pgx returns the error even if the
 	// connection fails before ReadyForQuery. This connection runs one statement.
-	createConfig.OnPgError = func(*pgconn.PgConn, *pgconn.PgError) bool { return false }
-	conn, err := pgx.ConnectConfig(ctx, createConfig)
+	conn, err := connectAdmin(ctx, admin, func(*pgconn.PgConn, *pgconn.PgError) bool { return false })
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}
@@ -108,6 +104,23 @@ func newURL(t testing.TB, version int64) string {
 	return child
 }
 
+func connectAdmin(ctx context.Context, admin string, onPgError pgconn.PgErrorHandler) (*pgx.Conn, error) {
+	// The pool parser keeps pool settings out of the startup parameters
+	// sent by the single admin connection.
+	cfg, err := pgxpool.ParseConfig(admin)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: invalid database configuration", EnvTestDatabaseURL)
+	}
+	if onPgError != nil {
+		cfg.ConnConfig.OnPgError = onPgError
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
+	if err != nil {
+		return nil, errors.New(redact(err, admin))
+	}
+	return conn, nil
+}
+
 func createDatabase(name string, exec func(string) error, registerCleanup func()) error {
 	err := exec("CREATE DATABASE " + name)
 	if pgconn.SafeToRetry(err) {
@@ -140,9 +153,9 @@ func cleanupDatabase(t testing.TB, admin, name string) {
 // error names the failed operation and the database. The error text is
 // scrubbed of the admin URL and its password.
 func dropDatabase(ctx context.Context, admin, name string) error {
-	conn, err := pgx.Connect(ctx, admin)
+	conn, err := connectAdmin(ctx, admin, nil)
 	if err != nil {
-		return fmt.Errorf("connect to test database server to drop %s: %s", name, redact(err, admin))
+		return fmt.Errorf("connect to test database server to drop %s: %w", name, err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
