@@ -57,24 +57,14 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 		return errors.New("imagebuild: the macOS image build needs root; run it with sudo")
 	}
 	build := images.BuildDir(dir)
-	if err := os.RemoveAll(build); err != nil {
+	if err := removeMacOSBuild(ctx, runTool, macOSMountPoints, build); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(build, 0o700); err != nil {
 		return err
 	}
 	defer func() {
-		if err == nil {
-			return
-		}
-		if errors.Is(err, vzrt.ErrVMMayRun) {
-			// The build VM may still use the staged disk, so deleting
-			// it could corrupt a running guest; keep it. The next build
-			// removes the directory at its start.
-			logger.Error("keeping the macOS build directory because the build VM may still run", "build_dir", build)
-			return
-		}
-		os.RemoveAll(build)
+		err = cleanupFailedMacOSBuild(runTool, macOSMountPoints, build, logger, err)
 	}()
 
 	ipsw := opts.IPSW
@@ -83,7 +73,6 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 		if err := downloadRestoreImage(ctx, ipsw, logger); err != nil {
 			return err
 		}
-		defer os.Remove(ipsw)
 	}
 	restore, err := vz.LoadMacOSRestoreImageFromPath(ipsw)
 	if err != nil {

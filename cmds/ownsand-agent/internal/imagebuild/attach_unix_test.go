@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 )
 
 // fakeHdiutilScript stands in for /usr/bin/hdiutil: it logs its arguments,
@@ -28,6 +30,10 @@ attach)
 	fi ;;
 info) cat "$FAKE_INFO_OUT" ;;
 detach)
+	if [ -n "$FAKE_DETACH_FAIL_ALWAYS" ]; then
+		echo "hdiutil: device still busy" >&2
+		exit 1
+	fi
 	if [ -n "$FAKE_DETACH_FAIL_ONCE" ] && [ "$2" != "-force" ] && [ ! -e "$FAKE_LOG.failed" ]; then
 		: > "$FAKE_LOG.failed"
 		echo "hdiutil: couldn't unmount: resource busy" >&2
@@ -167,6 +173,108 @@ func TestWithAttachedDiskRealProcesses(t *testing.T) {
 			}
 			if got, want := strings.Join(lines[1:], "|"), strings.Join(tc.wantLogLines, "|"); got != want {
 				t.Fatalf("calls after the attach = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// Run the cleanup path against real subprocess failures and disposable files.
+// The host-tool scripts simulate attachment state. They do not mount a disk.
+func TestMacOSBuildCleanupRealProcesses(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		provisionFails bool
+		detachFails    bool
+	}{
+		{name: "provision and detach fail", provisionFails: true, detachFails: true},
+		{name: "provision succeeds and detach fails", detachFails: true},
+		{name: "provision fails and forced detach succeeds", provisionFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			work := t.TempDir()
+			build := filepath.Join(work, "macos.build")
+			mnt := filepath.Join(build, "mnt")
+			disk := filepath.Join(build, images.MacOSDisk)
+			hdiutil := filepath.Join(work, "hdiutil")
+			diskutil := filepath.Join(work, "diskutil")
+			logPath := filepath.Join(work, "calls.log")
+			attachPath := filepath.Join(work, "attach.plist")
+			infoPath := filepath.Join(work, "info.plist")
+			if err := os.Mkdir(build, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for path, contents := range map[string]string{
+				hdiutil: fakeHdiutilScript,
+				diskutil: `#!/bin/sh
+case "$1" in
+mount) exit 0 ;;
+unmount) echo "diskutil: mount still busy" >&2; exit 1 ;;
+esac
+`,
+				attachPath: attachPlist,
+				infoPath:   emptyDiskInventory,
+				disk:       "staged disk sentinel",
+			} {
+				if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("FAKE_LOG", logPath)
+			t.Setenv("FAKE_ATTACH_OUT", attachPath)
+			t.Setenv("FAKE_INFO_OUT", infoPath)
+			t.Setenv("FAKE_ATTACH_FAIL", "")
+			t.Setenv("FAKE_DETACH_FAIL_ONCE", "1")
+			t.Setenv("FAKE_DETACH_FAIL_ALWAYS", "")
+			if tc.detachFails {
+				t.Setenv("FAKE_DETACH_FAIL_ALWAYS", "1")
+			}
+			run := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return runHostTool(ctx, filepath.Join(work, filepath.Base(name)), args...)
+			}
+			ctx := t.Context()
+			logger := discardLogger()
+			provisionErr := errors.New("provisioning failed")
+			err := withAttachedDisk(ctx, run, disk, logger, func(string) error {
+				return withMountedDataVolume(ctx, run, "disk5s1", mnt, func() error {
+					if err := os.WriteFile(filepath.Join(mnt, "sentinel"), []byte("guest sentinel"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if tc.provisionFails {
+						return provisionErr
+					}
+					return nil
+				})
+			})
+			mounts := func() ([]string, error) {
+				if tc.detachFails {
+					t.Fatal("a failed detach must retain staging before it checks host state")
+				}
+				return nil, nil
+			}
+			err = cleanupFailedMacOSBuild(run, mounts, build, logger, err)
+			if errors.Is(err, provisionErr) != tc.provisionFails || !strings.Contains(err.Error(), "diskutil: mount still busy") {
+				t.Fatalf("build error = %v, want unmount failure and provisioning failure = %v", err, tc.provisionFails)
+			}
+			if !tc.detachFails {
+				if errors.Is(err, errDiskDetachUnconfirmed) {
+					t.Fatalf("forced detach succeeded: %v", err)
+				}
+				if _, err := os.Stat(build); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("staging stat error = %v, want os.ErrNotExist", err)
+				}
+				return
+			}
+			if !errors.Is(err, errDiskDetachUnconfirmed) || !strings.Contains(err.Error(), "hdiutil: device still busy") || !strings.Contains(err.Error(), build) {
+				t.Fatalf("build error = %v, want the staging path and failed detach", err)
+			}
+			for path, want := range map[string]string{disk: "staged disk sentinel", filepath.Join(mnt, "sentinel"): "guest sentinel"} {
+				if got, err := os.ReadFile(path); err != nil || string(got) != want {
+					t.Fatalf("sentinel %q = %q, %v", path, got, err)
+				}
+			}
+			calls, err := os.ReadFile(logPath)
+			if err != nil || !strings.Contains(string(calls), "hdiutil detach /dev/disk4\nhdiutil detach -force /dev/disk4\n") {
+				t.Fatalf("host calls = %s, %v, want both detach attempts", calls, err)
 			}
 		})
 	}

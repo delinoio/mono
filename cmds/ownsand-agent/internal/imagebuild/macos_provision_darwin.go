@@ -142,7 +142,10 @@ func provisionMacOSDisk(ctx context.Context, build, disk, guestBinary string, lo
 		}
 		mnt := filepath.Join(build, "mnt")
 		return withMountedDataVolume(ctx, runTool, data, mnt, func() error {
-			return installGuestHelper(ctx, mnt, data, guestBinary, logger)
+			if err := installGuestHelper(ctx, mnt, data, guestBinary, logger); err != nil {
+				return fmt.Errorf("imagebuild: provision the macOS guest disk: %w", err)
+			}
+			return nil
 		})
 	})
 }

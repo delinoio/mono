@@ -98,6 +98,7 @@ func (v *diskPlistValue) decode(d *xml.Decoder, start xml.StartElement) error {
 			}
 		}
 	case "array":
+		v.list = make([]*diskPlistValue, 0)
 		for {
 			child, err := nextPlistElement(d)
 			if err == io.EOF {

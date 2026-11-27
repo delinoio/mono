@@ -40,6 +40,8 @@ const attachmentInfoTimeout = 30 * time.Second
 // partition table, which the macOS installer always creates.
 var errNoGUIDPartitionTable = errors.New("imagebuild: the attached guest disk has no GUID partition table")
 
+var errDiskDetachUnconfirmed = errors.New("imagebuild: guest disk detach remains unconfirmed")
+
 // hostRunner runs a host tool and returns its captured standard output, even on failure.
 type hostRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
@@ -160,26 +162,27 @@ func verifyDiskAttachment(run hostRunner, disk, whole string, logger *slog.Logge
 // withAttachedDisk attaches the raw disk image without mounting it, calls use
 // with the whole-disk device (for example disk4) and detaches that device
 // before it returns. If the attach fails after it reports a device, cleanup
-// requires a verified association with the staged image. A cleanup failure
-// is reported only when no earlier error exists.
+// requires a verified association with the staged image. Detach failures
+// are returned with any earlier error so the caller can retain staging.
 func withAttachedDisk(ctx context.Context, run hostRunner, disk string, logger *slog.Logger, use func(whole string) error) (err error) {
 	out, err := run(ctx, hdiutilPath, "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", "-plist", disk)
 	if err != nil {
+		err = fmt.Errorf("imagebuild: attach the guest disk: %w", err)
 		if whole := interruptedAttachDevice(out); whole != "" {
 			verify := func() bool { return verifyDiskAttachment(run, disk, whole, logger) }
 			if detachErr := detachDisk(run, whole, logger, verify); detachErr != nil {
-				logger.Warn("clean up the interrupted guest disk attachment failed", "device", whole, "error", detachErr)
+				err = errors.Join(err, detachErr)
 			}
 		}
-		return fmt.Errorf("imagebuild: attach the guest disk: %w", err)
+		return err
 	}
 	whole, guid := attachedWholeDisk(out)
 	if whole == "" {
 		return errors.New("imagebuild: the attach output of the guest disk names no device")
 	}
 	defer func() {
-		if derr := detachDisk(run, whole, logger, nil); derr != nil && err == nil {
-			err = derr
+		if detachErr := detachDisk(run, whole, logger, nil); detachErr != nil {
+			err = errors.Join(err, detachErr)
 		}
 	}()
 	if !guid {
@@ -201,11 +204,12 @@ func withMountedDataVolume(ctx context.Context, run hostRunner, data, mnt string
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), unmountTimeout)
 		defer cancel()
-		if _, unmountErr := run(cleanupCtx, diskutilPath, "unmount", data); unmountErr != nil && err == nil {
+		if _, unmountErr := run(cleanupCtx, diskutilPath, "unmount", data); unmountErr != nil {
 			if ctxErr := cleanupCtx.Err(); ctxErr != nil && !errors.Is(unmountErr, ctxErr) {
 				unmountErr = fmt.Errorf("%w: %w", ctxErr, unmountErr)
 			}
-			err = fmt.Errorf("imagebuild: unmount the guest Data volume: %w", unmountErr)
+			err = errors.Join(err, fmt.Errorf("imagebuild: unmount the guest Data volume: %w", unmountErr))
+			return
 		}
 		os.Remove(mnt)
 	}()
@@ -227,13 +231,16 @@ func detachDisk(run hostRunner, whole string, logger *slog.Logger, verify func()
 		_, err := run(ctx, hdiutilPath, args...)
 		return err
 	}
-	derr := attempt("detach", dev)
-	if derr == nil {
+	detachErr := attempt("detach", dev)
+	if detachErr == nil {
 		return nil
 	}
 	if verify != nil && !verify() {
-		return derr
+		return fmt.Errorf("%w for %s: %w", errDiskDetachUnconfirmed, dev, detachErr)
 	}
-	logger.Warn("detach the guest disk failed; forcing", "device", dev, "error", derr)
-	return attempt("detach", "-force", dev)
+	logger.Warn("detach the guest disk failed; forcing", "device", dev, "error", detachErr)
+	if forceErr := attempt("detach", "-force", dev); forceErr != nil {
+		return fmt.Errorf("%w for %s: detach: %w; forced detach: %w", errDiskDetachUnconfirmed, dev, detachErr, forceErr)
+	}
+	return nil
 }
