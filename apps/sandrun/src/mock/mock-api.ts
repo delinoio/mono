@@ -161,6 +161,13 @@ const OTHER_ADMIN = "mock-user-ada";
 const OTHER_MEMBER = "mock-user-lin";
 const LATER_MEMBER = "mock-user-nora";
 
+const IDLE_GITHUB_RUNNER_STATES = new Set([
+  RunnerState.CREATING,
+  RunnerState.PREPARING,
+  RunnerState.WARM,
+  RunnerState.WAITING_FOR_WORK,
+]);
+
 const now = () => Date.now();
 const ts = (offsetSeconds = 0): Timestamp =>
   timestampFromMs(now() + offsetSeconds * 1000);
@@ -1474,6 +1481,16 @@ export function createMockTransport(
               RequestState.CANCELED,
               RequestEndReason.INTEGRATION_REMOVED,
             );
+        }
+        for (const r of org.runners) {
+          if (
+            r.kind === WorkloadKind.GITHUB_JOB &&
+            r.githubInstallationId === i.githubInstallationId &&
+            r.requestId === "" &&
+            IDLE_GITHUB_RUNNER_STATES.has(r.state)
+          ) {
+            endRunner(org, r, RunnerEndReason.CLEAN_UP);
+          }
         }
         audit(
           org,
