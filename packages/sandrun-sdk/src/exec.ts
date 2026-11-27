@@ -127,6 +127,8 @@ export interface ExecHelperOptions {
  *   advances either offset also reset the backoff.
  * - It yields output in order and without duplicates, and reports output
  *   that it never received as `OutputLost`.
+ * - After it delivers a terminal event, it closes the active stream. If
+ *   closing rejects, iteration still ends normally.
  * - Cancellation ends the iterator and stops following the command. The
  *   command keeps running in the guest.
  * - A status that is the server's answer ends the iteration with that
@@ -150,25 +152,27 @@ export async function* execDevSession(
   let stderrOffset = 0n;
   let started = false;
   let anyEvent = false;
+  let terminalDelivered = false;
   let execError: unknown;
   let failures = 0;
 
   function* handle(
     event: DevSessionExecEvent["event"],
-  ): Generator<ExecEvent, boolean, undefined> {
+  ): Generator<ExecEvent, void, undefined> {
+    let outcome: ExecOutcome;
     switch (event.case) {
       case "started":
         if (!started) {
           started = true;
           yield { kind: ExecEventKind.Started, execId };
         }
-        return false;
+        return;
       case "outputTruncated": {
         const first = event.value;
         if (first.stdoutOffset > stdoutOffset) {
           yield lost(OutputStream.Stdout, stdoutOffset, first.stdoutOffset);
           if (abortedBy(signal)) {
-            return false;
+            return;
           }
           stdoutOffset = first.stdoutOffset;
         }
@@ -176,7 +180,7 @@ export async function* execDevSession(
           yield lost(OutputStream.Stderr, stderrOffset, first.stderrOffset);
           stderrOffset = first.stderrOffset;
         }
-        return false;
+        return;
       }
       case "stdout":
       case "stderr": {
@@ -188,12 +192,12 @@ export async function* execDevSession(
         const end = offset + BigInt(data.length);
         if (end <= expected) {
           // A chunk that an earlier stream already delivered.
-          return false;
+          return;
         }
         if (offset > expected) {
           yield lost(stream, expected, offset);
           if (abortedBy(signal)) {
-            return false;
+            return;
           }
         }
         const from = offset < expected ? expected : offset;
@@ -205,31 +209,43 @@ export async function* execDevSession(
           stderrOffset = end;
           yield { kind: ExecEventKind.Stderr, offset: from, data: chunk };
         }
-        return false;
+        return;
       }
       case "exited": {
         const status = event.value.status;
-        yield {
+        outcome = {
           kind: ExecEventKind.Exited,
           exitCode: status.case === "exitCode" ? status.value : undefined,
           signal: status.case === "signal" ? status.value : undefined,
           timedOut: event.value.timedOut,
         };
-        return true;
+        break;
       }
       case "failed":
-        yield {
+        outcome = {
           kind: ExecEventKind.Failed,
           reason: event.value.reason,
           message: event.value.message,
         };
-        return true;
+        break;
       case "sandboxEnded":
-        yield { kind: ExecEventKind.SandboxEnded, reason: event.value.reason };
-        return true;
+        outcome = {
+          kind: ExecEventKind.SandboxEnded,
+          reason: event.value.reason,
+        };
+        break;
       default:
         // Events of a newer schema carry no state the helper can report.
-        return false;
+        return;
+    }
+    // The caller can close this generator while it is yielding the outcome.
+    terminalDelivered = true;
+    try {
+      yield outcome;
+    } catch (error) {
+      // Preserve errors thrown into the generator by its caller.
+      terminalDelivered = false;
+      throw error;
     }
   }
 
@@ -282,20 +298,21 @@ export async function* execDevSession(
         const wasStarted: boolean = started;
         const previousStdoutOffset = stdoutOffset;
         const previousStderrOffset = stderrOffset;
-        const terminal = yield* handle(event);
+        yield* handle(event);
         // Keep the existing retry behavior for unknown events and terminal cleanup errors.
         progressed ||=
-          terminal ||
+          terminalDelivered ||
           event.case === undefined ||
           started !== wasStarted ||
           stdoutOffset !== previousStdoutOffset ||
           stderrOffset !== previousStderrOffset;
-        if (terminal || abortedBy(signal)) {
+        if (terminalDelivered || abortedBy(signal)) {
           return;
         }
       }
     } catch (error) {
-      if (abortedBy(signal)) {
+      // After the terminal event, the only upstream operation left is close.
+      if (terminalDelivered || abortedBy(signal)) {
         return;
       }
       if (

@@ -141,6 +141,67 @@ func TestBlockedCredentialInterruptRejectsThirdSignal(t *testing.T) {
 	testBlockedCredentialInterrupt(t, "stdin", consumeSecondInterrupt, 250*time.Millisecond)
 }
 
+func TestFirstInterruptCancelsMCPTransfer(t *testing.T) {
+	started, canceled := make(chan struct{}), make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != sandrunv1connect.DevSessionServiceGetDevSessionProcedure {
+			http.NotFound(w, r)
+			return
+		}
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-t.Context().Done():
+		}
+	}))
+	srv.Config.Protocols = new(http.Protocols)
+	srv.Config.Protocols.SetUnencryptedHTTP2(true)
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	cmd := sandRunCommand(t, srv.URL, "mcp", "--org", "fixture-org")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stdin.Close() })
+	cmd.Stdout = io.Discard
+	ended := startSandRun(t, cmd)
+	_, err = fmt.Fprintln(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"download","arguments":{"session_id":"fixture-session","guest_path":"file","local_path":"fixture","wait_seconds":4}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-ended:
+		t.Fatalf("SandRun exited before starting the transfer: %v", cmd.ProcessState)
+	case <-time.After(10 * time.Second):
+		t.Fatal("SandRun did not start the transfer")
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	// Keep stdin open and require cancellation and exit before the tool timer.
+	deadline, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	select {
+	case <-canceled:
+	case <-deadline.Done():
+		t.Fatal("the transfer RPC was not canceled after SIGINT")
+	}
+	select {
+	case <-ended:
+		if !cmd.ProcessState.Success() {
+			t.Fatalf("SandRun exited with %v, want exit 0", cmd.ProcessState)
+		}
+	case <-deadline.Done():
+		t.Fatal("SandRun did not exit after SIGINT")
+	}
+}
+
 func testBlockedCredentialInterrupt(t *testing.T, input, mode string, exitTimeout time.Duration) {
 	t.Helper()
 	var calls atomic.Int32

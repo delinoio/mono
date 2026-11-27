@@ -1721,6 +1721,8 @@ func (*DevSessionExecEvent_Failed) isDevSessionExecEvent_Event() {}
 
 func (*DevSessionExecEvent_SandboxEnded) isDevSessionExecEvent_Event() {}
 
+// To continue the same snapshot after rotation, keep organization_id,
+// dev_session_id, read_id, and path unchanged.
 type ReadDevSessionFileRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
@@ -1728,8 +1730,11 @@ type ReadDevSessionFileRequest struct {
 	// UUID v7 that the client generates.
 	ReadId string `protobuf:"bytes,3,opt,name=read_id,json=readId,proto3" json:"read_id,omitempty"`
 	// An absolute guest path, or a path relative to the workspace path.
-	Path          string `protobuf:"bytes,4,opt,name=path,proto3" json:"path,omitempty"`
-	Offset        int64  `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
+	Path string `protobuf:"bytes,4,opt,name=path,proto3" json:"path,omitempty"`
+	// On continuation, use the offset of the last accepted chunk plus the byte
+	// length of its data. If the previous call delivered no chunks, reuse its
+	// requested offset.
+	Offset        int64 `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1854,7 +1859,7 @@ func (x *DevSessionFileChunk) GetData() []byte {
 
 type DevSessionFileEnd struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Size of the whole file.
+	// Size in bytes of the whole file snapshot.
 	SizeBytes     int64 `protobuf:"varint,1,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1972,7 +1977,8 @@ type ReadDevSessionFileResponse_Chunk struct {
 }
 
 type ReadDevSessionFileResponse_End struct {
-	// The final message.
+	// Marks completion of the logical read and reports the whole snapshot size.
+	// A stream that closes with OK due to relay rotation can omit this event.
 	End *DevSessionFileEnd `protobuf:"bytes,2,opt,name=end,proto3,oneof"`
 }
 

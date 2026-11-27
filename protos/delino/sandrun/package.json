@@ -9,7 +9,12 @@
     "node": ">=24"
   },
   "exports": {
-    "./v1/*": "./v1/*.ts"
+    "./v1/*": {
+      "types": "./v1/*.ts",
+      "browser": "./v1/*.ts",
+      "node": "./dist/v1/*.js",
+      "default": "./v1/*.ts"
+    }
   },
   "files": [
     "dist"

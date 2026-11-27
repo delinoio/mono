@@ -32,6 +32,9 @@ service DevSessionService {
   // offsets.
   rpc AttachDevSessionExec(AttachDevSessionExecRequest) returns (stream AttachDevSessionExecResponse);
   // Stream a guest file from an offset in chunks of at most 1 MiB.
+  // Relay rotation can close the stream with OK before the end event. On
+  // clean EOF without end, call ReadDevSessionFile again to continue the
+  // same snapshot. The end event marks completion of the logical read.
   rpc ReadDevSessionFile(ReadDevSessionFileRequest) returns (stream ReadDevSessionFileResponse);
   // Write one chunk of at most 1 MiB to a guest file at an offset.
   rpc WriteDevSessionFile(WriteDevSessionFileRequest) returns (WriteDevSessionFileResponse);
@@ -226,6 +229,8 @@ message DevSessionExecEvent {
   }
 }
 
+// To continue the same snapshot after rotation, keep organization_id,
+// dev_session_id, read_id, and path unchanged.
 message ReadDevSessionFileRequest {
   string organization_id = 1;
   string dev_session_id = 2;
@@ -233,6 +238,9 @@ message ReadDevSessionFileRequest {
   string read_id = 3;
   // An absolute guest path, or a path relative to the workspace path.
   string path = 4;
+  // On continuation, use the offset of the last accepted chunk plus the byte
+  // length of its data. If the previous call delivered no chunks, reuse its
+  // requested offset.
   int64 offset = 5;
 }
 
@@ -243,14 +251,15 @@ message DevSessionFileChunk {
 }
 
 message DevSessionFileEnd {
-  // Size of the whole file.
+  // Size in bytes of the whole file snapshot.
   int64 size_bytes = 1;
 }
 
 message ReadDevSessionFileResponse {
   oneof event {
     DevSessionFileChunk chunk = 1;
-    // The final message.
+    // Marks completion of the logical read and reports the whole snapshot size.
+    // A stream that closes with OK due to relay rotation can omit this event.
     DevSessionFileEnd end = 2;
   }
 }

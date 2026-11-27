@@ -38,7 +38,13 @@ export function resolveApiOrigin(value: string | undefined): string {
   } catch {
     throw new SandRunConfigError("origin is not a valid URL");
   }
-  if (url.username !== "" || url.password !== "") {
+  const writtenOrigin = raw.trim();
+  // The URL parser removes empty userinfo. Check for its delimiter in the authority.
+  if (
+    url.username !== "" ||
+    url.password !== "" ||
+    /^https?:\/\/[^/?#\\]*@/i.test(writtenOrigin)
+  ) {
     throw new SandRunConfigError("origin must not contain credentials");
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
@@ -51,7 +57,7 @@ export function resolveApiOrigin(value: string | undefined): string {
     url.hash !== "" ||
     raw.includes("?") ||
     raw.includes("#") ||
-    !/^https?:\/\/[^/?#\\]+\/?$/i.test(raw.trim())
+    !/^https?:\/\/[^/?#\\]+\/?$/i.test(writtenOrigin)
   ) {
     throw new SandRunConfigError(
       "origin must not have a path, query or fragment",
