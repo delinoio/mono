@@ -981,7 +981,8 @@ func TestManagerRefreshInFlightDuringCleanupHost(t *testing.T) {
 	}
 	waitRefresh := startGatedWorker(t, openRelease, "Refresh during CleanupHost", m.Refresh)
 	waitFor(t, entered, "the route read before CleanupHost")
-	if err := m.CleanupHost(); err != nil {
+	waitCleanup := startGatedWorker(t, openRelease, "CleanupHost while Refresh is paused", m.CleanupHost)
+	if err := waitCleanup(); err != nil {
 		t.Fatalf("CleanupHost: %v", err)
 	}
 	n := len(applied())
