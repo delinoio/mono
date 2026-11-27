@@ -236,6 +236,9 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lctx, cancel := context.WithTimeout(ctx, v.opts.LookupTimeout)
 		sess, err = v.session(lctx, in, ev.Data.ID)
 		cancel()
+		if err == nil && sess.ID != ev.Data.ID {
+			err = errors.New("the agent session ID does not match the webhook session ID")
+		}
 		if err != nil && !errors.Is(err, errSessionGone) {
 			if ctx.Err() == nil {
 				svc.Logger.WarnContext(ctx, "openai_session_lookup_failed", slog.String("agent_integration_id", in.ID), slog.Any("error", err))
