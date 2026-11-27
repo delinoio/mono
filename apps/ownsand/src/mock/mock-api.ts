@@ -390,7 +390,7 @@ function emptyOrg(id: string, name: string): OrgState {
   };
 }
 
-function seed(): Map<string, OrgState> {
+function seed(northwindReadySnapshot: boolean): Map<string, OrgState> {
   const orgs = new Map<string, OrgState>();
   const acme = emptyOrg(MOCK_IDS.acme, "Acme Robotics");
   acme.members.push(
@@ -586,6 +586,15 @@ function seed(): Map<string, OrgState> {
     ),
     newMembership(MOCK_IDS.northwind, MOCK_USER, Role.MEMBER, "Mina Kim"),
   );
+  if (northwindReadySnapshot) {
+    northwind.snapshots.push(
+      create(SnapshotSchema, {
+        snapshotId: newMockId(),
+        organizationId: MOCK_IDS.northwind,
+        state: SnapshotState.READY,
+      }),
+    );
+  }
   orgs.set(MOCK_IDS.northwind, northwind);
 
   const contoso = emptyOrg(MOCK_IDS.contoso, "Contoso Research");
@@ -648,6 +657,8 @@ export interface MockTransportOptions {
   extraDevices?: number;
   /** Ready snapshots to add after the seeded Acme snapshot. */
   extraSnapshots?: number;
+  /** Give Northwind a ready snapshot for tests that use two organizations. */
+  northwindReadySnapshot?: boolean;
   /** Templates to add after the seeded Acme template. */
   extraTemplates?: number;
   /**
@@ -876,7 +887,7 @@ export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
-  const orgs = seed();
+  const orgs = seed(options.northwindReadySnapshot ?? false);
   for (const [orgId, state] of Object.entries({
     ...DEFAULT_BILLING,
     ...options.billing,
@@ -1600,10 +1611,11 @@ export function createMockTransport(
         requireAdmin(role);
         if (
           req.mode === AgentVersionPolicyMode.PIN &&
-          req.pinnedVersion.trim() === ""
+          (req.pinnedVersion.trim() === "" ||
+            /[ \t\r\n]/.test(req.pinnedVersion))
         ) {
           throw new ConnectError(
-            "pinned_version is required",
+            "invalid pinned_version: a version is required for PIN",
             Code.InvalidArgument,
           );
         }
@@ -1910,12 +1922,19 @@ export function createMockTransport(
         const { org } = membership(req.organizationId);
         requireBillingAllowed(org);
         findSnapshot(org, req.snapshotId);
-        if (req.name.trim() === "")
+        const name = req.name.trim();
+        if (name === "")
           throw new ConnectError("name is required", Code.InvalidArgument);
+        if (org.templates.some((template) => template.name === name)) {
+          throw new ConnectError(
+            "a template with this name exists",
+            Code.AlreadyExists,
+          );
+        }
         const template = create(TemplateSchema, {
           templateId: newMockId(),
           organizationId: req.organizationId,
-          name: req.name.trim(),
+          name,
           snapshotId: req.snapshotId,
           createdBy: { kind: PrincipalKind.USER, id: userId },
           createTime: ts(),

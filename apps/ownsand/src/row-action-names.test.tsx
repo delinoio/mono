@@ -51,11 +51,10 @@ describe("snapshot and template rows", () => {
         sandboxId: MOCK_IDS.runningSandbox,
       })
     ).snapshot!;
-    // Two templates with the same name on two snapshots.
     await snapshots.createTemplate({
       organizationId: MOCK_IDS.acme,
       snapshotId: second.snapshotId,
-      name: "node-24-toolchain",
+      name: "row-action-template",
     });
     renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, { transport });
     await screen.findByRole("list", { name: "Snapshots" });
@@ -83,7 +82,7 @@ describe("snapshot and template rows", () => {
     const templates = namesOf(screen.getByRole("list", { name: "Templates" }));
     expect(templates).toEqual([
       `Delete template node-24-toolchain from snapshot ${firstShort}`,
-      `Delete template node-24-toolchain from snapshot ${secondShort}`,
+      `Delete template row-action-template from snapshot ${secondShort}`,
     ]);
     // The accessible name starts with the visible text, and the visible text
     // is unchanged.
@@ -120,7 +119,7 @@ describe("snapshot and template rows", () => {
     // first, then the snapshot.
     await press(
       screen.getByRole("button", {
-        name: `Delete template node-24-toolchain from snapshot ${secondShort}`,
+        name: `Delete template row-action-template from snapshot ${secondShort}`,
       }),
     );
     dialog = await screen.findByRole("alertdialog");

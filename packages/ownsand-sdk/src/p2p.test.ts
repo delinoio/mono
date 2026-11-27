@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
-import { encodeMessages } from "./codec.ts";
+import { describe, expect, rs, test } from "@rstest/core";
+import { encodeMessages, FrameCodecError, FrameDecoder } from "./codec.ts";
 import { ActivityRegistry } from "./connection.ts";
 import {
   billingReasonOf,
@@ -29,11 +29,16 @@ import {
   type DataFrame,
   DataFrameKind,
   DataFrameSchema,
+  ExecRequestSchema,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
-import { PeerSession, PeerUnavailableError } from "./p2p/session.ts";
+import {
+  PeerSession,
+  PeerUnavailableError,
+  SessionEndedError,
+} from "./p2p/session.ts";
 import type { PeerConnectionConstructor } from "./p2p/webrtc.ts";
 import type { OperationContext } from "./relay/context.ts";
 import { Sandbox } from "./sandbox.ts";
@@ -1200,6 +1205,99 @@ describe("peer-to-peer data path", () => {
         expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
       });
     }
+  });
+
+  describe("when a data channel message fails to decode", () => {
+    const codecError = new FrameCodecError("scripted codec failure");
+    const sessionEnd = create(DataFrameSchema, {
+      streamId: 1n,
+      kind: DataFrameKind.SESSION_END,
+      payload: {
+        case: "sessionEnd",
+        value: { reason: SessionEndReason.EXPIRED },
+      },
+    });
+
+    test.each([
+      {
+        name: "dispatches completed frames once and in wire order",
+        prefix: [ev.stdout(0, "one"), ev.stdout(3, "two")],
+        sessionEnd: false,
+        expectedOutput: ["one", "two"],
+        expectedError: new PeerUnavailableError(codecError.message),
+      },
+      {
+        name: "closes immediately when no frame completed",
+        prefix: [],
+        sessionEnd: false,
+        expectedOutput: [],
+        expectedError: new PeerUnavailableError(codecError.message),
+      },
+      {
+        name: "keeps the session-end reason and stops dispatch there",
+        prefix: [ev.stdout(0, "one")],
+        sessionEnd: true,
+        expectedOutput: ["one"],
+        expectedError: new SessionEndedError(SessionEndReason.EXPIRED),
+      },
+    ])("$name", async (scenario) => {
+      const { h, rtc } = p2pSetup(() => {});
+      const session = await h.clock.run(
+        PeerSession.open(
+          {
+            clock: h.clock,
+            ids: new UuidV7Generator(() => h.clock.wallNow()),
+            dataPath: h.client.dataPath,
+            relay: h.client.relay,
+            sandboxes: h.client.sandboxes,
+            activity: new ActivityRegistry(),
+            logger: undefined,
+            organizationId: ORG,
+            sandboxId: SANDBOX,
+          },
+          rtc.RTCPeerConnection,
+          undefined,
+        ),
+      );
+      const output: string[] = [];
+      const stream = session.exec(
+        { case: "execRequest", value: create(ExecRequestSchema) },
+        undefined,
+      );
+      const result = assert.rejects(async () => {
+        for await (const { event } of stream) {
+          if (event.case === "stdout") {
+            output.push(text(event.value.data));
+          }
+        }
+      }, scenario.expectedError);
+      await h.clock.settle();
+      const request = rtc.frames[0]!;
+      const stdoutFrame = (event: ReturnType<typeof ev.stdout>) =>
+        create(DataFrameSchema, {
+          streamId: request.streamId,
+          sandboxId: SANDBOX,
+          kind: DataFrameKind.EXEC_EVENT,
+          payload: { case: "execEvent", value: { event } },
+        });
+      const frames = scenario.prefix.map(stdoutFrame);
+      if (scenario.sessionEnd) {
+        frames.push(sessionEnd, stdoutFrame(ev.stdout(3, "after end")));
+      }
+      const channel = rtc.channels[0]!;
+      const decode = rs.spyOn(FrameDecoder.prototype, "push");
+      try {
+        decode.mockReturnValueOnce({ frames, error: codecError });
+        channel.receive(new Uint8Array());
+      } finally {
+        decode.mockRestore();
+      }
+
+      await h.clock.run(result);
+      expect(output).toEqual(scenario.expectedOutput);
+      expect(channel.readyState).toBe("closed");
+      expect(session.closed).toBe(true);
+    });
   });
 
   describe("when GetIceServers fails", () => {

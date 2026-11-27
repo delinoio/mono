@@ -28,6 +28,8 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
+	"github.com/delinoio/mono/cmds/ownsand-agent/runtimelog"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
 
 // Exit codes.
@@ -251,8 +253,9 @@ func runAgentOutcome(ctx context.Context, cfg config.Config) (code int, updated 
 	return runAgentWithInstaller(ctx, cfg, nil)
 }
 
-func runAgentWithInstaller(ctx context.Context, cfg config.Config, installer update.Installer) (code int, updated bool) {
-	logger := newLogger(cfg)
+func runAgentWithInstaller(ctx context.Context, cfg config.Config, installer update.Installer, processors ...sdklog.Processor) (code int, updated bool) {
+	logger, shutdown := runtimelog.New(os.Stderr, cfg.LogLevel, runtimelog.Agent, processors...)
+	defer shutdown()
 	st, err := store.Open(cfg.StateDir)
 	if err != nil {
 		logger.Error("open state directory failed", "error", err)

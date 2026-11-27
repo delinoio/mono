@@ -940,6 +940,46 @@ describe("billing", () => {
 });
 
 describe("agent version policy", () => {
+  test("keeps a rejected pin as a draft and lets the admin save a correction", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+
+    const version = screen.getByRole("textbox", "Pinned version");
+    const save = screen.getByRole("button", "Save policy");
+    const notifications = screen.getByRole("region", "Notifications");
+    const saved = notifications.getByText("The agent version policy is saved.");
+    await screen.getByRole("radio", "Pin a version").tap();
+    await version.fill("1.4.2");
+    await save.tap();
+    await expect(saved).toBeVisible();
+    await expect(saved).toBeHidden();
+
+    await version.fill("1. 4.2");
+    await save.tap();
+    await expect(notifications).toContainText(
+      "invalid pinned_version: a version is required for PIN",
+    );
+    await expect(version).toHaveValue("1. 4.2");
+    await expect(saved).toBeHidden();
+
+    const devices = screen.getByRole("link", "Devices", { exact: true });
+    const settings = screen.getByRole("link", "Settings", { exact: true });
+    await devices.tap();
+    await settings.tap();
+    await expect(version).toHaveValue("1.4.2");
+
+    await version.fill("1.4.3");
+    await save.tap();
+    await expect(saved).toBeVisible();
+    await devices.tap();
+    await settings.tap();
+    await expect(version).toHaveValue("1.4.3");
+  });
+
   test("leaves the saved version in place when the admin leaves an unsaved edit", async ({
     app,
     screen,
@@ -1551,6 +1591,44 @@ describe("organization switcher popup width", () => {
       );
     });
   }
+});
+
+describe("template creation", () => {
+  test("keeps the form open for a duplicate name and accepts a corrected name", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/snapshots`);
+
+    const rows = browser.locator('ul[aria-label="Templates"] li');
+    const original = rows.filter({ hasText: "node-24-toolchain" });
+    await expect(original).toBeVisible();
+    await expect(rows).toHaveCount(1);
+    await screen.getByRole("button", /^Make template from snapshot/).tap();
+    const form = screen.getByRole("dialog", "Make a template");
+    const name = form.getByLabel("Template name");
+    const submit = form.getByRole("button", "Create template");
+
+    await name.fill("node-24-toolchain");
+    await submit.tap();
+    await expect(
+      form.getByText("a template with this name exists"),
+    ).toBeVisible();
+    await expect(name).toHaveValue("node-24-toolchain");
+    await expect(rows).toHaveCount(1);
+    await expect(original).toHaveCount(1);
+
+    await name.fill("review-template");
+    await submit.tap();
+    await expect(form).toBeHidden();
+    await expect(rows.filter({ hasText: "review-template" })).toBeVisible();
+    await expect(rows).toHaveCount(2);
+    await expect(original).toHaveCount(1);
+  });
 });
 
 // A name that is one 100-character word, the longest the console accepts. It
