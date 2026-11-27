@@ -285,11 +285,6 @@ func (e *env) execContext(ctx context.Context, sandboxID string, cmd ...string) 
 	return out.String(), exited, nil
 }
 
-func execSucceeded(exited *ownsandv1.ExecExited) bool {
-	code, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
-	return ok && code != nil && code.ExitCode == 0
-}
-
 // waitFor polls cond until it holds or 30 seconds passed.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
@@ -404,10 +399,8 @@ func TestVirtualizationIntegration(t *testing.T) {
 		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	t.Logf("guest: %s", strings.TrimSpace(out))
-	// The root file system grew to the 2 GiB disk at boot.
-	fields := strings.Fields(strings.Split(out, "\n")[2])
-	if len(fields) < 2 || len(fields[1]) < 7 {
-		t.Fatalf("root file system did not grow: %q", out)
+	if err := checkLinuxRootfsGrowth(out); err != nil {
+		t.Fatal(err)
 	}
 	// A NONE sandbox has no network device.
 	if strings.Contains(out, "eth0") {
@@ -485,6 +478,9 @@ func TestVirtualizationIntegration(t *testing.T) {
 
 	t.Run("cancel-during-restored-readiness", func(t *testing.T) {
 		e.requireCanceledRestore(t, snapID, ownsandv1.GuestOs_GUEST_OS_LINUX)
+	})
+	t.Run("restored-clock", func(t *testing.T) {
+		e.checkRestoreClock(t, snapID, ownsandv1.GuestOs_GUEST_OS_LINUX)
 	})
 	if snap.GetHasMemoryState() {
 		e.invalidateMemoryState(snapID)

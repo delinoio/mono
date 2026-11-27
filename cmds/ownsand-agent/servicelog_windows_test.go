@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/windows"
+
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 )
 
@@ -85,5 +87,98 @@ func TestOpenServiceLogAllowsConcurrentRead(t *testing.T) {
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != "x" {
 		t.Fatalf("read while open = %q, %v", b, err)
+	}
+}
+
+func TestOpenServiceLogWin32Path(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	longTail := strings.Repeat("a", 90) + `\` + strings.Repeat("b", 90) + `\` + strings.Repeat("c", 90) + `\agent.log`
+	shortUnicode := `C:\state\` + strings.Repeat("界", 90) + `\agent.log`
+	for _, tc := range []struct {
+		name, input, want string
+	}{
+		{"short drive", `C:\state\agent.log`, `C:\state\agent.log`},
+		{"short UNC", `\\server\share\agent.log`, `\\server\share\agent.log`},
+		{"short in UTF-16", shortUnicode, shortUnicode},
+		{"long drive", `C:/state/unused/../` + longTail, `\\?\C:\state\` + longTail},
+		{"long UNC", `//server/share/unused/../` + longTail, `\\?\UNC\server\share\` + longTail},
+		{"long relative", `unused\..\` + longTail, `\\?\` + filepath.Join(dir, longTail)},
+		{"extended drive", `\\?\C:\state\` + longTail, `\\?\C:\state\` + longTail},
+		{"extended UNC", `\\?\UNC\server\share\` + longTail, `\\?\UNC\server\share\` + longTail},
+		{"NT namespace", `\??\C:\state\` + longTail, `\??\C:\state\` + longTail},
+		{"device namespace", `\\.\C:\state\` + longTail, `\\.\C:\state\` + longTail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serviceLogWin32Path(tc.input); got != tc.want {
+				t.Errorf("serviceLogWin32Path(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOpenServiceLogLongStateDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), strings.Repeat("a", 90))
+	dir := filepath.Join(root, strings.Repeat("b", 90), strings.Repeat("c", 90))
+	path := filepath.Join(dir, "agent.log")
+	if !filepath.IsAbs(path) || len(path) <= windows.MAX_PATH {
+		t.Fatalf("test log must have an absolute path longer than MAX_PATH: %q", path)
+	}
+	// Use an extended path for fixture operations so the test itself works
+	// with long-path opt-in disabled.
+	t.Cleanup(func() {
+		if err := os.RemoveAll(`\\?\` + root); err != nil {
+			t.Error(err)
+		}
+	})
+
+	openAndWrite := func(stateDir, record string) *os.File {
+		t.Helper()
+		f, failure := setupServiceLog(stateDir)
+		if f == nil || failure != "" {
+			t.Fatalf("setupServiceLog: %s", failure)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		if f.Name() != filepath.Join(stateDir, "agent.log") {
+			t.Errorf("log handle name = %q", f.Name())
+		}
+		if _, err := f.WriteString(record); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	const first, second, third = "{\"msg\":\"first\"}\n", "{\"msg\":\"second\"}\n", "{\"msg\":\"third\"}\n"
+	if err := openAndWrite(dir, first).Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer := openAndWrite(dir, second)
+	if err := openAndWrite(`\\?\`+dir, third).Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	extendedPath := `\\?\` + path
+	if data, err := os.ReadFile(extendedPath); err != nil || string(data) != first+second+third {
+		t.Fatalf("read while open = %q, %v", data, err)
+	}
+	if err := os.Remove(extendedPath); err != nil {
+		t.Fatalf("delete while open: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(extendedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat after delete and close = %v, want os.ErrNotExist", err)
+	}
+
+	if err := os.Mkdir(extendedPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := openServiceLog(path)
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) || pathErr.Path != path {
+		t.Fatalf("open a directory at the log path = %v, want PathError with the original path", err)
+	}
+	if f, failure := setupServiceLog(dir); f != nil || !strings.HasPrefix(failure, "could not open agent.log (Windows error ") {
+		t.Fatalf("obstructed setupServiceLog = %v, %q", f, failure)
 	}
 }

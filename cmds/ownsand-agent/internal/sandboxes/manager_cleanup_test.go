@@ -131,7 +131,7 @@ func TestRestartRemovalWaitsForAcknowledgedSurvivor(t *testing.T) {
 		}
 		release()
 		e.m.bg.Wait()
-		if err := e.m.RemoveAll(t.Context()); err != nil {
+		if err := e.removeAllAndWipe(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(keep); !os.IsNotExist(err) || e.rt.hasFiles(id) || e.pendingCleanups() != 0 || e.rt.deleteCallCount() != 3 {

@@ -95,13 +95,30 @@ func newReopenFixture(t *testing.T, mode uint32) *reopenFixture {
 
 func (f *reopenFixture) entry(t *testing.T) *writeEntry {
 	t.Helper()
-	f.m.mu.Lock()
-	defer f.m.mu.Unlock()
-	e := f.m.entries[f.id]
+	return requireWriteEntry(t, f.m, f.id)
+}
+
+func requireWriteEntry(t *testing.T, m *writeManager, id string) *writeEntry {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.entries[id]
 	if e == nil {
 		t.Fatal("write entry is not registered")
 	}
 	return e
+}
+
+func failStagingClose(t *testing.T) func() {
+	t.Helper()
+	closeFile := closeStagingFile
+	closeStagingFile = func(file *os.File) error {
+		if err := closeFile(file); err != nil {
+			t.Fatalf("close staging file before injecting EIO: %v", err)
+		}
+		return syscall.EIO
+	}
+	return func() { closeStagingFile = closeFile }
 }
 
 func wantOpError(t *testing.T, err error, code ownsandv1.ErrorCode, msg string) {
@@ -117,14 +134,8 @@ func (f *reopenFixture) stageAndFailClose(t *testing.T) {
 	if _, err := f.m.apply(f.chunk); err != nil {
 		t.Fatalf("first chunk: %v", err)
 	}
-	closeFile := closeStagingFile
-	defer func() { closeStagingFile = closeFile }()
-	closeStagingFile = func(file *os.File) error {
-		if err := closeFile(file); err != nil {
-			t.Fatalf("close staging file before injecting EIO: %v", err)
-		}
-		return syscall.EIO
-	}
+	restoreClose := failStagingClose(t)
+	defer restoreClose()
 
 	_, err := f.m.apply(f.finish)
 	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "write: file system error")
@@ -137,6 +148,44 @@ func (f *reopenFixture) stageAndFailClose(t *testing.T) {
 	if _, err := os.Stat(f.target); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("target after failed close: %v", err)
 	}
+}
+
+func TestWriteCloseClosesModeFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the finish path keeps a duplicate staging handle on Unix")
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	h := newHarness(t, nil)
+	chunk := writePartialTo(t, h, target)
+	finish := &ownsandv1.WriteFileRequest{
+		WriteId: chunk.GetWriteId(),
+		Finish:  &ownsandv1.WriteFileFinish{SizeBytes: int64(len(chunk.GetData()))},
+	}
+	restoreClose := failStagingClose(t)
+	defer restoreClose()
+	_, err := h.srv.applyWrite(finish)
+	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "write: file system error")
+	entry := requireWriteEntry(t, h.srv.writes, chunk.GetWriteId())
+	modeFile := entry.modeFile
+	if entry.file != nil || modeFile == nil {
+		t.Fatalf("failed finish: primary handle present=%t, duplicate handle present=%t", entry.file != nil, modeFile != nil)
+	}
+	if _, err := modeFile.Stat(); err != nil {
+		t.Fatalf("duplicate staging handle before Close: %v", err)
+	}
+
+	h.srv.Close()
+	if _, err := modeFile.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("duplicate staging handle after Close: %v, want os.ErrClosed", err)
+	}
+	if entry.modeFile != nil {
+		t.Fatal("duplicate staging handle still registered after Close")
+	}
+	replacement := openReplacement(t, Config{StateDir: h.srv.cfg.StateDir, Now: h.clock.Now}, 0)
+	requireWriteArtifacts(t, h.srv, chunk, true)
+	h.clock.Advance(OperationRetention + time.Second)
+	replacement.Sweep()
+	requireWriteArtifacts(t, h.srv, chunk, false)
 }
 
 func TestWriteFinishRetryReopensStagingFileAfterFailedClose(t *testing.T) {

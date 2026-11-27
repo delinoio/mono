@@ -301,14 +301,28 @@ func growFile(path string, size int64) error {
 
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
-	return r.createVM(ctx, spec, vmCreateOps{cloneFile: unix.Clonefile, growFile: growFile, fitGPT: gpt.Fit})
+	return r.createVM(ctx, spec, r.createOps())
 }
 
-// vmCreateOps lets tests cancel create during a disk operation.
+func (r *Runtime) createOps() vmCreateOps {
+	return vmCreateOps{
+		cloneFile: unix.Clonefile,
+		growFile:  growFile,
+		fitGPT:    gpt.Fit,
+		setClock: func(ctx context.Context, v *vm, now time.Time) error {
+			return guestclient.SetClockOnce(ctx, v.Dial, now)
+		},
+		stopRestore: r.stopVM,
+	}
+}
+
+// vmCreateOps lets tests inject failures during disk preparation or restore.
 type vmCreateOps struct {
-	cloneFile func(string, string, int) error
-	growFile  func(string, int64) error
-	fitGPT    func(string) error
+	cloneFile   func(string, string, int) error
+	growFile    func(string, int64) error
+	fitGPT      func(string) error
+	setClock    func(context.Context, *vm, time.Time) error
+	stopRestore func(*vm) error
 }
 
 func (ops vmCreateOps) copyFile(ctx context.Context, src, dst string) error {
@@ -377,6 +391,18 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		cleanup()
 		return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 	}
+	// The image builder can replace the rootfs between the source check and the copy.
+	if spec.Snapshot == nil {
+		copiedDisk, err := os.Stat(disk)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("vzrt: stat copied base disk: %w", err)
+		}
+		if err := checkBaseDiskCapacity(copiedDisk.Size(), diskBytes); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
 	r.mu.Lock()
 	r.vms[spec.SandboxID] = v
 	r.mu.Unlock()
@@ -384,16 +410,16 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 	if memoryRestore {
 		err := r.restoreMemory(ctx, v, spec)
 		if err == nil && ctx.Err() == nil {
+			err = syncRestoreClock(ctx, r.logger, v.id, func(ctx context.Context, now time.Time) error {
+				return ops.setClock(ctx, v, now)
+			})
+		}
+		if err == nil && ctx.Err() == nil {
 			v.restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE
-			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := guestclient.SetClockOnce(clockCtx, v.Dial, time.Now()); err != nil {
-				r.logger.Warn("set guest clock after memory restore failed", "sandbox_id", v.id, "error", err)
-			}
-			cancel()
 			r.logger.Info("VM restored from memory state", "sandbox_id", v.id)
 			return v, nil
 		}
-		if err := finishFailedRestore(ctx, func() error { return r.stopVM(v) }, cleanup); err != nil {
+		if err := finishFailedRestore(ctx, func() error { return ops.stopRestore(v) }, cleanup); err != nil {
 			return nil, err
 		}
 		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)

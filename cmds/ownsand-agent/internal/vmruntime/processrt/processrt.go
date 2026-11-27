@@ -251,10 +251,9 @@ func (v *vm) signalHelper(sig syscall.Signal) error {
 // further worker.
 //
 // A helper that was reaped counts as stopped: it starts no worker, and the
-// runtime sends no signal to it (see signalHelper). The wait ends with an
-// error when ctx ends or the helper does not stop within helperStopTimeout.
-// The last observation error is part of that error, so that a missing `ps`
-// is not reported as a helper that ignored the signal.
+// runtime sends no signal to it (see signalHelper). All observations share
+// the earlier of the caller's deadline and helperStopTimeout. A timeout
+// includes the last probe failure to help diagnose a broken or missing `ps`.
 func (v *vm) waitHelperStopped(ctx context.Context) error {
 	if v.helper.pid == 0 {
 		return nil
@@ -263,40 +262,56 @@ func (v *vm) waitHelperStopped(ctx context.Context) error {
 	if v.stopWait > 0 {
 		timeout = v.stopWait
 	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	deadline, _ := waitCtx.Deadline()
+	active := func() bool {
+		// The deadline can pass before the context's timer has run.
+		return waitCtx.Err() == nil && time.Now().Before(deadline)
+	}
 	observe := processStopped
 	if v.observeStopped != nil {
 		observe = v.observeStopped
 	}
 	pid := v.helper.pid
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 	ticker := time.NewTicker(stopPoll)
 	defer ticker.Stop()
 	var observeErr error
-	for {
+	for active() {
 		// Check for an exit before every observation: the process ID of a
 		// reaped helper can belong to another process.
 		if v.hasExited() {
 			return nil
 		}
-		stopped, err := observe(ctx, pid)
-		if err == nil && stopped {
+		stopped, err := observe(waitCtx, pid)
+		if err == nil && stopped && active() {
 			return nil
 		}
-		observeErr = err
+		// Keep the last probe failure if the current probe was canceled
+		// by the wait deadline.
+		if err != nil && !errors.Is(err, waitCtx.Err()) {
+			observeErr = err
+		}
 		select {
 		case <-v.exited:
-			return nil
-		case <-ctx.Done():
-			return fmt.Errorf("processrt: wait for the helper of sandbox %s to stop: %w", v.id, ctx.Err())
-		case <-timer.C:
-			if observeErr != nil {
-				return fmt.Errorf("processrt: sandbox %s helper did not stop within %s: %w", v.id, timeout, observeErr)
-			}
-			return fmt.Errorf("processrt: sandbox %s helper did not stop within %s", v.id, timeout)
+		case <-waitCtx.Done():
 		case <-ticker.C:
 		}
 	}
+	callerErr := ctx.Err()
+	if callerDeadline, ok := ctx.Deadline(); callerErr == nil && ok && callerDeadline.Equal(deadline) {
+		callerErr = context.DeadlineExceeded
+	}
+	var err error
+	if callerErr == nil {
+		err = fmt.Errorf("processrt: sandbox %s helper did not stop within %s: %w", v.id, timeout, context.DeadlineExceeded)
+	} else {
+		err = fmt.Errorf("processrt: wait for the helper of sandbox %s to stop: %w", v.id, callerErr)
+	}
+	if observeErr != nil && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", err, observeErr)
+	}
+	return err
 }
 
 // ignoreExited drops errHelperExited from err. A rollback that finds the
