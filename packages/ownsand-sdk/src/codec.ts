@@ -167,6 +167,11 @@ export function encodeMessages(frame: DataFrame): Uint8Array[] {
   return messages;
 }
 
+interface FrameDecodeResult {
+  frames: DataFrame[];
+  error?: FrameCodecError;
+}
+
 /**
  * Reassembles frames from data channel messages. It rejects a declared
  * length above MAX_FRAME_SIZE before it buffers the body and stays failed
@@ -176,10 +181,10 @@ export class FrameDecoder {
   #buffer = new Uint8Array(0);
   #failed: FrameCodecError | undefined;
 
-  /** Adds one message and returns every frame that it completes. */
-  push(message: Uint8Array): DataFrame[] {
+  /** Returns the completed frames in wire order and any subsequent codec error. */
+  push(message: Uint8Array): FrameDecodeResult {
     if (this.#failed) {
-      throw this.#failed;
+      return { frames: [], error: this.#failed };
     }
     const joined = new Uint8Array(this.#buffer.length + message.length);
     joined.set(this.#buffer, 0);
@@ -216,9 +221,10 @@ export class FrameDecoder {
         error instanceof FrameCodecError
           ? error
           : new FrameCodecError(String(error));
-      throw this.#failed;
+      this.#buffer = new Uint8Array(0);
+      return { frames, error: this.#failed };
     }
-    return frames;
+    return { frames };
   }
 }
 

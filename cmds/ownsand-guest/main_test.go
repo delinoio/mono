@@ -21,11 +21,13 @@ import (
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
+	"go.opentelemetry.io/otel/attribute"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
 
 // runCapturingStderr runs run with args and returns its exit code and what
 // it wrote to os.Stderr.
-func runCapturingStderr(t *testing.T, args []string) (int, string) {
+func runCapturingStderr(t *testing.T, args []string, processors ...sdklog.Processor) (int, string) {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -33,7 +35,7 @@ func runCapturingStderr(t *testing.T, args []string) (int, string) {
 	}
 	orig := os.Stderr
 	os.Stderr = w
-	code := run(context.Background(), args, nil)
+	code := run(context.Background(), args, nil, processors...)
 	os.Stderr = orig
 	w.Close()
 	out, err := io.ReadAll(r)
@@ -80,23 +82,58 @@ func TestRunAcceptsASCIICaseFoldedLogLevel(t *testing.T) {
 	}
 }
 
+type guestLogProcessor struct {
+	records []sdklog.Record
+	closed  bool
+}
+
+func (*guestLogProcessor) Enabled(context.Context, sdklog.EnabledParameters) bool { return true }
+func (*guestLogProcessor) ForceFlush(context.Context) error                       { return nil }
+
+func (p *guestLogProcessor) OnEmit(_ context.Context, record *sdklog.Record) error {
+	p.records = append(p.records, record.Clone())
+	return nil
+}
+
+func (p *guestLogProcessor) Shutdown(context.Context) error {
+	p.closed = true
+	return nil
+}
+
 func TestRunListenFailureLogOmitsSocketPath(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	processor := &guestLogProcessor{}
 	t.Chdir(t.TempDir())
 	// The parent directory does not exist, so the bind fails.
 	code, stderr := runCapturingStderr(t, []string{
 		"--listen", "unix://no-such-dir-secret/guest-secret.sock",
 		"--state-dir", "state", "--clock", "ignore",
-	})
+	}, processor)
 	if code != 1 {
 		t.Fatalf("exit code %d, want 1; stderr %q", code, stderr)
 	}
-	if !strings.Contains(stderr, "listen failed") || !strings.Contains(stderr, "bind unix socket") {
+	if !strings.Contains(stderr, `"level":"ERROR","msg":"listen failed","component":"ownsand-guest"`) || !strings.Contains(stderr, "bind unix socket") {
 		t.Fatalf("stderr %q does not report the bind failure", stderr)
 	}
 	for _, leak := range []string{"no-such-dir-secret", "guest-secret"} {
 		if strings.Contains(stderr, leak) {
 			t.Fatalf("stderr contains %q: %q", leak, stderr)
 		}
+	}
+	if len(processor.records) != 1 || !processor.closed {
+		t.Fatalf("SDK record count = %d, shutdown called = %t", len(processor.records), processor.closed)
+	}
+	record := processor.records[0]
+	if record.Body().AsString() != "listen failed" || record.SeverityText() != "ERROR" || record.Severity() != 17 {
+		t.Fatalf("SDK body and severity = %v, %v, %s", record.Body(), record.Severity(), record.SeverityText())
+	}
+	fields := make(map[string]string)
+	record.WalkAttributes(func(kv attribute.KeyValue) bool {
+		fields[string(kv.Key)] = kv.Value.AsString()
+		return true
+	})
+	if len(fields) != 1 || fields["component"] != "ownsand-guest" {
+		t.Fatalf("SDK fields = %v, want guest component only", fields)
 	}
 }
 

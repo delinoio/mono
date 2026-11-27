@@ -270,9 +270,13 @@ export function fakeWebRtc(
       };
       record.peers.push(peer);
       channel.onSend = (bytes) => {
-        for (const frame of decoder.push(bytes)) {
+        const { frames, error } = decoder.push(bytes);
+        for (const frame of frames) {
           record.frames.push(frame);
           queueMicrotask(() => agent(frame, peer));
+        }
+        if (error !== undefined) {
+          queueMicrotask(() => channel.close());
         }
       };
       return channel;

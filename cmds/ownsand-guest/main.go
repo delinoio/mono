@@ -17,8 +17,10 @@ import (
 	"syscall"
 
 	"github.com/delinoio/mono/cmds/internal/loglevel"
+	"github.com/delinoio/mono/cmds/ownsand-agent/runtimelog"
 	"github.com/delinoio/mono/cmds/ownsand-guest/guest"
 	"github.com/delinoio/mono/cmds/ownsand-guest/guestlisten"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -63,7 +65,7 @@ func main() {
 
 // run serves the GuestService until ctx ends. openLog returns the log
 // output for the state directory; nil logs to standard error.
-func run(ctx context.Context, args []string, openLog func(stateDir string) (logOutput, error)) int {
+func run(ctx context.Context, args []string, openLog func(stateDir string) (logOutput, error), processors ...sdklog.Processor) int {
 	fs := flag.NewFlagSet("ownsand-guest", flag.ContinueOnError)
 	listen := fs.String("listen", envOr(envListen, guestlisten.DefaultSpec), "listener spec: vsock://:<port>, hvsock://<service GUID>, unix://<path> or tcp://<host:port> (env "+envListen+")")
 	stateDir := fs.String("state-dir", envOr(envStateDir, defaultStateDir()), "directory for read snapshots and write records on the guest disk (env "+envStateDir+")")
@@ -98,7 +100,8 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (logO
 		logOut = out.W
 		notes = out.Notes
 	}
-	logger := slog.New(slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: level})).With("component", "ownsand-guest")
+	logger, shutdown := runtimelog.New(logOut, level, runtimelog.Guest, processors...)
+	defer shutdown()
 	for _, note := range notes {
 		note(logger)
 	}

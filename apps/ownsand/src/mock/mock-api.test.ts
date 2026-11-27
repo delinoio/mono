@@ -10,6 +10,7 @@ import {
 } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   AgentUpdateState,
+  AgentVersionPolicyMode,
   ApiKeyState,
   Arch,
   BaseImage,
@@ -41,6 +42,56 @@ import {
   type MockBillingAccount,
 } from "./mock-api.ts";
 import { walkFixturePages } from "./walk-fixture-pages.ts";
+
+describe("mock agent version policy", () => {
+  afterEach(() => {
+    rs.useRealTimers();
+  });
+
+  test.each([
+    ["space", " "],
+    ["tab", "\t"],
+    ["carriage return", "\r"],
+    ["line feed", "\n"],
+  ])(
+    "rejects a pin with an embedded %s and preserves the policy",
+    async (_, whitespace) => {
+      rs.useFakeTimers();
+      const savedAt = Date.UTC(2026, 0, 1);
+      rs.setSystemTime(savedAt);
+      const client = createClient(
+        DeviceService,
+        createMockTransport({ userId: "user-admin-jun" }),
+      );
+      const request = { organizationId: MOCK_IDS.acme };
+      const pin = { ...request, mode: AgentVersionPolicyMode.PIN };
+      const { policy } = await client.updateAgentVersionPolicy({
+        ...pin,
+        pinnedVersion: "1.4.2",
+      });
+      expect(policy).toMatchObject({
+        ...pin,
+        pinnedVersion: "1.4.2",
+        updateTime: timestampFromMs(savedAt),
+        updatedBy: { id: "user-admin-jun" },
+      });
+
+      rs.setSystemTime(savedAt + 1000);
+      await expect(
+        client.updateAgentVersionPolicy({
+          ...pin,
+          pinnedVersion: `1.${whitespace}4.2`,
+        }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage: "invalid pinned_version: a version is required for PIN",
+      });
+      expect((await client.getAgentVersionPolicy(request)).policy).toEqual(
+        policy,
+      );
+    },
+  );
+});
 
 describe("mock device list", () => {
   const organizationId = MOCK_IDS.acme;
@@ -1141,6 +1192,86 @@ describe("mock createSandbox restore restrictions", () => {
       );
       expect(restore.sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
     }
+  });
+});
+
+describe("mock template names", () => {
+  const organizationId = MOCK_IDS.acme;
+  const seededName = "node-24-toolchain";
+  const duplicateError = {
+    code: Code.AlreadyExists,
+    rawMessage: "a template with this name exists",
+  };
+
+  test("rejects the seeded name after trimming and preserves the list", async () => {
+    const client = createClient(SnapshotService, createMockTransport());
+    const before = await client.listTemplates({ organizationId });
+    expect(before.templates.map((template) => template.templateId)).toEqual([
+      MOCK_IDS.template,
+    ]);
+
+    for (const name of [seededName, `  ${seededName}  `]) {
+      await expect(
+        client.createTemplate({
+          organizationId,
+          snapshotId: MOCK_IDS.snapshot,
+          name,
+        }),
+      ).rejects.toMatchObject(duplicateError);
+    }
+    expect(await client.listTemplates({ organizationId })).toEqual(before);
+  });
+
+  test("rejects the same name across snapshots and accepts an unused name", async () => {
+    const client = createClient(
+      SnapshotService,
+      createMockTransport({ extraSnapshots: 1 }),
+    );
+    const { snapshots } = await client.listSnapshots({ organizationId });
+    const second = snapshots.find(
+      ({ snapshotId }) => snapshotId !== MOCK_IDS.snapshot,
+    )!;
+    const request = { organizationId, snapshotId: second.snapshotId };
+    const before = await client.listTemplates({ organizationId });
+
+    await expect(
+      client.createTemplate({ ...request, name: seededName }),
+    ).rejects.toMatchObject(duplicateError);
+    expect(await client.listTemplates({ organizationId })).toEqual(before);
+
+    const { template } = await client.createTemplate({
+      ...request,
+      name: "  review-template  ",
+    });
+    expect(template).toMatchObject({ ...request, name: "review-template" });
+    expect((await client.listTemplates({ organizationId })).templates).toEqual([
+      ...before.templates,
+      template,
+    ]);
+  });
+
+  test("allows a different organization to use the same name", async () => {
+    const client = createClient(
+      SnapshotService,
+      createMockTransport({
+        northwindReadySnapshot: true,
+        billing: { [MOCK_IDS.northwind]: MockBillingState.AllowedLinked },
+      }),
+    );
+    const northwind = { organizationId: MOCK_IDS.northwind };
+    const { snapshots } = await client.listSnapshots(northwind);
+    const request = { ...northwind, snapshotId: snapshots[0]!.snapshotId };
+    const before = await client.listTemplates({ organizationId });
+
+    const { template } = await client.createTemplate({
+      ...request,
+      name: seededName,
+    });
+    expect(template).toMatchObject({ ...request, name: seededName });
+    expect((await client.listTemplates(northwind)).templates).toEqual([
+      template,
+    ]);
+    expect(await client.listTemplates({ organizationId })).toEqual(before);
   });
 });
 

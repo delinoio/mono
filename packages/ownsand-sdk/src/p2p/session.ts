@@ -3,7 +3,6 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
   encodeMessages,
-  FrameCodecError,
   FrameDecoder,
   MAX_FRAME_SIZE,
   validateFrame,
@@ -561,17 +560,14 @@ export class PeerSession {
       );
       return;
     }
-    let frames: DataFrame[];
+    let result;
     try {
-      frames = this.#decoder.push(bytes);
-    } catch (error) {
-      this.#terminate(
-        new PeerUnavailableError(
-          error instanceof FrameCodecError ? error.message : "decode failed",
-        ),
-      );
+      result = this.#decoder.push(bytes);
+    } catch {
+      this.#terminate(new PeerUnavailableError("decode failed"));
       return;
     }
+    const { frames, error } = result;
     for (const frame of frames) {
       const invalid = validateFrame(frame);
       if (invalid !== undefined) {
@@ -610,6 +606,9 @@ export class PeerSession {
         return;
       }
       this.#enqueue(frame);
+    }
+    if (error !== undefined) {
+      this.#terminate(new PeerUnavailableError(error.message));
     }
   }
 
