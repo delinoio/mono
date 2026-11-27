@@ -798,6 +798,7 @@
     font-family: var(--dui-font-family);
     font-size: 13px;
     line-height: 1.4;
+    overflow-wrap: anywhere;
     transform-origin: var(--transform-origin);
     transition:
       opacity 0.15s,
