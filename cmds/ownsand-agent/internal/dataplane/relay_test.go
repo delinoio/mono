@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/pion/webrtc/v4"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
@@ -116,6 +117,7 @@ func newRelayEnvWrapped(t *testing.T, timing Timing, limits RelayLimits, wrap fu
 	}
 	dp := New(Options{
 		Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), Timing: timing, Limits: limits,
+		IncludeLoopback: true, InterfaceFilter: loopbackOnly,
 		Auth: authFunc(func(ctx context.Context) (string, error) {
 			if hook := e.beforeAuth.Load(); hook != nil {
 				if err := (*hook)(ctx); err != nil {
@@ -1989,6 +1991,7 @@ func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T)
 				}
 			}
 			start := time.Now()
+			c.armFlushDeadline(start)
 			go c.closeAfterFlush()
 			if markerReceived != nil {
 				select {
@@ -2027,6 +2030,7 @@ func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
 	inner := c.cancel
 	c.cancel = func() { canceled <- struct{}{}; inner() }
 	go func() { <-c.out; inner() }()
+	c.armFlushDeadline(time.Now())
 	c.closeAfterFlush()
 	time.Sleep(600 * time.Millisecond)
 	if len(canceled) != 0 {
@@ -2039,9 +2043,8 @@ func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
 // relay stream, so HTTP/2 flow control blocks the agent's writer while the
 // outbound queue still has room and the control plane keeps sending bytes.
 // The queue takes the flush marker, but the writer never reaches it. The
-// agent must still cancel the connection at the shutdown deadline, and the
-// live grant of the new channel must get a new connection after the bounded
-// teardown.
+// agent must still cancel the connection at the shutdown deadline while
+// the old peer drains. A live grant on the new channel gets a connection.
 func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
 	const flush = time.Second
 	e := newRelayEnv(t, Timing{FlushDeadline: flush, ReceiveTimeout: time.Hour, KeepaliveInterval: time.Hour, ProbeIdle: time.Hour}, RelayLimits{})
@@ -2112,17 +2115,31 @@ func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
 		t.Fatalf("the outbound queue is full (%d frames), so the test does not cover a queue with free slots", len(old.out))
 	}
 
-	e.dp.ChannelLost(e.ch)
-	e.ch.Close()
+	peer, caller, releasePeer := e.bufferPeer()
+	// Keep Done open until the callback claims the peer. Otherwise the peer
+	// watcher can win the transition and hide a synchronous drain here.
 	lost := time.Now()
+	e.loseChannelWithBufferedPeer(peer)
 	select {
 	case <-old.ctx.Done():
-	case <-time.After(flush + 3*time.Second):
+	case <-time.After(time.Until(lost.Add(flush + 500*time.Millisecond))):
 		t.Fatalf("the connection was not canceled %v after the channel loss", time.Since(lost))
 	}
-	if d := time.Since(lost); d < flush*8/10 {
-		t.Fatalf("the connection was canceled after %v, before the %v flush deadline", d, flush)
+	if d := time.Since(lost); d < flush*8/10 || d > flush+500*time.Millisecond {
+		t.Fatalf("the connection was canceled after %v, want about %v from channel loss", d, flush)
 	}
+	select {
+	case <-peer.ctx.Done():
+		t.Fatal("the peer finished draining before the relay cancellation")
+	default:
+	}
+	releasePeer()
+	caller.waitClosed()
+	waitFor(t, "lost peer removal", func() bool {
+		e.dp.mu.Lock()
+		defer e.dp.mu.Unlock()
+		return e.dp.sessions[peer.id] == nil
+	})
 	// The grant of the new channel gets a new connection after the bounded
 	// teardown.
 	e.ch = newChannel(2)
@@ -2135,6 +2152,50 @@ func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
 	}
 	if d := time.Since(lost); d > flush+teardownGrace+4*time.Second {
 		t.Fatalf("the new connection took %v after the channel loss", d)
+	}
+}
+
+func (e *relayEnv) bufferPeer() (*session, *caller, func()) {
+	e.t.Helper()
+	c, id := e.session(e.t, e.dp, e.ch, time.Hour)
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	e.t.Cleanup(release)
+	c.dc.OnMessage(func(webrtc.DataChannelMessage) { <-gate })
+	c.send(datapath.MustNewFrame(1, e.sandbox, e.execReq("/bin/sh", "-c", "head -c 100000000 /dev/zero")))
+	e.dp.mu.Lock()
+	s := e.dp.sessions[id]
+	e.dp.mu.Unlock()
+	waitFor(e.t, "a backpressured peer", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.dc != nil && s.dc.BufferedAmount() > maxBuffered
+	})
+	return s, c, release
+}
+
+func (e *relayEnv) loseChannelWithBufferedPeer(s *session) {
+	e.t.Helper()
+	e.dp.ChannelLost(e.ch)
+	e.ch.Close()
+	if ended, reason := s.endState(); !ended || reason != ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST {
+		e.t.Fatalf("peer ended %v with reason %v after ChannelLost", ended, reason)
+	}
+	select {
+	case <-s.ctx.Done():
+		e.t.Fatal("ChannelLost waited for the peer drain")
+	default:
+	}
+	req := datapath.MustNewFrame(2, e.sandbox, e.execReq("/bin/sh", "-c", "sleep 30"))
+	if err := s.send(e.t.Context(), req); !errors.Is(err, errSessionEnding) {
+		e.t.Fatalf("operation send after channel loss returned %v", err)
+	}
+	s.onFrame(req)
+	s.mu.Lock()
+	_, admitted := s.streams[2]
+	s.mu.Unlock()
+	if admitted {
+		e.t.Fatal("lost peer admitted a request")
 	}
 }
 
@@ -2172,10 +2233,12 @@ func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
 	e.openOK(rc, 1, g.GetGrantId())
 	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
 	rc.nextOn(1)
+	peer, caller, releasePeer := e.bufferPeer()
+	oldChannel := e.ch
 	lost := time.Now()
-	e.dp.ChannelLost(e.ch)
-	e.ch.Close()
+	e.loseChannelWithBufferedPeer(peer)
 	var sawSessionEnd bool
+waitForClose:
 	for {
 		select {
 		case ev := <-events:
@@ -2194,11 +2257,29 @@ func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
 			if d := time.Since(lost); d > flush/2 {
 				t.Fatalf("the request closed %v after the channel loss, not at the end of the flush", d)
 			}
-			return
+			break waitForClose
 		case <-time.After(flush):
 			t.Fatal("the request side never closed")
 		}
 	}
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	req = e.execReq("/bin/true")
+	g = e.execGrant(req)
+	rc = e.conn()
+	e.dp.ChannelLost(oldChannel)
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	if f := rc.nextOn(1); f.GetRequestAccepted() == nil {
+		t.Fatalf("new generation did not accept its request: %v", f)
+	}
+	select {
+	case <-peer.ctx.Done():
+		t.Fatal("the new generation did not serve a request during the old peer drain")
+	default:
+	}
+	releasePeer()
+	caller.waitClosed()
 }
 
 // relayAttempt is one relay connection of a scripted control plane.
