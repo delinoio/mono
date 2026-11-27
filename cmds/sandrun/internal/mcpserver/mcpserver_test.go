@@ -746,13 +746,132 @@ func TestRunWithWaitStopsOnCallerCancellation(t *testing.T) {
 	}
 }
 
-type attachExecFixture struct {
+type execStreamFixture struct {
 	sandrunv1connect.UnimplementedDevSessionServiceHandler
+	start  func(*sandrunv1.ExecDevSessionRequest, *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error
 	attach func(context.Context, *sandrunv1.AttachDevSessionExecRequest, *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error
 }
 
-func (f attachExecFixture) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest], stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
+func (f execStreamFixture) ExecDevSession(_ context.Context, req *connect.Request[sandrunv1.ExecDevSessionRequest], stream *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
+	return f.start(req.Msg, stream)
+}
+
+func (f execStreamFixture) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest], stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
 	return f.attach(ctx, req.Msg, stream)
+}
+
+func TestExecStreamErrorRecovery(t *testing.T) {
+	const sessionID = "test-session"
+	keepalive := &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Keepalive{Keepalive: &sandrunv1.DevSessionExecKeepalive{}}}
+	started := &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Started{Started: &sandrunv1.DevSessionExecStarted{}}}
+	stdout := &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stdout{Stdout: &sandrunv1.DevSessionExecOutput{Data: []byte("hi")}}}
+	stderr := &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stderr{Stderr: &sandrunv1.DevSessionExecOutput{Data: []byte("!")}}}
+	exited := &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Exited{Exited: &sandrunv1.DevSessionExecExited{Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 0}}}}
+
+	for _, tc := range []struct {
+		name        string
+		startEvents []*sandrunv1.DevSessionExecEvent
+		attachCode  connect.Code
+		wantUnknown bool
+		recover     bool
+	}{
+		{name: "unconfirmed", startEvents: []*sandrunv1.DevSessionExecEvent{keepalive}, attachCode: connect.CodeNotFound, wantUnknown: true},
+		{name: "confirmed", startEvents: []*sandrunv1.DevSessionExecEvent{started, stdout, stderr}, attachCode: connect.CodePermissionDenied, recover: true},
+		{name: "immediate rejection"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var execID atomic.Pointer[string]
+			var starts, attaches atomic.Int32
+			fixture := execStreamFixture{
+				start: func(req *sandrunv1.ExecDevSessionRequest, stream *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
+					starts.Add(1)
+					id := req.GetExecId()
+					execID.Store(&id)
+					if len(tc.startEvents) == 0 {
+						return connect.NewError(connect.CodeFailedPrecondition, errors.New("session is not running"))
+					}
+					for _, event := range tc.startEvents {
+						if err := stream.Send(&sandrunv1.ExecDevSessionResponse{Event: event}); err != nil {
+							return err
+						}
+					}
+					return nil
+				},
+				attach: func(_ context.Context, req *sandrunv1.AttachDevSessionExecRequest, stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
+					attempt := attaches.Add(1)
+					if id := execID.Load(); id == nil || req.GetExecId() != *id || req.GetDevSessionId() != sessionID {
+						t.Errorf("attach request = %v", req)
+					}
+					if attempt == 1 {
+						var wantStdout, wantStderr int64
+						if tc.recover {
+							wantStdout, wantStderr = 2, 1
+						}
+						if req.GetStdoutOffset() != wantStdout || req.GetStderrOffset() != wantStderr {
+							t.Errorf("internal attach offsets = (%d, %d), want (%d, %d)", req.GetStdoutOffset(), req.GetStderrOffset(), wantStdout, wantStderr)
+						}
+						return connect.NewError(tc.attachCode, errors.New("attach rejected"))
+					}
+					if req.GetStdoutOffset() != 0 || req.GetStderrOffset() != 0 {
+						t.Errorf("replay attach offsets = (%d, %d), want (0, 0)", req.GetStdoutOffset(), req.GetStderrOffset())
+					}
+					for _, event := range []*sandrunv1.DevSessionExecEvent{started, stdout, stderr, exited} {
+						if err := stream.Send(&sandrunv1.AttachDevSessionExecResponse{Event: event}); err != nil {
+							return err
+						}
+					}
+					return nil
+				},
+			}
+			_, handler := sandrunv1connect.NewDevSessionServiceHandler(fixture)
+			upstream := httptest.NewUnstartedServer(handler)
+			upstream.Config.Protocols = new(http.Protocols)
+			upstream.Config.Protocols.SetUnencryptedHTTP2(true)
+			upstream.Start()
+			t.Cleanup(upstream.Close)
+			h := newHarness(t, Config{Client: func(context.Context) (*sandrun.Client, error) {
+				return sandrun.New(sandrun.Options{BaseURL: upstream.URL, APIKey: "test-key"})
+			}})
+			message, isErr := h.call("exec", map[string]any{
+				"session_id": sessionID, "command": []string{"true"}, "wait_seconds": 10,
+			}, nil)
+			t.Cleanup(func() {
+				if got := starts.Load(); got != 1 {
+					t.Errorf("start RPC count = %d, want 1", got)
+				}
+			})
+			if len(tc.startEvents) == 0 {
+				if !isErr || message != "failed_precondition: session is not running" || attaches.Load() != 0 {
+					t.Fatalf("immediate failure = %v %q, attach count = %d", isErr, message, attaches.Load())
+				}
+				return
+			}
+			if !isErr || !strings.HasPrefix(message, tc.attachCode.String()+": attach rejected\n") || attaches.Load() != 1 {
+				t.Fatalf("exec error = %v %q, attach count = %d", isErr, message, attaches.Load())
+			}
+			_, recovery, _ := strings.Cut(message, "\n")
+			beforeID, afterID, found := strings.Cut(recovery, "for exec_id ")
+			reportedID, _, hasEnd := strings.Cut(afterID, ".")
+			if id := execID.Load(); beforeID == "" || !found || !hasEnd || id == nil || reportedID == "" || reportedID != *id {
+				t.Fatalf("exec error %q does not report the original ID", message)
+			}
+			if strings.Contains(message, "outcome is unknown") != tc.wantUnknown ||
+				!strings.Contains(message, "exec_output with the same session_id and exec_id, stdout_offset 0, and stderr_offset 0") {
+				t.Fatalf("exec error lacks expected outcome or recovery wording: %q", message)
+			}
+			if tc.recover {
+				var out execResult
+				text, isErr := h.call("exec_output", map[string]any{
+					"session_id": sessionID, "exec_id": reportedID, "stdout_offset": 0, "stderr_offset": 0, "wait_seconds": 10,
+				}, &out)
+				if isErr || out.ExecID != reportedID || out.Running || out.ExitCode == nil || *out.ExitCode != 0 ||
+					out.Stdout.Text != "hi" || out.Stderr.Text != "!" || out.NextStdoutOffset != 2 || out.NextStderrOffset != 1 || attaches.Load() != 2 {
+					t.Fatalf("exec_output result = %q %+v, attach count = %d", text, out, attaches.Load())
+				}
+			}
+		})
+	}
 }
 
 func TestExecOutputAttachConfirmation(t *testing.T) {
@@ -800,7 +919,7 @@ func TestExecOutputAttachConfirmation(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, handler := sandrunv1connect.NewDevSessionServiceHandler(attachExecFixture{attach: func(ctx context.Context, req *sandrunv1.AttachDevSessionExecRequest, stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
+			_, handler := sandrunv1connect.NewDevSessionServiceHandler(execStreamFixture{attach: func(ctx context.Context, req *sandrunv1.AttachDevSessionExecRequest, stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
 				if req.GetExecId() != execID || req.GetStdoutOffset() != stdoutOffset || req.GetStderrOffset() != stderrOffset {
 					t.Errorf("attach request = %v", req)
 				}
