@@ -1032,6 +1032,93 @@ test.each([
   },
 );
 
+test("capacity refreshes device counts after a runner is deleted", async () => {
+  const organizationId = MOCK_IDS.acme;
+  const work = createClient(WorkService, createMockTransport());
+  const { devices: before } = await work.getCapacity({ organizationId });
+  expect(
+    before.map(({ ownsandDeviceId, runners }) => [
+      ownsandDeviceId,
+      Object.fromEntries(runners.map(({ state, count }) => [state, count])),
+    ]),
+  ).toEqual([
+    [MOCK_IDS.linuxDevice, { [RunnerState.WARM]: 1, [RunnerState.BUSY]: 1 }],
+    [MOCK_IDS.macDevice, {}],
+    [MOCK_IDS.windowsDevice, {}],
+  ]);
+
+  const { runner } = await work.deleteRunner({
+    organizationId,
+    runnerId: MOCK_IDS.warmRunner,
+  });
+  expect(runner?.state).toBe(RunnerState.DELETED);
+
+  const { devices: after } = await work.getCapacity({ organizationId });
+  expect(after).toEqual(
+    before.map((device) =>
+      device.ownsandDeviceId === MOCK_IDS.linuxDevice
+        ? {
+            ...device,
+            runners: device.runners.filter(
+              (count) => count.state === RunnerState.BUSY,
+            ),
+          }
+        : device,
+    ),
+  );
+});
+
+test("capacity groups only open runners assigned to devices in the organization", async () => {
+  const organizationId = MOCK_IDS.acme;
+  const ownsandDeviceId = MOCK_IDS.macDevice;
+  const work = createClient(
+    WorkService,
+    createMockTransport({
+      workFixtures: [
+        {
+          organizationId,
+          runners: [
+            ...[
+              RunnerState.DELETING,
+              RunnerState.BUSY,
+              RunnerState.WAITING_FOR_WORK,
+              RunnerState.WARM,
+              RunnerState.WARM,
+              RunnerState.PREPARING,
+              RunnerState.CREATING,
+              RunnerState.FAILED,
+              RunnerState.UNSPECIFIED,
+            ].map((state, index) => ({
+              runnerId: `mac-runner-${index}`,
+              ownsandDeviceId,
+              state,
+            })),
+            { runnerId: "unassigned", state: RunnerState.WARM },
+          ],
+        },
+        {
+          organizationId: MOCK_IDS.globex,
+          runners: [
+            { runnerId: "other-org", ownsandDeviceId, state: RunnerState.WARM },
+          ],
+        },
+      ],
+    }),
+  );
+  const { devices } = await work.getCapacity({ organizationId });
+  expect(
+    devices.find((device) => device.ownsandDeviceId === ownsandDeviceId)
+      ?.runners,
+  ).toEqual([
+    expect.objectContaining({ state: RunnerState.CREATING, count: 1 }),
+    expect.objectContaining({ state: RunnerState.PREPARING, count: 1 }),
+    expect.objectContaining({ state: RunnerState.WARM, count: 2 }),
+    expect.objectContaining({ state: RunnerState.WAITING_FOR_WORK, count: 1 }),
+    expect.objectContaining({ state: RunnerState.BUSY, count: 1 }),
+    expect.objectContaining({ state: RunnerState.DELETING, count: 1 }),
+  ]);
+});
+
 test.each([
   [MOCK_IDS.globex, "the organization has no OwnSand link"],
   [
