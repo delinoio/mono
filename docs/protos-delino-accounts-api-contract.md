@@ -182,7 +182,7 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 Ledger and credit messages:
 
 - `LedgerEntry` is append-only and kept for 7 years, also after the billing account is deleted. It carries `ledger_entry_id`, `billing_account_id`, `kind`, the signed `amount_usd_micros` (positive for credits; negative or zero for `USAGE`, `EXPIRY` and `REFUND`), `balance_after_usd_micros`, `create_time`, `paddle_transaction_id` (purchases and refunds) and `credit_grant_id` (the grant that a purchase created or that an `EXPIRY` or `REFUND` entry reduced). `USAGE` entries also carry `service`, `organization_id`, `meter`, `window_start` and `quantity`.
-- `CreditGrant` carries `credit_grant_id`, its `source` (`SUBSCRIPTION_CREDIT`, `MANUAL_TOP_UP` or `AUTO_TOP_UP`), `original_usd_micros`, `remaining_usd_micros`, `paddle_transaction_id`, `create_time` and `expire_time` (12 months after `create_time`).
+- `CreditGrant` carries `credit_grant_id`, its `source` (`SUBSCRIPTION_CREDIT`, `MANUAL_TOP_UP` or `AUTO_TOP_UP`), `original_usd_micros`, `remaining_usd_micros`, `paddle_transaction_id`, `create_time` and `expire_time`. The server sets `create_time` to the original webhook processing time and uses it for invoice dates and pagination. For a new grant, `expire_time` is 12 UTC calendar months after payment capture. If the payment has no unambiguous capture time, the server uses `create_time` as the basis. Existing grants keep their stored timestamps.
 - `Invoice` carries `paddle_transaction_id`, `kind`, `amount_usd_micros` (the credit amount, tax excluded) and `create_time`; `GetInvoiceUrl` returns the PDF link.
 
 ## Storage
