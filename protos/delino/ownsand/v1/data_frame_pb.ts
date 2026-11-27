@@ -456,7 +456,9 @@ export type ReadFileRequest = Message<"delino.ownsand.v1.ReadFileRequest"> & {
   bindingSalt: Uint8Array;
 
   /**
-   * Start offset. Zero on the first call.
+   * Byte position at which to start reading. Defaults to zero when omitted.
+   * The first call can start at a nonzero offset.
+   * To resume, use the same read_id and the offset of the next undelivered byte.
    *
    * @generated from field: int64 offset = 6;
    */
