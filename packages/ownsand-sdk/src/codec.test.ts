@@ -44,7 +44,11 @@ describe("data channel codec", () => {
       expect(m.length).toBeLessThanOrEqual(MAX_DATA_CHANNEL_MESSAGE_SIZE);
     }
     const decoder = new FrameDecoder();
-    const frames = messages.flatMap((m) => decoder.push(m));
+    const frames = messages.flatMap((m) => {
+      const result = decoder.push(m);
+      expect(result.error).toBeUndefined();
+      return result.frames;
+    });
     expect(frames).toHaveLength(1);
     expect(frames[0]!.streamId).toBe(1n);
     expect(payloadKind(frames[0]!)).toBe(DataFrameKind.FILE_READ_EVENT);
@@ -62,7 +66,9 @@ describe("data channel codec", () => {
       let at = 0;
       while (at < stream.length) {
         const n = 1 + Math.floor(Math.random() * 40_000);
-        for (const f of decoder.push(stream.subarray(at, at + n))) {
+        const { frames, error } = decoder.push(stream.subarray(at, at + n));
+        expect(error).toBeUndefined();
+        for (const f of frames) {
           ids.push(f.streamId);
         }
         at += n;
@@ -81,26 +87,45 @@ describe("data channel codec", () => {
       n >>>= 7;
     }
     prefix.push(n);
-    expect(() => decoder.push(Uint8Array.from(prefix))).toThrow(
-      FrameCodecError,
-    );
-    expect(() => decoder.push(encodeFrame(chunkFrame(1n, 1)))).toThrow(
-      FrameCodecError,
-    );
+    const { frames, error } = decoder.push(Uint8Array.from(prefix));
+    expect(frames).toEqual([]);
+    expect(error).toBeInstanceOf(FrameCodecError);
+    const next = decoder.push(encodeFrame(chunkFrame(1n, 1)));
+    expect(next.frames).toEqual([]);
+    expect(next.error).toBe(error);
   });
 
   test("rejects a length prefix longer than 10 bytes", () => {
     const decoder = new FrameDecoder();
-    expect(() => decoder.push(new Uint8Array(11).fill(0x80))).toThrow(
-      FrameCodecError,
-    );
+    const { frames, error } = decoder.push(new Uint8Array(11).fill(0x80));
+    expect(frames).toEqual([]);
+    expect(error).toBeInstanceOf(FrameCodecError);
   });
 
   test("rejects a body that is not a DataFrame", () => {
     const decoder = new FrameDecoder();
-    expect(() => decoder.push(Uint8Array.from([2, 0xff, 0xff]))).toThrow(
-      FrameCodecError,
+    const { frames, error } = decoder.push(Uint8Array.of(2, 0xff, 0xff));
+    expect(frames).toEqual([]);
+    expect(error).toBeInstanceOf(FrameCodecError);
+  });
+
+  test("returns the completed prefix once when a later body fails to decode", () => {
+    const decoder = new FrameDecoder();
+    const first = chunkFrame(1n, 1);
+    const second = encodeFrame(chunkFrame(2n, 1));
+    // Keep the one-byte length prefix and make the protobuf body fail.
+    second.fill(0xff, 1);
+    const third = encodeFrame(chunkFrame(3n, 1));
+    const { frames, error } = decoder.push(
+      Uint8Array.of(...encodeFrame(first), ...second, ...third),
     );
+    expect(frames).toEqual([first]);
+    expect(error).toBeInstanceOf(FrameCodecError);
+    expect(error?.message).toBe("frame body is not a valid DataFrame");
+
+    const next = decoder.push(third);
+    expect(next.frames).toEqual([]);
+    expect(next.error).toBe(error);
   });
 });
 
