@@ -79,12 +79,15 @@ function stdoutText(events: ExecStreamEvent[]): string {
 function gatedGenerator(
   gate: Promise<void>,
   outcome: { reject: unknown } | { result: ExecResult },
-): AsyncGenerator<ExecStreamEvent, ExecResult> {
+): ConstructorParameters<typeof ExecHandle>[1] {
   return (async function* () {
-    yield { type: ExecEventType.Started, execId: "e" } as ExecStreamEvent;
+    yield {
+      value: { type: ExecEventType.Started, execId: "e" } as ExecStreamEvent,
+      peer: false,
+    };
     await gate;
     if ("reject" in outcome) throw outcome.reject;
-    return outcome.result;
+    return { value: outcome.result, peer: false };
   })();
 }
 
@@ -160,9 +163,12 @@ describe("exec handle after a terminal failure", () => {
     const cleanup = openGate();
     let closing = false;
     let advanced = false;
-    async function* stream(): AsyncGenerator<ExecStreamEvent, ExecResult> {
+    async function* stream(): ConstructorParameters<typeof ExecHandle>[1] {
       try {
-        yield { type: ExecEventType.Started, execId: "e" };
+        yield {
+          value: { type: ExecEventType.Started, execId: "e" },
+          peer: false,
+        };
         advanced = true;
         throw new Error("unexpected stream read");
       } finally {
