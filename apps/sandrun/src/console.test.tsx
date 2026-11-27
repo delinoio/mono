@@ -305,6 +305,49 @@ describe("entry URLs during session restoration", () => {
     },
   );
 
+  test("discards replacement invitation fragments while signed out", async () => {
+    const { transport, calls } = gatedTransport(
+      MemberService.method.acceptInvitation.name,
+    );
+    const visit = openEntry(invitationUrl, transport, false);
+    expect(screen.getByText(invitationNotice)).toBeTruthy();
+
+    await act(async () => {
+      window.history.replaceState(null, "", "#secret=sri_replacement_fixture");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+
+    visit.expectScrubbed(invitationPath);
+    expect(screen.getByText(invitationNotice)).toBeTruthy();
+    expect(calls).toHaveLength(0);
+
+    visit.resolveAuth(true);
+
+    expect(
+      screen.getByLabelText<HTMLInputElement>("Invitation link or secret")
+        .value,
+    ).toBe("");
+    visit.expectScrubbed(invitationPath);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("preserves fragments after the address leaves the signed-out invitation route", async () => {
+    const visit = openEntry(invitationUrl, createMockTransport(), false);
+    expect(screen.getByText(invitationNotice)).toBeTruthy();
+
+    await act(async () => {
+      // Change the address before the router has rendered the new route.
+      window.history.replaceState(null, "", "/?source=fixture#other-route");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    visit.expectScrubbed("/?source=fixture#other-route");
+
+    await act(async () => {
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.queryByText(invitationNotice)).toBeNull();
+  });
+
   test("fills the invitation form after sign-in and accepts only on submit", async () => {
     const { transport, calls } = gatedTransport(
       MemberService.method.acceptInvitation.name,

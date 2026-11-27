@@ -38,6 +38,46 @@ describe("sign-in", () => {
     });
   }
 
+  test("clears a replacement invitation fragment while signed out", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const path = "/invitations/accept?source=fixture";
+    const notice = screen.getByText(
+      "Sign in, then open the invitation link again.",
+    );
+    await app.open(path);
+    await expect(notice).toBeVisible();
+
+    const historyLength = await browser.evaluate(async () => {
+      const length = window.history.length;
+      const changed = new Promise<void>((resolve) => {
+        window.addEventListener("hashchange", () => resolve(), { once: true });
+      });
+      window.location.replace("#secret=sri_replacement_fixture");
+      await changed;
+      return length;
+    });
+
+    await expect(browser).toHaveURL(path);
+    await expect(notice).toBeVisible();
+    expect(
+      await browser.evaluate(() => ({
+        historyLength: window.history.length,
+        historyState: window.history.state,
+        localStorageLength: window.localStorage.length,
+        sessionStorageLength: window.sessionStorage.length,
+      })),
+    ).toEqual({
+      historyLength,
+      historyState: null,
+      localStorageLength: 0,
+      sessionStorageLength: 0,
+    });
+    await app.screenshot("signed-out-invitation-fragment-cleared");
+  });
+
   test("returns to sign-in from a direct mock callback visit", async ({
     app,
     browser,
