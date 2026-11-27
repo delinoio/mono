@@ -124,10 +124,16 @@ func TestUnattendXML(t *testing.T) {
 	if err := xml.Unmarshal(b, &doc); err != nil {
 		t.Fatal(err)
 	}
+	type componentKey struct {
+		pass string
+		name string
+	}
 	passes := map[string]bool{}
+	components := map[componentKey]bool{}
 	for _, s := range doc.Settings {
 		passes[s.Pass] = true
 		for _, c := range s.Components {
+			components[componentKey{pass: s.Pass, name: c.Name}] = true
 			if c.Arch != "amd64" {
 				t.Errorf("component %s architecture %q", c.Name, c.Arch)
 			}
@@ -148,6 +154,15 @@ func TestUnattendXML(t *testing.T) {
 	}
 	if !passes["specialize"] || !passes["oobeSystem"] || len(passes) != 2 {
 		t.Errorf("passes %v", passes)
+	}
+	for _, required := range []componentKey{
+		{pass: "specialize", name: "Microsoft-Windows-Shell-Setup"},
+		{pass: "oobeSystem", name: "Microsoft-Windows-Shell-Setup"},
+		{pass: "oobeSystem", name: "Microsoft-Windows-International-Core"},
+	} {
+		if !components[required] {
+			t.Errorf("pass %q is missing required component %q", required.pass, required.name)
+		}
 	}
 	if _, err := unattendXML(unattendSettings{Language: "en-US<x>", Password: password}); err == nil {
 		t.Error("invalid language accepted")
