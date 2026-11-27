@@ -18,6 +18,7 @@ const (
 	// creation would leave a process outside the job if the launcher died.
 	processAttributeJobList = 0x0002000d
 	payloadStopTimeout      = 20 * time.Second
+	payloadWaitIntervalMS   = 1000
 )
 
 var (
@@ -34,64 +35,129 @@ var (
 	})
 )
 
+type payloadProcessOps struct {
+	start       func(windows.Handle, string, []string, *os.File) (windows.ProcessInformation, error)
+	wait        func(windows.Handle, <-chan struct{}) (uint32, error)
+	signal      func(uint32) error
+	freeConsole func()
+	terminate   func(windows.Handle, uint32) error
+	closeHandle func(windows.Handle) error
+	stopTimeout time.Duration
+}
+
+func windowsPayloadProcessOps() payloadProcessOps {
+	return payloadProcessOps{
+		start:       startPayloadProcess,
+		wait:        waitPayloadProcess,
+		signal:      stopPayloadConsole,
+		freeConsole: func() { freePayloadConsole.Call() },
+		terminate:   windows.TerminateJobObject,
+		closeHandle: windows.CloseHandle,
+		stopTimeout: payloadStopTimeout,
+	}
+}
+
 func runPayloadProcess(ctx context.Context, exe string, args []string, stderr *os.File) (int, error) {
+	return runPayloadProcessWith(ctx, exe, args, stderr, windowsPayloadProcessOps())
+}
+
+func runPayloadProcessWith(ctx context.Context, exe string, args []string, stderr *os.File, ops payloadProcessOps) (int, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return 0, fmt.Errorf("create the service payload job: %w", err)
 	}
-	defer windows.CloseHandle(job)
+	closeJob := func() error {
+		if job == 0 {
+			return nil
+		}
+		err := ops.closeHandle(job)
+		job = 0
+		return err
+	}
+	defer closeJob()
 	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
 		return 0, fmt.Errorf("set the service payload job limits: %w", err)
 	}
-	child, err := startPayloadProcess(job, exe, args, stderr)
+	child, err := ops.start(job, exe, args, stderr)
 	if err != nil {
 		return 0, fmt.Errorf("launch the service payload: %w", err)
 	}
-	defer windows.CloseHandle(child.Process)
-	defer windows.CloseHandle(child.Thread)
-	type result struct {
-		code uint32
-		err  error
-	}
-	done := make(chan result, 1)
+	defer ops.closeHandle(child.Process)
+	defer ops.closeHandle(child.Thread)
+	cancelWait := make(chan struct{})
+	done := make(chan struct{})
+	var code uint32
+	var waitErr error
 	go func() {
-		_, err := windows.WaitForSingleObject(child.Process, windows.INFINITE)
-		var code uint32
-		if err == nil {
-			err = windows.GetExitCodeProcess(child.Process, &code)
-		}
-		done <- result{code, err}
+		defer close(done)
+		code, waitErr = ops.wait(child.Process, cancelWait)
 	}()
 	select {
-	case res := <-done:
-		return int(res.code), res.err
+	case <-done:
+		return int(code), waitErr
 	case <-ctx.Done():
 	}
-	// Keep the launcher attached and its event handler registered until the payload exits.
-	defer freePayloadConsole.Call()
-	if err := stopPayloadConsole(child.ProcessId); err != nil {
+	forceStop := func(stopErr error) (int, error) {
+		if err := ops.terminate(job, 1); err != nil {
+			stopErr = fmt.Errorf("%w: terminate the service payload job: %w", stopErr, err)
+			// Kill-on-close gives Windows another way to stop the job. Join the
+			// waiter even if closing the job does not make the payload exit.
+			if err := closeJob(); err != nil {
+				stopErr = fmt.Errorf("%w: close the service payload job: %w", stopErr, err)
+			}
+			close(cancelWait)
+		}
+		<-done
+		return 0, stopErr
+	}
+
+	// Keep the console handler registered while stopping the payload.
+	defer ops.freeConsole()
+	if err := ops.signal(child.ProcessId); err != nil {
 		// The process can exit before AttachConsole. Terminate the job if
 		// the payload has already lost its console and is still running.
 		select {
-		case res := <-done:
-			return int(res.code), res.err
+		case <-done:
+			return int(code), waitErr
 		default:
-			_ = windows.TerminateJobObject(job, 1)
-			<-done
-			return 0, fmt.Errorf("signal the service payload to stop: %w", err)
+			return forceStop(fmt.Errorf("signal the service payload to stop: %w", err))
 		}
 	}
-	timer := time.NewTimer(payloadStopTimeout)
+	timer := time.NewTimer(ops.stopTimeout)
 	defer timer.Stop()
 	select {
-	case res := <-done:
-		return int(res.code), res.err
+	case <-done:
+		return int(code), waitErr
 	case <-timer.C:
-		_ = windows.TerminateJobObject(job, 1)
-		<-done
-		return 0, fmt.Errorf("the service payload did not stop within %s", payloadStopTimeout)
+		return forceStop(fmt.Errorf("the service payload did not stop within %s", ops.stopTimeout))
+	}
+}
+
+func waitPayloadProcess(process windows.Handle, cancel <-chan struct{}) (uint32, error) {
+	for {
+		select {
+		case <-cancel:
+			return 0, context.Canceled
+		default:
+		}
+		// A bounded wait lets the launcher cancel and join this waiter even
+		// if the process is still running and Windows rejected termination.
+		state, err := windows.WaitForSingleObject(process, payloadWaitIntervalMS)
+		if err != nil {
+			return 0, err
+		}
+		switch state {
+		case windows.WAIT_OBJECT_0:
+			var code uint32
+			err := windows.GetExitCodeProcess(process, &code)
+			return code, err
+		case uint32(windows.WAIT_TIMEOUT):
+			continue
+		default:
+			return 0, fmt.Errorf("unexpected service payload wait status: %#x", state)
+		}
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -748,8 +749,20 @@ func TestRunWithWaitStopsOnCallerCancellation(t *testing.T) {
 
 type execStreamFixture struct {
 	sandrunv1connect.UnimplementedDevSessionServiceHandler
+	get    func(context.Context, *sandrunv1.GetDevSessionRequest) (*sandrunv1.GetDevSessionResponse, error)
 	start  func(*sandrunv1.ExecDevSessionRequest, *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error
 	attach func(context.Context, *sandrunv1.AttachDevSessionExecRequest, *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error
+}
+
+func (f execStreamFixture) GetDevSession(ctx context.Context, req *connect.Request[sandrunv1.GetDevSessionRequest]) (*connect.Response[sandrunv1.GetDevSessionResponse], error) {
+	if f.get == nil {
+		return f.UnimplementedDevSessionServiceHandler.GetDevSession(ctx, req)
+	}
+	res, err := f.get(ctx, req.Msg)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(res), nil
 }
 
 func (f execStreamFixture) ExecDevSession(_ context.Context, req *connect.Request[sandrunv1.ExecDevSessionRequest], stream *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
@@ -1231,6 +1244,137 @@ func TestExecOutputWindowUTF8Boundaries(t *testing.T) {
 			}
 			if !reflect.DeepEqual(r.OutputTruncated, tc.wantTruncated) {
 				t.Errorf("truncated = %+v, want %+v", r.OutputTruncated, tc.wantTruncated)
+			}
+		})
+	}
+}
+
+func TestExecPassEnvGuestPrecedence(t *testing.T) {
+	const sessionID = "test-session"
+	const configured = "synthetic-operator-value"
+	for _, tc := range []struct {
+		name       string
+		guestOS    sandrunv1.GuestOs
+		value      string
+		noAlias    bool
+		lookupErr  error
+		waitLookup bool
+		wantError  string
+	}{
+		{name: "Windows", guestOS: sandrunv1.GuestOs_GUEST_OS_WINDOWS, value: configured},
+		{name: "Windows empty", guestOS: sandrunv1.GuestOs_GUEST_OS_WINDOWS},
+		{name: "Linux", guestOS: sandrunv1.GuestOs_GUEST_OS_LINUX, value: configured},
+		{name: "macOS", guestOS: sandrunv1.GuestOs_GUEST_OS_MACOS, value: configured},
+		{name: "exact match alone", value: configured, noAlias: true},
+		{name: "lookup rejected", value: configured,
+			lookupErr: connect.NewError(connect.CodePermissionDenied, errors.New("session lookup rejected")),
+			wantError: "permission_denied: session lookup rejected"},
+		{name: "unspecified OS", value: configured, wantError: "failed_precondition: cannot determine the dev session guest OS"},
+		{name: "unknown OS", guestOS: sandrunv1.GuestOs(100), value: configured,
+			wantError: "failed_precondition: cannot determine the dev session guest OS"},
+		{name: "lookup timeout", value: configured, waitLookup: true,
+			wantError: "deadline_exceeded: the dev session guest OS lookup did not finish"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			toolEnv := map[string]string{"BUILD_MODE": "tool-exact", "KEEP": "1", "UNSET": "tool-unset", "unset": "tool-distinct"}
+			if !tc.noAlias {
+				toolEnv["build_mode"] = "tool-lower"
+				toolEnv["Build_Mode"] = "tool-mixed"
+			}
+			wantEnv := maps.Clone(toolEnv)
+			wantEnv["BUILD_MODE"] = tc.value
+			delete(wantEnv, "UNSET")
+			if tc.guestOS == sandrunv1.GuestOs_GUEST_OS_WINDOWS {
+				delete(wantEnv, "build_mode")
+				delete(wantEnv, "Build_Mode")
+			}
+
+			var h *harness
+			var lookups, execs atomic.Int32
+			lookupCanceled := make(chan struct{})
+			fixture := execStreamFixture{
+				get: func(ctx context.Context, req *sandrunv1.GetDevSessionRequest) (*sandrunv1.GetDevSessionResponse, error) {
+					lookups.Add(1)
+					if req.GetOrganizationId() != h.org || req.GetDevSessionId() != sessionID {
+						t.Errorf("lookup received unexpected organization or session: %v", req)
+					}
+					if tc.waitLookup {
+						<-ctx.Done()
+						close(lookupCanceled)
+						return nil, ctx.Err()
+					}
+					if tc.lookupErr != nil {
+						return nil, tc.lookupErr
+					}
+					return &sandrunv1.GetDevSessionResponse{DevSession: &sandrunv1.DevSession{GuestOs: tc.guestOS}}, nil
+				},
+				start: func(req *sandrunv1.ExecDevSessionRequest, stream *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
+					execs.Add(1)
+					if !tc.noAlias && lookups.Load() != 1 {
+						t.Error("exec did not follow the guest OS lookup")
+					}
+					if !maps.Equal(req.GetEnv(), wantEnv) {
+						t.Errorf("exec environment = %v, want %v", req.GetEnv(), wantEnv)
+					}
+					return stream.Send(&sandrunv1.ExecDevSessionResponse{Event: &sandrunv1.DevSessionExecEvent{
+						Event: &sandrunv1.DevSessionExecEvent_Exited{Exited: &sandrunv1.DevSessionExecExited{
+							Status: &sandrunv1.DevSessionExecExited_ExitCode{ExitCode: 0},
+						}},
+					}})
+				},
+			}
+			_, handler := sandrunv1connect.NewDevSessionServiceHandler(fixture)
+			upstream := httptest.NewUnstartedServer(handler)
+			upstream.Config.Protocols = new(http.Protocols)
+			upstream.Config.Protocols.SetUnencryptedHTTP2(true)
+			upstream.Start()
+			t.Cleanup(upstream.Close)
+			cfg := Config{
+				Client: func(context.Context) (*sandrun.Client, error) {
+					return sandrun.New(sandrun.Options{BaseURL: upstream.URL, APIKey: "test-key"})
+				},
+				PassEnv: []string{"BUILD_MODE", "UNSET"},
+				LookupEnv: func(name string) (string, bool) {
+					return tc.value, name == "BUILD_MODE"
+				},
+			}
+			if tc.waitLookup {
+				cfg.maxWait = 500 * time.Millisecond
+			}
+			h = newHarness(t, cfg)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var out execResult
+			message, isErr := h.callContext(ctx, "exec", map[string]any{
+				"session_id": sessionID, "command": []string{"true"}, "env": toolEnv,
+			}, &out)
+			if strings.Contains(message, configured) {
+				t.Fatal("configured value appears in the tool result")
+			}
+			var wantLookups int32 = 1
+			if tc.noAlias {
+				wantLookups = 0
+			}
+			if got := lookups.Load(); got != wantLookups {
+				t.Errorf("session lookups = %d, want %d", got, wantLookups)
+			}
+			if tc.wantError != "" {
+				if !isErr || !strings.HasPrefix(message, tc.wantError) || execs.Load() != 0 {
+					t.Fatalf("result = %v %q, exec requests = %d", isErr, message, execs.Load())
+				}
+				if tc.waitLookup {
+					select {
+					case <-lookupCanceled:
+					case <-ctx.Done():
+						t.Fatal("exec did not cancel the pending lookup")
+					}
+				}
+				return
+			}
+			if isErr || execs.Load() != 1 || out.ExitCode == nil || *out.ExitCode != 0 ||
+				!slices.Equal(out.MissingEnv, []string{"UNSET"}) {
+				t.Fatalf("result = %v %q %+v, exec requests = %d", isErr, message, out, execs.Load())
 			}
 		})
 	}

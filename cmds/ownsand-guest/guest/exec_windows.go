@@ -38,9 +38,9 @@ const defaultPathExt = ".com;.exe;.bat;.cmd"
 // directory is searched first, then each directory of PATH. In each
 // directory a regular file of exactly that name is a match when the name has
 // an extension; then name plus each PATHEXT extension in order is tried. A
-// missing program returns an error that wraps exec.ErrNotFound. A match in a
-// relative directory returns exec.ErrDot, which os/exec returns for the same
-// match of the process PATH.
+// missing program returns an error that wraps exec.ErrNotFound. A relative
+// match returns exec.ErrDot unless PATH also selects the same file by an
+// absolute path.
 func lookPathIn(name string, env []string) (string, error) {
 	pathValue, _ := envValue(env, pathEnvKey, envKeyFold)
 	pathExt, ok := envValue(env, "PATHEXT", envKeyFold)
@@ -57,17 +57,33 @@ func lookPathIn(name string, env []string) (string, error) {
 		}
 		exts = append(exts, e)
 	}
-	dirs := append([]string{"."}, filepath.SplitList(pathValue)...)
-	for _, dir := range dirs {
+	relative, _ := findInDir(filepath.Join(".", name), exts)
+	for _, dir := range filepath.SplitList(pathValue) {
 		if dir == "" {
-			dir = "."
+			continue
 		}
-		if path, found := findInDir(filepath.Join(dir, name), exts); found {
-			if !filepath.IsAbs(path) {
-				return path, &exec.Error{Name: name, Err: exec.ErrDot}
+		path, found := findInDir(filepath.Join(dir, name), exts)
+		if !found {
+			continue
+		}
+		if relative != "" {
+			// As in exec.LookPath, only accept an absolute spelling of the
+			// executable already selected by the relative match.
+			relInfo, relErr := os.Lstat(relative)
+			pathInfo, pathErr := os.Lstat(path)
+			if relErr != nil || pathErr != nil || !os.SameFile(relInfo, pathInfo) {
+				break
 			}
+		}
+		if filepath.IsAbs(path) {
 			return path, nil
 		}
+		if relative == "" {
+			relative = path
+		}
+	}
+	if relative != "" {
+		return relative, &exec.Error{Name: name, Err: exec.ErrDot}
 	}
 	return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
 }
