@@ -165,6 +165,22 @@ type Conn struct {
 	// which the writer reports the result of its send (see sendMeasured).
 	// The queue and the outFrame stay unchanged for every other sender.
 	writeWaiters sync.Map // *ownsandv1.DataFrame -> *confirmedWrite
+
+	windowUpdateWait atomic.Pointer[windowUpdateWaitProbe]
+}
+
+type windowUpdateWaitProbe struct {
+	streamID uint64
+	reached  chan struct{}
+}
+
+// WatchWindowUpdateWaitForTest signals the first window update for streamID
+// that needs to wait for an ordinary outbound slot. The fixture must keep
+// the queue full until its call ends.
+func (c *Conn) WatchWindowUpdateWaitForTest(streamID uint64) <-chan struct{} {
+	probe := &windowUpdateWaitProbe{streamID: streamID, reached: make(chan struct{})}
+	c.windowUpdateWait.Store(probe)
+	return probe.reached
 }
 
 // outFrame is a frame in the outbound queue. final marks a stream's final
@@ -702,6 +718,12 @@ func (s *Stream) enqueueFrame(ctx context.Context, of outFrame) error {
 	c := s.conn
 	if s.isClosed() {
 		return ErrStreamClosed
+	}
+	if probe := c.windowUpdateWait.Load(); probe != nil &&
+		probe.streamID == s.ID && of.frame.GetRelayWindowUpdate() != nil &&
+		len(c.slots) == cap(c.slots) && ctx.Err() == nil && c.ctx.Err() == nil &&
+		c.windowUpdateWait.CompareAndSwap(probe, nil) {
+		close(probe.reached)
 	}
 	select {
 	case c.slots <- struct{}{}:
