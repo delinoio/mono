@@ -12,9 +12,13 @@ import {
   type DeviceCapacity,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
-import { useEffect, useMemo, useReducer, useState } from "react";
+import { useEffect, useReducer, useState } from "react";
 import { watchQueue } from "sandrun-sdk";
 import { SetupGuide } from "../components/setup.tsx";
+import {
+  RunnerProfileNotice,
+  useWorkRunnerProfiles,
+} from "../components/work-runner-profiles.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
@@ -34,7 +38,6 @@ import {
   QueueViewActionKind,
   waitingInQueueOrder,
 } from "../queue.ts";
-import { useRunnerProfiles } from "../runner-profiles.ts";
 import { Link, orgPath, RouteId } from "../router.tsx";
 
 const RUNNER_ORDER = [
@@ -100,12 +103,8 @@ export function OverviewPage() {
     return () => abort.abort();
   }, [transport, organizationId, attempt]);
 
-  const profiles = useRunnerProfiles(organizationId);
-  const profileNames = useMemo(
-    () =>
-      new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
-    [profiles.data],
-  );
+  const { query: profiles, profileNames } =
+    useWorkRunnerProfiles(organizationId);
   const link = useQuery(OwnSandLinkService.method.getOwnSandLink, {
     organizationId,
   });
@@ -149,13 +148,7 @@ export function OverviewPage() {
       ) : null}
       <section className="section" aria-labelledby="queue-title">
         <h2 id="queue-title">Waiting requests</h2>
-        {profiles.error ? (
-          <ErrorNotice
-            title="Could not load runner profiles."
-            error={profiles.error}
-            onRetry={() => void profiles.refetch()}
-          />
-        ) : null}
+        <RunnerProfileNotice query={profiles} />
         {view.live === LiveState.Connecting ? (
           <Loading label="Loading the queue" />
         ) : waiting.length === 0 ? (
@@ -190,7 +183,7 @@ export function OverviewPage() {
                     </td>
                     <td>{labels.workloadKind[r.kind]}</td>
                     <td>
-                      {profileNames.get(r.runnerProfileId) ?? (
+                      {profileNames?.get(r.runnerProfileId) ?? (
                         <ShortId id={r.runnerProfileId} />
                       )}
                     </td>

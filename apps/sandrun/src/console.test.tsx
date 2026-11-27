@@ -67,6 +67,7 @@ import {
 import {
   CreateRunnerProfileRequestSchema,
   type ListRunnerProfilesRequest,
+  type ListRunnerProfilesResponse,
   RunnerProfileService,
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import {
@@ -4281,6 +4282,234 @@ describe("failed query refreshes", () => {
       expect(screen.queryByText(refreshNotice)).toBeNull();
     });
   }
+
+  describe("runner profiles on work pages", () => {
+    const orgPath = `/orgs/${MOCK_IDS.acme}`;
+    const profileError = /^Could not load runner profiles\./;
+    const profileShortId = "0193b000…00b1";
+    const profilesKey = createConnectQueryKey({
+      schema: RunnerProfileService.method.listRunnerProfiles,
+      cardinality: undefined,
+    });
+
+    function profileFixture() {
+      const mock = createMockTransport();
+      const listFilters: string[] = [];
+      let failure: ConnectError | undefined;
+      let linuxProfileName: string | undefined = "linux-build";
+      const transport: Transport = {
+        ...mock,
+        async unary(method, ...args) {
+          if (method.name === "ListRequests" || method.name === "ListRunners") {
+            listFilters.push(
+              (args[3] as ListRequestsRequest | ListRunnersRequest)
+                .runnerProfileId,
+            );
+          }
+          if (method.name !== "ListRunnerProfiles") {
+            return mock.unary(method, ...args);
+          }
+          if (failure) throw failure;
+
+          const response = await mock.unary(method, ...args);
+          const message = response.message as ListRunnerProfilesResponse;
+          message.profiles = message.profiles.flatMap((profile) => {
+            if (profile.runnerProfileId !== MOCK_IDS.linuxProfile)
+              return [profile];
+            return linuxProfileName === undefined
+              ? []
+              : [{ ...profile, name: linuxProfileName }];
+          });
+          return response;
+        },
+      };
+      return {
+        transport,
+        listFilters,
+        fail(error: ConnectError) {
+          failure = error;
+        },
+        recover(name: string | undefined) {
+          failure = undefined;
+          linuxProfileName = name;
+        },
+      };
+    }
+
+    async function refreshProfiles(client: QueryClient) {
+      await act(async () => {
+        await client.refetchQueries({ queryKey: profilesKey });
+      });
+    }
+
+    function profileFilter() {
+      return screen.getByRole<HTMLButtonElement>("combobox", {
+        name: "Runner profile",
+      });
+    }
+
+    async function chooseProfile(name: string) {
+      await click(profileFilter());
+      await click(await screen.findByRole("option", { name }));
+    }
+
+    for (const { path, tableName, hasFilter } of [
+      { path: orgPath, tableName: "Waiting requests", hasFilter: false },
+      { path: `${orgPath}/requests`, tableName: "Requests", hasFilter: true },
+      { path: `${orgPath}/runners`, tableName: "Runners", hasFilter: true },
+    ]) {
+      async function workTable() {
+        return screen.findByRole("table", { name: tableName });
+      }
+
+      test(`${tableName} keeps cached profiles on a transient refresh failure`, async () => {
+        const fixture = profileFixture();
+        const client = renderConsole(path, fixture);
+        await waitFor(async () =>
+          expect(
+            within(await workTable()).getAllByText("linux-build").length,
+          ).toBeGreaterThan(0),
+        );
+        if (hasFilter) await chooseProfile("linux-build");
+        const table = await workTable();
+
+        fixture.fail(new ConnectError("offline", Code.Internal));
+        await refreshProfiles(client);
+
+        await screen.findByText(refreshNotice);
+        expect(screen.queryByText(profileError)).toBeNull();
+        expect(await workTable()).toBe(table);
+        expect(
+          within(table).getAllByText("linux-build").length,
+        ).toBeGreaterThan(0);
+        if (hasFilter) {
+          expect(profileFilter().disabled).toBe(false);
+          expect(profileFilter().textContent).toBe("linux-build");
+          expect(fixture.listFilters.at(-1)).toBe(MOCK_IDS.linuxProfile);
+          await chooseProfile("All profiles");
+          expect(fixture.listFilters.at(-1)).toBe("");
+          await chooseProfile("linux-build");
+          expect(fixture.listFilters.at(-1)).toBe(MOCK_IDS.linuxProfile);
+        }
+
+        fixture.recover("linux-build-renamed");
+        await click(screen.getByRole("button", { name: "Try again" }));
+        await waitFor(() =>
+          expect(
+            within(table).getAllByText("linux-build-renamed").length,
+          ).toBeGreaterThan(0),
+        );
+        expect(screen.queryByText(refreshNotice)).toBeNull();
+        if (hasFilter) {
+          expect(profileFilter().textContent).toBe("linux-build-renamed");
+          expect(fixture.listFilters.at(-1)).toBe(MOCK_IDS.linuxProfile);
+        }
+      });
+
+      for (const code of [
+        Code.NotFound,
+        Code.PermissionDenied,
+        Code.Unauthenticated,
+      ]) {
+        test(`${tableName} falls back to IDs on ${Code[code]}`, async () => {
+          const fixture = profileFixture();
+          const client = renderConsole(path, fixture);
+          await waitFor(async () =>
+            expect(
+              within(await workTable()).getAllByText("linux-build").length,
+            ).toBeGreaterThan(0),
+          );
+          if (hasFilter) {
+            await chooseProfile("linux-build");
+            expect(fixture.listFilters.at(-1)).toBe(MOCK_IDS.linuxProfile);
+          }
+
+          fixture.fail(new ConnectError("profile list unavailable", code));
+          await refreshProfiles(client);
+
+          expect(screen.queryByText(refreshNotice)).toBeNull();
+          const table = await workTable();
+          expect(within(table).queryByText("linux-build")).toBeNull();
+          expect(
+            within(table).getAllByText(profileShortId).length,
+          ).toBeGreaterThan(0);
+          if (hasFilter) {
+            expect(profileFilter().disabled).toBe(true);
+            expect(profileFilter().textContent).toBe("All profiles");
+            expect(fixture.listFilters.at(-1)).toBe("");
+          }
+          if (code === Code.Unauthenticated) {
+            expect(
+              screen.getByText("Your session ended. Sign in again."),
+            ).toBeTruthy();
+            expect(
+              screen.getByRole("button", { name: "Sign in with Delino" }),
+            ).toBeTruthy();
+            expect(
+              screen.queryByRole("button", { name: "Try again" }),
+            ).toBeNull();
+            return;
+          }
+
+          await screen.findByText(profileError);
+          // The two retryable failures exercise recovery with and without the
+          // previously selected profile.
+          const recoveredName =
+            code === Code.NotFound ? "linux-build-renamed" : undefined;
+          const previousListCalls = fixture.listFilters.length;
+          fixture.recover(recoveredName);
+          await click(screen.getByRole("button", { name: "Try again" }));
+          await waitFor(() =>
+            expect(screen.queryByText(profileError)).toBeNull(),
+          );
+          if (hasFilter) {
+            expect(profileFilter().disabled).toBe(false);
+            expect(profileFilter().textContent).toBe(
+              recoveredName ?? "All profiles",
+            );
+            if (recoveredName === undefined) {
+              expect(fixture.listFilters).toHaveLength(previousListCalls);
+            } else {
+              expect(fixture.listFilters.at(-1)).toBe(MOCK_IDS.linuxProfile);
+            }
+          }
+          const recoveredTable = await workTable();
+          expect(
+            within(recoveredTable).getAllByText(recoveredName ?? profileShortId)
+              .length,
+          ).toBeGreaterThan(0);
+        });
+      }
+
+      test(`${tableName} keeps work visible when the initial profile load fails`, async () => {
+        const fixture = profileFixture();
+        fixture.fail(new ConnectError("offline", Code.Internal));
+        renderConsole(path, fixture);
+
+        await screen.findByText(profileError);
+        const table = await workTable();
+        expect(
+          within(table).getAllByText(profileShortId).length,
+        ).toBeGreaterThan(0);
+        expect(screen.queryByText(refreshNotice)).toBeNull();
+        if (hasFilter) {
+          expect(profileFilter().disabled).toBe(true);
+          expect(profileFilter().textContent).toBe("All profiles");
+          expect(fixture.listFilters).toEqual([""]);
+        }
+
+        fixture.recover("linux-build");
+        await click(screen.getByRole("button", { name: "Try again" }));
+        await waitFor(() =>
+          expect(
+            within(table).getAllByText("linux-build").length,
+          ).toBeGreaterThan(0),
+        );
+        expect(screen.queryByText(profileError)).toBeNull();
+        if (hasFilter) expect(profileFilter().disabled).toBe(false);
+      });
+    }
+  });
 
   test("keeps the selected runner group after a refresh fails inside the dialog", async () => {
     const fixture = queryFixture("ListGitHubRunnerGroups");
