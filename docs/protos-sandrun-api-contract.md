@@ -94,6 +94,7 @@ The control plane serves every public service at `https://sandrun.api.delino.io`
 
 ### Organization and member messages
 
+- After authorization and any ownership-transfer deletion check, `UpdateMemberRole`, `RemoveMember` and `TransferOwnership` reject an empty target `user_id` with `invalid_argument` and the message `invalid user_id: is required`. A target containing U+0000 returns `invalid_argument` with `invalid user_id: must not contain NUL`. The server looks up other IDs as supplied, preserving case. An unknown target returns `not_found`.
 - `Organization` carries `settings` (`OrganizationSettings`) with the optional `max_dev_sessions_per_user`. `UpdateOrganizationSettings` takes the settings and a field mask; a masked path with no value clears the setting.
 - Invitation secrets are `sri_` followed by 32 random bytes in unpadded base64url. `CreateInvitationResponse` returns the secret once.
 
