@@ -38,19 +38,23 @@ func runFake(t *testing.T, r *Runtime, v *vm) {
 }
 
 func TestStartProcessCapsFirecrackerLog(t *testing.T) {
-	// Marker line first, then 2 MB on stdout and 2 MB on stderr: more than
-	// the cap by far, and a child that would die or block on a failed write.
-	bin := writeFakeFirecracker(t, `echo START
-head -c 2000000 /dev/zero | tr '\0' a
-head -c 2000000 /dev/zero | tr '\0' b >&2
+	// Each stream writes 2 MB. Create the marker only after every write succeeds.
+	bin := writeFakeFirecracker(t, `set -e
+echo START
+cat console-payload
+tr a b < console-payload >&2
 echo UNREACHABLE-TAIL
-exit 0`)
+: > console-complete`)
 	vmsDir := t.TempDir()
 	r := bareRuntime(Options{Binary: bin, VMsDir: vmsDir})
 	dir := r.vmDir("sbx")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "console-payload"), bytes.Repeat([]byte("a"), 2_000_000), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "console-complete")
 	v := &vm{id: "sbx", dir: dir}
 	runFake(t, r, v)
 
@@ -72,12 +76,21 @@ exit 0`)
 		t.Fatalf("mode = %v, want 0600", st.Mode().Perm())
 	}
 
+	// Removing the first marker makes the fallback launch prove its own writes.
+	if err := os.Remove(marker); err != nil {
+		t.Fatalf("first launch did not mark its console writes complete: %v", err)
+	}
+
 	// A second launch in the same directory (boot fallback) cannot grow the
 	// log beyond the cap.
 	v2 := &vm{id: "sbx", dir: dir}
 	runFake(t, r, v2)
 	if st, _ := os.Stat(path); st.Size() != vmruntime.ConsoleLogLimit {
 		t.Fatalf("log size after a second launch = %d, want %d", st.Size(), vmruntime.ConsoleLogLimit)
+	}
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("fallback launch did not mark its console writes complete: %v", err)
 	}
 
 	// The log lives and dies with the VM directory.
