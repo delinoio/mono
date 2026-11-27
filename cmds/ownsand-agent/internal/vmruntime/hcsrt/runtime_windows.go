@@ -26,6 +26,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netstack"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmacl"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -224,6 +225,12 @@ const copyFileFailIfExists = 0x1
 // copy is canceled. A caller whose copy must not be interrupted passes
 // context.Background().
 func copyFile(ctx context.Context, src, dst string) error {
+	return copyFileWithProgress(ctx, src, dst, nil)
+}
+
+// copyFileWithProgress lets tests attach a native progress routine to this call
+// and observe the cancellation flag and watcher's completion.
+func copyFileWithProgress(ctx context.Context, src, dst string, progress func(*int32, <-chan struct{}) (uintptr, unsafe.Pointer)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -241,6 +248,11 @@ func copyFile(ctx context.Context, src, dst string) error {
 	cancel := new(int32)
 	copying := make(chan struct{})
 	watcherDone := make(chan struct{})
+	var progressRoutine uintptr
+	var progressData unsafe.Pointer
+	if progress != nil {
+		progressRoutine, progressData = progress(cancel, watcherDone)
+	}
 	go func() {
 		defer close(watcherDone)
 		select {
@@ -249,7 +261,7 @@ func copyFile(ctx context.Context, src, dst string) error {
 		case <-copying:
 		}
 	}()
-	ok, _, e := procCopyFileExW.Call(uintptr(unsafe.Pointer(s)), uintptr(unsafe.Pointer(d)), 0, 0, uintptr(unsafe.Pointer(cancel)), copyFileFailIfExists)
+	ok, _, e := procCopyFileExW.Call(uintptr(unsafe.Pointer(s)), uintptr(unsafe.Pointer(d)), progressRoutine, uintptr(progressData), uintptr(unsafe.Pointer(cancel)), copyFileFailIfExists)
 	close(copying)
 	<-watcherDone
 	runtime.KeepAlive(cancel)
@@ -330,6 +342,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		copyFile:     copyFile,
 		makeFixedVHD: makeFixedVHD,
 		growVHDX:     growVHDX,
+		grantVM:      grantVM,
 		createSystem: createSystem,
 	})
 }
@@ -340,6 +353,7 @@ type vmCreateOps struct {
 	copyFile     func(context.Context, string, string) error
 	makeFixedVHD func(string, int64, bool) (int64, error)
 	growVHDX     func(string, int64) (int64, error)
+	grantVM      func(string, string) error
 	createSystem func(string, any) (*system, error)
 }
 
@@ -373,7 +387,7 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 			return err
 		}
 		dirReady = true
-		return grantVMGroup(spec.Dir, accessReadWrite, true)
+		return vmacl.RemoveWorkers(spec.Dir)
 	}
 	var (
 		vs   vmSpec
@@ -389,6 +403,15 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		if dirReady {
 			cleanup()
 		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		cleanup()
+		return nil, err
+	}
+	id := systemID(v.id)
+	if err := ops.grantVM(id, vs.Disk); err != nil {
+		cleanup()
 		return nil, err
 	}
 	vs.ConsolePipe = consolePipe(v.id)
@@ -407,7 +430,7 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		cleanup()
 		return nil, err
 	}
-	sys, err := ops.createSystem(systemID(v.id), newComputeSystemDoc(vs))
+	sys, err := ops.createSystem(id, newComputeSystemDoc(vs))
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -471,7 +494,7 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 // prepareLinuxDisk makes the fixed VHD of a Linux guest from the root file
 // system or a snapshot disk.
 func (r *Runtime) prepareLinuxDisk(ctx context.Context, spec vmruntime.Spec, ops vmCreateOps) (vmSpec, int64, error) {
-	if err := grantVMGroup(r.opts.Kernel, accessRead, false); err != nil {
+	if err := grantKernelRead(r.opts.Kernel); err != nil {
 		return vmSpec{}, 0, err
 	}
 	src, hasFooter := r.opts.Rootfs, false
@@ -498,9 +521,6 @@ func (r *Runtime) prepareLinuxDisk(ctx context.Context, spec vmruntime.Spec, ops
 	}
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
-	}
-	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {
-		return vmSpec{}, 0, err
 	}
 	vs := vmSpec{Kernel: r.opts.Kernel, Disk: disk}
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
