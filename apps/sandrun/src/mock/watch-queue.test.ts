@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
+import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import {
+  createClient,
   createConnectRouter,
   createHandlerContext,
   createRouterTransport,
@@ -9,9 +11,19 @@ import {
 import * as actualConnect from "@connectrpc/connect" with {
   rstest: "importActual",
 };
-import { RequestState } from "@delino/sandrun-protos/v1/common_pb";
+import {
+  AuditAction,
+  AuditService,
+  AuditTargetKind,
+} from "@delino/sandrun-protos/v1/audit_pb";
+import {
+  RequestState,
+  RunnerEndReason,
+  RunnerState,
+} from "@delino/sandrun-protos/v1/common_pb";
 import {
   CancelRequestRequestSchema,
+  GetRunnerRequestSchema,
   WatchQueueRequestSchema,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
@@ -36,7 +48,7 @@ afterEach(() => {
 });
 
 function openWatch(organizationId: string, options?: MockTransportOptions) {
-  createMockTransport(options);
+  const transport = createMockTransport(options);
   const register = rs.mocked(createRouterTransport).mock.lastCall?.[0];
   if (!register) throw new Error("Expected mock route registration");
   const router = createConnectRouter();
@@ -59,6 +71,16 @@ function openWatch(organizationId: string, options?: MockTransportOptions) {
   const remove = rs.spyOn(context.signal, "removeEventListener");
   return {
     context,
+    work: createClient(WorkService, transport),
+    audit: createClient(AuditService, transport),
+    getStoredRunner: async (runnerId: string) => {
+      const { runner } = await work.getRunner(
+        create(GetRunnerRequestSchema, { organizationId, runnerId }),
+        context,
+      );
+      if (!runner) throw new Error("Expected a stored runner");
+      return runner;
+    },
     stream: work
       .watchQueue(create(WatchQueueRequestSchema, { organizationId }), context)
       [Symbol.asyncIterator](),
@@ -78,6 +100,95 @@ function openWatch(organizationId: string, options?: MockTransportOptions) {
       ).length,
   };
 }
+
+async function readSnapshot(stream: ReturnType<typeof openWatch>["stream"]) {
+  for (;;) {
+    const { value, done } = await stream.next();
+    if (done) throw new Error("Expected a complete snapshot");
+    if (value.event?.case === "snapshotComplete") return;
+  }
+}
+
+test.each([RunnerState.DELETED, RunnerState.DELETING, RunnerState.FAILED])(
+  "deleting a runner in state %s preserves history and publishes no update",
+  async (state) => {
+    const organizationId = MOCK_IDS.acme;
+    const runnerId = MOCK_IDS.deletedRunner;
+    const request = { organizationId, runnerId };
+    const { work, audit, stream, getStoredRunner } = openWatch(organizationId);
+    if (state !== RunnerState.DELETED) {
+      // Set up states that the default mock does not seed.
+      const runner = await getStoredRunner(runnerId);
+      runner.state = state;
+    }
+    const { runner: before } = await work.getRunner(request);
+    expect(before).toMatchObject({
+      state,
+      endReason: RunnerEndReason.WORK_DONE,
+      endedAt: expect.any(Object),
+    });
+    const history = await audit.listAuditEvents({ organizationId });
+    await readSnapshot(stream);
+
+    try {
+      expect((await work.deleteRunner(request)).runner).toEqual(before);
+      expect((await work.getRunner(request)).runner).toEqual(before);
+      expect(await audit.listAuditEvents({ organizationId })).toEqual(history);
+
+      const next = stream.next();
+      rs.advanceTimersByTime(10_000);
+      await expect(next).resolves.toMatchObject({
+        value: { event: { case: "keepalive" } },
+      });
+    } finally {
+      await stream.return?.();
+    }
+  },
+);
+
+test("deleting a warm runner records one result, update and audit event across retries", async () => {
+  const firstDeletionTime = Date.UTC(2026, 0, 1);
+  rs.setSystemTime(firstDeletionTime);
+  const organizationId = MOCK_IDS.acme;
+  const runnerId = MOCK_IDS.warmRunner;
+  const request = { organizationId, runnerId };
+  const { work, audit, stream } = openWatch(organizationId);
+  const history = await audit.listAuditEvents({ organizationId });
+  await readSnapshot(stream);
+
+  try {
+    const deleted = await work.deleteRunner(request);
+    expect(deleted.runner).toMatchObject({
+      runnerId,
+      state: RunnerState.DELETED,
+      endReason: RunnerEndReason.DELETED_BY_USER,
+      endedAt: timestampFromMs(firstDeletionTime),
+    });
+    const update = stream.next();
+    rs.advanceTimersByTime(10_000);
+    await expect(update).resolves.toMatchObject({
+      value: { event: { case: "runner", value: deleted.runner } },
+    });
+
+    expect(await work.deleteRunner(request)).toEqual(deleted);
+    expect((await work.getRunner(request)).runner).toEqual(deleted.runner);
+    const { events } = await audit.listAuditEvents({ organizationId });
+    expect(events[0]).toMatchObject({
+      action: AuditAction.RUNNER_DELETED,
+      targetKind: AuditTargetKind.RUNNER,
+      targetId: runnerId,
+    });
+    expect(events.slice(1)).toEqual(history.events);
+
+    const next = stream.next();
+    rs.advanceTimersByTime(10_000);
+    await expect(next).resolves.toMatchObject({
+      value: { event: { case: "keepalive" } },
+    });
+  } finally {
+    await stream.return?.();
+  }
+});
 
 test("releases each wait after a keepalive or queue event", async () => {
   const { stream, cancelRequest, pendingAbortListeners } = openWatch(

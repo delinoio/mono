@@ -45,6 +45,16 @@ func TestGitHubAppOffByDefault(t *testing.T) {
 	}
 }
 
+func TestGitHubAppOffIgnoresOrigins(t *testing.T) {
+	env := baseEnv(t)
+	env[EnvGitHubAPIOrigin] = "http://[::1]:65536"
+	env[EnvGitHubWebOrigin] = "http://[::1]:65536"
+	cfg, err := Load(lookup(env))
+	if err != nil || cfg.GitHub != nil {
+		t.Fatalf("github = %+v, %v", cfg.GitHub, err)
+	}
+}
+
 func TestGitHubApp(t *testing.T) {
 	keyPEM, key := testPEM(t, false)
 	cfg, err := Load(lookup(gitHubEnv(t, keyPEM)))
@@ -80,8 +90,10 @@ func TestGitHubAppInvalid(t *testing.T) {
 		{EnvGitHubAppPrivateKey, "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n", EnvGitHubAppPrivateKey},
 		{EnvGitHubAPIOrigin, "https://api.github.com/v3", EnvGitHubAPIOrigin},
 		{EnvGitHubAPIOrigin, "https://:443", EnvGitHubAPIOrigin},
+		{EnvGitHubAPIOrigin, "http://[::1]:65536", EnvGitHubAPIOrigin},
 		{EnvGitHubWebOrigin, "ftp://github.com", EnvGitHubWebOrigin},
 		{EnvGitHubWebOrigin, "https://:443", EnvGitHubWebOrigin},
+		{EnvGitHubWebOrigin, "http://[::1]:65536", EnvGitHubWebOrigin},
 	} {
 		env := gitHubEnv(t, keyPEM)
 		env[tc.name] = tc.value

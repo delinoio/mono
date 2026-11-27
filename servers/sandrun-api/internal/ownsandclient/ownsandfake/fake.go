@@ -14,6 +14,7 @@ package ownsandfake
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"sort"
@@ -93,16 +94,27 @@ type Org struct {
 type fakeSandbox struct {
 	sb    *ownsandv1.Sandbox
 	files map[string][]byte
-	// writes of FileWrite operations, by write ID.
+	// writes holds FileWrite operations by ID. A nil entry marks an expired
+	// completion so a late retry cannot start a new write.
 	writes map[string]*fakeWrite
 	// reads keeps the snapshot of each read ID.
 	reads map[string][]byte
 }
 
 type fakeWrite struct {
-	path   string
-	ranges map[int64][]byte
+	path       string
+	ranges     map[int64][]byte
+	completion *fakeWriteCompletion
 }
+
+type fakeWriteCompletion struct {
+	result    *ownsandv1.WriteFileResponse
+	digest    [sha256.Size]byte
+	mode      uint32
+	expiresAt time.Time
+}
+
+const writeReplayRetention = 15 * time.Minute
 
 // New returns an empty fake.
 func New() *Fake {
@@ -481,17 +493,21 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 	if onRead != nil {
 		onRead(ctx, p)
 	}
-	for off := p.Offset; off < int64(len(snap)); {
+	size := int64(len(snap))
+	if p.Offset > size {
+		return p.Offset, connect.NewWireError(connect.CodeOutOfRange, errors.New("offset is beyond the end of the file"))
+	}
+	for off := p.Offset; off < size; {
 		if err := ctx.Err(); err != nil {
 			return off, err
 		}
-		end := min(off+readChunk, int64(len(snap)))
+		end := min(off+readChunk, size)
 		if _, err := w.Write(snap[off:end]); err != nil {
 			return off, err
 		}
 		off = end
 	}
-	return int64(len(snap)), nil
+	return size, nil
 }
 
 func (c *client) OpenFileWrite(sandboxID string, p ownsand.FileWriteParams) (ownsandclient.FileWrite, error) {
@@ -509,10 +525,10 @@ func (w *fileWrite) WriteChunk(ctx context.Context, offset int64, data []byte) (
 }
 
 func (w *fileWrite) Finish(ctx context.Context, offset int64, data []byte, sizeBytes int64, mode uint32) (*ownsandv1.WriteFileResponse, error) {
-	return w.send(offset, data, &sizeBytes)
+	return w.send(offset, data, &ownsandv1.WriteFileFinish{SizeBytes: sizeBytes, Mode: mode})
 }
 
-func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.WriteFileResponse, error) {
+func (w *fileWrite) send(offset int64, data []byte, finish *ownsandv1.WriteFileFinish) (*ownsandv1.WriteFileResponse, error) {
 	if err := w.c.running("WriteFile", w.sandboxID); err != nil {
 		return nil, err
 	}
@@ -523,17 +539,35 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 		return nil, err
 	}
 	s := org.sandboxes[w.sandboxID]
-	fw := s.writes[w.p.WriteID]
-	if fw == nil {
+	fw, exists := s.writes[w.p.WriteID]
+	if !exists {
 		fw = &fakeWrite{path: w.p.Path, ranges: map[int64][]byte{}}
 		s.writes[w.p.WriteID] = fw
+	} else if fw == nil {
+		return nil, connect.NewWireError(connect.CodeNotFound, errors.New("write expired"))
+	} else if completed := fw.completion; completed != nil {
+		if !time.Now().Before(completed.expiresAt) {
+			s.writes[w.p.WriteID] = nil
+			return nil, connect.NewWireError(connect.CodeNotFound, errors.New("write expired"))
+		}
+		if w.p.Path != fw.path {
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("write_id is bound to another path"))
+		}
+		if finish == nil {
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("write already finished"))
+		}
+		if offset != completed.result.GetOffset() || finish.GetSizeBytes() != completed.result.GetSizeBytes() ||
+			finish.GetMode() != completed.mode || sha256.Sum256(data) != completed.digest {
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("write already finished with other finish fields"))
+		}
+		return proto.CloneOf(completed.result), nil
 	}
 	if old, ok := fw.ranges[offset]; ok && !bytes.Equal(old, data) {
 		return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
 	}
 	fw.ranges[offset] = append([]byte(nil), data...)
 	res := &ownsandv1.WriteFileResponse{WriteId: w.p.WriteID, Offset: offset, Length: int64(len(data))}
-	if size != nil {
+	if finish != nil {
 		var buf bytes.Buffer
 		offsets := make([]int64, 0, len(fw.ranges))
 		for off := range fw.ranges {
@@ -546,12 +580,18 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 			}
 			buf.Write(fw.ranges[off])
 		}
-		if int64(buf.Len()) != *size {
+		if int64(buf.Len()) != finish.GetSizeBytes() {
 			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the size"))
 		}
 		s.files[fw.path] = buf.Bytes()
-		res.Finished, res.SizeBytes = true, *size
-		delete(s.writes, w.p.WriteID)
+		res.Finished, res.SizeBytes = true, finish.GetSizeBytes()
+		fw.ranges = nil
+		fw.completion = &fakeWriteCompletion{
+			result:    proto.CloneOf(res),
+			digest:    sha256.Sum256(data),
+			mode:      finish.GetMode(),
+			expiresAt: time.Now().Add(writeReplayRetention),
+		}
 	}
 	return res, nil
 }
