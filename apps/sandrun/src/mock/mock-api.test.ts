@@ -646,6 +646,64 @@ test("listing personal API keys reports expiry at the current time", async () =>
   }
 });
 
+test("repeating an API key revocation preserves its timestamp and audit event", async () => {
+  const revokedAt = Date.UTC(2026, 0, 1);
+  const clock = rs.spyOn(Date, "now").mockReturnValue(revokedAt);
+  try {
+    const transport = createMockTransport();
+    const apiKeys = createClient(ApiKeyService, transport);
+    const audit = createClient(AuditService, transport);
+    const organizationId = MOCK_IDS.acme;
+    const { apiKey } = await apiKeys.createApiKey({
+      organizationId,
+      name: "repeat-revoke",
+    });
+    if (!apiKey) throw new Error("Expected a key to revoke");
+    const { apiKeyId } = apiKey;
+    const input = { organizationId, apiKeyId };
+
+    const first = await apiKeys.revokeApiKey(input);
+    expect(first.apiKey).toEqual({
+      ...apiKey,
+      state: ApiKeyState.REVOKED,
+      revokedAt: timestampFromMs(revokedAt),
+    });
+    const afterFirst = await audit.listAuditEvents({ organizationId });
+    const revocations = afterFirst.events.filter(
+      (event) =>
+        event.action === AuditAction.API_KEY_REVOKED &&
+        event.targetId === apiKeyId,
+    );
+    expect(revocations).toHaveLength(1);
+    expect(revocations[0]).toMatchObject({
+      targetKind: AuditTargetKind.API_KEY,
+      subjectUserId: MOCK_USER,
+      createTime: timestampFromMs(revokedAt),
+    });
+
+    clock.mockReturnValue(revokedAt + 1000);
+    expect(await apiKeys.revokeApiKey(input)).toEqual(first);
+    const { apiKeys: listed } = await apiKeys.listApiKeys({ organizationId });
+    expect(listed.find((key) => key.apiKeyId === apiKeyId)).toEqual(
+      first.apiKey,
+    );
+    expect(await audit.listAuditEvents({ organizationId })).toEqual(afterFirst);
+
+    await expect(
+      apiKeys.revokeApiKey({ ...input, apiKeyId: "unknown-key" }),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+    await expect(
+      apiKeys.revokeApiKey({ ...input, organizationId: MOCK_IDS.contoso }),
+    ).rejects.toMatchObject({
+      code: Code.NotFound,
+      rawMessage: "organization not found",
+    });
+    expect(await audit.listAuditEvents({ organizationId })).toEqual(afterFirst);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 const apiKeyClock = Date.UTC(2026, 0, 1) + 250;
 const apiKeyClockTimestamp = timestampFromMs(apiKeyClock);
 

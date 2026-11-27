@@ -1895,15 +1895,24 @@ describe("API key revocation", () => {
     await expect(screen.getByText("claude-on-laptop · Active")).toBeVisible();
   });
 
-  test("confirming revokes the key", async ({ app, screen }) => {
+  test("confirming revokes the key and records it in Audit events", async ({
+    app,
+    browser,
+    screen,
+  }) => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await app.open(`/orgs/${ACME}/api-keys`);
     await screen.getByRole("button", "Revoke", { exact: true }).tap();
     const dialog = screen.getByRole("alertdialog", "Revoke claude-on-laptop?");
     await dialog.getByRole("button", "Revoke key").tap();
-    await expect(dialog).toBeHidden();
+    await expect(browser.locator(".dui-dialog-backdrop")).toBeHidden();
     await expect(screen.getByText("claude-on-laptop · Revoked")).toBeVisible();
+
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/audit`);
+    const events = screen.getByRole("table", "Audit events");
+    await expect(events.getByRole("cell", "API key revoked")).toBeVisible();
   });
 });
 

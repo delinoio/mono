@@ -2154,15 +2154,17 @@ export function createMockTransport(
         );
         if (k === undefined)
           throw new ConnectError("API key not found", Code.NotFound);
-        k.state = ApiKeyState.REVOKED;
-        k.revokedAt = ts();
-        audit(
-          org,
-          AuditAction.API_KEY_REVOKED,
-          AuditTargetKind.API_KEY,
-          k.apiKeyId,
-          userId,
-        );
+        if (k.state !== ApiKeyState.REVOKED) {
+          k.state = ApiKeyState.REVOKED;
+          k.revokedAt = ts();
+          audit(
+            org,
+            AuditAction.API_KEY_REVOKED,
+            AuditTargetKind.API_KEY,
+            k.apiKeyId,
+            userId,
+          );
+        }
         const { userId: _u, ...apiKey } = k;
         return { apiKey };
       },
