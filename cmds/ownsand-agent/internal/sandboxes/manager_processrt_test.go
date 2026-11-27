@@ -5,7 +5,9 @@
 package sandboxes
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -59,6 +61,83 @@ func TestRestartRemovesProcessRuntimeFilesOfLostSandboxes(t *testing.T) {
 	}
 	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || endReason(e.m, id) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
 		t.Fatalf("lost sandbox %v %v", s, endReason(e.m, id))
+	}
+}
+
+func TestRestartRemovesProcessRuntimeFilesAfterSocketRecordBecomesReadable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("socket record read must run without root privileges")
+	}
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	socketDir, err := os.MkdirTemp(t.TempDir(), "osb-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := e.st.Path(store.VMsDir, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, "socket-dir")
+	if err := os.WriteFile(record, []byte(socketDir), 0); err != nil {
+		t.Fatal(err)
+	}
+	guest, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restart := func() {
+		t.Helper()
+		e.m.Close()
+		rt, err := processrt.NewWithOptions(processrt.Options{GuestBinary: guest, VMsDir: e.st.Path(store.VMsDir), Logger: slog.New(slog.NewJSONHandler(io.Discard, nil))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := New(t.Context(), Options{Store: e.st, Runtime: rt, Now: e.clk.Now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.m = m
+	}
+	persistedPath := e.st.Path(store.SandboxesDir, id+".json")
+	before, err := os.ReadFile(persistedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restart()
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("state after failed cleanup = %v; want RUNNING", s)
+	}
+	if after, err := os.ReadFile(persistedPath); err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("persisted sandbox changed after failed cleanup (read error: %v)", err)
+	}
+	for _, path := range []string{dir, record, socketDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("cleanup did not preserve %s: %v", path, err)
+		}
+	}
+
+	if err := os.Chmod(record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restart()
+	for _, path := range []string{dir, socketDir} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s after retry: %v; want it removed", path, err)
+		}
+	}
+	data, err := os.ReadFile(persistedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Record
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != ownsandv1.SandboxState_SANDBOX_STATE_FAILED ||
+		persisted.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("persisted state after retry = %v/%v; want FAILED/LOST_ON_DEVICE", persisted.State, persisted.EndReason)
 	}
 }
 
