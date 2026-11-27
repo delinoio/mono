@@ -1,0 +1,60 @@
+{
+  "gid": "inv-17-windows-sync-links",
+  "commit": "6ad684dfa1f6b44ca0f706fa07e11360cfdd4f22",
+  "nativeValidation": {
+    "status": "pending",
+    "host": "delino-win-1",
+    "platform": "Windows",
+    "architecture": "amd64",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "6ad684dfa1f6b44ca0f706fa07e11360cfdd4f22",
+    "setup": [
+      "Use a short local path and create the directory in the prepare command. Copy the three files to that directory and verify their SHA-256 before running them. Have Git for Windows and system tar.exe on the host.",
+      "Run the permitted host fixture under Windows PowerShell 5.1 in a console whose account can create symbolic links, such as an elevated disposable test identity. Run the denied host fixture in a console under a writable, isolated non-admin account without SeCreateSymbolicLinkPrivilege, with Developer Mode disabled. Run each host fixture's commands in order from the root of the short validation directory.",
+      "For real guest acceptance, point SANDRUN_API_URL, SANDRUN_ORG and the normal SandRun credential at a non-production SandRun installation linked to OwnSand. Set SANDRUN_LINK_VALIDATION_SESSION to a fresh Windows dev session whose agent can create links for Permitted. Set it to a separate fresh session whose guest exec identity cannot create symbolic links and whose Developer Mode is disabled for Denied. For Restored, grant permission only to the disposable denied guest identity and obtain a fresh guest exec token with that permission. Keep the same guest workspace, manifest and local fixture. If the permission cannot be changed in place, retain that criterion as pending and record the concrete reason. Delete the disposable sessions after validation."
+    ],
+    "commands": [
+      "New-Item -ItemType Directory -Path '.\\.t3-tmp\\sync-links' -Force | Out-Null",
+      "Get-FileHash -Algorithm SHA256 '.\\.t3-tmp\\sync-links\\sandrun.test.exe', '.\\.t3-tmp\\sync-links\\sandrun.exe', '.\\.t3-tmp\\sync-links\\validate-windows-guest-links.ps1'",
+      "powershell.exe -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'",
+      "$env:TEMP = (Resolve-Path '.\\.t3-tmp').Path; $env:TMP = $env:TEMP",
+      "& '.\\.t3-tmp\\sync-links\\sandrun.test.exe' -test.v -test.run '^TestWindowsGuest(SyncRelativeLinks|SyncRetryFileToDirectory|CleanupSyncResults)$' | Tee-Object -FilePath '.\\.t3-tmp\\sync-links\\native-permitted.log'; if ($LASTEXITCODE -ne 0) { throw 'Permitted native fixture failed' }",
+      "chcp.com 437",
+      "$env:TEMP = (Resolve-Path '.\\.t3-tmp').Path; $env:TMP = $env:TEMP; $env:SANDRUN_TEST_WINDOWS_LINK_DENIED = '1'",
+      "& '.\\.t3-tmp\\sync-links\\sandrun.test.exe' -test.v -test.run '^TestWindowsGuestLinkPermissionFailureUTF8$' | Tee-Object -FilePath '.\\.t3-tmp\\sync-links\\native-denied.log'; if ($LASTEXITCODE -ne 0) { throw 'Denied native fixture failed' }",
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '.\\.t3-tmp\\sync-links\\validate-windows-guest-links.ps1' -Phase Permitted | Tee-Object -FilePath '.\\.t3-tmp\\sync-links\\guest-permitted.log'; if ($LASTEXITCODE -ne 0) { throw 'Permitted guest validation failed' }",
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '.\\.t3-tmp\\sync-links\\validate-windows-guest-links.ps1' -Phase Denied | Tee-Object -FilePath '.\\.t3-tmp\\sync-links\\guest-denied.log'; if ($LASTEXITCODE -ne 0) { throw 'Denied guest validation failed' }",
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '.\\.t3-tmp\\sync-links\\validate-windows-guest-links.ps1' -Phase Restored | Tee-Object -FilePath '.\\.t3-tmp\\sync-links\\guest-restored.log'; if ($LASTEXITCODE -ne 0) { throw 'Restored guest validation failed' }"
+    ],
+    "expectedResults": [
+      "The shell reports version 5.1. The permitted tests pass without skips. The actual generated apply command creates relative file, populated directory and dangling file links. The target text remains relative. A fully qualified file link succeeds. The v1 manifest records link mode, target length and SHA-256. The unchanged sync uploads zero files and bytes. Retargeting the populated directory link works while its old target file remains intact.",
+      "The denied native test confirms console code page 437 and ERROR_PRIVILEGE_NOT_HELD for an otherwise valid link. The exact generated apply command exits zero, emits an exact CRLF-terminated marker for dir\\café with C3 A9 and no BOM, and emits the ASCII control marker for the denied relative link.",
+      "The Permitted real guest phase uploads the regular file and three links, verifies targets and v1 manifest hashes and modes, then uploads zero files or bytes on an unchanged sync.",
+      "The Denied real guest phase uploads the regular file, warns with dir/café, and keeps the link out of the manifest. A sync with identical input sends only that single failed link record and shows the same warning. The Restored phase uploads exactly the link, confirms the now-present manifest row and reads through the link. Its second sync sends zero files or bytes."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-17-windows-sync-links/worker/.t3-tmp/sync-links/validate-windows-guest-links.ps1",
+      "copyTo": ".t3-tmp/sync-links/validate-windows-guest-links.ps1",
+      "sha256": {
+        "sandrun.test.exe": "c8071c99c7346fac713635a699d17482907f6fc1db4d70955248756c9e85794d",
+        "sandrun.exe": "c47afb0708834c0bbee23e5001de01194b0cdc61a4848188910e25bc5e2a5645",
+        "validate-windows-guest-links.ps1": "a900efdd75d5ccb2bd34b4c49b70f15aa06bda1b5cfe4aed755d04b598e4d562"
+      },
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-17-windows-sync-links/worker/.t3-tmp/sync-links/sandrun.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-17-windows-sync-links/worker/.t3-tmp/sync-links/sandrun.exe"
+      ],
+      "regressionTests": [
+        "go/sandrun/guest_windows_test.go",
+        "go/sandrun/sync_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/sync-links/native-permitted.log",
+        ".t3-tmp/sync-links/native-denied.log",
+        ".t3-tmp/sync-links/guest-permitted.log",
+        ".t3-tmp/sync-links/guest-denied.log",
+        ".t3-tmp/sync-links/guest-restored.log"
+      ]
+    }
+  }
+}
