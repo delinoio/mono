@@ -5,6 +5,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -16,15 +18,44 @@ import (
 	"github.com/delinoio/mono/go/sandrun/sandruntest"
 )
 
-// TestMCPCommand starts sandrun mcp on an in-memory transport: without a
-// credential, every tool tells the user to run sandrun login or set
-// SANDRUN_API_KEY, standard output stays free of anything but MCP messages,
-// and logs go to standard error.
+const unknownTransferID = "00000000-0000-4000-8000-000000000002"
+
+// TestMCPCommand checks sign-in guidance and wait validation through an
+// in-memory transport. The server writes logs to standard error.
 func TestMCPCommand(t *testing.T) {
 	f := newFixture(t)
 	f.env[EnvConfigDir] = t.TempDir() // no stored tokens
 	ctx, cs := startMCPCommand(t, f)
-	checkMCPCommandUnauthenticated(t, ctx, cs)
+	got := mcpCommandToolError(t, ctx, cs, "transfer_status", map[string]any{
+		"transfer_id": unknownTransferID, "wait_seconds": 0,
+	})
+	if want := checkMCPCommandUnauthenticated(t, ctx, cs); got != want {
+		t.Errorf("transfer_status without credential = %q, want %q", got, want)
+	}
+	got = mcpCommandToolError(t, ctx, cs, "transfer_status", map[string]any{
+		"transfer_id": unknownTransferID, "wait_seconds": 51,
+	})
+	if !strings.HasPrefix(got, "invalid_argument:") || !strings.Contains(got, "wait_seconds") {
+		t.Errorf("transfer_status with invalid wait = %q", got)
+	}
+}
+
+func TestMCPCommandUnknownTransferWithAPIKey(t *testing.T) {
+	f := newFixture(t)
+	f.env[EnvConfigDir] = t.TempDir() // no stored tokens
+	f.env[EnvAPIKey] = "synthetic-key"
+	f.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Errorf("unexpected HTTP request: %s %s", r.Method, r.URL.Path)
+		return nil, errors.New("unexpected HTTP request")
+	})}
+	ctx, cs := startMCPCommand(t, f)
+	got := mcpCommandToolError(t, ctx, cs, "transfer_status", map[string]any{
+		"transfer_id": unknownTransferID, "wait_seconds": 0,
+	})
+	want := "not_found: no transfer with this transfer_id runs in this server process; transfers stop when the server exits, so sync again"
+	if got != want {
+		t.Errorf("transfer_status with API key = %q, want %q", got, want)
+	}
 }
 
 func TestMCPCommandPicksUpLoginAfterStart(t *testing.T) {
@@ -88,8 +119,9 @@ func startMCPCommand(t *testing.T, f *fixture) (context.Context, *mcp.ClientSess
 	go func() {
 		done <- Run(ctx, Env{
 			Args: []string{"mcp", "--org", f.org, "--pass-env", "NPM_TOKEN"}, Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errb,
-			LookupEnv: func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
-			Getwd:     func() (string, error) { return f.wd, nil },
+			LookupEnv:  func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
+			HTTPClient: f.httpClient,
+			Getwd:      func() (string, error) { return f.wd, nil },
 		})
 	}()
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).Connect(ctx, clientT, nil)
@@ -100,14 +132,27 @@ func startMCPCommand(t *testing.T, f *fixture) (context.Context, *mcp.ClientSess
 	return ctx, cs
 }
 
-func checkMCPCommandUnauthenticated(t *testing.T, ctx context.Context, cs *mcp.ClientSession) {
+func checkMCPCommandUnauthenticated(t *testing.T, ctx context.Context, cs *mcp.ClientSession) string {
 	t.Helper()
-	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_sessions", Arguments: map[string]any{}})
+	text := mcpCommandToolError(t, ctx, cs, "list_sessions", map[string]any{})
+	if !strings.HasPrefix(text, "unauthenticated:") || !strings.Contains(text, "sandrun login") || !strings.Contains(text, EnvAPIKey) {
+		t.Fatalf("list_sessions without credential = %q", text)
+	}
+	return text
+}
+
+func mcpCommandToolError(t *testing.T, ctx context.Context, cs *mcp.ClientSession, name string, args map[string]any) string {
+	t.Helper()
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("call %s: %v", name, err)
 	}
-	text := res.Content[0].(*mcp.TextContent).Text
-	if !res.IsError || !strings.Contains(text, "sandrun login") || !strings.Contains(text, EnvAPIKey) || !strings.HasPrefix(text, "unauthenticated") {
-		t.Fatalf("tool without credential = %v %q", res.IsError, text)
+	if !res.IsError || len(res.Content) != 1 {
+		t.Fatalf("%s result = %+v, want one tool error", name, res)
 	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("%s error content has type %T, want *mcp.TextContent", name, res.Content[0])
+	}
+	return text.Text
 }
