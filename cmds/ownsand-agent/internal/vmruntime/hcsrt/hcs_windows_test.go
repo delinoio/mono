@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -91,8 +92,11 @@ func TestWaitExitBoundsDisconnectQuery(t *testing.T) {
 		deadline time.Time
 	}
 	query := make(chan request, 1)
+	release := make(chan struct{})
+	defer close(release)
 	sys.verifyExitFn = func(id string, deadline time.Time) (bool, error) {
 		query <- request{id, deadline}
+		<-release
 		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -112,5 +116,56 @@ func TestWaitExitBoundsDisconnectQuery(t *testing.T) {
 	notifySystem(sys, hcsEventSystemExited)
 	if err := <-exited; err != nil {
 		t.Fatalf("waitExit = %v after exit notification", err)
+	}
+}
+
+func TestVMWatcherRetriesAfterDisconnect(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		first     []systemProperties
+		confirmed []systemProperties
+	}{
+		{
+			name:      "running then stopped",
+			first:     []systemProperties{{ID: "fake", State: "Running"}},
+			confirmed: []systemProperties{{ID: "fake", State: "Stopped"}},
+		},
+		{name: "query error then absent", confirmed: []systemProperties{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sys := fakeSystem(neverExits)
+			registerFakeCallback(t, sys)
+			first := make(chan struct{})
+			retry := make(chan struct{})
+			confirm := make(chan struct{})
+			defer close(confirm)
+			var queries atomic.Int32
+			sys.verifyExitFn = func(id string, _ time.Time) (bool, error) {
+				if queries.Add(1) == 1 {
+					close(first)
+					if tc.first == nil {
+						return false, errors.New("HCS temporarily unavailable")
+					}
+					return confirmedSystemExit(id, tc.first)
+				}
+				close(retry)
+				<-confirm
+				return confirmedSystemExit(id, tc.confirmed)
+			}
+			v := &vm{exited: make(chan struct{})}
+			v.attachSystem(sys)
+			notifySystem(sys, hcsEventServiceDisconnect)
+			waitForSignal(t, first, "first status query")
+			waitForSignal(t, retry, "retried status query")
+			requireOpenSignal(t, v.Exited(), "VM exit")
+			requireOpenSignal(t, v.watchDone, "exit watcher")
+			// Release the retry without delivering an exit callback.
+			confirm <- struct{}{}
+			waitForSignal(t, v.Exited(), "VM exit")
+			waitForSignal(t, v.watchDone, "exit watcher")
+			if got := queries.Load(); got != 2 {
+				t.Fatalf("status queries = %d, want 2", got)
+			}
+		})
 	}
 }
