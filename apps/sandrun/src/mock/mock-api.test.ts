@@ -13,6 +13,7 @@ import {
 } from "@delino/sandrun-protos/v1/audit_pb";
 import { AgentVendor } from "@delino/sandrun-protos/v1/common_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
+import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
 import { createMockTransport, MOCK_IDS } from "./mock-api.ts";
@@ -24,6 +25,104 @@ const invalidInstallationState = {
 
 const apiKeyClock = Date.UTC(2026, 0, 1) + 250;
 const apiKeyClockTimestamp = timestampFromMs(apiKeyClock);
+
+const linuxProfile = {
+  organizationId: MOCK_IDS.acme,
+  runnerProfileId: MOCK_IDS.linuxProfile,
+};
+const seededResources = { vcpuCount: 4, memoryMib: 8192n, diskGib: 64n };
+
+test.each([
+  {
+    paths: ["resources.vcpu_count"],
+    resources: { vcpuCount: 8 },
+  },
+  {
+    paths: ["resources.memory_mib"],
+    resources: { memoryMib: 12288n },
+  },
+  {
+    paths: ["resources.disk_gib"],
+    resources: { diskGib: 96n },
+  },
+  {
+    paths: ["resources.memory_mib", "resources.disk_gib"],
+    resources: { memoryMib: 12288n, diskGib: 96n },
+  },
+  {
+    paths: ["resources"],
+    resources: { vcpuCount: 8, memoryMib: 12288n, diskGib: 96n },
+  },
+])(
+  "updates the runner profile with mask $paths",
+  async ({ paths, resources }) => {
+    const profiles = createClient(RunnerProfileService, createMockTransport());
+
+    const { profile } = await profiles.updateRunnerProfile({
+      ...linuxProfile,
+      profile: { resources },
+      updateMask: { paths },
+    });
+
+    const expected = { ...seededResources, ...resources };
+    expect(profile?.resources).toMatchObject(expected);
+    expect((await profiles.getRunnerProfile(linuxProfile)).profile).toEqual(
+      profile,
+    );
+  },
+);
+
+test.each([
+  {
+    label: "a zero masked value",
+    paths: ["resources.memory_mib"],
+    resources: { memoryMib: 0n },
+    rawMessage: "resources must be greater than zero",
+  },
+  {
+    label: "a missing resources message",
+    paths: ["resources.memory_mib"],
+    resources: undefined,
+    rawMessage: "resources must be greater than zero",
+  },
+  {
+    label: "an omitted value after a valid masked value",
+    paths: ["resources.memory_mib", "resources.disk_gib"],
+    resources: { memoryMib: 12288n },
+    rawMessage: "resources must be greater than zero",
+  },
+  {
+    label: "an unknown path after a valid masked value",
+    paths: ["resources.memory_mib", "resources.unsupported"],
+    resources: { memoryMib: 12288n },
+    rawMessage: "unknown mask path resources.unsupported",
+  },
+])(
+  "rejects a resource mask with $label without changing the profile or its audit history",
+  async ({ paths, resources, rawMessage }) => {
+    const transport = createMockTransport();
+    const profiles = createClient(RunnerProfileService, transport);
+    const audit = createClient(AuditService, transport);
+    const auditRequest = { organizationId: linuxProfile.organizationId };
+    const before = structuredClone(
+      await profiles.getRunnerProfile(linuxProfile),
+    );
+    const auditsBefore = structuredClone(
+      await audit.listAuditEvents(auditRequest),
+    );
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...linuxProfile,
+        profile: { resources },
+        updateMask: { paths },
+      }),
+    ).rejects.toMatchObject({ code: Code.InvalidArgument, rawMessage });
+
+    expect(await profiles.getRunnerProfile(linuxProfile)).toEqual(before);
+    expect(await audit.listAuditEvents(auditRequest)).toEqual(auditsBefore);
+  },
+);
 
 test.each([
   {

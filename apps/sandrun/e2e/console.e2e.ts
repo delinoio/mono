@@ -1201,11 +1201,17 @@ describe("runner profiles", () => {
     await dialog.getByLabel("Name").tap();
     await browser.keyboard.press("ControlOrMeta+A");
     await browser.keyboard.type("linux-build-retry");
+    await dialog.getByLabel("Memory (MiB)").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("12288");
     await dialog.getByRole("button", "Save changes").tap();
     await expect(dialog).toBeHidden();
     await expect(
       screen.getByLabel("runs-on label of linux-build-retry"),
     ).toHaveText("sandrun-linux-build-retry");
+    await expect(
+      screen.getByRole("listitem").filter({ hasText: "linux-build-retry ·" }),
+    ).toContainText("4 vCPU · 12288 MiB · 64 GiB");
   });
 
   test("validates whole milliseconds on click and Enter", async ({
