@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -16,7 +18,7 @@ import (
 )
 
 func setupServiceLog(stateDir string) (*os.File, string) {
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+	if err := os.MkdirAll(serviceLogWin32Path(stateDir), 0o700); err != nil {
 		return nil, serviceLogFailure("could not create the service state directory", err)
 	}
 	f, err := openServiceLog(filepath.Join(stateDir, "agent.log"))
@@ -24,6 +26,50 @@ func setupServiceLog(stateDir string) (*os.File, string) {
 		return nil, serviceLogFailure("could not open agent.log", err)
 	}
 	return f, ""
+}
+
+func serviceLogWin32Path(path string) string {
+	if len(path) >= 4 {
+		switch filepath.ToSlash(path[:4]) {
+		case "//?/", "/??/", "//./":
+			return path
+		}
+	}
+	if path == "" {
+		return path
+	}
+
+	absolute := path
+	if !filepath.IsAbs(path) {
+		// Resolve just the base with Win32 so even a long relative tail
+		// works. The base can be the current directory, a drive's current
+		// directory, or the root of the current volume.
+		base := filepath.VolumeName(path)
+		tail := path[len(base):]
+		if len(tail) > 0 && os.IsPathSeparator(tail[0]) {
+			base += `\`
+			tail = tail[1:]
+		}
+		base, err := filepath.Abs(base)
+		if err != nil {
+			return path
+		}
+		absolute = filepath.Join(base, tail)
+	}
+	// Without Win32 long-path opt-in, directory creation must leave space
+	// for a 12-character 8.3 name. Use the same threshold for the log open.
+	const longPathLimit = windows.MAX_PATH - 12
+	if len(utf16.Encode([]rune(absolute))) < longPathLimit &&
+		len(utf16.Encode([]rune(path))) < longPathLimit {
+		return path
+	}
+
+	// Win32 does not resolve slashes, "." or ".." after the extended prefix.
+	absolute = filepath.Clean(absolute)
+	if tail, ok := strings.CutPrefix(absolute, `\\`); ok {
+		return `\\?\UNC\` + tail
+	}
+	return `\\?\` + absolute
 }
 
 func serviceLogFailure(operation string, err error) string {
@@ -81,7 +127,7 @@ func ensureStartupEventSource() error {
 // With it, the delete completes when the handle closes. Remove this helper
 // when the Go standard library opens files with FILE_SHARE_DELETE.
 func openServiceLog(path string) (*os.File, error) {
-	name, err := windows.UTF16PtrFromString(path)
+	name, err := windows.UTF16PtrFromString(serviceLogWin32Path(path))
 	if err != nil {
 		return nil, err
 	}
