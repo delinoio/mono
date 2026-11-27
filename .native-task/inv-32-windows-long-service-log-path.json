@@ -1,0 +1,64 @@
+{
+  "gid": "inv-32-windows-long-service-log-path",
+  "commit": "ebae371717ce542f8bd87a80ad9dc43a3336b285",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "ebae371717ce542f8bd87a80ad9dc43a3336b285",
+    "setup": "Use PowerShell in a short disposable checkout on a local NTFS drive at the stated SHA. Run the non-elevated checks on delino-win-1, then repeat them on a disposable host when LongPathsEnabled is already disabled before the test process starts. These checks require no symlinks, tar extraction, protected ACLs, service control or Hyper-V.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'ebae371717ce542f8bd87a80ad9dc43a3336b285') { throw 'Unexpected validation revision' }",
+      "$work = (New-Item -ItemType Directory -Path '.t3-tmp\\windows-service-log' -Force).FullName",
+      "$env:TEMP = $work; $env:TMP = $work; $env:GOTMPDIR = $work",
+      "$longPathsEnabled = Get-ItemPropertyValue -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' -Name 'LongPathsEnabled' -ErrorAction SilentlyContinue; Write-Output ('LongPathsEnabled=' + $longPathsEnabled)",
+      "go test '-v' '-count=1' '-timeout=2m' '-run' '^(TestOpenServiceLog.*|TestResetDeletesStateWhileServiceLogIsOpen|TestStartupDiagnosticForInvalidConfiguration)$' './cmds/ownsand-agent' 2>&1 | Tee-Object -FilePath (Join-Path $work 'windows-tests.log'); if ($LASTEXITCODE -ne 0) { throw 'Windows service log tests failed' }"
+    ],
+    "expectedResults": [
+      "Go exits zero. The conversion cases pass for short drive and UNC paths, a short Unicode path, long local and UNC paths, a relative path and already prefixed paths.",
+      "The test creates a log at an ordinary absolute path above MAX_PATH, appends three JSON records in order, reads with a writer open, and deletes the log while that writer is still open.",
+      "The same writable log accepts its already-prefixed path as a second writer. A directory at agent.log yields the existing Windows open diagnostic, and the startup fallback fixture receives a redacted diagnostic.",
+      "The ordinary-path reset fixture deletes the log and identity while the log handle remains open.",
+      "If LongPathsEnabled is 1, the test confirms the conversion and Windows file behavior on that host. Baseline reproduction and disabled-policy acceptance require a disposable Windows environment where the displayed value is 0 or absent."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-long-service-log-path/worker/.t3-tmp/windows-service-log/scm-long-log.ps1",
+      "copyTo": ".t3-tmp\\windows-service-log\\scm-long-log.ps1",
+      "sha256": "1aa93868d629dd1fd234333223287dcf2ca5a21bfc0809f73a995fe36cf42d51",
+      "regressionTests": [
+        "cmds/ownsand-agent/servicelog_windows_test.go",
+        "cmds/ownsand-agent/service_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp\\windows-service-log\\windows-tests.log",
+        ".t3-tmp\\windows-service-log\\windows-scm.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-long-service-log-path/worker/.t3-tmp/windows-service-log/ownsand-agent-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-long-service-log-path/worker/.t3-tmp/windows-service-log/ownsand-agent-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-long-service-log-path/worker/.t3-tmp/windows-service-log/ownsand-agent-windows-arm64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-long-service-log-path/worker/.t3-tmp/windows-service-log/ownsand-agent-windows-arm64.test.exe"
+      ]
+    },
+    "requiresElevation": {
+      "status": "pending",
+      "reason": "Service registration, service control and registration of the Application Event Log source need administrator access. The non-elevated Windows account cannot run this probe.",
+      "setup": "Use an elevated PowerShell 7 session on a disposable Windows host with LongPathsEnabled already disabled and no installed ownsand-agent service. LocalSystem needs read and execute access to the checkout and write access to its .t3-tmp directory. After creating the scratch directory, copy the probe from files.copyFrom to files.copyTo using ordinary file transfer.",
+      "commands": [
+        "if ((git rev-parse HEAD).Trim() -ne 'ebae371717ce542f8bd87a80ad9dc43a3336b285') { throw 'Unexpected validation revision' }",
+        "$work = (New-Item -ItemType Directory -Path '.t3-tmp\\windows-service-log' -Force).FullName",
+        "$probe = Join-Path $work 'scm-long-log.ps1'; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $probe).Hash.ToLowerInvariant() -ne '1aa93868d629dd1fd234333223287dcf2ca5a21bfc0809f73a995fe36cf42d51') { throw 'Unexpected probe checksum' }",
+        "pwsh -NoProfile -File $probe 2>&1 | Tee-Object -FilePath (Join-Path $work 'windows-scm.log'); if ($LASTEXITCODE -ne 0) { throw 'SCM probe failed' }"
+      ],
+      "expectedResults": [
+        "The service starts two times with a disposable invalid log-level fixture, exits with SCM code 1066 and service exit 2 each time, and appends two redacted JSON records at the long state path.",
+        "With a directory in place of agent.log, the service reports the same exit status and writes a redacted Event ID 1 to the Application Event Log. The script removes the service and scratch state."
+      ],
+      "limitations": [
+        "The PowerShell probe was prepared on Linux and awaits native execution.",
+        "Changing system long-path policy is outside scope."
+      ]
+    }
+  }
+}
