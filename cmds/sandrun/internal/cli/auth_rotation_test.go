@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
@@ -228,6 +229,69 @@ func TestTokenSourceStopsWaitingOnCancel(t *testing.T) {
 		t.Fatalf("got %v, want context cancellation", err)
 	}
 	f.assertCalls("rt-0")
+}
+
+func TestAwaitRefreshRotationStopsAfterPollOnCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		firstPoll := make(chan struct{})
+		type rotationResult struct {
+			rotated bool
+			err     error
+		}
+		done := make(chan rotationResult, 1)
+		polls := 0
+		go func() {
+			defer close(done)
+			rotated, err := awaitRefreshRotation(ctx, func() (bool, error) {
+				polls++
+				if polls == 1 {
+					close(firstPoll)
+				}
+				return false, nil
+			})
+			done <- rotationResult{rotated: rotated, err: err}
+		}()
+		defer func() {
+			cancel()
+			// Let the waiter reach its deadline if it missed cancellation.
+			<-done
+		}()
+
+		timeout := time.NewTimer(refreshAdoptWait)
+		defer timeout.Stop()
+		select {
+		case <-firstPoll:
+		case result := <-done:
+			t.Fatalf("waiter returned before its first poll: rotated = %v, error = %v", result.rotated, result.err)
+		case <-timeout.C:
+			t.Fatal("waiter did not poll before the refresh wait deadline")
+		}
+
+		synctest.Wait()
+		select {
+		case result := <-done:
+			t.Fatalf("waiter returned before cancellation: rotated = %v, error = %v", result.rotated, result.err)
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("context ended before cancellation: %v", err)
+		}
+
+		cancel()
+		synctest.Wait()
+		select {
+		case result := <-done:
+			if result.rotated || !errors.Is(result.err, context.Canceled) {
+				t.Fatalf("waiter returned rotated = %v, error = %v, want false and context.Canceled", result.rotated, result.err)
+			}
+		default:
+			t.Fatal("waiter did not return after cancellation before the next poll")
+		}
+		if polls != 1 {
+			t.Fatalf("waiter polled %d times, want 1", polls)
+		}
+	})
 }
 
 func TestTokenSourceRejectsChangedSession(t *testing.T) {
