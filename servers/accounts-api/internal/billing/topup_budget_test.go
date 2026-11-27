@@ -100,7 +100,7 @@ func slowQueueFixture(t *testing.T, n int, onCharge func()) (*fixture, []string)
 func TestRunOnceLeavesTimeForLaterTasksDuringASlowTopUpQueue(t *testing.T) {
 	f, accounts := slowQueueFixture(t, 3, nil)
 	// A later task of the run has work: a due credit expiry notice.
-	notice := f.queueNotice(accounts[0], "credit_expiry/budget-test")
+	notice, _ := f.queueNotice(accounts[0])
 
 	f.s.RunOnce(ctx())
 

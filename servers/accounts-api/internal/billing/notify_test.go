@@ -30,24 +30,27 @@ func (h *hookSender) Send(ctx context.Context, msg email.Message) error {
 	return h.next.Send(ctx, msg)
 }
 
-// queueNotice queues one credit expiry notification for the account and
-// returns its ID.
-func (f *fixture) queueNotice(acct, key string) string {
+// queueNotice queues a $5 credit expiry notice and returns its ID and key.
+func (f *fixture) queueNotice(acct string) (id, key string) {
 	f.t.Helper()
-	err := f.db.InTx(ctx(), func(tx pgx.Tx) error {
-		return f.s.enqueue(ctx(), tx, acct, NotifyCreditExpiry, key, map[string]string{
-			notifyDetailAmount:     "5000000",
-			notifyDetailExpireTime: f.clock.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339Nano),
-		}, f.clock.Now())
-	})
-	if err != nil {
+	grantID, id := f.queueExpiryNotice(acct, 5*usd, f.clock.Now().Add(24*time.Hour))
+	return id, creditExpiryNotificationPrefix + grantID
+}
+
+func (f *fixture) queueExpiryNotice(acct string, amount int64, expiry time.Time) (grantID, noticeID string) {
+	f.t.Helper()
+	grantID = f.grant(acct, LedgerSubscriptionCredit, amount)
+	if _, err := f.db.Pool.Exec(ctx(), `UPDATE credit_grants SET expire_time = $2 WHERE credit_grant_id = $1`, grantID, expiry); err != nil {
 		f.t.Fatal(err)
 	}
-	var id string
-	if err := f.db.Pool.QueryRow(ctx(), `SELECT notification_id::text FROM billing_notifications WHERE dedup_key = $1`, key).Scan(&id); err != nil {
+	if err := f.s.QueueExpiryNotices(ctx()); err != nil {
 		f.t.Fatal(err)
 	}
-	return id
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT notification_id::text FROM billing_notifications WHERE dedup_key = $1`,
+		creditExpiryNotificationPrefix+grantID).Scan(&noticeID); err != nil {
+		f.t.Fatal(err)
+	}
+	return grantID, noticeID
 }
 
 type noticeState struct {
@@ -61,7 +64,8 @@ type noticeState struct {
 func (f *fixture) noticeState(id string) noticeState {
 	f.t.Helper()
 	var st noticeState
-	if err := f.db.Pool.QueryRow(ctx(), `SELECT attempts, send_time IS NOT NULL, abandon_time IS NOT NULL, next_attempt_time
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT attempts, send_time IS NOT NULL, abandon_time IS NOT NULL,
+		COALESCE(expiry_next_attempt_time, next_attempt_time)
 		FROM billing_notifications WHERE notification_id = $1`, id).Scan(&st.Attempts, &st.Sent, &st.Abandoned, &st.Next); err != nil {
 		f.t.Fatal(err)
 	}
@@ -81,7 +85,7 @@ func (f *fixture) noticeState(id string) noticeState {
 func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
-	interrupted := f.queueNotice(acct, "credit_expiry/deadline-a")
+	interrupted, key := f.queueNotice(acct)
 
 	passCtx, cancel := context.WithTimeout(ctx(), 300*time.Millisecond)
 	defer cancel()
@@ -113,7 +117,7 @@ func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 	// A notification that is due now runs before the deferred one.
 	f.s.email = f.email
 	other := f.account()
-	newer := f.queueNotice(other, "credit_expiry/deadline-b")
+	newer, _ := f.queueNotice(other)
 	if err := f.s.DeliverNotifications(ctx()); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +155,7 @@ func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 			userID = id
 		}
 	}
-	if userID == "" || got.IdempotencyKey != "credit_expiry/deadline-a/"+userID {
+	if userID == "" || got.IdempotencyKey != key+"/"+userID {
 		t.Fatalf("resumed message %+v", got)
 	}
 }
@@ -161,7 +165,7 @@ func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 func TestNotificationCanceledPassDefers(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
-	id := f.queueNotice(acct, "credit_expiry/canceled")
+	id, _ := f.queueNotice(acct)
 	n, ok, err := f.s.claimNotification(ctx())
 	if err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
@@ -185,7 +189,7 @@ func TestNotificationCanceledPassDefers(t *testing.T) {
 func TestNotificationConcurrentWorkersSkipLeased(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
-	id := f.queueNotice(acct, "credit_expiry/concurrent")
+	id, _ := f.queueNotice(acct)
 
 	workersCtx, cancelWorkers := context.WithTimeout(t.Context(), 15*time.Second)
 	type secondWorkerKey struct{}
@@ -321,7 +325,7 @@ func TestNotificationConcurrentWorkersSkipLeased(t *testing.T) {
 func TestNotificationLeaseExpiryRetries(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
-	id := f.queueNotice(acct, "credit_expiry/lease")
+	id, _ := f.queueNotice(acct)
 	if _, ok, err := f.s.claimNotification(ctx()); err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
@@ -342,7 +346,7 @@ func TestNotificationLeaseExpiryRetries(t *testing.T) {
 func TestNotificationOrdinaryFailureKeepsBackoff(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
-	id := f.queueNotice(acct, "credit_expiry/ordinary")
+	id, key := f.queueNotice(acct)
 	var first string
 	if err := f.db.Pool.QueryRow(ctx(), `SELECT min(user_id) FROM billing_account_members
 		WHERE billing_account_id = $1 AND role IN ('owner', 'admin')`, acct).Scan(&first); err != nil {
@@ -363,7 +367,7 @@ func TestNotificationOrdinaryFailureKeepsBackoff(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].IdempotencyKey == "" || msgs[0].To == first+"@example.com" {
 		t.Fatalf("emails %+v", msgs)
 	}
-	if want := fmt.Sprintf("credit_expiry/ordinary/%s", st.Recipients[0]); msgs[0].IdempotencyKey != want {
+	if want := key + "/" + st.Recipients[0]; msgs[0].IdempotencyKey != want {
 		t.Fatalf("key %q, want %q", msgs[0].IdempotencyKey, want)
 	}
 }
