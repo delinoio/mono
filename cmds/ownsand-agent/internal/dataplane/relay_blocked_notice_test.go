@@ -12,7 +12,7 @@ import (
 )
 
 // waitProbeContext is a stream context that reports the first Done call after
-// arm. The relay code that waits for an outbound slot (enqueueCtx) evaluates
+// arm. The relay code that waits for an outbound slot (enqueueStream) evaluates
 // ctx.Done() when it enters its select, after ctx.Err() returned nil. A test
 // therefore learns, without timing assumptions or goroutine stack parsing,
 // that the wait on the stream context has begun. A close that follows cancels
@@ -22,6 +22,7 @@ type waitProbeContext struct {
 	context.Context
 	armed  atomic.Bool
 	waited chan struct{}
+	resume <-chan struct{}
 }
 
 func newWaitProbeContext(parent context.Context) *waitProbeContext {
@@ -34,6 +35,9 @@ func (c *waitProbeContext) arm() { c.armed.Store(true) }
 func (c *waitProbeContext) Done() <-chan struct{} {
 	if c.armed.CompareAndSwap(true, false) {
 		close(c.waited)
+		if c.resume != nil {
+			<-c.resume
+		}
 	}
 	return c.Context.Done()
 }

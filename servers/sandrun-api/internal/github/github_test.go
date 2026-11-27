@@ -966,15 +966,15 @@ func TestCompletedBeforeQueued(t *testing.T) {
 // deactivation of the installation holds the link waits for it and then
 // stores no request for the inactive installation.
 func TestJobWaitsForDeactivation(t *testing.T) {
-	w := newGHWorld(t, worldOpts{})
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
-	ctx := context.Background()
+	ctx := t.Context()
 	tx, err := w.env.DB.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := tx.Exec(ctx, "SELECT 1 FROM github_installations WHERE github_installation_id = 501 FOR UPDATE"); err != nil {
 		t.Fatal(err)
 	}
@@ -983,11 +983,7 @@ func TestJobWaitsForDeactivation(t *testing.T) {
 		_, status := w.gh.Send("workflow_job", job("queued", 501, 60, sandRunLinux, ""))
 		done <- status
 	}()
-	select {
-	case status := <-done:
-		t.Fatalf("the delivery did not wait for the deactivation (status %d)", status)
-	case <-time.After(500 * time.Millisecond):
-	}
+	waitForDeactivationLookup(t, w, tx.Conn().PgConn().PID(), done)
 	if _, err := tx.Exec(ctx, "UPDATE github_installations SET state = $1 WHERE github_installation_id = 501",
 		int16(sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED)); err != nil {
 		t.Fatal(err)
@@ -1000,6 +996,46 @@ func TestJobWaitsForDeactivation(t *testing.T) {
 	}
 	if n := len(w.requests(t)); n != 0 {
 		t.Fatalf("%d requests for a suspended installation", n)
+	}
+}
+
+func waitForDeactivationLookup(t *testing.T, w *ghWorld, blocker uint32, done <-chan int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	observer, err := w.env.DB.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire installation lock observer: %v", err)
+	}
+	defer observer.Release()
+
+	const lookupSuffix = " FROM github_installations WHERE github_installation_id = $1 FOR SHARE"
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case status := <-done:
+			t.Fatalf("delivery finished before the installation lock wait was observed (status %d)", status)
+		case <-ctx.Done():
+			t.Fatalf("waiting for the delivery's installation lock: %v", ctx.Err())
+		case <-ticker.C:
+		}
+
+		var waiting bool
+		if err := observer.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+				AND starts_with(query, 'SELECT ') AND right(query, length($2::text)) = $2
+				AND $1 = ANY(pg_blocking_pids(pid))
+		)`, blocker, lookupSuffix).Scan(&waiting); err != nil {
+			t.Fatalf("observe the delivery's installation lock: %v", err)
+		}
+		if waiting {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("waiting for the delivery's installation lock: %v", err)
+			}
+			return
+		}
 	}
 }
 
