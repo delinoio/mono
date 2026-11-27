@@ -200,6 +200,53 @@ func waitBuildVMConsole(t *testing.T, b *BuildVM) {
 	}
 }
 
+func TestBuildVMConsoleCapsLogAcrossRedials(t *testing.T) {
+	first := bytes.Repeat([]byte("a"), 768<<10)
+	second := bytes.Repeat([]byte("b"), 768<<10)
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+	}{
+		{name: "fresh"},
+		{name: "existing", prefix: bytes.Repeat([]byte("p"), 64<<10)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), consoleFile)
+			if len(tc.prefix) > 0 {
+				if err := os.WriteFile(path, tc.prefix, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f := startBuildVMConsoleFixture(t, "cap-"+tc.name, path)
+			for i, data := range [][]byte{first, second} {
+				attempt := i + 1
+				conn := acceptBuildVMConsole(t, f.listener, attempt)
+				if err := writeWithin(conn, attempt, data, consoleFixtureBound); err != nil {
+					t.Fatal(err)
+				}
+				conn.Close()
+			}
+			// Wait for the second copy to reach EOF before stopping it.
+			acceptBuildVMConsole(t, f.listener, 3)
+			f.stop()
+			waitBuildVMConsole(t, f.build)
+
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			limit := int(vmruntime.ConsoleLogLimit)
+			if len(got) != limit {
+				t.Fatalf("console.log = %d bytes, want %d", len(got), limit)
+			}
+			secondBytes := limit - len(tc.prefix) - len(first)
+			if want := bytes.Join([][]byte{tc.prefix, first, second[:secondBytes]}, nil); !bytes.Equal(got, want) {
+				t.Fatal("console.log does not contain the expected prefix across both connections")
+			}
+		})
+	}
+}
+
 // A pipe that ends while the build VM still runs leaves no closer goroutine
 // behind, on a real named pipe: BuildVM.copyConsole re-dials after each end,
 // and once the pipe is gone no closer from an earlier connection is alive.
