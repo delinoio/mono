@@ -105,7 +105,10 @@ func TestRetryKeepsVerifiedRevocation(t *testing.T) {
 
 func TestVerifiedRetryClearsRevocationAfterSupersedingOlderManifest(t *testing.T) {
 	old := newRelease(t, nil)
-	current := newRelease(t, func(m *Manifest, _ *[]byte) { m.RevokedVersions = nil })
+	current := newRelease(t, func(m *Manifest, _ *[]byte) {
+		m.Sequence = 2
+		m.RevokedVersions = nil
+	})
 	var latest atomic.Pointer[release]
 	latest.Store(old)
 	signatureStarted := make(chan struct{})

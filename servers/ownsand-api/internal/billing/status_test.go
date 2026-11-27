@@ -504,10 +504,9 @@ func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
 	// not elapsed since the poll of the first step.
 	setHeld(true)
 	eventually(t, "the first retry", func() bool { return calls() == 1 })
-	polls := f.fake.Calls(accountstest.MethodListBillingStatusChanges)
-	if polls != 1 {
-		t.Fatalf("polls = %d, want the single poll of the first step", polls)
-	}
+	eventually(t, "the poll of the first held step", func() bool {
+		return f.fake.Calls(accountstest.MethodListBillingStatusChanges) == 1
+	})
 
 	// The failed attempt moved the row an hour ahead; later ticks skip it, and
 	// no further poll runs within the poll interval.
@@ -515,8 +514,8 @@ func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
 	if n := calls(); n != 1 {
 		t.Fatalf("a pending unlink that was not due was retried: %d calls", n)
 	}
-	if n := f.fake.Calls(accountstest.MethodListBillingStatusChanges); n != polls {
-		t.Fatalf("polls = %d, want %d: the poll interval has not elapsed", n, polls)
+	if n := f.fake.Calls(accountstest.MethodListBillingStatusChanges); n != 1 {
+		t.Fatalf("polls = %d, want 1: the poll interval has not elapsed", n)
 	}
 
 	// Once the back-off has elapsed, the next tick sends the unlink.
@@ -584,7 +583,7 @@ func TestRunPollCadence(t *testing.T) {
 		delay time.Duration
 	}{
 		{"fast poll", 5 * time.Millisecond},
-		// A poll that takes longer than two ticks makes the ticker drop ticks.
+		// A slow poll spans multiple maintenance ticks.
 		{"slow poll", 120 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -659,52 +658,47 @@ func TestRunPollOnLeaseReacquisition(t *testing.T) {
 				epoch uint64
 				held  bool
 			}
-			samples := make(chan struct{})
-			states := make(chan ownership)
+			first := ownership{epoch: 1, held: true}
+			var mu sync.Mutex
+			state, samples := first, 0
 			statuses := billing.NewStatuses(billing.StatusOptions{
 				DB: f.db, Logger: f.logger, Client: f.fake.Client(), Timing: &timing,
-				// Only the poll loop takes a step on the fixture's channel.
 				WhileHeld: func(func(*lease.Period)) bool { return false },
 				Ownership: func() (uint64, bool) {
-					select {
-					case samples <- struct{}{}:
-					case <-ctx.Done():
-						return 0, false
-					}
-					select {
-					case state := <-states:
-						return state.epoch, state.held
-					case <-ctx.Done():
-						return 0, false
-					}
+					mu.Lock()
+					defer mu.Unlock()
+					samples++
+					return state.epoch, state.held
 				},
 			})
 			go func() { defer close(done); statuses.Run(ctx) }()
 			defer func() { cancel(); <-done }()
 
-			// The next sample proves that the worker finished the previous step.
-			step := func(state ownership, previousPolls int) {
+			polls := func() int { return f.fake.Calls(accountstest.MethodListBillingStatusChanges) }
+			eventually(t, "the first poll", func() bool { return polls() == 1 })
+
+			// Both maintenance and an asynchronous poll sample ownership.
+			// Observe several samples without requiring a particular order.
+			step := func(next ownership, wantPolls int) {
 				t.Helper()
-				select {
-				case <-samples:
-				case <-time.After(5 * time.Second):
-					t.Fatal("timed out waiting for the next ownership sample")
+				mu.Lock()
+				state, samples = next, 0
+				mu.Unlock()
+				eventually(t, "poll count after the ownership change", func() bool { return polls() == wantPolls })
+				eventually(t, "several ownership samples after the change", func() bool {
+					mu.Lock()
+					defer mu.Unlock()
+					return samples >= 5
+				})
+				if got := polls(); got != wantPolls {
+					t.Fatalf("with ownership %+v: got %d polls, want %d", next, got, wantPolls)
 				}
-				if got := f.fake.Calls(accountstest.MethodListBillingStatusChanges); got != previousPolls {
-					t.Fatalf("before sample %+v: got %d polls, want %d", state, got, previousPolls)
-				}
-				states <- state
 			}
-			first := ownership{epoch: 1, held: true}
-			next := ownership{epoch: 3, held: true}
-			step(first, 0)
-			step(first, 1) // Renewal keeps this epoch and the existing cadence.
+			step(first, 1) // Renewing the same epoch keeps the current cadence.
 			if observeLoss {
 				step(ownership{epoch: 2}, 1)
 			}
-			step(next, 1)
-			step(next, 2)
-			step(next, 2)
+			step(ownership{epoch: 3, held: true}, 2)
 		})
 	}
 }
