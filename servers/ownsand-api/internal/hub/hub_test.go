@@ -329,6 +329,8 @@ func TestConfigLockWaitersCountsBlockedSenders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseFirst := sync.OnceFunc(unlockFirst)
+	t.Cleanup(releaseFirst)
 	if got := conn.ConfigLockWaiters(); got != 0 {
 		t.Fatalf("waiters with the lock held and nobody waiting = %d, want 0", got)
 	}
@@ -347,9 +349,14 @@ func TestConfigLockWaitersCountsBlockedSenders(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	unlockFirst()
-	if err := <-acquired; err != nil {
-		t.Fatal(err)
+	releaseFirst()
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("configuration lock worker did not finish within 10 seconds after the first lock was released")
 	}
 	if got := conn.ConfigLockWaiters(); got != 0 {
 		t.Fatalf("waiters after both released = %d, want 0", got)

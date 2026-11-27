@@ -192,6 +192,86 @@ func openStream(t *testing.T, c *Conn) *Stream {
 	return s
 }
 
+func TestStreamQueueBoundsFramesWithCredit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	limits := testLimits
+	limits.MaxQueuedFrames = 3
+	c := NewConn(ctx, "device", 1, limits)
+	slow, healthy := openStream(t, c), openStream(t, c)
+	drainOut(c)
+	send := func(s *Stream) *ownsandv1.DataFrame {
+		t.Helper()
+		f := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ExecEvent{
+			Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}},
+		})
+		if err := c.dispatch(f); err != nil {
+			t.Fatalf("dispatch on stream %d: %v", s.ID, err)
+		}
+		return f
+	}
+	if err := c.dispatch(acceptedFrame(slow)); err != nil {
+		t.Fatal(err)
+	}
+	for range limits.MaxQueuedFrames {
+		send(slow)
+	}
+	if slow.queuedFrames != 3 || len(slow.queue) != 4 {
+		t.Fatalf("queue held %d credit frames and %d total frames, want 3 and 4", slow.queuedFrames, len(slow.queue))
+	}
+	send(slow)
+	if frame, err := slow.Next(ctx, nil); frame != nil || !errors.Is(err, ErrQueueLimit) {
+		t.Fatalf("Next = %v, %v, want only ErrQueueLimit", frame, err)
+	}
+	if slow.queuedFrames != 0 || slow.controlFrames != 0 || slow.controlBytes != 0 || len(slow.queue) != 0 {
+		t.Fatal("the closed stream retained queued frames or counts")
+	}
+	send(slow) // A late frame must leave the closed stream unchanged.
+	slow.Close(true)
+	out := drainOut(c)
+	if len(out) != 1 || out[0].GetStreamId() != slow.ID || out[0].GetRelayStreamClose() == nil {
+		t.Fatalf("outbound frames = %v, want one close for stream %d", out, slow.ID)
+	}
+	want := send(healthy)
+	if frame, err := healthy.Next(ctx, nil); frame != want || err != nil {
+		t.Fatalf("healthy stream Next = %v, %v, want %v", frame, err, want)
+	}
+	if c.Err() != nil || c.StreamCount() != 1 {
+		t.Fatalf("connection: error = %v, open streams = %d", c.Err(), c.StreamCount())
+	}
+}
+
+func TestStreamQueueCountFollowsNext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	limits := testLimits
+	limits.MaxQueuedFrames = 2
+	c := NewConn(ctx, "device", 1, limits)
+	s := openStream(t, c)
+	enqueue := func() {
+		t.Helper()
+		f := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ExecEvent{
+			Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}},
+		})
+		if err := c.dispatch(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue()
+	enqueue()
+	for range 5 {
+		f, err := s.Next(ctx, nil)
+		if err != nil || f.GetExecEvent().GetKeepalive() == nil || s.queuedFrames != 1 {
+			t.Fatalf("Next = %v, %v with %d frames left, want one remaining frame", f, err, s.queuedFrames)
+		}
+		s.Consumed(ctx, f)
+		enqueue()
+	}
+	if s.queuedFrames != 2 || s.isClosed() {
+		t.Fatalf("queue count = %d, closed = %v, want two queued frames on the open stream", s.queuedFrames, s.isClosed())
+	}
+}
+
 func TestStreamQueueBoundsFramesWithoutCredit(t *testing.T) {
 	limits := testLimits
 	limits.MaxQueuedControlFrames = 3
@@ -267,7 +347,8 @@ func TestCompliantExchangeStaysWithinDefaultLimits(t *testing.T) {
 
 func TestDefaultLimitsApplyToZeroValues(t *testing.T) {
 	c := NewConn(context.Background(), "device", 1, Limits{StreamBuffer: datapath.MinWindowSize, MaxStreamsPerConn: 1, MaxStreamsPerGrant: 1})
-	if c.limits.MaxQueuedControlFrames != DefaultLimits().MaxQueuedControlFrames || c.limits.MaxQueuedControlBytes != DefaultLimits().MaxQueuedControlBytes {
+	if c.limits.MaxQueuedFrames != 4096 || c.limits.MaxQueuedFrames != DefaultLimits().MaxQueuedFrames ||
+		c.limits.MaxQueuedControlFrames != DefaultLimits().MaxQueuedControlFrames || c.limits.MaxQueuedControlBytes != DefaultLimits().MaxQueuedControlBytes {
 		t.Fatalf("limits = %+v, want the defaults", c.limits)
 	}
 }
@@ -526,6 +607,96 @@ func TestConcurrentOpensReachTheAgentInIDOrder(t *testing.T) {
 	}
 	c.Close(ErrConnClosed)
 	waitRun(t, done, time.Second)
+}
+
+func TestOpenRejectsEndedContextBeforeAllocation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{"canceled", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		}, context.Canceled},
+		{"expired", func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}, context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := tc.end()
+			defer cancel()
+			c := NewConn(context.Background(), "device", 1, testLimits)
+			if s, err := c.Open(ctx, "grant", "sandbox"); s != nil || !errors.Is(err, tc.want) {
+				t.Fatalf("Open = %v, %v, want nil, %v", s, err, tc.want)
+			}
+			if c.next != 0 || c.StreamCount() != 0 || perGrantCount(c, "grant") != 0 ||
+				len(c.openGate) != 0 || len(c.slots) != 0 || len(c.out) != 0 {
+				t.Fatal("Open used admission state with an already ended context")
+			}
+		})
+	}
+}
+
+type openCommitContext struct {
+	context.Context
+	beforeErr func()
+}
+
+func (c openCommitContext) Err() error {
+	c.beforeErr()
+	return c.Context.Err()
+}
+
+func TestOpenCancelAfterTakingOutboundSlot(t *testing.T) {
+	limits := testLimits
+	limits.MaxStreamsPerConn = 1
+	limits.MaxStreamsPerGrant = 1
+	c := NewConn(context.Background(), "device", 1, limits)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := openCommitContext{Context: ctx, beforeErr: func() {
+		// The slot marks the last checkpoint, after provisional admission.
+		if len(c.slots) == 1 {
+			if c.StreamCount() != 1 || perGrantCount(c, "grant") != 1 {
+				t.Fatal("expected a provisional stream when checking the outbound slot")
+			}
+			cancel()
+		}
+	}}
+	if s, err := c.Open(request, "grant", "sandbox"); s != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Open = %v, %v, want nil, context.Canceled", s, err)
+	}
+	if c.StreamCount() != 0 || perGrantCount(c, "grant") != 0 || c.pendingFinals != 0 ||
+		len(c.openGate) != 0 || len(c.slots) != 0 || len(c.out) != 0 {
+		t.Fatal("canceled Open retained admission state or queued a frame")
+	}
+
+	s, err := c.Open(context.Background(), "grant", "sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ID != 2 {
+		t.Fatalf("stream ID = %d, want 2 after discarding provisional stream 1", s.ID)
+	}
+	s.Close(true)
+	if got := len(c.out); got != 2 {
+		t.Fatalf("queued frames = %d, want one open and one final close", got)
+	}
+	open, final := <-c.out, <-c.out
+	if open.frame.GetRelayStreamOpen() == nil || open.frame.GetStreamId() != s.ID ||
+		final.frame.GetRelayStreamClose() == nil || final.frame.GetStreamId() != s.ID || !final.final {
+		t.Fatalf("queued frames = %v, %v, want stream %d open and final close", open.frame, final.frame, s.ID)
+	}
+	c.dequeued(open)
+	if len(c.slots) != 0 || c.pendingFinals != 1 || perGrantCount(c, "grant") != 1 {
+		t.Fatal("admission must keep the final reservation until the writer finishes")
+	}
+	c.sent(final)
+	if c.pendingFinals != 0 || perGrantCount(c, "grant") != 0 {
+		t.Fatal("the final frame retained its admission slots after being sent")
+	}
 }
 
 // TestOpenCancelWhileQueueIsFull cancels an Open that waits for room in a full

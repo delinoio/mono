@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,8 +30,11 @@ func TestDrainUsageWaitsForRecordingRequest(t *testing.T) {
 	s.Usage = usage
 	m := &meterInterceptor{s: s}
 	const procedure = ownsandv1connect.SandboxServiceListSandboxesProcedure
+	const fixtureTimeout = 5 * time.Second
 
 	release := make(chan struct{})
+	releaseHandler := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseHandler)
 	entered := make(chan struct{})
 	finished := make(chan struct{})
 	handler := m.WrapUnary(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
@@ -44,33 +48,38 @@ func TestDrainUsageWaitsForRecordingRequest(t *testing.T) {
 		defer close(finished)
 		_, _ = handler(context.Background(), fakeRequest{procedure: procedure})
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(fixtureTimeout):
+		t.Fatal("timed out waiting for the billed handler to enter")
+	}
 
 	// Not drained while the request is running: a short context ends first.
-	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	short, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	err := s.DrainUsage(short)
 	cancel()
 	if !errors.Is(err, ErrUsageDrainIncomplete) {
 		t.Fatalf("DrainUsage with a running request = %v, want ErrUsageDrainIncomplete", err)
 	}
 
+	drainCtx, cancelDrain := context.WithTimeout(t.Context(), fixtureTimeout)
+	defer cancelDrain()
 	drained := make(chan error, 1)
-	go func() { drained <- s.DrainUsage(context.Background()) }()
+	go func() { drained <- s.DrainUsage(drainCtx) }()
 	select {
 	case err := <-drained:
 		t.Fatalf("DrainUsage returned %v before the request ended", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(release)
+	releaseHandler()
 	select {
 	case err := <-drained:
 		if err != nil {
 			t.Fatalf("DrainUsage = %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("DrainUsage did not return after the request ended")
+	case <-time.After(fixtureTimeout):
+		t.Fatal("timed out waiting for the background DrainUsage result")
 	}
-	<-finished
 	select {
 	case q := <-usage.added:
 		if q != 1 {
@@ -79,7 +88,14 @@ func TestDrainUsageWaitsForRecordingRequest(t *testing.T) {
 	default:
 		t.Error("the request recorded no usage before DrainUsage returned")
 	}
-	if err := s.DrainUsage(context.Background()); err != nil {
+	select {
+	case <-finished:
+	case <-time.After(fixtureTimeout):
+		t.Fatal("timed out waiting for the billed handler to finish")
+	}
+	idleCtx, cancelIdle := context.WithTimeout(t.Context(), fixtureTimeout)
+	defer cancelIdle()
+	if err := s.DrainUsage(idleCtx); err != nil {
 		t.Errorf("DrainUsage with no request = %v", err)
 	}
 }
