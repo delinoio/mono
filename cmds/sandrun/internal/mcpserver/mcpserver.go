@@ -759,6 +759,16 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 			"exec %s did not confirm its start before the wait passed, so it may not run; exec_output with this exec_id returns not_found if it did not start", execID)))
 	}
 	if err != nil {
+		var streamErr *sandrun.ExecStreamError
+		var status *connect.Error
+		if errors.As(err, &streamErr) && errors.As(streamErr, &status) {
+			message := fmt.Sprintf("%s\nExec result unavailable for exec_id %s.", toolError(status), streamErr.ExecID)
+			if streamErr.OutcomeUnknown {
+				message += " The command outcome is unknown."
+			}
+			return nil, execResult{}, errors.New(message +
+				" Call exec_output with the same session_id and exec_id, stdout_offset 0, and stderr_offset 0 to read retained output and the result.")
+		}
 		return nil, execResult{}, toolError(err)
 	}
 	out := col.result(execID, res)
