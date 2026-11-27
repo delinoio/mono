@@ -1,0 +1,67 @@
+{
+  "gid": "inv-30-windows-build-console-cap",
+  "commit": "eba049f1b3d2f8f55458e1df7bb50035be61ebb7",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows amd64",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "eba049f1b3d2f8f55458e1df7bb50035be61ebb7",
+    "setup": "Use a short ASCII directory on the Windows host. Run the commands in order in one non-elevated PowerShell session. After creating .t3-tmp, copy files.copyFrom to files.copyTo. The ZIP contains ordinary files with ASCII names. The named-pipe tests need no repository checkout, Go installation, symlink privileges, tar, service control, or Hyper-V access.",
+    "commands": [
+      "New-Item -ItemType Directory -Path '.t3-tmp', '.t3-tmp\\go-temp' -Force | Out-Null",
+      "$env:TEMP = (Resolve-Path '.t3-tmp\\go-temp').Path; $env:TMP = $env:TEMP",
+      "if ((Get-FileHash -Algorithm SHA256 -LiteralPath '.t3-tmp\\windows-console-cap.zip').Hash -ne '67F0B8FFB368557C08529372CCACCB52C727F464B47B28955AC3D702BF5C7857') { throw 'Unexpected test artifact hash' }",
+      "Expand-Archive -LiteralPath '.t3-tmp\\windows-console-cap.zip' -DestinationPath '.t3-tmp\\windows-console-cap' -Force",
+      "& '.\\.t3-tmp\\windows-console-cap\\hcsrt-windows-amd64.test.exe' -test.v -test.count=1 -test.timeout=3m '-test.run=^(TestBuildVMConsole|TestCopyConsole)' 2>&1 | Tee-Object -FilePath '.t3-tmp\\windows-console-cap-fixed.log'; if ($LASTEXITCODE -ne 0) { throw 'Fixed console tests failed' }",
+      "& '.\\.t3-tmp\\windows-console-cap\\hcsrt-windows-amd64-append-control.test.exe' -test.v -test.count=1 -test.timeout=3m '-test.run=^TestBuildVMConsoleCapsLogAcrossRedials$' 2>&1 | Tee-Object -FilePath '.t3-tmp\\windows-console-cap-append-control.log'; $controlExit = $LASTEXITCODE; $overCap = @(Select-String -LiteralPath '.t3-tmp\\windows-console-cap-append-control.log' -Pattern 'console\\.log = (\\d+) bytes, want 1048576' | Where-Object { [int]$_.Matches[0].Groups[1].Value -gt 1048576 }); if ($controlExit -ne 1 -or $overCap.Count -ne 2) { throw 'The append-only control did not reproduce both cap failures' }"
+    ],
+    "expectedResults": [
+      "The ZIP hash matches and both fixture executables extract.",
+      "The fixed executable exits 0 without skips. The fresh case keeps 768 KiB of a followed by 256 KiB of b. The existing case keeps 64 KiB of p, 768 KiB of a, and 192 KiB of b. Both cases finish the bounded writes and reach the third accept.",
+      "The fixed executable also passes the existing EOF, redial, stop, exit, log-open failure, bounded-write, and cleanup cases.",
+      "The append-only control exits 1 and reports an oversized log for both the fresh and existing cases. This failure is expected."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-build-console-cap/worker/.t3-tmp/console-cap/windows-console-cap.zip",
+      "copyTo": ".t3-tmp/windows-console-cap.zip",
+      "sha256": "67F0B8FFB368557C08529372CCACCB52C727F464B47B28955AC3D702BF5C7857",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/console_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-console-cap-fixed.log",
+        ".t3-tmp/windows-console-cap-append-control.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-build-console-cap/worker/.t3-tmp/console-cap/hcsrt-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-build-console-cap/worker/.t3-tmp/console-cap/hcsrt-windows-amd64-append-control.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-build-console-cap/worker/.t3-tmp/console-cap/ownsand-agent-windows-amd64.exe"
+      ]
+    },
+    "limits": [
+      "The native named-pipe fixture uses the real Windows pipe and the production capture code with a fake HCS handle. It does not boot an image.",
+      "The non-elevated validation account cannot run the Hyper-V image builds."
+    ],
+    "requiresElevation": {
+      "status": "blocked-on-delino-win-1",
+      "setup": "Use an elevated PowerShell on a disposable Hyper-V host. Set OWNSAND_VALIDATION_WINDOWS_ISO to a disposable Windows Server 2025 Standard Evaluation ISO with Desktop Experience at edition index 2 and OWNSAND_VALIDATION_WINDOWS_GUEST to an x64 ownsand-guest.exe built at the stated revision. Copy the agent to .t3-tmp/ownsand-agent-windows-amd64.exe. Use separate fresh state directories and preserve both log files.",
+      "commands": [
+        "$iso = (Resolve-Path -LiteralPath $env:OWNSAND_VALIDATION_WINDOWS_ISO -ErrorAction Stop).Path; $guest = (Resolve-Path -LiteralPath $env:OWNSAND_VALIDATION_WINDOWS_GUEST -ErrorAction Stop).Path; $root = (New-Item -ItemType Directory -Path (Join-Path '.t3-tmp' ('console-images-' + [guid]::NewGuid().ToString('N')))).FullName",
+        "$success = Join-Path $root 'success'; & '.\\.t3-tmp\\ownsand-agent-windows-amd64.exe' image build --state-dir $success --os windows --iso $iso --edition 2 --guest-binary $guest 2>&1 | Tee-Object -FilePath (Join-Path $root 'success.log'); if ($LASTEXITCODE -ne 0) { throw 'Successful image build failed' }",
+        "if (!(Test-Path (Join-Path $success 'images\\windows\\disk.vhdx')) -or !(Test-Path (Join-Path $success 'images\\windows\\image.json')) -or (Test-Path (Join-Path $success 'images\\windows\\console.log')) -or (Test-Path (Join-Path $success 'images\\windows.build\\console.log'))) { throw 'Installed image files or console cleanup differ from expectations' }",
+        "$program = Join-Path $root 'no-ready.go'; $noReady = Join-Path $root 'no-ready.exe'; @('package main', 'func main() {}') | Set-Content -Encoding Ascii -LiteralPath $program; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'; go build -o $noReady $program; if ($LASTEXITCODE -ne 0) { throw 'Could not build the no-ready guest fixture' }",
+        "$failure = Join-Path $root 'failure'; & '.\\.t3-tmp\\ownsand-agent-windows-amd64.exe' image build --state-dir $failure --os windows --iso $iso --edition 2 --guest-binary $noReady 2>&1 | Tee-Object -FilePath (Join-Path $root 'failure.log'); if ($LASTEXITCODE -eq 0) { throw 'The no-ready guest unexpectedly installed' }",
+        "if (!(Select-String -Quiet -LiteralPath (Join-Path $root 'failure.log') -Pattern 'hcsrt: the guest helper did not answer within|hcsrt: the build VM stopped before its guest helper answered')) { throw 'Build did not reach the expected first-boot failure' }; $retained = Get-Item -LiteralPath (Join-Path $failure 'images\\windows.build\\console.log') -ErrorAction Stop; if ($retained.Length -gt 1048576 -or (Test-Path (Join-Path $failure 'images\\windows\\disk.vhdx'))) { throw 'Failed staging or capped log differs from expectations' }; $retained.Length"
+      ],
+      "expectedResults": [
+        "The successful image build installs disk.vhdx and image.json without preserving console.log.",
+        "The intentionally nonresponsive guest reaches first boot and then fails readiness. The readiness timeout can take up to 60 minutes. The console log remains in staging and is at most 1,048,576 bytes. No image is installed in that state directory."
+      ],
+      "files": {
+        "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-build-console-cap/worker/.t3-tmp/console-cap/ownsand-agent-windows-amd64.exe",
+        "copyTo": ".t3-tmp/ownsand-agent-windows-amd64.exe"
+      }
+    }
+  }
+}
