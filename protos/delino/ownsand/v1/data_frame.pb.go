@@ -479,12 +479,16 @@ func (x *ExecStarted) GetStartTime() *timestamppb.Timestamp {
 	return nil
 }
 
-// The requested offsets are older than the kept output.
+// On relay and peer-to-peer streams, AttachExec sends one output_truncated
+// event after started if either requested offset is below its stream's retained
+// start. The event gives the effective resume offsets for both streams.
 type ExecOutputTruncated struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// First available stdout offset.
+	// Effective stdout resume offset, the larger of the requested stdout offset
+	// and the retained stdout start.
 	StdoutOffset int64 `protobuf:"varint,1,opt,name=stdout_offset,json=stdoutOffset,proto3" json:"stdout_offset,omitempty"`
-	// First available stderr offset.
+	// Effective stderr resume offset, the larger of the requested stderr offset
+	// and the retained stderr start.
 	StderrOffset  int64 `protobuf:"varint,2,opt,name=stderr_offset,json=stderrOffset,proto3" json:"stderr_offset,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

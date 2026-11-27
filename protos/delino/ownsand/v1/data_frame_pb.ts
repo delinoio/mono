@@ -175,20 +175,24 @@ export const ExecStartedSchema: GenMessage<ExecStarted> = /*@__PURE__*/
   messageDesc(file_delino_ownsand_v1_data_frame, 3);
 
 /**
- * The requested offsets are older than the kept output.
+ * On relay and peer-to-peer streams, AttachExec sends one output_truncated
+ * event after started if either requested offset is below its stream's retained
+ * start. The event gives the effective resume offsets for both streams.
  *
  * @generated from message delino.ownsand.v1.ExecOutputTruncated
  */
 export type ExecOutputTruncated = Message<"delino.ownsand.v1.ExecOutputTruncated"> & {
   /**
-   * First available stdout offset.
+   * Effective stdout resume offset, the larger of the requested stdout offset
+   * and the retained stdout start.
    *
    * @generated from field: int64 stdout_offset = 1;
    */
   stdoutOffset: bigint;
 
   /**
-   * First available stderr offset.
+   * Effective stderr resume offset, the larger of the requested stderr offset
+   * and the retained stderr start.
    *
    * @generated from field: int64 stderr_offset = 2;
    */
