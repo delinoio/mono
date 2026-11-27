@@ -13,6 +13,7 @@
 //	                          counter, removal record, pending update
 //	status.json               last status of the running agent (for `status`)
 //	sandboxes/<id>.json       sandbox records with TTL deadlines
+//	sandboxes/<id>.cleanup     pending failed-create cleanup markers
 //	snapshots/<id>/           snapshot record and content
 //	execs.json                exec_id records for at-most-once execution
 //	vms/<sandbox-id>/         runtime-owned VM files (disks, memory state)
@@ -54,6 +55,8 @@ const (
 	UpdateDir      = "update"
 	snapshotRecord = "record.json"
 	stagedSnapshot = ".record.pending"
+
+	sandboxCleanupSuffix = ".cleanup"
 )
 
 // ErrNotFound reports a missing record.
@@ -316,6 +319,51 @@ func (s *Store) LoadSandboxes(decode func(data []byte) error) error {
 	return nil
 }
 
+// SaveSandboxCleanup records a failed create before its sandbox record can
+// become terminal and be acknowledged.
+func (s *Store) SaveSandboxCleanup(id string) error {
+	if err := validID(id); err != nil {
+		return err
+	}
+	if err := WriteFileAtomic(s.Path(SandboxesDir, id+sandboxCleanupSuffix), nil, 0o600); err != nil {
+		return err
+	}
+	return s.syncSandboxCleanupDirectory()
+}
+
+// DeleteSandboxCleanup removes the marker after runtime Delete succeeds.
+// Sync even if the marker is missing, in case a previous removal succeeded
+// but its directory sync failed.
+func (s *Store) DeleteSandboxCleanup(id string) error {
+	if err := validID(id); err != nil {
+		return err
+	}
+	if err := os.Remove(s.Path(SandboxesDir, id+sandboxCleanupSuffix)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return s.syncSandboxCleanupDirectory()
+}
+
+// LoadSandboxCleanups returns failed creates that still need runtime cleanup.
+func (s *Store) LoadSandboxCleanups() ([]string, error) {
+	entries, err := os.ReadDir(s.Path(SandboxesDir))
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, entry := range entries {
+		id, marker := strings.CutSuffix(entry.Name(), sandboxCleanupSuffix)
+		// Only regular files with valid marker names belong to the inventory.
+		// A conflicting directory can prevent a marker save while the live
+		// record still needs startup reconciliation.
+		if !marker || !entry.Type().IsRegular() || validID(id) != nil {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // SnapshotDir returns the directory of one snapshot.
 func (s *Store) SnapshotDir(id string) (string, error) {
 	if err := validID(id); err != nil {
@@ -415,9 +463,9 @@ func (s *Store) LoadExecs(v any) error {
 	return s.readJSON(s.Path(ExecsFile), v)
 }
 
-// WipeLocalData deletes every sandbox record, snapshot, VM file, base image
-// and update download, and the exec records. It keeps the identity and
-// agent.json.
+// WipeLocalData deletes the sandbox records, cleanup markers, snapshots, VM
+// files, base images, update downloads and exec records. It keeps the identity
+// and agent.json.
 func (s *Store) WipeLocalData() error {
 	for _, sub := range []string{SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
 		if err := removeAll(s.Path(sub)); err != nil {
