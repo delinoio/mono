@@ -88,11 +88,16 @@ type Links struct {
 
 	mu      sync.Mutex
 	clients map[string]cachedClient
+	lookups map[string]*clientLookups
 }
 
 type cachedClient struct {
 	revision string
 	client   ownsandclient.Client
+}
+
+type clientLookups struct {
+	active int
 }
 
 // Register mounts OwnSandLinkService and its daily re-encryption job and
@@ -101,8 +106,20 @@ func Register(r *app.Registry, factory ownsandclient.Factory, m *metrics.Metrics
 	if removal.LeaseDuration <= 0 {
 		removal.LeaseDuration = time.Minute
 	}
-	l := &Links{svc: r.Service, factory: factory, metrics: m, removal: removal, clients: map[string]cachedClient{}}
+	l := &Links{
+		svc: r.Service, factory: factory, metrics: m, removal: removal,
+		clients: make(map[string]cachedClient),
+		lookups: make(map[string]*clientLookups),
+	}
 	r.Handle(sandrunv1connect.NewOwnSandLinkServiceHandler(&Handler{links: l}, r.HandlerOptions()...))
+	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
+		Name: "ownsand_link",
+		Prepare: func(_ context.Context, d api.OrganizationDeletion) (api.OrganizationDeletionSteps, error) {
+			return api.OrganizationDeletionSteps{
+				AfterCommit: func(context.Context) { l.forget(d.OrganizationID) },
+			}, nil
+		},
+	})
 	r.AddDailyJob(jobs.Job{Name: "reencrypt_ownsand_links", Run: func(ctx context.Context, _ time.Time) (int64, error) { return l.Reencrypt(ctx, l.svc.Secrets) }})
 	return l
 }
@@ -142,6 +159,12 @@ func (l *Links) ClientForRemoval(ctx context.Context, orgID string) (ownsandclie
 }
 
 func (l *Links) client(ctx context.Context, orgID string, any bool) (ownsandclient.Client, Link, error) {
+	// Register before reading the link so eviction can invalidate a lookup
+	// whose read overlaps the commit.
+	lookups := l.beginLookup(orgID)
+	var built cachedClient
+	defer func() { l.finishLookup(orgID, lookups, built) }()
+
 	s := l.svc
 	var lk Link
 	var state int16
@@ -177,10 +200,37 @@ func (l *Links) client(ctx context.Context, orgID string, any bool) (ownsandclie
 	}
 	revision := lk.CredentialRevision
 	c := l.instrument(orgID, inner, func() { l.markInvalid(orgID, revision) })
-	l.mu.Lock()
-	l.clients[orgID] = cachedClient{revision: revision, client: c}
-	l.mu.Unlock()
+	built = cachedClient{revision: revision, client: c}
 	return c, lk, nil
+}
+
+func (l *Links) beginLookup(orgID string) *clientLookups {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lookups := l.lookups[orgID]
+	if lookups == nil {
+		lookups = &clientLookups{}
+		l.lookups[orgID] = lookups
+	}
+	lookups.active++
+	return lookups
+}
+
+func (l *Links) finishLookup(orgID string, lookups *clientLookups, built cachedClient) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Eviction detaches the old group of lookups. Only lookups in the
+	// current group may publish a client or update its count.
+	if l.lookups[orgID] != lookups {
+		return
+	}
+	if built.client != nil {
+		l.clients[orgID] = built
+	}
+	lookups.active--
+	if lookups.active == 0 {
+		delete(l.lookups, orgID)
+	}
 }
 
 func (l *Links) instrument(orgID string, inner ownsandclient.Client, onUnauthenticated func()) ownsandclient.Client {
@@ -207,6 +257,7 @@ func (l *Links) markInvalid(orgID, revision string) {
 func (l *Links) forget(orgID string) {
 	l.mu.Lock()
 	delete(l.clients, orgID)
+	delete(l.lookups, orgID)
 	l.mu.Unlock()
 }
 
