@@ -102,6 +102,7 @@ func New(cfg Config) *Server {
 			"Delete the session with delete_session when you are done.",
 		Logger: cfg.Logger,
 	})
+	s.mcp.AddReceivingMiddleware(validateToolArguments)
 	s.register()
 	return s
 }
@@ -276,21 +277,21 @@ type listSessionsResult struct {
 }
 
 func (s *Server) register() {
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "list_profiles", Description: "List the dev session profiles: name, guest OS, resources, workspace path, TTLs and maximum queue wait."}, withToolDeadline(s.cfg.maxWait, s.listProfiles))
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "create_session", Description: "Create a dev session of a profile. Returns at once with the session ID and state; a session without free capacity is QUEUED. Call wait_session until it is RUNNING."}, withToolDeadline(s.cfg.maxWait, s.createSession))
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "wait_session", Description: "Wait until a dev session is RUNNING or ended, or the wait passes, and return its state. Call it again while the state is QUEUED or STARTING."}, s.waitSession)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "list_sessions", Description: "List your own dev sessions with ID, profile, guest OS, state, label and times."}, withToolDeadline(s.cfg.maxWait, s.listSessions))
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "get_session", Description: "Read one dev session."}, withToolDeadline(s.cfg.maxWait, s.getSession))
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "delete_session", Description: "Delete a dev session (cancel it when queued) and return its final state."}, withToolDeadline(s.cfg.maxWait, s.deleteSession))
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "exec", Description: "Run a command (an argument array, no shell unless you call one) in a running dev session. " +
+	addTool(s.mcp, &mcp.Tool{Name: "list_profiles", Description: "List the dev session profiles: name, guest OS, resources, workspace path, TTLs and maximum queue wait."}, withToolDeadline(s.cfg.maxWait, s.listProfiles))
+	addTool(s.mcp, &mcp.Tool{Name: "create_session", Description: "Create a dev session of a profile. Returns at once with the session ID and state; a session without free capacity is QUEUED. Call wait_session until it is RUNNING."}, withToolDeadline(s.cfg.maxWait, s.createSession))
+	addTool(s.mcp, &mcp.Tool{Name: "wait_session", Description: "Wait until a dev session is RUNNING or ended, or the wait passes, and return its state. Call it again while the state is QUEUED or STARTING."}, s.waitSession)
+	addTool(s.mcp, &mcp.Tool{Name: "list_sessions", Description: "List your own dev sessions with ID, profile, guest OS, state, label and times."}, withToolDeadline(s.cfg.maxWait, s.listSessions))
+	addTool(s.mcp, &mcp.Tool{Name: "get_session", Description: "Read one dev session."}, withToolDeadline(s.cfg.maxWait, s.getSession))
+	addTool(s.mcp, &mcp.Tool{Name: "delete_session", Description: "Delete a dev session (cancel it when queued) and return its final state."}, withToolDeadline(s.cfg.maxWait, s.deleteSession))
+	addTool(s.mcp, &mcp.Tool{Name: "exec", Description: "Run a command (an argument array, no shell unless you call one) in a running dev session. " +
 		"When it ends within the wait: the exit code or signal, timed_out and the output. Otherwise: the exec_id, running true, the output so far and the next offsets for exec_output; the command keeps running. " +
 		"Each stream returns at most the first 8 KiB and the last 24 KiB of new output, with the omitted byte range. Standard input is not supported."}, s.exec)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "exec_output", Description: "Read the output of an exec from the given offsets and its result when it ended within the wait. The guest keeps the last 8 MiB of each stream until 10 minutes after the command ends."}, s.execOutput)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "sync", Description: "Copy the local Git working tree (tracked and untracked files that are not ignored) into the workspace of a running dev session, incrementally. " +
+	addTool(s.mcp, &mcp.Tool{Name: "exec_output", Description: "Read the output of an exec from the given offsets and its result when it ended within the wait. The guest keeps the last 8 MiB of each stream until 10 minutes after the command ends."}, s.execOutput)
+	addTool(s.mcp, &mcp.Tool{Name: "sync", Description: "Copy the local Git working tree (tracked and untracked files that are not ignored) into the workspace of a running dev session, incrementally. " +
 		"When it ends within the wait: the uploaded, deleted and skipped file counts, the bytes sent and the warnings. Otherwise: a transfer_id for transfer_status."}, s.sync)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "download", Description: "Copy a guest file or directory to a local path; an existing local path is replaced. " +
+	addTool(s.mcp, &mcp.Tool{Name: "download", Description: "Copy a guest file or directory to a local path; an existing local path is replaced. " +
 		"When it ends within the wait: the local path, the file count and the bytes. Otherwise: a transfer_id for transfer_status."}, s.download)
-	mcp.AddTool(s.mcp, &mcp.Tool{Name: "transfer_status", Description: fmt.Sprintf("Return the progress or outcome of a sync or download in this server process. The process keeps all active transfers and the %d most recent outcomes, including failures. Older IDs return not_found. Active transfers stop when the process exits.", transferHistoryLimit)}, s.transferStatus)
+	addTool(s.mcp, &mcp.Tool{Name: "transfer_status", Description: fmt.Sprintf("Return the progress or outcome of a sync or download in this server process. The process keeps all active transfers and the %d most recent outcomes, including failures. Older IDs return not_found. Active transfers stop when the process exits.", transferHistoryLimit)}, s.transferStatus)
 }
 
 // withToolDeadline passes one deadline through every RPC and lets the tool
