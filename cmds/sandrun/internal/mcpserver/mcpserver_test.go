@@ -86,7 +86,12 @@ func newHarness(t *testing.T, cfg Config) *harness {
 // returns the text content and whether the result is an error.
 func (h *harness) call(name string, args map[string]any, out any) (string, bool) {
 	h.t.Helper()
-	res, err := h.session.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	return h.callContext(context.Background(), name, args, out)
+}
+
+func (h *harness) callContext(ctx context.Context, name string, args map[string]any, out any) (string, bool) {
+	h.t.Helper()
+	res, err := h.session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
 		h.t.Fatalf("%s: %v", name, err)
 	}
@@ -994,19 +999,69 @@ func TestSyncAndDownloadThroughTransferStatus(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "main.c"), []byte("int main(){}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h := newHarness(t, Config{WorkDir: repo})
+	type transferGate struct {
+		arrived chan struct{}
+		release <-chan struct{}
+	}
+	var activeGate atomic.Pointer[transferGate]
+	transport := toolDeadlineTransport(func(req *http.Request) (*http.Response, error) {
+		// Both SDK transfers look up the running session before moving any files.
+		if gate := activeGate.Load(); gate != nil && req.URL.Path == sandrunv1connect.DevSessionServiceGetDevSessionProcedure {
+			select {
+			case gate.arrived <- struct{}{}:
+			default:
+			}
+			select {
+			case <-gate.release:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	var h *harness
+	h = newHarness(t, Config{WorkDir: repo, Client: func(context.Context) (*sandrun.Client, error) {
+		return sandrun.New(sandrun.Options{BaseURL: h.srv.URL, APIKey: h.srv.APIKey,
+			HTTPClient: &http.Client{Transport: transport}})
+	}})
 	id := h.running()
 
-	var r transferResult
-	text, isErr := h.call("sync", map[string]any{"session_id": id, "wait_seconds": 0}, &r)
-	if isErr || r.TransferID == "" || r.Kind != "sync" {
-		t.Fatalf("sync = %q %+v", text, r)
+	runTransfer := func(kind string, args map[string]any) transferResult {
+		t.Helper()
+		paused, resume := context.WithCancel(t.Context())
+		defer resume()
+		gate := &transferGate{arrived: make(chan struct{}, 1), release: paused.Done()}
+		activeGate.Store(gate)
+		defer activeGate.Store(nil)
+
+		startCtx, cancelStart := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancelStart()
+		var initial transferResult
+		text, isErr := h.callContext(startCtx, kind, args, &initial)
+		if isErr || initial.TransferID == "" || initial.Kind != kind || !initial.Running ||
+			initial.Progress == nil || initial.Sync != nil || initial.Download != nil {
+			t.Fatalf("%s start = %q %+v, want a running transfer with progress only", kind, text, initial)
+		}
+		select {
+		case <-gate.arrived:
+		case <-startCtx.Done():
+			t.Fatalf("%s did not reach GetDevSession: %v", kind, startCtx.Err())
+		}
+		resume()
+
+		statusCtx, cancelStatus := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancelStatus()
+		var terminal transferResult
+		text, isErr = h.callContext(statusCtx, "transfer_status", map[string]any{"transfer_id": initial.TransferID}, &terminal)
+		if isErr || terminal.TransferID != initial.TransferID || terminal.Kind != kind || terminal.Running || terminal.Progress != nil {
+			t.Fatalf("%s transfer_status = %q %+v, want the terminal result for %s", kind, text, terminal, initial.TransferID)
+		}
+		return terminal
 	}
-	if r.Running && r.Progress == nil {
-		t.Fatal("a running transfer has no progress")
-	}
-	if text, isErr := h.call("transfer_status", map[string]any{"transfer_id": r.TransferID}, &r); isErr || r.Running || r.Sync == nil || r.Sync.Uploaded != 1 {
-		t.Fatalf("transfer_status = %q %+v", text, r)
+
+	synced := runTransfer("sync", map[string]any{"session_id": id, "wait_seconds": 0})
+	if synced.Sync == nil || synced.Sync.Uploaded != 1 || synced.Download != nil {
+		t.Fatalf("sync result = %+v, want one uploaded file", synced)
 	}
 	if b, err := os.ReadFile(filepath.Join(h.ws, "main.c")); err != nil || string(b) != "int main(){}" {
 		t.Fatal("the sync did not copy the file")
@@ -1015,15 +1070,15 @@ func TestSyncAndDownloadThroughTransferStatus(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(h.ws, "a.out"), []byte("built"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	text, isErr = h.call("download", map[string]any{"session_id": id, "guest_path": "a.out", "local_path": "out/a.out", "wait_seconds": 0}, &r)
-	if isErr || r.TransferID == "" || r.Kind != "download" {
-		t.Fatalf("download = %q %+v", text, r)
+	downloaded := runTransfer("download", map[string]any{
+		"session_id": id, "guest_path": "a.out", "local_path": "out/a.out", "wait_seconds": 0,
+	})
+	localPath := filepath.Join(repo, "out/a.out")
+	if downloaded.Download == nil || downloaded.Download.Files != 1 || downloaded.Download.LocalPath != localPath || downloaded.Sync != nil {
+		t.Fatalf("download result = %+v, want one file at %s", downloaded, localPath)
 	}
-	if text, isErr = h.call("transfer_status", map[string]any{"transfer_id": r.TransferID}, &r); isErr || r.Running {
-		t.Fatalf("transfer_status = %q %+v", text, r)
-	}
-	if r.Download == nil || r.Download.Files != 1 || r.Download.LocalPath != filepath.Join(repo, "out/a.out") {
-		t.Fatalf("download result %+v", r)
+	if b, err := os.ReadFile(localPath); err != nil || string(b) != "built" {
+		t.Fatalf("downloaded file = %q, err = %v, want %q", b, err, "built")
 	}
 	if text, isErr := h.call("transfer_status", map[string]any{"transfer_id": "missing"}, nil); !isErr || !strings.HasPrefix(text, "not_found") {
 		t.Fatalf("unknown transfer = %q", text)
