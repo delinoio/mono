@@ -9,6 +9,7 @@ import {
   FailureClass,
   OwnSandConfigError,
   OwnSandCredentialError,
+  OwnSandError,
   redactError,
 } from "./errors.ts";
 import { BaseImage, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
@@ -359,21 +360,28 @@ describe("redactError keeps the classification of a rebuilt Connect error", () =
     expect(classifyFailure(redacted)).toBe(FailureClass.Interruption);
   });
 
-  test("a cause-free error stays terminal and an unchanged error keeps its identity", () => {
+  test("a cause-free error stays terminal and keeps its identity when clean", () => {
     const bare = new ConnectError(`rejected ${KEY}`, Code.Unknown);
     expect(classifyFailure(bare)).toBe(FailureClass.Terminal);
     const redacted = redactError(bare, [KEY]) as ConnectError;
     expect(redacted.cause).toBeUndefined();
     expect(classifyFailure(redacted)).toBe(FailureClass.Terminal);
+    const clean = new ConnectError("request rejected", Code.Unknown);
+    expect(redactError(clean, [KEY])).toBe(clean);
+    const plain = new Error("request rejected");
+    expect(redactError(plain, [KEY])).toBe(plain);
+  });
+
+  test("keeps the original cause when there is no redaction secret", () => {
     const { error } = leaky();
-    expect(redactError(error, ["unrelated-secret"])).toBe(error);
     expect(redactError(error, [])).toBe(error);
+    expect(redactError(error, [""])).toBe(error);
   });
 
   test("a Connect error as cause is not kept and the code decides", () => {
     const inner = new ConnectError(`inner ${KEY}`, Code.Unavailable);
     const outer = new ConnectError(
-      `outer ${KEY}`,
+      "request unavailable",
       Code.Unavailable,
       undefined,
       undefined,
@@ -383,12 +391,29 @@ describe("redactError keeps the classification of a rebuilt Connect error", () =
     expect(redacted.cause).toBeUndefined();
     expect(classifyFailure(redacted)).toBe(classifyFailure(outer));
     expect(classifyFailure(redacted)).toBe(FailureClass.Unavailable);
+    expect(outer.cause).toBe(inner);
+  });
+
+  test("a plain error drops its original cause when the message is clean", () => {
+    const { cause } = leaky();
+    const error = new TypeError("adapter failed", { cause });
+    const redacted = redactError(error, [KEY]) as Error;
+    expect(redacted).toBeInstanceOf(OwnSandError);
+    expect(redacted.name).toBe(error.name);
+    expect(redacted.message).toBe(error.message);
+    expect(redacted.cause).toBeUndefined();
+    expect(classifyFailure(redacted)).toBe(FailureClass.Interruption);
+    expect(chainText(redacted)).not.toContain(KEY);
+    expect(error.cause).toBe(cause);
   });
 
   test("a redacted credential failure never becomes retryable", () => {
-    const credential = new OwnSandCredentialError(`token source ${KEY}`);
+    const diagnostic = new Error(`token source diagnostic ${KEY}`);
+    const credential = new OwnSandCredentialError(`token source ${KEY}`, {
+      cause: diagnostic,
+    });
     const wrapped = new ConnectError(
-      `token source ${KEY}`,
+      "token source unavailable",
       Code.Unknown,
       undefined,
       undefined,
@@ -398,9 +423,11 @@ describe("redactError keeps the classification of a rebuilt Connect error", () =
     const redacted = redactError(wrapped, [KEY]) as ConnectError;
     expect(redacted.cause).toBeInstanceOf(OwnSandCredentialError);
     expect(redacted.cause).not.toBe(credential);
+    expect((redacted.cause as Error).message).toBe("token source [redacted]");
     expect((redacted.cause as Error).cause).toBeUndefined();
     expect(classifyFailure(redacted)).toBe(FailureClass.Terminal);
     expect(chainText(redacted)).not.toContain(KEY);
+    expect(credential.cause).toBe(diagnostic);
     // A bare credential error keeps its class when its message changes.
     const bare = redactError(credential, [KEY]);
     expect(bare).toBeInstanceOf(OwnSandCredentialError);
@@ -410,12 +437,41 @@ describe("redactError keeps the classification of a rebuilt Connect error", () =
 
 describe("transport failures keep their classification through the client redaction", () => {
   const protoHeaders = (type: string) => ({ "content-type": type });
-  const failingBody = () =>
+  const failingBody = (error = new Error(`body failure ${KEY}`)) =>
     new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.error(new Error(`body failure ${KEY}`));
+        controller.error(error);
       },
     });
+  const cleanFailure = () => {
+    const nested = new Error(`nested diagnostic ${KEY}`);
+    const diagnostic = new Error(`adapter diagnostic ${KEY}`, {
+      cause: nested,
+    });
+    return new ConnectError(
+      "transport interrupted",
+      Code.Unknown,
+      { "x-trace": "adapter" },
+      undefined,
+      diagnostic,
+    );
+  };
+  const expectSafeInterruption = (error: unknown, original: ConnectError) => {
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error).not.toBe(original);
+    const result = error as ConnectError;
+    expect(result.rawMessage).toBe("transport interrupted");
+    expect(result.code).toBe(Code.Unknown);
+    expect(result.metadata.get("x-trace")).toBe("adapter");
+    expect(result.details).toBe(original.details);
+    expect(result.cause).toBeInstanceOf(Error);
+    expect(result.cause).not.toBe(original.cause);
+    expect((result.cause as Error).message).toBe("transport failure");
+    expect((result.cause as Error).cause).toBeUndefined();
+    expect(chainText(result)).not.toContain(KEY);
+    expect(chainText(original)).toContain(KEY);
+    expect(classifyFailure(result)).toBe(FailureClass.Interruption);
+  };
   // The adapter fails with a plain error, or with a Connect error that
   // already wraps the original error as its cause (a Connect-aware adapter).
   const failures: [string, () => Error][] = [
@@ -475,6 +531,15 @@ describe("transport failures keep their classification through the client redact
       },
     );
 
+    test("unary: a clean outer message still replaces the diagnostic cause", async () => {
+      const original = cleanFailure();
+      const transport = transportOf(async () => {
+        throw original;
+      });
+      const error = await unary(transport).catch((e: unknown) => e);
+      expectSafeInterruption(error, original);
+    });
+
     test("unary: a failed response body read stays an interruption without the secret", async () => {
       const transport = transportOf(
         async () =>
@@ -502,29 +567,37 @@ describe("transport failures keep their classification through the client redact
       },
     );
 
-    test("stream: a failed response body read stays an interruption without the secret", async () => {
-      const transport = transportOf(
-        async () =>
-          new Response(failingBody(), {
-            status: 200,
-            headers: protoHeaders("application/connect+proto"),
-          }),
-      );
-      const res = await stream(transport);
-      const error: any = await (async () => {
-        try {
-          for await (const _ of res.message) {
-            // Drain until the stream error.
+    test.each(["plain error", "clean outer message"])(
+      "stream: a failed response body read (%s) stays an interruption without the secret",
+      async (kind) => {
+        const original =
+          kind === "clean outer message" ? cleanFailure() : undefined;
+        const transport = transportOf(
+          async () =>
+            new Response(failingBody(original), {
+              status: 200,
+              headers: protoHeaders("application/connect+proto"),
+            }),
+        );
+        const res = await stream(transport);
+        const error: any = await (async () => {
+          try {
+            for await (const _ of res.message) {
+              // Drain until the stream error.
+            }
+          } catch (e) {
+            return e;
           }
-        } catch (e) {
-          return e;
+          return undefined;
+        })();
+        expect(error).toBeInstanceOf(ConnectError);
+        expect(chainText(error)).not.toContain(KEY);
+        expect(classifyFailure(error)).toBe(FailureClass.Interruption);
+        if (original !== undefined) {
+          expectSafeInterruption(error, original);
         }
-        return undefined;
-      })();
-      expect(error).toBeInstanceOf(ConnectError);
-      expect(chainText(error)).not.toContain(KEY);
-      expect(classifyFailure(error)).toBe(FailureClass.Interruption);
-    });
+      },
+    );
   });
 
   const credentialsAndFailures = credentials.flatMap(([name, credential]) =>

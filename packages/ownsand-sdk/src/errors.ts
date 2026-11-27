@@ -279,26 +279,22 @@ export function connectErrorFromDetail(detail: ErrorDetail): ConnectError {
  */
 function replacementCause(
   cause: unknown,
-  secrets: readonly string[],
+  redact: (text: string) => string,
 ): Error | undefined {
   if (cause === undefined || cause instanceof ConnectError) {
     return undefined;
   }
   if (cause instanceof OwnSandCredentialError) {
-    const redacted = redactError(cause, secrets) as OwnSandCredentialError;
-    return redacted === cause
-      ? new OwnSandCredentialError(cause.message)
-      : redacted;
+    return new OwnSandCredentialError(redact(cause.message));
   }
   return new Error("transport failure");
 }
 
 /**
- * Replaces every occurrence of each secret in the error message. Connect
- * errors never contain request headers, but this keeps a credential out of
- * an error even when a lower layer echoed it. A rebuilt Connect error keeps
- * its code, metadata and details and never its original cause, but it keeps
- * the classification of the original (see `replacementCause`).
+ * With a redaction secret, replaces every occurrence in the error message
+ * and discards the original cause even if the message is clean. A rebuilt
+ * Connect error keeps its code, metadata, details and failure classification
+ * (see `replacementCause`).
  */
 export function redactError(
   error: unknown,
@@ -319,9 +315,10 @@ export function redactError(
     }
     return out;
   };
+  const cause = error.cause;
   if (error instanceof ConnectError) {
     const raw = redact(error.rawMessage);
-    if (!changed) {
+    if (!changed && cause === undefined) {
       return error;
     }
     const copy = new ConnectError(
@@ -329,13 +326,13 @@ export function redactError(
       error.code,
       error.metadata,
       undefined,
-      replacementCause(error.cause, secrets),
+      replacementCause(cause, redact),
     );
     copy.details = error.details;
     return copy;
   }
   const message = redact(error.message);
-  if (!changed) {
+  if (!changed && cause === undefined) {
     return error;
   }
   // A credential error stays a credential error, so that redaction never
@@ -344,6 +341,6 @@ export function redactError(
     error instanceof OwnSandCredentialError
       ? new OwnSandCredentialError(message)
       : new OwnSandError(message);
-  copy.name = error.name;
+  copy.name = redact(error.name);
   return copy;
 }
