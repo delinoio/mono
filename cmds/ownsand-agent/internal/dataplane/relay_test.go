@@ -1886,11 +1886,31 @@ func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T)
 		t.Run(tc, func(t *testing.T) {
 			_, c := newManualConn(t, Timing{}, 4)
 			c.flushDeadline = deadline
+			var markerReceived chan bool
 			switch tc {
 			case "marker_taken_close_request_stalls":
-				// The writer dequeues the marker and then blocks in the
-				// request close; it never starts its own 2-second timer.
-				go func() { <-c.out; select {} }()
+				markerReceived = make(chan bool, 1)
+				release := make(chan struct{})
+				writerDone := make(chan struct{})
+				t.Cleanup(func() {
+					close(release)
+					select {
+					case <-writerDone:
+					case <-time.After(5 * time.Second):
+						t.Error("the simulated writer did not exit after release")
+					}
+				})
+				go func() {
+					defer close(writerDone)
+					select {
+					case frame, ok := <-c.out:
+						markerReceived <- ok && frame == nil
+					case <-release:
+						return
+					}
+					// Stall the request close until cleanup releases the writer.
+					<-release
+				}()
 			case "queue_full":
 				for i := 0; i < cap(c.out); i++ {
 					c.out <- keepaliveFrame(false)
@@ -1898,6 +1918,21 @@ func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T)
 			}
 			start := time.Now()
 			go c.closeAfterFlush()
+			if markerReceived != nil {
+				select {
+				case received := <-markerReceived:
+					if !received {
+						t.Fatal("the writer did not dequeue the nil flush marker")
+					}
+					if c.ctx.Err() != nil {
+						t.Fatal("the connection was canceled before the test observed the flush marker")
+					}
+				case <-c.ctx.Done():
+					t.Fatal("the connection was canceled before the test observed the flush marker")
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for the writer to dequeue the flush marker")
+				}
+			}
 			select {
 			case <-c.ctx.Done():
 			case <-time.After(5 * time.Second):
