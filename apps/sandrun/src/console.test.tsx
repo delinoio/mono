@@ -4542,6 +4542,7 @@ describe("failed query refreshes", () => {
       },
     };
     return {
+      underlyingTransport: mock,
       transport,
       pageTokens,
       fail(error: Error | undefined, continuationOnly = false) {
@@ -4550,6 +4551,117 @@ describe("failed query refreshes", () => {
       },
     };
   }
+
+  describe("the organization switcher", () => {
+    const path = `/orgs/${MOCK_IDS.acme}/requests`;
+    const orgListKey = createConnectQueryKey({
+      schema: OrganizationService.method.listOrganizations,
+      cardinality: undefined,
+    });
+    const combobox = { name: "Organization" };
+    const retry = { name: "Try again" };
+    const signIn = { name: "Sign in with Delino" };
+
+    async function refreshList(client: QueryClient) {
+      await act(async () => {
+        await client.refetchQueries({ queryKey: orgListKey });
+      });
+    }
+
+    test("offers retry after a first-load error", async () => {
+      const fixture = queryFixture("ListOrganizations");
+      fixture.fail(new ConnectError("offline", Code.Internal));
+      renderConsole(path, fixture);
+      const topBar = within(screen.getByRole("banner"));
+
+      expect((await topBar.findByRole("alert")).textContent).toContain(
+        "Something went wrong. Try again.",
+      );
+      expect(topBar.queryByRole("combobox", combobox)).toBeNull();
+      expect(topBar.queryByText(refreshNotice)).toBeNull();
+      await screen.findByRole("heading", { name: "Requests", level: 1 });
+
+      fixture.fail(undefined);
+      await click(topBar.getByRole("button", retry));
+      expect(await topBar.findByRole("combobox", combobox)).toBeTruthy();
+      expect(topBar.queryByRole("alert")).toBeNull();
+    });
+
+    test.each([
+      [
+        Code.NotFound,
+        "It was not found, or you no longer have access to it.",
+        retry,
+      ],
+      [Code.PermissionDenied, "You do not have permission to do this.", retry],
+      [Code.Unauthenticated, "Your session ended. Sign in again.", signIn],
+    ] as const)(
+      "closes the open switcher after %s",
+      async (code, message, action) => {
+        const fixture = queryFixture("ListOrganizations");
+        const client = renderConsole(path, fixture);
+        const topBar = within(screen.getByRole("banner"));
+        await click(await topBar.findByRole("combobox", combobox));
+        await screen.findByRole("option", { name: "Northwind Labs" });
+
+        fixture.fail(new ConnectError("list unavailable", code));
+        await refreshList(client);
+
+        expect(await topBar.findByText(message)).toBeTruthy();
+        expect(topBar.getByRole("button", action)).toBeTruthy();
+        expect(topBar.queryByText(refreshNotice)).toBeNull();
+        expect(topBar.queryByRole("combobox", combobox)).toBeNull();
+        expect(screen.queryAllByRole("option")).toHaveLength(0);
+        expect(topBar.getByRole("link", { name: "SandRun" })).toBeTruthy();
+        expect(
+          topBar.getByRole("link", { name: "Account settings" }),
+        ).toBeTruthy();
+        expect(topBar.getByRole("button", { name: "Sign out" })).toBeTruthy();
+        expect(
+          screen.getByRole("heading", { name: "Requests", level: 1 }),
+        ).toBeTruthy();
+        expect(window.location.pathname).toBe(path);
+      },
+    );
+
+    test("keeps open options after a transient error and updates them after retry", async () => {
+      const fixture = queryFixture("ListOrganizations");
+      const client = renderConsole(path, fixture);
+      const topBar = within(screen.getByRole("banner"));
+      const selector = await topBar.findByRole("combobox", combobox);
+      await click(selector);
+      const northwind = await screen.findByRole("option", {
+        name: "Northwind Labs",
+      });
+
+      fixture.fail(new ConnectError("offline", Code.Internal));
+      await refreshList(client);
+
+      expect(await topBar.findByText(refreshNotice)).toBeTruthy();
+      expect(topBar.getByRole("combobox", combobox)).toBe(selector);
+      expect(screen.getByRole("option", { name: "Northwind Labs" })).toBe(
+        northwind,
+      );
+
+      const { organization } = await createClient(
+        OrganizationService,
+        fixture.underlyingTransport,
+      ).createOrganization({ name: "Fabrikam" });
+      fixture.fail(undefined);
+      await click(topBar.getByRole("button", retry));
+      await waitFor(() => expect(topBar.queryByText(refreshNotice)).toBeNull());
+      if (selector.getAttribute("aria-expanded") !== "true")
+        await click(selector);
+      await click(await screen.findByRole("option", { name: "Fabrikam" }));
+
+      expect(window.location.pathname).toBe(
+        `/orgs/${organization!.organizationId}/requests`,
+      );
+      expect(
+        await screen.findByRole("heading", { name: "Requests", level: 1 }),
+      ).toBeTruthy();
+    });
+  });
 
   for (const [name, error] of [
     ["unavailable", new ConnectError("offline", Code.Unavailable)],
