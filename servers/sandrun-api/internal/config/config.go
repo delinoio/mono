@@ -435,6 +435,9 @@ func parseOrigin(name, value, example string) (string, error) {
 		u.ForceQuery || u.Fragment != "" || u.User != nil || strings.Contains(value, "#") {
 		return "", fmt.Errorf("%s must be an origin such as %s", name, example)
 	}
+	if err := validateURLPort(name, u); err != nil {
+		return "", err
+	}
 	return strings.TrimSuffix(value, "/"), nil
 }
 
@@ -478,6 +481,17 @@ func validateURL(name, value string) error {
 	u, err := url.Parse(value)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
 		return fmt.Errorf("%s must be an http or https URL", name)
+	}
+	return validateURLPort(name, u)
+}
+
+func validateURLPort(name string, u *url.URL) error {
+	port := u.Port()
+	if port == "" {
+		return nil
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("%s must use a port between 0 and 65535", name)
 	}
 	return nil
 }
