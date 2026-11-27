@@ -1193,7 +1193,7 @@ describe("integrations", () => {
     expect(screen.getAllByText(/Webhook secret: Set at/).length).toBe(1);
   });
 
-  test("creates a Devin integration with password credential fields", async () => {
+  test("creates a Claude Code integration with a password credential field", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`);
     await click(
       await screen.findByRole("button", { name: "Create agent integration" }),
@@ -1221,6 +1221,60 @@ describe("integrations", () => {
     await settle(80);
     expect(await screen.findByText(/claude-2/)).toBeTruthy();
     expect(document.body.textContent).not.toContain("env_key_value");
+  });
+
+  test("creates a Devin integration with two masked credentials", async () => {
+    const { transport, calls } = gatedTransport("CreateAgentIntegration");
+    const name = "devin-fixture";
+    const outpostName = "fixture-outpost";
+    const apiToken = "fixture-api-token";
+    const outpostToken = "fixture-outpost-token";
+    renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, { transport });
+    await click(
+      await screen.findByRole("button", { name: "Create agent integration" }),
+    );
+    const form = within(
+      await screen.findByRole("dialog", {
+        name: "Create an agent integration",
+      }),
+    );
+    await click(form.getByRole("combobox", { name: "Vendor" }));
+    await click(await screen.findByRole("option", { name: "Devin" }));
+
+    const apiTokenInput = form.getByLabelText<HTMLInputElement>("API token");
+    const outpostTokenInput =
+      form.getByLabelText<HTMLInputElement>("Outpost token");
+    expect(apiTokenInput.type).toBe("password");
+    expect(outpostTokenInput.type).toBe("password");
+    await type(form.getByRole("textbox", { name: "Name" }), name);
+    await type(
+      form.getByRole("textbox", { name: "Devin outpost name" }),
+      outpostName,
+    );
+    await type(apiTokenInput, apiToken);
+    await type(outpostTokenInput, outpostToken);
+    await click(form.getByRole("button", { name: "Create integration" }));
+    expect(calls).toHaveLength(1);
+    await act(async () => calls[0].settle());
+
+    const list = within(
+      await screen.findByRole("list", { name: "Agent integrations" }),
+    );
+    expect(await list.findByText(`${name} · Devin`)).toBeTruthy();
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({
+        organizationId: MOCK_IDS.acme,
+        vendor: AgentVendor.DEVIN,
+        name,
+        settings: { case: "devin", value: { outpostName } },
+        credentials: {
+          case: "devinCredentials",
+          value: { apiToken, outpostToken },
+        },
+      }),
+    ]);
+    expect(document.body.textContent).not.toContain(apiToken);
+    expect(document.body.textContent).not.toContain(outpostToken);
   });
 
   test("Connect GitHub opens the installation URL from the control plane", async () => {
