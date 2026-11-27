@@ -40,6 +40,33 @@ func writeAll(fd int, p []byte) error {
 	return nil
 }
 
+// The kernel returns ENODEV when it cannot select a transport and
+// ENETUNREACH when the selected transport cannot reach VMADDR_CID_LOCAL.
+func rawVsockLoopbackUnavailable(err error) bool {
+	return errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ENETUNREACH)
+}
+
+func TestRawVsockLoopbackUnavailable(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "connected"},
+		{name: "missing transport", err: unix.ENODEV, want: true},
+		{name: "local CID unreachable", err: unix.ENETUNREACH, want: true},
+		{name: "connection refused", err: unix.ECONNREFUSED},
+		{name: "connection timed out", err: unix.ETIMEDOUT},
+		{name: "invalid address", err: unix.EINVAL},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rawVsockLoopbackUnavailable(tt.err); got != tt.want {
+				t.Errorf("rawVsockLoopbackUnavailable(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func requireVsockLoopback(t *testing.T) {
 	t.Helper()
 	requireVsockSocket(t)
@@ -74,7 +101,7 @@ func requireVsockLoopback(t *testing.T) {
 		t.Fatalf("set raw vsock probe connect timeout: %v", err)
 	}
 	if err := unix.Connect(client, &unix.SockaddrVM{CID: unix.VMADDR_CID_LOCAL, Port: bound.Port}); err != nil {
-		if errors.Is(err, unix.ENODEV) {
+		if rawVsockLoopbackUnavailable(err) {
 			t.Skipf("raw vsock probe could not connect to VMADDR_CID_LOCAL, local transport unavailable: %v", err)
 		}
 		t.Fatalf("raw vsock probe connect to VMADDR_CID_LOCAL: %v", err)
