@@ -1,0 +1,44 @@
+{
+  "gid": "inv-21-delidev-macos-cef-notices",
+  "commit": "932e8b9d83bc671c0df0ea7db82d0e8a1a935965",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "932e8b9d83bc671c0df0ea7db82d0e8a1a935965",
+    "setup": "Use a clean checkout with the worker commit and the Node.js version from .nvmrc. Use macOS with Xcode tools, CMake, Ninja, jq, and a native Rust toolchain. Run commands in one Bash session from the checkout root. Copy the probe to files.copyTo after creating that directory. The script runs unsigned local packaging with a fresh Cargo target and uses the existing CEF cache without changing its notice files.",
+    "commands": [
+      "git rev-parse HEAD",
+      "mkdir -p .t3-tmp/validation",
+      "export TMPDIR=\"$PWD/.t3-tmp\"",
+      "pnpm install --frozen-lockfile",
+      "node --test apps/delidev/tauri.test.mjs",
+      "bash -n .t3-tmp/validation/macos-packaging.sh",
+      "set -o pipefail; bash .t3-tmp/validation/macos-packaging.sh 2>&1 | tee .t3-tmp/validation/macos-packaging.log"
+    ],
+    "packagingCommands": [
+      "pnpm --filter delidev tauri build --bundles app --no-sign",
+      "pnpm --filter delidev tauri bundle --bundles dmg --no-sign"
+    ],
+    "expectedResults": [
+      "Record the actual checkout SHA. The original worker commit is 932e8b9d83bc671c0df0ea7db82d0e8a1a935965.",
+      "All four macOS wrapper scenarios pass. The Linux-only wrapper scenarios skip on macOS.",
+      "The app-only build and the app in the mounted DMG contain the embedded framework and both notices at Contents/Resources/cef. Each notice matches its original bytes.",
+      "A direct CEF_PATH with unpacked notices packages both files. The custom resource is present and the custom hook runs after staging in its configured cwd.",
+      "A corrupt archive, a missing archive, and missing credits each cause a nonzero exit with the relevant input in the diagnostic. The caller hook does not run and no new app is produced.",
+      "Shared CEF packaging succeeds with the notices removed from its CEF_PATH. The custom resource and hook work. The app omits the framework and CEF notices. Temporary notice staging is empty after the checks."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-21-delidev-macos-cef-notices/worker/.t3-tmp/validation/macos-packaging.sh",
+      "copyTo": ".t3-tmp/validation/macos-packaging.sh",
+      "regressionTest": "apps/delidev/tauri.test.mjs",
+      "outputLogs": [
+        ".t3-tmp/validation/macos-packaging.log",
+        ".t3-tmp/macos-cef-run.*/corrupt-archive.log",
+        ".t3-tmp/macos-cef-run.*/missing-archive.log",
+        ".t3-tmp/macos-cef-run.*/missing-credits.log"
+      ]
+    }
+  }
+}
