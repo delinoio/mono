@@ -290,14 +290,15 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitBinding := holdTx(t, w.env, "SELECT pg_advisory_xact_lock(42)")
+	binding := holdTx(t, w.env, "SELECT pg_advisory_xact_lock(42)")
 	const sid = "ses-dispatch-wins"
 	w.devin.AddSession(sid, true)
 	req := w.requestBySource(t, sid)
 	id := req.GetRequestId()
-	waitForLockWaiter(t, w.env)
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: binding.pid,
+		query: "UPDATE requests SET state = $2, runner_id = $3, update_time = $4"})
 	// Keep the claim change uncommitted until the fake guest starts.
-	commitClaim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
+	claim := holdTx(t, w.env, "SELECT 1 FROM agent_claims WHERE request_id = $1 FOR UPDATE", id)
 	// Use a separate connection to observe the locks. The two fixture
 	// transactions, dispatch and claim loss can fill the default pool.
 	observer, err := pgx.ConnectConfig(ctx, w.env.DB.Pool.Config().ConnConfig)
@@ -316,9 +317,9 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 		}
 		return waiting
 	})
-	commitBinding()
+	binding.commit()
 	w.waitRunner(t, warm.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)
-	commitClaim()
+	claim.commit()
 	eventually(t, "the lost claim is released locally", func() bool {
 		claim, err := w.l.Agents.Claim(ctx, id)
 		return err == nil && claim.State == agent.ClaimReleased
@@ -375,12 +376,12 @@ func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
 			w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 			warm := w.warmRunner(t)
 			// Dispatch selects the warm runner and waits for its lock.
-			resumeDispatch := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
+			dispatch := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
 			const sid = "ses-loss-wins"
 			w.devin.AddSession(sid, true)
 			req := w.requestBySource(t, sid)
 			id := req.GetRequestId()
-			waitForLockWaiter(t, w.env)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: dispatch.pid, query: "FROM runners WHERE runner_id = $1 FOR UPDATE"})
 			w.assertClaim(t, id, agent.ClaimHeld)
 
 			tc.lost(w.devin, sid)
@@ -389,7 +390,7 @@ func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
 				t.Fatalf("unexpected cancellation: %v", canceled)
 			}
 			w.assertClaim(t, id, agent.ClaimReleased)
-			resumeDispatch()
+			dispatch.commit()
 
 			tc.lost(w.devin, sid)
 			stays(t, "the canceled request and the unassigned warm runner", func() bool {

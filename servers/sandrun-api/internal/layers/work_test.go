@@ -695,7 +695,7 @@ func TestDeleteRunnerUsesLockedState(t *testing.T) {
 	if _, err := w.env.DB.Pool.Exec(ctx, updateState, runnerID, int16(sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)); err != nil {
 		t.Fatal(err)
 	}
-	commit := holdTx(t, w.env, updateState, runnerID, int16(sandrunv1.RunnerState_RUNNER_STATE_BUSY))
+	holder := holdTx(t, w.env, updateState, runnerID, int16(sandrunv1.RunnerState_RUNNER_STATE_BUSY))
 	type deleteResult struct {
 		response *connect.Response[sandrunv1.DeleteRunnerResponse]
 		err      error
@@ -705,8 +705,9 @@ func TestDeleteRunnerUsesLockedState(t *testing.T) {
 		response, err := admin.Work.DeleteRunner(ctx, connect.NewRequest(deleteRequest))
 		result <- deleteResult{response, err}
 	}()
-	waitForLockWaiter(t, w.env)
-	commit()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE"})
+	holder.commit()
 	first := <-result
 	if first.err != nil || first.response.Msg.GetRunner().GetState() != sandrunv1.RunnerState_RUNNER_STATE_DELETING ||
 		first.response.Msg.GetRunner().GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {

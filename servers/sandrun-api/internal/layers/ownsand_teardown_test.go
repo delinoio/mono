@@ -146,12 +146,13 @@ func TestOwnSandTeardownContention(t *testing.T) {
 			waitCleanup(ctx)
 
 			queued := w.createSession(t, w.env.User(w.org.Member), profileID)
-			commit := holdTx(t, w.env, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", w.org.ID)
+			const query = "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE"
+			holder := holdTx(t, w.env, query, w.org.ID)
 			releaseCleanup()
-			waitForLockWaiter(t, w.env)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, query: query})
 			cancel()
 			wantCode(t, "canceled teardown", <-result, connect.CodeCanceled)
-			commit()
+			holder.commit()
 			eventually(t, "claim released by canceled request", func() bool {
 				id, removing := teardownLink(t, w)
 				return id == originalID && !removing
