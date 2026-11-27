@@ -1,0 +1,59 @@
+{
+  "gid": "inv-02-macos-case-file-to-directory-retry",
+  "commit": "508191c61b7ac82372d79c5a781a37484301c60d",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "508191c61b7ac82372d79c5a781a37484301c60d",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "setup": "Copy the standalone probe to the specified location in the exact worker commit checkout. Run the commands in order in one Bash session from the repository root. The commands mount disposable case-insensitive APFS and case-sensitive HFSX volumes under the checkout. Each standalone probe asserts that its volume has the requested case behavior. The exit trap detaches both volumes.",
+    "setupReference": "https://man.freebsd.org/cgi/man.cgi?apropos=0&manpath=macOS+26.7&query=hdiutil&sektion=1",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"508191c61b7ac82372d79c5a781a37484301c60d\"",
+      "test \"$(go env GOOS)\" = darwin",
+      "git rev-parse HEAD",
+      "go env GOOS GOARCH",
+      "sw_vers",
+      "validation=\"$PWD/.t3-tmp/validation\"",
+      "mkdir -p \"$validation\"",
+      "test -f \"$validation/sync-retry-probe.go\"",
+      "volumes=\"$(mktemp -d \"$validation/volumes.XXXXXX\")\"",
+      "mkdir \"$volumes/case-insensitive\" \"$volumes/case-sensitive\"",
+      "detach_volumes() { hdiutil detach \"$volumes/case-sensitive\" >/dev/null 2>&1 || true; hdiutil detach \"$volumes/case-insensitive\" >/dev/null 2>&1 || true; }",
+      "trap detach_volumes EXIT",
+      "hdiutil create -quiet -size 1g -fs APFS -type SPARSE -volname \"SandRun CI Sync\" \"$volumes/case-insensitive.sparseimage\"",
+      "hdiutil create -quiet -size 1g -fs HFSX -type SPARSE -volname \"SandRun CS Sync\" \"$volumes/case-sensitive.sparseimage\"",
+      "hdiutil attach -quiet -nobrowse -mountpoint \"$volumes/case-insensitive\" \"$volumes/case-insensitive.sparseimage\"",
+      "hdiutil attach -quiet -nobrowse -mountpoint \"$volumes/case-sensitive\" \"$volumes/case-sensitive.sparseimage\"",
+      "for mode in case-insensitive case-sensitive; do diskutil info \"$volumes/$mode\" | tee \"$validation/macos-$mode-volume.log\"; TMPDIR=\"$volumes/$mode\" GOTMPDIR=\"$volumes/$mode\" go run \"$validation/sync-retry-probe.go\" \"$mode\" 2>&1 | tee \"$validation/macos-$mode-probe.log\"; TMPDIR=\"$volumes/$mode\" GOTMPDIR=\"$volumes/$mode\" go test -count=1 -v ./go/sandrun -run 'TestSyncRetryFileToDirectory|TestSyncCaseOnlyReplacement|TestSplitSyncDeletions|TestPruneDirs|TestPOSIXSyncCleanup|TestSyncLockAcquisitionStreamLoss' 2>&1 | tee \"$validation/macos-$mode-focused.log\"; done"
+    ],
+    "expectedResults": [
+      "The checkout reports darwin/arm64. The case-insensitive probe reports distinct: false, applies the regular-file replacement, receives the injected manifest write error, and finishes a normal retry with one upload and one deletion. It verifies the restored child bytes, preserved sentinel, newly published manifest and lock and temporary-input removal.",
+      "The case-sensitive probe reports distinct: true. The distinct old directory causes a strict deletion error. It verifies that the intended child keeps the guest edit, the earlier manifest remains, the old sentinel survives and cleanup runs. After the probe removes the disposable blocker, normal retry restores the child and publishes the new manifest.",
+      "The focused tests pass on both volumes. TestSyncRetryFileToDirectoryCaseOnly/directory_link removes the link while preserving its target. The exact-spelling retry, ordinary strict deletion, reverse transition, binary list handling and cleanup tests pass. Record both filesystem modes and retain the six log files."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-macos-case-file-to-directory-retry/worker/.t3-tmp/validation/sync-retry-probe.go",
+      "copyTo": ".t3-tmp/validation/sync-retry-probe.go",
+      "regressionTests": [
+        "go/sandrun/sync_case_test.go",
+        "go/sandrun/sync_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/validation/macos-case-insensitive-volume.log",
+        ".t3-tmp/validation/macos-case-insensitive-probe.log",
+        ".t3-tmp/validation/macos-case-insensitive-focused.log",
+        ".t3-tmp/validation/macos-case-sensitive-volume.log",
+        ".t3-tmp/validation/macos-case-sensitive-probe.log",
+        ".t3-tmp/validation/macos-case-sensitive-focused.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-macos-case-file-to-directory-retry/worker/.t3-tmp/validation/sandrun-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-macos-case-file-to-directory-retry/worker/.t3-tmp/validation/sandrun-darwin-arm64",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-macos-case-file-to-directory-retry/worker/.t3-tmp/validation/sandrun-windows-amd64.test.exe"
+      ]
+    }
+  }
+}
