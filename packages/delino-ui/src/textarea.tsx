@@ -8,7 +8,7 @@ import {
 import { Textarea as TextareaPart } from "@ui-sdk/react/textarea";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./dialog-context.ts";
+import { useForwardedAutoFocus } from "./panel-autofocus.ts";
 
 export type TextareaProps = React.ComponentProps<typeof TextareaPart> & {
   /** The visible name of the field. */
@@ -16,9 +16,8 @@ export type TextareaProps = React.ComponentProps<typeof TextareaPart> & {
   /** Help text shown below the textarea. */
   description?: React.ReactNode;
   /**
-   * An error message to show. A non-empty message marks the field as
-   * invalid. Without one, the field shows the browser's message after a
-   * failed submit.
+   * A non-empty error message marks an enabled field as invalid. Without
+   * one, an enabled field shows the browser's message after a failed submit.
    */
   error?: React.ReactNode;
 };
@@ -51,7 +50,7 @@ export function Textarea({
     <Field
       className="dui-text-field"
       disabled={disabled}
-      invalid={hasError ? true : undefined}
+      invalid={hasError && !disabled ? true : undefined}
     >
       <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
       {/*

@@ -9,6 +9,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import {
   AlertDialog,
@@ -31,6 +32,13 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "./dialog.tsx";
+import {
+  Drawer,
+  DrawerClose,
+  DrawerContent,
+  DrawerTitle,
+  DrawerTrigger,
+} from "./drawer.tsx";
 import { NumberInput } from "./number-input.tsx";
 import { PasswordInput } from "./password-input.tsx";
 import { Progress } from "./progress.tsx";
@@ -834,6 +842,231 @@ describe("autoFocus inside Dialog", () => {
   });
 });
 
+describe("panel autofocus boundaries", () => {
+  const fields = [TextField, Textarea, NumberInput, PasswordInput];
+  const panels = [
+    {
+      Root: Dialog,
+      Content: DialogContent,
+      Title: DialogTitle,
+      Close: DialogClose,
+      Trigger: DialogTrigger,
+      role: "dialog",
+    },
+    {
+      Root: AlertDialog,
+      Content: AlertDialogContent,
+      Title: AlertDialogTitle,
+      Close: AlertDialogClose,
+      Trigger: AlertDialogTrigger,
+      role: "alertdialog",
+    },
+    {
+      Root: Drawer,
+      Content: DrawerContent,
+      Title: DrawerTitle,
+      Close: DrawerClose,
+      Trigger: DrawerTrigger,
+      role: "dialog",
+    },
+  ] as const;
+
+  function PanelFixture({
+    panel: { Root, Content, Title, Close, Trigger },
+    children,
+    useTrigger = false,
+    explicitFocus = false,
+  }: {
+    panel: (typeof panels)[number];
+    children: React.ReactNode;
+    useTrigger?: boolean;
+    explicitFocus?: boolean;
+  }) {
+    const [open, setOpen] = React.useState(false);
+    const cancelRef = React.useRef<HTMLButtonElement>(null);
+    const returnRef = React.useRef<HTMLButtonElement>(null);
+    return (
+      <>
+        {useTrigger ? null : (
+          <button type="button" onClick={() => setOpen(true)}>
+            Open
+          </button>
+        )}
+        <button type="button" ref={returnRef}>
+          Return here
+        </button>
+        <Root {...(useTrigger ? {} : { open, onOpenChange: setOpen })}>
+          {useTrigger ? <Trigger>Open</Trigger> : null}
+          <Content
+            initialFocus={explicitFocus ? () => cancelRef.current : undefined}
+            finalFocus={explicitFocus ? () => returnRef.current : undefined}
+          >
+            <Title>Rename</Title>
+            <Close ref={cancelRef}>Cancel</Close>
+            {children}
+          </Content>
+        </Root>
+      </>
+    );
+  }
+
+  async function openPanel() {
+    const opener = screen.getByRole("button", { name: "Open" });
+    await act(async () => {
+      opener.focus();
+      fireEvent.click(opener);
+    });
+    return opener;
+  }
+
+  async function closePanel(dismissal: "Escape" | "Cancel") {
+    await act(async () => {
+      if (dismissal === "Escape") {
+        fireEvent.keyDown(document.activeElement as Element, { key: "Escape" });
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      }
+    });
+  }
+
+  for (const Field of fields) {
+    for (const autoFocus of [true, undefined]) {
+      test(`mounts ${Field.name} beside a closed Dialog with autoFocus=${autoFocus}`, () => {
+        render(
+          <Dialog>
+            <form>
+              <Field label="Outside" autoFocus={autoFocus} />
+            </form>
+            <DialogTrigger>Open</DialogTrigger>
+            <DialogContent>
+              <DialogTitle>Rename</DialogTitle>
+            </DialogContent>
+          </Dialog>,
+        );
+
+        const field = screen.getByLabelText("Outside");
+        expect(document.activeElement === field).toBe(autoFocus === true);
+        expect(screen.queryByRole("dialog")).toBeNull();
+      });
+    }
+  }
+
+  for (const panel of panels) {
+    describe(panel.Root.name, () => {
+      for (const Field of fields) {
+        for (const dismissal of ["Escape", "Cancel"] as const) {
+          test(`focuses ${Field.name} and restores the controlled opener after ${dismissal}`, async () => {
+            render(
+              <PanelFixture panel={panel}>
+                <Field label="Inside" autoFocus />
+              </PanelFixture>,
+            );
+            const opener = await openPanel();
+            await waitFor(() => {
+              expect(document.activeElement).toBe(
+                screen.getByLabelText("Inside"),
+              );
+            });
+
+            await closePanel(dismissal);
+
+            await waitFor(() => {
+              expect(screen.queryByRole(panel.role)).toBeNull();
+              expect(document.activeElement).toBe(opener);
+            });
+          });
+        }
+      }
+
+      test("restores focus to the SDK trigger", async () => {
+        render(
+          <PanelFixture panel={panel} useTrigger>
+            <TextField label="Inside" autoFocus />
+          </PanelFixture>,
+        );
+        const opener = await openPanel();
+        await waitFor(() => {
+          expect(document.activeElement).toBe(screen.getByLabelText("Inside"));
+        });
+
+        await closePanel("Escape");
+        await waitFor(() => expect(document.activeElement).toBe(opener));
+      });
+
+      test("honors explicit initial and final focus", async () => {
+        render(
+          <PanelFixture panel={panel} explicitFocus>
+            <TextField label="Inside" autoFocus />
+          </PanelFixture>,
+        );
+        const returnTarget = screen.getByRole("button", {
+          name: "Return here",
+        });
+        await openPanel();
+        await waitFor(() => {
+          expect(document.activeElement).toBe(
+            screen.getByRole("button", { name: "Cancel" }),
+          );
+        });
+
+        await closePanel("Escape");
+        await waitFor(() => expect(document.activeElement).toBe(returnTarget));
+      });
+    });
+  }
+
+  test("focuses Cancel when the AlertDialog field is unmarked", async () => {
+    render(
+      <PanelFixture panel={panels[1]}>
+        <TextField label="Inside" />
+      </PanelFixture>,
+    );
+    await openPanel();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Cancel" }),
+      );
+    });
+  });
+
+  test("defers autofocus for fields created by a custom content render", async () => {
+    function CustomDialog() {
+      const [open, setOpen] = React.useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>
+            Open
+          </button>
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogContent
+              render={({ children, ...props }) => (
+                <section {...props}>
+                  {children}
+                  <TextField label="Inside" autoFocus />
+                </section>
+              )}
+            >
+              <DialogTitle>Rename</DialogTitle>
+              <DialogClose>Cancel</DialogClose>
+            </DialogContent>
+          </Dialog>
+        </>
+      );
+    }
+
+    render(<CustomDialog />);
+    const opener = await openPanel();
+    const dialog = await screen.findByRole("dialog", { name: "Rename" });
+    expect(dialog.tagName).toBe("SECTION");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByLabelText("Inside"));
+    });
+
+    await closePanel("Escape");
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+});
+
 describe("Checkbox", () => {
   test("toggles when its label is pressed", () => {
     const changes: unknown[] = [];
@@ -1307,6 +1540,56 @@ describe("Select", () => {
       expect(trigger.textContent).toBe("Twelve");
     });
 
+    test("uses a nonempty explicit label in the trigger and list", async () => {
+      const option = (
+        <SelectOption value="option-id" label="Twelve">
+          Dozen
+        </SelectOption>
+      );
+      const markup = document.createElement("div");
+      markup.innerHTML = renderToStaticMarkup(
+        <Select label="Quantity" defaultValue="option-id">
+          {option}
+        </Select>,
+      );
+      expect(markup.querySelector(".dui-select-value")?.textContent).toBe(
+        "Twelve",
+      );
+      const values: (string | null)[] = [];
+      render(
+        <Select label="Quantity" onValueChange={(value) => values.push(value)}>
+          {option}
+        </Select>,
+      );
+      const trigger = screen.getByRole("combobox", { name: "Quantity" });
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      const row = screen.getByRole("option", { name: "Twelve" });
+      expect(row.textContent).toBe("Twelve");
+      await act(async () => {
+        fireEvent.click(row);
+      });
+      expect(trigger.textContent).toBe("Twelve");
+      expect(values).toEqual(["option-id"]);
+    });
+
+    test("keeps the row's child text for an empty explicit label", async () => {
+      render(
+        <Select label="Quantity">
+          <SelectOption value="option-id" label="">
+            Dozen
+          </SelectOption>
+        </Select>,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("combobox", { name: "Quantity" }));
+      });
+      expect(screen.getByRole("option", { name: "Dozen" }).textContent).toBe(
+        "Dozen",
+      );
+    });
+
     test("reads the text of nested elements and numbers", () => {
       const slot = 2;
       render(
@@ -1331,18 +1614,60 @@ describe("Select", () => {
       ).toContain("Slot 2");
     });
 
-    test("keeps showing the value for an option without text", () => {
-      render(
-        <Select label="Empty" defaultValue="raw-value">
-          <SelectOption value="raw-value">
-            {null}
-            {false}
-          </SelectOption>
-        </Select>,
+    test.each([
+      { name: "an empty string", children: "" },
+      { name: "whitespace", children: "  " },
+      { name: "nested whitespace", children: <span>{"  "}</span> },
+      { name: "textless children", children: [null, false] },
+    ])("shows the option value for $name", async ({ children }) => {
+      const option = <SelectOption value="raw-value">{children}</SelectOption>;
+      const preselected = (
+        <Select label="Preselected" defaultValue="raw-value">
+          {option}
+        </Select>
       );
-      expect(
-        screen.getByRole("combobox", { name: "Empty" }).textContent,
-      ).toContain("raw-value");
+      const markup = document.createElement("div");
+      markup.innerHTML = renderToStaticMarkup(preselected);
+      expect(markup.querySelector(".dui-select-value")?.textContent).toBe(
+        "raw-value",
+      );
+
+      const values: (string | null)[] = [];
+      render(
+        <>
+          {preselected}
+          <Select label="Empty" onValueChange={(value) => values.push(value)}>
+            {option}
+          </Select>
+        </>,
+      );
+      const preselectedTrigger = screen.getByRole("combobox", {
+        name: "Preselected",
+      });
+      expect(preselectedTrigger.textContent).toBe("raw-value");
+      await act(async () => {
+        fireEvent.click(preselectedTrigger);
+      });
+      const preselectedRow = screen.getByRole("option", { name: "raw-value" });
+      expect(preselectedRow.textContent).toBe("raw-value");
+      expect(preselectedRow.getAttribute("aria-selected")).toBe("true");
+      await act(async () => {
+        fireEvent.keyDown(document.activeElement as Element, { key: "Escape" });
+      });
+      expect(preselectedTrigger.getAttribute("aria-expanded")).toBe("false");
+      expect(preselectedTrigger.textContent).toBe("raw-value");
+
+      const trigger = screen.getByRole("combobox", { name: "Empty" });
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      const row = screen.getByRole("option", { name: "raw-value" });
+      expect(row.textContent).toBe("raw-value");
+      await act(async () => {
+        fireEvent.click(row);
+      });
+      expect(trigger.textContent).toBe("raw-value");
+      expect(values).toEqual(["raw-value"]);
     });
   });
 
@@ -1488,6 +1813,13 @@ describe("Tabs", () => {
 });
 
 describe("Tooltip", () => {
+  // happy-dom does not compute layout. Check the authored wrapping rule.
+  test("allows long unbroken text to wrap inside the tooltip width", () => {
+    const tooltip = block(".dui-tooltip");
+    expect(tooltip).toContain("max-width: 280px");
+    expect(tooltip).toContain("overflow-wrap: anywhere");
+  });
+
   test("describes its trigger with hidden content", () => {
     render(
       <Tooltip>
@@ -1567,6 +1899,29 @@ function contrast(first: string, second: string): number {
   );
   return (high! + 0.05) / (low! + 0.05);
 }
+
+describe("SegmentedControl selection contrast", () => {
+  test("contrasts the inset stroke with the indicator and track in both schemes", () => {
+    const indicator = block(".dui-segmented-control-indicator");
+    expect(indicator).toContain(
+      "inset 0 0 0 2px var(--dui-color-accent-graphic)",
+    );
+    expect(indicator).toContain("background: var(--dui-color-surface);");
+    expect(block(".dui-segmented-control")).toContain(
+      "background: var(--dui-color-neutral);",
+    );
+
+    const light = [block(":root")];
+    const dark = [...light, ...darkRule(":root")];
+    for (const scheme of [light, dark]) {
+      const stroke = property(scheme, "--dui-color-accent-graphic")!;
+      const fill = property(scheme, "--dui-color-surface")!;
+      const track = property(scheme, "--dui-color-neutral")!;
+      expect(contrast(stroke, fill)).toBeGreaterThanOrEqual(3);
+      expect(contrast(stroke, track)).toBeGreaterThanOrEqual(3);
+    }
+  });
+});
 
 test("keeps the pressed Toggle stroke at 3:1 on both surfaces in both schemes", () => {
   const pressed = block(".dui-toggle[data-pressed]");
