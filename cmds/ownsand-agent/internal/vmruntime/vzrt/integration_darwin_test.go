@@ -404,10 +404,8 @@ func TestVirtualizationIntegration(t *testing.T) {
 		t.Fatalf("exec output %q exited %q", out, ex)
 	}
 	t.Logf("guest: %s", strings.TrimSpace(out))
-	// The root file system grew to the 2 GiB disk at boot.
-	fields := strings.Fields(strings.Split(out, "\n")[2])
-	if len(fields) < 2 || len(fields[1]) < 7 {
-		t.Fatalf("root file system did not grow: %q", out)
+	if err := checkLinuxRootfsGrowth(out); err != nil {
+		t.Fatal(err)
 	}
 	// A NONE sandbox has no network device.
 	if strings.Contains(out, "eth0") {
