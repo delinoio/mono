@@ -639,6 +639,7 @@ func TestTCPFlowLimit(t *testing.T) {
 	}
 	defer b.Close()
 	hostA := <-accepted
+	t.Cleanup(func() { hostA.Close() })
 
 	cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
 	if c, err := g.dial(cctx, "203.0.113.10:80"); err == nil {
@@ -656,9 +657,11 @@ func TestTCPFlowLimit(t *testing.T) {
 	// The guest closes A; the host side sees the end, and once the silent
 	// remote side idles out, the slot returns.
 	a.Close()
-	_ = hostA.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := hostA.Read(make([]byte, 1)); err == nil {
-		t.Fatal("the host socket of the closed guest connection stayed open for reads")
+	if err := hostA.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set host socket read deadline: %v", err)
+	}
+	if n, err := hostA.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("read from host socket: got %d bytes and error %v, want 0 bytes and EOF", n, err)
 	}
 	waitFor(t, "the TCP slot of the closed connection", func() bool { return n.limiter.inUse(TransportTCP) == 1 })
 	d, err := g.dial(ctx, "203.0.113.10:80")
