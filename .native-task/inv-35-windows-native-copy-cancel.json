@@ -1,0 +1,43 @@
+{
+  "gid": "inv-35-windows-native-copy-cancel",
+  "commit": "2c0bf91e262b1d8484fee9d2e9f35fa397d02807",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "2c0bf91e262b1d8484fee9d2e9f35fa397d02807",
+    "setup": "Use non-elevated PowerShell at the worker commit in a writable local NTFS checkout. Run command 1 from the checkout root, copy files.copyFrom to files.copyTo, then run commands 2 and 3 in the same checkout.",
+    "commands": [
+      "New-Item -ItemType Directory -Path '.t3-tmp/native-copy-cancel' -Force | Out-Null",
+      "if ((Get-FileHash -Algorithm SHA256 -LiteralPath '.t3-tmp/native-copy-cancel/validate-copy-cancellation.ps1').Hash.ToLowerInvariant() -ne '03a742105b7dbf07155aa5da372d10d1ee2da726c229702cb29529d4f03a4751') { throw 'Unexpected native validation script checksum.' }",
+      "& './.t3-tmp/native-copy-cancel/validate-copy-cancellation.ps1' -ExpectedSha '2c0bf91e262b1d8484fee9d2e9f35fa397d02807'"
+    ],
+    "expectedResults": [
+      "The script runs go test '-v' '-count=10' '-timeout=2m' '-run' '^TestCopyFileEndsWithItsContext$' ./cmds/ownsand-agent/internal/vmruntime/hcsrt. All 10 repetitions pass the live, already_canceled and in_flight subtests without a skip.",
+      "The positive log contains 10 strictly partial reports from CopyFileExW at 0 < transferred < total, with a live context, pbCancel set by the watcher, a context.Canceled result and an absent destination.",
+      "The script creates a test-only overlay that cancels before the copy and verifies that the destination is absent. It runs go test '-v' '-count=1' '-timeout=2m' \"-overlay=$overlayPath\" '-run' '^TestCopyFileEndsWithItsContext$/^in_flight$' ./cmds/ownsand-agent/internal/vmruntime/hcsrt. This control must exit 1 with the progress assertion showing 0 of 0 and context canceled. The validation script itself succeeds.",
+      "After authorized PR publication, verify that the automatically triggered Go on Windows job passes. The job runs this package with the rest of the Go module."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-native-copy-cancel/worker/.t3-tmp/native-copy-cancel/validate-copy-cancellation.ps1",
+      "copyTo": ".t3-tmp/native-copy-cancel/validate-copy-cancellation.ps1",
+      "sha256": "03a742105b7dbf07155aa5da372d10d1ee2da726c229702cb29529d4f03a4751",
+      "sources": [
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/runtime_windows.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/runtime_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/native-copy-cancel/native-positive.log",
+        ".t3-tmp/native-copy-cancel/native-pre-entry-control.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-native-copy-cancel/worker/.t3-tmp/native-copy-cancel/hcsrt-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-native-copy-cancel/worker/.t3-tmp/native-copy-cancel/hcsrt-windows-arm64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-native-copy-cancel/worker/.t3-tmp/native-copy-cancel/hcsrt-windows-pre-entry-control.test.exe"
+      ]
+    },
+    "requiredElevationScenarios": [],
+    "privilegeNotes": "The native fixture uses ordinary files. It needs no symlinks, service control, state-directory ACL setup, guest image, or Hyper-V."
+  }
+}
