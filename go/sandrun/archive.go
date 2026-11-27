@@ -197,12 +197,18 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
 				return st, err
 			}
+			key := foldCase(name)
+			names := fileNames[key]
+			if err := checkArchiveCaseCollision(root, name, hdr.Name, names); err != nil {
+				return st, err
+			}
 			_ = root.Remove(name)
 			if err := e.link(root, target, name); err != nil {
 				if err := e.copyFile(root, st, target, name); err != nil {
 					return st, err
 				}
 			}
+			fileNames[key] = rememberArchiveFileName(names, name, hdr.Name)
 			regular[name] = true
 			st.files++
 		default:

@@ -112,11 +112,11 @@ type Server struct {
 	// replyFailures fail a call after it took effect: a lost response.
 	replyFailures map[string]error
 	gates         map[string]*Gate
+	linkReplyGate *Gate
 	calls         map[string]int
 }
 
-// Gate holds the calls of one method before they take effect, until
-// Release. Tests use it to keep a call in flight while other operations run.
+// Gate holds calls of one method until Release.
 type Gate struct {
 	method string
 	// Entered receives one value when a held call reaches the gate and can
@@ -128,6 +128,22 @@ type Gate struct {
 
 // Release lets the held calls, and every later call, continue.
 func (g *Gate) Release() { g.once.Do(func() { close(g.release) }) }
+
+func (g *Gate) wait() {
+	if g == nil {
+		return
+	}
+	select {
+	case <-g.release:
+		return
+	default:
+	}
+	select {
+	case <-g.release:
+	case g.Entered <- struct{}{}:
+		<-g.release
+	}
+}
 
 // New starts a fake. now is its clock; nil selects time.Now.
 func New(t testing.TB, now func() time.Time) *Server {
@@ -289,6 +305,16 @@ func (f *Server) Hold(method string) *Gate {
 	return g
 }
 
+// HoldLinkReply holds successful LinkOrganization responses after the link
+// takes effect and the response status is captured.
+func (f *Server) HoldLinkReply() *Gate {
+	g := &Gate{method: MethodLinkOrganization, Entered: make(chan struct{}, 16), release: make(chan struct{})}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.linkReplyGate = g
+	return g
+}
+
 // Calls returns the number of calls of method, failed calls included.
 func (f *Server) Calls(method string) int {
 	f.mu.Lock()
@@ -325,18 +351,7 @@ func (f *Server) begin(method string) error {
 	err := f.failures[method]
 	g := f.gates[method]
 	f.mu.Unlock()
-	if g != nil {
-		select {
-		case <-g.release:
-			return err
-		default:
-		}
-		select {
-		case <-g.release:
-		case g.Entered <- struct{}{}:
-			<-g.release
-		}
-	}
+	g.wait()
 	return err
 }
 
@@ -447,24 +462,32 @@ func (h handler) LinkOrganization(_ context.Context, req *connect.Request[accoun
 	if err := f.begin(MethodLinkOrganization); err != nil {
 		return nil, err
 	}
-	m := req.Msg
+	resp, gate, err := f.linkOrganization(req.Msg)
+	if err != nil {
+		return nil, err
+	}
+	gate.wait()
+	return connect.NewResponse(resp), nil
+}
+
+func (f *Server) linkOrganization(m *accountsv1.LinkOrganizationRequest) (*accountsv1.LinkOrganizationResponse, *Gate, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	a, ok := f.accounts[m.GetBillingAccountId()]
 	if !ok {
-		return nil, connect.NewError(connect.CodeNotFound, errors.New("billing account not found"))
+		return nil, nil, connect.NewError(connect.CodeNotFound, errors.New("billing account not found"))
 	}
 	role, member := a.members[m.GetUserId()]
 	if !member {
-		return nil, connect.NewError(connect.CodeNotFound, errors.New("billing account not found"))
+		return nil, nil, connect.NewError(connect.CodeNotFound, errors.New("billing account not found"))
 	}
 	if role != accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER && role != accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN {
-		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("the user must be owner or admin of the billing account"))
+		return nil, nil, connect.NewError(connect.CodePermissionDenied, errors.New("the user must be owner or admin of the billing account"))
 	}
 	org := m.GetOrganizationId()
 	if l, ok := f.links[org]; ok {
 		if l.account != a.id {
-			return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the organization is linked to another billing account"))
+			return nil, nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the organization is linked to another billing account"))
 		}
 		l.name = m.GetOrganizationName()
 	} else {
@@ -474,10 +497,10 @@ func (h handler) LinkOrganization(_ context.Context, req *connect.Request[accoun
 		f.refreshLocked(org)
 	}
 	if err := f.replyFailures[MethodLinkOrganization]; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return connect.NewResponse(&accountsv1.LinkOrganizationResponse{Status: proto.Clone(f.links[org].status).(*accountsv1.OrganizationBillingStatus),
-		BillingAccountName: a.name}), nil
+	return &accountsv1.LinkOrganizationResponse{Status: proto.Clone(f.links[org].status).(*accountsv1.OrganizationBillingStatus),
+		BillingAccountName: a.name}, f.linkReplyGate, nil
 }
 
 func (h handler) UnlinkOrganization(_ context.Context, req *connect.Request[accountsv1.UnlinkOrganizationRequest]) (*connect.Response[accountsv1.UnlinkOrganizationResponse], error) {

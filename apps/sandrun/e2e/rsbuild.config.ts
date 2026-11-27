@@ -7,7 +7,7 @@ export default mergeRsbuildConfig(consoleConfig, {
   resolve: {
     alias: {
       "./mock/mock-api.ts$": fileURLToPath(
-        new URL("./invitation-mock.ts", import.meta.url),
+        new URL("./credential-mock.ts", import.meta.url),
       ),
     },
   },

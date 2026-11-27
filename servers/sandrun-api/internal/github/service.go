@@ -336,9 +336,10 @@ func (h *Handler) UpdateGitHubInstallation(ctx context.Context, req *connect.Req
 }
 
 // UnlinkGitHubInstallation removes the GitHub registrations of idle runners
-// while holding the installation lock. It then deletes the link, ends open
-// requests and schedules sandbox deletion in the same transaction. A runner
-// whose removal GitHub refused stays so it can finish its job.
+// while holding the installation lock. Each confirmed removal commits with
+// the runner's retirement. A final transaction deletes the link, ends open
+// requests and retires the remaining idle runners. A runner whose removal
+// GitHub refused stays so it can finish its job.
 func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Request[sandrunv1.UnlinkGitHubInstallationRequest]) (*connect.Response[sandrunv1.UnlinkGitHubInstallationResponse], error) {
 	l := h.l
 	s := l.svc
@@ -354,7 +355,7 @@ func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Req
 	if err != nil {
 		return nil, s.Internal(ctx, "get github installation", err)
 	}
-	var deleted []string
+	var retired, deleted []string
 	err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
@@ -366,23 +367,11 @@ func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Req
 		if cur == nil || cur.ID != inst.ID {
 			return api.ErrNotFound("GitHub installation")
 		}
-		skip := map[string]bool{}
+		var skip map[string]bool
 		if l.Configured() && cur.Active() {
-			idle, err := l.idleRunners(ctx, tx, cur.OrganizationID, cur.PoolKey())
+			retired, skip, err = l.retireUnlinkRunners(ctx, tx, cur)
 			if err != nil {
 				return err
-			}
-			for _, r := range idle {
-				refused, err := l.removeRegistration(ctx, tx, cur, r.ID)
-				if err != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					return api.ErrUnavailable("GitHub runner registration could not be removed; try again")
-				}
-				if refused {
-					skip[r.ID] = true
-				}
 			}
 		}
 		if deleted, err = l.deactivateTx(ctx, tx, cur, skip); err != nil {
@@ -396,14 +385,19 @@ func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Req
 			TargetKind: sandrunv1.AuditTargetKind_AUDIT_TARGET_KIND_GITHUB_INSTALLATION, TargetID: inst.ID,
 		})
 	})
+	if err == nil {
+		retired = append(retired, deleted...)
+	}
+	for _, id := range retired {
+		l.engine.DeleteSandboxOf(context.WithoutCancel(ctx), c.OrganizationID, id)
+	}
+	if err == nil || len(retired) > 0 {
+		s.WorkChanged(c.OrganizationID)
+	}
 	if err != nil {
 		return nil, s.Internal(ctx, "unlink github installation", err)
 	}
-	for _, r := range deleted {
-		l.engine.DeleteSandboxOf(context.WithoutCancel(ctx), c.OrganizationID, r)
-	}
-	s.WorkChanged(c.OrganizationID)
 	s.Logger.InfoContext(ctx, "github_installation_unlinked", slog.String("organization_id", c.OrganizationID), slog.String("installation_id", inst.ID),
-		slog.Int64("github_installation_id", inst.GitHubID), slog.Int("runners_deleted", len(deleted)))
+		slog.Int64("github_installation_id", inst.GitHubID), slog.Int("runners_deleted", len(retired)))
 	return connect.NewResponse(&sandrunv1.UnlinkGitHubInstallationResponse{}), nil
 }
