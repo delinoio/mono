@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -310,6 +311,8 @@ type env struct {
 	ex  *execs
 	// logger is the manager logger; nil selects the default logger.
 	logger *slog.Logger
+
+	freeDiskCalls atomic.Int64
 }
 
 func newEnv(t *testing.T) *env { return newEnvWithLogger(t, nil) }
@@ -332,7 +335,16 @@ func (e *env) restart() {
 	if e.m != nil {
 		e.m.Close()
 	}
-	m, err := New(context.Background(), Options{Store: e.st, Runtime: e.rt, Now: e.clk.Now, Logger: e.logger, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
+	m, err := New(context.Background(), Options{
+		Store:   e.st,
+		Runtime: e.rt,
+		Now:     e.clk.Now,
+		Logger:  e.logger,
+		FreeDisk: func() (int64, error) {
+			e.freeDiskCalls.Add(1)
+			return 1 << 50, nil
+		},
+	})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -939,25 +951,43 @@ func TestCreateLimits(t *testing.T) {
 // INVALID_ARGUMENT that names resources.disk_gib, before the limit check, the
 // free disk probe and the runtime see it, and keeps no record.
 func TestCreateRejectsDiskThatOverflowsBytes(t *testing.T) {
-	e := newEnv(t)
 	for _, disk := range []int64{validate.MaxDiskGiB + 1, math.MaxInt64} {
-		cmd := e.createCmd(1, time.Hour, time.Hour)
-		cmd.Resources.DiskGib = disk
-		// A huge device limit proves that the rejection comes from the
-		// validation and not from the capacity check.
-		cmd.Limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: math.MaxInt64, VcpuOvercommitPercent: 100}
-		_, err := e.m.Create(context.Background(), cmd)
-		var ce *CommandError
-		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || !strings.Contains(ce.Error(), "resources.disk_gib") {
-			t.Fatalf("disk_gib %d: err = %v, want INVALID_ARGUMENT naming resources.disk_gib", disk, err)
+		t.Run(fmt.Sprintf("disk_gib=%d", disk), func(t *testing.T) {
+			e := newEnv(t)
+			cmd := e.createCmd(1, time.Hour, time.Hour)
+			cmd.Resources.DiskGib = disk
+			// A permissive device limit isolates resource validation from capacity checks.
+			cmd.Limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: math.MaxInt64, VcpuOvercommitPercent: 100}
+			_, err := e.m.Create(t.Context(), cmd)
+			var ce *CommandError
+			if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || !strings.Contains(ce.Error(), "resources.disk_gib") {
+				t.Fatalf("err = %v, want INVALID_ARGUMENT naming resources.disk_gib", err)
+			}
+			if n := e.freeDiskCalls.Load(); n != 0 {
+				t.Fatalf("free disk probes = %d, want 0", n)
+			}
+			if n := e.rt.startCount(); n != 0 {
+				t.Fatalf("runtime starts = %d, want 0", n)
+			}
+			if n := len(e.m.Entries()); n != 0 {
+				t.Fatalf("entries = %d, want 0", n)
+			}
+		})
+	}
+
+	t.Run("valid_disk", func(t *testing.T) {
+		e := newEnv(t)
+		entry := e.create(time.Hour, time.Hour)
+		if n := e.freeDiskCalls.Load(); n != 1 {
+			t.Fatalf("free disk probes = %d, want 1", n)
 		}
-	}
-	if n := e.rt.startCount(); n != 0 {
-		t.Fatalf("runtime starts = %d, want 0", n)
-	}
-	if n := len(e.m.Entries()); n != 0 {
-		t.Fatalf("entries = %d, want 0", n)
-	}
+		if n := e.rt.startCount(); n != 1 {
+			t.Fatalf("runtime starts = %d, want 1", n)
+		}
+		if state := entry.GetState(); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Fatalf("sandbox state = %v, want RUNNING", state)
+		}
+	})
 }
 
 func TestTTLExpiry(t *testing.T) {
