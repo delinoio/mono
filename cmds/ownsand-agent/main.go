@@ -354,7 +354,7 @@ func runLaunchd(cfg config.Config) int {
 }
 
 func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
-	st, err := store.Open(cfg.StateDir)
+	st, err := store.OpenForRead(cfg.StateDir)
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
