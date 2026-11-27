@@ -59,6 +59,7 @@ type eventOutcome struct {
 	Result           string
 	BillingAccountID string
 	TransactionID    string
+	Grant            *grantTelemetry
 }
 
 // WebhookHandler serves `POST /webhooks/paddle`. It verifies the
@@ -173,6 +174,17 @@ func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome
 			WHERE paddle_event_id = $1`, ev.EventID, out.Result, out.BillingAccountID)
 		return err
 	})
+	if grant := out.Grant; err == nil && grant != nil {
+		s.metrics.CreditGrant(string(grant.Kind))
+		s.logger.InfoContext(ctx, "billing_credit_granted",
+			slog.String("billing_account_id", out.BillingAccountID),
+			slog.String("credit_grant_id", grant.ID),
+			slog.String("source", string(grant.Kind)),
+			slog.String("paddle_transaction_id", out.TransactionID),
+			slog.Int64("amount_usd_micros", grant.Amount),
+			slog.Int64("debt_paid_usd_micros", grant.DebtPaid),
+			slog.Int64("balance_after_usd_micros", grant.Balance))
+	}
 	return out, err
 }
 
@@ -375,7 +387,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 			s.logger.WarnContext(ctx, "billing_charge_without_top_up",
 				slog.String("billing_account_id", accountID), slog.String("paddle_transaction_id", txn.ID))
 		}
-		if _, _, err := s.addGrant(ctx, tx, acct, grantInput{Kind: kind.LedgerKind(), Amount: amount, PaddleTransactionID: txn.ID}, now); err != nil {
+		if _, out.Grant, err = s.addGrant(ctx, tx, acct, grantInput{Kind: kind.LedgerKind(), Amount: amount, PaddleTransactionID: txn.ID}, now); err != nil {
 			return out, err
 		}
 		if found {
@@ -384,7 +396,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 			}
 		}
 	case hasPrice(txn, s.priceID):
-		if _, _, err := s.addGrant(ctx, tx, acct, grantInput{
+		if _, out.Grant, err = s.addGrant(ctx, tx, acct, grantInput{
 			Kind: LedgerSubscriptionCredit, Amount: SubscriptionCreditUSDMicros, PaddleTransactionID: txn.ID,
 		}, now); err != nil {
 			return out, err
