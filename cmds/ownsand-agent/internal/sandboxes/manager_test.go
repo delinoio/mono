@@ -3301,33 +3301,37 @@ func TestLockSnapshotImportSerializesOneIDOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unlockA()
 	// Another ID takes its own lock at once.
-	unlockB, err := e.m.LockSnapshotImport(context.Background(), idB)
+	const lockBTimeout = time.Second
+	ctxB, cancelB := context.WithTimeout(t.Context(), lockBTimeout)
+	unlockB, err := e.m.LockSnapshotImport(ctxB, idB)
+	cancelB()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("snapshot B (%s) could not acquire its import lock within %s while snapshot A (%s) was held: %v", idB, lockBTimeout, idA, err)
 	}
 	unlockB()
 	// The same ID waits for the holder.
-	acquired := make(chan func(), 1)
+	acquired := make(chan error, 1)
 	go func() {
-		unlock, err := e.m.LockSnapshotImport(context.Background(), idA)
-		if err != nil {
-			t.Error(err)
-			close(acquired)
-			return
+		unlock, err := e.m.LockSnapshotImport(t.Context(), idA)
+		if err == nil {
+			unlock()
 		}
-		acquired <- unlock
+		acquired <- err
 	}()
 	select {
-	case <-acquired:
-		t.Fatal("second import of the same ID did not wait")
+	case err := <-acquired:
+		t.Fatalf("second import of the same ID returned before release: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	unlockA()
 	unlockA() // A second release is a no-op.
 	select {
-	case unlock := <-acquired:
-		unlock()
+	case err := <-acquired:
+		if err != nil {
+			t.Fatalf("waiting import failed to acquire the released lock: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("waiting import did not acquire the released lock")
 	}
