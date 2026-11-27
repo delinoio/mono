@@ -1500,6 +1500,14 @@ describe("runner profiles", () => {
       await browser.keyboard.press("ControlOrMeta+A");
       await browser.keyboard.type(valid);
     }
+    for (const [label, equalTtl] of [
+      ["Idle TTL (minutes)", "60"],
+      ["Maximum TTL (hours)", "1"],
+    ] as const) {
+      await dialog.getByLabel(label).tap();
+      await browser.keyboard.press("ControlOrMeta+A");
+      await browser.keyboard.type(equalTtl);
+    }
     await dialog.getByRole("button", "Create profile").tap();
 
     await expect(dialog).toBeHidden();
