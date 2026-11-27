@@ -88,10 +88,13 @@ type CreditServiceClient interface {
 	// accounts-api creates a Paddle checkout transaction for the subscription
 	// price with the billing account ID in its custom data and returns its ID
 	// for Paddle.js checkout. The subscription becomes ACTIVE only after the
-	// verified payment webhook. While the status is PENDING, the call returns
-	// the open checkout transaction again, so that a user can retry a closed
-	// checkout. Fails with `already_exists` while the status is ACTIVE or
-	// PAST_DUE.
+	// verified payment webhook.
+	// While the subscription is PENDING and has a stored checkout, the call
+	// reuses the checkout if Paddle confirms it is payable. If Paddle confirms
+	// the checkout is canceled or missing, the call returns a new checkout ID.
+	// An inconclusive lookup or a payment awaiting the verified webhook returns
+	// retryable `unavailable` and preserves the pending checkout.
+	// Fails with `already_exists` while the status is ACTIVE or PAST_DUE.
 	StartSubscription(context.Context, *connect.Request[v1.StartSubscriptionRequest]) (*connect.Response[v1.StartSubscriptionResponse], error)
 	// Cancel the subscription at the end of the paid period. Owner and admin
 	// only. The subscription stays ACTIVE until current_period_end. Calling it
@@ -316,10 +319,13 @@ type CreditServiceHandler interface {
 	// accounts-api creates a Paddle checkout transaction for the subscription
 	// price with the billing account ID in its custom data and returns its ID
 	// for Paddle.js checkout. The subscription becomes ACTIVE only after the
-	// verified payment webhook. While the status is PENDING, the call returns
-	// the open checkout transaction again, so that a user can retry a closed
-	// checkout. Fails with `already_exists` while the status is ACTIVE or
-	// PAST_DUE.
+	// verified payment webhook.
+	// While the subscription is PENDING and has a stored checkout, the call
+	// reuses the checkout if Paddle confirms it is payable. If Paddle confirms
+	// the checkout is canceled or missing, the call returns a new checkout ID.
+	// An inconclusive lookup or a payment awaiting the verified webhook returns
+	// retryable `unavailable` and preserves the pending checkout.
+	// Fails with `already_exists` while the status is ACTIVE or PAST_DUE.
 	StartSubscription(context.Context, *connect.Request[v1.StartSubscriptionRequest]) (*connect.Response[v1.StartSubscriptionResponse], error)
 	// Cancel the subscription at the end of the paid period. Owner and admin
 	// only. The subscription stays ACTIVE until current_period_end. Calling it
