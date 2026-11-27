@@ -71,12 +71,11 @@ func (l Link) proto() *sandrunv1.OwnSandLink {
 // OwnSand with Links.ClientForRemoval (for example, to delete the runners'
 // sandboxes); an error stops the removal and keeps the link. InTx runs in
 // the transaction that deletes the link, after the organization row lock.
+// Its optional callback runs only if that transaction commits.
 type RemovalHook struct {
 	Name    string
 	Prepare func(ctx context.Context, orgID string) error
-	InTx    func(ctx context.Context, tx pgx.Tx, orgID string) error
-	// AfterCommit runs after the link is deleted (best effort).
-	AfterCommit func(ctx context.Context, orgID string)
+	InTx    func(ctx context.Context, tx pgx.Tx, orgID string) (afterCommit func(context.Context), err error)
 }
 
 // Links reads links and builds the OwnSand clients of organizations.
@@ -426,6 +425,7 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 			return nil, s.Internal(ctx, "prepare ownsand link removal", err)
 		}
 	}
+	var afterCommit []func(context.Context)
 	err = db.InTxWithContexts(cleanupCtx, ctx, s.DB.Pool.Begin, func(tx pgx.Tx) error {
 		if err := api.LockOrganization(cleanupCtx, tx, c.OrganizationID); err != nil {
 			return err
@@ -440,8 +440,12 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 			if hook.InTx == nil {
 				continue
 			}
-			if err := hook.InTx(ctx, tx, c.OrganizationID); err != nil {
+			after, err := hook.InTx(ctx, tx, c.OrganizationID)
+			if err != nil {
 				return fmt.Errorf("ownsand link removal hook %s: %w", hook.Name, err)
+			}
+			if after != nil {
+				afterCommit = append(afterCommit, after)
 			}
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM ownsand_links WHERE ownsand_link_id = $1", claim.linkID); err != nil {
@@ -458,10 +462,8 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[sa
 	}
 	committed = true
 	l.forget(c.OrganizationID)
-	for _, hook := range l.hooks {
-		if hook.AfterCommit != nil {
-			hook.AfterCommit(context.WithoutCancel(ctx), c.OrganizationID)
-		}
+	for _, after := range afterCommit {
+		after(context.WithoutCancel(ctx))
 	}
 	s.Logger.InfoContext(ctx, "ownsand_link_removed", slog.String("organization_id", c.OrganizationID))
 	return connect.NewResponse(&sandrunv1.RemoveOwnSandLinkResponse{}), nil
