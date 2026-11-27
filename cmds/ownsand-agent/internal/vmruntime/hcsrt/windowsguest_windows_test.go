@@ -114,7 +114,7 @@ func TestWindowsBaseImageGeneration(t *testing.T) {
 	installMustWait := func() {
 		ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 		defer cancel()
-		if err := images.Install(ctx, base); !errors.Is(err, context.DeadlineExceeded) {
+		if err := images.Install(ctx, base, ownsandv1.GuestOs_GUEST_OS_WINDOWS); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("install during source copy = %v, want deadline exceeded", err)
 		}
 	}
@@ -133,7 +133,7 @@ func TestWindowsBaseImageGeneration(t *testing.T) {
 		checkWindowsGeneration(t, spec.Dir, disk, "A")
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
-		if err := images.Install(ctx, base); err != nil {
+		if err := images.Install(ctx, base, ownsandv1.GuestOs_GUEST_OS_WINDOWS); err != nil {
 			t.Fatalf("install during local disk growth = %v", err)
 		}
 		return size, nil
@@ -206,7 +206,7 @@ func TestWindowsBaseImageGenerationRecoveryAndCopyFailure(t *testing.T) {
 	writeWindowsGeneration(t, images.BuildDir(base), images.WindowsDisk, "B", 2, 4096)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if err := images.Install(ctx, base); err != nil {
+	if err := images.Install(ctx, base, ownsandv1.GuestOs_GUEST_OS_WINDOWS); err != nil {
 		t.Fatalf("install after failed copy = %v", err)
 	}
 }
