@@ -32,6 +32,10 @@
 # non-zero and name the container, but the state files already name the
 # replacement. A failed image removal is only logged. The exit code is the deployment verdict.
 #
+# The first Accounts API deploy with legacy images uses a separate drain
+# invocation. It stops and removes all old containers before a compatible
+# replacement is eligible to start. See the Accounts API cutover contract.
+#
 # A service that publishes UDP host ports cannot run next to its replacement,
 # because only one container can publish a host port. For such a service the
 # script creates the replacement, stops the running containers to free the
@@ -114,6 +118,11 @@
 #                           route change and proxy reload before the script
 #                           gives up without changing the route (default: the
 #                           value of DROPLET_LOCK_TIMEOUT).
+#   DROPLET_ACCOUNTS_CAP_CUTOVER
+#                           set to drain for the one-time Accounts API drain.
+#   DROPLET_ACCOUNTS_CAP_SAFE_MONTH
+#                           UTC YYYY-MM approved after reviewing claim history
+#                           following a completed drain. See the workflow contract.
 set -euo pipefail
 
 # The whole script is one function that the last line calls with standard
@@ -286,6 +295,13 @@ main() {
   if [[ -n "$taken" ]]; then
     fail "a container named $new already exists; nothing was changed."
   fi
+  local previous_serving="the previous container keeps serving"
+  if [[ "$service" == accounts-api ]]; then
+    accounts_cap_cutover "$state" "$image" "$stop_timeout" "${old[@]}"
+    if (( ${#old[@]} == 0 )); then
+      previous_serving="the service awaits a healthy compatible replacement"
+    fi
+  fi
   # The replacement takes no `--network-alias "$service"`. The running
   # container keeps that alias (and the route still names it), and Docker DNS
   # would hand out the replacement address with the shared alias while the
@@ -314,11 +330,11 @@ main() {
     # script before any cleanup, so the call is an `if` operand.
     if ! docker run --detach "${create[@]}" > /dev/null; then
       discard_replacement "$new" "$replacement_stop_timeout"
-      fail "$new did not start; the previous container keeps serving."
+      fail "$new did not start; $previous_serving."
     fi
     if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
       discard_replacement "$new" "$replacement_stop_timeout"
-      fail "$new did not pass the health check; the previous container keeps serving."
+      fail "$new did not pass the health check; $previous_serving."
     fi
   else
     local running_ids
@@ -381,7 +397,7 @@ main() {
       restart_previous "${stopped[@]}"
       fail "the route of $service was not switched; the previous containers were started again."
     fi
-    fail "the route of $service was not switched; the previous container keeps serving."
+    fail "the route of $service was not switched; $previous_serving."
   fi
 
   # The proxy routes to the replacement now, so it is the deployed image.
@@ -460,6 +476,98 @@ main() {
 fail() {
   echo "::error::$1" >&2
   exit 1
+}
+
+# Inspect the actual image ID of existing containers. The optional allowlist
+# records exact registry digests for verified builds that predate the label.
+accounts_cap_image() {
+  local allowlist="$1" reference="$2" image_id="$3" capability
+  capability="$(docker image inspect --format '{{index .Config.Labels "io.delino.accounts.cap-accounting"}}' "$image_id")" ||
+    return 1
+  [[ "$capability" == claim-time ]] ||
+    { [[ -z "$capability" && "$reference" =~ ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ && -f "$allowlist" ]] &&
+      grep -Fxq -- "$reference" "$allowlist"; }
+}
+
+write_accounts_cap_state() {
+  local path="$1" value="$2"
+  if ! printf '%s\n' "$value" > "$path.new" || ! mv -fT "$path.new" "$path"; then
+    fail "could not record the Accounts API cap cutover in $path."
+  fi
+}
+
+# The caller holds the service lock from inventory through replacement startup.
+# Drain is a separate invocation so an operator can review claims after all
+# legacy processes exit. Record activation before a worker can make a claim,
+# even if startup or the subsequent proxy switch fails.
+accounts_cap_cutover() {
+  local state="$1" image="$2" stop_timeout="$3"
+  shift 3
+  local path="$state.cap-accounting" allowlist="$state.cap-compatible-images"
+  local mode="${DROPLET_ACCOUNTS_CAP_CUTOVER:-}" safe_month="${DROPLET_ACCOUNTS_CAP_SAFE_MONTH:-}"
+  local month_pattern='[0-9]{4}-(0[1-9]|1[0-2])' status="" id reference image_id inventory month
+  if [[ -e "$path" || -L "$path" ]]; then
+    if [[ ! -f "$path" || -L "$path" ]] || ! status="$(cat "$path")" ||
+      [[ "$status" != active && "$status" != draining && ! "$status" =~ ^drained\ $month_pattern$ ]]; then
+      fail "could not verify the Accounts API cap cutover state in $path."
+    fi
+  fi
+  if ! accounts_cap_image "$allowlist" "$image" "$image"; then
+    fail "Accounts API image $image has no verified claim-time cap capability; deploy a compatible image."
+  fi
+  if [[ "$mode" == drain ]]; then
+    [[ "$status" != active && -z "$safe_month" ]] ||
+      fail "Accounts API drain is only for first activation. Review claim history after the drain."
+    if [[ "$status" == 'drained '* && $# == 0 ]]; then
+      echo "Accounts API containers are already drained (${status#drained } UTC)."
+      exit 0
+    fi
+    write_accounts_cap_state "$path" draining
+    for id in "$@"; do
+      echo "Drain Accounts API container $id"
+      if ! docker stop --time "$stop_timeout" "$id" > /dev/null || ! docker rm "$id" > /dev/null; then
+        fail "could not confirm that Accounts API container $id stopped and was removed; no replacement was started."
+      fi
+    done
+    if ! inventory="$(docker ps --all --quiet --filter 'label=io.delino.service=accounts-api')" || [[ -n "$inventory" ]]; then
+      fail "could not confirm that all Accounts API containers were removed; no replacement was started."
+    fi
+    month="$(date -u +%Y-%m)"
+    [[ "$month" =~ ^$month_pattern$ ]] || fail "could not read the UTC month for the Accounts API cap cutover."
+    write_accounts_cap_state "$path" "drained $month"
+    echo "Accounts API containers drained in $month UTC. Deploy after the next UTC month begins or after reviewing this month's claims."
+    exit 0
+  fi
+  [[ -z "$mode" ]] || fail "DROPLET_ACCOUNTS_CAP_CUTOVER must be unset or drain."
+
+  case "$status" in
+    draining)
+      fail "the Accounts API drain is incomplete; rerun the drain before deploying."
+      ;;
+    'drained '*)
+      (( $# == 0 )) || fail "Accounts API containers appeared after the drain; rerun the drain before deploying."
+      month="$(date -u +%Y-%m)"
+      [[ "$month" =~ ^$month_pattern$ ]] || fail "could not read the UTC month for the Accounts API cap cutover."
+      if [[ ! "$month" > "${status#drained }" && ( "$month" != "${status#drained }" || "$safe_month" != "$month" ) ]]; then
+        fail "Accounts API was drained in ${status#drained } UTC; wait for a new UTC month or confirm the current month's legacy claim accounting."
+      fi
+      ;;
+    *)
+      [[ -n "$status" || $# != 0 ]] ||
+        fail "Accounts API has no verified prior deployment; run the Accounts API drain before deploying."
+      for id in "$@"; do
+        if ! inventory="$(docker inspect --format '{{.Config.Image}} {{.Image}}' "$id")" ||
+          ! read -r reference image_id <<< "$inventory" ||
+          [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+          ! accounts_cap_image "$allowlist" "$reference" "$image_id"; then
+          fail "Accounts API container $id has no verified claim-time cap capability; follow the Accounts API cutover procedure before deploying."
+        fi
+      done
+      ;;
+  esac
+  if [[ "$status" != active ]]; then
+    write_accounts_cap_state "$path" active
+  fi
 }
 
 # Starts the previous containers again after a failed replacement of a
