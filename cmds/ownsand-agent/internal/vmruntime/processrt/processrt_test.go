@@ -1618,6 +1618,69 @@ func TestDeleteUntrackedRemovesRecordedSocketDirectory(t *testing.T) {
 	mustExist(t, unrelated)
 }
 
+func TestDeleteUntrackedRetainsUnreadableSocketDirectoryRecord(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("socket record read must run without root privileges")
+	}
+	ctx := t.Context()
+	vmsDir := t.TempDir()
+	id := "0192f4b6-7c3a-7def-8abc-000000000001"
+	dir := writeSandboxFiles(t, vmsDir, id)
+	socketDir, err := os.MkdirTemp(t.TempDir(), socketDirPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(socketDir, "g.sock")
+	if err := os.WriteFile(socket, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordSocketDir(dir, socketDir); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, socketDirFile)
+	if err := os.Chmod(record, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(record); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("read of restricted socket record = %v; want a permission error", err)
+	}
+
+	rt := newRuntimeWithVMsDir(t, vmsDir)
+	if err := rt.Delete(ctx, id); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Delete with an unreadable socket record = %v; want a permission error", err)
+	}
+	mustExist(t, filepath.Join(dir, rootDir, "user-file.txt"))
+	mustExist(t, record)
+	mustExist(t, socket)
+	if err := os.Chmod(record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block external cleanup to verify it happens before sandbox removal.
+	if err := os.Chmod(socketDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(socketDir, 0o700); err != nil && !os.IsNotExist(err) {
+			t.Errorf("restore socket directory permissions: %v", err)
+		}
+	})
+	if err := rt.Delete(ctx, id); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Delete with a read-only socket directory = %v; want a permission error", err)
+	}
+	if data, err := os.ReadFile(record); err != nil || string(data) != socketDir {
+		t.Fatalf("socket directory record after failed cleanup = %q, %v; want %q", data, err, socketDir)
+	}
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Delete(ctx, id); err != nil {
+		t.Fatalf("Delete after restoring access: %v", err)
+	}
+	mustNotExist(t, socketDir)
+	mustNotExist(t, dir)
+}
+
 func TestDeleteRetainsSocketDirectoryRecordOnRemovalFailure(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("socket directory removal must run without root privileges")
