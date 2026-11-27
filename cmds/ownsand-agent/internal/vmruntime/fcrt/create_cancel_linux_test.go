@@ -20,8 +20,11 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 // These tests start the test binary as a fake firecracker that serves a
@@ -46,8 +49,29 @@ const (
 	loadBlock         = "block"           // never answers, until the process is killed
 	loadFail          = "fail"            // HTTP 400, as a state file that Firecracker cannot read
 	loadResumeAndDrop = "resume-and-drop" // the guest writes to disk before the response is lost
+	loadClockBlock    = "clock-block"     // restores and waits for cancellation in SetClock
+	loadClockFail     = "clock-fail"      // restores and rejects SetClock
 	capturedDisk      = "captured snapshot"
 )
+
+type restoreClockGuest struct {
+	ownsandv1connect.UnimplementedGuestServiceHandler
+	note  func(string)
+	block bool
+}
+
+func (g restoreClockGuest) CheckReady(context.Context, *connect.Request[ownsandv1.CheckReadyRequest]) (*connect.Response[ownsandv1.CheckReadyResponse], error) {
+	return connect.NewResponse(&ownsandv1.CheckReadyResponse{}), nil
+}
+
+func (g restoreClockGuest) SetClock(ctx context.Context, _ *connect.Request[ownsandv1.SetClockRequest]) (*connect.Response[ownsandv1.SetClockResponse], error) {
+	g.note("guest SetClock")
+	if g.block {
+		<-ctx.Done()
+		return connect.NewResponse(&ownsandv1.SetClockResponse{}), nil
+	}
+	return nil, connect.NewError(connect.CodeInternal, errors.New("clock rejected"))
+}
 
 // The helper runs from init, which precedes TestMain, so TestMain stays
 // unchanged. Launch 1 is the memory-state restore attempt; later launches
@@ -114,6 +138,19 @@ func init() {
 				os.Exit(5)
 			}
 			conn.Close()
+		case req.Method == http.MethodPut && req.URL.Path == "/snapshot/load" && (loadMode == loadClockBlock || loadMode == loadClockFail):
+			guestListener, err := net.Listen("unix", vsockSocket)
+			if err != nil {
+				fault(w, err.Error())
+				return
+			}
+			mux := http.NewServeMux()
+			mux.Handle(ownsandv1connect.NewGuestServiceHandler(restoreClockGuest{note: note, block: loadMode == loadClockBlock}))
+			var protocols http.Protocols
+			protocols.SetUnencryptedHTTP2(true)
+			guest := &http.Server{Handler: mux, Protocols: &protocols}
+			go guest.Serve(vsockListener{guestListener})
+			w.WriteHeader(http.StatusNoContent)
 		case req.Method == http.MethodPut && req.URL.Path == "/snapshot/load":
 			fault(w, "cannot load the snapshot")
 		case req.Method == http.MethodPut && req.URL.Path == "/vsock" && launch > 1:
@@ -191,13 +228,14 @@ func newCreateFixture(t *testing.T, loadMode string) *createFixture {
 		t.Fatal(err)
 	}
 	res := &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 128}
-	r := bareRuntime(Options{Binary: bin})
+	vmsDir := t.TempDir()
+	r := bareRuntime(Options{Binary: bin, VMsDir: vmsDir})
 	logs := &syncBuffer{}
 	r.logger = slog.New(slog.NewJSONHandler(logs, nil))
 	// Delete stops a process that a failed assertion left behind.
 	t.Cleanup(func() { r.Close() })
 	return &createFixture{r: r, log: logPath, logs: logs, spec: vmruntime.Spec{
-		SandboxID: "sbx", Dir: filepath.Join(t.TempDir(), "vm"), GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX,
+		SandboxID: "sbx", Dir: filepath.Join(vmsDir, "sbx"), GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX,
 		NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE, Resources: res, MemoryRestoreAllowed: true,
 		Snapshot: &vmruntime.SnapshotSource{SnapshotID: "snap", Dir: snap, HasMemoryState: true, Resources: res},
 	}}
@@ -350,6 +388,101 @@ func TestCreateContextEndedDuringRestoreStartsNoReplacement(t *testing.T) {
 			requireProcessGone(t, f.firstPID(t))
 			requireReleased(t, f)
 		})
+	}
+}
+
+func TestCreateContextEndedDuringRestoreClock(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		want   error
+		retain bool
+	}{
+		{name: "canceled", want: context.Canceled},
+		{name: "deadline", want: context.DeadlineExceeded},
+		{name: "unconfirmed stop", want: context.Canceled, retain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCreateFixture(t, loadClockBlock)
+			signalGroup, stopTimeout := f.r.signalGroup, f.r.stopTimeout
+			if tc.retain {
+				f.r.signalGroup = func(int) error { return nil }
+				f.r.stopTimeout = 20 * time.Millisecond
+			}
+			var parent context.Context
+			var end func()
+			if tc.want == context.DeadlineExceeded {
+				deadline := newManualDeadlineContext()
+				parent, end = deadline, deadline.expire
+			} else {
+				parent, end = context.WithCancel(context.Background())
+			}
+			type result struct {
+				vm  vmruntime.VM
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				m, err := f.r.Create(parent, f.spec)
+				done <- result{vm: m, err: err}
+				close(done)
+			}()
+			t.Cleanup(func() {
+				end()
+				for range done {
+				}
+				f.r.signalGroup, f.r.stopTimeout = signalGroup, stopTimeout
+			})
+			f.waitEvent(t, "guest SetClock")
+			end()
+			select {
+			case res := <-done:
+				if res.vm != nil || !errors.Is(res.err, tc.want) {
+					t.Fatalf("create returned VM=%v, error=%v, want nil VM and %v", res.vm != nil, res.err, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("create did not finish after the parent context ended")
+			}
+			if n := f.launches(t); n != 1 {
+				t.Fatalf("%d firecracker launches, want 1", n)
+			}
+			f.requireNoColdFallback(t)
+			pid := f.firstPID(t)
+			if tc.retain {
+				if err := syscall.Kill(pid, 0); err != nil {
+					t.Fatalf("process %d did not survive the first stop: %v", pid, err)
+				}
+				if _, err := os.Stat(filepath.Join(f.spec.Dir, launchRecordFile)); err != nil {
+					t.Fatalf("launch record missing after an unconfirmed stop: %v", err)
+				}
+				if n := f.registered(); n != 1 {
+					t.Fatalf("%d VMs registered after an unconfirmed stop, want 1", n)
+				}
+				f.r.signalGroup, f.r.stopTimeout = signalGroup, stopTimeout
+				if err := f.r.Delete(context.Background(), f.spec.SandboxID); err != nil {
+					t.Fatalf("retry retained VM cleanup: %v", err)
+				}
+			}
+			requireProcessGone(t, pid)
+			requireReleased(t, f)
+		})
+	}
+}
+
+func TestCreateRestoreClockErrorWithLiveParent(t *testing.T) {
+	f := newCreateFixture(t, loadClockFail)
+	m, err := f.r.Create(context.Background(), f.spec)
+	if err != nil || m == nil {
+		t.Fatalf("create returned VM=%v, error=%v, want a restored VM", m != nil, err)
+	}
+	if got := m.RestorePath(); got != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE {
+		t.Fatalf("restore path = %v, want MEMORY_STATE", got)
+	}
+	if logs := f.logs.String(); !strings.Contains(logs, `"level":"WARN","msg":"set guest clock after memory restore failed"`) ||
+		!strings.Contains(logs, "clock rejected") {
+		t.Fatalf("missing clock RPC warning: %s", logs)
+	}
+	if n := f.launches(t); n != 1 {
+		t.Fatalf("%d firecracker launches, want 1", n)
 	}
 }
 
