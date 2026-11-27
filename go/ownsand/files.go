@@ -499,10 +499,7 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 			opts.OnProgress(offset)
 		}
 		if last {
-			if !res.GetFinished() {
-				return offset, op.dpErr(errors.New("ownsand: the last chunk was acknowledged without finish"))
-			}
-			return res.GetSizeBytes(), nil
+			return offset, op.checkFinish(res, req.GetFinish().GetSizeBytes())
 		}
 		buf, nextBuf = nextBuf, buf
 		n, rerr = m, nerr
@@ -618,8 +615,10 @@ func (fw *FileWrite) send(ctx context.Context, offset int64, data []byte, finish
 	if res.GetOffset() != offset || res.GetLength() != int64(len(data)) {
 		return nil, fw.op.dpErr(fmt.Errorf("ownsand: write result for offset %d length %d, sent offset %d length %d", res.GetOffset(), res.GetLength(), offset, len(data)))
 	}
-	if finish != nil && !res.GetFinished() {
-		return nil, fw.op.dpErr(errors.New("ownsand: the last chunk was acknowledged without finish"))
+	if finish != nil {
+		if err := fw.op.checkFinish(res, finish.GetSizeBytes()); err != nil {
+			return nil, err
+		}
 	}
 	return res, nil
 }
@@ -667,6 +666,16 @@ type writeOp struct {
 	s     *Sandbox
 	id    string
 	grant *relayGrant
+}
+
+func (op *writeOp) checkFinish(res *ownsandv1.WriteFileResponse, sizeBytes int64) error {
+	if !res.GetFinished() {
+		return op.dpErr(errors.New("ownsand: the last chunk was acknowledged without finish"))
+	}
+	if res.GetSizeBytes() != sizeBytes {
+		return op.dpErr(fmt.Errorf("ownsand: the agent reported a final size of %d bytes, requested %d", res.GetSizeBytes(), sizeBytes))
+	}
+	return nil
 }
 
 func (op *writeOp) dpErr(err error) error {

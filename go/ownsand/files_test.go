@@ -582,6 +582,38 @@ func TestWriteFileChunkedBothTransports(t *testing.T) {
 	}
 }
 
+func TestWriteFileFinalSizeMismatch(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.writeSizeDelta = 3
+			c := cp.client(t, tr)
+			c.timing.writeAttemptDeadline = fullChunkWriteAttemptDeadline
+			s := cp.handle(t, c)
+			ctx := context.Background()
+			data := make([]byte, datapath.MaxFileChunkSize+7)
+			var progress []int64
+			n, err := s.WriteFile(ctx, "/stream", bytes.NewReader(data), WriteOptions{
+				OnProgress: func(written int64) { progress = append(progress, written) },
+			})
+			var dp *DataPathError
+			if !errors.As(err, &dp) || dp.Operation != "write-file" {
+				t.Fatalf("WriteFile error = %v, want a write data path error", err)
+			}
+			if n != int64(len(data)) || len(progress) != 2 || progress[0] != datapath.MaxFileChunkSize || progress[1] != n {
+				t.Fatalf("acknowledged %d bytes with progress %v, want %d bytes over two chunks", n, progress, len(data))
+			}
+			err = s.WriteFileBytes(ctx, "/bytes", []byte("hello"), WriteOptions{})
+			if !errors.As(err, &dp) || dp.Operation != "write-file" {
+				t.Fatalf("WriteFileBytes error = %v, want a write data path error", err)
+			}
+			if got := len(cp.agent.writeRequests()); got != 3 {
+				t.Fatalf("%d write requests, want 3 without retries", got)
+			}
+		})
+	}
+}
+
 // countingReader counts Read calls and runs onRead, when set, with the call
 // number before it serves the bytes.
 type countingReader struct {
@@ -857,13 +889,18 @@ func TestWriteFileSourceEnd(t *testing.T) {
 }
 
 func TestWriteEmptyFile(t *testing.T) {
-	cp := newFakeCP(t)
-	s := cp.handle(t, cp.client(t, TransportRelay))
-	if err := s.WriteFileBytes(context.Background(), "/empty", nil, WriteOptions{Mode: 0o600}); err != nil {
-		t.Fatal(err)
-	}
-	if f, ok := cp.agent.file("/empty"); !ok || len(f) != 0 {
-		t.Fatal("empty file not written")
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			s := cp.handle(t, cp.client(t, tr))
+			n, err := s.WriteFile(context.Background(), "/empty", bytes.NewReader(nil), WriteOptions{Mode: 0o600})
+			if err != nil || n != 0 {
+				t.Fatalf("WriteFile = (%d, %v), want (0, nil)", n, err)
+			}
+			if f, ok := cp.agent.file("/empty"); !ok || len(f) != 0 {
+				t.Fatal("empty file not written")
+			}
+		})
 	}
 }
 
@@ -1499,6 +1536,49 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 			big, _ := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/big"})
 			if _, err := big.WriteChunk(ctx, 0, make([]byte, datapath.MaxFileChunkSize+1)); !validate.IsValidationError(err) {
 				t.Fatalf("chunk above 1 MiB: %v", err)
+			}
+		})
+	}
+}
+
+func TestFileWriteFinishChecksDeclaredSize(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			for _, tc := range []struct {
+				name  string
+				delta int64
+			}{
+				{name: "declared total"},
+				{name: "end of final chunk", delta: -3},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					cp := newFakeCP(t)
+					cp.agent.writeSizeDelta = tc.delta
+					s := cp.handle(t, cp.client(t, tr))
+					ctx := context.Background()
+					fw, err := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/out"})
+					if err != nil {
+						t.Fatal(err)
+					}
+					// Write the tail first. The final chunk fills the gap and ends before the total.
+					if _, err := fw.WriteChunk(ctx, 2, []byte("cde")); err != nil {
+						t.Fatal(err)
+					}
+					res, err := fw.Finish(ctx, 0, []byte("ab"), 5, 0o644)
+					if tc.delta == 0 {
+						if err != nil || res.GetSizeBytes() != 5 {
+							t.Fatalf("Finish = (%v, %v), want size 5", res, err)
+						}
+					} else {
+						var dp *DataPathError
+						if res != nil || !errors.As(err, &dp) || dp.Operation != "write-file" {
+							t.Fatalf("Finish = (%v, %v), want no response and a write data path error", res, err)
+						}
+					}
+					if got := len(cp.agent.writeRequests()); got != 2 {
+						t.Fatalf("%d write requests, want 2 without retries", got)
+					}
+				})
 			}
 		})
 	}
