@@ -11,9 +11,8 @@ import (
 	"time"
 )
 
-// ErrLockTimeout reports that another listener start held the lock of the
-// same unix socket path for the whole wait budget. The message omits the
-// path.
+// ErrLockTimeout reports that a contended unix socket path lock could not
+// be acquired before the deadline. The message omits the path.
 var ErrLockTimeout = errors.New("guestlisten: wait for the unix socket path lock timed out")
 
 // ErrLockFailed reports a failure to open or take the lock of a unix socket
@@ -29,14 +28,14 @@ const unixLockSuffix = ".lock"
 const (
 	// unixLockPollInterval is the pause between two attempts to take the lock.
 	unixLockPollInterval = 10 * time.Millisecond
-	// unixLockWaitBudget bounds the total pause of one lock wait. The wait
-	// counts its pauses instead of reading a clock, so the bound does not
-	// depend on timer granularity.
+	// unixLockWaitBudget bounds the elapsed time to acquire a contended lock.
 	unixLockWaitBudget = 5 * time.Second
 )
 
 // Test seams for the lock wait. Production code never changes them.
 var (
+	unixLockNow = time.Now
+	unixLockTry = tryLockFile
 	// unixLockSleep pauses between two attempts to take the lock.
 	unixLockSleep = time.Sleep
 	// unixLockBudget is the wait budget of one lock wait.
@@ -62,14 +61,16 @@ func lockUnixAddress(address string) (func(), error) {
 	if runtime.GOOS == "linux" && strings.HasPrefix(address, "@") {
 		return noop, nil
 	}
-	var waited time.Duration
+	deadline := unixLockNow().Add(unixLockBudget)
+	retried := false
 	wait := func() bool {
-		if waited >= unixLockBudget {
+		retried = true
+		remaining := deadline.Sub(unixLockNow())
+		if remaining <= 0 {
 			return false
 		}
-		unixLockSleep(unixLockPollInterval)
-		waited += unixLockPollInterval
-		return true
+		unixLockSleep(min(unixLockPollInterval, remaining))
+		return unixLockNow().Before(deadline)
 	}
 	f, err := openUnixLockFile(address+unixLockSuffix, wait)
 	if errors.Is(err, os.ErrNotExist) {
@@ -78,28 +79,35 @@ func lockUnixAddress(address string) (func(), error) {
 	if err != nil {
 		return nil, pathFreeError(ErrLockFailed, err)
 	}
-	for {
-		locked, err := tryLockFile(f)
+	// The first immediate attempt is allowed. If opening the sidecar needed
+	// a retry, the same deadline already applies to taking the lock.
+	for !retried || unixLockNow().Before(deadline) {
+		locked, err := unixLockTry(f)
 		if err != nil {
 			_ = f.Close()
 			return nil, pathFreeError(ErrLockFailed, err)
 		}
 		if locked {
+			if retried && !unixLockNow().Before(deadline) {
+				unlockFile(f)
+				break
+			}
 			return func() {
 				unlockFile(f)
 				_ = f.Close()
 			}, nil
 		}
 		if !wait() {
-			_ = f.Close()
-			return nil, ErrLockTimeout
+			break
 		}
 	}
+	_ = f.Close()
+	return nil, ErrLockTimeout
 }
 
 func openUnixLockFile(path string, wait func() bool) (*os.File, error) {
 	const mode = 0o600
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		return os.OpenFile(path, os.O_RDWR|os.O_CREATE, mode)
 	}
 

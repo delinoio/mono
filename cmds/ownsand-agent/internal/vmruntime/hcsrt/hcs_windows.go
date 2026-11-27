@@ -24,6 +24,7 @@ import (
 var (
 	modComputeCore = windows.NewLazySystemDLL("computecore.dll")
 
+	procHcsGrantVmAccess              = modComputeCore.NewProc("HcsGrantVmAccess")
 	procHcsCreateOperation            = modComputeCore.NewProc("HcsCreateOperation")
 	procHcsCloseOperation             = modComputeCore.NewProc("HcsCloseOperation")
 	procHcsWaitForOperationResult     = modComputeCore.NewProc("HcsWaitForOperationResult")

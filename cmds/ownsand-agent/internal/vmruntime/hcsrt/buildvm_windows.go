@@ -70,10 +70,7 @@ func StartBuildVM(opts BuildVMOptions) (*BuildVM, error) {
 	if err := CheckHost(); err != nil {
 		return nil, err
 	}
-	if err := grantVMGroup(opts.Dir, accessReadWrite, true); err != nil {
-		return nil, err
-	}
-	if err := grantVMGroup(opts.Disk, accessReadWrite, false); err != nil {
+	if err := grantVM(opts.ID, opts.Disk); err != nil {
 		return nil, err
 	}
 	pipe := `\\.\pipe\` + opts.ID + `-com1`

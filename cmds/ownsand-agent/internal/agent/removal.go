@@ -55,11 +55,19 @@ func (a *Agent) removeDevice(ctx context.Context) (err error) {
 			return ctx.Err()
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	// Record the notice before waiting so new builders are refused while
+	// already admitted builders finish. Keep the guard through final reset.
+	cleanup, err := a.st.LockCleanup(ctx)
+	if err != nil {
 		return err
 	}
+	defer cleanup.Close()
 	if !st.Removal.CleanupDone {
 		if err := a.Sandboxes.RemoveAll(ctx); err != nil {
+			a.logger.Error("removal clean-up failed", "error", err)
+			return err
+		}
+		if err := cleanup.WipeLocalData(); err != nil {
 			a.logger.Error("removal clean-up failed", "error", err)
 			return err
 		}
@@ -99,7 +107,7 @@ func (a *Agent) removeDevice(ctx context.Context) (err error) {
 			return ctx.Err()
 		}
 	}
-	if err := a.st.Reset(); err != nil {
+	if err := cleanup.Reset(); err != nil {
 		return err
 	}
 	a.logger.Info("device key deleted; the agent is no longer enrolled")

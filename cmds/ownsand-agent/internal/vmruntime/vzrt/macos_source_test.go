@@ -192,6 +192,71 @@ func TestMacOSBaseImageGenerationRecoveryAndFailedCopy(t *testing.T) {
 	}
 }
 
+// linkMacOSStorage moves a storage file outside the image and links to it.
+func linkMacOSStorage(t *testing.T, dir, name string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	target := filepath.Join(filepath.Dir(dir), "target")
+	if err := os.Rename(path, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("cannot create a symlink on this system: %v", err)
+	}
+}
+
+func TestMacOSBaseImageRejectsLinkedStorage(t *testing.T) {
+	testMacOSBaseImageRejectsLinkedStorage(t, copyMacOSMarker)
+}
+
+func testMacOSBaseImageRejectsLinkedStorage(t *testing.T, copySource func(context.Context, string, string) error) {
+	t.Helper()
+	for _, name := range []string{images.MacOSDisk, images.MacOSAuxStorage} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			base := filepath.Join(root, images.MacOSDir)
+			writeMacOSGeneration(t, base, "A", 1, 2048, 1)
+			linkMacOSStorage(t, base, name)
+			spec := vmruntime.Spec{
+				Dir:       filepath.Join(root, "sandbox"),
+				Resources: &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 2048, DiskGib: 1},
+			}
+			supportsModel := func([]byte) bool { return true }
+			_, err := prepareMacOSSource(t.Context(), spec, base, supportsModel, func(context.Context, string, string) error {
+				t.Fatal("prepare attempted to copy from an incomplete base image")
+				return nil
+			})
+			if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "the macOS base image is incomplete; build it again") {
+				t.Fatalf("prepare with no backup = %v, want incomplete image precondition", err)
+			}
+			if _, err := os.Lstat(spec.Dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("sandbox directory after rejected create: %v", err)
+			}
+
+			writeMacOSGeneration(t, images.OldDir(base), "B", 1, 2048, 1)
+			model, err := prepareMacOSSource(t.Context(), spec, base, supportsModel, copySource)
+			if err != nil {
+				t.Fatalf("prepare with backup: %v", err)
+			}
+			checkMacOSGeneration(t, spec, model, "B")
+			for _, file := range []string{diskFile, auxFile} {
+				src, err := os.Lstat(filepath.Join(base, file))
+				if err != nil || !src.Mode().IsRegular() {
+					t.Fatalf("recovered %s is not a regular file: %v, %v", file, src, err)
+				}
+				dst, err := os.Lstat(filepath.Join(spec.Dir, file))
+				if err != nil || !dst.Mode().IsRegular() || os.SameFile(src, dst) {
+					t.Fatalf("sandbox %s is not a private regular file: %v, %v", file, dst, err)
+				}
+			}
+			srcDisk, err := os.Lstat(filepath.Join(base, images.MacOSDisk))
+			if err != nil || srcDisk.Size() != 1<<30 {
+				t.Fatalf("recovered base disk changed: %v, %v", srcDisk, err)
+			}
+		})
+	}
+}
+
 func TestMacOSDiskPreparationUsesOnlySnapshotInputs(t *testing.T) {
 	root := t.TempDir()
 	base := filepath.Join(root, images.MacOSDir)

@@ -316,6 +316,20 @@ type env struct {
 	freeDiskCalls atomic.Int64
 }
 
+// removeAllAndWipe includes the store wipe that follows successful runtime
+// deletion during authenticated device removal.
+func (e *env) removeAllAndWipe(ctx context.Context) error {
+	cleanup, err := e.st.LockCleanup(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup.Close()
+	if err := e.m.RemoveAll(ctx); err != nil {
+		return err
+	}
+	return cleanup.WipeLocalData()
+}
+
 func newEnv(t *testing.T) *env { return newEnvWithLogger(t, nil) }
 
 // newEnvWithLogger is newEnv with a manager logger that a test can read.
@@ -1808,7 +1822,7 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 	failed := e.create(time.Hour, 2*time.Hour).GetSandboxId()
 	other := e.create(time.Hour, 2*time.Hour).GetSandboxId()
 	e.rt.deleteFails = 1
-	if err := e.m.RemoveAll(ctx); err == nil {
+	if err := e.removeAllAndWipe(ctx); err == nil {
 		t.Fatal("RemoveAll returned nil although a runtime Delete failed")
 	}
 	if e.rt.deleteCalls != 2 {
@@ -1830,7 +1844,7 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 		t.Fatalf("record of the failed sandbox was wiped: %v", err)
 	}
 
-	if err := e.m.RemoveAll(ctx); err != nil {
+	if err := e.removeAllAndWipe(ctx); err != nil {
 		t.Fatalf("retry returned %v", err)
 	}
 	if e.rt.deleteCalls != 3 {
@@ -1843,7 +1857,7 @@ func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
 		t.Fatalf("record kept after the complete clean-up: %v", err)
 	}
 
-	if err := e.m.RemoveAll(ctx); err != nil {
+	if err := e.removeAllAndWipe(ctx); err != nil {
 		t.Fatalf("RemoveAll after a complete clean-up returned %v", err)
 	}
 	if e.rt.deleteCalls != 3 {
@@ -1865,7 +1879,7 @@ func TestRemoveAllCancelsCreateAndRetriesFailedDeletion(t *testing.T) {
 	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_CREATING)
 
 	removed := make(chan error, 1)
-	go func() { removed <- e.m.RemoveAll(t.Context()) }()
+	go func() { removed <- e.removeAllAndWipe(t.Context()) }()
 	select {
 	case err := <-created:
 		if err == nil {
@@ -1901,7 +1915,7 @@ func TestRemoveAllCancelsCreateAndRetriesFailedDeletion(t *testing.T) {
 		}
 	}
 	requireCreateRefused()
-	if err := e.m.RemoveAll(t.Context()); err != nil {
+	if err := e.removeAllAndWipe(t.Context()); err != nil {
 		t.Fatalf("removal retry failed: %v", err)
 	}
 	requireCreateRefused()
@@ -4015,7 +4029,7 @@ func TestRemoveAllRetriesAcknowledgedFailedCreate(t *testing.T) {
 	id := retainedFailedCreate(t, e, true)
 	e.rt.deleteFails = 1
 
-	if err := e.m.RemoveAll(t.Context()); err == nil {
+	if err := e.removeAllAndWipe(t.Context()); err == nil {
 		t.Fatal("RemoveAll succeeded despite the failed VM deletion")
 	}
 	if calls := e.rt.deleteCallCount(); calls != 1 {
@@ -4028,7 +4042,7 @@ func TestRemoveAllRetriesAcknowledgedFailedCreate(t *testing.T) {
 	checkFailedCreateFiles(t, e, id, true)
 
 	for range 2 {
-		if err := e.m.RemoveAll(t.Context()); err != nil {
+		if err := e.removeAllAndWipe(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -4122,7 +4136,7 @@ func TestRemoveAllWaitsForFailedCreateCleanup(t *testing.T) {
 						t.Error("failed background Delete dropped pending cleanup")
 					}
 				}
-				if err := e.m.RemoveAll(t.Context()); err != nil {
+				if err := e.removeAllAndWipe(t.Context()); err != nil {
 					t.Fatal(err)
 				}
 				if calls := e.rt.deleteCallCount(); calls != 1+tc.deleteFailures {

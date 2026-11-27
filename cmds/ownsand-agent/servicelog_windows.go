@@ -86,7 +86,7 @@ func ensureStartupEventSource() error {
 // With it, the delete completes when the handle closes. Remove this helper
 // when the Go standard library opens files with FILE_SHARE_DELETE.
 func openServiceLog(path string) (*os.File, error) {
-	name, err := windows.UTF16PtrFromString(path)
+	name, err := windows.UTF16PtrFromString(store.Win32StatePath(path))
 	if err != nil {
 		return nil, err
 	}
