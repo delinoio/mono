@@ -145,8 +145,9 @@ func New(cfg Config) (*Server, error) {
 
 // Close stops admitting writes and fences read snapshot workers. Call it
 // after Run returns. If all writes and write sweeps have finished, Close
-// releases the state directory lock before returning. Otherwise the last
-// operation releases it when it finishes. Concurrent calls are safe.
+// closes the staging handles and releases the state directory lock before
+// returning. Otherwise the last operation does both when it finishes.
+// Concurrent calls are safe.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.writeMu.Lock()
@@ -157,10 +158,11 @@ func (s *Server) Close() error {
 
 		s.writeMu.Lock()
 		s.readsFenced = true
-		if s.activeWrites == 0 {
-			s.lock.release()
-		}
+		drained := s.activeWrites == 0
 		s.writeMu.Unlock()
+		if drained {
+			s.releaseStateDir()
+		}
 	})
 	return nil
 }
@@ -177,11 +179,20 @@ func (s *Server) beginWrite() bool {
 
 func (s *Server) endWrite() {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	s.activeWrites--
-	if s.readsFenced && s.activeWrites == 0 {
-		s.lock.release()
+	drained := s.readsFenced && s.activeWrites == 0
+	s.writeMu.Unlock()
+	if drained {
+		s.releaseStateDir()
 	}
+}
+
+// Close and endWrite use writeMu to select the single caller that observes
+// both the read fence and the drained writes. The write fence prevents any
+// new operation from opening a staging file after that point.
+func (s *Server) releaseStateDir() {
+	s.writes.closeStagingFiles()
+	s.lock.release()
 }
 
 func (s *Server) applyWrite(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteFileResponse, error) {
