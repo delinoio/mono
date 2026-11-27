@@ -388,16 +388,57 @@ func TestStatusAbsentStatusFile(t *testing.T) {
 	}
 }
 
-// A valid status.json keeps the existing report and exit 0.
 func TestStatusValidStatusFile(t *testing.T) {
-	st := statusFixture(t)
-	if err := st.SaveStatus(&agent.Status{Connected: true, AgentVersion: "1.2.3", Runtime: "process"}); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name             string
+		snapshot         agent.Status
+		wantCapabilities string
+	}{
+		{
+			name: "with capability report",
+			snapshot: agent.Status{
+				GuestOSes:      []string{"GUEST_OS_LINUX", "GUEST_OS_MACOS"},
+				BaseImages:     []string{"BASE_IMAGE_LINUX"},
+				CapabilitiesAt: time.Date(2026, 11, 22, 14, 25, 28, 0, time.Local),
+				Checks: []agent.StatusCheck{
+					{ID: "virtualization-entitlement", Passed: true, Detail: "the agent executable has the entitlement"},
+					{ID: "macos-base-image", Detail: "the macOS base image is not built"},
+					{ID: "outbound-network", Passed: true},
+				},
+			},
+			wantCapabilities: " guest OSes GUEST_OS_LINUX, GUEST_OS_MACOS; base images BASE_IMAGE_LINUX (report of 2026-11-22 14:25:28)\n" +
+				"  virtualization-entitlement: passed (the agent executable has the entitlement)\n" +
+				"  macos-base-image: failed (the macOS base image is not built)\n" +
+				"  outbound-network: passed",
+		},
+		{
+			name:             "without capability report",
+			wantCapabilities: " unknown (no capability report yet)",
+		},
 	}
-	var out, errb bytes.Buffer
-	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
-	if code != exitOK || !strings.Contains(out.String(), "Connection: connected") || !strings.Contains(out.String(), "Agent: 1.2.3, runtime process") || strings.Contains(out.String(), "has not run") || errb.Len() != 0 {
-		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := statusFixture(t)
+			snapshot := tt.snapshot
+			snapshot.Connected = true
+			snapshot.AgentVersion = "1.2.3"
+			snapshot.Runtime = "process"
+			if err := st.SaveStatus(&snapshot); err != nil {
+				t.Fatal(err)
+			}
+
+			var out, errb bytes.Buffer
+			code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+			stdout := out.String()
+			if code != exitOK || !strings.Contains(stdout, "Connection: connected") || !strings.Contains(stdout, "Agent: 1.2.3, runtime process") || strings.Contains(stdout, "has not run") || errb.Len() != 0 {
+				t.Fatalf("status: %d %q / %q", code, stdout, errb.String())
+			}
+			_, rest, foundStart := strings.Cut(stdout, "\nCapabilities:")
+			capabilities, _, foundEnd := strings.Cut(rest, "\nSandboxes:")
+			if !foundStart || !foundEnd || capabilities != tt.wantCapabilities {
+				t.Fatalf("stdout = %q; want capability section %q", stdout, "Capabilities:"+tt.wantCapabilities)
+			}
+		})
 	}
 }
 
