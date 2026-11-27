@@ -78,6 +78,7 @@ func TestSupervisorWithLease(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); l.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
 	select {
 	case <-started:
 	case <-time.After(10 * time.Second):
