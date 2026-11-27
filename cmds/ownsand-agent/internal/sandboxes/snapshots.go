@@ -41,11 +41,10 @@ type snapshot struct {
 	// users counts the creates and exports that read the content now; a
 	// delete waits until it is zero.
 	users int
-	// deleting is set when a delete arrived while users was not zero, or when
-	// a removal started. The snapshot takes no new users, and the last user
-	// deletes it. The entry leaves Manager.snapshots only after the stored
-	// record and content were removed, so a failed removal stays visible in
-	// the state report and a repeated delete can retry it.
+	// deleting is set when a delete arrives or a removal starts. The snapshot
+	// takes no new users, and the last user deletes it. The entry leaves
+	// Manager.snapshots only after removal succeeds. A failed removal stays
+	// visible in the state report and a repeated delete can retry it.
 	deleting bool
 	// removeMu serializes the removals of this snapshot: an explicit delete,
 	// the release of the last reader and the removal that an import runs
@@ -78,7 +77,7 @@ type pendingSnapshot struct {
 // the commands, so the delete finds it and cancels the create: the create
 // then returns ABORTED without publishing a ready record. A failed cleanup
 // stays available to a repeated delete. A delete cancels the claims that
-// exist when it runs. A create received after the delete is not canceled.
+// exist when the agent receives it.
 type SnapshotCreateClaim struct {
 	m  *Manager
 	id string
@@ -197,12 +196,16 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	}
 	id := cmd.GetSnapshotId()
 	m.mu.Lock()
-	if snap, ok := m.snapshots[id]; ok {
+	if snap := m.snapshots[id]; snap != nil && (!claim.deleted || !snap.usable()) {
 		// Read the snapshot before the unlock: a delete writes
 		// snap.deleting under m.mu.
 		entry, err := existingSnapshotEntry(snap)
 		m.mu.Unlock()
 		return entry, err
+	}
+	if claim.deleted {
+		m.mu.Unlock()
+		return nil, m.abortedSnapshotError(id)
 	}
 	sb, ok := m.sandboxes[cmd.GetSandboxId()]
 	m.mu.Unlock()
@@ -214,8 +217,10 @@ func (m *Manager) CreateClaimedSnapshot(ctx context.Context, cmd *ownsandv1.Crea
 	m.mu.Lock()
 	state, vm, rec := sb.rec.State, sb.vm, sb.rec
 	// A duplicate create that waited for the sandbox lock finds the
-	// snapshot that the first create published.
-	if snap, ok := m.snapshots[id]; ok {
+	// snapshot that the first create published. A canceled claim can still
+	// see the old entry marked for deletion. It cannot return a ready copy
+	// that a later command published.
+	if snap := m.snapshots[id]; snap != nil && (!claim.deleted || !snap.usable()) {
 		// Read the snapshot before the unlock: a delete writes
 		// snap.deleting under m.mu.
 		entry, err := existingSnapshotEntry(snap)
@@ -568,9 +573,16 @@ func (m *Manager) PrepareSnapshotImport(id string) error {
 // A duplicate that finds the copy marked for deletion returns
 // FAILED_PRECONDITION.
 func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
+	return m.ReceiveSnapshotDelete(cmd)()
+}
+
+// ReceiveSnapshotDelete cancels the claims and marks the copy that exist at
+// receipt. The command worker calls the returned function to complete the
+// command, including any disk removal.
+func (m *Manager) ReceiveSnapshotDelete(cmd *ownsandv1.DeleteSnapshotCommand) func() error {
 	id := cmd.GetSnapshotId()
 	if err := validate.UUIDv7("snapshot_id", id); err != nil {
-		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
+		return func() error { return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err) }
 	}
 	m.mu.Lock()
 	creates := 0
@@ -580,26 +592,27 @@ func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
 		}
 		creates = len(pending.claims)
 	}
-	snap, ok := m.snapshots[id]
-	if !ok {
-		m.mu.Unlock()
-		if creates > 0 {
-			m.logger.Info("snapshot delete recorded during its create", "snapshot_id", id, "creates", creates)
-		}
-		return nil
-	}
-	if snap.users > 0 {
+	snap := m.snapshots[id]
+	var users int
+	if snap != nil {
 		snap.deleting = true
-		users := snap.users
-		m.mu.Unlock()
-		m.logger.Info("snapshot delete deferred until its readers end", "snapshot_id", id, "users", users)
-		return nil
+		users = snap.users
 	}
-	// Mark the copy under the lock, so that no reader starts before the
-	// removal; the entry leaves m.snapshots only when the removal succeeded.
-	snap.deleting = true
 	m.mu.Unlock()
-	return m.removeSnapshotEntry(snap)
+	return func() error {
+		switch {
+		case snap == nil:
+			if creates > 0 {
+				m.logger.Info("snapshot delete recorded during its create", "snapshot_id", id, "creates", creates)
+			}
+			return nil
+		case users > 0:
+			m.logger.Info("snapshot delete deferred until its readers end", "snapshot_id", id, "users", users)
+			return nil
+		default:
+			return m.removeSnapshotEntry(snap)
+		}
+	}
 }
 
 // SnapshotContent returns the content directory and entry of a ready local

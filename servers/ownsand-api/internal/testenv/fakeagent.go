@@ -276,6 +276,8 @@ func (a *FakeAgent) ResumeReads() {
 
 func (a *FakeAgent) read() {
 	defer close(a.closed)
+	// Release the gate before reporting that the channel has closed.
+	defer a.ResumeReads()
 	for {
 		a.mu.Lock()
 		gate := a.readGate
