@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { readdirSync, readFileSync } from "node:fs";
-import { afterEach, describe, expect, test } from "@rstest/core";
+import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
@@ -2240,6 +2240,68 @@ describe("Avatar", () => {
       fallback.closest("[data-slot='avatar']")?.getAttribute("data-size"),
     ).toBe("large");
   });
+
+  test("shows decorative initials without exposing them when there is no source", () => {
+    render(<Avatar alt="" fallback="AL" />);
+
+    const fallback = screen.getByText("AL");
+    expect(fallback.getAttribute("aria-hidden")).toBe("true");
+    expect(fallback.hasAttribute("role")).toBe(false);
+    expect(fallback.hasAttribute("aria-label")).toBe(false);
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+
+  test("keeps the decorative fallback hidden while loading and after an error", async () => {
+    using complete = rs.spyOn(HTMLImageElement.prototype, "complete", "get");
+    complete.mockReturnValue(false);
+    const { container } = render(
+      <Avatar alt="" fallback="AL" src="/ada.png" />,
+    );
+
+    const image = container.querySelector("img")!;
+    const fallback = screen.getByText("AL");
+    expect(fallback.getAttribute("data-loading-status")).toBe("loading");
+    expect(fallback.getAttribute("aria-hidden")).toBe("true");
+    expect(screen.queryByRole("img")).toBeNull();
+
+    await act(async () => {
+      fireEvent.error(image);
+    });
+
+    expect(screen.getByText("AL")).toBe(fallback);
+    expect(fallback.getAttribute("data-loading-status")).toBe("error");
+    expect(fallback.getAttribute("aria-hidden")).toBe("true");
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+
+  test.each(["", "Ada Lovelace"])(
+    "uses only the native image after loading with alt %j",
+    async (alt) => {
+      const { container } = render(
+        <Avatar alt={alt} fallback="AL" src="/ada.png" />,
+      );
+
+      const fallback = screen.getByText("AL");
+      const image = container.querySelector("img")!;
+      expect(screen.queryAllByRole("img")).toEqual(alt ? [fallback] : []);
+      if (alt) {
+        expect(screen.getByRole("img", { name: alt })).toBe(fallback);
+      }
+
+      await act(async () => {
+        fireEvent.load(image);
+      });
+
+      expect(screen.queryByText("AL")).toBeNull();
+      expect(container.querySelector("img")).toBe(image);
+      expect(image.getAttribute("alt")).toBe(alt);
+      expect(image.hasAttribute("aria-hidden")).toBe(false);
+      expect(screen.queryAllByRole("img")).toEqual(alt ? [image] : []);
+      if (alt) {
+        expect(screen.getByRole("img", { name: alt })).toBe(image);
+      }
+    },
+  );
 
   test.each(["", "   "])("treats the blank src %j as no image", (src) => {
     const { container } = render(
