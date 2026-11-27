@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/go/ownsand"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/cursor"
@@ -253,6 +254,55 @@ func TestCursorRequestLifecycle(t *testing.T) {
 	}
 	if strings.Contains(w.env.Logs.String(), cursorKey) {
 		t.Fatal("the API key reached the log")
+	}
+}
+
+func TestCursorCredentialCleanupFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		started bool
+		reason  sandrunv1.RequestEndReason
+	}{
+		{"exit before start event", false, sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED},
+		{"exit after start event", true, sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_LOST},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			cleanupCode := int64(22)
+			w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+				result := &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: new(int64)}
+				if !strings.Contains(p.Command[len(p.Command)-1], agent.LogFile) {
+					return result, nil
+				}
+				if tc.started {
+					return nil, p.OnEvent(ownsand.ExecEvent{Kind: ownsand.ExecEventStarted, ExecID: p.ExecID})
+				}
+				result.ExitCode = &cleanupCode
+				return result, nil
+			}, func(_ context.Context, _, execID string, _ ownsand.AttachParams) (*ownsand.ExecResult, error) {
+				return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &cleanupCode}, nil
+			})
+			const id = "credential-cleanup-failed"
+			w.cursor.AddRequest(id, true)
+			req := w.requestBySource(t, id)
+			failed := w.waitRequest(t, req.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_FAILED)
+			if failed.GetEndReason() != tc.reason {
+				t.Fatalf("end reason = %s, want %s", failed.GetEndReason(), tc.reason)
+			}
+			eventually(t, "sandbox deletion", func() bool {
+				return w.fake.Calls("DeleteSandbox") > 0 && w.fake.Active(w.osOrg) == 0
+			})
+			if (w.fake.Calls("AttachExec") > 0) != tc.started {
+				t.Fatalf("unexpected attach count: %d", w.fake.Calls("AttachExec"))
+			}
+			logs := w.env.Logs.String()
+			if !tc.started && !strings.Contains(logs, "exit code 22") {
+				t.Error("the startup diagnostic lacks the cleanup exit code")
+			}
+			if strings.Contains(logs, cursorKey) {
+				t.Error("the credential reached the log")
+			}
+		})
 	}
 }
 

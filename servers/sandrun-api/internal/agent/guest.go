@@ -220,7 +220,8 @@ type Program struct {
 // StartScript returns the script that reads the credential file into the
 // environment, deletes the file, changes to the home directory and runs
 // the program with its output appended to the runner log. Exit code 20
-// means that the credential file was missing.
+// means the credential file could not be read. Exit code 22 means it
+// could not be removed.
 func StartScript(guest sandrunv1.GuestOs, p Program) string {
 	var b strings.Builder
 	b.WriteString(ScriptPrelude(guest, p.ExtraBins...))
@@ -229,7 +230,7 @@ func StartScript(guest sandrunv1.GuestOs, p Program) string {
 	log := JoinPath(guest, p.Dir, LogFile)
 	if IsWindows(guest) {
 		fmt.Fprintf(&b, "try { $env:%s = [IO.File]::ReadAllText(%s) } catch { exit 20 }\n", p.CredentialEnv, Quote(guest, cred))
-		fmt.Fprintf(&b, "Remove-Item -Force -LiteralPath %s\n", Quote(guest, cred))
+		fmt.Fprintf(&b, "try { Remove-Item -Force -LiteralPath %s -ErrorAction Stop } catch { exit 22 }\n", Quote(guest, cred))
 		for _, kv := range p.Env {
 			fmt.Fprintf(&b, "$env:%s = %s\n", kv[0], Quote(guest, kv[1]))
 		}
@@ -253,7 +254,7 @@ func StartScript(guest sandrunv1.GuestOs, p Program) string {
 		fmt.Fprintf(&b, " *>> %s\nexit $LASTEXITCODE\n", Quote(guest, log))
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%s=$(cat %s) || exit 20\nrm -f %s\nexport %s\n", p.CredentialEnv, Quote(guest, cred), Quote(guest, cred), p.CredentialEnv)
+	fmt.Fprintf(&b, "%s=$(cat %s) || exit 20\nrm -f %s >/dev/null 2>&1 || exit 22\nexport %s\n", p.CredentialEnv, Quote(guest, cred), Quote(guest, cred), p.CredentialEnv)
 	for _, kv := range p.Env {
 		fmt.Fprintf(&b, "export %s=%s\n", kv[0], Quote(guest, kv[1]))
 	}
