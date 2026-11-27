@@ -50,7 +50,7 @@ func TestKeepaliveEchoWhileOutboundQueueIsFull(t *testing.T) {
 		sent <- f
 		return nil
 	})
-	awaitIdleSendEntry(t, writerBlocked, done)
+	awaitSendEntry(t, writerBlocked, done)
 	closing := openStream(t, c)
 	receiving := openStream(t, c)
 	for i := 2; i < outboundQueue; i++ {
