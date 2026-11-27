@@ -1,0 +1,76 @@
+{
+  "gid": "inv-34-windows-open-log-reset-fixture",
+  "commit": "bf4748c500b67349a585e6f8b20fdb7e9f368f6e",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows amd64",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "bf4748c500b67349a585e6f8b20fdb7e9f368f6e",
+    "sourceTree": "cd304c5e3754f2b050b91cf28c14d815a64b32fe",
+    "setup": "Run in a clean checkout on local NTFS, using PowerShell 7 and the repository Go toolchain. Use a non-elevated account with write access to the checkout and its temporary directory. The positive test uses the real service log opener and the normal enrollment lock. The test needs no symlink creation, tar extraction, protected ACLs, service control, DiskPart, or Hyper-V. The two overlays replace only the test fixture.",
+    "commands": [
+      "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $false",
+      "if ((git rev-parse HEAD).Trim() -ne 'bf4748c500b67349a585e6f8b20fdb7e9f368f6e') { throw 'Unexpected validation revision' }",
+      "$identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = [Security.Principal.WindowsPrincipal]::new($identity)",
+      "if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run the standard checks without elevation' }",
+      "$work = (New-Item -ItemType Directory -Force -Path '.t3-tmp\\open-log-reset').FullName",
+      "$testTemp = (New-Item -ItemType Directory -Force -Path (Join-Path $work ('standard-' + [guid]::NewGuid().ToString('N')))).FullName; $env:TEMP = $testTemp; $env:TMP = $testTemp; $env:GOTMPDIR = $testTemp",
+      "$ownerSid = (Get-Acl -LiteralPath $testTemp).GetOwner([Security.Principal.SecurityIdentifier]); if ($ownerSid.Value -ne $identity.User.Value) { throw 'Expected a user-owned test directory' }",
+      "$report = & go test '-mod=readonly' './cmds/ownsand-agent' '-run' '^TestResetDeletesStateWhileServiceLogIsOpen$' '-count=1' '-v' 2>&1; $exitCode = $LASTEXITCODE; $report | Tee-Object -FilePath (Join-Path $work 'windows-standard.log'); if ($exitCode -ne 0 -or ($report -join [Environment]::NewLine) -notmatch '--- PASS: TestResetDeletesStateWhileServiceLogIsOpen') { throw 'Windows reset fixture did not pass' }",
+      "$source = (Resolve-Path 'cmds/ownsand-agent/servicelog_windows_test.go').Path; $replacement = Join-Path $work 'negative-servicelog_windows_test.go'; $overlay = Join-Path $work 'negative-overlay.json'; $mapping = @{ Replace = @{} }; $mapping.Replace[$source] = $replacement; [IO.File]::WriteAllText($overlay, ($mapping | ConvertTo-Json -Depth 3 -Compress))",
+      "if ((Get-FileHash -Algorithm SHA256 -LiteralPath $replacement).Hash.ToLowerInvariant() -ne 'e04232f45b8d386b1d2d7926fdd7287ee814311714f4e5fef2873666f4e06b08') { throw 'Unexpected negative-control source' }",
+      "$report = & go test '-mod=readonly' '-overlay' $overlay './cmds/ownsand-agent' '-run' '^TestResetDeletesStateWhileServiceLogIsOpen$' '-count=1' '-v' 2>&1; $exitCode = $LASTEXITCODE; $report | Tee-Object -FilePath (Join-Path $work 'windows-negative.log'); if ($exitCode -ne 1 -or ($report -join [Environment]::NewLine) -notmatch 'Reset with the log open:.*agent[.]log') { throw 'Negative control did not fail at log deletion' }",
+      "$source = (Resolve-Path 'cmds/ownsand-agent/servicelog_windows_test.go').Path; $original = git show 'babe8113d35dd4d8a8a95e0d8782481b238543e8:cmds/ownsand-agent/servicelog_windows_test.go'; if ($LASTEXITCODE -ne 0) { throw 'Cannot read START fixture' }; [IO.File]::WriteAllLines((Join-Path $work 'start-servicelog_windows_test.go'), [string[]]$original); $replacement = Join-Path $work 'start-servicelog_windows_test.go'; $overlay = Join-Path $work 'start-overlay.json'; $mapping = @{ Replace = @{} }; $mapping.Replace[$source] = $replacement; [IO.File]::WriteAllText($overlay, ($mapping | ConvertTo-Json -Depth 3 -Compress))",
+      "$report = & go test '-mod=readonly' '-overlay' $overlay './cmds/ownsand-agent' '-run' '^TestResetDeletesStateWhileServiceLogIsOpen$' '-count=1' '-v' 2>&1; $exitCode = $LASTEXITCODE; $report | ForEach-Object { [string]$_ -replace '(store: restrict state directory: ).*?(state directory and its content must be owned by).*', '$1[owner and temp path redacted] $2 [allowed principals omitted]' } | Tee-Object -FilePath (Join-Path $work 'windows-start.log'); if ($exitCode -ne 1 -or ($report -join [Environment]::NewLine) -notmatch 'store: restrict state directory: .*state directory and its content must be owned by') { throw 'START fixture did not fail at the owner check' }"
+    ],
+    "expectedResults": [
+      "The standard-user test exits 0 and passes the reset, post-reset append, successful close and three file absence checks.",
+      "The os.OpenFile negative control exits 1 at the Reset with the log open assertion. The error identifies agent.log and reports a Windows sharing violation.",
+      "The START fixture exits 1 at the store owner check before it reaches reset. Its local report redacts the owner and temp path."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-windows-open-log-reset-fixture/worker/.t3-tmp/open-log-reset/negative-servicelog_windows_test.go",
+      "copyTo": ".t3-tmp\\open-log-reset\\negative-servicelog_windows_test.go",
+      "sha256": "e04232f45b8d386b1d2d7926fdd7287ee814311714f4e5fef2873666f4e06b08",
+      "regressionTests": ["cmds/ownsand-agent/servicelog_windows_test.go"],
+      "outputLogs": [
+        ".t3-tmp\\open-log-reset\\windows-standard.log",
+        ".t3-tmp\\open-log-reset\\windows-negative.log",
+        ".t3-tmp\\open-log-reset\\windows-start.log",
+        ".t3-tmp\\open-log-reset\\windows-elevated.log"
+      ],
+      "crossBuildArtifacts": [
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-windows-open-log-reset-fixture/worker/.t3-tmp/open-log-reset/ownsand-agent-windows-amd64.test.exe",
+          "sha256": "840d2b6cc2b9c2ca29647abcf079745266000a0160f43616edc56e3ccd4f645b"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-windows-open-log-reset-fixture/worker/.t3-tmp/open-log-reset/ownsand-agent-windows-amd64-negative.test.exe",
+          "sha256": "c41db7c0887ad7b2621b3d031863483518141dcc9fcd9ebe34c377a4231d2c47"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-windows-open-log-reset-fixture/worker/.t3-tmp/open-log-reset/ownsand-agent-windows-amd64-start.test.exe",
+          "sha256": "474d245bc5e9f8445637da65f6135710a00acc38c1bda3be73e81a45cf48fa18"
+        }
+      ],
+      "directExecutionAlternative": "Copy a listed binary to $work. Run & (Join-Path $work '<binary filename>') '-test.run=^TestResetDeletesStateWhileServiceLogIsOpen$' '-test.count=1' '-test.v' under the same account and temporary-directory conditions. Use the candidate, negative and START executables for the corresponding cases."
+    },
+    "requiresElevation": {
+      "status": "pending",
+      "reason": "The elevated repeat is part of acceptance and requires a separate administrator PowerShell session. The standard validation account cannot perform this repeat.",
+      "commands": [
+        "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $false",
+        "if ((git rev-parse HEAD).Trim() -ne 'bf4748c500b67349a585e6f8b20fdb7e9f368f6e') { throw 'Unexpected validation revision' }",
+        "$identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = [Security.Principal.WindowsPrincipal]::new($identity)",
+        "if (-not ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) { throw 'Run this repeat in an elevated PowerShell session' }",
+        "$work = (New-Item -ItemType Directory -Force -Path '.t3-tmp\\open-log-reset').FullName",
+        "$testTemp = (New-Item -ItemType Directory -Force -Path (Join-Path $work ('elevated-' + [guid]::NewGuid().ToString('N')))).FullName; $env:TEMP = $testTemp; $env:TMP = $testTemp; $env:GOTMPDIR = $testTemp",
+        "$report = & go test '-mod=readonly' './cmds/ownsand-agent' '-run' '^TestResetDeletesStateWhileServiceLogIsOpen$' '-count=1' '-v' 2>&1; $exitCode = $LASTEXITCODE; $report | Tee-Object -FilePath (Join-Path $work 'windows-elevated.log'); if ($exitCode -ne 0 -or ($report -join [Environment]::NewLine) -notmatch '--- PASS: TestResetDeletesStateWhileServiceLogIsOpen') { throw 'Windows reset fixture did not pass' }"
+      ],
+      "expectedResults": [
+        "The elevated test exits 0 and passes the same reset, post-reset append, close and absence checks."
+      ]
+    }
+  }
+}
