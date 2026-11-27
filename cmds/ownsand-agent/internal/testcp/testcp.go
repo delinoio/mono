@@ -53,6 +53,23 @@ type Channel struct {
 // Close ends the channel from the control plane side.
 func (c *Channel) Close() { c.once.Do(func() { close(c.done) }) }
 
+func (c *Channel) enqueue(env *ownsandv1.AgentEnvelope) bool {
+	// Reject a channel that was already closed before this send. If closure
+	// overlaps the send, either case in the second select can still win.
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+
+	select {
+	case c.out <- env:
+		return true
+	case <-c.done:
+		return false
+	}
+}
+
 // Server is the fake control plane.
 type Server struct {
 	URL string
@@ -471,26 +488,13 @@ func (s *Server) record(ch *Channel, env *ownsandv1.AgentEnvelope) {
 }
 
 func (s *Server) sendOn(ch *Channel, env *ownsandv1.AgentEnvelope) {
-	select {
-	case ch.out <- env:
-	case <-ch.done:
-	}
+	ch.enqueue(env)
 }
 
-// Send sends an envelope on the current channel.
+// Send reports whether it queued an envelope on the current channel.
 func (s *Server) Send(env *ownsandv1.AgentEnvelope) bool {
-	s.mu.Lock()
-	ch := s.channel
-	s.mu.Unlock()
-	if ch == nil {
-		return false
-	}
-	select {
-	case ch.out <- env:
-		return true
-	case <-ch.done:
-		return false
-	}
+	ch := s.Current()
+	return ch != nil && ch.enqueue(env)
 }
 
 // IssueCredential creates a device session credential without the
