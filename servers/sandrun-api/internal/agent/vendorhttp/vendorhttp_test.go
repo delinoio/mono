@@ -194,6 +194,84 @@ func TestClientSuccessfulJSONAndSSE(t *testing.T) {
 	}
 }
 
+func TestStreamErrorBodyDeadline(t *testing.T) {
+	const budget = 150 * time.Millisecond
+	for _, path := range []string{"/diagnostic-timeout", "/parent-cancellation", "/healthy"} {
+		t.Run(path[1:], func(t *testing.T) {
+			requestCanceled := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/healthy" {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.(http.Flusher).Flush()
+					time.Sleep(2 * budget)
+					fmt.Fprint(w, "data: delayed event\n\n")
+					return
+				}
+				w.Header().Set("Retry-After", "7")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprint(w, "partial diagnostic")
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+				close(requestCanceled)
+			}))
+			t.Cleanup(srv.Close)
+			deadline, stop := context.WithTimeout(t.Context(), 5*time.Second)
+			defer stop()
+			ctx, cancel := context.WithCancel(deadline)
+			defer cancel()
+			c := Client{Vendor: "DEVIN", BaseURL: srv.URL, StreamErrorBodyTimeout: budget}
+			if path == "/parent-cancellation" {
+				c.StreamErrorBodyTimeout = time.Minute
+				c.HTTP = &http.Client{Transport: cancelOnBodyRead{cancel: cancel}}
+			}
+
+			var data string
+			err := c.Stream(ctx, "watch_queue", path, nil, nil, func(e Event) error {
+				data = string(e.Data)
+				return nil
+			})
+			if path == "/healthy" {
+				if err != nil || data != "delayed event" {
+					t.Fatalf("healthy stream: data %q, error %v", data, err)
+				}
+				return
+			}
+			if deadline.Err() != nil || (path == "/diagnostic-timeout" && ctx.Err() != nil) {
+				t.Fatalf("read returned only after caller timeout: %v", err)
+			}
+			want := StatusError{Vendor: "DEVIN", Op: "watch_queue", Status: http.StatusServiceUnavailable, RetryAfter: 7 * time.Second}
+			if got, ok := AsStatus(err); !ok || *got != want {
+				t.Fatalf("status error = %#v, want %+v", err, want)
+			}
+			select {
+			case <-requestCanceled:
+			case <-deadline.Done():
+				t.Fatal("blocked diagnostic read did not cancel the HTTP request")
+			}
+		})
+	}
+}
+
+type cancelOnBodyRead struct{ cancel context.CancelFunc }
+
+func (tr cancelOnBodyRead) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err == nil {
+		resp.Body = cancelingBody{ReadCloser: resp.Body, cancel: tr.cancel}
+	}
+	return resp, err
+}
+
+type cancelingBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelingBody) Read(p []byte) (int, error) {
+	b.cancel()
+	return b.ReadCloser.Read(p)
+}
+
 func TestClientErrorsAndLogs(t *testing.T) {
 	for _, tc := range []struct {
 		name, vendor, body, wantCode string

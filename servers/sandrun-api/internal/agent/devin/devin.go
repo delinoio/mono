@@ -44,6 +44,17 @@ import (
 // DefaultBaseURL is the Devin API origin.
 const DefaultBaseURL = "https://api.devin.ai"
 
+// Rotate before Devin's five-minute stream limit.
+const defaultWatchRefreshInterval = 4*time.Minute + 30*time.Second
+
+var defaultWatchHTTP = newWatchHTTPClient(http.DefaultTransport.(*http.Transport), vendorhttp.DefaultCallTimeout)
+
+func newWatchHTTPClient(transport *http.Transport, headerTimeout time.Duration) *http.Client {
+	watchTransport := transport.Clone()
+	watchTransport.ResponseHeaderTimeout = headerTimeout
+	return &http.Client{Transport: watchTransport}
+}
+
 // DefaultReleaseGrace (recorded decision): after the worker exits, Devin
 // asks the orchestrator to confirm that session_status is suspended or
 // terminated before it releases the claim, because the status can lag the
@@ -55,8 +66,13 @@ const DefaultReleaseGrace = 2 * time.Minute
 type Options struct {
 	// BaseURL is the Devin API origin; empty selects DefaultBaseURL.
 	BaseURL string
-	// HTTP sends the API calls; nil selects http.DefaultClient.
+	// HTTP overrides both HTTP clients. By default, unary calls use
+	// http.DefaultClient and watches use a separate client with a header timeout.
 	HTTP *http.Client
+	// WatchRefreshInterval overrides the scheduled rotation interval in tests.
+	WatchRefreshInterval time.Duration
+	// WatchErrorBodyTimeout overrides the watch diagnostic read timeout in tests.
+	WatchErrorBodyTimeout time.Duration
 	// ReleaseGrace is the longest wait for a confirmed session end before
 	// SandRun releases the claim; zero selects DefaultReleaseGrace.
 	ReleaseGrace time.Duration
@@ -78,6 +94,9 @@ func Register(hub *agent.Hub, opts Options) *Vendor {
 	}
 	if opts.ReleaseGrace == 0 {
 		opts.ReleaseGrace = DefaultReleaseGrace
+	}
+	if opts.WatchRefreshInterval == 0 {
+		opts.WatchRefreshInterval = defaultWatchRefreshInterval
 	}
 	v := &Vendor{hub: hub, opts: opts, log: hub.Service().Logger}
 	hub.AddVendor(v)
@@ -173,8 +192,8 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) {
 }
 
 // watchSession resolves the outpost, lists its pending sessions, admits each one,
-// and follows the watch stream from the list's cursor. Devin ends a watch
-// stream after at most 5 minutes; that end is scheduled.
+// and follows the watch stream from the list's cursor until scheduled rotation
+// or a failure.
 func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch) error {
 	c, err := v.api(ctx, w.In)
 	if err != nil {
@@ -224,7 +243,14 @@ func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch) error {
 	if cursor != "" {
 		q.Set("cursor", cursor)
 	}
-	err = c.Stream(ctx, "watch_queue", "/opbeta/outposts/devins", q, nil, func(e vendorhttp.Event) error {
+	streamCtx, cancel := context.WithTimeout(ctx, v.opts.WatchRefreshInterval)
+	defer cancel()
+	watch := *c
+	if watch.HTTP == nil {
+		watch.HTTP = defaultWatchHTTP
+	}
+	watch.StreamErrorBodyTimeout = v.opts.WatchErrorBodyTimeout
+	err = watch.Stream(streamCtx, "watch_queue", "/opbeta/outposts/devins", q, nil, func(e vendorhttp.Event) error {
 		var ev watchEvent
 		if err := json.Unmarshal(e.Data, &ev); err != nil || ev.Object.Metadata.SessionID == "" {
 			w.Logger.WarnContext(ctx, "vendor_event_invalid", slog.String("event", e.Name))
@@ -233,8 +259,13 @@ func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch) error {
 		v.handle(ctx, w, c, outpost, ev.Type, &ev.Object)
 		return nil
 	})
-	if ctx.Err() != nil {
+	switch {
+	case ctx.Err() != nil:
 		return ctx.Err()
+	case err == context.DeadlineExceeded && streamCtx.Err() == context.DeadlineExceeded:
+		return nil
+	case err == nil:
+		return errors.New("the Devin queue stream ended before scheduled rotation")
 	}
 	return err
 }
