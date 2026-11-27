@@ -85,6 +85,7 @@ type Agent struct {
 	conn       *conn
 	generation uint64
 	reportSeq  uint64
+	resumes    map[string]chan struct{} // received resume commands that can still change a sandbox
 	urlWaiters map[string]chan *ownsandv1.SignedUrlGrant
 	// urlGrantTimeout overrides defaultURLGrantTimeout; tests set it.
 	urlGrantTimeout time.Duration
