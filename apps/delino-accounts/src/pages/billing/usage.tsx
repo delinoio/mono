@@ -112,9 +112,14 @@ function UsageSummary() {
           {rows.length === 0 ? (
             <Empty title="No usage in this month" />
           ) : (
-            <div className="table-wrap">
+            <div
+              className="table-wrap"
+              role="region"
+              aria-labelledby="usage-table-caption"
+              tabIndex={0}
+            >
               <table className="table">
-                <caption className="visually-hidden">
+                <caption id="usage-table-caption" className="visually-hidden">
                   Usage by service, organization and meter
                 </caption>
                 <thead>
