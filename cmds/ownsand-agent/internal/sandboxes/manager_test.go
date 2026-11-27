@@ -3760,6 +3760,7 @@ func TestFailedCreateCleanupStopsAfterClose(t *testing.T) {
 // because the VM may still be live, and stops counting once a retry confirmed
 // the stop.
 func TestBusyWhileVMStopIsPendingOrFailed(t *testing.T) {
+	const timeout = 5 * time.Second
 	e := newEnv(t)
 	ctx := context.Background()
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
@@ -3769,12 +3770,29 @@ func TestBusyWhileVMStopIsPendingOrFailed(t *testing.T) {
 	e.rt.deleteFails = 1
 	started, block := e.rt.deleteStarted, e.rt.deleteBlock
 	e.rt.mu.Unlock()
-	done := make(chan error, 1)
+	release := sync.OnceFunc(func() { close(block) })
+	var entry *ownsandv1.SandboxStateEntry
+	var deleteErr error
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			t.Error("delete did not finish during cleanup")
+		}
+	})
 	go func() {
-		_, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id})
-		done <- err
+		defer close(done)
+		entry, deleteErr = e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id})
 	}()
-	<-started
+	select {
+	case <-started:
+	case <-done:
+		t.Fatalf("delete finished before the VM stop started: %v, %v", entry, deleteErr)
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for the VM stop to start")
+	}
 	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
 		t.Fatalf("state %v, want DELETING", s)
 	}
@@ -3782,8 +3800,13 @@ func TestBusyWhileVMStopIsPendingOrFailed(t *testing.T) {
 		t.Fatal("not busy while the VM stop is pending")
 	}
 	// The injected failure ends the pending stop without confirming it.
-	close(block)
-	requireInternal(t, <-done)
+	release()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for delete after releasing the VM stop")
+	}
+	requireInternal(t, deleteErr)
 	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
 		t.Fatalf("state after failed stop %v, want DELETING", s)
 	}
