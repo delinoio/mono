@@ -172,7 +172,7 @@ func TestRelayWriteFileQueueLimitBeforeCredit(t *testing.T) {
 	c := startWriteCall(t, 15*time.Second, 0, func(o *app.Options) {
 		o.RelayLimits = &limits
 	})
-	defer c.sendWriteResult()
+	defer c.releaseWriteResult()
 	for range limits.MaxQueuedFrames + 1 {
 		c.relay.SendFrame(datapath.MustNewFrame(c.stream, c.sandboxID, &ownsandv1.WriteFileResponse{}))
 	}
