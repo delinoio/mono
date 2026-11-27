@@ -18,6 +18,15 @@ import (
 // runtime does not provide.
 var ErrUnsupported = errors.New("vmruntime: not supported")
 
+// EffectiveMemoryMiB returns the configured memory for a VM. Hyper-V rounds
+// up to whole 2 MiB pages. A rounded size can exceed math.MaxInt64.
+func EffectiveMemoryMiB(kind config.RuntimeKind, requestedMiB int64) uint64 {
+	if kind == config.RuntimeKindHyperV && requestedMiB%2 == 1 {
+		return uint64(requestedMiB) + 1
+	}
+	return uint64(requestedMiB)
+}
+
 // SnapshotSource is the snapshot that a new sandbox starts from.
 type SnapshotSource struct {
 	SnapshotID string

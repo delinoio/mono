@@ -421,7 +421,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 				return nil, err
 			}
 			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			clockErr := guestclient.New(v.Dial).SetClock(clockCtx, time.Now())
+			clockErr := guestclient.SetClockOnce(clockCtx, v.Dial, time.Now())
 			cancel()
 			if err := ctx.Err(); err != nil {
 				cleanup()
