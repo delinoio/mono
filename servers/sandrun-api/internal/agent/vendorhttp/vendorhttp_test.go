@@ -53,6 +53,8 @@ func TestReadEventsLineEndingsAndBOM(t *testing.T) {
 		{"LF", "data: ok\n\n", []Event{{Name: "message", Data: []byte("ok")}}},
 		{"CRLF", "data: ok\r\n\r\n", []Event{{Name: "message", Data: []byte("ok")}}},
 		{"CR", "data: ok\r\r", []Event{{Name: "message", Data: []byte("ok")}}},
+		{"empty data", "data\n\n", []Event{{Name: "message", Data: []byte{}}}},
+		{"empty data lines", "data:\ndata: ok\ndata:\n\n", []Event{{Name: "message", Data: []byte("\nok\n")}}},
 		{
 			"mixed with split CRLF",
 			"event: created\r\nid: c1\rdata: first\n: comment\rdata: second\r\n\r\ndata: after\n\n",
@@ -117,6 +119,50 @@ func TestReadEventsReaderErrorAndLineLimit(t *testing.T) {
 		if err := ReadEvents(strings.NewReader(line+ending+ending), unexpectedEvent); err == nil {
 			t.Errorf("ReadEvents accepted an oversized line ending in %q", ending)
 		}
+	}
+}
+
+func TestReadEventsPayloadLimit(t *testing.T) {
+	const limit = 1 << 20
+	first := strings.Repeat("é", limit/4)
+	second := strings.Repeat("b", limit-len(first)-1)
+	for _, tc := range []struct {
+		name   string
+		suffix string
+	}{
+		{name: "at limit"},
+		{name: "over limit from data", suffix: "b"},
+		{name: "over limit from separator", suffix: "\rdata:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "id: cursor\ndata: before\n\nevent: large\r\ndata: " + first +
+				"\r\ndata: " + second + tc.suffix + "\r\n\r\ndata: after\n\n"
+			var got []Event
+			err := ReadEvents(strings.NewReader(body), func(e Event) error {
+				got = append(got, e)
+				return nil
+			})
+			if tc.suffix != "" {
+				if err == nil || err.Error() != fmt.Sprintf("event stream payload exceeds %d bytes", limit) {
+					t.Errorf("ReadEvents returned %v, want a payload limit error", err)
+				}
+				if len(got) != 1 || got[0].ID != "cursor" || string(got[0].Data) != "before" {
+					t.Errorf("want only the preceding event, got %d events", len(got))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []Event{
+				{ID: "cursor", Name: "message", Data: []byte("before")},
+				{ID: "cursor", Name: "large", Data: []byte(first + "\n" + second)},
+				{ID: "cursor", Name: "message", Data: []byte("after")},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("want three ordered events with ID carryover and complete payloads, got %d events", len(got))
+			}
+		})
 	}
 }
 

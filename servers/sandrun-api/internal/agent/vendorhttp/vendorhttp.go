@@ -38,6 +38,8 @@ const (
 	maxBody = 4 << 20
 	// maxEventLine bounds one line of an event stream.
 	maxEventLine = 1 << 20
+	// maxEventData bounds the joined data lines of one event.
+	maxEventData = 1 << 20
 	// maxErrorBody bounds the body used to check for a known error code.
 	maxErrorBody = 64 << 10
 	// DefaultCallTimeout bounds one unary call when the caller's context has
@@ -303,12 +305,13 @@ func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, 
 // following the WHATWG event stream rules. It skips one leading UTF-8 BOM
 // and accepts LF, CRLF, and CR line endings. Comment lines start with `:`.
 // A blank line dispatches an event with data, joining its `data:` lines with `\n`.
+// A payload above maxEventData ends the stream with an error before dispatch.
 func ReadEvents(r io.Reader, fn func(Event) error) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), maxEventLine)
 	sc.Split(splitEventLines())
 	var ev Event
-	var data [][]byte
+	data := []byte{}
 	hasData := false
 	firstLine := true
 	for sc.Scan() {
@@ -319,7 +322,7 @@ func ReadEvents(r io.Reader, fn func(Event) error) error {
 		}
 		if len(line) == 0 {
 			if hasData {
-				ev.Data = bytes.Join(data, []byte("\n"))
+				ev.Data = data
 				if ev.Name == "" {
 					ev.Name = "message"
 				}
@@ -327,7 +330,7 @@ func ReadEvents(r io.Reader, fn func(Event) error) error {
 					return err
 				}
 			}
-			ev, data, hasData = Event{ID: ev.ID}, nil, false
+			ev, data, hasData = Event{ID: ev.ID}, []byte{}, false
 			continue
 		}
 		if line[0] == ':' {
@@ -339,7 +342,17 @@ func ReadEvents(r io.Reader, fn func(Event) error) error {
 		case "event":
 			ev.Name = string(value)
 		case "data":
-			data = append(data, append([]byte(nil), value...))
+			size := len(data) + len(value)
+			if hasData {
+				size++ // Include the newline between data lines.
+			}
+			if size > maxEventData {
+				return fmt.Errorf("event stream payload exceeds %d bytes", maxEventData)
+			}
+			if hasData {
+				data = append(data, '\n')
+			}
+			data = append(data, value...)
 			hasData = true
 		case "id":
 			if !bytes.ContainsRune(value, 0) {
