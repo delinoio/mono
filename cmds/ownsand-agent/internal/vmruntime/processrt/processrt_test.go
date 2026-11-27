@@ -439,51 +439,73 @@ func TestDeleteNeverContinuesHelperBeforeKill(t *testing.T) {
 	}
 }
 
-// TestPauseFailureContinuesHelper checks that Pause resumes the helper when
-// listing the exec process groups fails after the helper has stopped.
+// TestPauseFailureContinuesHelper checks rollback and retry after a helper
+// stop confirmation or worker enumeration fails.
 func TestPauseFailureContinuesHelper(t *testing.T) {
-	rt := newRuntime(t)
-	v := createSandbox(t, rt)
-	shell, sleeper := startWorker(t, v)
-	helper, err := rt.lookup(v.SandboxID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	helperPID := helper.helper.pid
+	for _, stage := range []string{"helper stop", "worker enumeration"} {
+		t.Run(stage, func(t *testing.T) {
+			rt := newRuntime(t)
+			v := createSandbox(t, rt)
+			shell, sleeper := startWorker(t, v)
+			helper, err := rt.lookup(v.SandboxID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			helperPID := helper.helper.pid
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	useStopSeams(t, helper, func(ctx context.Context, pid int) (bool, error) {
-		stopped, err := processStopped(ctx, pid)
-		// Let the stop wait succeed so cancellation fails the worker listing.
-		if stopped && err == nil {
-			cancel()
-		}
-		return stopped, err
-	}, 0)
-	err = rt.Pause(ctx, v)
-	useStopSeams(t, helper, nil, 0)
-	if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "processrt: list exec process groups of sandbox "+v.SandboxID()+":") {
-		t.Fatalf("Pause = %v; want a worker enumeration error wrapping context.Canceled", err)
-	}
-	waitState(t, "helper after the failed Pause", helperPID, "S", "R")
-	for _, pid := range []int{shell, sleeper} {
-		waitState(t, "worker after the failed Pause", pid, "S", "R")
-	}
+			if stage == "helper stop" {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				useStopSeams(t, helper, func(probeCtx context.Context, _ int) (bool, error) {
+					cancel()
+					<-probeCtx.Done()
+					return true, nil
+				}, 0)
+				err = rt.Pause(ctx, v)
+				useStopSeams(t, helper, nil, 0)
+				if !errors.Is(err, context.Canceled) || !strings.HasPrefix(err.Error(), "processrt: wait for the helper of sandbox "+v.SandboxID()+" to stop:") {
+					t.Fatalf("Pause = %v; want a helper stop error wrapping context.Canceled", err)
+				}
+			} else {
+				realPS, err := exec.LookPath("ps")
+				if err != nil {
+					t.Fatal(err)
+				}
+				oldPath := os.Getenv("PATH")
+				t.Setenv("PROCESSRT_TEST_PS", realPS)
+				installPSFixture(t, `
+if [ "$1" = "-A" ]; then
+    exit 2
+fi
+exec "$PROCESSRT_TEST_PS" "$@"
+`)
+				err = rt.Pause(context.Background(), v)
+				t.Setenv("PATH", oldPath)
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 || !strings.HasPrefix(err.Error(), "processrt: list exec process groups of sandbox "+v.SandboxID()+":") {
+					t.Fatalf("Pause = %v; want a worker enumeration error wrapping ps exit 2", err)
+				}
+			}
+			waitState(t, "helper after the failed Pause", helperPID, "S", "R")
+			for _, pid := range []int{shell, sleeper} {
+				waitState(t, "worker after the failed Pause", pid, "S", "R")
+			}
 
-	if err := rt.Pause(context.Background(), v); err != nil {
-		t.Fatal(err)
-	}
-	waitState(t, "helper after the second Pause", helperPID, "T")
-	for _, pid := range []int{shell, sleeper} {
-		waitState(t, "worker after the second Pause", pid, "T")
-	}
-	if err := rt.Resume(context.Background(), v); err != nil {
-		t.Fatal(err)
-	}
-	waitState(t, "helper after Resume", helperPID, "S", "R")
-	for _, pid := range []int{shell, sleeper} {
-		waitState(t, "worker after Resume", pid, "S", "R")
+			if err := rt.Pause(context.Background(), v); err != nil {
+				t.Fatal(err)
+			}
+			waitState(t, "helper after the second Pause", helperPID, "T")
+			for _, pid := range []int{shell, sleeper} {
+				waitState(t, "worker after the second Pause", pid, "T")
+			}
+			if err := rt.Resume(context.Background(), v); err != nil {
+				t.Fatal(err)
+			}
+			waitState(t, "helper after Resume", helperPID, "S", "R")
+			for _, pid := range []int{shell, sleeper} {
+				waitState(t, "worker after Resume", pid, "S", "R")
+			}
+		})
 	}
 }
 
@@ -602,6 +624,17 @@ func TestPSStopped(t *testing.T) {
 			t.Fatalf("psStopped = %v, %v; want false, context.Canceled", stopped, err)
 		}
 	})
+}
+
+func TestPSStoppedDeadlineRetainsCompletedFailure(t *testing.T) {
+	installPSFixture(t, "exit 2")
+	out, probeErr := exec.Command("ps").Output()
+	// Model the deadline firing after ps exits but before its result is checked.
+	stopped, err := psStoppedResult(out, probeErr, context.DeadlineExceeded)
+	var exitErr *exec.ExitError
+	if stopped || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("probe result = %v, %v; want false and ps exit 2", stopped, err)
+	}
 }
 
 func installPSFixture(t *testing.T, script string) {
@@ -727,9 +760,16 @@ func TestPauseEnumeratesOnlyAfterHelperIsObservedStopped(t *testing.T) {
 	waitState(t, "worker after Resume", shell, "S", "R")
 }
 
-// TestPauseRollsBackWhenHelperDoesNotStop checks that a Pause whose helper is
-// never observed stopped fails, signals no worker, and continues the helper
-// again, so that the sandbox is not frozen.
+// observeLateStop returns a stopped state after the wait context expires.
+func observeLateStop(ctx context.Context, _ int) (bool, error) {
+	if _, ok := ctx.Deadline(); ok {
+		<-ctx.Done()
+	}
+	return true, nil
+}
+
+// TestPauseRollsBackWhenHelperDoesNotStop checks that Pause rejects a late
+// stopped state, leaves the workers running, and continues the helper.
 func TestPauseRollsBackWhenHelperDoesNotStop(t *testing.T) {
 	rt := newRuntime(t)
 	m := createSandbox(t, rt)
@@ -741,10 +781,10 @@ func TestPauseRollsBackWhenHelperDoesNotStop(t *testing.T) {
 	helperPID := h.helper.pid
 	var signals []syscall.Signal
 	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
-	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, nil }, 100*time.Millisecond)
+	useStopSeams(t, h, observeLateStop, 100*time.Millisecond)
 
 	err = rt.Pause(context.Background(), m)
-	if err == nil || !strings.Contains(err.Error(), "did not stop") {
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "did not stop") {
 		t.Fatalf("Pause = %v; want a did-not-stop error", err)
 	}
 	if want := []syscall.Signal{syscall.SIGSTOP, syscall.SIGCONT}; !reflect.DeepEqual(signals, want) {
@@ -765,10 +805,8 @@ func TestPauseRollsBackWhenHelperDoesNotStop(t *testing.T) {
 	}
 }
 
-// TestDeleteFailsWhenHelperDoesNotStop checks that a Delete whose helper is
-// never observed stopped returns an error, kills neither the workers nor the
-// helper, keeps the sandbox tracked and reports no cleanup, and that a retry
-// completes the cleanup.
+// TestDeleteFailsWhenHelperDoesNotStop checks that a late stopped state leaves
+// the sandbox tracked and its processes alive, so Delete can retry.
 func TestDeleteFailsWhenHelperDoesNotStop(t *testing.T) {
 	rt := newRuntime(t)
 	m := createSandbox(t, rt)
@@ -780,10 +818,10 @@ func TestDeleteFailsWhenHelperDoesNotStop(t *testing.T) {
 	helperPID := h.helper.pid
 	var signals []syscall.Signal
 	h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
-	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, nil }, 100*time.Millisecond)
+	useStopSeams(t, h, observeLateStop, 100*time.Millisecond)
 
 	err = rt.Delete(context.Background(), m.SandboxID())
-	if err == nil || !strings.Contains(err.Error(), "did not stop") {
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "did not stop") {
 		t.Fatalf("Delete = %v; want a did-not-stop error", err)
 	}
 	for _, sig := range signals {
@@ -827,7 +865,7 @@ func TestLifecycleEnumeratesOnlyAfterHelperPSStopped(t *testing.T) {
 		{name: "Delete", run: func(rt *Runtime, m vmruntime.VM) error { return rt.Delete(context.Background(), m.SandboxID()) }},
 	}
 	for _, op := range operations {
-		for _, failure := range []string{"persistent", "transient"} {
+		for _, failure := range []string{"persistent", "transient", "deadline"} {
 			t.Run(op.name+"/"+failure, func(t *testing.T) {
 				rt := newRuntime(t)
 				m := createSandbox(t, rt)
@@ -842,14 +880,20 @@ func TestLifecycleEnumeratesOnlyAfterHelperPSStopped(t *testing.T) {
 				}
 				oldPath := os.Getenv("PATH")
 				listed := filepath.Join(t.TempDir(), "listed")
+				failed := filepath.Join(t.TempDir(), "failed")
 				t.Setenv("PROCESSRT_TEST_PS", realPS)
 				t.Setenv("PROCESSRT_TEST_PS_LISTED", listed)
 				t.Setenv("PROCESSRT_TEST_PS_FAILURE", failure)
-				t.Setenv("PROCESSRT_TEST_PS_FAILED", filepath.Join(t.TempDir(), "failed"))
+				t.Setenv("PROCESSRT_TEST_PS_FAILED", failed)
 				installPSFixture(t, `
 if [ "$1" = "-A" ]; then
     touch "$PROCESSRT_TEST_PS_LISTED" || exit 3
-elif [ "$PROCESSRT_TEST_PS_FAILURE" = "persistent" ] || [ ! -e "$PROCESSRT_TEST_PS_FAILED" ]; then
+elif [ "$PROCESSRT_TEST_PS_FAILURE" = "deadline" ]; then
+    printf '%s\n' "$$" > "$PROCESSRT_TEST_PS_FAILED" || exit 3
+    exec /bin/sleep 30
+elif [ "$PROCESSRT_TEST_PS_FAILURE" = "persistent" ]; then
+    exit 2
+elif [ ! -e "$PROCESSRT_TEST_PS_FAILED" ]; then
     touch "$PROCESSRT_TEST_PS_FAILED" || exit 3
     exit 2
 fi
@@ -857,15 +901,17 @@ exec "$PROCESSRT_TEST_PS" "$@"
 `)
 				observations := 0
 				observedStopped := false
-				wait := 100 * time.Millisecond
+				var probeErr error
+				wait := 500 * time.Millisecond
 				if failure == "transient" {
 					wait = 0 // Use the real timeout while waiting for the stop signal to take effect.
 				}
 				useStopSeams(t, h, func(ctx context.Context, pid int) (bool, error) {
 					mustNotExist(t, listed)
 					stopped, err := psStopped(ctx, pid)
+					probeErr = err
 					observations++
-					if observations == 1 {
+					if observations == 1 && failure != "deadline" {
 						var exitErr *exec.ExitError
 						if stopped || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
 							t.Errorf("first observation = %v, %v; want false and ps exit 2", stopped, err)
@@ -875,12 +921,28 @@ exec "$PROCESSRT_TEST_PS" "$@"
 					return stopped, err
 				}, wait)
 
+				start := time.Now()
 				err = op.run(rt, m)
+				elapsed := time.Since(start)
 				t.Setenv("PATH", oldPath)
-				if failure == "persistent" {
-					var exitErr *exec.ExitError
-					if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
-						t.Fatalf("%s = %v; want an error from the failed ps probe", op.name, err)
+				if failure != "transient" {
+					if failure == "deadline" {
+						if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "ps:") || !errors.Is(probeErr, context.DeadlineExceeded) || observations != 1 || elapsed >= psTimeout/2 {
+							t.Fatalf("%s = %v, last probe = %v, probes = %d, elapsed = %s; want one probe canceled by the %s wait", op.name, err, probeErr, observations, elapsed, wait)
+						}
+						data, readErr := os.ReadFile(failed)
+						pid, pidErr := strconv.Atoi(strings.TrimSpace(string(data)))
+						if readErr != nil || pidErr != nil || pid <= 0 {
+							t.Fatalf("read ps fixture PID: %q, %v, %v", data, readErr, pidErr)
+						}
+						if killErr := syscall.Kill(pid, 0); !errors.Is(killErr, syscall.ESRCH) {
+							t.Fatalf("ps fixture status = %v; want the canceled process reaped", killErr)
+						}
+					} else {
+						var exitErr *exec.ExitError
+						if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+							t.Fatalf("%s = %v; want both context.DeadlineExceeded and ps exit 2", op.name, err)
+						}
 					}
 					mustNotExist(t, listed)
 					if _, err := rt.lookup(m.SandboxID()); err != nil {
@@ -912,6 +974,56 @@ exec "$PROCESSRT_TEST_PS" "$@"
 				mustExist(t, listed)
 			})
 		}
+	}
+}
+
+func TestWaitHelperStoppedSharesDeadline(t *testing.T) {
+	t.Run("local", func(t *testing.T) {
+		testSharedHelperStopDeadline(t, context.Background(), 200*time.Millisecond)
+	})
+	t.Run("caller", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		testSharedHelperStopDeadline(t, ctx, time.Second)
+	})
+}
+
+func TestWaitHelperStoppedReportsPSFailureAtCallerDeadline(t *testing.T) {
+	installPSFixture(t, "exit 2")
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	h := &vm{helper: helperProcess{pid: os.Getpid()}, observeStopped: psStopped}
+	err := h.waitHelperStopped(ctx)
+	var exitErr *exec.ExitError
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("wait = %v; want both context.DeadlineExceeded and ps exit 2", err)
+	}
+}
+
+func testSharedHelperStopDeadline(t *testing.T, ctx context.Context, wait time.Duration) {
+	t.Helper()
+	var deadlines []time.Time
+	h := &vm{helper: helperProcess{pid: 1}}
+	useStopSeams(t, h, func(probeCtx context.Context, _ int) (bool, error) {
+		deadline, ok := probeCtx.Deadline()
+		if !ok {
+			t.Fatal("probe has no stop deadline")
+		}
+		deadlines = append(deadlines, deadline)
+		if len(deadlines) == 1 {
+			return false, nil
+		}
+		<-probeCtx.Done()
+		return false, probeCtx.Err()
+	}, wait)
+	if err := h.waitHelperStopped(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait = %v; want context.DeadlineExceeded", err)
+	}
+	if len(deadlines) != 2 || !deadlines[0].Equal(deadlines[1]) {
+		t.Fatalf("probe deadlines = %v; want two probes with the same deadline", deadlines)
+	}
+	if deadline, ok := ctx.Deadline(); ok && !deadline.Equal(deadlines[0]) {
+		t.Errorf("probe deadline = %s; want caller deadline %s", deadlines[0], deadline)
 	}
 }
 
@@ -971,12 +1083,25 @@ func TestWaitHelperStoppedReportsObservationError(t *testing.T) {
 		t.Fatal(err)
 	}
 	cause := errors.New("ps is broken")
-	useStopSeams(t, h, func(context.Context, int) (bool, error) { return false, cause }, 50*time.Millisecond)
+	observations := 0
+	useStopSeams(t, h, func(context.Context, int) (bool, error) {
+		observations++
+		if observations == 1 {
+			return false, cause
+		}
+		return false, nil
+	}, 100*time.Millisecond)
 	if err := h.waitHelperStopped(context.Background()); !errors.Is(err, cause) {
 		t.Errorf("wait with a failing observation = %v; want it to wrap %v", err, cause)
 	}
+	if observations < 2 {
+		t.Fatalf("observations = %d; want a running observation after the probe error", observations)
+	}
 
-	useStopSeams(t, h, h.observeStopped, 10*time.Second)
+	useStopSeams(t, h, func(context.Context, int) (bool, error) {
+		t.Error("started a probe after caller cancellation")
+		return true, nil
+	}, 10*time.Second)
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
