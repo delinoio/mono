@@ -36,12 +36,13 @@ func TestWithoutAgentEnv(t *testing.T) {
 		"OWNSAND_AGENT_STATE_DIR=",
 		"OWNSAND_OTHER=kept",
 	}
+	original := slices.Clone(in)
 	got := withoutAgentEnv(in)
 	want := []string{"PATH=/usr/bin", "HOME=/home/test", "OWNSAND_OTHER=kept"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("withoutAgentEnv = %v, want %v", got, want)
 	}
-	if len(in) != 6 {
-		t.Fatalf("input slice changed: %v", in)
+	if !slices.Equal(in, original) {
+		t.Fatalf("input after withoutAgentEnv = %v, want %v", in, original)
 	}
 }

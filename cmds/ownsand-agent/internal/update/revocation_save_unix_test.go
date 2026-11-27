@@ -29,7 +29,10 @@ func TestRevocationSaveFailureKeepsCreateGate(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			revoking := newRelease(t, nil)
-			clearing := newRelease(t, func(m *Manifest, _ *[]byte) { m.RevokedVersions = nil })
+			clearing := newRelease(t, func(m *Manifest, _ *[]byte) {
+				m.Sequence = 2
+				m.RevokedVersions = nil
+			})
 			u, _, _ := newUpdater(t, revoking, "0.9.0", &atomic.Bool{}, revoking.pub, clearing.pub)
 			if tc.startRevoked {
 				if err := update(u, "1.1.0", true); err != nil {

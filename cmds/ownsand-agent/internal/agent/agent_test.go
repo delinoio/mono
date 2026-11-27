@@ -1556,7 +1556,7 @@ func newUpdateEnv(t *testing.T, block bool, revokedVersions ...string) *updateEn
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	sum := sha256.Sum256(artifact)
-	manifest, _ := json.Marshal(update.Manifest{Schema: 1, RevokedVersions: revokedVersions, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
+	manifest, _ := json.Marshal(update.Manifest{Schema: 1, Sequence: 1, RevokedVersions: revokedVersions, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
 	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifest))
 	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { w.Write(manifest) })
 	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(sig)) })
@@ -2193,25 +2193,162 @@ func TestCommandResultWithoutChannelIsLogged(t *testing.T) {
 	}
 }
 
+type countingSnapshotRuntime struct {
+	vmruntime.Runtime
+	captures atomic.Int32
+}
+
+func (r *countingSnapshotRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	r.captures.Add(1)
+	return r.Runtime.Snapshot(ctx, vm, dir)
+}
+
+func TestSnapshotCanceledBeforeCapture(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	rt := &countingSnapshotRuntime{}
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt.Runtime = o.Runtime
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+	sandboxID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatalf("generate sandbox ID: %v", err)
+	}
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create %v", res)
+	}
+	snapID, _ := uuidv7.NewString()
+	dir, err := st.SnapshotDir(snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(dir, "partial")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sentinel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	create := &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}
+	cmd := &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: create}}
+	chanCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.agent.handleCommand(chanCtx, context.Background(), cmd, 0)
+	if res := h.result(snapID); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED || res.GetCreateSnapshot() != nil {
+		t.Fatalf("canceled capture = %v, want ABORTED and no snapshot", res)
+	}
+	if got := rt.captures.Load(); got != 0 {
+		t.Fatalf("runtime captures = %d, want 0", got)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("canceled capture touched an existing directory: %v", err)
+	}
+	if h.agent.Sandboxes.HasSnapshot(snapID) {
+		t.Fatal("canceled capture is known to the manager")
+	}
+	res := h.command(cmd)
+	ready := res.GetCreateSnapshot().GetSnapshot()
+	if res.GetError() != nil || ready.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("live capture = %v, want a ready snapshot", res)
+	}
+	if entry, err := h.agent.Sandboxes.CreateSnapshot(chanCtx, create); err != nil || !proto.Equal(ready, entry) {
+		t.Fatalf("canceled retry = %v, %v, want the published snapshot", entry, err)
+	}
+	if got := rt.captures.Load(); got != 1 {
+		t.Fatalf("runtime captures after the retry = %d, want 1", got)
+	}
+}
+
+func TestSnapshotRemovalFencesCapturesAfterLookup(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	rt := &countingSnapshotRuntime{}
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt.Runtime = o.Runtime
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create sandbox: %v", res)
+	}
+
+	lookedUp := make(chan struct{}, 2)
+	resume := make(chan struct{})
+	release := sync.OnceFunc(func() { close(resume) })
+	defer release()
+	h.agent.Sandboxes.SetSnapshotLookupHookForTest(func(string) {
+		lookedUp <- struct{}{}
+		<-resume
+	})
+	startCapture := func(ctx context.Context) <-chan error {
+		snapID, _ := uuidv7.NewString()
+		done := make(chan error, 1)
+		go func() {
+			entry, err := h.agent.Sandboxes.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID})
+			if entry != nil {
+				err = fmt.Errorf("unexpected snapshot entry: %v (error %v)", entry, err)
+			}
+			done <- err
+		}()
+		waitClosed(t, lookedUp, "source sandbox lookup")
+		return done
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	canceled := startCapture(ctx)
+	live := startCapture(t.Context())
+	cancel()
+	h.requestDeviceRemoval(false)
+	h.requireRunResult(ErrRemoved)
+	requireEmptyStateDir(t, st)
+	release()
+	check := func(done <-chan error, want ownsandv1.ErrorCode) {
+		t.Helper()
+		select {
+		case err := <-done:
+			var ce *sandboxes.CommandError
+			if !errors.As(err, &ce) || ce.Code != want {
+				t.Errorf("capture after removal = %v, want %s", err, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("capture did not return after removal")
+		}
+	}
+	check(canceled, ownsandv1.ErrorCode_ERROR_CODE_ABORTED)
+	check(live, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION)
+	if got := rt.captures.Load(); got != 0 {
+		t.Errorf("runtime captures after removal = %d, want 0", got)
+	}
+	requireEmptyStateDir(t, st)
+}
+
 // snapshotCtxRuntime records the context error that Snapshot sees.
 type snapshotCtxRuntime struct {
 	vmruntime.Runtime
+	cancel context.CancelFunc
 	ctxErr chan error
 }
 
 func (r *snapshotCtxRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	r.cancel()
 	r.ctxErr <- ctx.Err()
 	return r.Runtime.Snapshot(context.WithoutCancel(ctx), vm, dir)
 }
 
-// TestSnapshotCaptureEndsWithItsChannel checks that a snapshot capture stays
-// bound to the channel context: a pending capture is not in the state report,
+// TestSnapshotCaptureEndsWithItsChannel checks that a snapshot already in
+// progress stays bound to the channel context: a pending capture is not in the state report,
 // so the control plane fails it after a reconnect, and nothing reports a late
 // completion. Remove this test together with that limit.
 func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
-	rt := &snapshotCtxRuntime{ctxErr: make(chan error, 1)}
+	chanCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	rt := &snapshotCtxRuntime{cancel: cancel, ctxErr: make(chan error, 1)}
 	h := startWith(t, cp, st, id, func(o *Options) {
 		rt.Runtime = o.Runtime
 		o.Runtime = rt
@@ -2229,8 +2366,6 @@ func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate snapshot ID: %v", err)
 	}
-	chanCtx, cancel := context.WithCancel(context.Background())
-	cancel()
 	h.agent.handleCommand(chanCtx, context.Background(), &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}, 0)
 	select {
 	case err := <-rt.ctxErr:

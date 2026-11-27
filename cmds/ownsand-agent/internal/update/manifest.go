@@ -49,6 +49,7 @@ const ManifestSchema = 1
 // Manifest is the signed release manifest.
 type Manifest struct {
 	Schema          int       `json:"schema"`
+	Sequence        uint64    `json:"sequence"`
 	Releases        []Release `json:"releases"`
 	RevokedVersions []string  `json:"revoked_versions"`
 }
@@ -72,11 +73,13 @@ type Artifact struct {
 
 // Verification errors.
 var (
-	ErrBadSignature = errors.New("update: release manifest signature does not verify")
-	ErrNoKeys       = errors.New("update: no release public key is configured")
-	ErrHashMismatch = errors.New("update: release artifact SHA-256 does not match the manifest")
-	ErrRevoked      = errors.New("update: target version is revoked")
-	ErrNoArtifact   = errors.New("update: manifest has no artifact of this platform for the target version")
+	ErrManifestNoSequence = errors.New("update: release manifest has no positive sequence")
+	ErrManifestRollback   = errors.New("update: release manifest sequence is older or conflicts with the accepted manifest")
+	ErrBadSignature       = errors.New("update: release manifest signature does not verify")
+	ErrNoKeys             = errors.New("update: no release public key is configured")
+	ErrHashMismatch       = errors.New("update: release artifact SHA-256 does not match the manifest")
+	ErrRevoked            = errors.New("update: target version is revoked")
+	ErrNoArtifact         = errors.New("update: manifest has no artifact of this platform for the target version")
 )
 
 // DecodeSignature decodes the base64 content of a .sig file.

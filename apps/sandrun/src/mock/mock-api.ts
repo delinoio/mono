@@ -1406,6 +1406,8 @@ export function createMockTransport(
       removeOwnSandLink(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
+        if (org.link === undefined)
+          throw new ConnectError("OwnSand link not found", Code.NotFound);
         const requestsOnNewlyDeletedRunners = new Set<string>();
         for (const runner of org.runners) {
           if (TERMINAL_RUNNER_STATES.has(runner.state)) continue;
@@ -1499,15 +1501,17 @@ export function createMockTransport(
             Code.FailedPrecondition,
           );
         issuedStates.delete(req.state);
-        if (
-          org.installations.some(
-            (i) => i.githubInstallationId === req.githubInstallationId,
+        for (const linkedOrg of orgs.values()) {
+          if (
+            linkedOrg.installations.some(
+              (i) => i.githubInstallationId === req.githubInstallationId,
+            )
           )
-        )
-          throw new ConnectError(
-            "the installation is already linked",
-            Code.AlreadyExists,
-          );
+            throw new ConnectError(
+              "the installation is already linked",
+              Code.AlreadyExists,
+            );
+        }
         const installation = create(GitHubInstallationSchema, {
           installationId: uuidV7(),
           organizationId: req.organizationId,
