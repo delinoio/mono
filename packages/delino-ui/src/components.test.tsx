@@ -1900,6 +1900,29 @@ function contrast(first: string, second: string): number {
   return (high! + 0.05) / (low! + 0.05);
 }
 
+describe("SegmentedControl selection contrast", () => {
+  test("contrasts the inset stroke with the indicator and track in both schemes", () => {
+    const indicator = block(".dui-segmented-control-indicator");
+    expect(indicator).toContain(
+      "inset 0 0 0 2px var(--dui-color-accent-graphic)",
+    );
+    expect(indicator).toContain("background: var(--dui-color-surface);");
+    expect(block(".dui-segmented-control")).toContain(
+      "background: var(--dui-color-neutral);",
+    );
+
+    const light = [block(":root")];
+    const dark = [...light, ...darkRule(":root")];
+    for (const scheme of [light, dark]) {
+      const stroke = property(scheme, "--dui-color-accent-graphic")!;
+      const fill = property(scheme, "--dui-color-surface")!;
+      const track = property(scheme, "--dui-color-neutral")!;
+      expect(contrast(stroke, fill)).toBeGreaterThanOrEqual(3);
+      expect(contrast(stroke, track)).toBeGreaterThanOrEqual(3);
+    }
+  });
+});
+
 test("keeps the pressed Toggle stroke at 3:1 on both surfaces in both schemes", () => {
   const pressed = block(".dui-toggle[data-pressed]");
   expect(pressed).toContain("background: var(--dui-color-neutral-hover);");

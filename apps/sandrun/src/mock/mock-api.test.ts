@@ -20,13 +20,20 @@ import {
 import {
   AgentVendor,
   ApiKeyState,
+  RequestEndReason,
+  RequestState,
   ResourcesSchema,
+  RunnerEndReason,
+  RunnerState,
+  WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
+import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
+import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
-import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
+import { type Request, WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
-import { createMockTransport, MOCK_IDS } from "./mock-api.ts";
+import { createMockTransport, MOCK_IDS, MOCK_USER } from "./mock-api.ts";
 
 const invalidInstallationState = {
   code: Code.FailedPrecondition,
@@ -345,6 +352,221 @@ test.each([
     });
   },
 );
+
+test("removing OwnSand ends each active request and publishes its terminal outcome once", async () => {
+  const organizationId = MOCK_IDS.acme;
+  const otherOrgId = MOCK_IDS.globex;
+  const devSessionId = "running-dev";
+  const agentSessionId = "running-agent";
+  const unboundId = "starting-without-runner";
+  const deletingAgentId = "agent-with-deleting-runner";
+  const transport = createMockTransport({
+    watchQueueEndsAfterMs: 500,
+    workFixtures: [
+      {
+        organizationId,
+        requests: [
+          {
+            requestId: devSessionId,
+            kind: WorkloadKind.DEV_SESSION,
+            state: RequestState.RUNNING,
+            runnerId: "dev-runner",
+            ownerUserId: MOCK_USER,
+          },
+          {
+            requestId: agentSessionId,
+            kind: WorkloadKind.AGENT_SESSION,
+            state: RequestState.RUNNING,
+            runnerId: "agent-runner",
+          },
+          {
+            requestId: unboundId,
+            kind: WorkloadKind.AGENT_SESSION,
+            state: RequestState.STARTING,
+          },
+          {
+            requestId: deletingAgentId,
+            kind: WorkloadKind.AGENT_SESSION,
+            state: RequestState.RUNNING,
+            runnerId: "deleting-runner",
+          },
+        ],
+        runners: [
+          {
+            runnerId: "dev-runner",
+            requestId: devSessionId,
+            kind: WorkloadKind.DEV_SESSION,
+            state: RunnerState.BUSY,
+          },
+          {
+            runnerId: "agent-runner",
+            requestId: agentSessionId,
+            kind: WorkloadKind.AGENT_SESSION,
+            state: RunnerState.BUSY,
+          },
+          {
+            runnerId: "deleting-runner",
+            requestId: deletingAgentId,
+            kind: WorkloadKind.AGENT_SESSION,
+            state: RunnerState.DELETING,
+          },
+        ],
+        devSessions: [
+          {
+            devSessionId,
+            ownerUserId: MOCK_USER,
+            runnerId: "dev-runner",
+            state: RequestState.RUNNING,
+          },
+        ],
+      },
+      {
+        organizationId: otherOrgId,
+        requests: [
+          {
+            requestId: "other-org-job",
+            kind: WorkloadKind.GITHUB_JOB,
+            state: RequestState.RUNNING,
+          },
+        ],
+      },
+    ],
+  });
+  const link = createClient(OwnSandLinkService, transport);
+  const work = createClient(WorkService, transport);
+  const sessions = createClient(DevSessionService, transport);
+  const audit = createClient(AuditService, transport);
+  const endedJob = structuredClone(
+    (await work.getRequest({ organizationId, requestId: MOCK_IDS.endedJob }))
+      .request,
+  );
+  const otherOrgRequests = { organizationId: otherOrgId, includeEnded: true };
+  const otherHistory = structuredClone(
+    await work.listRequests(otherOrgRequests),
+  );
+  expect(otherHistory.requests).toHaveLength(1);
+  expect((await link.getOwnSandLink({ organizationId })).link).toBeDefined();
+  const live = new AbortController();
+  const fresh = new AbortController();
+  try {
+    const watch = work
+      .watchQueue({ organizationId }, { signal: live.signal, timeoutMs: 5_000 })
+      [Symbol.asyncIterator]();
+    const initialRequests: Request[] = [];
+    for (;;) {
+      const next = await watch.next();
+      if (next.done) throw new Error("Expected a complete queue snapshot");
+      const event = next.value.event;
+      if (event.case === "snapshotComplete") break;
+      if (event.case === "request") initialRequests.push(event.value);
+    }
+    expect(initialRequests).toContainEqual(
+      expect.objectContaining({
+        requestId: MOCK_IDS.runningJob,
+        state: RequestState.RUNNING,
+      }),
+    );
+
+    const removalStartedAt = Date.now();
+    await link.removeOwnSandLink({ organizationId });
+    const removalFinishedAt = Date.now();
+
+    const updates: Request[] = [];
+    for (let next = await watch.next(); !next.done; next = await watch.next()) {
+      if (next.value.event.case === "request")
+        updates.push(next.value.event.value);
+    }
+    const history = (
+      await work.listRequests({ organizationId, includeEnded: true })
+    ).requests;
+    const byId = new Map(
+      history.map((request) => [request.requestId, request]),
+    );
+    expect(updates.map((request) => request.requestId).sort()).toEqual(
+      initialRequests.map((request) => request.requestId).sort(),
+    );
+    expect(updates).toHaveLength(8);
+    for (const request of updates) {
+      expect(request).toEqual(byId.get(request.requestId));
+      expect(request.endedAt).toBeDefined();
+      const endedAt = timestampMs(request.endedAt!);
+      expect(endedAt).toBeGreaterThanOrEqual(removalStartedAt);
+      expect(endedAt).toBeLessThanOrEqual(removalFinishedAt);
+    }
+    for (const requestId of [
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.queuedAgent,
+      MOCK_IDS.queuedDev,
+    ]) {
+      expect(byId.get(requestId)).toMatchObject({
+        state: RequestState.CANCELED,
+        endReason: RequestEndReason.INTEGRATION_REMOVED,
+      });
+    }
+    for (const requestId of [MOCK_IDS.runningJob, unboundId, deletingAgentId]) {
+      expect(byId.get(requestId)).toMatchObject({
+        state: RequestState.FAILED,
+        endReason: RequestEndReason.INTEGRATION_REMOVED,
+      });
+    }
+    expect(byId.get(devSessionId)).toMatchObject({
+      state: RequestState.ENDED,
+      endReason: RequestEndReason.SESSION_DELETED,
+    });
+    expect(byId.get(agentSessionId)).toMatchObject({
+      state: RequestState.FAILED,
+      endReason: RequestEndReason.RUNNER_LOST,
+    });
+    for (const id of [MOCK_IDS.queuedDev, devSessionId]) {
+      const request = byId.get(id)!;
+      const { devSession } = await sessions.getDevSession({
+        organizationId,
+        devSessionId: id,
+      });
+      expect(devSession).toMatchObject({
+        state: request.state,
+        endReason: request.endReason,
+        endedAt: request.endedAt,
+      });
+    }
+    expect(byId.get(MOCK_IDS.endedJob)).toEqual(endedJob);
+    expect(await work.listRequests(otherOrgRequests)).toEqual(otherHistory);
+    expect((await work.listRequests({ organizationId })).requests).toEqual([]);
+    expect(
+      (await link.getOwnSandLink({ organizationId })).link,
+    ).toBeUndefined();
+    const { runner } = await work.getRunner({
+      organizationId,
+      runnerId: MOCK_IDS.busyRunner,
+    });
+    expect(runner).toMatchObject({
+      state: RunnerState.DELETED,
+      endReason: RunnerEndReason.CLEAN_UP,
+    });
+    expect(
+      (await audit.listAuditEvents({ organizationId })).events[0],
+    ).toMatchObject({
+      action: AuditAction.OWNSAND_LINK_REMOVED,
+      targetKind: AuditTargetKind.OWNSAND_LINK,
+      targetId: organizationId,
+    });
+
+    const snapshot = work
+      .watchQueue(
+        { organizationId },
+        { signal: fresh.signal, timeoutMs: 5_000 },
+      )
+      [Symbol.asyncIterator]();
+    await expect(snapshot.next()).resolves.toMatchObject({
+      done: false,
+      value: { event: { case: "snapshotComplete" } },
+    });
+    await snapshot.return?.();
+  } finally {
+    live.abort();
+    fresh.abort();
+  }
+});
 
 test("GitHub installation state is scoped to its organization and can be used once before expiry", async () => {
   const issuedAt = Date.UTC(2026, 0, 1) + 123;
