@@ -3,6 +3,7 @@ import { Field, FieldDescription, FieldLabel } from "@ui-sdk/react/field";
 import { Switch as SwitchPart, SwitchThumb } from "@ui-sdk/react/switch";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
+import { renderFieldLabel } from "./field-label-render.tsx";
 
 export type SwitchProps = Omit<
   React.ComponentProps<typeof SwitchPart>,
@@ -33,7 +34,12 @@ export function Switch({
   return (
     <Field className="dui-switch-field">
       <div className="dui-switch-text">
-        <FieldLabel className="dui-switch-label">{label}</FieldLabel>
+        <FieldLabel
+          className="dui-switch-label"
+          render={renderFieldLabel(props.id, props.render != null)}
+        >
+          {label}
+        </FieldLabel>
         {/* Workaround: the UI SDK Field predicts the description id in
             aria-describedby before the field binds on the client, so static
             markup would point at a missing element. Always render the
