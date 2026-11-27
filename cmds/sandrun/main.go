@@ -13,14 +13,21 @@ import (
 )
 
 func main() {
+	os.Exit(runSandRun(nil))
+}
+
+func runSandRun(interruptRestored func()) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	// Restore the default interrupt action after cancellation so a later
 	// interrupt can end a command blocked on credential input.
 	go func() {
 		<-ctx.Done()
 		stop()
+		if interruptRestored != nil {
+			interruptRestored()
+		}
 	}()
 	code := cli.Run(ctx, cli.Env{Args: os.Args[1:]})
 	stop()
-	os.Exit(code)
+	return code
 }
