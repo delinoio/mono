@@ -37,7 +37,6 @@ const (
 	// windowsReadyTimeout bounds the cold boot of a Windows guest until its
 	// guest helper service answers.
 	windowsReadyTimeout = 5 * time.Minute
-	stopTimeout         = 30 * time.Second
 	dialTimeout         = 10 * time.Second
 	tunnelTimeout       = 20 * time.Second
 	removeTimeout       = 10 * time.Second

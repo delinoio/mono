@@ -2535,6 +2535,7 @@ type retainedCreateRuntime struct {
 	mu          sync.Mutex
 	failDeletes int
 	deleteCalls int
+	firstDelete func()
 }
 
 func (r *retainedCreateRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
@@ -2547,9 +2548,12 @@ func (r *retainedCreateRuntime) Create(ctx context.Context, spec vmruntime.Spec)
 func (r *retainedCreateRuntime) Delete(ctx context.Context, id string) error {
 	r.mu.Lock()
 	r.deleteCalls++
-	fail := r.deleteCalls <= r.failDeletes
+	attempt := r.deleteCalls
 	r.mu.Unlock()
-	if fail {
+	if attempt == 1 && r.firstDelete != nil {
+		r.firstDelete()
+	}
+	if attempt <= r.failDeletes {
 		return errors.New("injected stop failure")
 	}
 	return r.Runtime.Delete(ctx, id)
