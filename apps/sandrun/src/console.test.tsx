@@ -25,7 +25,7 @@ import {
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
-import type { MessageInitShape } from "@bufbuild/protobuf";
+import type { DescMethodUnary, MessageInitShape } from "@bufbuild/protobuf";
 import {
   createConnectQueryKey,
   createQueryOptions,
@@ -2389,24 +2389,100 @@ describe("setup guidance", () => {
     empty: (
       "ListGitHubInstallations" | "ListAgentIntegrations" | "ListRunnerProfiles"
     )[],
+    linkState = OwnSandLinkState.ACTIVE,
   ): Transport {
     const mock = createMockTransport();
-    const emptyLists = createRouterTransport((router) => {
+    const fixture = createRouterTransport((router) => {
+      router.service(OwnSandLinkService, {
+        getOwnSandLink: ({ organizationId }) => ({
+          link: { organizationId, state: linkState },
+        }),
+      });
       router.service(GitHubService, { listGitHubInstallations: () => ({}) });
       router.service(AgentIntegrationService, {
         listAgentIntegrations: () => ({}),
       });
       router.service(RunnerProfileService, { listRunnerProfiles: () => ({}) });
+      router.service(WorkService, { listRunners: () => ({}) });
     });
-    const emptyMethods = new Set<string>(empty);
+    const fixtureMethods = new Set<string>([
+      ...empty,
+      "GetOwnSandLink",
+      "ListRunners",
+    ]);
     return {
       ...mock,
       unary(method, ...args) {
-        const transport = emptyMethods.has(method.name) ? emptyLists : mock;
+        const transport = fixtureMethods.has(method.name) ? fixture : mock;
         return transport.unary(method, ...args);
       },
     };
   }
+
+  test.each([
+    [
+      OwnSandLinkState.INVALID,
+      false,
+      "Replace OwnSand API key",
+      "integrations",
+    ],
+    [OwnSandLinkState.INVALID, true, "Replace OwnSand API key", "integrations"],
+    [
+      OwnSandLinkState.ACTIVE,
+      false,
+      "Connect GitHub or create an agent integration",
+      "integrations",
+    ],
+    [OwnSandLinkState.ACTIVE, true, "Create a runner profile", "profiles"],
+  ] as const)(
+    "shows the next action with link state %s and GitHub connected: %s",
+    async (linkState, hasGitHub, actionName, destination) => {
+      const emptyLists: Parameters<typeof linkedSetupTransport>[0] = [
+        "ListAgentIntegrations",
+        "ListRunnerProfiles",
+      ];
+      if (!hasGitHub) emptyLists.push("ListGitHubInstallations");
+      const transport = linkedSetupTransport(emptyLists, linkState);
+      const client = renderConsole(acmePath, { transport });
+      const setupMethods: DescMethodUnary[] = [
+        GitHubService.method.listGitHubInstallations,
+        AgentIntegrationService.method.listAgentIntegrations,
+        RunnerProfileService.method.listRunnerProfiles,
+      ];
+      for (const method of setupMethods) {
+        await waitFor(() =>
+          expect(
+            client.getQueryState(
+              createConnectQueryKey({
+                schema: method,
+                input: { organizationId: MOCK_IDS.acme, pageSize: 1 },
+                transport,
+                cardinality: "finite",
+              }),
+            )?.status,
+          ).toBe("success"),
+        );
+      }
+
+      const checklist = await screen.findByRole("region", {
+        name: "Set up SandRun",
+      });
+      const ownSandStep = within(checklist)
+        .getByText("Link OwnSand")
+        .closest("li");
+      expect(ownSandStep?.getAttribute("data-done")).toBe(
+        String(linkState === OwnSandLinkState.ACTIVE),
+      );
+      const href = `${acmePath}/${destination}`;
+      const action = within(checklist).getByRole("link", { name: actionName });
+      expect(action.getAttribute("href")).toBe(href);
+
+      await click(screen.getByRole("link", { name: "Runners" }));
+      expect(await screen.findByText("No runners match")).toBeTruthy();
+      const emptyAction = await screen.findByRole("link", { name: actionName });
+      expect(emptyAction.getAttribute("href")).toBe(href);
+    },
+  );
 
   test("offers a work source when both lists are empty and profiles fail", async () => {
     const mock = linkedSetupTransport([
