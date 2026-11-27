@@ -1399,26 +1399,67 @@ func TestRestartReconcile(t *testing.T) {
 func TestRestartFailsWhenRuntimeInventoryFails(t *testing.T) {
 	e := newEnv(t)
 	live := e.create(time.Hour, 2*time.Hour).GetSandboxId()
-	// The agent restarts: the VM ended, its files stay, and the inventory
-	// fails with an ID that it did know.
+	loadRecord := func() Record {
+		t.Helper()
+		var record Record
+		if err := e.st.LoadSandboxes(func(data []byte) error {
+			var decoded Record
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				return err
+			}
+			if decoded.SandboxID == live {
+				record = decoded
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("load sandbox records: %v", err)
+		}
+		if record.SandboxID == "" {
+			t.Fatalf("persisted sandbox %s is missing", live)
+		}
+		return record
+	}
+	before := loadRecord()
+	if before.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("persisted state before restart = %v, want RUNNING", before.State)
+	}
+
+	// The VM survives the restart, but the runtime can only return a
+	// partial inventory.
 	cause := errors.New("enumeration denied")
 	rt := newFakeRuntime()
+	rt.vms[live] = &fakeVM{id: live, exited: make(chan struct{})}
 	rt.files[live] = true
 	rt.runningErr = cause
+	ctx := context.Background()
+	if ids, err := rt.Running(ctx); !slices.Equal(ids, []string{live}) || !errors.Is(err, cause) {
+		t.Fatalf("Running = %v, %v, want [%s] and %v", ids, err, live, cause)
+	}
+
 	e.rt = rt
 	e.m.Close()
-	_, err := New(context.Background(), Options{Store: e.st, Runtime: rt, Now: e.clk.Now, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
+	_, err := New(ctx, Options{Store: e.st, Runtime: rt, Now: e.clk.Now, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
 	if !errors.Is(err, cause) {
 		t.Fatalf("New = %v, want an error that wraps %v", err, cause)
 	}
-	if rt.deleteCalls != 0 || !rt.hasFiles(live) {
-		t.Fatalf("reconcile deleted before the inventory succeeded (delete calls %d)", rt.deleteCalls)
+	if calls, hasVM, hasFiles := rt.deleteCalls, rt.vms[live] != nil, rt.hasFiles(live); calls != 0 || !hasVM || !hasFiles {
+		t.Fatalf("after failed inventory: delete calls = %d, VM present = %t, files present = %t, want 0, true, true", calls, hasVM, hasFiles)
 	}
-	// The record stays live: no transition was committed.
+	afterFailure := loadRecord()
+	if afterFailure.State != before.State || afterFailure.EndReason != before.EndReason || afterFailure.Revision != before.Revision {
+		t.Fatalf("persisted record after failed inventory = (%v, %v, revision %d), want (%v, %v, revision %d)",
+			afterFailure.State, afterFailure.EndReason, afterFailure.Revision, before.State, before.EndReason, before.Revision)
+	}
+
 	rt.runningErr = nil
 	e.restart()
-	if s, _ := e.m.State(live); s != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || endReason(e.m, live) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
-		t.Fatalf("after a successful retry the sandbox is %v %v, want FAILED LOST_ON_DEVICE", s, endReason(e.m, live))
+	if calls, hasVM, hasFiles := rt.deleteCalls, rt.vms[live] != nil, rt.hasFiles(live); calls != 1 || hasVM || hasFiles {
+		t.Fatalf("after retry: delete calls = %d, VM present = %t, files present = %t, want 1, false, false", calls, hasVM, hasFiles)
+	}
+	afterRetry := loadRecord()
+	if afterRetry.State != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || afterRetry.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE || afterRetry.Revision <= before.Revision {
+		t.Fatalf("persisted record after retry = (%v, %v, revision %d), want (FAILED, LOST_ON_DEVICE, revision > %d)",
+			afterRetry.State, afterRetry.EndReason, afterRetry.Revision, before.Revision)
 	}
 }
 
