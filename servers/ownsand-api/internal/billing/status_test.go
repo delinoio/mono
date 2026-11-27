@@ -503,10 +503,9 @@ func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
 	// not elapsed since the poll of the first step.
 	setHeld(true)
 	eventually(t, "the first retry", func() bool { return calls() == 1 })
-	polls := f.fake.Calls(accountstest.MethodListBillingStatusChanges)
-	if polls != 1 {
-		t.Fatalf("polls = %d, want the single poll of the first step", polls)
-	}
+	eventually(t, "the poll of the first held step", func() bool {
+		return f.fake.Calls(accountstest.MethodListBillingStatusChanges) == 1
+	})
 
 	// The failed attempt moved the row an hour ahead; later ticks skip it, and
 	// no further poll runs within the poll interval.
@@ -514,8 +513,8 @@ func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
 	if n := calls(); n != 1 {
 		t.Fatalf("a pending unlink that was not due was retried: %d calls", n)
 	}
-	if n := f.fake.Calls(accountstest.MethodListBillingStatusChanges); n != polls {
-		t.Fatalf("polls = %d, want %d: the poll interval has not elapsed", n, polls)
+	if n := f.fake.Calls(accountstest.MethodListBillingStatusChanges); n != 1 {
+		t.Fatalf("polls = %d, want 1: the poll interval has not elapsed", n)
 	}
 
 	// Once the back-off has elapsed, the next tick sends the unlink.
@@ -583,7 +582,7 @@ func TestRunPollCadence(t *testing.T) {
 		delay time.Duration
 	}{
 		{"fast poll", 5 * time.Millisecond},
-		// A poll that takes longer than two ticks makes the ticker drop ticks.
+		// A slow poll spans multiple maintenance ticks.
 		{"slow poll", 120 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

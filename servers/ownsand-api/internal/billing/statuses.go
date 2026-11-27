@@ -530,8 +530,8 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 // every Poll interval (measured between poll starts) and, every Tick,
 // records time-based suspensions and starts a retry of the due pending
 // unlinks unless the previous retry is still running; every instance
-// refreshes the metrics. A slow UnlinkOrganization call delays none of
-// these steps. Run returns after the running retry ended.
+// refreshes the metrics. Polls and unlink retries run independently of
+// each other and the maintenance step. Run waits for both on shutdown.
 func (s *Statuses) Run(ctx context.Context) {
 	if s.client == nil {
 		s.logger.Warn("billing_status_sync_disabled",
@@ -539,15 +539,25 @@ func (s *Statuses) Run(ctx context.Context) {
 	}
 	t := time.NewTicker(s.timing.Tick)
 	defer t.Stop()
-	// A retry batch can take as long as ten seconds for each due row, so it
-	// runs in its own goroutine, one batch at a time: the poll, the
-	// time-based suspensions and the metrics keep their schedule. Run waits
-	// for the running batch before it returns; the batch ends with ctx.
-	var batch sync.WaitGroup
-	defer batch.Wait()
+	var workers sync.WaitGroup
+	defer workers.Wait()
 	var retrying atomic.Bool
 	var lastPoll time.Time
-	for {
+	var pollDone <-chan time.Time
+	var pollRequested bool
+	for ctx.Err() == nil {
+		select {
+		case lastPoll = <-pollDone:
+			pollDone = nil
+		default:
+		}
+		// Consume any kick queued during the previous poll before dispatching
+		// a new one, even if a tick woke this step.
+		select {
+		case <-s.kick:
+			pollRequested = true
+		default:
+		}
 		if s.held() {
 			if s.client != nil {
 				// The poll interval runs from the start of the previous poll,
@@ -556,11 +566,21 @@ func (s *Statuses) Run(ctx context.Context) {
 				// runs a few milliseconds before the interval has elapsed
 				// would otherwise wait for the next tick, which stretches
 				// every interval by one Tick.
-				if lastPoll.IsZero() || time.Since(lastPoll) >= s.timing.Poll-s.timing.Tick/2 {
-					// A failed poll is retried at the next poll interval, not
-					// at every tick; Poll logs the failure.
-					lastPoll = time.Now()
-					_ = s.Poll(ctx)
+				if pollDone == nil && (pollRequested || lastPoll.IsZero() || time.Since(lastPoll) >= s.timing.Poll-s.timing.Tick/2) {
+					pollRequested = false
+					done := make(chan time.Time, 1)
+					pollDone = done
+					workers.Go(func() {
+						if ctx.Err() != nil || !s.held() {
+							// The poll did not start. Keep it due on the next held step.
+							done <- time.Time{}
+							return
+						}
+						// A failed poll keeps the same cadence. Poll logs the failure.
+						start := time.Now()
+						_ = s.Poll(ctx)
+						done <- start
+					})
 				}
 				// Due pending unlinks are retried at every tick, not only at
 				// a poll: the back-off bounds (1 second to 5 minutes) are
@@ -570,12 +590,10 @@ func (s *Statuses) Run(ctx context.Context) {
 				// has not reached stay due and are selected first by the
 				// next batch.
 				if retrying.CompareAndSwap(false, true) {
-					batch.Add(1)
-					go func() {
-						defer batch.Done()
+					workers.Go(func() {
 						defer retrying.Store(false)
 						_ = s.RetryPendingUnlinks(ctx)
-					}()
+					})
 				}
 			}
 			_ = s.Advance(ctx)
@@ -586,7 +604,7 @@ func (s *Statuses) Run(ctx context.Context) {
 			return
 		case <-t.C:
 		case <-s.kick:
-			lastPoll = time.Time{}
+			pollRequested = true
 		}
 	}
 }
