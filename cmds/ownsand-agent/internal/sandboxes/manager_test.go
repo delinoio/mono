@@ -417,9 +417,7 @@ func TestCreateDeleteLifecycle(t *testing.T) {
 		ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING,
 		ownsandv1.SandboxState_SANDBOX_STATE_DELETING, ownsandv1.SandboxState_SANDBOX_STATE_DELETED,
 	}
-	if got := e.out.states(id); len(got) != 4 || got[0] != want[0] || got[3] != want[3] {
-		t.Fatalf("updates %v", got)
-	}
+	requireStates(t, e.out.states(id), want)
 	if e.ex.ended[id] != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatal("execs not ended with the sandbox")
 	}
