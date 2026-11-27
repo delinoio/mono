@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -169,12 +170,22 @@ func TestVirtualizationRejectsUndersizedSparseBaseDisk(t *testing.T) {
 				t.Fatalf("manager entry = %v, want FAILED / CREATE_FAILED", entry)
 			}
 			ids, err := rt.Running(context.Background())
-			if err != nil || len(ids) != 0 || e.m.Busy() {
-				t.Fatalf("rejected create left runtime VMs %v (error %v) or a busy manager", ids, err)
+			if err != nil || len(ids) != 0 {
+				t.Fatalf("runtime VMs after rejected create = %v, error = %v, want none", ids, err)
 			}
 			if _, err := os.Stat(e.st.Path(store.VMsDir, cmd.GetSandboxId())); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("rejected create left a sandbox directory: stat error %v", err)
 			}
+			if !e.m.Busy() {
+				t.Fatal("manager is idle before failed-create cleanup")
+			}
+			synctest.Test(t, func(t *testing.T) {
+				e.m.Tick(t.Context(), false)
+				synctest.Wait()
+				if e.m.Busy() {
+					t.Fatal("manager is still busy after failed-create cleanup")
+				}
+			})
 		})
 	}
 }
