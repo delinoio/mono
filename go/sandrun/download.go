@@ -14,6 +14,7 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/go/uuidv7"
+	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 )
 
 // Download limits.
@@ -57,7 +58,8 @@ type DownloadResult struct {
 // session download" section of docs/servers-sandrun-api-foundation.md defines
 // it. A directory is packed with the guest tar into a temporary archive
 // next to the workspace, read with ReadDevSessionFile and extracted
-// locally; the guest archive is removed afterwards. A file above 500 MiB or
+// locally. The SDK removes the guest archive after the probe completes and
+// the archive is no longer needed. A file above 500 MiB or
 // a transfer above 2 GiB fails (*LimitError): the SDK checks the size of
 // the file or the archive before it reads it and every archive entry during
 // extraction. Extraction rejects absolute entries, entries outside the
@@ -90,15 +92,7 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 	archive := guestSibling(s, ".sandrun-download-"+id+".tar")
 	env := map[string]string{guestEnvPath: guestPath, guestEnvDLArchive: archive}
 	pr, err := c.runGuest(ctx, s, opProbe, env)
-	// The probe may have created the archive also when it failed later, so
-	// the archive is always removed.
-	defer func() {
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-		defer cancel()
-		if r, err := c.runGuest(cctx, s, opRemoveArchive, map[string]string{guestEnvDLArchive: archive}); err != nil || r.exitCode != 0 {
-			c.logger.DebugContext(ctx, "sandrun download clean-up failed", "dev_session_id", s.GetDevSessionId(), "code", codeText(err))
-		}
-	}()
+	defer c.cleanupDownloadArchive(ctx, s, archive, err)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +189,24 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 	}
 	report(TransferProgress{Phase: TransferDone, BytesDone: wireBytes, BytesTotal: wireBytes})
 	return res, nil
+}
+
+func (c *Client) cleanupDownloadArchive(ctx context.Context, s *sandrunv1.DevSession, archive string, probeErr error) {
+	// The probe can still create the archive after its stream ends. Wait
+	// for that exec before removing the archive, even if the caller canceled.
+	var streamErr *ExecStreamError
+	if errors.As(probeErr, &streamErr) {
+		if _, err := c.recoverGuestExec(ctx, s, streamErr); err != nil {
+			c.logger.DebugContext(ctx, "sandrun download skipped archive clean-up because the probe may still be running",
+				"dev_session_id", s.GetDevSessionId(), "exec_id", streamErr.ExecID, "code", codeText(err))
+			return
+		}
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if r, err := c.runGuest(cleanupCtx, s, opRemoveArchive, map[string]string{guestEnvDLArchive: archive}); err != nil || r.exitCode != 0 {
+		c.logger.DebugContext(ctx, "sandrun download clean-up failed", "dev_session_id", s.GetDevSessionId(), "code", codeText(err))
+	}
 }
 
 // wrapLimit gives a *LimitError the failed_precondition Connect code.

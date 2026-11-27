@@ -202,7 +202,7 @@ func TestOverlappingAdjustmentAndPurchaseApplyOnce(t *testing.T) {
 // back together, and that Paddle's retry commits one result.
 func TestPendingAdjustmentFailureRollsBackTheGrant(t *testing.T) {
 	f := newFixture(t)
-	telemetry := f.captureGrantTelemetry()
+	telemetry := f.captureBillingTelemetry()
 	acct := f.account()
 	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_1", "refund", "approved", "txn_buy", 400))
 
@@ -229,7 +229,7 @@ func TestPendingAdjustmentFailureRollsBackTheGrant(t *testing.T) {
 		t.Fatalf("state changed: balance %d, pending %d, refunds %d, events %d (was %d)",
 			f.balance(acct), f.pendingCount(), f.refundCount(), f.eventCount(), events)
 	}
-	telemetry.want(t)
+	telemetry.wantGrants(t)
 
 	if _, err := f.db.Pool.Exec(ctx(), `DROP TRIGGER fail_refund ON credit_refunds`); err != nil {
 		t.Fatal(err)
@@ -247,7 +247,7 @@ func TestPendingAdjustmentFailureRollsBackTheGrant(t *testing.T) {
 		t.Fatalf("pending %d, refunds %d", f.pendingCount(), f.refundCount())
 	}
 	grant := f.ledger(acct)[0]
-	telemetry.want(t, grant)
+	telemetry.wantGrants(t, grant)
 
 	// A different event ID for the same transaction also adds no grant.
 	if code := f.webhook(paddle.EventTransactionCompleted, purchase("txn_buy", acct, LedgerSubscriptionCredit, 1000)); code != http.StatusOK {
@@ -256,5 +256,5 @@ func TestPendingAdjustmentFailureRollsBackTheGrant(t *testing.T) {
 	if got := f.balance(acct); got != 6*usd {
 		t.Fatalf("balance after the replay = %d, want %d", got, 6*usd)
 	}
-	telemetry.want(t, grant)
+	telemetry.wantGrants(t, grant)
 }

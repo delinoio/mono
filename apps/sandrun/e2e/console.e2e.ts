@@ -834,6 +834,14 @@ describe("integrations", () => {
     const row = screen.getByRole("listitem").filter({ hasText: updatedName });
     await expect(row).toContainText("Cursor self-hosted pool name: pool-after");
     await expect(row).toContainText("Service account API key: Set at");
+
+    // Globex starts with no integrations, so this event belongs to the one created here.
+    await screen.getByRole("link", "Audit events").tap();
+    await expect(browser).toHaveURL(`/orgs/${GLOBEX}/audit`);
+    const audit = screen.getByRole("table", "Audit events");
+    await expect(
+      audit.getByRole("cell", "Agent integration credentials replaced"),
+    ).toBeVisible();
   });
 
   test("links OwnSand and shows only when the key was set", async ({
@@ -1368,6 +1376,80 @@ describe("personal API keys", () => {
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
     await expect(screen.getByText(name, { exact: false })).toBeVisible();
+  });
+
+  test("shows a key as expired after a fresh list request", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    const issuedAt = await browser.evaluate(() => {
+      const issuedAt = Date.now();
+      Date.now = () => issuedAt;
+      return issuedAt;
+    });
+
+    await screen.getByRole("button", "Create API key").tap();
+    await browser.keyboard.type("expiring-key");
+    await screen.getByRole("combobox", "Expires after").tap();
+    await screen.getByRole("option", "30 days").tap();
+    await screen.getByRole("button", "Create key").tap();
+    const dialog = screen.getByRole("dialog", "Your new personal API key");
+    await browser.evaluate(() => {
+      Date.now = () => new Date().getTime();
+      return null;
+    });
+    await dialog.getByRole("button", "Done").tap();
+    await expect(browser.locator('[role="dialog"]')).toBeHidden();
+
+    const row = screen
+      .getByRole("listitem")
+      .filter({ hasText: "expiring-key" });
+    const revoke = row.getByRole("button", "Revoke", { exact: true });
+    await expect(row).toContainText("expiring-key · Active");
+    await expect(revoke).toBeVisible();
+
+    await screen.getByRole("link", "Members", { exact: true }).tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/members`);
+    await browser.evaluate(
+      (expiresAt) => {
+        Date.now = () => expiresAt;
+        return null;
+      },
+      issuedAt + 30 * 24 * 60 * 60 * 1000,
+    );
+    await screen.getByRole("link", "API keys", { exact: true }).tap();
+
+    await expect(row).toContainText("expiring-key · Expired");
+    await expect(revoke).toBeHidden();
+  });
+
+  test("creates a key without an expiry when Never is selected", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    await screen.getByRole("button", "Create API key").tap();
+    await screen.getByLabel("Name").tap();
+    await browser.keyboard.type("non-expiring fixture key");
+    await screen.getByLabel("Expires after").tap();
+    await screen.getByRole("option", "Never").tap();
+    await screen.getByRole("button", "Create key").tap();
+
+    const dialog = screen.getByRole("dialog", "Your new personal API key");
+    await expect(dialog).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(
+      screen
+        .getByRole("listitem")
+        .filter({ hasText: "non-expiring fixture key" }),
+    ).toContainText("does not expire");
   });
 });
 

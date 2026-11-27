@@ -14,6 +14,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/auth"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/authz"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 )
 
 // OrganizationHandler serves OrganizationService.
@@ -164,8 +165,8 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 			h.releaseOrganizationDeletion(ctx, d)
 		}
 	}()
-	cleanupCtx := context.WithValue(ctx, organizationDeletionContextKey{}, attempt)
-	cleanupCtx, prepared, err := h.organizationDeletionPrepare(cleanupCtx, d)
+	deletionCtx := context.WithValue(ctx, organizationDeletionContextKey{}, attempt)
+	cleanupCtx, prepared, err := h.organizationDeletionPrepare(deletionCtx, d)
 	if err != nil {
 		return nil, h.Internal(ctx, "prepare organization deletion", err)
 	}
@@ -175,14 +176,14 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 		organizationDeletionAbort(cleanupCtx, prepared)
 		return nil, h.Internal(ctx, "check organization deletion", err)
 	}
-	err = pgx.BeginFunc(cleanupCtx, conn, func(tx pgx.Tx) error {
-		ctx := cleanupCtx
-		if err := LockOrganization(ctx, tx, d.OrganizationID); err != nil {
+	err = db.InTxWithContexts(cleanupCtx, deletionCtx, conn.Begin, func(tx pgx.Tx) error {
+		if err := LockOrganization(cleanupCtx, tx, d.OrganizationID); err != nil {
 			return err
 		}
-		if err := attempt.verify(ctx, tx); err != nil {
+		if err := attempt.verify(cleanupCtx, tx); err != nil {
 			return err
 		}
+		ctx := deletionCtx
 		if err := organizationDeletionInTx(ctx, tx, prepared); err != nil {
 			return err
 		}

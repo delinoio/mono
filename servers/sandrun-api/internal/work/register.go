@@ -3,6 +3,7 @@
 package work
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -25,9 +26,19 @@ import (
 // retention of ended requests and runners (30 days) and the clean-up hooks
 // of OwnSand link removal, runner profile deletion and organization
 // deletion, and returns the engine for the adapters of later layers.
-func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m *metrics.Metrics, timing Timing) *Engine {
+func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m *metrics.Metrics, timing Timing, watch WatchQueueTiming) *Engine {
 	e := New(r.Service, links, profiles, m, timing)
-	r.Handle(sandrunv1connect.NewWorkServiceHandler(&Handler{e: e}, r.HandlerOptions()...))
+	watch = WatchQueueTiming{
+		Keepalive:  cmp.Or(watch.Keepalive, watchKeepalive),
+		Lifetime:   cmp.Or(watch.Lifetime, watchLifetime),
+		WriteGrace: cmp.Or(watch.WriteGrace, watchWriteGrace),
+		Poll:       cmp.Or(watch.Poll, watchPoll),
+	}
+	h := &Handler{e: e, watch: watch}
+	opts := r.HandlerOptions()
+	path, handler := sandrunv1connect.NewWorkServiceHandler(h, opts...)
+	r.Handle(path, handler)
+	r.Handle(sandrunv1connect.WorkServiceWatchQueueProcedure, h.withWatchQueueDeadline(handler, connect.NewErrorWriter(opts...)))
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "dispatcher", RunFunc: e.RunDispatcher})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "runner_reconciler", RunFunc: e.RunReconciler})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "work_gauges", RunFunc: e.RunGauges})
@@ -62,23 +73,26 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 			if err != nil {
 				return api.OrganizationDeletionSteps{}, err
 			}
-			ctx, stop := links.WatchRemoval(ctx, claim)
+			cleanupCtx, stop := links.WatchRemoval(ctx, claim)
 			abort := func(ctx context.Context) {
 				stop()
 				links.ReleaseRemoval(ctx, claim)
 			}
 			if claim.HasLink() {
-				if err := e.cleanUpOrganizationRunners(ctx, d.OrganizationID); err != nil {
+				if err := e.cleanUpOrganizationRunners(cleanupCtx, d.OrganizationID); err != nil {
 					abort(ctx)
 					return api.OrganizationDeletionSteps{}, err
 				}
 			}
 			var ended []*Request
 			return api.OrganizationDeletionSteps{
-				PrepareContext: ctx,
+				PrepareContext: cleanupCtx,
 				Abort:          abort,
 				InTx: func(ctx context.Context, tx pgx.Tx) error {
-					if err := links.CheckRemoval(ctx, tx, claim); err != nil {
+					if err := links.CheckRemoval(cleanupCtx, tx, claim); err != nil {
+						return err
+					}
+					if err := stop(); err != nil {
 						return err
 					}
 					var err error
@@ -86,7 +100,6 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 					return err
 				},
 				AfterCommit: func(ctx context.Context) {
-					stop()
 					e.releaseClaims(ctx, ended)
 				},
 			}, nil

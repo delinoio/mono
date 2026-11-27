@@ -22,8 +22,8 @@
      #d22030 on #ffffff 5.26:1, #8b95a1 on #ffffff 3.04:1, #3182f6 on
      #ffffff 3.71:1, #3182f6 on #f9fafb 3.55:1 (the dark toast surface),
      #4e5968 on #ffffff 7.11:1 (muted text and placeholders).
-     State indicators (the Progress, Meter and Slider fill
-     and the Select option check) use --dui-color-accent-graphic instead of
+     State indicators (the Progress, Meter and Slider fill, the Select option
+     check and the pressed Toggle stroke) use --dui-color-accent-graphic instead of
      --dui-color-accent, because #1b64da is only 2.01:1 against the dark
      track (#3c3c47) and 2.56:1 against the dark highlighted option
      (#2c2c35). The dark focus ring #4593fc is only 2.94:1 on the inverted
@@ -798,6 +798,7 @@
     font-family: var(--dui-font-family);
     font-size: 13px;
     line-height: 1.4;
+    overflow-wrap: anywhere;
     transform-origin: var(--transform-origin);
     transition:
       opacity 0.15s,
@@ -1772,6 +1773,7 @@
   .dui-toggle[data-pressed] {
     background: var(--dui-color-neutral-hover);
     color: var(--dui-color-text);
+    box-shadow: inset 0 0 0 2px var(--dui-color-accent-graphic);
   }
 
   .dui-toggle:focus-visible {
@@ -2091,8 +2093,8 @@
       background: CanvasText;
     }
 
-    /* Toggle and Pagination: the pressed and the current surface is a
-       background only. Fill it with `Highlight` and `HighlightText`. A border
+    /* Toggle and Pagination: use `Highlight` for the pressed Toggle and
+       current page fills and `HighlightText` for their labels. A border
        would widen these controls, because their size follows their content
        and a `min-width` that already includes the border box, while a fill
        changes no size. The focus ring is an outline, so it stays visible on
@@ -2105,6 +2107,11 @@
       forced-color-adjust: none;
       background: Highlight;
       color: HighlightText;
+    }
+
+    /* The opt-out also keeps the inset shadow unless it is cleared. */
+    .dui-toggle[data-pressed] {
+      box-shadow: none;
     }
   }
 }

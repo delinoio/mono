@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/servers/accounts-api/internal/directory"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 )
@@ -51,8 +52,11 @@ func (s *Service) enqueue(ctx context.Context, tx pgx.Tx, accountID string, kind
 		return err
 	}
 	tag, err := tx.Exec(ctx, `INSERT INTO billing_notifications (notification_id, billing_account_id, kind, dedup_key, details,
-			create_time, next_attempt_time)
-		VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT (dedup_key) DO NOTHING`,
+			create_time, next_attempt_time, expiry_next_attempt_time)
+		VALUES ($1, $2, $3, $4, $5, $6,
+			CASE WHEN $3 = 'credit_expiry' THEN 'infinity'::timestamptz ELSE $6 END,
+			CASE WHEN $3 = 'credit_expiry' THEN $6::timestamptz END)
+		ON CONFLICT (dedup_key) DO NOTHING`,
 		id, accountID, string(kind), key, body, now)
 	if err != nil {
 		return err
@@ -74,11 +78,12 @@ type notification struct {
 	DedupKey         string
 	Details          map[string]string
 	Attempts         int
+	SaveExpiryAmount bool
 }
 
 // DeliverNotifications sends the due notifications. A notification is
 // claimed in a short transaction that locks its row (SKIP LOCKED) and moves
-// next_attempt_time forward by notificationLease. The moved time is the lease:
+// its next attempt time forward by notificationLease. The moved time is the lease:
 // no other instance picks the notification before it, so several instances
 // never deliver one notification at once, and the lease needs no row lock
 // during the sends. Each send commits its own recipient row right after it,
@@ -111,11 +116,13 @@ func (s *Service) claimNotification(ctx context.Context) (notification, bool, er
 		now := s.timestamp()
 		var details []byte
 		var kind string
-		err := tx.QueryRow(ctx, `SELECT notification_id::text, billing_account_id::text, kind, dedup_key, details, attempts
+		err := tx.QueryRow(ctx, `SELECT notification_id::text, billing_account_id::text, kind, dedup_key, details, attempts,
+			expiry_next_attempt_time IS NOT NULL
 			FROM billing_notifications
-			WHERE send_time IS NULL AND abandon_time IS NULL AND next_attempt_time <= $1
-			ORDER BY next_attempt_time LIMIT 1 FOR UPDATE SKIP LOCKED`, now).Scan(
-			&n.ID, &n.BillingAccountID, &kind, &n.DedupKey, &details, &n.Attempts)
+			WHERE send_time IS NULL AND abandon_time IS NULL
+				AND COALESCE(expiry_next_attempt_time, next_attempt_time) <= $1
+			ORDER BY COALESCE(expiry_next_attempt_time, next_attempt_time) LIMIT 1 FOR UPDATE SKIP LOCKED`, now).Scan(
+			&n.ID, &n.BillingAccountID, &kind, &n.DedupKey, &details, &n.Attempts, &n.SaveExpiryAmount)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -126,7 +133,10 @@ func (s *Service) claimNotification(ctx context.Context) (notification, bool, er
 		if err := json.Unmarshal(details, &n.Details); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE billing_notifications SET next_attempt_time = $2 WHERE notification_id = $1`,
+		if _, err := tx.Exec(ctx, `UPDATE billing_notifications SET
+			next_attempt_time = CASE WHEN expiry_next_attempt_time IS NULL THEN $2 ELSE next_attempt_time END,
+			expiry_next_attempt_time = CASE WHEN expiry_next_attempt_time IS NOT NULL THEN $2::timestamptz END
+			WHERE notification_id = $1`,
 			n.ID, now.Add(notificationLease)); err != nil {
 			return err
 		}
@@ -150,6 +160,7 @@ func (s *Service) settle(ctx context.Context, fn func(ctx context.Context) error
 // not get it yet and records the result.
 func (s *Service) deliver(ctx context.Context, n notification) error {
 	var expiry time.Time
+	var grantID string
 	if n.Kind == NotifyCreditExpiry {
 		var err error
 		expiry, err = time.Parse(time.RFC3339Nano, n.Details[notifyDetailExpireTime])
@@ -158,6 +169,11 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 		}
 		if !expiry.After(s.timestamp()) {
 			return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
+		}
+		var ok bool
+		grantID, ok = strings.CutPrefix(n.DedupKey, creditExpiryNotificationPrefix)
+		if !ok || !uuidv7.Valid(grantID) {
+			return s.abandonCreditExpiryNotice(ctx, n, "invalid_credit_grant_key")
 		}
 	}
 
@@ -203,6 +219,21 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 	if err != nil {
 		return s.interruptedOr(ctx, n, err)
 	}
+	if grantID != "" && len(recipients) == 0 {
+		grant, err := s.readCreditExpiryGrant(ctx, n, grantID, expiry)
+		if err != nil {
+			if ctx.Err() != nil {
+				return s.deferNotification(ctx, n)
+			}
+			return s.settle(ctx, func(ctx context.Context) error {
+				return s.finish(ctx, n, err, 0)
+			})
+		}
+		if reason := grant.suppressionReason(s.timestamp()); reason != "" {
+			return s.abandonCreditExpiryNotice(ctx, n, reason)
+		}
+	}
+
 	lines := noticeLines(n)
 	// A failure for one recipient does not stop the others: a recipient that
 	// keeps failing must not keep later, independent recipients from getting
@@ -217,18 +248,46 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 		if ctx.Err() != nil {
 			return s.deferNotification(ctx, n)
 		}
-		user, err := s.directory.User(ctx, userID)
+		user, lookupErr := s.directory.User(ctx, userID)
 		// A profile lookup can cross the expiry even if it returns no email.
 		if n.Kind == NotifyCreditExpiry && !expiry.After(s.timestamp()) {
 			return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
 		}
-		if err != nil && !errors.Is(err, directory.ErrUserNotFound) {
+		var recipientErr error
+		if lookupErr != nil && !errors.Is(lookupErr, directory.ErrUserNotFound) {
+			recipientErr = fmt.Errorf("read recipient profile: %w", lookupErr)
+		}
+		recipientLines := lines
+		recipientExpiry := expiry
+		if grantID != "" {
+			grant, err := s.readCreditExpiryGrant(ctx, n, grantID, expiry)
+			if err == nil {
+				if reason := grant.suppressionReason(s.timestamp()); reason != "" {
+					return s.abandonCreditExpiryNotice(ctx, n, reason)
+				}
+				recipientExpiry = grant.expiry
+				// Legacy notices may have reached Resend before a receipt
+				// or retry was recorded. Reuse their queued amount for all
+				// recipients until those notices drain.
+				if n.SaveExpiryAmount && lookupErr == nil && user.PrimaryEmail != "" {
+					var amount int64
+					amount, err = s.saveCreditExpiryAmount(ctx, n.ID, userID, grant.remaining)
+					if err == nil {
+						recipientLines = creditExpiryLines(n.Details[notifyDetailExpireTime], FormatUSD(amount))
+					}
+				}
+			}
+			if recipientErr == nil {
+				recipientErr = err
+			}
+		}
+		if recipientErr != nil {
 			if ctx.Err() != nil {
 				return s.deferNotification(ctx, n)
 			}
 			failedRecipients++
 			if failed == nil {
-				failed = fmt.Errorf("read recipient profile: %w", err)
+				failed = recipientErr
 			}
 			continue
 		}
@@ -240,13 +299,13 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 				BillingAccountName: name,
 				To:                 user.PrimaryEmail,
 				Link:               email.BillingAccountPath(s.webOrigin, n.BillingAccountID),
-				Lines:              lines,
+				Lines:              recipientLines,
 				IdempotencyKey:     n.DedupKey + "/" + userID,
 			})
 			if err != nil {
 				return err
 			}
-			if n.Kind == NotifyCreditExpiry && !expiry.After(s.timestamp()) {
+			if n.Kind == NotifyCreditExpiry && !recipientExpiry.After(s.timestamp()) {
 				return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
 			}
 			err = s.email.Send(ctx, msg)
@@ -366,7 +425,10 @@ func (s *Service) interruptedOr(ctx context.Context, n notification, err error) 
 // not block the queue. It returns the error of ctx.
 func (s *Service) deferNotification(ctx context.Context, n notification) error {
 	err := s.settle(ctx, func(ctx context.Context) error {
-		_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET next_attempt_time = $2 WHERE notification_id = $1`,
+		_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET
+			next_attempt_time = CASE WHEN expiry_next_attempt_time IS NULL THEN $2 ELSE next_attempt_time END,
+			expiry_next_attempt_time = CASE WHEN expiry_next_attempt_time IS NOT NULL THEN $2::timestamptz END
+			WHERE notification_id = $1`,
 			n.ID, s.timestamp().Add(notificationDeferDelay))
 		return err
 	})
@@ -410,7 +472,9 @@ func (s *Service) finish(ctx context.Context, n notification, failed error, fail
 		slog.Bool("abandoned", abandon != nil),
 		slog.Int("failed_recipients", failedRecipients),
 		slog.Any("error", failed))
-	_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET attempts = $2, next_attempt_time = $3, abandon_time = $4
+	_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET attempts = $2, abandon_time = $4,
+		next_attempt_time = CASE WHEN expiry_next_attempt_time IS NULL THEN $3 ELSE next_attempt_time END,
+		expiry_next_attempt_time = CASE WHEN expiry_next_attempt_time IS NOT NULL THEN $3::timestamptz END
 		WHERE notification_id = $1`, n.ID, attempts, now.Add(backoff), abandon)
 	return err
 }
@@ -452,14 +516,7 @@ func noticeLines(n notification) []string {
 			"Add credit with a top-up so that your services keep running.",
 		}
 	case NotifyCreditExpiry:
-		expires := n.Details[notifyDetailExpireTime]
-		if t, err := time.Parse(time.RFC3339Nano, expires); err == nil {
-			expires = t.UTC().Format("January 2, 2006 15:04 UTC")
-		}
-		return []string{
-			fmt.Sprintf("%s of credit expires on %s.", amount(notifyDetailAmount), expires),
-			"Unused credit leaves the balance when it expires.",
-		}
+		return creditExpiryLines(n.Details[notifyDetailExpireTime], amount(notifyDetailAmount))
 	case NotifyOrganizationBlocked, NotifyOrganizationSuspended:
 		return organizationLines(n)
 	default:
@@ -493,6 +550,65 @@ func organizationLines(n notification) []string {
 	return []string{
 		fmt.Sprintf("%s is blocked because %s.", org, cause),
 		fmt.Sprintf("It will be suspended on %s unless the subscription is active and the balance is above $0.00 before then.", suspend),
+	}
+}
+
+const creditExpiryNotificationPrefix = "credit_expiry/"
+
+type creditExpiryGrant struct {
+	remaining int64
+	expiry    time.Time
+}
+
+func (g creditExpiryGrant) suppressionReason(now time.Time) string {
+	if !g.expiry.After(now) {
+		return "credit_expired"
+	}
+	if g.remaining <= 0 {
+		return "no_remaining_credit"
+	}
+	return ""
+}
+
+// readCreditExpiryGrant reads committed credit without locking the grant
+// during the send. Apply the earlier of the grant and notification deadlines.
+func (s *Service) readCreditExpiryGrant(ctx context.Context, n notification, grantID string, queuedExpiry time.Time) (creditExpiryGrant, error) {
+	var grant creditExpiryGrant
+	err := s.db.Pool.QueryRow(ctx, `SELECT remaining_usd_micros, expire_time FROM credit_grants
+		WHERE credit_grant_id = $1 AND billing_account_id = $2`, grantID, n.BillingAccountID).Scan(&grant.remaining, &grant.expiry)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return creditExpiryGrant{expiry: queuedExpiry}, nil
+	}
+	if err != nil {
+		return creditExpiryGrant{}, fmt.Errorf("read credit expiry grant: %w", err)
+	}
+	if queuedExpiry.Before(grant.expiry) {
+		grant.expiry = queuedExpiry
+	}
+	return grant, nil
+}
+
+// saveCreditExpiryAmount commits the amount before the provider call and
+// returns the original amount if a previous attempt used this recipient key.
+func (s *Service) saveCreditExpiryAmount(ctx context.Context, notificationID, userID string, remaining int64) (int64, error) {
+	var amount int64
+	err := s.db.Pool.QueryRow(ctx, `INSERT INTO billing_notification_expiry_amounts AS saved (notification_id, user_id, amount_usd_micros)
+		VALUES ($1, $2, $3) ON CONFLICT (notification_id, user_id)
+		DO UPDATE SET amount_usd_micros = saved.amount_usd_micros RETURNING amount_usd_micros`,
+		notificationID, userID, remaining).Scan(&amount)
+	if err != nil {
+		return 0, fmt.Errorf("save credit expiry amount: %w", err)
+	}
+	return amount, nil
+}
+
+func creditExpiryLines(expires, amount string) []string {
+	if t, err := time.Parse(time.RFC3339Nano, expires); err == nil {
+		expires = t.UTC().Format("January 2, 2006 15:04 UTC")
+	}
+	return []string{
+		fmt.Sprintf("%s of credit expires on %s.", amount, expires),
+		"Unused credit leaves the balance when it expires.",
 	}
 }
 
@@ -542,7 +658,7 @@ func (s *Service) QueueExpiryNotices(ctx context.Context) error {
 			if acct.Deleted || remaining <= 0 {
 				return nil
 			}
-			return s.enqueue(ctx, tx, acct.ID, NotifyCreditExpiry, "credit_expiry/"+r.GrantID, map[string]string{
+			return s.enqueue(ctx, tx, acct.ID, NotifyCreditExpiry, creditExpiryNotificationPrefix+r.GrantID, map[string]string{
 				notifyDetailAmount:     fmt.Sprint(remaining),
 				notifyDetailExpireTime: expire.UTC().Format(time.RFC3339Nano),
 			}, fresh)

@@ -31,29 +31,41 @@ export type SliderProps = Omit<
   thumbLabels?: readonly string[];
 };
 
-function isEmptyArray(value: unknown): boolean {
-  return Array.isArray(value) && value.length === 0;
+type SliderValueProp = SliderProps["value"];
+
+function thumbCount(value: SliderValueProp): number {
+  return Array.isArray(value) ? value.length : 1;
+}
+
+function isRangeValue(value: SliderValueProp): boolean {
+  return thumbCount(value) > 1;
+}
+
+// The SDK adapter chooses its Field bindings from value ?? defaultValue.
+// Keep a mode-compatible reset default when control is released. If the
+// original default cannot represent the mode, use its first controlled value.
+// Remove this fallback when the SDK adapter chooses bindings from live state.
+function compatibleResetDefault(
+  defaultValue: SliderValueProp,
+  value: SliderValueProp,
+): SliderValueProp {
+  if (
+    value !== undefined &&
+    isRangeValue(value) !== isRangeValue(defaultValue)
+  ) {
+    return value;
+  }
+  return defaultValue;
 }
 
 /**
- * A labeled slider built from UI SDK `Field` and `Slider`. Pass a number as
- * `value` or `defaultValue` for one thumb, or an array of more than one value for a
- * range with one thumb per value. An array of one value is one thumb. Arrow keys move the focused thumb.
+ * A labeled slider built from UI SDK `Field` and `Slider`. A number or
+ * one-value array gives one thumb. A longer array gives one thumb per value.
+ * Compatible controlled updates preserve the mounted mode. Omit `value`
+ * to release control while keeping the current values.
  *
- * An empty array in `value` or `defaultValue` counts as no value, because a
- * slider has at least one thumb. A controlled `value={[]}` therefore behaves
- * like an uncontrolled slider that starts at the UI SDK default (`min`, or 0).
- * `onValueChange` then reports a number, not an array, because the UI SDK state
- * is a number when no value is given. A later re-render with `value={[20]}`
- * shows one thumb with the value 20.
- *
- * A slider that mounted as a range keeps one thumb per committed value. An
- * accepted controller update (such as `setValue`) from one array of more than
- * one value to another adds or removes thumbs, and the positional names use
- * the current total. A canceled update changes nothing.
- *
- * When `value={[]}` replaces a number or a non-empty array, the slider resets
- * to that default, as if it mounted again with no value.
+ * An empty `defaultValue` is treated as absent. Passing `value={[]}` after
+ * a controlled value resets the slider to the current default (or `min`).
  */
 export function Slider({
   label,
@@ -64,52 +76,75 @@ export function Slider({
   disabled,
   value: valueProp,
   defaultValue: defaultValueProp,
+  onValueChange,
+  "aria-label": ariaLabel,
+  "aria-labelledby": ariaLabelledBy,
   ...props
 }: SliderProps) {
-  const valueIsEmpty = isEmptyArray(valueProp);
-  const value = valueIsEmpty ? undefined : valueProp;
-  const hasValue = value !== undefined;
-  // Workaround: the UI SDK keeps its last state when `value` becomes
-  // undefined, and this wrapper maps an empty array to undefined. After a
-  // non-empty value is replaced by `[]`, the SDK state (for example the range
-  // 20 and 80) would then differ from the one default thumb rendered here.
-  // Remounting the SDK root through a new key makes it start again from `min`
-  // or `defaultValue`. The key changes only when a value is replaced by an
-  // empty array, so a fresh mount, `[]` to a value and an uncontrolled slider
-  // keep their state. The remount drops the focus of the thumb. The state is
-  // adjusted during render, which React supports for state derived from props.
-  // Remove when the UI SDK resets its state when a controlled value becomes
-  // undefined.
-  const currentDefaultValue = isEmptyArray(defaultValueProp)
-    ? undefined
-    : defaultValueProp;
-  // The UI SDK reads `defaultValue` only when its root mounts, so the thumb
-  // count must follow the default of that mount and not a later prop. The
-  // mounted default is captured with the epoch and captured again when the
-  // root remounts.
-  const [resetState, setResetState] = React.useState({
-    hadValue: hasValue,
+  const valueIsEmpty = thumbCount(valueProp) === 0;
+  const requestedValue = valueIsEmpty ? undefined : valueProp;
+  const currentDefault =
+    thumbCount(defaultValueProp) === 0 ? undefined : defaultValueProp;
+  const [configuration, setConfiguration] = React.useState(() => ({
     epoch: 0,
-    mountedDefault: currentDefaultValue,
-  });
-  let resetEpoch = resetState.epoch;
-  let defaultValue = resetState.mountedDefault;
-  if (resetState.hadValue !== hasValue) {
-    if (resetState.hadValue && valueIsEmpty) {
-      resetEpoch += 1;
-      defaultValue = currentDefaultValue;
-    }
-    setResetState({
-      hadValue: hasValue,
-      epoch: resetEpoch,
-      mountedDefault: defaultValue,
+    controlled:
+      requestedValue === undefined
+        ? undefined
+        : { initial: requestedValue, value: requestedValue },
+    resetDefault: currentDefault,
+    defaultProp: currentDefault,
+  }));
+
+  let { controlled, resetDefault } = configuration;
+  if (valueIsEmpty && controlled !== undefined) {
+    // The SDK keeps the current value when its value prop becomes undefined.
+    // Remount only for the explicit empty-array reset. Remove this workaround
+    // when the SDK can reset to the supplied default without a remount.
+    setConfiguration({
+      epoch: configuration.epoch + 1,
+      controlled: undefined,
+      resetDefault: currentDefault,
+      defaultProp: currentDefault,
     });
+  } else {
+    if (requestedValue !== undefined) {
+      if (controlled === undefined) {
+        controlled = { initial: requestedValue, value: requestedValue };
+      } else if (
+        requestedValue !== controlled.value &&
+        isRangeValue(requestedValue) === isRangeValue(controlled.value)
+      ) {
+        controlled = { ...controlled, value: requestedValue };
+      }
+    } else if (
+      currentDefault !== undefined &&
+      currentDefault !== configuration.defaultProp &&
+      thumbCount(currentDefault) ===
+        thumbCount(compatibleResetDefault(resetDefault, controlled?.initial))
+    ) {
+      resetDefault = currentDefault;
+    }
+
+    if (
+      controlled !== configuration.controlled ||
+      resetDefault !== configuration.resetDefault ||
+      currentDefault !== configuration.defaultProp
+    ) {
+      setConfiguration({
+        epoch: configuration.epoch,
+        controlled,
+        resetDefault,
+        defaultProp: currentDefault,
+      });
+    }
   }
-  const initial = value ?? defaultValue;
-  const thumbCount = Array.isArray(initial) ? initial.length : 1;
-  // The UI SDK treats only an array of more than one value as a range. A
-  // one-value array is a single thumb that the field label names.
-  const isRange = Array.isArray(initial) && initial.length > 1;
+
+  const value = requestedValue === undefined ? undefined : controlled?.value;
+  const defaultValue =
+    value === undefined
+      ? compatibleResetDefault(resetDefault, controlled?.initial)
+      : resetDefault;
+  const isRange = isRangeValue(value ?? defaultValue);
   // A range thumb without an explicit name is named by the visible label and
   // its position. The names reference the rendered label by id, so a React node
   // label works and the names stay correct on the server and the client.
@@ -128,35 +163,39 @@ export function Slider({
   return (
     <Field className="dui-text-field" disabled={disabled}>
       <SliderRoot
-        key={resetEpoch}
+        key={configuration.epoch}
         className={mergeClassName("dui-slider", className)}
         disabled={disabled}
         value={value}
         defaultValue={defaultValue}
-        // The range overrides the id of the label with `labelId`, but the UI
-        // SDK derives the default `aria-labelledby` of the group from the id
-        // that it predicts for the label, which no element has. Without this
-        // prop the group has a dangling reference in static markup. It comes
-        // before `{...props}` so a caller `aria-labelledby` wins, and it is
-        // skipped for a caller `aria-label`, which `aria-labelledby` would
-        // override. A single thumb keeps the label id of the UI SDK.
+        onValueChange={
+          isRange && value === undefined
+            ? (next, details) => {
+                if (thumbCount(next) < 2) {
+                  details.cancel();
+                  return;
+                }
+                onValueChange?.(next, details);
+              }
+            : onValueChange
+        }
+        aria-label={isRange && !ariaLabel?.trim() ? undefined : ariaLabel}
+        // An explicit empty reference suppresses the SDK's predicted Field
+        // label ID when a caller names the group with aria-label. Remove this
+        // override when the SDK respects aria-label on its own.
         aria-labelledby={
-          isRange && props["aria-label"] === undefined ? labelId : undefined
+          isRange
+            ? ariaLabelledBy?.trim()
+              ? ariaLabelledBy
+              : ariaLabel?.trim()
+                ? ""
+                : labelId
+            : ariaLabelledBy
         }
         {...props}
       >
         {(state) => {
-          // The mounted shape decides whether this is a range. Once it is,
-          // an accepted change of the committed value (a controller
-          // `setValue`, for example) can add or remove thumbs, so the count
-          // follows the committed array of the UI SDK root and not the props.
-          // A single thumb, and a change between a single thumb and a range,
-          // keep the count of the props.
-          const committed = state.value;
-          const count =
-            isRange && Array.isArray(committed) && committed.length > 1
-              ? committed.length
-              : thumbCount;
+          const count = isRange ? thumbCount(state.value) : 1;
           return (
             <>
               <div className="dui-slider-header">

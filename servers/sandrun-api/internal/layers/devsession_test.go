@@ -975,13 +975,20 @@ func (w *workWorld) waitState(t *testing.T, id string, state sandrunv1.RequestSt
 // not_found, so no session of a deleted profile stays queued.
 func TestCreateDevSessionDuringProfileDeletion(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{})
-	ctx := context.Background()
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	tx, err := w.env.DB.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer func() {
+		// Cancel any pending creation before releasing the lock on failure.
+		cancel()
+		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelRollback()
+		_ = tx.Rollback(rollbackCtx)
+	}()
 	if _, err := tx.Exec(ctx, "SELECT 1 FROM runner_profiles WHERE runner_profile_id = $1 FOR UPDATE", profileID); err != nil {
 		t.Fatal(err)
 	}
@@ -990,14 +997,41 @@ func TestCreateDevSessionDuringProfileDeletion(t *testing.T) {
 		_, err := w.env.User(w.org.Member).DevSession.CreateDevSession(ctx, connect.NewRequest(&sandrunv1.CreateDevSessionRequest{OrganizationId: w.org.ID, RunnerProfileId: profileID}))
 		done <- err
 	}()
-	time.Sleep(300 * time.Millisecond)
+	blockerPID := tx.Conn().PgConn().PID()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	var waiting bool
+	for !waiting {
+		select {
+		case err := <-done:
+			t.Fatalf("CreateDevSession finished before waiting for the profile lock: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("waiting for CreateDevSession to block on the profile lock: %v", ctx.Err())
+		case <-ticker.C:
+		}
+		// Check which statement is blocked to verify the shared lock itself.
+		if err := w.env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND query LIKE 'SELECT 1 FROM runner_profiles WHERE % FOR SHARE'
+			  AND $1 = ANY(pg_blocking_pids(pid))
+		)`, blockerPID).Scan(&waiting); err != nil {
+			t.Fatalf("observe CreateDevSession waiting for the profile lock: %v", err)
+		}
+	}
+	t.Logf("CreateDevSession waited for the profile lock held by PostgreSQL backend %d", blockerPID)
 	if _, err := tx.Exec(ctx, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", profileID); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	wantCode(t, "create during deletion", <-done, connect.CodeNotFound)
+	select {
+	case err := <-done:
+		wantCode(t, "create during deletion", err, connect.CodeNotFound)
+	case <-ctx.Done():
+		t.Fatalf("waiting for CreateDevSession after profile deletion: %v", ctx.Err())
+	}
 	var n int
 	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM requests WHERE runner_profile_id = $1", profileID).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("%d requests of the deleted profile (%v)", n, err)

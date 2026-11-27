@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,16 +26,22 @@ import (
 
 // Stream limits of WatchQueue (protos contract).
 const (
-	watchKeepalive = 25 * time.Second
-	watchLifetime  = 13*time.Minute + 30*time.Second
-	watchPoll      = time.Second
+	watchKeepalive  = 25 * time.Second
+	watchLifetime   = 13*time.Minute + 30*time.Second
+	watchWriteGrace = 15 * time.Second
+	watchPoll       = time.Second
 )
+
+// WatchQueueTiming overrides the stream intervals for tests. Zero fields use
+// the production values.
+type WatchQueueTiming struct {
+	Keepalive, Lifetime, WriteGrace, Poll time.Duration
+}
 
 // Handler serves WorkService.
 type Handler struct {
-	e *Engine
-	// watch overrides the WatchQueue durations (tests).
-	watchKeepalive, watchLifetime, watchPoll time.Duration
+	e     *Engine
+	watch WatchQueueTiming
 }
 
 var _ sandrunv1connect.WorkServiceHandler = (*Handler)(nil)
@@ -385,20 +392,38 @@ func (h *Handler) GetCapacity(ctx context.Context, req *connect.Request[sandrunv
 	return connect.NewResponse(resp), nil
 }
 
+type watchQueueRotationKey struct{}
+
+var errWatchQueueRotation = errors.New("watch queue rotation")
+
+func (h *Handler) withWatchQueueDeadline(next http.Handler, errorWriter *connect.ErrorWriter) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		rotateAt := time.Now().Add(h.watch.Lifetime)
+		// Connect writes and flushes the final status after WatchQueue returns.
+		// Keep the write deadline active until the HTTP handler finishes.
+		if err := http.NewResponseController(w).SetWriteDeadline(rotateAt.Add(h.watch.WriteGrace)); err != nil {
+			_ = errorWriter.Write(w, req, h.e.svc.Internal(ctx, "set watch queue response write deadline", err))
+			return
+		}
+		next.ServeHTTP(w, req.WithContext(context.WithValue(ctx, watchQueueRotationKey{}, rotateAt)))
+	})
+}
+
 // WatchQueue streams every open request and runner, then snapshot_complete,
 // then changes to either table, including transitions to terminal states.
 func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[sandrunv1.WatchQueueRequest], stream *connect.ServerStream[sandrunv1.WatchQueueResponse]) error {
 	s := h.e.svc
+	rotateAt, ok := ctx.Value(watchQueueRotationKey{}).(time.Time)
+	if !ok {
+		return s.Internal(ctx, "get watch queue rotation deadline", http.ErrNotSupported)
+	}
+	ctx, cancel := context.WithDeadlineCause(ctx, rotateAt, errWatchQueueRotation)
+	defer cancel()
 	c, err := s.Authorize(ctx, s.DB.Pool, req.Msg.GetOrganizationId(), authz.ActionRead)
 	if err != nil {
 		return err
 	}
-	keepalive, lifetime, poll := watchKeepalive, watchLifetime, watchPoll
-	if h.watchKeepalive > 0 {
-		keepalive, lifetime, poll = h.watchKeepalive, h.watchLifetime, h.watchPoll
-	}
-	ctx, cancel := context.WithTimeout(ctx, lifetime)
-	defer cancel()
 	// Only a CREATING runner without a sandbox can disappear without a
 	// terminal state when OwnSand rejects CreateSandbox for capacity.
 	removable := map[string]*sandrunv1.Runner{}
@@ -438,13 +463,13 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[sandrunv1
 		return err
 	}
 	checkpoint := batch.snapshot
-	ticker := time.NewTicker(poll)
+	ticker := time.NewTicker(h.watch.Poll)
 	defer ticker.Stop()
 	lastSend := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			if errors.Is(context.Cause(ctx), errWatchQueueRotation) {
 				// The stream ends before 14 minutes with an OK status; the
 				// client reconnects.
 				return nil
@@ -466,7 +491,7 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[sandrunv1
 		if len(batch.rows) > 0 || len(batch.removed) > 0 {
 			lastSend = time.Now()
 		}
-		if time.Since(lastSend) >= keepalive {
+		if time.Since(lastSend) >= h.watch.Keepalive {
 			if err := stream.Send(&sandrunv1.WatchQueueResponse{Event: &sandrunv1.WatchQueueResponse_Keepalive{Keepalive: &sandrunv1.WatchQueueKeepalive{}}}); err != nil {
 				return err
 			}

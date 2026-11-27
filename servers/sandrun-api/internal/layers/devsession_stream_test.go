@@ -26,7 +26,7 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
 )
 
-func startDevSessionH2C(t *testing.T, handler http.Handler, window int) (*http.Client, string) {
+func startStreamH2C(t *testing.T, handler http.Handler, window int) (*http.Client, string) {
 	t.Helper()
 	server := httptest.NewUnstartedServer(handler)
 	var protocols http.Protocols
@@ -107,7 +107,7 @@ func TestDevSessionStalledResponse(t *testing.T) {
 				return nil, ctx.Err()
 			})
 			handler := w.env.App.Handler()
-			client, baseURL := startDevSessionH2C(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client, baseURL := startStreamH2C(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == tc.procedure {
 					defer close(finished)
 				}
@@ -251,7 +251,7 @@ func TestDevSessionFileReadRotation(t *testing.T) {
 	const relayLimit = 200 * time.Millisecond
 	w := newWorkWorld(t, devsession.Timing{StreamLimit: relayLimit, WriteGracePeriod: 2 * time.Second})
 	session, sandboxID := w.runningSession(t)
-	httpClient, baseURL := startDevSessionH2C(t, w.env.App.Handler(), 64)
+	httpClient, baseURL := startStreamH2C(t, w.env.App.Handler(), 64)
 	client := sandrunv1connect.NewDevSessionServiceClient(httpClient, baseURL)
 	path := "download.txt"
 	data := make([]byte, 1500)

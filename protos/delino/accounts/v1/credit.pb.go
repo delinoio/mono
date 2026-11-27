@@ -519,8 +519,9 @@ type AutoTopUpSettings struct {
 	// admins. A successful top-up and enabling the setting reset it to 0.
 	ConsecutiveFailures int32 `protobuf:"varint,5,opt,name=consecutive_failures,json=consecutiveFailures,proto3" json:"consecutive_failures,omitempty"`
 	// Output only. Updates ignore this field. Monthly cap usage in the current
-	// UTC calendar month. The total includes completed and in-flight automatic
-	// top-ups, including queued entries, and excludes failed automatic top-ups.
+	// UTC calendar month. The total includes completed, in-flight and
+	// timed-out automatic top-ups, including queued entries. A verified
+	// payment failure releases a timed-out top-up's reservation.
 	MonthToDateUsdMicros int64 `protobuf:"varint,6,opt,name=month_to_date_usd_micros,json=monthToDateUsdMicros,proto3" json:"month_to_date_usd_micros,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
