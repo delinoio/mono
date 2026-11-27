@@ -31,7 +31,7 @@ const fixtureInputs = new Set([
   "pnpm-workspace.yaml",
   "rstack.config.ts",
   "lefthook.yml",
-  "scripts/install-git-hooks.sh",
+  "scripts/install-git-hooks.mjs",
   // The Droplet fixtures run provisioning with stubbed host commands.
   "scripts/droplet/provision.sh",
   // The Droplet fixtures run this helper against a stubbed `docker`.

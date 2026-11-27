@@ -244,16 +244,23 @@ func psStopped(ctx context.Context, pid int) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, psTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	return psStoppedResult(out, err, ctx.Err())
+}
+
+func psStoppedResult(out []byte, err, ctxErr error) (bool, error) {
+	stat := bytes.TrimSpace(out)
+	var exitErr *exec.ExitError
+	missing := errors.As(err, &exitErr) && exitErr.ExitCode() == 1 &&
+		len(stat) == 0 && len(bytes.TrimSpace(exitErr.Stderr)) == 0
+	// The deadline invalidates a stop confirmation and can kill the command.
+	// Keep a completed probe failure so the wait can report it with its timeout.
+	if ctxErr != nil && (err == nil || missing || (exitErr != nil && exitErr.ExitCode() < 0)) {
 		return false, fmt.Errorf("ps: %w", ctxErr)
 	}
-	stat := bytes.TrimSpace(out)
+	if missing {
+		return true, nil
+	}
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 &&
-			len(stat) == 0 && len(bytes.TrimSpace(exitErr.Stderr)) == 0 {
-			return true, nil
-		}
 		return false, fmt.Errorf("ps: %w", err)
 	}
 	if len(stat) == 0 {

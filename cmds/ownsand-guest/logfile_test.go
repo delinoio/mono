@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -221,11 +222,30 @@ func TestOpenLogFileRotatesOnTheNextStartAfterTheBlockEnds(t *testing.T) {
 
 func TestOpenLogFileReportsAnUnopenableLog(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, logFile), 0o700); err != nil {
+	path := filepath.Join(dir, logFile)
+	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openLogFile(dir, logRotateBytes); err == nil {
-		t.Fatal("openLogFile opened a directory as the log")
+	_, err := openLogFile(dir, logRotateBytes)
+	checkLogSetupError(t, err, openGuestLog, path)
+}
+
+func TestOpenLogFileReportsAnUncreatableStateDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state")
+	writeFile(t, path, "occupied")
+	_, err := openLogFile(path, logRotateBytes)
+	checkLogSetupError(t, err, createLogStateDir, path)
+}
+
+func checkLogSetupError(t *testing.T, err error, operation logSetupOperation, path string) {
+	t.Helper()
+	var setupErr *logSetupError
+	if !errors.As(err, &setupErr) || setupErr.operation != operation {
+		t.Fatalf("got %v, want log setup error for %q", err, operation)
+	}
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) || pathErr.Path != path {
+		t.Fatalf("got %v, want wrapped filesystem error for %q", err, path)
 	}
 }
 

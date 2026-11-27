@@ -625,7 +625,7 @@ func (a *app) fileRead(ctx context.Context, name string, args []string) error {
 		if dst, err = openDownloadTarget(ctx, *to); err != nil {
 			return err
 		}
-		w = dst.f
+		w = dst.writer
 	}
 	n, err := s.ReadFile(ctx, rest[1], w)
 	if dst != nil {
@@ -648,7 +648,8 @@ func (a *app) fileRead(ctx context.Context, name string, args []string) error {
 // regular file (a device or a FIFO) cannot be replaced by a rename and is
 // written in place.
 type downloadTarget struct {
-	f *os.File
+	f      *os.File
+	writer io.Writer
 	// path is the destination with symbolic links resolved, so that the
 	// rename replaces the target of a link (or creates a missing target) and
 	// keeps the link.
@@ -666,7 +667,12 @@ func openDownloadTarget(ctx context.Context, to string) (*downloadTarget, error)
 		if err != nil {
 			return nil, err
 		}
-		return &downloadTarget{f: f, path: to}, nil
+		w, err := downloadFileWriter(ctx, f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return &downloadTarget{f: f, writer: w, path: to}, nil
 	case err == nil:
 		if path, err = filepath.EvalSymlinks(to); err != nil {
 			return nil, err
@@ -709,7 +715,7 @@ func openDownloadTarget(ctx context.Context, to string) (*downloadTarget, error)
 				return nil, err
 			}
 		}
-		return &downloadTarget{f: f, path: path, tmp: tmp}, nil
+		return &downloadTarget{f: f, writer: f, path: path, tmp: tmp}, nil
 	}
 	return nil, fmt.Errorf("create a temporary file beside %s: too many name collisions", to)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/go/ownsand"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/cursor"
@@ -86,6 +87,96 @@ func TestCursorClaimDuringProfileDeletion(t *testing.T) {
 		t.Error("the vendor claim is still active")
 	}
 	w.assertNoRequestsOrClaims(t)
+}
+
+func TestCursorClaimDuringProfileDeletionRetriesRelease(t *testing.T) {
+	for _, scenario := range []string{"poll", "repeated_demand", "lease_turnover"} {
+		t.Run(scenario, func(t *testing.T) {
+			timing := fastAgentTiming()
+			timing.PollInterval = time.Hour // Each step runs one poll explicitly.
+			const guest = sandrunv1.GuestOs_GUEST_OS_LINUX
+			const id = "bc-deleted-profile"
+			w := newCursorWorldTiming(t, guest, timing)
+			w.cursor.FailClaimCalls(true)
+			holder := holdTx(t, w.env, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", w.profileID)
+			w.cursor.AddRequest(id, true)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+				query: "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE"})
+			if n := w.cursor.ClaimCount(id); n != 1 {
+				t.Fatalf("%d claims while admission waits for the profile, want 1", n)
+			}
+			holder.commit()
+			eventually(t, "failed release of the unused vendor claim", func() bool {
+				return w.cursor.ReleaseAttempts(id) == 1
+			})
+			if _, held := w.cursor.Claim(id); !held {
+				t.Fatal("the vendor claim disappeared after the release failed")
+			}
+			w.assertNoRequestsOrClaims(t)
+
+			failedAttempts := 1
+			switch scenario {
+			case "poll":
+				eventually(t, "the watch to stop after profile deletion", func() bool {
+					return w.cursor.Streams() == 0
+				})
+			case "repeated_demand":
+				w.createProfile(t, agentProfileProto("replacement", w.integrationID, guest, time.Hour))
+				w.cursor.AddRequest(id, true)
+				eventually(t, "release retry on the repeated demand", func() bool {
+					return w.cursor.ReleaseAttempts(id) == 2
+				})
+				failedAttempts++
+			case "lease_turnover":
+				w.l.Agents.Poll(t.Context())
+				if attempts := w.cursor.ReleaseAttempts(id); attempts != 2 {
+					t.Fatalf("release attempts under the original lease = %d, want 2", attempts)
+				}
+				w.env.Stop()
+				w.cursor.FailClaimCalls(false)
+				// Reacquire the lease on the same app and hub, which held
+				// the earlier cleanup entry in memory.
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					w.env.App.Run(ctx)
+				}()
+				t.Cleanup(func() { cancel(); <-done })
+				eventually(t, "a new lease", w.env.App.Lease.Held)
+				w.l.Agents.Poll(t.Context())
+				if attempts := w.cursor.ReleaseAttempts(id); attempts != 2 {
+					t.Fatalf("release attempts after lease turnover = %d, want 2", attempts)
+				}
+				if _, held := w.cursor.Claim(id); !held {
+					t.Fatal("the new lease released the old claim")
+				}
+				w.assertNoRequestsOrClaims(t)
+				t.Log("The same app reacquired the lease. Two failures occurred under the original lease, and the new lease sent no release.")
+				return
+			}
+
+			w.cursor.FailClaimCalls(false)
+			w.l.Agents.Poll(t.Context())
+			w.l.Agents.Poll(t.Context())
+			if attempts, releases := w.cursor.ReleaseAttempts(id), w.cursor.Released(id); attempts != failedAttempts+1 || releases != 1 {
+				t.Fatalf("release attempts = %d, successes = %d, want %d and 1", attempts, releases, failedAttempts+1)
+			}
+			if _, held := w.cursor.Claim(id); held {
+				t.Fatal("the vendor claim is still active")
+			}
+			_, claims, _ := w.cursor.WatchCalls()
+			if len(claims) != 1 {
+				t.Fatalf("claim attempts = %v, want only the original claim", claims)
+			}
+			w.assertNoRequestsOrClaims(t)
+			t.Logf("A poll without a vendor event released the claim after %d failed attempts. A second poll made no release call.", failedAttempts)
+			if scenario == "repeated_demand" {
+				w.cursor.Announce(id, 2)
+				w.requestBySource(t, id)
+			}
+		})
+	}
 }
 
 // TestCursorRequestLifecycle: a pending request is claimed with a SandRun
@@ -163,6 +254,55 @@ func TestCursorRequestLifecycle(t *testing.T) {
 	}
 	if strings.Contains(w.env.Logs.String(), cursorKey) {
 		t.Fatal("the API key reached the log")
+	}
+}
+
+func TestCursorCredentialCleanupFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		started bool
+		reason  sandrunv1.RequestEndReason
+	}{
+		{"exit before start event", false, sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED},
+		{"exit after start event", true, sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_LOST},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			cleanupCode := int64(22)
+			w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+				result := &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: new(int64)}
+				if !strings.Contains(p.Command[len(p.Command)-1], agent.LogFile) {
+					return result, nil
+				}
+				if tc.started {
+					return nil, p.OnEvent(ownsand.ExecEvent{Kind: ownsand.ExecEventStarted, ExecID: p.ExecID})
+				}
+				result.ExitCode = &cleanupCode
+				return result, nil
+			}, func(_ context.Context, _, execID string, _ ownsand.AttachParams) (*ownsand.ExecResult, error) {
+				return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &cleanupCode}, nil
+			})
+			const id = "credential-cleanup-failed"
+			w.cursor.AddRequest(id, true)
+			req := w.requestBySource(t, id)
+			failed := w.waitRequest(t, req.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_FAILED)
+			if failed.GetEndReason() != tc.reason {
+				t.Fatalf("end reason = %s, want %s", failed.GetEndReason(), tc.reason)
+			}
+			eventually(t, "sandbox deletion", func() bool {
+				return w.fake.Calls("DeleteSandbox") > 0 && w.fake.Active(w.osOrg) == 0
+			})
+			if (w.fake.Calls("AttachExec") > 0) != tc.started {
+				t.Fatalf("unexpected attach count: %d", w.fake.Calls("AttachExec"))
+			}
+			logs := w.env.Logs.String()
+			if !tc.started && !strings.Contains(logs, "exit code 22") {
+				t.Error("the startup diagnostic lacks the cleanup exit code")
+			}
+			if strings.Contains(logs, cursorKey) {
+				t.Error("the credential reached the log")
+			}
+		})
 	}
 }
 

@@ -713,7 +713,7 @@ fi
 		if list := env[guestEnvLinks]; list != "" && env[guestEnvWorkspace] != "" {
 			applied.Store(true)
 			body, err := os.ReadFile(list)
-			if want := "link\t" + target + "\n"; err != nil || string(body) != want {
+			if want := "\xef\xbb\xbflink\t" + target + "\n"; err != nil || string(body) != want {
 				t.Errorf("staged link list = %x, %v, want %x", body, err, want)
 			}
 		}
@@ -1377,10 +1377,89 @@ func TestInvalidWindowsPath(t *testing.T) {
 	}
 }
 
+func TestSyncPOSIXListPaths(t *testing.T) {
+	needPOSIX(t)
+	t.Run("single deletion", func(t *testing.T) {
+		const name = "\ufeffnote.txt"
+		c, srv, org := newTestClient(t, "")
+		ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+		dir := newRepo(t, map[string]string{name: "original"}, nil, "")
+		p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+		if _, err := c.Sync(t.Context(), p); err != nil {
+			t.Fatal(err)
+		}
+		if got := readGuest(t, ds, name); got != "original" {
+			t.Fatalf("initial guest file = %q", got)
+		}
+		git(t, dir, "rm", "--", name)
+		res, err := c.Sync(t.Context(), p)
+		if err != nil || res.Deleted != 1 {
+			t.Fatalf("deletion sync = %+v, %v", res, err)
+		}
+		if _, err := os.Lstat(filepath.Join(ds.GetWorkspacePath(), name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("guest file should be removed, lstat returned %v", err)
+		}
+		if files := guestManifest(t, ds).Files; len(files) != 0 {
+			t.Fatalf("manifest contains deleted paths: %+v", files)
+		}
+	})
+
+	for _, tc := range []struct{ name, first string }{
+		{"U+FEFF first", "\ufefffirst"},
+		{"ordinary first", "plain"},
+	} {
+		t.Run("replace and prune with "+tc.name, func(t *testing.T) {
+			prefixes := []string{tc.first, "\ufefflater"}
+			tracked := map[string]string{}
+			for _, prefix := range prefixes {
+				tracked[prefix+"-config"] = "old file"
+				tracked[prefix+"-prune/child.txt"] = "old child"
+			}
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, tracked, nil, "")
+			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{}
+			for _, prefix := range prefixes {
+				config, prune := prefix+"-config", prefix+"-prune"
+				git(t, dir, "rm", "-r", "--", config, prune)
+				if err := os.Mkdir(filepath.Join(dir, config), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				want[config+"/child.txt"], want[prune] = "new child", "new file"
+			}
+			for path, content := range want {
+				if err := os.WriteFile(filepath.Join(dir, path), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res, err := c.Sync(t.Context(), p)
+			if err != nil || res.Uploaded != len(want) || res.Deleted != len(tracked) {
+				t.Fatalf("replacement and prune sync = %+v, %v", res, err)
+			}
+			files := guestManifest(t, ds).Files
+			if len(files) != len(want) {
+				t.Fatalf("manifest has %d paths, want %d", len(files), len(want))
+			}
+			for path, content := range want {
+				if got := readGuest(t, ds, path); got != content {
+					t.Errorf("guest %q = %q, want %q", path, got, content)
+				}
+				if _, ok := files[path]; !ok {
+					t.Errorf("manifest omits %q", path)
+				}
+			}
+		})
+	}
+}
+
 func TestSyncRetryFileToDirectory(t *testing.T) {
 	needPOSIX(t)
 	// Exercise a nested archive parent with a leading dash and a newline.
-	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_LINUX, "-a with space\n", func(t *testing.T, link, target string) {
+	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_LINUX, "-a with space\n", "-a with space\n", func(t *testing.T, link, target string) {
 		t.Helper()
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
@@ -1388,14 +1467,24 @@ func TestSyncRetryFileToDirectory(t *testing.T) {
 	})
 }
 
-func testSyncRetryFileToDirectory(t *testing.T, guestOS sandrunv1.GuestOs, former string, makeDirectoryLink func(*testing.T, string, string)) {
+func TestSyncRetryFileToDirectoryCaseOnly(t *testing.T) {
+	needPOSIX(t)
+	testSyncRetryFileToDirectory(t, sandrunv1.GuestOs_GUEST_OS_MACOS, "Assets", "assets", func(t *testing.T, link, target string) {
+		t.Helper()
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func testSyncRetryFileToDirectory(t *testing.T, guestOS sandrunv1.GuestOs, former, incoming string, makeDirectoryLink func(*testing.T, string, string)) {
 	t.Helper()
 	for _, scenario := range []string{"first apply", "manifest write failure", "directory link", "ordinary deletion failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			c, srv, org := newTestClient(t, "")
 			ds := newSession(t, c, srv, org, guestOS)
 			ws := ds.GetWorkspacePath()
-			child := former + "/nested/new.txt"
+			child := incoming + "/nested/new.txt"
 			dir := newRepo(t, map[string]string{former: "old"}, nil, "")
 			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
 			ctx := context.Background()
@@ -1413,6 +1502,15 @@ func testSyncRetryFileToDirectory(t *testing.T, guestOS sandrunv1.GuestOs, forme
 				t.Fatal(err)
 			}
 			old := guestManifest(t, ds)
+			distinct := false
+			if former != incoming {
+				_, err := os.Lstat(filepath.Join(ws, incoming))
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				distinct = errors.Is(err, os.ErrNotExist)
+				t.Logf("guest workspace keeps %s and %s distinct: %t", former, incoming, distinct)
+			}
 			git(t, dir, "rm", "-q", "--", former)
 			if scenario == "ordinary deletion failure" {
 				child = "unrelated.txt"
@@ -1427,6 +1525,7 @@ func testSyncRetryFileToDirectory(t *testing.T, guestOS sandrunv1.GuestOs, forme
 			git(t, dir, "add", "--", child)
 
 			var guestOnly, linkTarget string
+			strictFailure := scenario == "ordinary deletion failure"
 			switch scenario {
 			case "manifest write failure":
 				srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
@@ -1446,9 +1545,17 @@ func testSyncRetryFileToDirectory(t *testing.T, guestOS sandrunv1.GuestOs, forme
 					t.Fatalf("manifest after failed write = %+v, want %+v", m, old)
 				}
 				checkCleanup()
-				guestOnly = former + "/guest.txt"
+				guestOnly = incoming + "/guest.txt"
 				if err := os.WriteFile(filepath.Join(ws, child), []byte("guest edit"), 0o644); err != nil {
 					t.Fatal(err)
+				}
+				if distinct {
+					// A guest-created directory at the old spelling must still block deletion.
+					if err := os.Mkdir(filepath.Join(ws, former), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					guestOnly = former + "/guest.txt"
+					strictFailure = true
 				}
 			case "directory link", "ordinary deletion failure":
 				if err := os.Remove(filepath.Join(ws, former)); err != nil {
@@ -1478,11 +1585,15 @@ func testSyncRetryFileToDirectory(t *testing.T, guestOS sandrunv1.GuestOs, forme
 			if guestOnly != "" && readGuest(t, ds, guestOnly) != "keep" {
 				t.Fatal("sync changed a guest-only file")
 			}
-			if scenario == "ordinary deletion failure" {
+			if strictFailure {
 				if connect.CodeOf(err) != connect.CodeInternal || !strings.Contains(err.Error(), "the guest apply command exited") {
 					t.Fatalf("ordinary deletion should fail in guest apply, got %v", err)
 				}
-				if _, err := os.Lstat(filepath.Join(ws, child)); !errors.Is(err, os.ErrNotExist) {
+				if scenario == "manifest write failure" {
+					if got := readGuest(t, ds, child); got != "guest edit" {
+						t.Fatalf("archive extracted after a failed deletion, child = %q", got)
+					}
+				} else if _, err := os.Lstat(filepath.Join(ws, child)); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("archive extracted after a failed deletion, stat returned %v", err)
 				}
 				if m := guestManifest(t, ds); m.Version != old.Version || !maps.Equal(m.Files, old.Files) {
@@ -1496,8 +1607,13 @@ func testSyncRetryFileToDirectory(t *testing.T, guestOS sandrunv1.GuestOs, forme
 			if got := readGuest(t, ds, child); got != "new" {
 				t.Fatalf("file after sync = %q", got)
 			}
+			if distinct {
+				if _, err := os.Lstat(filepath.Join(ws, former)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("old path was not removed, stat returned %v", err)
+				}
+			}
 			if linkTarget != "" {
-				if info, err := os.Lstat(filepath.Join(ws, former)); err != nil || !info.IsDir() {
+				if info, err := os.Lstat(filepath.Join(ws, incoming)); err != nil || !info.IsDir() {
 					t.Fatalf("sync did not replace the symlink with a directory: %v, %v", info, err)
 				}
 				if data, err := os.ReadFile(filepath.Join(linkTarget, "keep.txt")); err != nil || string(data) != "keep" {
@@ -1779,26 +1895,39 @@ func TestSyncRejectsLocalIdentityChangeBeforeUpload(t *testing.T) {
 
 func TestPruneDirs(t *testing.T) {
 	changed := []localFile{{rel: "a"}, {rel: "x/y"}}
-	got, aliases := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed, false)
+	got, aliases := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	want := []string{"a/b/c", "a/b", "x/y", "a"}
 	if !slices.Equal(got, want) || len(aliases) != 0 {
 		t.Fatalf("pruneDirs = %q, %q; want %q and no aliases", got, aliases, want)
 	}
 }
 
-func TestPruneDirsCaseOnlyReplacement(t *testing.T) {
-	deleted := []string{"Assets/nested/old.txt", "Assets/nested/another.txt", "Exact/sub/old.txt"}
-	changed := []localFile{{rel: "assets"}, {rel: "Exact"}}
+func TestPruneDirsAliases(t *testing.T) {
+	deleted := []string{"Assets/nested/old.txt", "Assets/nested/another.txt", "Exact/sub/old.txt", "caf\u00e9/nested/old.txt"}
+	changed := []localFile{{rel: "assets"}, {rel: "Exact"}, {rel: "cafe\u0301"}}
 	wantExact := []string{"Exact/sub", "Exact"}
-	for _, matchAliases := range []bool{false, true} {
-		var wantAliases []string
-		if matchAliases {
-			wantAliases = []string{"Assets", "assets", "Assets/nested", "Assets", "assets", "Assets"}
-		}
-		exact, aliases := pruneDirs(deleted, changed, matchAliases)
-		if !slices.Equal(exact, wantExact) || !slices.Equal(aliases, wantAliases) {
-			t.Fatalf("pruneDirs(matchAliases=%t) = %q, %q; want %q, %q", matchAliases, exact, aliases, wantExact, wantAliases)
-		}
+	for _, tc := range []struct {
+		osys sandrunv1.GuestOs
+		want []string
+	}{
+		{osys: sandrunv1.GuestOs_GUEST_OS_LINUX},
+		{osys: sandrunv1.GuestOs_GUEST_OS_WINDOWS, want: []string{
+			"Assets", "assets", "Assets/nested",
+			"Assets", "assets", "Assets",
+		}},
+		{osys: sandrunv1.GuestOs_GUEST_OS_MACOS, want: []string{
+			"Assets", "assets", "Assets/nested",
+			"caf\u00e9", "cafe\u0301", "caf\u00e9/nested",
+			"Assets", "assets", "Assets",
+			"caf\u00e9", "cafe\u0301", "caf\u00e9",
+		}},
+	} {
+		t.Run(tc.osys.String(), func(t *testing.T) {
+			exact, aliases := pruneDirs(deleted, changed, tc.osys)
+			if !slices.Equal(exact, wantExact) || !slices.Equal(aliases, tc.want) {
+				t.Fatalf("pruneDirs = %q, %q; want %q, %q", exact, aliases, wantExact, tc.want)
+			}
+		})
 	}
 }
 
@@ -2025,7 +2154,7 @@ func TestPOSIXSyncCleanup(t *testing.T) {
 				guestEnvArchive + "=" + archive,
 				guestEnvLock + "=" + lockArg,
 			}
-			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes} {
+			for _, key := range []string{guestEnvDeletes, guestEnvReplaceFiles, guestEnvAliasReplace, guestEnvPrunes, guestEnvAliasPrunes} {
 				path := filepath.Join(dir, key)
 				if scenario.archiveDir {
 					if err := os.WriteFile(path, nil, 0o644); err != nil {
@@ -2188,6 +2317,11 @@ func TestSyncLockAndRestartAfterStoppedSync(t *testing.T) {
 
 func TestSyncLockAcquisitionStreamLoss(t *testing.T) {
 	needPOSIX(t)
+	unrelated := filepath.Join(t.TempDir(), "unrelated")
+	if err := os.WriteFile(unrelated, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(guestEnvAliasReplace, unrelated)
 	for _, tc := range []struct {
 		name     string
 		exitCode int64
@@ -2269,8 +2403,11 @@ func TestSyncLockAcquisitionStreamLoss(t *testing.T) {
 			if len(requests) != wantCommands || requests[0].GetExecId() != streamErr.ExecID {
 				t.Fatalf("sync issued %d commands, want %d starting with the original lock exec", len(requests), wantCommands)
 			}
-			if acquired && !maps.Equal(requests[1].GetEnv(), map[string]string{guestEnvLock: lock}) {
-				t.Fatal("recovery cleanup must target only the lock")
+			if acquired && !maps.Equal(requests[1].GetEnv(), map[string]string{guestEnvLock: lock, guestEnvAliasReplace: ""}) {
+				t.Fatal("recovery cleanup must target only the lock and ignore an inherited alias list")
+			}
+			if got, err := os.ReadFile(unrelated); err != nil || string(got) != "keep" {
+				t.Fatalf("sync touched an inherited alias list: %q, %v", got, err)
 			}
 			_, statErr := os.Stat(lock)
 			if acquired && !errors.Is(statErr, os.ErrNotExist) || !acquired && statErr != nil {
@@ -3421,6 +3558,43 @@ fi
 	}
 	if m := guestManifest(t, ds); len(m.Files) != 0 {
 		t.Fatalf("manifest contains the failed link: %+v", m)
+	}
+}
+
+func TestSyncPathListEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		windows bool
+		paths   []string
+		want    string
+	}{
+		{"Windows ordinary first", true, []string{"dir/plain", "\ufefflater"}, "\xef\xbb\xbfdir\\plain\n\ufefflater\n"},
+		{"Windows U+FEFF first", true, []string{"\ufefffirst", "dir/\ufefflater"}, "\xef\xbb\xbf\ufefffirst\ndir\\\ufefflater\n"},
+		{"POSIX", false, []string{"\ufefffirst", "dir/\ufefflater\nname"}, "\ufefffirst\x00dir/\ufefflater\nname\x00"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pathList(tc.paths, tc.windows); string(got) != tc.want {
+				t.Errorf("path list = % x, want % x", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSyncWindowsLinkListEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first string
+		want  string
+	}{
+		{"ordinary first", "plain", "\xef\xbb\xbfplain\ttarget\\file\n\ufefflater\ttarget\\\ufefffile\n"},
+		{"U+FEFF first", "\ufefffirst", "\xef\xbb\xbf\ufefffirst\ttarget\\file\n\ufefflater\ttarget\\\ufefffile\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			links := []localFile{localSymlink(tc.first, "target/file"), localSymlink("\ufefflater", "target/\ufefffile")}
+			if got := windowsLinkList(links); string(got) != tc.want {
+				t.Errorf("link list = % x, want % x", got, tc.want)
+			}
+		})
 	}
 }
 

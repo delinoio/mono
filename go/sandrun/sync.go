@@ -227,7 +227,11 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if p.Force {
 		force = "1"
 	}
+	windows := osys == sandrunv1.GuestOs_GUEST_OS_WINDOWS
 	cleanupEnv := map[string]string{guestEnvLock: lock}
+	if !windows {
+		cleanupEnv[guestEnvAliasReplace] = ""
+	}
 	lr, err := c.runGuest(ctx, s, opLock, map[string]string{
 		guestEnvLock: lock, guestEnvForce: force, guestEnvWorkspace: s.GetWorkspacePath(),
 	})
@@ -286,11 +290,10 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 	if err != nil {
 		return nil, err
 	}
-	windows := osys == sandrunv1.GuestOs_GUEST_OS_WINDOWS
 	applyEnv := map[string]string{
 		guestEnvWorkspace: s.GetWorkspacePath(), guestEnvStaleManifest: "",
 		guestEnvArchive: "", guestEnvDeletes: "", guestEnvReplaceFiles: "",
-		guestEnvPrunes: "", guestEnvLinks: "",
+		guestEnvPrunes: "", guestEnvAliasPrunes: "", guestEnvLinks: "",
 	}
 
 	if workspaceMissing {
@@ -329,17 +332,18 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 			return nil, err
 		}
 	}
-	strictDeletes, replacedFiles := splitSyncDeletions(deleted, changed)
+	strictDeletes, replacedFiles, aliasReplacements := splitSyncDeletions(deleted, changed, osys == sandrunv1.GuestOs_GUEST_OS_MACOS)
 	if !windows {
-		applyEnv[guestEnvAliasPrunes] = ""
+		applyEnv[guestEnvAliasReplace] = ""
 	}
-	prunes, aliasPrunes := pruneDirs(deleted, changed, osys == sandrunv1.GuestOs_GUEST_OS_MACOS)
+	prunes, aliasPrunes := pruneDirs(deleted, changed, osys)
 	for _, list := range []struct {
 		suffix string
 		env    string
 		paths  []string
 	}{
 		{".delete", guestEnvDeletes, strictDeletes},
+		{".replace-alias", guestEnvAliasReplace, aliasReplacements},
 		{".replace", guestEnvReplaceFiles, replacedFiles},
 		{".prune", guestEnvPrunes, prunes},
 		{".prune-alias", guestEnvAliasPrunes, aliasPrunes},
@@ -360,14 +364,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		list := guestSibling(s, ".sandrun-sync-"+syncID+".links")
 		applyEnv[guestEnvLinks] = list
 		cleanupEnv[guestEnvLinks] = list
-		var b bytes.Buffer
-		for _, l := range links {
-			b.WriteString(strings.ReplaceAll(l.rel, "/", `\`))
-			b.WriteByte('\t')
-			b.WriteString(strings.ReplaceAll(l.target, "/", `\`))
-			b.WriteByte('\n')
-		}
-		n, err := c.writeGuestFile(ctx, s, list, 0o644, &b, nil)
+		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(windowsLinkList(links)), nil)
 		res.BytesSent += n
 		if err != nil {
 			return nil, err
@@ -584,11 +581,18 @@ func planSync(local *localList, old manifest) (*syncPlan, error) {
 	return plan, nil
 }
 
+// PowerShell's ReadAllLines consumes one UTF-8 BOM. Write it explicitly
+// so it preserves a leading U+FEFF in the first path.
+const windowsListPreamble = "\xef\xbb\xbf"
+
 // pathList returns the guest list file of relative paths: NUL-separated
 // for Linux and macOS guests, newline-separated with backslashes for
 // Windows guests.
 func pathList(paths []string, windows bool) []byte {
 	var b bytes.Buffer
+	if windows {
+		b.WriteString(windowsListPreamble)
+	}
 	for _, p := range paths {
 		if windows {
 			b.WriteString(strings.ReplaceAll(p, "/", `\`))
@@ -601,27 +605,50 @@ func pathList(paths []string, windows bool) []byte {
 	return b.Bytes()
 }
 
-// splitSyncDeletions separates former files that incoming paths need
-// as directories. If the manifest write failed after apply, those paths may
-// already be directories and must stay in place when the SDK retries.
-func splitSyncDeletions(deleted []string, changed []localFile) (strict, replacedFiles []string) {
-	if len(deleted) == 0 || len(changed) == 0 {
-		return deleted, nil
+func windowsLinkList(links []localFile) []byte {
+	var b bytes.Buffer
+	b.WriteString(windowsListPreamble)
+	for _, l := range links {
+		b.WriteString(strings.ReplaceAll(l.rel, "/", `\`))
+		b.WriteByte('\t')
+		b.WriteString(strings.ReplaceAll(l.target, "/", `\`))
+		b.WriteByte('\n')
 	}
-	parents := map[string]bool{}
+	return b.Bytes()
+}
+
+// splitSyncDeletions separates former files that incoming paths need as
+// directories. Alias records carry both spellings so the guest can check
+// whether it is safe to keep a directory created before a failed manifest write.
+func splitSyncDeletions(deleted []string, changed []localFile, matchAliases bool) (strict, replacedFiles, aliases []string) {
+	if len(deleted) == 0 || len(changed) == 0 {
+		return deleted, nil, nil
+	}
+	key := func(p string) string { return p }
+	if matchAliases {
+		key = foldCase
+	}
+	parents := map[string]string{}
 	for _, f := range changed {
-		for dir := path.Dir(f.rel); dir != "." && !parents[dir]; dir = path.Dir(dir) {
-			parents[dir] = true
+		for dir := path.Dir(f.rel); dir != "."; dir = path.Dir(dir) {
+			k := key(dir)
+			if _, ok := parents[k]; ok {
+				break
+			}
+			parents[k] = dir
 		}
 	}
 	for _, rel := range deleted {
-		if parents[rel] {
-			replacedFiles = append(replacedFiles, rel)
-		} else {
+		switch incoming := parents[key(rel)]; incoming {
+		case "":
 			strict = append(strict, rel)
+		case rel:
+			replacedFiles = append(replacedFiles, rel)
+		default:
+			aliases = append(aliases, rel, incoming)
 		}
 	}
-	return strict, replacedFiles
+	return strict, replacedFiles, aliases
 }
 
 // pruneDirs lists the directories to remove after the deletions and before
@@ -629,19 +656,23 @@ func splitSyncDeletions(deleted []string, changed []localFile) (strict, replaced
 // to the alias list: the old ancestor, the incoming spelling, and the
 // directory to remove. The guest checks that both spellings name the same
 // directory before it prunes an alias candidate.
-func pruneDirs(deleted []string, changed []localFile, matchAliases bool) (exact, aliases []string) {
+func pruneDirs(deleted []string, changed []localFile, osys sandrunv1.GuestOs) (exact, aliases []string) {
 	if len(deleted) == 0 || len(changed) == 0 {
 		return nil, nil
 	}
 	key := func(p string) string {
-		if matchAliases {
-			return foldCase(p)
-		}
 		return p
 	}
-	incoming := map[string]string{}
-	for _, f := range changed {
-		incoming[key(f.rel)] = f.rel
+	switch osys {
+	case sandrunv1.GuestOs_GUEST_OS_MACOS:
+		key = foldNormalizedCase
+	case sandrunv1.GuestOs_GUEST_OS_WINDOWS:
+		key = foldCase
+	}
+	incoming := make(map[string]*localFile, len(changed))
+	for i := range changed {
+		f := &changed[i]
+		incoming[key(f.rel)] = f
 	}
 	type alias struct{ old, incoming string }
 	dirs := map[string]alias{}
@@ -651,8 +682,11 @@ func pruneDirs(deleted []string, changed []localFile, matchAliases bool) (exact,
 			chain = append(chain, dir)
 			if replacement, ok := incoming[key(dir)]; ok {
 				var names alias
-				if replacement != dir {
-					names = alias{old: dir, incoming: replacement}
+				if replacement.rel != dir {
+					if osys == sandrunv1.GuestOs_GUEST_OS_WINDOWS && replacement.entry.Mode == modeSymlink {
+						continue
+					}
+					names = alias{old: dir, incoming: replacement.rel}
 				}
 				for _, c := range chain {
 					dirs[c] = names
