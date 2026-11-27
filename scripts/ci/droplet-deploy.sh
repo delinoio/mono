@@ -295,6 +295,12 @@ main() {
   if [[ -n "$taken" ]]; then
     fail "a container named $new already exists; nothing was changed."
   fi
+  local sandrun_kind="" sandrun_status="" sandrun_cancel=""
+  if [[ "$service" == sandrun-api ]]; then
+    (( ${#publish[@]} == 0 )) || fail "SandRun rollback requires an HTTP-only deployment."
+    sandrun_kind="$(sandrun_image_kind "$state.removal-images" "$image")" ||
+      fail "SandRun target $image has no verified OwnSand removal capability; the route was not changed."
+  fi
   local previous_serving="the previous container keeps serving"
   if [[ "$service" == accounts-api ]]; then
     accounts_cap_cutover "$state" "$image" "$stop_timeout" "${old[@]}"
@@ -375,6 +381,35 @@ main() {
     fi
   fi
 
+  if [[ -n "$sandrun_kind" ]]; then
+    local guard="$new" action=status
+    local -a guard_args=()
+    if [[ "$sandrun_kind" != guard ]]; then
+      if ! guard="$(sandrun_rollback_driver "$sandrun_kind" "$new" "${old[@]}")"; then
+        discard_replacement "$new" "$replacement_stop_timeout"
+        fail "could not verify a running SandRun rollback guard, matching database settings and, for a pre-lease image, disabled legacy recovery; $previous_serving."
+      fi
+    fi
+    if [[ "$sandrun_kind" == pre-lease ]]; then
+      action=fence
+      guard_args=("$deployment_id")
+      # Arm cleanup before the database call: a lost reply can hide a commit.
+      # Use a literal trap because errexit may unwind main before EXIT runs.
+      printf -v sandrun_cancel 'sandrun_cancel_fence %q %q' "$guard" "$deployment_id"
+      trap "$sandrun_cancel" EXIT
+    fi
+    if ! sandrun_status="$(sandrun_guard "$guard" "$action" "${guard_args[@]}")" ||
+      [[ "$sandrun_kind" == pre-lease && "$sandrun_status" != ready ]] ||
+      [[ "$sandrun_kind" == lease && "$sandrun_status" != open ]] ||
+      [[ "$sandrun_kind" == guard && "$sandrun_status" != open && "$sandrun_status" != fenced ]]; then
+      # These outcomes are reported only after the fence transaction aborts.
+      if [[ "$sandrun_status" == tokens-remain || "$sandrun_status" == drain-incomplete ]]; then trap - EXIT; fi
+      sandrun_guard_failure "$sandrun_status"
+      discard_replacement "$new" "$replacement_stop_timeout"
+      fail "the route of $service was not switched; $previous_serving."
+    fi
+  fi
+
   # Deployments and provisioning share the proxy lock because each switch
   # applies the whole Caddyfile. Take it after the service lock. Keep the
   # pre-switch traps active while waiting for it.
@@ -384,8 +419,12 @@ main() {
     trap 'pending_signal=INT' INT
     trap 'pending_signal=HUP' HUP
     route_result=0
+    # From the first possible route write, retain the fence unless Caddy's
+    # result proves that the replacement did not take over.
+    if [[ -n "$sandrun_cancel" ]]; then trap - EXIT; fi
     write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol" "$deployment_id" ||
       route_result=$?
+    if [[ -n "$sandrun_cancel" && "$route_result" == 1 ]]; then trap "$sandrun_cancel" EXIT; fi
     exec {proxy_lock_fd}>&-
   fi
   if (( route_result != 0 && route_result != 1 )); then
@@ -470,12 +509,121 @@ main() {
   if (( ${#failed[@]} > 0 )); then
     fail "the replacement $new already serves $service as $image, but the cleanup of the previous containers failed (${failed[*]}). Remove them by hand, or deploy the same image again to retry."
   fi
+  if [[ "$sandrun_kind" == guard && "$sandrun_status" == fenced ]]; then
+    if ! sandrun_guard "$new" resume > /dev/null; then
+      fail "SandRun switched to $image, but could not reopen OwnSand teardown admission. Deploy the same image again."
+    fi
+  fi
   echo "$service runs $image behind https://$hostname"
 }
 
 fail() {
   echo "::error::$1" >&2
   exit 1
+}
+
+# Verify the pulled immutable reference (or an existing container's image
+# ID). Builds before the label require a reviewed digest and capability.
+sandrun_guard_image() {
+  docker image inspect --format '{{index .Config.Labels "io.delino.sandrun.ownsand-removal"}}' "$1" 2>/dev/null
+}
+
+sandrun_image_kind() {
+  local allowlist="$1" image="$2" capability
+  capability="$(sandrun_guard_image "$image")" || return 1
+  if [[ "$capability" == rollback-guard-v1 ]]; then
+    echo guard
+  elif [[ -z "$capability" && -f "$allowlist" ]]; then
+    local pre_lease=0 lease=0
+    if grep -Fxq -- "pre-lease $image" "$allowlist"; then pre_lease=1; fi
+    if grep -Fxq -- "lease $image" "$allowlist"; then lease=1; fi
+    case "$pre_lease:$lease" in
+      1:0) echo pre-lease ;;
+      0:1) echo lease ;;
+      *) return 1 ;;
+    esac
+  else
+    return 1
+  fi
+}
+
+# Old binaries cannot run the guard. Use a running guard-capable container
+# only after comparing its effective database settings with the target and
+# every other running SandRun container. Keep settings inside the pipeline.
+sandrun_rollback_driver() {
+  local kind="$1" replacement="$2" id info status image_id capability driver=""
+  shift 2
+  local -a containers=("$replacement")
+  for id in "$@"; do
+    info="$(docker inspect --format '{{.State.Status}} {{.Image}}' "$id" 2>/dev/null)" || return 1
+    read -r status image_id <<< "$info"
+    case "$status" in
+      exited|created|dead) continue ;;
+      running) ;;
+      *) return 1 ;;
+    esac
+    containers+=("$id")
+    [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    capability="$(sandrun_guard_image "$image_id")" || return 1
+    if [[ "$capability" == rollback-guard-v1 ]]; then driver="$id"; fi
+  done
+  [[ -n "$driver" ]] || return 1
+  docker inspect --format '{{json .Config.Env}}' "${containers[@]}" 2>/dev/null |
+    python3 -c '
+import json
+import sys
+
+kind, count = sys.argv[1], int(sys.argv[2])
+def database_settings(line):
+    settings = {}
+    legacy_key = "RECLAIM_LEGACY_OWNSAND_REMOVALS"
+    for entry in json.loads(line):
+        key, sep, value = entry.partition("=")
+        if key in ("DATABASE_URL", legacy_key) or key.startswith("PG"):
+            if not sep or key in settings:
+                raise ValueError
+            settings[key] = value
+    if not settings.get("DATABASE_URL", "").strip():
+        raise ValueError
+    legacy = settings.pop(legacy_key, "").strip()
+    if kind == "pre-lease" and legacy not in ("", "0", "f", "F", "false", "False", "FALSE"):
+        raise ValueError
+    return settings
+
+try:
+    configs = [database_settings(line) for line in sys.stdin]
+    same_database = len(configs) == count and all(config == configs[0] for config in configs)
+except (TypeError, ValueError, AttributeError):
+    same_database = False
+sys.exit(0 if same_database else 1)
+' "$kind" "${#containers[@]}" ||
+    return 1
+  echo "$driver"
+}
+
+sandrun_guard() {
+  local container="$1"
+  shift
+  timeout --signal=KILL 25s docker exec "$container" /usr/local/bin/sandrun-api ownsand-rollback "$@" 2>/dev/null
+}
+
+sandrun_cancel_fence() {
+  if ! sandrun_guard "$1" cancel "$2" > /dev/null; then
+    echo "::error::could not confirm that SandRun teardown admission was restored. Deploy a guard-capable image to recover." >&2
+  fi
+}
+
+sandrun_guard_failure() {
+  case "$1" in
+    tokens-remain)
+      echo "::error::SandRun rollback blocked by an unfinished OwnSand removal (live or expired). Retry removal on a lease-aware image." >&2 ;;
+    drain-incomplete)
+      echo "::error::SandRun rollback could not drain in-flight OwnSand removal claim writers." >&2 ;;
+    fenced)
+      echo "::error::SandRun teardown admission is fenced. Deploy a guard-capable image to reopen it." >&2 ;;
+    *)
+      echo "::error::SandRun could not verify OwnSand removal state in the target database." >&2 ;;
+  esac
 }
 
 # Inspect the actual image ID of existing containers. The optional allowlist
