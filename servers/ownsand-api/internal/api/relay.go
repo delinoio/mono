@@ -508,7 +508,8 @@ func endFromAgent(f *ownsandv1.DataFrame) (error, bool) {
 // the accepted event), ends a stream without the agent's accepted notice
 // after the acceptance timeout (restarted when the connection receives a
 // large frame, because a notice cannot overtake a large frame in transit), and
-// rotates an accepted stream with an OK status before 14 minutes.
+// rotates an accepted stream with an OK status before 14 minutes or when
+// its queue reaches the frame limit.
 func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time.Time, request *ownsandv1.DataFrame, ev streamEvents) (err error) {
 	sendClose := true
 	defer func() {
@@ -542,8 +543,19 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 		}
 		f, nerr := c.stream.Next(ctx, ticker.C)
 		if nerr != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+			queueLimit := errors.Is(nerr, relay.ErrQueueLimit)
+			if queueLimit {
+				// The relay sends the stream close itself.
+				sendClose = false
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if queueLimit {
+				if accepted {
+					return nil // the caller can resume from its last delivered offsets
+				}
+				return errUnavailable(relayQueueLimitMessage)
 			}
 			if errors.Is(nerr, relay.ErrUnknownKind) {
 				// The relay already ended the stream with an error frame.
@@ -733,6 +745,8 @@ func (h RelayHandler) ReadFile(ctx context.Context, req *connect.Request[ownsand
 	})
 }
 
+const relayQueueLimitMessage = "the relay stream queue limit was reached"
+
 func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsandv1.WriteFileRequest]) (resp *connect.Response[ownsandv1.WriteFileResponse], err error) {
 	m := req.Msg
 	verr := validate.WriteFileRequest(m, false)
@@ -762,8 +776,15 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 	for {
 		f, nerr := c.stream.Next(cctx, nil)
 		if nerr != nil {
+			queueLimit := errors.Is(nerr, relay.ErrQueueLimit)
+			if queueLimit {
+				sendClose = false
+			}
 			if err := writeCallContextError(ctx, cctx); err != nil {
 				return nil, err
+			}
+			if queueLimit {
+				return nil, errUnavailable(relayQueueLimitMessage)
 			}
 			if errors.Is(nerr, relay.ErrUnknownKind) {
 				// The relay already ended the stream with an error frame.
