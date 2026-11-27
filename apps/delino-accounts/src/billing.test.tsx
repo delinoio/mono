@@ -15,8 +15,11 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { Code, ConnectError } from "@connectrpc/connect";
-import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
+import {
+  BillingAccountRole,
+  BillingAccountService,
+} from "@delino/accounts-protos/v1/billing_account_pb";
 import { SubscriptionStatus } from "@delino/accounts-protos/v1/credit_pb";
 import { pendingInvitation } from "./invitation.ts";
 import { afterSignInPath } from "./pages/callback.tsx";
@@ -44,6 +47,7 @@ import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
 /** A token of an earlier link that waits in `sessionStorage`. */
 const EARLIER_INVITATION_TOKEN = "bai_earlier-token";
 const ACCOUNT_PATH = `/billing/${ACCOUNT_ID}`;
+const INVITATION_PATH = "/billing/invitations/accept";
 const UUID_V7 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -79,6 +83,14 @@ async function renderAccount(
 
 function calls(api: ReturnType<typeof createFakeApi>, method: string) {
   return api.calls.filter((c) => c.method === method).map((c) => c.request);
+}
+
+function holdAcceptance() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((release) => {
+    resolve = release;
+  });
+  return { promise, resolve };
 }
 
 function setMemberRole(
@@ -1829,6 +1841,149 @@ describe("invitation acceptance", () => {
     expect(window.location.pathname).toBe(ACCOUNT_PATH);
     expect(calls(api, "AcceptInvitation")).toHaveLength(2);
   });
+
+  test("keeps a replacement fragment readable when success comes before hashchange", async () => {
+    const api = createFakeApi();
+    addBillingAccounts(api, 1);
+    api.userId = OUTSIDER;
+    const earlierAccountId = [...api.accounts.keys()].find(
+      (id) => id !== ACCOUNT_ID,
+    )!;
+    api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
+      accountId: earlierAccountId,
+      role: BillingAccountRole.ADMIN,
+    });
+    const held = holdAcceptance();
+    api.gates.set(`AcceptInvitation:${EARLIER_INVITATION_TOKEN}`, held.promise);
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+    // Happy DOM delivers hashchange for replaceState. Hold the event here
+    // so the fixture can settle the request before notifying the page.
+    const holdHashChange = (event: Event) => event.stopImmediatePropagation();
+    window.addEventListener("hashchange", holdHashChange);
+    try {
+      renderApp(INVITATION_PATH, { api });
+      const accept = await screen.findByRole<HTMLButtonElement>("button", {
+        name: "Accept invitation",
+      });
+      await click(accept);
+      expect(accept.hasAttribute("data-pending")).toBe(true);
+      const replacementHash = `#token=${INVITATION_TOKEN}`;
+      window.history.replaceState(null, "", replacementHash);
+      held.resolve();
+      await waitFor(() =>
+        expect(accept.hasAttribute("data-pending")).toBe(false),
+      );
+      expect(window.location.pathname).toBe(INVITATION_PATH);
+      expect(window.location.hash).toBe(replacementHash);
+      expect(pendingInvitation.read()).toBe(EARLIER_INVITATION_TOKEN);
+      window.removeEventListener("hashchange", holdHashChange);
+      await act(async () =>
+        window.dispatchEvent(new HashChangeEvent("hashchange")),
+      );
+      expect(window.location.hash).toBe("");
+      expect(pendingInvitation.read()).toBeUndefined();
+      const replacement = screen.getByRole<HTMLButtonElement>("button", {
+        name: "Accept invitation",
+      });
+      expect(replacement).not.toBe(accept);
+      await click(replacement);
+      await screen.findByRole("heading", { name: "Acme Robotics", level: 1 });
+      expect(window.location.pathname).toBe(ACCOUNT_PATH);
+      expect(calls(api, "AcceptInvitation")).toEqual([
+        expect.objectContaining({ invitationToken: EARLIER_INVITATION_TOKEN }),
+        expect.objectContaining({ invitationToken: INVITATION_TOKEN }),
+      ]);
+    } finally {
+      held.resolve();
+      window.removeEventListener("hashchange", holdHashChange);
+    }
+  });
+
+  test.each([false, true])(
+    "a replacement link can be accepted when incomplete success arrives before opening it: %s",
+    async (completeFirst) => {
+      const api = createFakeApi();
+      const held = holdAcceptance();
+      const accepted: string[] = [];
+      api.transport = createRouterTransport(({ service }) => {
+        service(BillingAccountService, {
+          async acceptInvitation({ invitationToken }) {
+            accepted.push(invitationToken);
+            if (invitationToken === EARLIER_INVITATION_TOKEN) {
+              await held.promise;
+              return {};
+            }
+            return { billingAccount: { billingAccountId: ACCOUNT_ID } };
+          },
+        });
+      });
+      pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+      const { queryClient } = renderApp(INVITATION_PATH, { api });
+      const main = within(screen.getByRole("main"));
+      try {
+        await click(screen.getByRole("button", { name: "Accept invitation" }));
+        expect(accepted).toEqual([EARLIER_INVITATION_TOKEN]);
+        if (completeFirst) {
+          held.resolve();
+          expect((await main.findByRole("alert")).textContent).toBe(
+            "You may have joined the billing account.",
+          );
+          expect(pendingInvitation.read()).toBeUndefined();
+        }
+        await act(async () => {
+          window.history.replaceState(null, "", `#token=${INVITATION_TOKEN}`);
+          window.dispatchEvent(new HashChangeEvent("hashchange"));
+        });
+        held.resolve();
+        await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+        expect(main.queryByRole("alert")).toBeNull();
+        expect(window.location.pathname).toBe(INVITATION_PATH);
+        const replacement = screen.getByRole("button", {
+          name: "Accept invitation",
+        });
+        await click(replacement);
+        expect(window.location.pathname).toBe(ACCOUNT_PATH);
+        expect(accepted).toEqual([EARLIER_INVITATION_TOKEN, INVITATION_TOKEN]);
+      } finally {
+        held.resolve();
+      }
+    },
+  );
+
+  test.each([INVITATION_TOKEN, "bai_missing"])(
+    "refreshes the open billing list only if the held acceptance succeeds (%s)",
+    async (token) => {
+      const api = createFakeApi();
+      api.userId = OUTSIDER;
+      const held = holdAcceptance();
+      api.gates.set(`AcceptInvitation:${token}`, held.promise);
+      const { queryClient } = renderApp(`${INVITATION_PATH}#token=${token}`, {
+        api,
+      });
+      try {
+        await click(screen.getByRole("button", { name: "Accept invitation" }));
+        expect(queryClient.isMutating()).toBe(1);
+        await click(screen.getByRole("link", { name: "Not now" }));
+        await screen.findByText("No billing accounts yet");
+        expect(calls(api, "ListBillingAccounts")).toHaveLength(1);
+        const historyLength = window.history.length;
+        held.resolve();
+        await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+        if (token === INVITATION_TOKEN) {
+          await screen.findByRole("link", { name: /Acme Robotics.*Viewer/ });
+          expect(calls(api, "ListBillingAccounts")).toHaveLength(2);
+        } else {
+          expect(screen.getByText("No billing accounts yet")).toBeTruthy();
+          expect(calls(api, "ListBillingAccounts")).toHaveLength(1);
+        }
+        expect(calls(api, "AcceptInvitation")).toHaveLength(1);
+        expect(window.location.pathname).toBe("/billing");
+        expect(window.history.length).toBe(historyLength);
+      } finally {
+        held.resolve();
+      }
+    },
+  );
 
   test.each([
     { outcome: "succeeds", registered: true },

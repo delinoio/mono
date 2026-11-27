@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { generateKeyPairSync, sign } from "node:crypto";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import {
+  create,
+  fromBinary,
+  type MessageInitShape,
+  toBinary,
+} from "@bufbuild/protobuf";
 import {
   AcceptInvitationRequestSchema,
   AcceptInvitationResponseSchema,
   BillingAccountRole,
   CreateInvitationRequestSchema,
+  GetBillingAccountRequestSchema,
   GetBillingAccountResponseSchema,
+  ListBillingAccountsResponseSchema,
 } from "@delino/accounts-protos/v1/billing_account_pb";
 import { type Browser, describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -24,6 +31,12 @@ const REPLACEMENT_TOKEN = "bai_fixture_replacement";
 const ACCOUNT = {
   billingAccountId: "0193a1b2-0000-7000-8000-000000000001",
   name: "Example account",
+  callerRole: BillingAccountRole.VIEWER,
+};
+const REPLACEMENT_ACCOUNT = {
+  ...ACCOUNT,
+  billingAccountId: "0193a1b2-0000-7000-8000-000000000002",
+  name: "Replacement account",
 };
 
 async function stubLogto(browser: Browser) {
@@ -120,8 +133,29 @@ async function stubLogto(browser: Browser) {
   return { started, release };
 }
 
-async function captureAcceptances(browser: Browser) {
+async function captureAcceptances(
+  browser: Browser,
+  {
+    holdFirst = false,
+    firstResponse = { billingAccount: ACCOUNT },
+  }: {
+    holdFirst?: boolean;
+    firstResponse?: MessageInitShape<
+      typeof AcceptInvitationResponseSchema
+    > | null;
+  } = {},
+) {
   const accepted: string[] = [];
+  const joined: (typeof ACCOUNT)[] = [];
+  let listReads = 0;
+  let markFirstStarted!: () => void;
+  let releaseFirst!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
   await browser.route(`${API_ORIGIN}/**`, async (route) => {
     const headers = {
       "access-control-allow-origin": "*",
@@ -134,27 +168,56 @@ async function captureAcceptances(browser: Browser) {
     }
 
     const method = new URL(route.request.url).pathname.split("/").pop();
-    let body: Uint8Array = new Uint8Array();
+    let body: Uint8Array<ArrayBufferLike> = new Uint8Array();
     if (method === "AcceptInvitation") {
-      accepted.push(
-        fromBinary(
-          AcceptInvitationRequestSchema,
-          Buffer.from(route.request.postData ?? ""),
-        ).invitationToken,
+      const { invitationToken } = fromBinary(
+        AcceptInvitationRequestSchema,
+        Buffer.from(route.request.postData ?? ""),
       );
+      accepted.push(invitationToken);
+      const first = invitationToken === FIRST_TOKEN;
+      const account = first ? ACCOUNT : REPLACEMENT_ACCOUNT;
+      const response = first ? firstResponse : { billingAccount: account };
+      if (first) {
+        markFirstStarted();
+        if (holdFirst) await firstGate;
+      }
+      if (response === null) {
+        await route.fulfill({
+          status: 404,
+          headers,
+          json: { code: "not_found", message: "invitation not found" },
+        });
+        return;
+      }
+      joined.push(account);
       body = toBinary(
         AcceptInvitationResponseSchema,
-        create(AcceptInvitationResponseSchema, { billingAccount: ACCOUNT }),
+        create(AcceptInvitationResponseSchema, response),
       );
     } else if (method === "GetBillingAccount") {
+      const { billingAccountId } = fromBinary(
+        GetBillingAccountRequestSchema,
+        Buffer.from(route.request.postData ?? ""),
+      );
+      const account =
+        billingAccountId === REPLACEMENT_ACCOUNT.billingAccountId
+          ? REPLACEMENT_ACCOUNT
+          : ACCOUNT;
       body = toBinary(
         GetBillingAccountResponseSchema,
-        create(GetBillingAccountResponseSchema, { billingAccount: ACCOUNT }),
+        create(GetBillingAccountResponseSchema, { billingAccount: account }),
+      );
+    } else if (method === "ListBillingAccounts") {
+      listReads += 1;
+      body = toBinary(
+        ListBillingAccountsResponseSchema,
+        create(ListBillingAccountsResponseSchema, { billingAccounts: joined }),
       );
     }
     await route.fulfill({ contentType: "application/proto", headers, body });
   });
-  return accepted;
+  return { accepted, firstStarted, releaseFirst, listReads: () => listReads };
 }
 
 async function openReplacement(browser: Browser) {
@@ -185,7 +248,7 @@ describe("billing invitation sign-in", () => {
       screen,
     }) => {
       const logto = await stubLogto(browser);
-      const accepted = await captureAcceptances(browser);
+      const { accepted } = await captureAcceptances(browser);
       const signIn = screen.getByRole("button", "Sign in to accept");
       try {
         await app.open(`${INVITATION_PATH}#token=${FIRST_TOKEN}`);
@@ -230,12 +293,218 @@ describe("billing invitation sign-in", () => {
       }
       await accept.click();
       await expect(
-        screen.getByRole("heading", ACCOUNT.name, { level: 1 }),
+        screen.getByRole(
+          "heading",
+          replacement === "none" ? ACCOUNT.name : REPLACEMENT_ACCOUNT.name,
+          { level: 1 },
+        ),
       ).toBeVisible();
       expect(accepted).toEqual([
         replacement === "none" ? FIRST_TOKEN : REPLACEMENT_TOKEN,
       ]);
       await expect.poll(() => storedToken(browser)).toBe(null);
+    });
+  }
+});
+
+describe("billing invitation acceptance", () => {
+  for (const eventFirst of [false, true]) {
+    test(`keeps the replacement invitation when hashchange runs ${eventFirst ? "before" : "after"} the first success`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await seedFixtureSession(browser, app.baseUrl);
+      const fixture = await captureAcceptances(browser, { holdFirst: true });
+      const accept = screen.getByRole("button", "Accept invitation");
+      const replacementHash = `#token=${REPLACEMENT_TOKEN}`;
+      try {
+        await app.open(`${INVITATION_PATH}#token=${FIRST_TOKEN}`);
+        await accept.click();
+        await fixture.firstStarted;
+        await expect(accept).toBeDisabled();
+        if (!eventFirst) await app.screenshot("first-invitation-pending");
+        await browser.evaluate((hash) => {
+          history.replaceState(null, "", hash);
+          return null;
+        }, replacementHash);
+        const dispatchHashChange = () =>
+          browser.evaluate(() => {
+            window.dispatchEvent(new HashChangeEvent("hashchange"));
+            return null;
+          });
+        if (eventFirst) await dispatchHashChange();
+        fixture.releaseFirst();
+        await expect(accept).toBeEnabled();
+        expect(await browser.evaluate(() => location.pathname)).toBe(
+          INVITATION_PATH,
+        );
+        if (!eventFirst) {
+          expect(await browser.evaluate(() => location.hash)).toBe(
+            replacementHash,
+          );
+          await dispatchHashChange();
+        }
+        await expect.poll(() => browser.evaluate(() => location.hash)).toBe("");
+        await expect(accept).toBeEnabled();
+        if (!eventFirst) await app.screenshot("replacement-invitation-ready");
+        await accept.click();
+        await expect(
+          screen.getByRole("heading", REPLACEMENT_ACCOUNT.name, { level: 1 }),
+        ).toBeVisible();
+        expect(fixture.accepted).toEqual([FIRST_TOKEN, REPLACEMENT_TOKEN]);
+      } finally {
+        fixture.releaseFirst();
+      }
+    });
+  }
+
+  for (const [description, hash] of [
+    ["empty fragment", ""],
+    ["tokenless fragment", "#anchor"],
+    ["same-token fragment", `#token=${FIRST_TOKEN}`],
+  ]) {
+    test(`opens the accepted account with history replacement (${description})`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await seedFixtureSession(browser, app.baseUrl);
+      const fixture = await captureAcceptances(browser, { holdFirst: true });
+      try {
+        await app.open(`${INVITATION_PATH}#token=${FIRST_TOKEN}`);
+        const accept = screen.getByRole("button", "Accept invitation");
+        const historyLength = await browser.evaluate(() => history.length);
+        await accept.click();
+        await fixture.firstStarted;
+        await browser.evaluate((path) => {
+          history.replaceState(null, "", path);
+          return null;
+        }, INVITATION_PATH + hash);
+        if (!hash) await app.screenshot("current-invitation-pending");
+        fixture.releaseFirst();
+        await expect(
+          screen.getByRole("heading", ACCOUNT.name, { level: 1 }),
+        ).toBeVisible();
+        expect(await browser.evaluate(() => location.pathname)).toBe(
+          `/billing/${ACCOUNT.billingAccountId}`,
+        );
+        expect(await browser.evaluate(() => history.length)).toBe(
+          historyLength,
+        );
+        expect(fixture.accepted).toEqual([FIRST_TOKEN]);
+        if (!hash) await app.screenshot("current-invitation-account");
+      } finally {
+        fixture.releaseFirst();
+      }
+    });
+  }
+
+  for (const [description, firstResponse] of [
+    ["omitted account", {}],
+    ["empty account", { billingAccount: {} }],
+    ["whitespace ID", { billingAccount: { billingAccountId: " \t " } }],
+  ] as const) {
+    test(`recovers a successful invitation with a missing routing ID (${description})`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await seedFixtureSession(browser, app.baseUrl);
+      const fixture = await captureAcceptances(browser, { firstResponse });
+      await app.open("/billing");
+      await expect(screen.getByText("No billing accounts yet")).toBeVisible();
+      expect(fixture.listReads()).toBe(1);
+      // Enter through the sign-in return path without reloading the query client.
+      await browser.evaluate(
+        ({ key, token, path }) => {
+          sessionStorage.setItem(key, token);
+          history.pushState(null, "", path);
+          window.dispatchEvent(new PopStateEvent("popstate"));
+          return null;
+        },
+        {
+          key: PENDING_INVITATION_KEY,
+          token: FIRST_TOKEN,
+          path: INVITATION_PATH,
+        },
+      );
+      const accept = screen.getByRole("button", "Accept invitation");
+      await expect(accept).toBeVisible();
+      const screenshotName = description.replace(" ", "-").toLowerCase();
+      await app.screenshot(`before-${screenshotName}-recovery`);
+      await accept.click();
+      await expect(screen.getByRole("main").getByRole("alert")).toHaveText(
+        "You may have joined the billing account.",
+      );
+      await expect(accept).toHaveCount(0);
+      expect(await browser.evaluate(() => location.pathname)).toBe(
+        INVITATION_PATH,
+      );
+      expect(await storedToken(browser)).toBe(null);
+      expect(fixture.accepted).toEqual([FIRST_TOKEN]);
+      expect(fixture.listReads()).toBe(1);
+      await app.screenshot(`after-${screenshotName}-recovery`);
+      await screen.getByRole("link", "Go to your billing accounts").click();
+      await expect(
+        screen.getByRole("link", /Example account.*Viewer/),
+      ).toBeVisible();
+      expect(await browser.evaluate(() => location.pathname)).toBe("/billing");
+      expect(fixture.listReads()).toBe(2);
+    });
+  }
+
+  for (const succeeds of [true, false]) {
+    const outcome = succeeds ? "success" : "failure";
+    test(`preserves the open billing list route after a late acceptance ${outcome}`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await seedFixtureSession(browser, app.baseUrl);
+      const fixture = await captureAcceptances(browser, {
+        holdFirst: true,
+        firstResponse: succeeds ? { billingAccount: ACCOUNT } : null,
+      });
+      try {
+        await app.open(`${INVITATION_PATH}#token=${FIRST_TOKEN}`);
+        await screen.getByRole("button", "Accept invitation").click();
+        await fixture.firstStarted;
+        await screen.getByRole("link", "Not now").click();
+        const empty = screen.getByText("No billing accounts yet");
+        await expect(empty).toBeVisible();
+        expect(fixture.listReads()).toBe(1);
+        const entry = await browser.evaluate(() => [
+          location.href,
+          history.length,
+        ]);
+        await app.screenshot(`billing-list-before-acceptance-${outcome}`);
+        fixture.releaseFirst();
+        if (succeeds) {
+          await expect(
+            screen.getByRole("link", /Example account.*Viewer/),
+          ).toBeVisible();
+        } else {
+          await expect
+            .poll(() =>
+              browser.evaluate(() =>
+                performance
+                  .getEntriesByType("resource")
+                  .some((entry) => entry.name.endsWith("/AcceptInvitation")),
+              ),
+            )
+            .toBe(true);
+          await expect(empty).toBeVisible();
+        }
+        expect(fixture.listReads()).toBe(succeeds ? 2 : 1);
+        expect(fixture.accepted).toEqual([FIRST_TOKEN]);
+        expect(
+          await browser.evaluate(() => [location.href, history.length]),
+        ).toEqual(entry);
+        await app.screenshot(`billing-list-after-acceptance-${outcome}`);
+      } finally {
+        fixture.releaseFirst();
+      }
     });
   }
 });
