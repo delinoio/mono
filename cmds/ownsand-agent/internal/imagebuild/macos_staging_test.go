@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -79,8 +80,8 @@ func TestMacOSStaleBuildRemoval(t *testing.T) {
 			}
 			err := removeMacOSBuild(t.Context(), run, mounts, build)
 			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), build) {
-					t.Fatalf("cleanup error = %v, want staging path and %q", err, tc.wantErr)
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), strconv.Quote(build)) {
+					t.Fatalf("cleanup error = %v, want quoted staging path %q and %q", err, build, tc.wantErr)
 				}
 				if got, err := os.ReadFile(sentinel); err != nil || string(got) != "preserve" {
 					t.Fatalf("staged sentinel = %q, %v", got, err)
