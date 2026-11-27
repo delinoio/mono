@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import {
+  create,
+  type DescEnum,
+  type MessageInitShape,
+} from "@bufbuild/protobuf";
 import {
   type Duration,
   DurationSchema,
@@ -45,11 +49,14 @@ import {
   Priority,
   RequestEndReason,
   RequestState,
+  RequestStateSchema,
   Role,
   RunnerEndReason,
   ResourcesSchema,
   RunnerState,
+  RunnerStateSchema,
   WorkloadKind,
+  WorkloadKindSchema,
 } from "@delino/sandrun-protos/v1/common_pb";
 import {
   type DevSession,
@@ -817,6 +824,21 @@ function page<T>(
   return { items: slice, nextPageToken: next };
 }
 
+function validateListFilter(
+  field: string,
+  schema: DescEnum,
+  values: readonly number[],
+): void {
+  for (const value of values) {
+    if (schema.value[value] === undefined) {
+      throw new ConnectError(
+        `invalid ${field}: must be a defined ${schema.name} value`,
+        Code.InvalidArgument,
+      );
+    }
+  }
+}
+
 function hasPath(mask: FieldMask | undefined, path: string): boolean {
   return mask?.paths.includes(path) ?? false;
 }
@@ -1296,6 +1318,19 @@ export function createMockTransport(
             k.revokedAt = ts();
           }
         }
+        for (const r of org.requests) {
+          if (
+            r.kind === WorkloadKind.DEV_SESSION &&
+            r.state === RequestState.QUEUED &&
+            r.ownerUserId === m.userId
+          )
+            endRequest(
+              org,
+              r,
+              RequestState.CANCELED,
+              RequestEndReason.MEMBER_REMOVED,
+            );
+        }
         audit(
           org,
           AuditAction.MEMBER_REMOVED,
@@ -1737,6 +1772,9 @@ export function createMockTransport(
       },
       listRunnerProfiles(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("workload_kind", WorkloadKindSchema, [
+          req.workloadKind,
+        ]);
         const items = org.profiles.filter(
           (p) =>
             req.workloadKind === WorkloadKind.UNSPECIFIED ||
@@ -1890,6 +1928,8 @@ export function createMockTransport(
     router.service(WorkService, {
       listRequests(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("kind", WorkloadKindSchema, [req.kind]);
+        validateListFilter("states", RequestStateSchema, req.states);
         const active = org.requests
           .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
           .sort(compareQueueOrder);
@@ -1946,6 +1986,7 @@ export function createMockTransport(
       },
       listRunners(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("states", RunnerStateSchema, req.states);
         const items = org.runners.filter(
           (r) =>
             (req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)) &&
@@ -2164,6 +2205,7 @@ export function createMockTransport(
       },
       listDevSessions(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("states", RequestStateSchema, req.states);
         const items = org.devSessions.filter(
           (s) =>
             (req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)) &&

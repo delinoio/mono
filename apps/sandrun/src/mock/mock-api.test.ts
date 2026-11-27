@@ -23,12 +23,15 @@ import {
   RequestEndReason,
   RequestState,
   ResourcesSchema,
+  Role,
   RunnerEndReason,
   RunnerState,
   WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
 import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
+import { MemberService } from "@delino/sandrun-protos/v1/member_pb";
+import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
 import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import {
@@ -39,10 +42,247 @@ import {
 import { expect, rs, test } from "@rstest/core";
 import { createMockTransport, MOCK_IDS, MOCK_USER } from "./mock-api.ts";
 
+test("ends the departing member's queued dev session and publishes one update", async () => {
+  const transport = createMockTransport();
+  const organizationId = MOCK_IDS.acme;
+  const members = createClient(MemberService, transport);
+  const organizations = createClient(OrganizationService, transport);
+  const sessions = createClient(DevSessionService, transport);
+  const work = createClient(WorkService, transport);
+  const getSession = (devSessionId: string) =>
+    sessions.getDevSession({ organizationId, devSessionId });
+  const getRequest = (requestId: string) =>
+    work.getRequest({ organizationId, requestId });
+
+  const { invitationSecret } = await members.createInvitation({
+    organizationId,
+    role: Role.ADMIN,
+  });
+  await organizations.transferOwnership({
+    organizationId,
+    userId: "mock-user-ada",
+  });
+  const queuedJob = await getRequest(MOCK_IDS.queuedJob);
+  expect(queuedJob.request?.state).toBe(RequestState.QUEUED);
+  const endedSession = await getSession(MOCK_IDS.devSessionOther);
+  expect(endedSession.devSession?.state).toBe(RequestState.ENDED);
+
+  const watch = new AbortController();
+  const stream = work
+    .watchQueue({ organizationId }, { signal: watch.signal })
+    [Symbol.asyncIterator]();
+  try {
+    const initialRequestIds: string[] = [];
+    for (;;) {
+      const { value, done } = await stream.next();
+      if (done) throw new Error("Expected a complete snapshot");
+      if (value.event.case === "snapshotComplete") break;
+      if (value.event.case === "request")
+        initialRequestIds.push(value.event.value.requestId);
+    }
+    expect(initialRequestIds).toContain(MOCK_IDS.queuedDev);
+
+    await members.removeMember({ organizationId, userId: MOCK_USER });
+    await expect(getSession(MOCK_IDS.queuedDev)).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    await expect(getRequest(MOCK_IDS.queuedDev)).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    const { member } = await members.acceptInvitation({ invitationSecret });
+    expect(member).toMatchObject({ userId: MOCK_USER, role: Role.ADMIN });
+
+    const terminal = {
+      state: RequestState.CANCELED,
+      endReason: RequestEndReason.MEMBER_REMOVED,
+    };
+    const { devSession } = await getSession(MOCK_IDS.queuedDev);
+    const { request } = await getRequest(MOCK_IDS.queuedDev);
+    expect(devSession).toMatchObject(terminal);
+    expect(request).toMatchObject(terminal);
+    expect(request?.endedAt).toBeDefined();
+    expect(devSession?.endedAt).toEqual(request?.endedAt);
+    expect(await getRequest(MOCK_IDS.queuedJob)).toEqual(queuedJob);
+    expect(await getSession(MOCK_IDS.devSessionOther)).toEqual(endedSession);
+
+    // Publish another update to check that removal emitted exactly one.
+    const { request: canceledAgent } = await work.cancelRequest({
+      organizationId,
+      requestId: MOCK_IDS.queuedAgent,
+    });
+    for (const update of [request, canceledAgent]) {
+      await expect(stream.next()).resolves.toMatchObject({
+        done: false,
+        value: { event: { case: "request", value: update } },
+      });
+    }
+  } finally {
+    watch.abort();
+    await stream.return?.();
+  }
+
+  const rejoinedRequestIds: string[] = [];
+  for await (const { event } of work.watchQueue({ organizationId })) {
+    if (event.case === "snapshotComplete") break;
+    if (event.case === "request")
+      rejoinedRequestIds.push(event.value.requestId);
+  }
+  expect(rejoinedRequestIds).toContain(MOCK_IDS.queuedJob);
+  expect(rejoinedRequestIds).not.toContain(MOCK_IDS.queuedDev);
+});
+
 const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
 };
+
+test("rejects undefined kind filters on runner profiles and requests", async () => {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const work = createClient(WorkService, transport);
+  const organizationId = MOCK_IDS.acme;
+  const unknownKind = 99 as WorkloadKind;
+
+  await expect(
+    profiles.listRunnerProfiles({ organizationId, workloadKind: unknownKind }),
+  ).rejects.toMatchObject({
+    code: Code.InvalidArgument,
+    rawMessage: "invalid workload_kind: must be a defined WorkloadKind value",
+  });
+  await expect(
+    work.listRequests({ organizationId, kind: unknownKind }),
+  ).rejects.toMatchObject({
+    code: Code.InvalidArgument,
+    rawMessage: "invalid kind: must be a defined WorkloadKind value",
+  });
+});
+
+test.each([
+  { includeEnded: false, mixed: false },
+  { includeEnded: false, mixed: true },
+  { includeEnded: true, mixed: false },
+  { includeEnded: true, mixed: true },
+])(
+  "rejects undefined state filters (includeEnded=$includeEnded, mixed=$mixed)",
+  async ({ includeEnded, mixed }) => {
+    const transport = createMockTransport();
+    const work = createClient(WorkService, transport);
+    const sessions = createClient(DevSessionService, transport);
+    const request = { organizationId: MOCK_IDS.acme, includeEnded };
+    const requestStates = mixed ? [RequestState.QUEUED] : [];
+    requestStates.push(99 as RequestState);
+    const runnerStates = mixed ? [RunnerState.BUSY] : [];
+    runnerStates.push(99 as RunnerState);
+    const invalidRequestState = {
+      code: Code.InvalidArgument,
+      rawMessage: "invalid states: must be a defined RequestState value",
+    };
+
+    await expect(
+      work.listRequests({ ...request, states: requestStates }),
+    ).rejects.toMatchObject(invalidRequestState);
+    await expect(
+      work.listRunners({ ...request, states: runnerStates }),
+    ).rejects.toMatchObject({
+      code: Code.InvalidArgument,
+      rawMessage: "invalid states: must be a defined RunnerState value",
+    });
+    await expect(
+      sessions.listDevSessions({ ...request, states: requestStates }),
+    ).rejects.toMatchObject(invalidRequestState);
+  },
+);
+
+test("keeps defined filters, zero values and omitted filters working", async () => {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const work = createClient(WorkService, transport);
+  const sessions = createClient(DevSessionService, transport);
+  const request = { organizationId: MOCK_IDS.acme };
+
+  const allProfiles = await profiles.listRunnerProfiles(request);
+  expect(allProfiles.profiles.map((profile) => profile.workloadKind)).toEqual([
+    WorkloadKind.GITHUB_JOB,
+    WorkloadKind.AGENT_SESSION,
+    WorkloadKind.DEV_SESSION,
+  ]);
+  expect(
+    await profiles.listRunnerProfiles({
+      ...request,
+      workloadKind: WorkloadKind.UNSPECIFIED,
+    }),
+  ).toEqual(allProfiles);
+  const githubProfiles = await profiles.listRunnerProfiles({
+    ...request,
+    workloadKind: WorkloadKind.GITHUB_JOB,
+  });
+  expect(
+    githubProfiles.profiles.map((profile) => profile.runnerProfileId),
+  ).toEqual([MOCK_IDS.linuxProfile]);
+
+  const githubRequests = await work.listRequests({
+    ...request,
+    kind: WorkloadKind.GITHUB_JOB,
+    states: [RequestState.QUEUED],
+  });
+  expect(githubRequests.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.queuedJob,
+  ]);
+  expect(
+    await work.listRequests({ ...request, kind: WorkloadKind.UNSPECIFIED }),
+  ).toEqual(await work.listRequests(request));
+  const busyRunners = await work.listRunners({
+    ...request,
+    states: [RunnerState.BUSY],
+  });
+  expect(busyRunners.runners.map((runner) => runner.runnerId)).toEqual([
+    MOCK_IDS.busyRunner,
+  ]);
+  const queuedSessions = await sessions.listDevSessions({
+    ...request,
+    states: [RequestState.QUEUED],
+  });
+  expect(
+    queuedSessions.devSessions.map((session) => session.devSessionId),
+  ).toEqual([MOCK_IDS.queuedDev]);
+  expect(
+    await work.listRequests({ ...request, states: [RequestState.UNSPECIFIED] }),
+  ).toMatchObject({ requests: [] });
+  expect(
+    await work.listRunners({ ...request, states: [RunnerState.UNSPECIFIED] }),
+  ).toMatchObject({ runners: [] });
+  expect(
+    await sessions.listDevSessions({
+      ...request,
+      states: [RequestState.UNSPECIFIED],
+    }),
+  ).toMatchObject({ devSessions: [] });
+});
+
+test("paginates filtered requests in queue order before ended requests", async () => {
+  const work = createClient(WorkService, createMockTransport());
+  const request = {
+    organizationId: MOCK_IDS.acme,
+    kind: WorkloadKind.GITHUB_JOB,
+    includeEnded: true,
+    pageSize: 2,
+  };
+  const first = await work.listRequests(request);
+  expect(first.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.runningJob,
+    MOCK_IDS.queuedJob,
+  ]);
+  expect(first.nextPageToken).not.toBe("");
+
+  const last = await work.listRequests({
+    ...request,
+    pageToken: first.nextPageToken,
+  });
+  expect(last.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.endedJob,
+  ]);
+  expect(last.nextPageToken).toBe("");
+});
 
 async function runnerProfileFixture() {
   const transport = createMockTransport();
