@@ -847,6 +847,7 @@ func (f *fixture) topUpStatuses(accountID string) []string {
 
 func TestAutoTopUpMonthlyCap(t *testing.T) {
 	f := newFixture(t)
+	telemetry := f.captureGrantTelemetry()
 	acct := f.account()
 	f.activate(acct)
 	f.grant(acct, LedgerManualTopUp, 30*usd)
@@ -874,6 +875,8 @@ func TestAutoTopUpMonthlyCap(t *testing.T) {
 	if f.balance(acct) != 29*usd {
 		t.Fatalf("balance after the webhook = %d", f.balance(acct))
 	}
+	entries := f.ledger(acct)
+	telemetry.want(t, entries[len(entries)-1])
 
 	if res := f.deduct(acct, 20*usd); !res.AutoTopUpQueued {
 		t.Fatal("second top-up of the month not queued")

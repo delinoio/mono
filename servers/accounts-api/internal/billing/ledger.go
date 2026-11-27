@@ -213,16 +213,24 @@ type grantInput struct {
 	PaddleTransactionID string
 }
 
+type grantTelemetry struct {
+	ID       string
+	Kind     LedgerKind
+	Amount   int64
+	DebtPaid int64
+	Balance  int64
+}
+
 // addGrant creates the credit grant of a verified purchase and its ledger
-// entry, then applies the pending adjustments of the purchase. A purchase
-// that already has a grant adds no credit (created is false), but it still
-// applies the pending adjustments of the purchase, because a release that
-// predates the pending adjustment table creates grants without draining it.
+// entry, then applies the pending adjustments of the purchase. It returns
+// telemetry only for a new grant. A purchase that already has a grant still
+// applies its pending adjustments, because a release that predates the
+// pending adjustment table creates grants without draining it.
 // A webhook caller holds the purchase lock (lockPurchase) before the lock of
 // acct.
-func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, eventTime time.Time) (grantID string, created bool, err error) {
+func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, eventTime time.Time) (grantID string, telemetry *grantTelemetry, err error) {
 	if in.Amount <= 0 {
-		return "", false, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
+		return "", nil, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
 	}
 	// Use the time after both locks for credit that expired while the webhook
 	// waited. Keep the original event time for the grant's creation and lifetime.
@@ -235,59 +243,54 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		// grant, which is acct for every grant that a webhook resolves.
 		if grantAccountID == acct.ID {
 			if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
-				return "", false, err
+				return "", nil, err
 			}
 		}
-		return grantID, false, nil
+		return grantID, nil, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", false, err
+		return "", nil, err
 	}
 	// The balance before the inline expiry is the baseline of the low-balance
 	// check: an expiry that the new grant does not make up for is a decrease.
 	before := acct.Balance
 	if err := s.expireDue(ctx, tx, acct, accountingTime); err != nil {
-		return "", false, err
+		return "", nil, err
 	}
 	debtPaid, kept := payoff(acct.Balance, in.Amount)
 	if grantID, err = newID(); err != nil {
-		return "", false, err
+		return "", nil, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO credit_grants (credit_grant_id, billing_account_id, source, original_usd_micros,
 			remaining_usd_micros, paddle_transaction_id, create_time, expire_time)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		grantID, acct.ID, string(in.Kind), in.Amount, kept, in.PaddleTransactionID, eventTime, GrantExpireTime(eventTime)); err != nil {
-		return "", false, err
+		return "", nil, err
 	}
 	if _, err := writeEntry(ctx, tx, acct, entry{
 		Kind: in.Kind, Amount: in.Amount, PaddleTransactionID: in.PaddleTransactionID, CreditGrantID: grantID,
 	}, accountingTime); err != nil {
-		return "", false, err
+		return "", nil, err
 	}
 	// afterIncrease runs first so that a grant that reaches the threshold
 	// re-arms the alert before afterDecrease reads the settings. A purchase
 	// never queues an automatic top-up (usage is false).
 	if err := s.afterIncrease(ctx, tx, acct, accountingTime); err != nil {
-		return "", false, err
+		return "", nil, err
 	}
 	if _, err := s.afterDecrease(ctx, tx, acct, before, accountingTime, false); err != nil {
-		return "", false, err
+		return "", nil, err
 	}
-	s.metrics.CreditGrant(string(in.Kind))
-	s.logger.InfoContext(ctx, "billing_credit_granted",
-		slog.String("billing_account_id", acct.ID),
-		slog.String("credit_grant_id", grantID),
-		slog.String("source", string(in.Kind)),
-		slog.String("paddle_transaction_id", in.PaddleTransactionID),
-		slog.Int64("amount_usd_micros", in.Amount),
-		slog.Int64("debt_paid_usd_micros", debtPaid),
-		slog.Int64("balance_after_usd_micros", acct.Balance))
+	// Capture the balance after the grant, before a pending refund or chargeback.
+	balance := acct.Balance
 	// Approved refunds and chargebacks of this purchase that arrived before
 	// its payment now reduce the new grant, as if they had arrived after it.
 	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
-		return "", false, err
+		return "", nil, err
 	}
-	return grantID, true, nil
+	return grantID, &grantTelemetry{
+		ID: grantID, Kind: in.Kind, Amount: in.Amount, DebtPaid: debtPaid, Balance: balance,
+	}, nil
 }
 
 // removeCredit removes amount for a refund or chargeback of grantID with a
