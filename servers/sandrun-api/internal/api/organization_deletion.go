@@ -105,7 +105,7 @@ func OrganizationDeletionQuerier(ctx context.Context, fallback db.Querier) db.Qu
 // that need a transaction.
 func (s *Service) InOrganizationDeletionTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	if a, _ := ctx.Value(organizationDeletionContextKey{}).(*organizationDeletionAttempt); a != nil {
-		return pgx.BeginFunc(ctx, a.conn, fn)
+		return db.InTxWithContexts(ctx, ctx, a.conn.Begin, fn)
 	}
 	return s.DB.InTx(ctx, fn)
 }

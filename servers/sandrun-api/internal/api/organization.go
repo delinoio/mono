@@ -143,6 +143,9 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 	if err != nil {
 		return nil, err
 	}
+	if err := h.DB.CheckOwnSandTeardownAdmission(ctx); err != nil {
+		return nil, h.Internal(ctx, "check OwnSand teardown admission", err)
+	}
 	// Cleanup needs a stable Postgres session and also uses the ordinary
 	// pool. Give the advisory lock its own connection.
 	conn, err := pgx.ConnectConfig(ctx, h.DB.Pool.Config().ConnConfig)
@@ -259,8 +262,8 @@ func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect
 		if deleting {
 			return ErrPrecondition("organization deletion is in progress; try again")
 		}
-		if target == "" {
-			return ErrInvalidf("invalid user_id: is required")
+		if err := validateMembershipTargetUserID(target); err != nil {
+			return err
 		}
 		if target == c.UserID {
 			return ErrInvalidf("invalid user_id: the caller is already the owner")

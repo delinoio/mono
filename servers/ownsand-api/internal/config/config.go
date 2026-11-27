@@ -47,6 +47,7 @@ const (
 	EnvLogtoTokenEndpoint       = "LOGTO_TOKEN_ENDPOINT"
 	EnvAccountsM2MClientID      = "ACCOUNTS_M2M_CLIENT_ID"
 	EnvAccountsM2MClientSecret  = "ACCOUNTS_M2M_CLIENT_SECRET"
+	EnvWriteOwnerUnlinks        = "BILLING_WRITE_OWNER_UNLINKS"
 	EnvMetricsAddr              = "METRICS_ADDR"
 )
 
@@ -174,11 +175,12 @@ type R2 struct {
 // (development and tests); usage is then still metered into the outbox,
 // and the reporter stays idle.
 type Accounts struct {
-	Enabled       bool
-	APIOrigin     string
-	TokenEndpoint string
-	ClientID      string
-	ClientSecret  string
+	WriteOwnerUnlinks bool
+	Enabled           bool
+	APIOrigin         string
+	TokenEndpoint     string
+	ClientID          string
+	ClientSecret      string
 }
 
 // Config is the validated server configuration. It holds secrets; never log
@@ -407,7 +409,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvAccountsAPIOrigin); v != "" {
 		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+		if err != nil || !validHTTPURL(u) || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
 			// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, so check it too. The origin has no query, empty or not.
 			// User information (user, user:password or an empty "@") is not part of an origin,
 			// and it would send credentials to the accounts API in every request URL.
@@ -425,6 +427,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.Accounts.Enabled = true
 	}
+	if v := get(EnvWriteOwnerUnlinks); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false", EnvWriteOwnerUnlinks)
+		}
+		cfg.Accounts.WriteOwnerUnlinks = b
+	}
+
 	if v := get(EnvMetricsAddr); v != "" {
 		if err := listenaddr.Validate(EnvMetricsAddr, v); err != nil {
 			return Config{}, err
@@ -471,10 +481,23 @@ func parseKey(name, value string) ([]byte, error) {
 
 func validateURL(name, value string) error {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+	if err != nil || !validHTTPURL(u) {
 		return fmt.Errorf("%s must be an http or https URL", name)
 	}
 	return nil
+}
+
+func validHTTPURL(u *url.URL) bool {
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+		return false
+	}
+	port := u.Port()
+	if port == "" {
+		return true
+	}
+	// url.Parse checks the port syntax but accepts decimal values above 65535.
+	_, err := strconv.ParseUint(port, 10, 16)
+	return err == nil
 }
 
 // validateR2Endpoint requires a root HTTP or HTTPS account endpoint.

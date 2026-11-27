@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"slices"
 	"strings"
@@ -21,12 +22,15 @@ import (
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/devsession"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/lease"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/profile"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/secrets"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/work"
 )
@@ -110,6 +114,122 @@ func TestWarmRunnersAndReclaim(t *testing.T) {
 	// Warm runners wait while a request is uncovered: no warm runner comes
 	// back while the pool is full.
 	stays(t, "no warm runner while full", func() bool { return w.fake.Active(w.osOrg) <= 2 })
+}
+
+func TestDispatchDemandAfterOwnSandLinkReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		kind   sandrunv1.WorkloadKind
+		source work.Source
+		pool   string
+	}{
+		{"binding demand", sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, work.SourceDevSession, ""},
+		{"pool demand", sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB, work.SourceGitHub, "123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			fake := ownsandfake.New()
+			factory := &dispatchLinkFactory{Fake: fake}
+			w := newWorkWorldWithProvider(t, devsession.Timing{}, fake, factory)
+			p := devProfileProto("demand", 0, 0)
+			p.WorkloadKind = tc.kind
+			if tc.pool != "" {
+				p.WorkspacePath = ""
+			}
+			profileID := w.createProfile(t, p)
+
+			// Stop the background dispatcher before enqueuing demand so each
+			// explicit pass can be checked before the next pass starts.
+			w.env.Stop()
+			database := w.env.DB
+			replacement, key := api.NewID(), ownsandKey('b')
+			fake.AddOrg(replacement, key)
+			ring, err := secrets.NewKeyring(w.env.SecretKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sealed, err := ring.Seal([]byte(key), secrets.AssociatedData("ownsand_link", w.org.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Ensure the pass has to build a client for its snapshot.
+			if _, err := database.Pool.Exec(ctx, "UPDATE ownsand_links SET credential_revision = $2 WHERE organization_id = $1", w.org.ID, api.NewID()); err != nil {
+				t.Fatal(err)
+			}
+			factory.afterNew = func() error {
+				// Install the replacement after the pass reads the old link,
+				// while keeping the request queued for the reservation check.
+				_, err := database.Pool.Exec(ctx, `UPDATE ownsand_links SET ownsand_organization_id = $2, credential_revision = $3, api_key_ciphertext = $4
+					WHERE organization_id = $1`, w.org.ID, replacement, api.NewID(), sealed.Ciphertext)
+				return err
+			}
+
+			storedProfile, err := w.l.Profiles.Get(ctx, database.Pool, w.org.ID, profileID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestID := api.NewID()
+			if err := database.InTx(ctx, func(tx pgx.Tx) error {
+				_, _, err := w.l.Engine.CreateRequest(ctx, tx, work.NewRequest{
+					Profile: storedProfile, Source: tc.source, PoolKey: tc.pool, RequestID: requestID, OwnerUserID: w.org.Owner,
+				})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			w.l.Engine.Pass(ctx, w.org.ID)
+			if factory.afterNew != nil {
+				t.Fatal("dispatcher did not load the old link client")
+			}
+			var runnerCount int
+			if err := database.Pool.QueryRow(ctx, "SELECT count(*) FROM runners WHERE organization_id = $1", w.org.ID).Scan(&runnerCount); err != nil {
+				t.Fatal(err)
+			}
+			if calls := fake.Calls("CreateSandbox"); runnerCount != 0 || calls != 0 {
+				t.Fatalf("stale link: %d runner rows, %d create calls", runnerCount, calls)
+			}
+			req, err := w.l.Engine.GetRequest(ctx, database.Pool, w.org.ID, requestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.State != sandrunv1.RequestState_REQUEST_STATE_QUEUED || req.RunnerID != "" || req.StartAttempts != 0 {
+				t.Fatalf("stale link: state %s, runner %q, attempts %d", req.State, req.RunnerID, req.StartAttempts)
+			}
+
+			w.l.Engine.Pass(ctx, w.org.ID)
+			if calls, current := fake.Calls("CreateSandbox"), fake.Active(replacement); calls != 1 || current != 1 {
+				t.Fatalf("current link: %d total create calls, %d active sandboxes at replacement", calls, current)
+			}
+			var bound, sponsor, pool string
+			if err := database.Pool.QueryRow(ctx, `SELECT coalesce(request_id::text, ''), coalesce(sponsor_request_id::text, ''), coalesce(pool_key, '')
+				FROM runners WHERE organization_id = $1`, w.org.ID).Scan(&bound, &sponsor, &pool); err != nil {
+				t.Fatal(err)
+			}
+			if tc.pool == "" {
+				if bound != requestID || sponsor != "" || pool != "" {
+					t.Fatalf("binding reservation: bound %q, sponsor %q, pool %q", bound, sponsor, pool)
+				}
+			} else if bound != "" || sponsor != requestID || pool != tc.pool {
+				t.Fatalf("pool reservation: bound %q, sponsor %q, pool %q", bound, sponsor, pool)
+			}
+		})
+	}
+}
+
+type dispatchLinkFactory struct {
+	*ownsandfake.Fake
+	afterNew func() error
+}
+
+func (f *dispatchLinkFactory) New(orgID, key string) (ownsandclient.Client, error) {
+	client, err := f.Fake.New(orgID, key)
+	if err != nil || f.afterNew == nil {
+		return client, err
+	}
+	afterNew := f.afterNew
+	f.afterNew = nil
+	return client, afterNew()
 }
 
 func TestWarmReservationDuringProfileDeletion(t *testing.T) {
@@ -447,14 +567,20 @@ func TestWorkService(t *testing.T) {
 	owner := w.env.User(w.org.Owner)
 
 	// Watch: the snapshot has every open request and runner.
-	wctx, cancel := context.WithCancel(ctx)
+	wctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	watch, err := w.env.User(w.org.Member).Work.WatchQueue(wctx, connect.NewRequest(&sandrunv1.WatchQueueRequest{OrganizationId: w.org.ID}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	snapshot := map[string]bool{}
-	for watch.Receive() {
+	for {
+		if !watch.Receive() {
+			if err := watch.Err(); err != nil {
+				t.Fatalf("watch ended before snapshot_complete: %v", err)
+			}
+			t.Fatal("watch ended before snapshot_complete")
+		}
 		m := watch.Msg()
 		if m.GetSnapshotComplete() != nil {
 			break
@@ -569,7 +695,7 @@ func TestDeleteRunnerUsesLockedState(t *testing.T) {
 	if _, err := w.env.DB.Pool.Exec(ctx, updateState, runnerID, int16(sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)); err != nil {
 		t.Fatal(err)
 	}
-	commit := holdTx(t, w.env, updateState, runnerID, int16(sandrunv1.RunnerState_RUNNER_STATE_BUSY))
+	holder := holdTx(t, w.env, updateState, runnerID, int16(sandrunv1.RunnerState_RUNNER_STATE_BUSY))
 	type deleteResult struct {
 		response *connect.Response[sandrunv1.DeleteRunnerResponse]
 		err      error
@@ -579,8 +705,9 @@ func TestDeleteRunnerUsesLockedState(t *testing.T) {
 		response, err := admin.Work.DeleteRunner(ctx, connect.NewRequest(deleteRequest))
 		result <- deleteResult{response, err}
 	}()
-	waitForLockWaiter(t, w.env)
-	commit()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE"})
+	holder.commit()
 	first := <-result
 	if first.err != nil || first.response.Msg.GetRunner().GetState() != sandrunv1.RunnerState_RUNNER_STATE_DELETING ||
 		first.response.Msg.GetRunner().GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
@@ -677,7 +804,9 @@ func TestCleanUps(t *testing.T) {
 		t.Fatal("a sandbox survived the organization deletion")
 	}
 	var rows int
-	_ = w.env.DB.Pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM requests WHERE organization_id = $1) + (SELECT count(*) FROM runners WHERE organization_id = $1)", w.org.ID).Scan(&rows)
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM requests WHERE organization_id = $1) + (SELECT count(*) FROM runners WHERE organization_id = $1)", w.org.ID).Scan(&rows); err != nil {
+		t.Fatalf("count work rows after organization deletion: %v", err)
+	}
 	if rows != 0 {
 		t.Fatalf("%d work rows left", rows)
 	}
@@ -1013,6 +1142,126 @@ func TestDeleteSandboxRetry(t *testing.T) {
 			}
 			calls := w.fake.Calls("DeleteSandbox")
 			stays(t, "no more DeleteSandbox calls", func() bool { return w.fake.Calls("DeleteSandbox") == calls })
+		})
+	}
+}
+
+func TestStartFailureAfterSandboxStatusDeadline(t *testing.T) {
+	timing := testenv.FastWorkTiming()
+	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
+	unavailable := connect.NewWireError(connect.CodeUnavailable, errors.New("OwnSand temporarily unavailable"))
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.StartRunning = false
+		o.GetError = unavailable
+	})
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	session := w.createSession(t, w.env.User(w.org.Member), profileID)
+	requestID := session.GetDevSessionId()
+	getRequest := func() *work.Request {
+		t.Helper()
+		req, err := w.l.Engine.GetRequest(t.Context(), w.env.DB.Pool, w.org.ID, requestID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+	queueTime := getRequest().QueueTime
+
+	for attempt := int32(1); attempt <= work.MaxStartAttempts; attempt++ {
+		starting := w.waitState(t, requestID, sandrunv1.RequestState_REQUEST_STATE_STARTING)
+		runnerID := starting.GetRunnerId()
+		runner := w.runner(t, runnerID)
+		if runner.GetOwnsandSandboxId() == "" {
+			t.Fatal("starting runner has no sandbox ID")
+		}
+		// Prevent replacement sandboxes while checking the result of this attempt.
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateError = unavailable })
+
+		w.env.Clock.Advance(timing.StartTimeout)
+		calls := w.fake.Calls("GetSandbox")
+		eventually(t, "repeated status errors at the startup limit", func() bool {
+			return w.fake.Calls("GetSandbox") >= calls+3
+		})
+		if state := w.runner(t, runnerID).GetState(); state != sandrunv1.RunnerState_RUNNER_STATE_CREATING {
+			t.Fatalf("runner state at startup limit = %s", state)
+		}
+		if req := getRequest(); req.State != sandrunv1.RequestState_REQUEST_STATE_STARTING || req.StartAttempts != attempt {
+			t.Fatalf("request at startup limit has state %s and %d attempts, want STARTING and %d attempts", req.State, req.StartAttempts, attempt)
+		}
+		w.env.Clock.Advance(time.Millisecond)
+
+		eventually(t, "runner start failure after the status deadline", func() bool {
+			return w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_FAILED
+		})
+		if reason := w.runner(t, runnerID).GetEndReason(); reason != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+			t.Fatalf("runner end reason = %s", reason)
+		}
+		eventually(t, "failed sandbox deleted and cleanup mark cleared", func() bool {
+			var pending bool
+			if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT sandbox_cleanup FROM runners WHERE runner_id = $1", runnerID).Scan(&pending); err != nil {
+				t.Fatal(err)
+			}
+			return !pending && w.fake.Active(w.osOrg) == 0
+		})
+
+		req := getRequest()
+		if req.StartAttempts != attempt || !req.QueueTime.Equal(queueTime) {
+			t.Fatalf("request has %d attempts and queue time %v, want %d and %v", req.StartAttempts, req.QueueTime, attempt, queueTime)
+		}
+		if attempt == work.MaxStartAttempts {
+			if req.State != sandrunv1.RequestState_REQUEST_STATE_FAILED || req.EndReason != sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED {
+				t.Fatalf("exhausted request state = %s, end reason = %s", req.State, req.EndReason)
+			}
+			break
+		}
+		if req.State != sandrunv1.RequestState_REQUEST_STATE_QUEUED || req.RunnerID != "" {
+			t.Fatalf("retry request state = %s, runner = %q", req.State, req.RunnerID)
+		}
+		w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateError = nil })
+	}
+}
+
+func TestStartFailureSandboxStatusBeforeDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		recovered bool
+	}{
+		{name: "recovers", recovered: true},
+		{name: "not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorkWorld(t, devsession.Timing{})
+			unavailable := connect.NewWireError(connect.CodeUnavailable, errors.New("OwnSand temporarily unavailable"))
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.StartRunning = false
+				o.GetError = unavailable
+			})
+			profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+			session := w.createSession(t, w.env.User(w.org.Member), profileID)
+			starting := w.waitState(t, session.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_STARTING)
+			runnerID := starting.GetRunnerId()
+			eventually(t, "sandbox status lookup", func() bool { return w.fake.Calls("GetSandbox") > 0 })
+
+			if tc.recovered {
+				w.fake.SetRunning(w.osOrg, w.runner(t, runnerID).GetOwnsandSandboxId())
+				w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.GetError = nil })
+				running := w.waitState(t, session.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
+				if running.GetRunnerId() != runnerID {
+					t.Fatalf("recovered session runner = %q, want %q", running.GetRunnerId(), runnerID)
+				}
+				return
+			}
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+				o.CreateError = unavailable
+				o.GetError = connect.NewWireError(connect.CodeNotFound, errors.New("sandbox not found"))
+			})
+			eventually(t, "runner start failure without advancing the clock", func() bool {
+				return w.runner(t, runnerID).GetState() == sandrunv1.RunnerState_RUNNER_STATE_FAILED
+			})
+			if reason := w.runner(t, runnerID).GetEndReason(); reason != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+				t.Fatalf("runner end reason = %s", reason)
+			}
+			w.waitState(t, session.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_QUEUED)
 		})
 	}
 }
@@ -1605,60 +1854,134 @@ func TestWatchQueueCommitOrder(t *testing.T) {
 }
 
 func TestWatchQueueSnapshotAcrossTables(t *testing.T) {
-	env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
+	// Keep the work components from waiting on the same runners lock as the watch.
+	seed := testenv.New(t)
+	eventually(t, "core instance holds lease", seed.App.Lease.Held)
+	env := seed.NewReplica(t, testenv.WithLayers(ownsandfake.New(), &layers.Layers{}))
 	org := env.NewOrg("alice")
 	requestID := seedQueueWatchRow(t, env, org.ID, false)
 	runnerID := seedQueueWatchRow(t, env, org.ID, true)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	writer, err := env.DB.Pool.Begin(ctx)
+	setupCtx, cancelSetup := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancelSetup()
+	config := env.DB.Pool.Config().ConnConfig
+	observer, err := pgx.ConnectConfig(setupCtx, config)
+	if err != nil {
+		t.Fatalf("connect queue snapshot lock observer: %v", err)
+	}
+	defer observer.Close(t.Context())
+	writer, err := env.DB.Pool.Begin(setupCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer writer.Rollback(t.Context())
-	if _, err := writer.Exec(ctx, "LOCK TABLE runners IN ACCESS EXCLUSIVE MODE"); err != nil {
+	if _, err := writer.Exec(setupCtx, "LOCK TABLE runners IN ACCESS EXCLUSIVE MODE"); err != nil {
 		t.Fatal(err)
 	}
+	writerPID := writer.Conn().PgConn().PID()
+	cancelSetup()
+
+	watchCtx, cancelWatch := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelWatch()
 	type watchResult struct {
 		stream *connect.ServerStreamForClient[sandrunv1.WatchQueueResponse]
 		err    error
 	}
-	started := make(chan watchResult, 1)
+	firstEvent := make(chan watchResult, 1)
 	go func() {
-		stream, err := env.User(org.Member).Work.WatchQueue(ctx, connect.NewRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org.ID}))
-		started <- watchResult{stream, err}
+		stream, err := env.User(org.Member).Work.WatchQueue(watchCtx, connect.NewRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org.ID}))
+		// Connect can report a server error on Receive even if WatchQueue returned a stream.
+		if err == nil && !stream.Receive() {
+			err = stream.Err()
+			if err == nil {
+				err = io.EOF
+			}
+		}
+		firstEvent <- watchResult{stream, err}
 	}()
 
 	// Commit only after the watch read requests and is blocked reading runners.
-	eventually(t, "watch reading the runner snapshot", func() bool {
-		var waiting bool
-		err := env.DB.Pool.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1 FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock'
-				AND query LIKE '% FROM runners WHERE organization_id = $1 AND state = ANY($2)%'
-		)`).Scan(&waiting)
-		if err != nil {
-			t.Fatal(err)
+	observeCtx, cancelObservation := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancelObservation()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	var readerPID uint32
+	for readerPID == 0 && observeCtx.Err() == nil {
+		select {
+		case result := <-firstEvent:
+			if result.err != nil {
+				t.Fatalf("WatchQueue ended before waiting for writer PID %d: %v", writerPID, result.err)
+			}
+			t.Fatalf("WatchQueue emitted an event before waiting for writer PID %d", writerPID)
+		case <-observeCtx.Done():
+			continue
+		case <-tick.C:
 		}
-		return waiting
-	})
-	endQueueWatchRow(t, ctx, writer, requestID, false)
-	endQueueWatchRow(t, ctx, writer, runnerID, true)
-	if err := writer.Commit(ctx); err != nil {
+		err := observer.QueryRow(observeCtx, `SELECT COALESCE(min(a.pid), 0)
+			FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid AND l.database = a.datid
+			WHERE a.datname = current_database()
+			  AND l.relation = 'runners'::regclass AND l.locktype = 'relation'
+			  AND l.mode = 'AccessShareLock' AND NOT l.granted
+			  AND $1 = ANY(pg_blocking_pids(a.pid))`, writerPID).Scan(&readerPID)
+		if err != nil && observeCtx.Err() == nil {
+			logQueueSnapshotLocks(t, config)
+			t.Fatalf("observe queue snapshot reader blocked by writer PID %d: %v", writerPID, err)
+		}
+	}
+	if readerPID == 0 {
+		logQueueSnapshotLocks(t, config)
+		t.Fatalf("timed out waiting for the queue snapshot reader to be blocked by writer PID %d: %v", writerPID, observeCtx.Err())
+	}
+	tick.Stop()
+	cancelObservation()
+	t.Logf("queue snapshot reader PID %d waited for writer PID %d on runners", readerPID, writerPID)
+
+	endQueueWatchRow(t, watchCtx, writer, requestID, false)
+	endQueueWatchRow(t, watchCtx, writer, runnerID, true)
+	if err := writer.Commit(watchCtx); err != nil {
 		t.Fatal(err)
 	}
-	watch := <-started
+	watch := <-firstEvent
 	if watch.err != nil {
-		t.Fatal(watch.err)
+		t.Fatalf("receive the first WatchQueue event: %v", watch.err)
 	}
-	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestOpen, watchRunnerOpen)
+	defer watch.stream.Close()
+	expectQueueWatchState(t, watch.stream.Msg(), requestID, watchRequestOpen, watchRunnerOpen)
 	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestOpen, watchRunnerOpen)
 	if msg := nextQueueWatchEvent(t, watch.stream); msg.GetSnapshotComplete() == nil {
 		t.Fatalf("expected snapshot_complete, got %v", msg)
 	}
 	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), requestID, watchRequestEnd, watchRunnerEnd)
 	expectQueueWatchState(t, nextQueueWatchEvent(t, watch.stream), runnerID, watchRequestEnd, watchRunnerEnd)
+}
+
+func logQueueSnapshotLocks(t *testing.T, config *pgx.ConnConfig) {
+	t.Helper()
+	// Use a fresh connection in case the observation deadline interrupted a query.
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Logf("connect to collect queue snapshot lock diagnostics: %v", err)
+		return
+	}
+	defer conn.Close(ctx)
+
+	var locks string
+	err = conn.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(activity) ORDER BY pid), '[]'::jsonb)::text
+		FROM (
+			SELECT a.pid, a.state, a.wait_event_type, a.wait_event, pg_blocking_pids(a.pid) AS blocked_by,
+				l.locktype, l.relation::regclass::text AS relation, l.mode, l.granted
+			FROM pg_stat_activity a
+			LEFT JOIN pg_locks l ON l.pid = a.pid AND (NOT l.granted OR
+				(l.database = a.datid AND l.relation IN ('requests'::regclass, 'runners'::regclass)))
+			WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+		) activity`).Scan(&locks)
+	if err != nil {
+		t.Logf("collect queue snapshot lock diagnostics: %v", err)
+		return
+	}
+	t.Logf("queue snapshot lock diagnostics: %s", locks)
 }
 
 func seedQueueWatchRow(t *testing.T, env *testenv.Env, orgID string, runner bool) string {

@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -31,8 +33,10 @@ type Fake struct {
 	order           []string
 	streams         map[int]chan string
 	nextID          int
-	lists           int
+	listTimes       []time.Time
 	failWatch       int
+	htmlWatches     int
+	failLookup      bool
 	failRelease     bool
 	queuePages      map[string]map[string]any
 	claimAttempts   []string
@@ -50,6 +54,7 @@ type entry struct {
 	Phase         string
 	AcceptorID    string
 	SessionStatus string
+	EmptyLookup   bool
 }
 
 func (e *entry) object(outpost string) map[string]any {
@@ -99,7 +104,7 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		f.lists++
+		f.listTimes = append(f.listTimes, time.Now())
 		if f.queuePages != nil {
 			page, ok := f.queuePages[q.Get("cursor")]
 			f.mu.Unlock()
@@ -110,29 +115,35 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, page)
 			return
 		}
-		var items []any
-		for _, id := range f.order {
+		// Use positions in the insertion order so claims and deletions do not shift the cursor.
+		start := 0
+		if c, ok := strings.CutPrefix(q.Get("cursor"), "page-"); ok {
+			if position, err := strconv.Atoi(c); err == nil {
+				start = max(position, 0)
+			}
+		}
+		phase := q.Get("phase")
+		cursor := start
+		total, remaining := 0, 0
+		var page []any
+		for i, id := range f.order {
 			e := f.entries[id]
-			if e == nil {
+			if e == nil || (phase != "" && phase != e.Phase) {
 				continue
 			}
-			if q.Get("phase") == "" || q.Get("phase") == e.Phase {
-				items = append(items, e.object(f.OutpostID))
+			total++
+			if i < start {
+				continue
 			}
+			// Return one item per page so SandRun follows the cursor.
+			if remaining == 0 {
+				page = []any{e.object(f.OutpostID)}
+				cursor = i + 1
+			}
+			remaining++
 		}
 		f.mu.Unlock()
-		// One item per page, so SandRun follows the cursor.
-		page, rest := items, []any(nil)
-		start := 0
-		if c := q.Get("cursor"); strings.HasPrefix(c, "page-") {
-			fmt.Sscanf(c, "page-%d", &start)
-		}
-		if start < len(items) {
-			page, rest = items[start:start+1], items[start+1:]
-		} else {
-			page = nil
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": page, "has_next_page": len(rest) > 0, "cursor": fmt.Sprintf("page-%d", start+1), "total": len(items)})
+		writeJSON(w, http.StatusOK, map[string]any{"items": page, "has_next_page": remaining > 1, "cursor": fmt.Sprintf("page-%d", cursor), "total": total})
 	case strings.HasPrefix(path, "/opbeta/outposts/devins/"):
 		rest := strings.TrimPrefix(path, "/opbeta/outposts/devins/")
 		sid, action, _ := strings.Cut(rest, "/")
@@ -155,6 +166,14 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case r.Method == http.MethodGet && action == "":
+			if f.failLookup {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+				return
+			}
+			if e.EmptyLookup {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			writeJSON(w, http.StatusOK, e.object(f.OutpostID))
 		case r.Method == http.MethodPost && action == "claim":
 			f.claimAttempts = append(f.claimAttempts, sid)
@@ -183,13 +202,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 				// A terminated session leaves the queue.
 				delete(f.entries, sid)
 				f.broadcastLocked("DELETED", e)
-				writeJSON(w, http.StatusOK, e.object(f.OutpostID))
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 			// The session returns to the queue at once.
 			e.Phase, e.AcceptorID = "pending", ""
 			f.broadcastLocked("MODIFIED", e)
-			writeJSON(w, http.StatusOK, e.object(f.OutpostID))
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && action == "operator-message":
 			f.messages[sid] = append(f.messages[sid], body.Message)
 			writeJSON(w, http.StatusOK, map[string]string{})
@@ -203,6 +222,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 
 func (f *Fake) watch(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
+	if f.htmlWatches > 0 {
+		f.htmlWatches--
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html>Maintenance</html>")
+		return
+	}
 	if f.failWatch > 0 {
 		f.failWatch--
 		f.mu.Unlock()
@@ -292,6 +318,13 @@ func (f *Fake) SetSessionStatusSilently(sid, status string) {
 	f.entries[sid].SessionStatus = status
 }
 
+// SetEmptyLookup controls whether a queue-entry lookup returns a bodyless 200.
+func (f *Fake) SetEmptyLookup(sid string, empty bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries[sid].EmptyLookup = empty
+}
+
 // Forget removes a session without a watch event, so that reading its
 // queue entry answers 404.
 func (f *Fake) Forget(sid string) {
@@ -345,6 +378,20 @@ func (f *Fake) FailWatches(n int) {
 	f.failWatch = n
 }
 
+// ServeHTMLWatches returns a maintenance page for the next n watch calls.
+func (f *Fake) ServeHTMLWatches(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.htmlWatches = n
+}
+
+// FailLookups sets whether an existing queue entry lookup fails with 503.
+func (f *Fake) FailLookups(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failLookup = fail
+}
+
 // FailReleases sets whether release calls fail with 503.
 func (f *Fake) FailReleases(fail bool) {
 	f.mu.Lock()
@@ -363,7 +410,14 @@ func (f *Fake) Streams() int {
 func (f *Fake) Lists() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.lists
+	return len(f.listTimes)
+}
+
+// ListTimes returns the start times of calls for the outpost queue.
+func (f *Fake) ListTimes() []time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.listTimes)
 }
 
 // QueuePage describes a scripted list response for a request cursor.

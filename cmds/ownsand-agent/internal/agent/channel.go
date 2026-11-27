@@ -223,9 +223,10 @@ func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityRepor
 	caps.MacOSHardwareModels = a.macOSHardwareModels(caps.MacOSHardwareModels)
 	free, _ := a.opts.FreeDisk()
 	report := &ownsandv1.CapabilityReport{
-		HostOs:       sysinfo.HostOS(),
-		Arch:         sysinfo.Arch(),
-		AgentVersion: version.Version,
+		HostOs:               sysinfo.HostOS(),
+		Arch:                 sysinfo.Arch(),
+		AgentVersion:         version.Version,
+		ResumeFenceSupported: true,
 		Capabilities: &ownsandv1.DeviceCapabilities{
 			LogicalCpuCount:      sysinfo.LogicalCPUs(),
 			MemoryMib:            sysinfo.MemoryMiB(),
@@ -285,7 +286,7 @@ func (a *Agent) dispatch(chanCtx, agentCtx context.Context, c *conn, env *ownsan
 			// Signal removal before the channel can exit and Run decides
 			// whether to restart. The clean-up command only queues a reply
 			// and closes admission here.
-			a.handleClaimedCommand(chanCtx, agentCtx, m.Command, 0, nil)
+			a.handleCommand(chanCtx, agentCtx, m.Command, 0)
 			return
 		}
 		// An update or withdrawal command takes its order here, in receive
@@ -294,10 +295,8 @@ func (a *Agent) dispatch(chanCtx, agentCtx context.Context, c *conn, env *ownsan
 		if isUpdateCommand(m.Command) {
 			order = a.updater.NextOrder()
 		}
-		// A create_snapshot command registers in the same way, so that a
-		// delete_snapshot command received next finds it.
-		claim := a.claimSnapshotCreate(m.Command)
-		go a.handleClaimedCommand(chanCtx, agentCtx, m.Command, order, claim)
+		receipt := a.receiveCommand(m.Command)
+		go a.handleReceivedCommand(chanCtx, agentCtx, m.Command, order, receipt)
 	case *ownsandv1.AgentEnvelope_Configuration:
 		cfg := m.Configuration
 		a.Sandboxes.SetLimits(cfg.GetLimits())

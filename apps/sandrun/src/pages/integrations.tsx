@@ -2,6 +2,7 @@
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
 import {
+  createConnectQueryKey,
   createQueryOptions,
   useInfiniteQuery,
   useMutation,
@@ -48,6 +49,7 @@ import {
   CopyValue,
   Detail,
   Empty,
+  ErrorNotice,
   FormDialog,
   ListPagination,
   Loading,
@@ -55,7 +57,7 @@ import {
   QueryBoundary,
   StateBadge,
   showsFullError,
-  toastError,
+  useActionSignInNotice,
 } from "../components/ui.tsx";
 import { ownsandDevicesUrl } from "../config.ts";
 import { formatTime, labels } from "../format.ts";
@@ -331,6 +333,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
 function GitHubSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const { isCurrentVisit } = useRouter();
+  const { signInError, reportActionError } = useActionSignInNotice();
   const mounted = useRef(false);
   useLayoutEffect(() => {
     mounted.current = true;
@@ -362,7 +365,7 @@ function GitHubSection({ admin }: { admin: boolean }) {
         externalNavigation.assign(res.url);
       }
     } catch (error) {
-      toastError(error);
+      reportActionError(error);
     }
   };
 
@@ -385,6 +388,7 @@ function GitHubSection({ admin }: { admin: boolean }) {
         whose runs-on label names a runner profile. Install the SandRun GitHub
         App on a GitHub organization; GitHub then returns to this console.
       </p>
+      {signInError ? <ErrorNotice error={signInError} /> : null}
       <QueryBoundary query={list} loading="Loading GitHub installations">
         {(data) => {
           const installations = new Map<string, GitHubInstallation>();
@@ -798,7 +802,22 @@ function IntegrationDialog({
     invalidateServices(queryClient, AgentIntegrationService);
   const createIntegration = useMutation(
     AgentIntegrationService.method.createAgentIntegration,
-    { onSuccess: refresh },
+    {
+      onSuccess: async (_, { organizationId }) => {
+        // Invalidation alone reuses an in-flight fetch when no page is cached.
+        // That first response may contain the list from before creation.
+        await queryClient.cancelQueries({
+          queryKey: createConnectQueryKey({
+            schema: AgentIntegrationService.method.listAgentIntegrations,
+            input: { organizationId },
+            cardinality: "infinite",
+          }),
+          fetchStatus: "fetching",
+          predicate: (query) => query.state.data === undefined,
+        });
+        await refresh();
+      },
+    },
   );
   const updateIntegration = useMutation(
     AgentIntegrationService.method.updateAgentIntegration,

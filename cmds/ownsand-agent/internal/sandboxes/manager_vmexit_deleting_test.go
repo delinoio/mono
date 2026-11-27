@@ -4,10 +4,13 @@ package sandboxes
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -17,6 +20,104 @@ func (e *env) stopVM(id string) {
 	e.rt.mu.Lock()
 	e.rt.vms[id].stop()
 	e.rt.mu.Unlock()
+}
+
+func TestTickRetriesLostVMAfterRevisionFailure(t *testing.T) {
+	const (
+		lost    = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
+		idle    = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED
+		max     = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED
+		failed  = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
+		deleted = ownsandv1.SandboxState_SANDBOX_STATE_DELETED
+	)
+	for _, tc := range []struct {
+		name    string
+		pause   bool
+		elapsed time.Duration
+		state   ownsandv1.SandboxState
+		reason  ownsandv1.SandboxEndReason
+	}{
+		{"running", false, 0, failed, lost},
+		{"running past idle", false, 61 * time.Minute, deleted, idle},
+		{"paused", true, 0, failed, lost},
+		{"paused past idle", true, 61 * time.Minute, failed, lost},
+		{"paused past maximum", true, 2 * time.Hour, deleted, max},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				logs := &lockedBuffer{}
+				e := newEnvWithLogger(t, slog.New(slog.NewTextHandler(logs, nil)))
+				live := e.create(time.Hour, 2*time.Hour)
+				id := live.GetSandboxId()
+				e.ex.running[id] = true
+				if tc.pause {
+					var err error
+					live, err = e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				restore := breakFile(t, e.st.Path(store.AgentFile))
+				before := e.out.count()
+				requireUnchanged := func() {
+					t.Helper()
+					entry := e.m.StateReport(1, nil).GetSandboxes()[0]
+					if entry.GetState() != live.GetState() || entry.GetRevision().GetCounter() != live.GetRevision().GetCounter() || e.out.count() != before {
+						t.Fatalf("live revision changed or an update was published while storage was down: %v", entry)
+					}
+					if !e.rt.hasFiles(id) || e.rt.deleteCallCount() != 0 || e.ex.endedCalls(id) != 0 {
+						t.Fatal("cleanup started before the revision was saved")
+					}
+				}
+				requireRevisionError := func(message string) {
+					t.Helper()
+					for _, line := range strings.Split(logs.String(), "\n") {
+						if strings.Contains(line, message) && strings.Contains(line, "sandboxes: persist revision:") {
+							return
+						}
+					}
+					t.Fatalf("missing revision error %q in logs:\n%s", message, logs.String())
+				}
+
+				e.stopVM(id)
+				synctest.Wait()
+				requireRevisionError("record lost sandbox failed")
+				requireUnchanged()
+
+				e.tickAndWait()
+				requireRevisionError("end sandbox failed")
+				requireUnchanged()
+
+				e.clk.Advance(tc.elapsed)
+				restore()
+				e.tickAndWait()
+				e.tickAndWait()
+				e.tickAndWait()
+
+				entry := e.m.StateReport(2, nil).GetSandboxes()[0]
+				if entry.GetState() != tc.state || entry.GetEndReason() != tc.reason || entry.GetRevision().GetCounter() <= live.GetRevision().GetCounter() {
+					t.Fatalf("terminal entry = %v, want a newer %v with reason %v", entry, tc.state, tc.reason)
+				}
+				if e.rt.hasFiles(id) || e.rt.deleteCallCount() != 1 {
+					t.Fatal("expected one runtime delete and no remaining files")
+				}
+				e.ex.mu.Lock()
+				calls, reason := e.ex.calls[id], e.ex.ended[id]
+				e.ex.mu.Unlock()
+				if calls != 1 || reason != tc.reason {
+					t.Fatalf("exec tracker notified %d times with %v, want one notification with %v", calls, reason, tc.reason)
+				}
+				e.out.mu.Lock()
+				defer e.out.mu.Unlock()
+				updates := e.out.entries[before:]
+				if len(updates) != 2 || updates[0].GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETING ||
+					updates[0].GetRevision().GetCounter() <= live.GetRevision().GetCounter() || updates[0].GetRevision().GetCounter() >= entry.GetRevision().GetCounter() ||
+					updates[1].GetRevision().GetCounter() != entry.GetRevision().GetCounter() || updates[1].GetState() != tc.state || updates[1].GetEndReason() != tc.reason {
+					t.Fatalf("published updates = %v, want DELETING followed by the terminal entry", updates)
+				}
+			})
+		})
+	}
 }
 
 func TestTickRetriesCallerDeleteAfterVMExitsDuringCleanup(t *testing.T) {

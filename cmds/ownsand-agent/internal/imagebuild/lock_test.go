@@ -4,6 +4,7 @@ package imagebuild
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -19,9 +20,14 @@ import (
 )
 
 const (
-	lockHelperEnv   = "IMAGEBUILD_LOCK_HELPER_DIR"
-	lockHelperReady = "holding"
-	stagingSentinel = "sentinel"
+	lockHelperEnv         = "IMAGEBUILD_LOCK_HELPER_DIR"
+	lockHelperReady       = "holding"
+	lockHolderTimeout     = 10 * time.Second
+	lockContenderDirEnv   = "IMAGEBUILD_LOCK_CONTENDER_DIR"
+	lockContenderGuestEnv = "IMAGEBUILD_LOCK_CONTENDER_GUEST"
+	lockContenderBinEnv   = "IMAGEBUILD_LOCK_CONTENDER_GUEST_BINARY"
+	lockContenderTimeout  = 5 * time.Second
+	stagingSentinel       = "sentinel"
 )
 
 func lockTestLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -54,8 +60,10 @@ func TestLockHolderHelper(t *testing.T) {
 }
 
 type lockHolder struct {
-	cmd   *exec.Cmd
-	stdin io.WriteCloser
+	process *os.Process
+	stdin   io.WriteCloser
+	done    chan struct{}
+	waitErr error
 }
 
 // startLockHolder starts a process that holds the build lock of dir and waits
@@ -75,13 +83,14 @@ func startLockHolder(t *testing.T, dir string) *lockHolder {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	h := &lockHolder{cmd: cmd, stdin: stdin}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
+	h := &lockHolder{process: cmd.Process, stdin: stdin, done: make(chan struct{})}
+	t.Cleanup(func() { h.kill(t) })
 	ready := make(chan error, 1)
 	go func() {
+		defer func() {
+			h.waitErr = cmd.Wait()
+			close(h.done)
+		}()
 		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
 			if strings.TrimSpace(sc.Text()) == lockHelperReady {
@@ -97,7 +106,7 @@ func startLockHolder(t *testing.T, dir string) *lockHolder {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(lockHolderTimeout):
 		t.Fatal("the lock holder did not take the lock in time")
 	}
 	return h
@@ -105,10 +114,26 @@ func startLockHolder(t *testing.T, dir string) *lockHolder {
 
 func (h *lockHolder) kill(t *testing.T) {
 	t.Helper()
-	if err := h.cmd.Process.Kill(); err != nil {
-		t.Fatal(err)
+	select {
+	case <-h.done:
+		return
+	default:
 	}
-	_ = h.cmd.Wait()
+	if err := h.process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("stop the lock holder: %v", err)
+	}
+	_ = h.wait(t)
+}
+
+func (h *lockHolder) wait(t *testing.T) error {
+	t.Helper()
+	select {
+	case <-h.done:
+		return h.waitErr
+	case <-time.After(lockHolderTimeout):
+		t.Fatal("the lock holder did not exit in time")
+		return nil
+	}
 }
 
 func imageDir(t *testing.T, imagesDir string, os ownsandv1.GuestOs) string {
@@ -120,11 +145,31 @@ func imageDir(t *testing.T, imagesDir string, os ownsandv1.GuestOs) string {
 	return dir
 }
 
-func TestBuildLockRefusesASecondProcessBeforeTouchingStaging(t *testing.T) {
-	imagesDir := t.TempDir()
-	dir := imageDir(t, imagesDir, ownsandv1.GuestOs_GUEST_OS_WINDOWS)
-	h := startLockHolder(t, dir)
-
+// TestLockContenderHelper runs the contender in a separate process so the
+// parent can stop it even if acquiring the lock blocks.
+func TestLockContenderHelper(t *testing.T) {
+	dir := os.Getenv(lockContenderDirEnv)
+	if dir == "" {
+		t.Skip("helper process of the multi-process lock tests")
+	}
+	guest, ok := ownsandv1.GuestOs_value[os.Getenv(lockContenderGuestEnv)]
+	if !ok {
+		t.Fatal("invalid contender guest OS")
+	}
+	if guestOS := ownsandv1.GuestOs(guest); guestOS != ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED {
+		opts := Options{
+			ImagesDir:   dir,
+			GuestOS:     guestOS,
+			ISO:         filepath.Join(dir, "missing.iso"),
+			IPSW:        filepath.Join(dir, "missing.ipsw"),
+			GuestBinary: os.Getenv(lockContenderBinEnv),
+			Logger:      lockTestLogger(),
+		}
+		if err := Build(t.Context(), opts); !errors.Is(err, ErrBuildInProgress) {
+			t.Fatalf("want ErrBuildInProgress, got %v", err)
+		}
+		return
+	}
 	ran := false
 	err := withBuildLock(dir, lockTestLogger(), func() error {
 		ran = true
@@ -144,6 +189,38 @@ func TestBuildLockRefusesASecondProcessBeforeTouchingStaging(t *testing.T) {
 	if !strings.Contains(err.Error(), "build in progress for windows image") {
 		t.Fatalf("error text: %v", err)
 	}
+}
+
+func runLockContender(t *testing.T, dir string, guest ownsandv1.GuestOs) {
+	t.Helper()
+	var guestBinary string
+	if guest != ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED {
+		guestBinary = fakeGuestBinary(t, guest)
+	}
+	// The caller keeps the holder alive until CombinedOutput stops and reaps
+	// the contender. Releasing the lock first could let a blocked build run.
+	ctx, cancel := context.WithTimeout(t.Context(), lockContenderTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLockContenderHelper$")
+	cmd.Env = append(os.Environ(),
+		lockContenderDirEnv+"="+dir,
+		lockContenderGuestEnv+"="+guest.String(),
+		lockContenderBinEnv+"="+guestBinary,
+	)
+	cmd.WaitDelay = time.Second
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("%s: lock contender did not return within %s\n%s", t.Name(), lockContenderTimeout, out)
+		}
+		t.Fatalf("lock contender failed: %v\n%s", err, out)
+	}
+}
+
+func TestBuildLockRefusesASecondProcessBeforeTouchingStaging(t *testing.T) {
+	dir := imageDir(t, t.TempDir(), ownsandv1.GuestOs_GUEST_OS_WINDOWS)
+	h := startLockHolder(t, dir)
+
+	runLockContender(t, dir, ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED)
 	if got, err := os.ReadFile(filepath.Join(images.BuildDir(dir), stagingSentinel)); err != nil || string(got) != "staged" {
 		t.Fatalf("the staging directory of the holder was modified: %q %v", got, err)
 	}
@@ -152,10 +229,10 @@ func TestBuildLockRefusesASecondProcessBeforeTouchingStaging(t *testing.T) {
 	if err := h.stdin.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.cmd.Wait(); err != nil {
+	if err := h.wait(t); err != nil {
 		t.Fatalf("the lock holder failed: %v", err)
 	}
-	ran = false
+	ran := false
 	if err := withBuildLock(dir, lockTestLogger(), func() error { ran = true; return nil }); err != nil || !ran {
 		t.Fatalf("a build after the holder completed: ran=%v err=%v", ran, err)
 	}
@@ -272,15 +349,10 @@ func TestBuildRefusesWhileAnotherProcessBuilds(t *testing.T) {
 			imagesDir := t.TempDir()
 			dir := imageDir(t, imagesDir, guest)
 			startLockHolder(t, dir)
-			opts := Options{ImagesDir: imagesDir, GuestOS: guest, ISO: "x.iso", GuestBinary: fakeGuestBinary(t, guest), Logger: lockTestLogger()}
-			err := Build(t.Context(), opts)
-			if !errors.Is(err, ErrBuildInProgress) {
-				t.Fatalf("want ErrBuildInProgress, got %v", err)
-			}
+			runLockContender(t, imagesDir, guest)
 			if _, err := os.Stat(filepath.Join(images.BuildDir(dir), stagingSentinel)); err != nil {
 				t.Fatalf("Build touched the staging directory of the holder: %v", err)
 			}
-
 		})
 	}
 }

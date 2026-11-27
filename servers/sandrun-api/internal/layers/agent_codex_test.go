@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
@@ -48,8 +49,16 @@ type codexWorld struct {
 // adapter's scripts, which the interim rule does not verify yet.
 func newCodexWorld(t *testing.T, guest sandrunv1.GuestOs, opts ...testenv.Option) *codexWorld {
 	t.Helper()
+	return newCodexWorldWithTiming(t, guest, fastAgentTiming(), opts...)
+}
+
+func newCodexWorldWithTiming(t *testing.T, guest sandrunv1.GuestOs, timing agent.Timing, opts ...testenv.Option) *codexWorld {
+	t.Helper()
 	fake := codexfake.New(t, codexAPIKey)
-	w := newAgentWorld(t, layers.Options{Codex: codex.Options{BaseURL: fake.Server.URL}, CodexGuestOSes: []sandrunv1.GuestOs{sandrunv1.GuestOs_GUEST_OS_LINUX, sandrunv1.GuestOs_GUEST_OS_MACOS}}, opts...)
+	w := newAgentWorld(t, layers.Options{
+		Codex: codex.Options{BaseURL: fake.Server.URL}, AgentTiming: timing,
+		CodexGuestOSes: []sandrunv1.GuestOs{sandrunv1.GuestOs_GUEST_OS_LINUX, sandrunv1.GuestOs_GUEST_OS_MACOS},
+	}, opts...)
 	cw := &codexWorld{agentWorld: w, openai: fake}
 	cw.integrationID = w.createIntegration(t, &sandrunv1.CreateAgentIntegrationRequest{
 		Vendor: sandrunv1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, Name: "codex",
@@ -68,6 +77,34 @@ func (w *codexWorld) deliver(t *testing.T, id string, body []byte) int {
 	return w.sender.Send(t, codexfake.Delivery{ID: id, Body: body})
 }
 
+func newCodexWebhookWorld(t *testing.T) *codexWorld {
+	t.Helper()
+	timing := fastAgentTiming()
+	// Keep background session lookups out of the webhook read counts.
+	timing.PollInterval = time.Hour
+	return newCodexWorldWithTiming(t, sandrunv1.GuestOs_GUEST_OS_LINUX, timing)
+}
+
+func (w *codexWorld) expectDelivery(t *testing.T, id string, body []byte, wantCode int, wantResult webhook.Result) {
+	t.Helper()
+	code := w.deliver(t, id, body)
+	seen, err := webhook.Seen(t.Context(), w.env.DB.Pool, webhook.SenderOpenAI, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deliveryLog string
+	for line := range strings.Lines(w.env.Logs.String()) {
+		if strings.Contains(line, `"msg":"openai_webhook_delivery"`) && strings.Contains(line, `"delivery_id":"`+id+`"`) {
+			deliveryLog = line
+		}
+	}
+	wantSeen := wantCode == http.StatusOK
+	t.Logf("delivery %s: HTTP %d, recorded=%t, expected result %s", id, code, seen, wantResult)
+	if code != wantCode || seen != wantSeen || !strings.Contains(deliveryLog, `"result":"`+string(wantResult)+`"`) {
+		t.Fatalf("want HTTP %d, recorded=%t, result %s. Delivery log: %s", wantCode, wantSeen, wantResult, deliveryLog)
+	}
+}
+
 func TestCreateDirectDuringProfileChange(t *testing.T) {
 	for _, tc := range []struct {
 		name, change string
@@ -79,22 +116,34 @@ func TestCreateDirectDuringProfileChange(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
-			ctx := t.Context()
+			ctx, cancel := context.WithTimeout(t.Context(), 2*lockWaitTimeout)
+			defer cancel()
 			in, err := w.l.Integrations.Get(ctx, w.env.DB.Pool, w.org.ID, w.integrationID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			args := append([]any{w.profileID}, tc.args...)
-			commit := holdTx(t, w.env, tc.change, args...)
+			holder := holdTx(t, w.env, tc.change, args...)
+			waiterPID := make(chan int32, 1)
 			done := make(chan error, 1)
 			go func() {
 				done <- w.env.DB.InTx(ctx, func(tx pgx.Tx) error {
+					waiterPID <- int32(tx.Conn().PgConn().PID())
 					_, _, err := w.l.Agents.CreateDirectTx(ctx, tx, w.l.Codex, in, agent.DirectDemand{VendorRequestID: "sess_profile_changed"})
 					return err
 				})
 			}()
-			waitForLockWaiter(t, w.env)
-			commit()
+			var pid int32
+			select {
+			case pid = <-waiterPID:
+			case err := <-done:
+				t.Fatalf("direct admission finished before its transaction started: %v", err)
+			case <-ctx.Done():
+				t.Fatalf("start direct admission transaction: %v", ctx.Err())
+			}
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, waiterPID: pid,
+				query: "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE"})
+			holder.commit()
 			if err := <-done; !errors.Is(err, agent.ErrNoProfile) {
 				t.Fatalf("create direct: %v, want ErrNoProfile", err)
 			}
@@ -116,6 +165,13 @@ func TestCodexSessionLifecycle(t *testing.T) {
 	w.openai.AddSession("sess_1", "ccarenv_1")
 	w.openai.Update("sess_1", func(s *codexfake.Session) { s.RemoteURL = remoteURL })
 	body := codexfake.ActionRequired("sess_1")
+	const pendingWithoutEnvironment = `{"id":"sess_1","status":"requires_action","required_actions":[{"type":"environment_connection","environment_id":"ccarenv_1"}]}`
+	w.openai.Respond("sess_1", http.StatusOK, pendingWithoutEnvironment)
+	if code := w.deliver(t, "wh_missing_environment", body); code != http.StatusOK {
+		t.Fatalf("delivery without environment %d", code)
+	}
+	w.assertNoRequestsOrClaims(t)
+	w.openai.Respond("sess_1", 0, "")
 	if code := w.deliver(t, "wh_1", body); code != http.StatusOK {
 		t.Fatalf("delivery %d", code)
 	}
@@ -175,9 +231,56 @@ func TestCodexSessionLifecycle(t *testing.T) {
 			t.Fatal("a sandrun-only credential reached a guest file")
 		}
 	}
-	stays(t, "STARTING while the session waits for the executor", func() bool {
-		return w.request(t, req.GetRequestId()).GetState() == sandrunv1.RequestState_REQUEST_STATE_STARTING
-	})
+	in, err := w.l.Integrations.Get(t.Context(), w.env.DB.Pool, w.org.ID, w.integrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.openai.AddSession("sess_connected", "ccarenv_connected")
+	w.openai.Update("sess_connected", func(s *codexfake.Session) { s.NeedsConnection, s.Status = false, "in_progress" })
+	claims := []*agent.Claim{
+		{RequestID: req.GetRequestId(), VendorRequestID: "sess_1"},
+		{RequestID: "connected_request", VendorRequestID: "sess_connected"},
+	}
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+	}{
+		{"pending", 0, "", false},
+		{"empty", http.StatusOK, "", true},
+		{"whitespace", http.StatusOK, " \t\n", true},
+		{"no-content", http.StatusNoContent, "", true},
+		{"null", http.StatusOK, "null", true},
+		{"empty-object", http.StatusOK, "{}", true},
+		{"wrong-id", http.StatusOK, `{"id":"sess_other","status":"in_progress"}`, true},
+		{"missing-status", http.StatusOK, `{"id":"sess_1"}`, true},
+		{"blank-status", http.StatusOK, `{"id":"sess_1","status":" "}`, true},
+		{"pending-without-environment", http.StatusOK, pendingWithoutEnvironment, false},
+		{"pending-without-remote", http.StatusOK, `{"id":"sess_1","status":"requires_action","required_actions":[{"type":"environment_connection","environment_id":"ccarenv_1"}],"environment":{"type":"self_hosted","id":"ccarenv_1"}}`, false},
+		{"failed", http.StatusOK, `{"id":"sess_1","status":"failed"}`, false},
+		{"not-found", http.StatusNotFound, "", false},
+	} {
+		if !t.Run(tc.name, func(t *testing.T) {
+			w.openai.Respond("sess_1", tc.status, tc.body)
+			w.l.Agents.Poll(t.Context())
+			requestState := w.request(t, req.GetRequestId()).GetState()
+			runnerState := w.runner(t, runner.GetRunnerId()).GetState()
+			if requestState != sandrunv1.RequestState_REQUEST_STATE_STARTING || runnerState != sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK {
+				t.Fatalf("request %s, runner %s, want STARTING and WAITING_FOR_WORK", requestState, runnerState)
+			}
+			confirmed, err := w.l.Codex.CheckStarted(t.Context(), in, claims)
+			if len(confirmed) != 1 || confirmed[0] != "connected_request" {
+				t.Fatalf("confirmed %v, want only connected_request", confirmed)
+			}
+			if (err != nil) != tc.wantErr || (err != nil && !strings.Contains(err.Error(), req.GetRequestId())) {
+				t.Fatalf("startup error = %v, want error for the pending claim = %t", err, tc.wantErr)
+			}
+		}) {
+			return
+		}
+	}
+	w.openai.Respond("sess_1", 0, "")
 	w.openai.Update("sess_1", func(s *codexfake.Session) { s.NeedsConnection, s.Status = false, "in_progress" })
 	w.waitRunner(t, runner.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_BUSY)
 	w.waitRequest(t, req.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
@@ -394,28 +497,53 @@ func TestCodexWebhookCredentialLookup(t *testing.T) {
 // records nothing, so OpenAI's retry of the same delivery ID creates the
 // request; a deleted session is ignored.
 func TestCodexLookupFailureRedelivers(t *testing.T) {
-	w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	w := newCodexWebhookWorld(t)
 	w.openai.AddSession("sess_retry", "ccarenv_retry")
+	const deliveryID = "wh_retry"
+	body := codexfake.ActionRequired("sess_retry")
 	w.openai.Fail(http.StatusInternalServerError)
-	if code := w.deliver(t, "wh_retry", codexfake.ActionRequired("sess_retry")); code != http.StatusInternalServerError {
-		t.Fatalf("failed lookup %d", code)
-	}
+	w.expectDelivery(t, deliveryID, body, http.StatusInternalServerError, webhook.ResultFailed)
 	w.openai.Fail(0)
-	if code := w.deliver(t, "wh_retry", codexfake.ActionRequired("sess_retry")); code != http.StatusOK {
-		t.Fatalf("retry %d", code)
+
+	w.openai.Respond("sess_retry", http.StatusOK, `{
+		"status":"requires_action",
+		"required_actions":[{"type":"environment_connection","environment_id":"ccarenv_retry"}],
+		"environment":{"type":"self_hosted","id":"ccarenv_retry","remote_url":"https://api.openai.test/v1/agents/api"}
+	}`)
+	w.expectDelivery(t, deliveryID, body, http.StatusInternalServerError, webhook.ResultFailed)
+	w.openai.Respond("sess_retry", 0, "")
+	w.openai.Update("sess_retry", func(s *codexfake.Session) { s.ID = "sess_other" })
+	w.expectDelivery(t, deliveryID, body, http.StatusInternalServerError, webhook.ResultFailed)
+	w.assertNoRequestsOrClaims(t)
+	var runners int
+	if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT count(*) FROM runners WHERE organization_id = $1", w.org.ID).Scan(&runners); err != nil {
+		t.Fatal(err)
 	}
+	if runners != 0 || strings.Contains(w.env.Logs.String(), "sess_other") {
+		t.Fatalf("runner count %d or unexpected response ID in log", runners)
+	}
+	t.Log("failed connection deliveries saved no requests, claims or runners")
+
+	w.openai.Update("sess_retry", func(s *codexfake.Session) { s.ID = "sess_retry" })
+	w.expectDelivery(t, deliveryID, body, http.StatusOK, webhook.ResultProcessed)
 	w.requestBySource(t, "sess_retry:ccarenv_retry")
-	if code := w.deliver(t, "wh_gone", codexfake.ActionRequired("sess_gone")); code != http.StatusOK {
-		t.Fatalf("deleted session %d", code)
+	reads := w.openai.Reads()
+	w.expectDelivery(t, deliveryID, body, http.StatusOK, webhook.ResultDuplicate)
+	if w.openai.Reads() != reads {
+		t.Fatal("duplicate connection delivery performed a session lookup")
 	}
-	stays(t, "one request", func() bool { return len(w.requests(t)) == 1 })
+	w.expectDelivery(t, "wh_gone", codexfake.ActionRequired("sess_gone"), http.StatusOK, webhook.ResultIgnored)
+	if requests := w.requests(t); len(requests) != 1 {
+		t.Fatalf("%d requests, want one", len(requests))
+	}
+	t.Log("corrected connection delivery created one request; duplicate skipped lookup")
 }
 
 // TestCodexSessionFailedReleasesCompute: agent.session.failed for a
 // session that is still failed ends its request and deletes its runner;
 // a queued request ends with CANCELED.
 func TestCodexSessionFailedReleasesCompute(t *testing.T) {
-	w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	w := newCodexWebhookWorld(t)
 	w.openai.AddSession("sess_f", "ccarenv_f")
 	if code := w.deliver(t, "wh_f1", codexfake.ActionRequired("sess_f")); code != http.StatusOK {
 		t.Fatal(code)
@@ -435,14 +563,32 @@ func TestCodexSessionFailedReleasesCompute(t *testing.T) {
 		t.Fatalf("request %v after a stale failed event", r.GetState())
 	}
 	w.openai.Update("sess_f", func(s *codexfake.Session) { s.Status, s.NeedsConnection = "failed", false })
-	if code := w.deliver(t, "wh_f3", codexfake.Event("agent.session.failed", "sess_f")); code != http.StatusOK {
-		t.Fatal(code)
+	const deliveryID = "wh_f3"
+	body := codexfake.Event("agent.session.failed", "sess_f")
+	beforeReq, beforeRunner := w.request(t, req.GetRequestId()), w.runner(t, runnerID)
+	w.openai.Respond("sess_f", http.StatusOK, `{"status":"failed"}`)
+	w.expectDelivery(t, deliveryID, body, http.StatusInternalServerError, webhook.ResultFailed)
+	w.openai.Respond("sess_f", 0, "")
+	w.openai.Update("sess_f", func(s *codexfake.Session) { s.ID = "sess_other" })
+	w.expectDelivery(t, deliveryID, body, http.StatusInternalServerError, webhook.ResultFailed)
+	if !proto.Equal(w.request(t, req.GetRequestId()), beforeReq) || !proto.Equal(w.runner(t, runnerID), beforeRunner) {
+		t.Fatal("failed lookups changed the open request or runner")
 	}
+	t.Log("failed session lookups left the open request and runner unchanged")
+
+	w.openai.Update("sess_f", func(s *codexfake.Session) { s.ID = "sess_f" })
+	w.expectDelivery(t, deliveryID, body, http.StatusOK, webhook.ResultProcessed)
 	r := w.waitRequest(t, req.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_FAILED)
 	if r.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE {
 		t.Fatalf("end reason %v", r.GetEndReason())
 	}
 	w.waitRunner(t, runnerID, sandrunv1.RunnerState_RUNNER_STATE_DELETED)
+	reads := w.openai.Reads()
+	w.expectDelivery(t, deliveryID, body, http.StatusOK, webhook.ResultDuplicate)
+	if w.openai.Reads() != reads {
+		t.Fatal("duplicate failure delivery performed a session lookup")
+	}
+	t.Log("corrected failure delivery ended the request and deleted the runner; duplicate skipped lookup")
 
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))

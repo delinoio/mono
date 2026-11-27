@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/snapxfer"
@@ -27,6 +28,8 @@ func commandKind(cmd *ownsandv1.AgentCommand) string {
 		return "pause_sandbox"
 	case *ownsandv1.AgentCommand_ResumeSandbox:
 		return "resume_sandbox"
+	case *ownsandv1.AgentCommand_FenceResume:
+		return "fence_resume"
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		return "create_snapshot"
 	case *ownsandv1.AgentCommand_ExportSnapshot:
@@ -94,31 +97,47 @@ func errorDetail(err error) *ownsandv1.ErrorDetail {
 // order is the update order that dispatch took when it received an update or
 // withdrawal command; it is zero for every other command.
 func (a *Agent) handleCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64) {
-	a.handleClaimedCommand(chanCtx, agentCtx, cmd, order, nil)
+	a.handleReceivedCommand(chanCtx, agentCtx, cmd, order, a.receiveCommand(cmd))
 }
 
-// claimSnapshotCreate registers the receipt of a create_snapshot command in
-// receive order, before its goroutine starts, so that a delete_snapshot
-// command received right after it cancels the create even when the delete
-// goroutine runs first. It returns nil for every other command.
-func (a *Agent) claimSnapshotCreate(cmd *ownsandv1.AgentCommand) *sandboxes.SnapshotCreateClaim {
-	c, ok := cmd.GetCommand().(*ownsandv1.AgentCommand_CreateSnapshot)
-	if !ok {
-		return nil
-	}
-	return a.Sandboxes.ClaimSnapshotCreate(c.CreateSnapshot.GetSnapshotId())
+type commandReceipt struct {
+	snapshotCreate *sandboxes.SnapshotCreateClaim
+	snapshotDelete func() error
+	resumeDone     chan struct{}
 }
 
-// handleClaimedCommand is handleCommand for a command that dispatch already
-// registered: claim is the claim of a create_snapshot command, which this
-// function releases when the command ended. A create_snapshot command without
-// a claim takes its own.
-func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64, claim *sandboxes.SnapshotCreateClaim) {
-	if claim == nil {
-		claim = a.claimSnapshotCreate(cmd)
+// receiveCommand registers commands in channel receive order, before their workers start.
+func (a *Agent) receiveCommand(cmd *ownsandv1.AgentCommand) commandReceipt {
+	switch c := cmd.GetCommand().(type) {
+	case *ownsandv1.AgentCommand_CreateSnapshot:
+		return commandReceipt{snapshotCreate: a.Sandboxes.ClaimSnapshotCreate(c.CreateSnapshot.GetSnapshotId())}
+	case *ownsandv1.AgentCommand_DeleteSnapshot:
+		return commandReceipt{snapshotDelete: a.Sandboxes.ReceiveSnapshotDelete(c.DeleteSnapshot)}
+	case *ownsandv1.AgentCommand_ResumeSandbox:
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.resumes == nil {
+			a.resumes = make(map[string]chan struct{})
+		}
+		done := make(chan struct{})
+		a.resumes[cmd.GetCommandId()] = done
+		return commandReceipt{resumeDone: done}
+	default:
+		return commandReceipt{}
 	}
-	if claim != nil {
-		defer claim.Release()
+}
+
+func (a *Agent) handleReceivedCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64, receipt commandReceipt) {
+	if receipt.resumeDone != nil {
+		defer func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			delete(a.resumes, cmd.GetCommandId())
+			close(receipt.resumeDone)
+		}()
+	}
+	if receipt.snapshotCreate != nil {
+		defer receipt.snapshotCreate.Release()
 	}
 	kind := commandKind(cmd)
 	logger := a.logger.With("command_id", cmd.GetCommandId(), "command", kind)
@@ -144,9 +163,15 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 		var e *ownsandv1.SandboxStateEntry
 		e, err = a.Sandboxes.Resume(agentCtx, c.ResumeSandbox)
 		setSandboxResult(res, e)
+	case *ownsandv1.AgentCommand_FenceResume:
+		var result *ownsandv1.FenceResumeResult
+		result, err = a.fenceResume(chanCtx, c.FenceResume)
+		if result != nil {
+			res.Result = &ownsandv1.AgentCommandResult_FenceResume{FenceResume: result}
+		}
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
-		e, err = a.Sandboxes.CreateClaimedSnapshot(chanCtx, c.CreateSnapshot, claim)
+		e, err = a.Sandboxes.CreateClaimedSnapshot(chanCtx, c.CreateSnapshot, receipt.snapshotCreate)
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotResult{Snapshot: e}}
 		}
@@ -159,6 +184,9 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 	case *ownsandv1.AgentCommand_ImportSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
 		e, err = a.importSnapshot(chanCtx, c.ImportSnapshot)
+		if interruption := snapshotImportInterruption(err); interruption != nil {
+			err = interruption
+		}
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotResult{Snapshot: e}}
 		}
@@ -173,7 +201,7 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 	case *ownsandv1.AgentCommand_WithdrawAgentUpdate:
 		err = updateCommandError(a.updater.WithdrawOrdered(order))
 	case *ownsandv1.AgentCommand_DeleteSnapshot:
-		err = a.Sandboxes.DeleteSnapshot(c.DeleteSnapshot)
+		err = receipt.snapshotDelete()
 	default:
 		err = &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown command"}
 	}
@@ -188,6 +216,30 @@ func (a *Agent) handleClaimedCommand(chanCtx, agentCtx context.Context, cmd *own
 		// sandbox update.
 		logger.Warn("command result not sent")
 	}
+}
+
+// fenceResume waits for a received resume, including one from a closed channel.
+// The server sends each resume ID once. The reader registers it before it can
+// receive a fence on that stream. A replacement stream starts after the old
+// reader exits, so a resume that is absent here cannot arrive later.
+func (a *Agent) fenceResume(ctx context.Context, cmd *ownsandv1.FenceResumeCommand) (*ownsandv1.FenceResumeResult, error) {
+	a.mu.Lock()
+	done := a.resumes[cmd.GetResumeCommandId()]
+	a.mu.Unlock()
+	if done != nil {
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, Message: "the resume is still in progress"}
+		}
+	}
+	entry := a.Sandboxes.StateEntry(cmd.GetSandboxId())
+	if entry == nil {
+		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, Message: "sandbox is unknown on this device"}
+	}
+	return &ownsandv1.FenceResumeResult{ResumeCommandId: cmd.GetResumeCommandId(), Sandbox: entry}, nil
 }
 
 func setSandboxResult(res *ownsandv1.AgentCommandResult, e *ownsandv1.SandboxStateEntry) {
@@ -231,6 +283,19 @@ func (a *Agent) exportSnapshot(ctx context.Context, cmd *ownsandv1.ExportSnapsho
 	}
 	a.logger.Info("snapshot exported", "snapshot_id", cmd.GetSnapshotId(), "part_count", len(parts), "size_bytes", size)
 	return &ownsandv1.ExportSnapshotResult{Parts: parts, SizeBytes: size}, nil
+}
+
+// snapshotImportInterruption reports the context status without exposing
+// details from wrapped transfer errors.
+func snapshotImportInterruption(err error) *sandboxes.CommandError {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_CANCELED, Message: "snapshot import canceled"}
+	case errors.Is(err, context.DeadlineExceeded):
+		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DEADLINE_EXCEEDED, Message: "snapshot import deadline exceeded"}
+	default:
+		return nil
+	}
 }
 
 // importSnapshot downloads, verifies and publishes a snapshot copy. Imports
@@ -329,6 +394,10 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 		return nil, fmt.Errorf("remove stale snapshot import: %w", err)
 	}
 	if err := a.transfer.Import(ctx, snapshotID, cmd.GetParts(), filepath.Join(dir, "content")); err != nil {
+		if interruption := snapshotImportInterruption(err); interruption != nil {
+			a.logger.Warn("snapshot import interrupted during transfer", "snapshot_id", snapshotID, "error", interruption)
+			return nil, err
+		}
 		a.logger.Error("snapshot import failed", "snapshot_id", snapshotID, "error", err)
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS, Message: "snapshot import failed its download or hash check"}
 	}
@@ -337,7 +406,11 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	}
 	e, err := a.Sandboxes.AddImportedSnapshot(ctx, entry)
 	if err != nil {
-		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", err)
+		loggedErr := err
+		if interruption := snapshotImportInterruption(err); interruption != nil {
+			loggedErr = interruption
+		}
+		a.logger.Warn("snapshot import stopped before publication", "snapshot_id", snapshotID, "error", loggedErr)
 		return nil, err
 	}
 	published = true

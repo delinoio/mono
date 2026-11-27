@@ -9,6 +9,7 @@
     "dev": "rsbuild dev",
     "preview": "rsbuild preview",
     "tauri": "node tauri.mjs",
+    "test": "node --test tauri.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

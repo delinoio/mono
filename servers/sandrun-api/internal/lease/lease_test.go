@@ -191,6 +191,11 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 		renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
 	b := &Lease{DB: database, InstanceID: "b", Logger: logger}
 
+	type acquisitionResult struct {
+		held bool
+		err  error
+	}
+	firstAcquisition := make(chan acquisitionResult, 1)
 	var calls atomic.Int32
 	blocked := make(chan struct{})
 	unblock := make(chan struct{})
@@ -198,7 +203,9 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	a.renew = func(ctx context.Context) (bool, error) {
 		switch calls.Add(1) {
 		case 1:
-			return a.TryAcquire(ctx)
+			held, err := a.TryAcquire(ctx)
+			firstAcquisition <- acquisitionResult{held: held, err: err}
+			return held, err
 		case 2:
 			// A renewal that does not return and ignores its context.
 			close(blocked)
@@ -214,17 +221,31 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); a.Run(ctx) }()
 	var once sync.Once
 	release := func() { once.Do(func() { close(unblock) }) }
 	t.Cleanup(func() {
-		release()
 		cancel()
+		release()
 		<-done
 	})
 
-	if err := a.Wait(ctx); err != nil {
-		t.Fatal(err)
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelStartup()
+	go func() { defer close(done); a.Run(ctx) }()
+
+	select {
+	case result := <-firstAcquisition:
+		if result.err != nil {
+			t.Fatalf("first lease acquisition failed: %v", result.err)
+		}
+		if !result.held {
+			t.Fatal("first lease acquisition was refused")
+		}
+	case <-startupCtx.Done():
+		t.Fatalf("timed out waiting for the first lease acquisition: %v", startupCtx.Err())
+	}
+	if err := a.Wait(startupCtx); err != nil {
+		t.Fatalf("timed out waiting for local lease ownership: %v", err)
 	}
 	<-blocked
 	if !a.Held() {
@@ -337,8 +358,7 @@ func TestWaitRechecksOwnershipAfterWake(t *testing.T) {
 // the full I/O timeout.
 func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
 	l, lost := newTestLease()
-	expireAt := time.Now().Add(200 * time.Millisecond)
-	var deadline time.Time
+	var expireAt, deadline time.Time
 	var hasDeadline bool
 	started := make(chan struct{})
 	returned := make(chan time.Time, 1)
@@ -356,9 +376,24 @@ func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
 	applied := make(chan struct{})
 	go func() {
 		defer close(applied)
+		expireAt = time.Now().Add(200 * time.Millisecond)
 		l.applyRenewal(0, true, "", expireAt)
 	}()
-	<-started
+	var startupFailure string
+	select {
+	case <-started:
+	case <-applied:
+		startupFailure = "applyRenewal returned before the acquisition callback started"
+	case <-time.After(2 * time.Second):
+		startupFailure = "acquisition callback did not start within two seconds"
+	}
+	// The callback can start and return before this goroutine runs. Receiving
+	// from started also publishes expireAt and the callback's deadline.
+	select {
+	case <-started:
+	default:
+		t.Fatal(startupFailure)
+	}
 	// The context is a timeout of the remaining time, so its deadline can
 	// differ from the expiry by the time that the call took.
 	if !hasDeadline || deadline.Sub(expireAt) > 50*time.Millisecond {
@@ -431,6 +466,7 @@ func TestLeaseReleaseDrain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); a.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
 	if err := a.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}

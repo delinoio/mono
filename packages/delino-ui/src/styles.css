@@ -900,6 +900,7 @@
     bottom: 0;
     z-index: calc(100 - var(--toast-index));
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 12px;
     box-sizing: border-box;
@@ -976,15 +977,13 @@
 
   .dui-toast-text {
     display: grid;
-    flex: 1;
+    /* Reserve a readable line before deciding which controls fit beside it. */
+    flex: 1 1 min(10ch, 100%);
     gap: 2px;
     min-width: 0;
   }
 
-  /* `.dui-toast` hides overflow, so a long unbroken token (an email address or
-     a URL) in the title or description would be clipped. `anywhere` breaks it
-     at the toast width. Unlike `break-word`, it also lowers the min-content
-     size, so the text column and the action button still fit. */
+  /* Break unbroken text within the message column to avoid clipping it. */
   .dui-toast-title {
     font-size: 15px;
     font-weight: 600;
@@ -1004,7 +1003,11 @@
   .dui-toast-button {
     flex: none;
     width: auto;
+    max-inline-size: 100%;
     height: auto;
+    padding-block: 6px;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .dui-toast-button::before {
@@ -1249,6 +1252,19 @@
 
   .dui-collapsible-panel:is([data-starting-style], [data-ending-style]) {
     height: 0;
+  }
+
+  /* Keep the focus outline inside the button where the panel clips overflow. */
+  .dui-collapsible-panel[data-open] .dui-button:focus-visible {
+    outline-offset: -2px;
+  }
+
+  .dui-collapsible-panel[data-open]
+    .dui-button:where(
+      [data-variant="primary"],
+      [data-variant="danger"]
+    ):focus-visible {
+    outline-color: var(--dui-color-on-accent);
   }
 
   /* Popover. Triggers and close buttons use the button rules. */
@@ -2021,6 +2037,10 @@
      so every cue pairs a fill or a border with the idle state instead of
      relying on one fixed color. */
   @media (forced-colors: active) {
+    .dui-collapsible-panel[data-open] .dui-button:focus-visible {
+      outline-color: ButtonText;
+    }
+
     /* SegmentedControl: forced colors remove the inset shadow. Draw a
        Highlight border for selection and an offset CanvasText outline for
        keyboard focus. */
