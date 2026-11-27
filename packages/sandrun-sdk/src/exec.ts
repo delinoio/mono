@@ -123,8 +123,8 @@ export interface ExecHelperOptions {
  *   helper continues with `AttachDevSessionExec` from the next stdout and
  *   stderr offsets. A clean end continues at once. Failures wait with
  *   exponential backoff from 1 second to 30 seconds. The first start event
- *   resets the backoff and yields Started. Replayed starts and keepalives
- *   do neither.
+ *   resets the backoff and yields Started. New output and truncation that
+ *   advances either offset also reset the backoff.
  * - It yields output in order and without duplicates, and reports output
  *   that it never received as `OutputLost`.
  * - After it delivers a terminal event, it closes the active stream. If
@@ -295,10 +295,17 @@ export async function* execDevSession(
         }
         const event = message.event.event;
         anyEvent = true;
-        if (event.case !== "started" || !started) {
-          progressed = true;
-        }
+        const wasStarted: boolean = started;
+        const previousStdoutOffset = stdoutOffset;
+        const previousStderrOffset = stderrOffset;
         yield* handle(event);
+        // Keep the existing retry behavior for unknown events and terminal cleanup errors.
+        progressed ||=
+          terminalDelivered ||
+          event.case === undefined ||
+          started !== wasStarted ||
+          stdoutOffset !== previousStdoutOffset ||
+          stderrOffset !== previousStderrOffset;
         if (terminalDelivered || abortedBy(signal)) {
           return;
         }

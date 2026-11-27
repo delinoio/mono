@@ -69,7 +69,7 @@ This contract owns the SandRun command-line interface, component `sandrun-cli`, 
 `sandrun mcp` serves the Model Context Protocol over standard input and output for one coding agent. The agent's MCP configuration starts it, for example `sandrun mcp --org <organization-id> --pass-env NPM_TOKEN`. It has no network listener.
 
 - The server uses `SANDRUN_API_KEY` when set. Otherwise, it looks up stored Logto tokens on each tool call that needs a client until initialization succeeds. Without a usable credential, the tool returns an error that tells the user to run `sandrun login` or set `SANDRUN_API_KEY`. Running `sandrun login` lets the next call use the stored tokens without a server restart. The server reuses the client after initialization and refreshes its Logto access token as the CLI does.
-- `--pass-env NAME` (repeatable) names local environment variables that the server adds to every `exec` call. The server reads their values from its own environment when it runs the command, so the values never pass through the agent's model context. A tool call cannot add names to this list. When a named variable is not set, the server leaves it out and reports its name, without a value, in the tool result.
+- Use `--pass-env NAME` once for each local environment variable to pass to every `exec` command. The MCP server reads the configured values from its own environment when `exec` runs and sends them to the guest. A tool call cannot add names to this list. The server omits unset variables from the guest request and lists only their names in the `exec` result's `missing_env` field. The server omits passed values from result metadata. Both `exec` and `exec_output` return guest stdout and stderr, which can expose the passed values.
 - Standard output carries only MCP messages. Logs go to standard error.
 - Dev sessions do not depend on the server process. When it exits, its dev sessions stay until they are deleted or their TTL ends; `list_sessions` finds them again.
 - Tool waits: a tool call waits at most 50 seconds. OpenAI Codex stops an MCP tool call after 60 seconds by default (`tool_timeout_sec`), so 50 seconds leaves time for the response. The `wait_seconds` arguments accept 0 to 50, with a default of 50.
@@ -108,7 +108,7 @@ Only the stored Logto tokens and the selected organization in the user configura
 - The CLI sends tokens only to the configured API origin and the Logto tenant.
 - The CLI never prints a stored token or a credential, except the new secret of `sandrun api-key create` once.
 - The CLI never accepts a personal API key as a command-line argument; it reads `SANDRUN_API_KEY` from the environment.
-- The MCP server never returns token, API key or `--pass-env` values in tool results.
+- The MCP server omits tokens, API keys and `--pass-env` values from the metadata it adds to tool results. For `--pass-env`, `exec` reads values from the server environment and reports only the names of unset variables in `missing_env`. Both `exec` and `exec_output` return captured guest stdout and stderr to the agent. Treat guest output as potentially sensitive because a command can print the values passed to it.
 
 ## Logging
 
@@ -121,7 +121,8 @@ Only the stored Logto tokens and the selected organization in the user configura
 - Tests cover argument parsing, credential input from standard input and files, `SANDRUN_API_KEY` precedence, output formats and error exit codes against a fake `sandrun-api`. The session tests cover a create wait deadline before the first read, a permanent error on the first or a later poll, caller cancellation, and a standalone wait deadline before the first read.
 - Exec JSON tests cover UTF-8 split across contiguous chunks, offsets for both streams, replacement before truncation or a final result, and attach after an interrupt with pending bytes. The fake guest tests also check that text mode preserves the original bytes.
 - Refresh rotation tests use two token sources over one credential store and a fake Logto issuer. They cover adopting a valid access token without an issuer request, refreshing with the stored token, discarding a stale response, and recovering from `invalid_grant` when publication precedes or follows the rejection. They also cover the unchanged store, cancellation, sign-out, session replacement and the three-request limit.
-- MCP server tests against a fake `sandrun-api`: the tool list and schemas, the 50-second wait limit, `exec` with a command that ends within the wait and one that does not, `exec_output` from offsets with omitted ranges, `--pass-env` values that never appear in tool results, sync and download through `transfer_status`, and error mapping.
+- MCP server tests against a fake `sandrun-api`: the tool list and schemas, the 50-second wait limit, `exec` with a command that ends within the wait and one that does not, `exec_output` from offsets with omitted ranges, sync and download through `transfer_status`, and error mapping.
+- The `--pass-env` fixture checks that `exec` uses the server's environment lookup for configured names, forwards set values to the guest, and reports only the unset name in `missing_env`. The guest emits fixed status text. The fixture verifies that the configured value is absent from the `exec` result and the tool list.
 
 ## Dependencies and Integrations
 

@@ -46,6 +46,10 @@ const err = (offset: number, data: string): EventInit => ({
   case: "stderr",
   value: { offset: BigInt(offset), data: text.encode(data) },
 });
+const truncated = (stdoutOffset: bigint, stderrOffset: bigint): EventInit => ({
+  case: "outputTruncated",
+  value: { stdoutOffset, stderrOffset },
+});
 const started: EventInit = { case: "started", value: { execId: "x" } };
 const keepalive: EventInit = { case: "keepalive", value: {} };
 const exited = (code: number): EventInit => ({
@@ -651,6 +655,148 @@ describe("exec helper", () => {
     expect(execs).toHaveLength(1);
     expect(attachRequests).toHaveLength(1);
   });
+
+  test.each([out(0, ""), err(0, ""), truncated(0n, 0n)])(
+    "surfaces attach NotFound after a non-progressing $case event",
+    async (event) => {
+      const unavailable = new ConnectError(
+        "relay restarting",
+        Code.Unavailable,
+      );
+      const notFound = new ConnectError("unknown exec", Code.NotFound);
+      const { server } = execServer([unavailable], [[event, notFound]]);
+      const clock = new RecordingClock();
+
+      await expect(
+        client(server.fetch, clock).runDevSessionExec(execInput),
+      ).rejects.toMatchObject({
+        code: Code.NotFound,
+        rawMessage: "unknown exec",
+      });
+      expect(clock.sleeps).toEqual([1_000]);
+    },
+  );
+
+  test.each([
+    {
+      name: "two replayed output chunks",
+      replays: [out(0, "abc"), err(0, "XY")],
+    },
+    {
+      name: "replayed output through the cap",
+      replays: [
+        out(0, "abc"),
+        err(0, "XY"),
+        out(0, "ab"),
+        err(1, "Y"),
+        out(3, ""),
+        err(0, "XY"),
+      ],
+    },
+    {
+      name: "no-op truncation through the cap",
+      replays: [
+        truncated(3n, 2n),
+        truncated(1n, 0n),
+        truncated(3n, 1n),
+        truncated(0n, 2n),
+        truncated(2n, 1n),
+        truncated(0n, 0n),
+      ],
+    },
+  ])("preserves backoff after $name", async ({ replays }) => {
+    const unavailable = new ConnectError("relay restarting", Code.Unavailable);
+    const { server, execs, attachRequests } = execServer(
+      [started, out(0, "abc"), err(0, "XY"), unavailable],
+      [...replays.map((event) => [event, unavailable]), [exited(0)]],
+    );
+    const clock = new RecordingClock();
+    const events: string[] = [];
+    for await (const event of client(server.fetch, clock).execDevSession(
+      execInput,
+    )) {
+      events.push(describeEvent(event));
+    }
+
+    const attachCount = replays.length + 1;
+    expect(clock.sleeps).toEqual(
+      [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000].slice(
+        0,
+        attachCount,
+      ),
+    );
+    expect(events).toEqual([
+      "started",
+      "stdout 0 abc",
+      "stderr 0 XY",
+      ...Array.from({ length: attachCount }, () => "reattach 3 2"),
+      "exited 0",
+    ]);
+    expect(execs).toHaveLength(1);
+    expect(attachRequests).toHaveLength(attachCount);
+    for (const request of attachRequests) {
+      expect(request).toMatchObject({
+        execId: execs[0]!.execId,
+        stdoutOffset: 3n,
+        stderrOffset: 2n,
+      });
+    }
+  });
+
+  test.each([
+    {
+      name: "partially overlapping output",
+      event: out(2, "cd"),
+      delivered: "stdout 3 d",
+      stdoutOffset: 4n,
+    },
+    {
+      name: "advancing truncation",
+      event: truncated(5n, 1n),
+      delivered: "lost stdout 3-5",
+      stdoutOffset: 5n,
+    },
+  ])(
+    "resets backoff after $name",
+    async ({ event, delivered, stdoutOffset }) => {
+      const unavailable = new ConnectError(
+        "relay restarting",
+        Code.Unavailable,
+      );
+      const { server, execs, attachRequests } = execServer(
+        [started, out(0, "abc"), err(0, "XY"), unavailable],
+        [[out(0, "abc"), unavailable], [event, unavailable], [exited(0)]],
+      );
+      const clock = new RecordingClock();
+      const events: string[] = [];
+      for await (const event of client(server.fetch, clock).execDevSession(
+        execInput,
+      )) {
+        events.push(describeEvent(event));
+      }
+
+      expect(clock.sleeps).toEqual([1_000, 2_000, 1_000]);
+      expect(events).toEqual([
+        "started",
+        "stdout 0 abc",
+        "stderr 0 XY",
+        "reattach 3 2",
+        "reattach 3 2",
+        delivered,
+        `reattach ${stdoutOffset} 2`,
+        "exited 0",
+      ]);
+      expect(execs).toHaveLength(1);
+      const execId = execs[0]!.execId;
+      expect(
+        attachRequests.map((r) => [r.execId, r.stdoutOffset, r.stderrOffset]),
+      ).toEqual([
+        [execId, 3n, 2n],
+        [execId, 3n, 2n],
+        [execId, stdoutOffset, 2n],
+      ]);
+    },
+  );
 
   test("backs off to the cap after replayed starts", async () => {
     const unavailable = new ConnectError("relay restarting", Code.Unavailable);
