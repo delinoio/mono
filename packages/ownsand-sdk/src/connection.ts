@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
+import { isMessage, type Message } from "@bufbuild/protobuf";
 import {
   Code,
   ConnectError,
+  type ContextValues,
+  createContextValues,
   type Interceptor,
   type Transport,
 } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
+import {
+  AttachExecResponseSchema,
+  ExecResponseSchema,
+  ReadFileResponseSchema,
+  RelayService,
+} from "@delino/ownsand-protos/v1/relay_pb";
 import {
   OwnSandConfigError,
   OwnSandCredentialError,
@@ -148,12 +157,13 @@ export interface ConnectionOptions {
  * not set, reports byte activity and redacts the credential from errors.
  */
 export function createApiTransport(options: ConnectionOptions): Transport {
+  const relayCallerSignals = new WeakMap<ContextValues, AbortSignal>();
   const transport = createConnectTransport({
     baseUrl: options.origin,
     useBinaryFormat: true,
     fetch: guardedFetch(options),
     interceptors: [
-      loggingInterceptor(options),
+      loggingInterceptor(options, relayCallerSignals),
       redactingInterceptor(options),
       organizationInterceptor(options.organizationId),
       credentialInterceptor(options),
@@ -161,8 +171,40 @@ export function createApiTransport(options: ConnectionOptions): Transport {
   });
   return {
     unary: transport.unary,
-    stream(...args) {
-      const opening = transport.stream(...args);
+    stream(method, signal, timeoutMs, header, input, contextValues) {
+      let callContext = contextValues;
+      if (
+        options.logger !== undefined &&
+        method.parent === RelayService &&
+        signal !== undefined
+      ) {
+        // Connect gives interceptors a linked signal. Keep the original signal
+        // per call so the logger can recognize an explicit caller abort. Use a
+        // distinct context identity even if callers reuse their context values.
+        callContext =
+          contextValues === undefined
+            ? createContextValues()
+            : {
+                get: contextValues.get.bind(contextValues),
+                set(key, value) {
+                  contextValues.set(key, value);
+                  return this;
+                },
+                delete(key) {
+                  contextValues.delete(key);
+                  return this;
+                },
+              };
+        relayCallerSignals.set(callContext, signal);
+      }
+      const opening = transport.stream(
+        method,
+        signal,
+        timeoutMs,
+        header,
+        input,
+        callContext,
+      );
       // Connect starts the call now and first awaits it when the caller reads.
       // Handle an early rejection while keeping it on the original promise.
       void opening.catch(() => {});
@@ -410,6 +452,20 @@ function redactingInterceptor(options: ConnectionOptions): Interceptor {
   return (next) => (req) => redactCall(next, req, secrets());
 }
 
+function isRelayTerminal(message: Message): boolean {
+  if (isMessage(message, ReadFileResponseSchema)) {
+    return message.event?.event.case === "end";
+  }
+  if (
+    isMessage(message, ExecResponseSchema) ||
+    isMessage(message, AttachExecResponseSchema)
+  ) {
+    const event = message.event?.event.case;
+    return event === "exited" || event === "failed" || event === "sandboxEnded";
+  }
+  return false;
+}
+
 /**
  * Logs one `rpc` record per call with its terminal outcome. A unary call is
  * recorded when the response arrives or the call fails. A server-streaming
@@ -420,7 +476,10 @@ function redactingInterceptor(options: ConnectionOptions): Interceptor {
  * iterates records nothing after it opens. The record never carries stream
  * content.
  */
-function loggingInterceptor(options: ConnectionOptions): Interceptor {
+function loggingInterceptor(
+  options: ConnectionOptions,
+  relayCallerSignals: WeakMap<ContextValues, AbortSignal>,
+): Interceptor {
   return (next) => async (req) => {
     const logger = options.logger;
     if (logger === undefined) {
@@ -458,24 +517,31 @@ function loggingInterceptor(options: ConnectionOptions): Interceptor {
     return {
       ...res,
       message: (async function* () {
-        // Connect does not forward return() of an abandoned stream down the
-        // interceptor chain. It ends the call, which aborts the request
-        // signal, and then drains this iterator until it completes. The
-        // signal is still live when the stream ends by itself, because
-        // Connect ends the call only after the last read returns. An
-        // aborted signal at completion therefore means the consumer or the
-        // caller ended the stream first, except when the relay layer closed
-        // the stream after its terminal event: it then aborts with
-        // RelayStreamCompletedError, the call completed and the consumer
-        // only stopped reading. Connect surfaces that abort as a canceled
-        // error of the drained iterator, which is the abort's effect and not
-        // a failure of the call.
-        const closedAfterTerminal = (): boolean =>
-          req.signal.aborted &&
-          req.signal.reason instanceof RelayStreamCompletedError;
+        const callerSignal = relayCallerSignals.get(req.contextValues);
+        let terminalYielded = false;
+        // Connect handles iterator return() by aborting with its default
+        // AbortError and draining the interceptor chain. Caller aborts carry
+        // the original reason, and timeouts carry a Connect error. The sandbox
+        // helpers use their own completion reason when they stop at a terminal.
+        const closedAfterTerminal = (): boolean => {
+          const reason = req.signal.reason;
+          return (
+            reason instanceof RelayStreamCompletedError ||
+            (terminalYielded &&
+              reason instanceof DOMException &&
+              reason.name === "AbortError" &&
+              reason !== callerSignal?.reason)
+          );
+        };
         let outcome = Code[Code.Canceled];
         try {
-          yield* inner;
+          for await (const message of inner) {
+            terminalYielded =
+              !req.signal.aborted &&
+              req.service === RelayService &&
+              isRelayTerminal(message);
+            yield message;
+          }
           outcome =
             !req.signal.aborted || closedAfterTerminal()
               ? "ok"
