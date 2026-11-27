@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"runtime"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -51,6 +52,98 @@ func lockEnrollment(t *testing.T, s *Store) func() {
 		t.Fatal(err)
 	}
 	return unlock
+}
+
+func TestEnrollmentLockRejectsEndedContext(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	expired, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	for _, ctx := range []context.Context{canceled, expired} {
+		t.Run(ctx.Err().Error(), func(t *testing.T) {
+			unlock, err := s.LockEnrollment(ctx)
+			if unlock != nil {
+				unlock()
+				t.Fatal("acquired the lock with an ended context")
+			}
+			if !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, ctx.Err()) {
+				t.Fatalf("lock error = %v, want ErrEnrollmentBusy and %v", err, ctx.Err())
+			}
+			lockEnrollment(t, s)()
+		})
+	}
+}
+
+func TestEnrollmentLockReleasesAcquisitionAfterCancellation(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	releaseHolder := lockEnrollment(t, s)
+	defer releaseHolder()
+	f, err := openEnrollmentLock(s.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	attempts := 0
+	err = waitEnrollmentLock(ctx, f, func(f *os.File) (bool, error) {
+		ok, err := tryLockFile(f)
+		attempts++
+		if attempts == 1 {
+			if ok || err != nil {
+				t.Fatalf("first attempt = (%t, %v), want contention", ok, err)
+			}
+			releaseHolder()
+		} else {
+			if !ok || err != nil {
+				t.Fatalf("retry = (%t, %v), want acquisition", ok, err)
+			}
+			cancel()
+		}
+		return ok, err
+	})
+	if attempts != 2 || !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("lock after %d attempts = %v, want ErrEnrollmentBusy and Canceled after two attempts", attempts, err)
+	}
+	// The descriptor is still open, so this also verifies the explicit unlock.
+	lockEnrollment(t, s)()
+}
+
+// deadlineBeforeSignal models a context whose timer has not reported expiry yet.
+type deadlineBeforeSignal struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c deadlineBeforeSignal) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func TestEnrollmentLockChecksDeadlineBeforeRetry(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	releaseHolder := lockEnrollment(t, s)
+	defer releaseHolder()
+	f, err := openEnrollmentLock(s.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx := deadlineBeforeSignal{t.Context(), time.Now().Add(enrollmentLockPoll / 2)}
+		attempts := 0
+		err := waitEnrollmentLock(ctx, f, func(f *os.File) (bool, error) {
+			attempts++
+			if attempts != 1 {
+				t.Fatal("retried after the deadline")
+			}
+			ok, err := tryLockFile(f)
+			releaseHolder()
+			return ok, err
+		})
+		if attempts != 1 || !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("lock after %d attempts = %v, want ErrEnrollmentBusy and DeadlineExceeded after one attempt", attempts, err)
+		}
+	})
 }
 
 // TestEnrollmentLockExcludesOtherStores checks that the lock excludes

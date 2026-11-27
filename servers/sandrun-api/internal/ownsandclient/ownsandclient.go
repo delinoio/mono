@@ -110,15 +110,25 @@ func (s *sdkClient) ListDevices(ctx context.Context) ([]*ownsandv1.Device, error
 }
 
 func (s *sdkClient) TemplateGuestOS(ctx context.Context, templateID string) (ownsandv1.GuestOs, error) {
+	return s.templateGuestOS(ctx, templateID, nil)
+}
+
+func (s *sdkClient) templateGuestOS(ctx context.Context, templateID string, observe func(rpc string, err error)) (ownsandv1.GuestOs, error) {
 	token := ""
 	for {
 		res, err := s.c.Snapshots().ListTemplates(ctx, &ownsandv1.ListTemplatesRequest{OrganizationId: s.org, PageSize: 200, PageToken: token})
+		if observe != nil {
+			observe("ListTemplates", err)
+		}
 		if err != nil {
 			return 0, err
 		}
 		for _, t := range res.GetTemplates() {
 			if t.GetTemplateId() == templateID {
 				snap, err := s.c.Snapshots().Get(ctx, &ownsandv1.GetSnapshotRequest{OrganizationId: s.org, SnapshotId: t.GetSnapshotId()})
+				if observe != nil {
+					observe("GetSnapshot", err)
+				}
 				if err != nil {
 					return 0, err
 				}
@@ -207,9 +217,8 @@ func Code(err error) string {
 	return connect.CodeOf(err).String()
 }
 
-// Instrumented wraps a client: it counts and logs every call, and calls
-// OnUnauthenticated when OwnSand rejects the key, so the link layer marks the
-// link INVALID.
+// Instrumented records OwnSand metrics and logs. It calls OnUnauthenticated
+// when OwnSand rejects the key, so the link layer marks the link INVALID.
 type Instrumented struct {
 	Inner   Client
 	Metrics *metrics.Metrics
@@ -224,6 +233,10 @@ type Instrumented struct {
 func (c *Instrumented) Observe(ctx context.Context, rpc string, start time.Time, err error, attrs ...slog.Attr) {
 	code := Code(err)
 	c.Metrics.OwnSandCall(rpc, code)
+	c.logAndInvalidate(ctx, rpc, start, err, code, attrs...)
+}
+
+func (c *Instrumented) logAndInvalidate(ctx context.Context, rpc string, start time.Time, err error, code string, attrs ...slog.Attr) {
 	all := append([]slog.Attr{
 		slog.String("rpc", rpc), slog.String("code", code), slog.String("organization_id", c.OrganizationID),
 		slog.Int64("duration_ms", time.Since(start).Milliseconds()),
@@ -247,8 +260,17 @@ func (c *Instrumented) ListDevices(ctx context.Context) ([]*ownsandv1.Device, er
 
 func (c *Instrumented) TemplateGuestOS(ctx context.Context, templateID string) (ownsandv1.GuestOs, error) {
 	start := time.Now()
-	g, err := c.Inner.TemplateGuestOS(ctx, templateID)
-	c.Observe(ctx, "ListTemplates", start, err, slog.String("ownsand_template_id", templateID))
+	var g ownsandv1.GuestOs
+	var err error
+	if sdk, ok := c.Inner.(*sdkClient); ok {
+		g, err = sdk.templateGuestOS(ctx, templateID, func(rpc string, err error) {
+			c.Metrics.OwnSandCall(rpc, Code(err))
+		})
+	} else {
+		g, err = c.Inner.TemplateGuestOS(ctx, templateID)
+	}
+	// Keep one log and at most one key invalidation for the complete lookup.
+	c.logAndInvalidate(ctx, "ListTemplates", start, err, Code(err), slog.String("ownsand_template_id", templateID))
 	return g, err
 }
 

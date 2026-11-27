@@ -166,10 +166,12 @@ type outpostPage struct {
 // queue by outpost ID only.
 func (v *Vendor) outpostID(ctx context.Context, c *vendorhttp.Client, name string) (string, error) {
 	cursor := ""
+	usedCursors := make(map[string]struct{})
 	for {
 		q := url.Values{}
 		if cursor != "" {
 			q.Set("cursor", cursor)
+			usedCursors[cursor] = struct{}{}
 		}
 		var page outpostPage
 		if err := c.Do(ctx, "list_outposts", http.MethodGet, "/opbeta/outposts", q, nil, &page); err != nil {
@@ -180,7 +182,8 @@ func (v *Vendor) outpostID(ctx context.Context, c *vendorhttp.Client, name strin
 				return o.Metadata.OutpostID, nil
 			}
 		}
-		if !page.HasNextPage || page.Cursor == "" || page.Cursor == cursor {
+		_, used := usedCursors[page.Cursor]
+		if !page.HasNextPage || page.Cursor == "" || used {
 			return "", fmt.Errorf("no Devin outpost is named %q", name)
 		}
 		cursor = page.Cursor
@@ -204,17 +207,20 @@ func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch) error {
 		return err
 	}
 	cursor := ""
+	usedCursors := make(map[string]struct{})
 	listedPending := make(map[string]struct{})
 	for {
 		q := url.Values{"outpost": {outpost}, "phase": {"pending"}, "first": {"200"}}
 		if cursor != "" {
 			q.Set("cursor", cursor)
+			usedCursors[cursor] = struct{}{}
 		}
 		var page entryPage
 		if err := c.Do(ctx, "list_queue", http.MethodGet, "/opbeta/outposts/devins", q, nil, &page); err != nil {
 			return err
 		}
-		stalled := page.HasNextPage && (page.Cursor == "" || page.Cursor == cursor)
+		_, used := usedCursors[page.Cursor]
+		stalled := page.HasNextPage && (page.Cursor == "" || used)
 		for i := range page.Items {
 			e := &page.Items[i]
 			if e.Status.Phase == "pending" && e.matchesOutpost(outpost) {
