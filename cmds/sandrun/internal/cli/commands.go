@@ -119,13 +119,23 @@ func parseDuration(flagName, s string) (time.Duration, error) {
 // readSecret reads a credential from the file of a --*-file flag or from
 // standard input, and removes one trailing line break. Credentials never
 // come from command-line arguments, which other local users can read.
-func (a *app) readSecret(file, what string) (string, error) {
+func (a *app) readSecret(file, what string, rejectOversizedStdin bool) (string, error) {
 	var b []byte
 	var err error
 	if file != "" {
 		b, err = os.ReadFile(file)
 	} else {
-		b, err = io.ReadAll(io.LimitReader(a.env.Stdin, 1<<20))
+		const limitMiB = 1
+		const limitBytes = limitMiB << 20
+		readLimit := int64(limitBytes)
+		if rejectOversizedStdin {
+			// One extra byte distinguishes overflow from an input at the limit.
+			readLimit++
+		}
+		b, err = io.ReadAll(io.LimitReader(a.env.Stdin, readLimit))
+		if len(b) > limitBytes {
+			return "", usageErr("standard input for %s exceeds the %d MiB limit", what, limitMiB)
+		}
 	}
 	if err != nil {
 		return "", fmt.Errorf("read the %s: %w", what, err)
@@ -409,7 +419,7 @@ func (a *app) ownsandLink(ctx context.Context, name string, args []string) error
 	if err != nil {
 		return err
 	}
-	key, err := a.readSecret(*keyFile, "OwnSand API key")
+	key, err := a.readSecret(*keyFile, "OwnSand API key", false)
 	if err != nil {
 		return err
 	}
@@ -610,7 +620,7 @@ func integrationSettings(v sandrunv1.AgentVendor, f *integrationFlags) any {
 // readIntegrationCredentials reads the vendor credentials message as JSON
 // with the protobuf field names, for example {"environment_key": "..."}.
 func (a *app) readIntegrationCredentials(v sandrunv1.AgentVendor, file string) (any, error) {
-	raw, err := a.readSecret(file, "integration credentials")
+	raw, err := a.readSecret(file, "integration credentials", true)
 	if err != nil {
 		return nil, err
 	}
