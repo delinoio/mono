@@ -21,12 +21,15 @@ import (
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/devsession"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/lease"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/profile"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/secrets"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/work"
 )
@@ -110,6 +113,122 @@ func TestWarmRunnersAndReclaim(t *testing.T) {
 	// Warm runners wait while a request is uncovered: no warm runner comes
 	// back while the pool is full.
 	stays(t, "no warm runner while full", func() bool { return w.fake.Active(w.osOrg) <= 2 })
+}
+
+func TestDispatchDemandAfterOwnSandLinkReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		kind   sandrunv1.WorkloadKind
+		source work.Source
+		pool   string
+	}{
+		{"binding demand", sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, work.SourceDevSession, ""},
+		{"pool demand", sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB, work.SourceGitHub, "123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			fake := ownsandfake.New()
+			factory := &dispatchLinkFactory{Fake: fake}
+			w := newWorkWorldWithProvider(t, devsession.Timing{}, fake, factory)
+			p := devProfileProto("demand", 0, 0)
+			p.WorkloadKind = tc.kind
+			if tc.pool != "" {
+				p.WorkspacePath = ""
+			}
+			profileID := w.createProfile(t, p)
+
+			// Stop the background dispatcher before enqueuing demand so each
+			// explicit pass can be checked before the next pass starts.
+			w.env.Stop()
+			database := w.env.DB
+			replacement, key := api.NewID(), ownsandKey('b')
+			fake.AddOrg(replacement, key)
+			ring, err := secrets.NewKeyring(w.env.SecretKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sealed, err := ring.Seal([]byte(key), secrets.AssociatedData("ownsand_link", w.org.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Ensure the pass has to build a client for its snapshot.
+			if _, err := database.Pool.Exec(ctx, "UPDATE ownsand_links SET credential_revision = $2 WHERE organization_id = $1", w.org.ID, api.NewID()); err != nil {
+				t.Fatal(err)
+			}
+			factory.afterNew = func() error {
+				// Install the replacement after the pass reads the old link,
+				// while keeping the request queued for the reservation check.
+				_, err := database.Pool.Exec(ctx, `UPDATE ownsand_links SET ownsand_organization_id = $2, credential_revision = $3, api_key_ciphertext = $4
+					WHERE organization_id = $1`, w.org.ID, replacement, api.NewID(), sealed.Ciphertext)
+				return err
+			}
+
+			storedProfile, err := w.l.Profiles.Get(ctx, database.Pool, w.org.ID, profileID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestID := api.NewID()
+			if err := database.InTx(ctx, func(tx pgx.Tx) error {
+				_, _, err := w.l.Engine.CreateRequest(ctx, tx, work.NewRequest{
+					Profile: storedProfile, Source: tc.source, PoolKey: tc.pool, RequestID: requestID, OwnerUserID: w.org.Owner,
+				})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			w.l.Engine.Pass(ctx, w.org.ID)
+			if factory.afterNew != nil {
+				t.Fatal("dispatcher did not load the old link client")
+			}
+			var runnerCount int
+			if err := database.Pool.QueryRow(ctx, "SELECT count(*) FROM runners WHERE organization_id = $1", w.org.ID).Scan(&runnerCount); err != nil {
+				t.Fatal(err)
+			}
+			if calls := fake.Calls("CreateSandbox"); runnerCount != 0 || calls != 0 {
+				t.Fatalf("stale link: %d runner rows, %d create calls", runnerCount, calls)
+			}
+			req, err := w.l.Engine.GetRequest(ctx, database.Pool, w.org.ID, requestID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.State != sandrunv1.RequestState_REQUEST_STATE_QUEUED || req.RunnerID != "" || req.StartAttempts != 0 {
+				t.Fatalf("stale link: state %s, runner %q, attempts %d", req.State, req.RunnerID, req.StartAttempts)
+			}
+
+			w.l.Engine.Pass(ctx, w.org.ID)
+			if calls, current := fake.Calls("CreateSandbox"), fake.Active(replacement); calls != 1 || current != 1 {
+				t.Fatalf("current link: %d total create calls, %d active sandboxes at replacement", calls, current)
+			}
+			var bound, sponsor, pool string
+			if err := database.Pool.QueryRow(ctx, `SELECT coalesce(request_id::text, ''), coalesce(sponsor_request_id::text, ''), coalesce(pool_key, '')
+				FROM runners WHERE organization_id = $1`, w.org.ID).Scan(&bound, &sponsor, &pool); err != nil {
+				t.Fatal(err)
+			}
+			if tc.pool == "" {
+				if bound != requestID || sponsor != "" || pool != "" {
+					t.Fatalf("binding reservation: bound %q, sponsor %q, pool %q", bound, sponsor, pool)
+				}
+			} else if bound != "" || sponsor != requestID || pool != tc.pool {
+				t.Fatalf("pool reservation: bound %q, sponsor %q, pool %q", bound, sponsor, pool)
+			}
+		})
+	}
+}
+
+type dispatchLinkFactory struct {
+	*ownsandfake.Fake
+	afterNew func() error
+}
+
+func (f *dispatchLinkFactory) New(orgID, key string) (ownsandclient.Client, error) {
+	client, err := f.Fake.New(orgID, key)
+	if err != nil || f.afterNew == nil {
+		return client, err
+	}
+	afterNew := f.afterNew
+	f.afterNew = nil
+	return client, afterNew()
 }
 
 func TestWarmReservationDuringProfileDeletion(t *testing.T) {
