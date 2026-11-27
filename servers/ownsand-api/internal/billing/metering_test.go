@@ -526,6 +526,7 @@ func TestReportStopsAfterTheLeaseIsLost(t *testing.T) {
 	held.Store(true)
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	releaseFirstRequest := sync.OnceFunc(func() { close(release) })
 	var calls atomic.Int32
 	accounts.beforeRequest = func() {
 		if calls.Add(1) == 1 {
@@ -535,19 +536,34 @@ func TestReportStopsAfterTheLeaseIsLost(t *testing.T) {
 	}
 	m := f.metering(client, func(o *billing.Options) { o.Held = held.Load })
 
-	errc := make(chan error, 1)
-	go func() { errc <- m.Report(ctx) }()
+	reportCtx, cancelReport := context.WithCancel(ctx)
+	reportDone := make(chan struct{})
+	var reportErr error
+	// Release the hook before the fake server's cleanup waits for its requests.
+	t.Cleanup(func() {
+		releaseFirstRequest()
+		cancelReport()
+		select {
+		case <-reportDone:
+		case <-time.After(10 * time.Second):
+			t.Error("Report did not return during cleanup")
+		}
+	})
+	go func() {
+		defer close(reportDone)
+		reportErr = m.Report(reportCtx)
+	}()
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the first batch RPC did not start")
 	}
 	held.Store(false)
-	close(release)
+	releaseFirstRequest()
 	select {
-	case err := <-errc:
-		if err != nil {
-			t.Fatalf("a pass that lost the lease must end without an error: %v", err)
+	case <-reportDone:
+		if reportErr != nil {
+			t.Fatalf("a pass that lost the lease must end without an error: %v", reportErr)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Report did not return")
