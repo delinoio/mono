@@ -250,6 +250,13 @@ func TestOfflineDeleteAndReconciliation(t *testing.T) {
 		t.Fatalf("offline delete: %v %v", del, err)
 	}
 
+	retry, err := callDeleteSandbox(ctx, env.User(org.Member), org.ID, idA)
+	if err != nil || retry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE ||
+		retry.GetLastKnownState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("offline delete retry: %v %v", retry, err)
+	}
+	waitForDeleteEvents(t, env, idA, 2)
+
 	// The agent lost sandbox B while offline (for example a host reboot) and
 	// still runs A: on reconnect, B fails with LOST_ON_DEVICE and A gets the
 	// pending delete.
@@ -264,6 +271,9 @@ func TestOfflineDeleteAndReconciliation(t *testing.T) {
 	sb = waitState(t, c, org.ID, idA, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
 	if sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatalf("A end reason = %v", sb.GetEndReason())
+	}
+	if got := len(deleteCommands(agent2, idA)); got != 1 {
+		t.Fatalf("delete commands on reconnect after the offline retry = %d, want 1", got)
 	}
 	sb = getSandbox(t, c, org.ID, idB)
 	if sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
