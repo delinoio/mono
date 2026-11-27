@@ -66,7 +66,7 @@ func (a *app) mcp(ctx context.Context, name string, args []string) error {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			client, err := a.sdk()
+			client, err := a.sdkWithTokenSource(a.mcpTokenSource)
 			return client, describeCredentialError(err)
 		},
 		OrganizationID: org,
@@ -82,6 +82,40 @@ func (a *app) mcp(ctx context.Context, name string, args []string) error {
 		return nil
 	}
 	return err
+}
+
+// mcpTokenSource lets the caller return on cancellation while a successful
+// refresh still holds the refresh gate through conditional publication.
+func (a *app) mcpTokenSource() (sandrun.TokenSource, error) {
+	source, err := a.tokenSource()
+	if err != nil {
+		return nil, err
+	}
+	type result struct {
+		token string
+		err   error
+	}
+	return func(ctx context.Context) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		done := make(chan result, 1)
+		go func() {
+			// Logto still uses the caller context. The buffered send lets
+			// the worker exit if the caller left during the store write.
+			token, err := source(ctx)
+			done <- result{token, err}
+		}()
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case r := <-done:
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			return r.token, r.err
+		}
+	}, nil
 }
 
 // describeCredentialError keeps a credential error readable for the agent.
