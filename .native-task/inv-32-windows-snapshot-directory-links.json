@@ -1,0 +1,42 @@
+{
+  "gid": "inv-32-windows-snapshot-directory-links",
+  "commit": "a4c4aa11105b27edb4596957e8f25da353724e91",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "a4c4aa11105b27edb4596957e8f25da353724e91",
+    "setup": "Run the first four commands from the exact revision in a disposable local checkout on delino-win-1. Run the last command separately on Windows with SeCreateSymbolicLinkPrivilege and repeat commands 1 through 3 first. Do not treat a skipped link test as acceptance.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'a4c4aa11105b27edb4596957e8f25da353724e91') { throw 'Unexpected validation revision' }",
+      "New-Item -ItemType Directory -Path '.t3-tmp' -Force | Out-Null",
+      "$env:TEMP = (Resolve-Path '.t3-tmp').Path; $env:TMP = $env:TEMP; $env:GOTMPDIR = $env:TEMP",
+      "go test -v '-count=1' '-run=^Test(RepairTarDirectoryLinksWithoutSymlinkPrivilege|ReadTarRejectsEscapes|ExportImportRoundTrip|ImportStopsWhenTheContextIsDone)$' ./internal/fsutil ./cmds/ownsand-agent/internal/snapxfer 2>&1 | Tee-Object -FilePath '.t3-tmp/windows-snapshot-unprivileged.log'; if ($LASTEXITCODE -ne 0) { throw 'Non-elevated Windows tests failed' }",
+      "go test -v '-count=1' '-run=^Test(ReadTarDirectoryLinksInEitherOrder|ReadTarRejectsChainedSymlinkEscape|ReadTarRejectsLinkThatLaterBecomesChained|ExportImportRoundTripWithForwardDirectoryLinks|ImportRejectsSymlinkEscape)$' ./internal/fsutil ./cmds/ownsand-agent/internal/snapxfer 2>&1 | Tee-Object -FilePath '.t3-tmp/windows-snapshot-symlinks.log'; if ($LASTEXITCODE -ne 0 -or (Select-String -Path '.t3-tmp/windows-snapshot-symlinks.log' -SimpleMatch '--- SKIP:')) { throw 'Windows symbolic-link acceptance failed or skipped' }"
+    ],
+    "expectedResults": [
+      "The non-elevated command exits zero. The repair fixture uses actual Windows filesystem attributes. It recreates the file-form stand-in, skips the directory-form stand-in, preserves the original on cancellation, rejects creation failure, and rejects a replacement that still lacks the directory attribute. The archive name and target checks, ordinary round trip, and canceled import also pass.",
+      "The symlink command exits zero with no skips. Direct and chained reads through real, relative directory symlinks return the original data after extraction and publication. Both tar orders pass. Regular-file and dangling links retain their expected behavior. The confinement fixtures preserve the extraction boundary."
+    ],
+    "files": {
+      "regressionTests": [
+        "internal/fsutil/tar_links_windows_test.go",
+        "internal/fsutil/fsutil_test.go",
+        "cmds/ownsand-agent/internal/snapxfer/snapxfer_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-snapshot-unprivileged.log",
+        ".t3-tmp/windows-snapshot-symlinks.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-snapshot-directory-links/worker/.t3-tmp/validation/ownsand-agent-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-snapshot-directory-links/worker/.t3-tmp/validation/fsutil.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-snapshot-directory-links/worker/.t3-tmp/validation/snapxfer.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-snapshot-directory-links/worker/.t3-tmp/validation/ownsand-agent-windows-arm64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-snapshot-directory-links/worker/.t3-tmp/validation/windows-arm64/fsutil.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-windows-snapshot-directory-links/worker/.t3-tmp/validation/windows-arm64/snapxfer.test.exe"
+      ]
+    }
+  }
+}
