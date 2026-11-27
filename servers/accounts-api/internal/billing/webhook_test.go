@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+	"github.com/delinoio/mono/servers/accounts-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle/paddletest"
@@ -266,13 +269,54 @@ func TestWebhookRefundAndChargeback(t *testing.T) {
 	// The approval removes the credit, and the balance becomes negative.
 	f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_1", "refund", "approved", "txn_buy", 1000))
 	f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_1", "refund", "approved", "txn_buy", 1000))
-	// Another adjustment cannot remove more than the purchase added.
-	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_2", "chargeback", "approved", "txn_buy", 1000))
-	f.wantLedger(acct,
-		wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
-		wantEntry{LedgerUsage, -4 * usd, 6 * usd},
-		wantEntry{LedgerRefund, -10 * usd, -4 * usd},
-	)
+
+	type chargebackRecord struct {
+		TransactionID   string
+		AmountUSDMicros int64
+		HasLedgerEntry  bool
+		CreateTime      time.Time
+	}
+	checkChargeback := func(delivery string) chargebackRecord {
+		t.Helper()
+		rows, err := f.db.Pool.Query(ctx(), `SELECT g.paddle_transaction_id, r.amount_usd_micros,
+			r.ledger_entry_id IS NOT NULL, r.create_time
+			FROM credit_refunds r JOIN credit_grants g USING (credit_grant_id)
+			WHERE r.paddle_adjustment_id = 'adj_2'`)
+		if err != nil {
+			t.Fatalf("%s: query chargeback: %v", delivery, err)
+		}
+		record, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[chargebackRecord])
+		if err != nil {
+			t.Fatalf("%s: expected exactly one chargeback record for adj_2: %v", delivery, err)
+		}
+		if record.TransactionID != "txn_buy" || record.AmountUSDMicros != 0 || record.HasLedgerEntry {
+			t.Fatalf("%s: chargeback record = %+v, want txn_buy, zero amount and no ledger entry", delivery, record)
+		}
+		return record
+	}
+	want := []wantEntry{
+		{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
+		{LedgerUsage, -4 * usd, 6 * usd},
+		{LedgerRefund, -10 * usd, -4 * usd},
+	}
+	// Record the chargeback even though the full refund leaves no credit to reverse.
+	chargeback := paddletest.Adjustment("adj_2", "chargeback", "approved", "txn_buy", 1000)
+	if got := f.webhookResult(paddle.EventAdjustmentCreated, chargeback); got != webhookApplied {
+		t.Fatalf("chargeback result = %q, want %q", got, webhookApplied)
+	}
+	first := checkChargeback("first delivery")
+	f.wantLedger(acct, want...)
+
+	// A fresh event exercises adjustment-ID deduplication.
+	f.clock.Advance(time.Second)
+	if got := f.webhookResult(paddle.EventAdjustmentCreated, chargeback); got != webhookIgnored {
+		t.Fatalf("chargeback replay result = %q, want %q", got, webhookIgnored)
+	}
+	replayed := checkChargeback("replay")
+	if !replayed.CreateTime.Equal(first.CreateTime) {
+		t.Fatalf("chargeback creation time after replay = %v, want %v", replayed.CreateTime, first.CreateTime)
+	}
+	f.wantLedger(acct, want...)
 	// An unknown transaction is unmatched and changes nothing.
 	if code := f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_3", "refund", "approved", "txn_unknown", 500)); code != http.StatusOK {
 		t.Fatal(code)
@@ -283,16 +327,46 @@ func TestWebhookFailedRenewalAndChargeFailure(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
+	paymentFailedCount := func() int {
+		t.Helper()
+		var count int
+		if err := f.db.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_notifications
+			WHERE billing_account_id = $1 AND kind = $2`, acct, NotifyPaymentFailed).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
 	failed := paddletest.Transaction(paddletest.TransactionData{
 		ID: "txn_renew", SubscriptionID: subID, Origin: paddle.OriginSubscriptionRecurring, PriceID: priceID,
 		SubtotalCents: 1000, Status: "past_due",
 	})
-	f.webhook(paddle.EventTransactionPaymentFailed, failed)
-	f.webhook(paddle.EventTransactionPaymentFailed, failed) // Paddle retries: one email per transaction
-	// A failed attempt inside the checkout sends nothing.
-	f.webhook(paddle.EventTransactionPaymentFailed, paddletest.Transaction(paddletest.TransactionData{
-		ID: "txn_checkout", Origin: paddle.OriginWeb, BillingAccountID: acct, PriceID: priceID, SubtotalCents: 1000,
-	}))
+	// Distinct events for the same renewal transaction queue one notification.
+	for attempt := range 2 {
+		if code := f.webhook(paddle.EventTransactionPaymentFailed, failed); code != http.StatusOK {
+			t.Fatalf("renewal delivery %d: status = %d, want %d", attempt+1, code, http.StatusOK)
+		}
+		if got := paymentFailedCount(); got != 1 {
+			t.Fatalf("renewal delivery %d: payment-failed notifications = %d, want 1", attempt+1, got)
+		}
+	}
+
+	// The recorded subscription would qualify these failures for renewal
+	// notifications if the handler did not check the checkout origin.
+	for _, origin := range []string{paddle.OriginWeb, paddle.OriginAPI} {
+		before := paymentFailedCount()
+		data := paddletest.Transaction(paddletest.TransactionData{
+			ID: "txn_checkout_" + origin, SubscriptionID: subID, Origin: origin, PriceID: priceID,
+			SubtotalCents: 1000, Status: "past_due",
+		})
+		if got := f.webhookResult(paddle.EventTransactionPaymentFailed, data); got != webhookIgnored {
+			t.Errorf("%s checkout: webhook result = %q, want %q", origin, got, webhookIgnored)
+		}
+		if got := paymentFailedCount(); got != before {
+			t.Errorf("%s checkout: payment-failed notifications = %d, want %d", origin, got, before)
+		}
+	}
+
 	if err := f.s.DeliverNotifications(ctx()); err != nil {
 		t.Fatal(err)
 	}
@@ -319,8 +393,11 @@ func TestWebhookFailedRenewalAndChargeFailure(t *testing.T) {
 		ID: "txn_charge", SubscriptionID: subID, Origin: paddle.OriginSubscriptionCharge,
 		TopUpID: paddletest.ChargeTopUpID(charge), SubtotalCents: 2500, Status: "past_due",
 	})
-	f.webhook(paddle.EventTransactionPaymentFailed, data)
-	f.webhook(paddle.EventTransactionPaymentFailed, data)
+	for attempt := range 2 {
+		if code := f.webhook(paddle.EventTransactionPaymentFailed, data); code != http.StatusOK {
+			t.Fatalf("one-time charge delivery %d: status = %d, want %d", attempt+1, code, http.StatusOK)
+		}
+	}
 	st, _ := loadSettings(ctx(), f.db.Pool, acct)
 	if st.ConsecutiveFailures != 1 {
 		t.Fatalf("failures %d, want 1", st.ConsecutiveFailures)
@@ -367,80 +444,71 @@ func emailsTo(f *fixture, addr string) int {
 	return n
 }
 
-// TestEmailDeliveryContinuesAfterRecipientFailure pins that one recipient
-// that keeps failing does not keep a later recipient from getting the
-// email, and that the notification is still abandoned after the retry
-// budget.
+// TestEmailDeliveryContinuesAfterRecipientFailure checks first-attempt
+// delivery to later recipients, retry deduplication, and abandonment.
 func TestEmailDeliveryContinuesAfterRecipientFailure(t *testing.T) {
-	f := newFixture(t)
-	acct := f.account()
-	// Recipients sort by user ID: "admin-N" comes before "owner-N".
-	var adminID, ownerID string
-	if err := f.db.Pool.QueryRow(ctx(), `SELECT
-		(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'admin'),
-		(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'owner')`,
-		acct).Scan(&adminID, &ownerID); err != nil {
-		t.Fatal(err)
-	}
-	if adminID >= ownerID {
-		t.Fatalf("admin %q must sort before owner %q", adminID, ownerID)
-	}
-	adminAddr, ownerAddr := adminID+"@example.com", ownerID+"@example.com"
-	f.grant(acct, LedgerManualTopUp, 25*usd)
-	f.deduct(acct, 20*usd)
-
-	// The first sorted recipient always fails, the second succeeds.
-	f.email.SetErrFor(adminAddr, errSendTest)
-	for i := 0; i < notificationMaxAttempts+2; i++ {
-		if err := f.s.DeliverNotifications(ctx()); err != nil {
+	setup := func(t *testing.T) (f *fixture, acct, adminAddr, ownerAddr string) {
+		t.Helper()
+		f = newFixture(t)
+		acct = f.account()
+		// Recipients sort by user ID: "admin-N" comes before "owner-N".
+		var adminID, ownerID string
+		if err := f.db.Pool.QueryRow(ctx(), `SELECT
+			(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'admin'),
+			(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'owner')`,
+			acct).Scan(&adminID, &ownerID); err != nil {
 			t.Fatal(err)
 		}
-		f.clock.Advance(time.Hour)
+		if adminID >= ownerID {
+			t.Fatalf("admin %q must sort before owner %q", adminID, ownerID)
+		}
+		adminAddr, ownerAddr = adminID+"@example.com", ownerID+"@example.com"
+		f.grant(acct, LedgerManualTopUp, 25*usd)
+		f.deduct(acct, 20*usd)
+		f.email.SetErrFor(adminAddr, errSendTest)
+		return f, acct, adminAddr, ownerAddr
 	}
-	if got := emailsTo(f, ownerAddr); got != 1 {
-		t.Fatalf("emails to the second recipient = %d, want exactly 1", got)
-	}
-	if got := emailsTo(f, adminAddr); got != 0 {
-		t.Fatalf("emails to the failing recipient = %d", got)
-	}
-	var attempts int
-	var abandoned bool
-	var delivered int
-	if err := f.db.Pool.QueryRow(ctx(), `SELECT n.attempts, n.abandon_time IS NOT NULL,
-			(SELECT count(*) FROM billing_notification_deliveries d WHERE d.notification_id = n.notification_id)
-		FROM billing_notifications n WHERE n.billing_account_id = $1 AND n.kind = $2`,
-		acct, string(NotifyLowBalance)).Scan(&attempts, &abandoned, &delivered); err != nil {
-		t.Fatal(err)
-	}
-	if attempts != notificationMaxAttempts || !abandoned || delivered != 1 {
-		t.Fatalf("attempts %d abandoned %v deliveries %d", attempts, abandoned, delivered)
+	deliverAndCheck := func(f *fixture, stage, adminAddr, ownerAddr string, wantAdmin int) {
+		f.t.Helper()
+		if err := f.s.DeliverNotifications(ctx()); err != nil {
+			f.t.Fatalf("%s: deliver notifications: %v", stage, err)
+		}
+		if admin, owner := emailsTo(f, adminAddr), emailsTo(f, ownerAddr); admin != wantAdmin || owner != 1 {
+			f.t.Fatalf("%s: email counts for admin/owner = %d/%d, want %d/1", stage, admin, owner, wantAdmin)
+		}
 	}
 
-	// A transient failure of the first recipient delivers to both after the
-	// retry, and the second recipient is not emailed twice.
-	acct2 := f.account()
-	var admin2 string
-	if err := f.db.Pool.QueryRow(ctx(), `SELECT user_id FROM billing_account_members
-		WHERE billing_account_id = $1 AND role = 'admin'`, acct2).Scan(&admin2); err != nil {
-		t.Fatal(err)
-	}
-	f.grant(acct2, LedgerManualTopUp, 25*usd)
-	f.deduct(acct2, 20*usd)
-	f.email.SetErrFor(admin2+"@example.com", errSendTest)
-	if err := f.s.DeliverNotifications(ctx()); err != nil {
-		t.Fatal(err)
-	}
-	f.email.SetErrFor(admin2+"@example.com", nil)
-	f.clock.Advance(2 * time.Minute)
-	if err := f.s.DeliverNotifications(ctx()); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.s.DeliverNotifications(ctx()); err != nil {
-		t.Fatal(err)
-	}
-	if got := emailsTo(f, admin2+"@example.com"); got != 1 {
-		t.Fatalf("emails to the recovered recipient = %d, want 1", got)
-	}
+	t.Run("permanent failure", func(t *testing.T) {
+		f, acct, adminAddr, ownerAddr := setup(t)
+		deliverAndCheck(f, "first attempt", adminAddr, ownerAddr, 0)
+		for pass := 2; pass <= notificationMaxAttempts+2; pass++ {
+			f.clock.Advance(time.Hour)
+			deliverAndCheck(f, fmt.Sprintf("worker pass %d", pass), adminAddr, ownerAddr, 0)
+		}
+
+		var attempts int
+		var abandoned bool
+		var delivered int
+		if err := f.db.Pool.QueryRow(ctx(), `SELECT n.attempts, n.abandon_time IS NOT NULL,
+				(SELECT count(*) FROM billing_notification_deliveries d WHERE d.notification_id = n.notification_id)
+			FROM billing_notifications n WHERE n.billing_account_id = $1 AND n.kind = $2`,
+			acct, string(NotifyLowBalance)).Scan(&attempts, &abandoned, &delivered); err != nil {
+			t.Fatal(err)
+		}
+		if attempts != notificationMaxAttempts || !abandoned || delivered != 1 {
+			t.Fatalf("attempts %d abandoned %v deliveries %d", attempts, abandoned, delivered)
+		}
+	})
+
+	t.Run("transient failure", func(t *testing.T) {
+		f, _, adminAddr, ownerAddr := setup(t)
+		deliverAndCheck(f, "first attempt", adminAddr, ownerAddr, 0)
+
+		f.email.SetErrFor(adminAddr, nil)
+		f.clock.Advance(2 * time.Minute)
+		deliverAndCheck(f, "retry after recovery", adminAddr, ownerAddr, 1)
+		deliverAndCheck(f, "extra worker pass", adminAddr, ownerAddr, 1)
+	})
 }
 
 type sendError struct{}
@@ -481,42 +549,67 @@ func TestCloseAccountCancelsSubscription(t *testing.T) {
 	}
 }
 
+type pendingTopUpScanKey struct{}
+
+type emptyTopUpScans chan struct{}
+
+func (scans emptyTopUpScans) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, " FROM top_ups WHERE status = 'pending'") {
+		return context.WithValue(ctx, pendingTopUpScanKey{}, true)
+	}
+	return ctx
+}
+
+func (scans emptyTopUpScans) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	// pgx traces the completed SELECT before QueryRow reports ErrNoRows.
+	if ctx.Value(pendingTopUpScanKey{}) == true && data.Err == nil && data.CommandTag.String() == "SELECT 0" {
+		select {
+		case scans <- struct{}{}:
+		case <-ctx.Done():
+		}
+	}
+}
+
 func TestWorkerWakeAndStop(t *testing.T) {
-	f := newFixture(t)
+	scans := make(emptyTopUpScans, 3)
+	cfg, err := pgxpool.ParseConfig(dbtest.NewURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.Tracer = scans
+	pool, err := pgxpool.NewWithConfig(ctx(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := newFixtureOn(t, &db.DB{Pool: pool})
 	acct := f.account()
 	f.activate(acct)
 	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
 	runCtx, cancel := context.WithCancel(ctx())
 	done := make(chan struct{})
-	go func() {
-		f.s.RunWorker(runCtx, time.Hour)
-		close(done)
-	}()
-	// An early fatal assertion must stop the worker and wait for it before
-	// the fixture closes the database and the provider, which t.Cleanup runs
-	// in reverse order of registration. Cancel is idempotent, so the normal
-	// path below may stop the worker first.
+	// Join the worker before the fixture closes the database and provider,
+	// including when an assertion fails.
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Errorf("RunWorker did not stop during cleanup")
-		}
+		<-done
 	})
-	// RunWorker reads the wake channel only after the startup RunOnce scan has
-	// returned. Send a wake with nothing queued and wait until the worker has
-	// received it: the drained channel proves the startup scan has finished,
-	// so the startup scan cannot be what charges the top-up queued below. The
-	// wake channel holds one signal and the idle wake handler does nothing.
-	f.s.Wake()
-	deadline := time.Now().Add(10 * time.Second)
-	for len(f.s.wake) != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the worker did not finish its startup scan")
+	go func() {
+		defer close(done)
+		f.s.RunWorker(runCtx, time.Hour)
+	}()
+	waitForEmptyScan := func(pass string) {
+		select {
+		case <-scans:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the %s pass did not finish an empty pending top-up scan", pass)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
+	waitForEmptyScan("startup")
+	// Wait for the setup wake's scan to find no pending work before queuing
+	// the top-up. Only the second wake should be able to charge it.
+	f.s.Wake()
+	waitForEmptyScan("setup wake")
 	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
 		t.Fatal("not queued")
 	}
@@ -524,12 +617,14 @@ func TestWorkerWakeAndStop(t *testing.T) {
 		t.Fatalf("%d charges before Wake", n)
 	}
 	f.s.Wake()
-	deadline = time.Now().Add(10 * time.Second)
-	for len(f.paddle.Charges()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("Wake did not charge the queued top-up")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// After charging, the worker scans once more before it returns to idle.
+	select {
+	case <-scans:
+	case <-time.After(10 * time.Second):
+		t.Error("Wake did not finish processing pending top-ups")
+	}
+	if n := len(f.paddle.Charges()); n != 1 {
+		t.Fatalf("%d charges after Wake, want 1", n)
 	}
 	cancel()
 	select {

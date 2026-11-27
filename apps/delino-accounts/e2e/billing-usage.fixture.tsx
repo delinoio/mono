@@ -2,6 +2,7 @@
 import "delino-ui/styles.css";
 import "../src/index.css";
 import { Code, ConnectError } from "@connectrpc/connect";
+import type { ListUsageSummaryRequest } from "@delino/accounts-protos/v1/usage_pb";
 import { createRoot } from "react-dom/client";
 import { createQueryClient } from "../src/api.ts";
 import { Accounts } from "../src/App.tsx";
@@ -11,17 +12,27 @@ import {
   ACCOUNT_ID,
   addUsageRows,
   createFakeApi,
-  OWNER,
+  VIEWER,
 } from "../src/testing/fake-api.ts";
 
 const api = createFakeApi();
-api.userId = OWNER;
-const account = api.accounts.get(ACCOUNT_ID)!;
-account.usage.length = 0;
-addUsageRows(account, 201, 1_000_000n);
+api.userId = VIEWER;
 
-const method = "ListUsageSummary";
+const usageSummaryMethod = "ListUsageSummary";
+const account = api.accounts.get(ACCOUNT_ID)!;
 const fixture = {
+  seedPagination() {
+    account.usage.length = 0;
+    addUsageRows(account, 201, 1_000_000n);
+  },
+  summaryMonths() {
+    return api.calls
+      .filter(({ method }) => method === usageSummaryMethod)
+      .map(({ request }) => {
+        const { year, month } = request as ListUsageSummaryRequest;
+        return [year, month];
+      });
+  },
   raiseLastRowCost() {
     account.usage.at(-1)!.amountUsdMicros = 3_000_000n;
   },
@@ -31,14 +42,14 @@ const fixture = {
   },
   failNextContinuation() {
     api.failContinuation.set(
-      method,
+      usageSummaryMethod,
       new ConnectError("busy", Code.ResourceExhausted),
     );
   },
   pageTokens() {
     return api.calls
-      .filter((call) => call.method === method)
-      .map((call) => call.request.pageToken as string);
+      .filter(({ method }) => method === usageSummaryMethod)
+      .map(({ request }) => (request as ListUsageSummaryRequest).pageToken);
   },
 };
 
@@ -52,7 +63,7 @@ window.billingUsageFixture = fixture;
 window.history.replaceState(null, "", `/billing/${ACCOUNT_ID}`);
 createRoot(document.getElementById("root")!).render(
   <AuthContextProvider
-    value={{ ...NOT_CONFIGURED, isAuthenticated: true, userId: OWNER }}
+    value={{ ...NOT_CONFIGURED, isAuthenticated: true, userId: VIEWER }}
   >
     <Accounts
       config={ACCOUNTS_CONFIG}

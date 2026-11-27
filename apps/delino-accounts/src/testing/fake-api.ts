@@ -47,6 +47,7 @@ export const OUTSIDER = "user-outsider";
 
 export const ACCOUNT_ID = "0193a1b2-0000-7000-8000-000000000001";
 export const INVITATION_TOKEN = "bai_valid-token";
+const INVITATION_ID = "0193a1b2-0000-7000-8000-0000000000a1";
 
 const T0 = new Date("2026-11-01T00:00:00Z");
 const ts = (date: Date = T0) => timestampFromDate(date);
@@ -82,10 +83,12 @@ export interface FakeApi {
   /** The signed-in user; change it to switch roles. */
   userId: string;
   accounts: Map<string, FakeAccount>;
-  invitationTokens: Map<
-    string,
-    { accountId: string; role: BillingAccountRole }
-  >;
+  /** Adds a pending invitation row and returns its ID. */
+  addInvitationToken(
+    token: string,
+    accountId: string,
+    role: BillingAccountRole,
+  ): string;
   calls: Call[];
   /** Fails the next call of a method with the given error once. */
   failNext: Map<string, ConnectError>;
@@ -136,7 +139,7 @@ function seedAccount(): FakeAccount {
     ],
     invitations: [
       {
-        invitationId: "0193a1b2-0000-7000-8000-0000000000a1",
+        invitationId: INVITATION_ID,
         billingAccountId: ACCOUNT_ID,
         email: "pending@example.com",
         role: BillingAccountRole.VIEWER,
@@ -266,15 +269,12 @@ export function createFakeApi({
 }: { usageMonth?: UtcMonth } = {}): FakeApi {
   const fixedUsageMonth =
     usageMonth === undefined ? undefined : { ...usageMonth };
+  const invitationTokens = new Map([
+    [INVITATION_TOKEN, { accountId: ACCOUNT_ID, invitationId: INVITATION_ID }],
+  ]);
   const api = {
     userId: OWNER,
     accounts: new Map([[ACCOUNT_ID, seedAccount()]]),
-    invitationTokens: new Map([
-      [
-        INVITATION_TOKEN,
-        { accountId: ACCOUNT_ID, role: BillingAccountRole.VIEWER },
-      ],
-    ]),
     calls: [] as Call[],
     failNext: new Map<string, ConnectError>(),
     failContinuation: new Map<string, ConnectError>(),
@@ -283,6 +283,37 @@ export function createFakeApi({
   let nextId = 100;
   const newId = () =>
     `0193a1b2-0000-7000-8000-${String(nextId++).padStart(12, "0")}`;
+
+  const createInvitationRow = (
+    billingAccountId: string,
+    email: string,
+    role: BillingAccountRole,
+    inviterUserId = api.userId,
+  ): Init<BillingAccountInvitation> => ({
+    invitationId: newId(),
+    billingAccountId,
+    email,
+    role,
+    state: InvitationState.PENDING,
+    inviterUserId,
+    createTime: ts(),
+    expireTime: ts(new Date("2026-11-08T00:00:00Z")),
+  });
+  api.addInvitationToken = (token, accountId, role) => {
+    const account = api.accounts.get(accountId)!;
+    const invitation = createInvitationRow(
+      accountId,
+      "alternate-invitee@example.com",
+      role,
+      OWNER,
+    );
+    account.invitations.unshift(invitation);
+    invitationTokens.set(token, {
+      accountId,
+      invitationId: invitation.invitationId,
+    });
+    return invitation.invitationId;
+  };
 
   const record = (method: string, request: object) => {
     api.calls.push({ method, request: { ...request } });
@@ -429,16 +460,7 @@ export function createFakeApi({
         record("CreateInvitation", req);
         await awaitDeferredCall(api, "CreateInvitation");
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
-        const invitation = {
-          invitationId: newId(),
-          billingAccountId: account.id,
-          email: req.email,
-          role: req.role,
-          state: InvitationState.PENDING,
-          inviterUserId: api.userId,
-          createTime: ts(),
-          expireTime: ts(new Date("2026-11-08T00:00:00Z")),
-        };
+        const invitation = createInvitationRow(account.id, req.email, req.role);
         account.invitations.unshift(invitation);
         return { invitation };
       },
@@ -462,22 +484,39 @@ export function createFakeApi({
         if (invitation === undefined) {
           throw new ConnectError("invitation not found", Code.NotFound);
         }
+        if (invitation.state !== InvitationState.PENDING) {
+          throw new ConnectError(
+            "invitation is no longer pending",
+            Code.FailedPrecondition,
+          );
+        }
         invitation.state = InvitationState.REVOKED;
         return { invitation };
       },
       async acceptInvitation(req) {
         record("AcceptInvitation", req);
         await api.gates.get(`AcceptInvitation:${req.invitationToken}`);
-        const invitation = api.invitationTokens.get(req.invitationToken);
-        if (invitation === undefined) {
+        const token = invitationTokens.get(req.invitationToken);
+        if (token === undefined) {
           throw new ConnectError("invitation not found", Code.NotFound);
         }
-        const account = api.accounts.get(invitation.accountId)!;
-        // Like the production service, reject before touching the membership
-        // or consuming the token, so that the link stays a stable failure.
+        const account = api.accounts.get(token.accountId)!;
+        // Reject before changing the membership or invitation state.
         if (account.deleted) {
           throw new ConnectError(
             "the billing account was deleted",
+            Code.FailedPrecondition,
+          );
+        }
+        const invitation = account.invitations.find(
+          (i) => i.invitationId === token.invitationId,
+        );
+        if (invitation === undefined) {
+          throw new ConnectError("invitation not found", Code.NotFound);
+        }
+        if (invitation.state !== InvitationState.PENDING) {
+          throw new ConnectError(
+            "invitation is no longer pending",
             Code.FailedPrecondition,
           );
         }
@@ -495,7 +534,7 @@ export function createFakeApi({
           createTime: ts(),
         };
         account.members.push(joined);
-        api.invitationTokens.delete(req.invitationToken);
+        invitation.state = InvitationState.ACCEPTED;
         return { billingAccount: view(account), member: joined };
       },
       listMembers(req) {

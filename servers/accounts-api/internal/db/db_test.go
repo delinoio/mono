@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db/dbtest"
@@ -212,14 +213,47 @@ func TestOrganizationLinkStatusMigrationKeepsCompleteRows(t *testing.T) {
 	if _, err := d.Pool.Exec(ctx, `DELETE FROM organization_links WHERE organization_link_id = $1`, incomplete); err != nil {
 		t.Fatal(err)
 	}
-	if err := insertLink(ctx, d, "01900000-0000-7000-8000-000000000302", account, "blocked", "no_active_subscription", int64(2), now, now); err != nil {
+	const blocked = "01900000-0000-7000-8000-000000000302"
+	if err := insertLink(ctx, d, blocked, account, "blocked", "no_active_subscription", int64(2), now, now.Add(72*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := insertLink(ctx, d, "01900000-0000-7000-8000-000000000303", account, nil, nil, nil, nil, nil); err != nil {
+	const withoutStatus = "01900000-0000-7000-8000-000000000303"
+	if err := insertLink(ctx, d, withoutStatus, account, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
+	}
+	type linkSnapshot struct {
+		Service, OrganizationID, BillingAccountID string
+		Status, Reason                            pgtype.Text
+		Sequence                                  pgtype.Int8
+		BlockedSince, SuspendTime                 pgtype.Timestamptz
+	}
+	readLink := func(id, phase string) linkSnapshot {
+		t.Helper()
+		var link linkSnapshot
+		err := d.Pool.QueryRow(ctx, `SELECT service, organization_id, billing_account_id::text,
+			billing_status, status_reason, status_sequence, blocked_since, suspend_time
+			FROM organization_links WHERE organization_link_id = $1`, id).Scan(
+			&link.Service, &link.OrganizationID, &link.BillingAccountID,
+			&link.Status, &link.Reason, &link.Sequence, &link.BlockedSince, &link.SuspendTime)
+		if err != nil {
+			t.Fatalf("read organization link %s %s migration: %v", id, phase, err)
+		}
+		link.BlockedSince.Time = link.BlockedSince.Time.UTC()
+		link.SuspendTime.Time = link.SuspendTime.Time.UTC()
+		return link
+	}
+	ids := []string{blocked, withoutStatus}
+	before := make(map[string]linkSnapshot, len(ids))
+	for _, id := range ids {
+		before[id] = readLink(id, "before")
 	}
 	if err := d.Migrate(ctx, discard()); err != nil {
 		t.Fatalf("migrate with complete rows: %v", err)
+	}
+	for _, id := range ids {
+		if got, want := readLink(id, "after"), before[id]; got != want {
+			t.Errorf("organization link %s changed during migration:\n got %+v\nwant %+v", id, got, want)
+		}
 	}
 	if err := insertLink(ctx, d, incomplete, account, "blocked", nil, int64(1), now, now); !isStatusCompleteViolation(err) {
 		t.Fatalf("insert an incomplete row after migration 00005: error = %v, want a violation of organization_links_status_complete", err)
