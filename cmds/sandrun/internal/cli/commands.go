@@ -454,6 +454,8 @@ func (a *app) ownsandUnlink(ctx context.Context, name string, args []string) err
 
 // GitHub.
 
+const githubInstallBrowserSignIn = "Before you open the URL, sign in to the SandRun console in the browser you will use. Use the same SandRun account you used to generate the URL."
+
 func (a *app) githubInstallURL(ctx context.Context, name string, args []string) error {
 	fs := a.newFlags(name)
 	if _, err := a.positional(fs, args); err != nil {
@@ -473,7 +475,8 @@ func (a *app) githubInstallURL(ctx context.Context, name string, args []string) 
 	if _, err := fmt.Fprintln(a.env.Stdout, res.Msg.GetUrl()); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.env.Stderr, "Open the URL in a browser before %s; the SandRun console completes the link.\n", ts(res.Msg.GetExpireTime()))
+	fmt.Fprintln(a.env.Stderr, githubInstallBrowserSignIn)
+	fmt.Fprintf(a.env.Stderr, "Open the URL before %s. The SandRun console completes the link.\n", ts(res.Msg.GetExpireTime()))
 	return nil
 }
 
@@ -1291,24 +1294,32 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 func (a *app) apiKeyCreate(ctx context.Context, name string, args []string) error {
 	fs := a.newFlags(name)
 	keyName := fs.String("name", "", "key name (1 to 64 characters)")
-	expiresIn := fs.String("expires-in", "", "expiry after now, for example 30d (default: no expiry)")
+	var expiresIn stringFlag
+	fs.Var(&expiresIn, "expires-in", "positive duration, for example 30d (omit for no expiry)")
 	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
 	if *keyName == "" {
 		return usageErr("--name is required")
 	}
-	d, err := parseDuration("expires-in", *expiresIn)
-	if err != nil {
-		return err
+	var duration time.Duration
+	if expiresIn.set {
+		var err error
+		duration, err = parseDuration("expires-in", expiresIn.v)
+		if err != nil {
+			return err
+		}
+		if duration == 0 {
+			return usageErr("--expires-in: duration must be positive")
+		}
 	}
 	org, c, err := a.orgSetup()
 	if err != nil {
 		return err
 	}
 	req := &sandrunv1.CreateApiKeyRequest{OrganizationId: org, Name: *keyName}
-	if d > 0 {
-		req.ExpiresAt = timestamppb.New(time.Now().Add(d))
+	if expiresIn.set {
+		req.ExpiresAt = timestamppb.New(time.Now().Add(duration))
 	}
 	res, err := c.APIKeys().CreateApiKey(ctx, connect.NewRequest(req))
 	if err != nil {

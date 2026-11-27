@@ -6,7 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -618,16 +621,28 @@ func invitationRows(t *testing.T, env *testenv.Env, accountID string) []string {
 // sent, so a failed send, which revokes the invitation, leaves the creation
 // record and row and then the revocation with its reason.
 func TestInvitationCreateFailureAuditsCreationThenRevocation(t *testing.T) {
-	env := testenv.New(t)
+	var keys []string
+	var keysMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keysMu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		firstSend := len(keys) == 1
+		keysMu.Unlock()
+		if firstSend {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"invitation-email"}`))
+	}))
+	defer provider.Close()
+	env := testenv.NewWithResend(t, provider.URL)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
 
-	env.Email.SetErr(errors.New("resend down"))
 	_, err := owner.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
 		BillingAccountId: accountID, Email: "undelivered@example.com", Role: roleViewer,
 	}))
 	wantCode(t, err, connect.CodeUnavailable)
-	env.Email.SetErr(nil)
 
 	logs := env.Logs.String()
 	if !strings.Contains(logs, `"msg":"invitation_email_failed"`) {
@@ -653,14 +668,26 @@ func TestInvitationCreateFailureAuditsCreationThenRevocation(t *testing.T) {
 	if got := invitationRows(t, env, accountID); strings.Join(got, ",") != "undelivered@example.com=revoked" {
 		t.Errorf("invitations after a failed send = %v, want one revoked", got)
 	}
-	if n := len(env.Email.Messages()); n != 0 {
-		t.Errorf("%d emails after a failed send, want 0", n)
+	if strings.Contains(logs, "billing_email_sent") || !strings.Contains(logs, `"error_kind":"provider"`) {
+		t.Error("unusable acknowledgement should log only a provider failure")
 	}
 
 	// The retry succeeds and logs one more creation record, with the new
 	// invitation.
 	inv := invite(t, owner, accountID, "undelivered@example.com", roleViewer)
+	keysMu.Lock()
+	defer keysMu.Unlock()
+	if len(keys) != 2 {
+		t.Fatalf("provider requests = %d, want 2", len(keys))
+	}
+	firstKey, nextKey := keys[0], keys[1]
+	if !strings.HasPrefix(firstKey, "invitation/") || firstKey == nextKey || nextKey != "invitation/"+inv.GetInvitationId() {
+		t.Fatalf("unexpected provider keys %q and %q", firstKey, nextKey)
+	}
 	logs = env.Logs.String()
+	if !strings.Contains(logs, `"resend_email_id":"invitation-email"`) || strings.Contains(logs, "undelivered@example.com") {
+		t.Error("success should identify the provider email and omit the recipient")
+	}
 	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 2 {
 		t.Fatalf("%d invitation_created audit records after a successful retry, want 2", n)
 	}

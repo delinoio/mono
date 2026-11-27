@@ -77,7 +77,7 @@ func TestListLedgerEntriesOrder(t *testing.T) {
 	}
 	// traverse follows the tokens from the first page and returns the IDs in
 	// the order of the pages.
-	traverse := func(token string, size int32) []string {
+	traverse := func(t *testing.T, token string, size int32) []string {
 		t.Helper()
 		var out []string
 		for pages := 0; pages < 10; pages++ {
@@ -105,7 +105,7 @@ func TestListLedgerEntriesOrder(t *testing.T) {
 			t.Fatalf("unpaginated order = %v (token %q), want %v", got, full.GetNextPageToken(), want)
 		}
 		for size := int32(1); size <= 5; size++ {
-			if got := traverse("", size); !slices.Equal(got, want) {
+			if got := traverse(t, "", size); !slices.Equal(got, want) {
 				t.Fatalf("page size %d order = %v, want %v", size, got, want)
 			}
 		}
@@ -125,7 +125,7 @@ func TestListLedgerEntriesOrder(t *testing.T) {
 		// traversal continues with the entries that have lower IDs, and the
 		// new traversal after the same position would end.
 		legacy := legacyLedgerToken(t, "ListLedgerEntries", f.AccountID, ledgerOldest)
-		got := traverse(legacy, 2)
+		got := traverse(t, legacy, 2)
 		if wantLegacy := []string{ledgerTie3, ledgerTie2, ledgerTie1, ledgerMiddle}; !slices.Equal(got, wantLegacy) {
 			t.Fatalf("legacy traversal = %v, want %v", got, wantLegacy)
 		}
@@ -160,8 +160,11 @@ func TestListLedgerEntriesOrder(t *testing.T) {
 	t.Run("members read, outsiders do not", func(t *testing.T) {
 		resp, err := env.Credit(f.Viewer.ID).ListLedgerEntries(ctx(), connect.NewRequest(&accountsv1.ListLedgerEntriesRequest{
 			BillingAccountId: f.AccountID}))
-		if err != nil || !slices.Equal(ids(resp.Msg), want) {
-			t.Fatalf("viewer list = %v, %v", ids(resp.Msg), err)
+		if err != nil {
+			t.Fatalf("list ledger entries as viewer: %v", err)
+		}
+		if got := ids(resp.Msg); !slices.Equal(got, want) {
+			t.Fatalf("viewer list = %v, want %v", got, want)
 		}
 		_, err = env.Credit(f.Outsider.ID).ListLedgerEntries(ctx(), connect.NewRequest(&accountsv1.ListLedgerEntriesRequest{
 			BillingAccountId: f.AccountID}))
