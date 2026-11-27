@@ -18,6 +18,7 @@ import (
 	"debug/pe"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -30,6 +31,11 @@ import (
 
 // ErrUnsupported reports an image build that this host cannot run.
 var ErrUnsupported = errors.New("imagebuild: not supported on this host")
+
+// UsageError reports a missing required option or an invalid explicit helper.
+type UsageError struct{ error }
+
+func (e *UsageError) Unwrap() error { return e.error }
 
 // Options configure a build.
 type Options struct {
@@ -89,39 +95,67 @@ func ParseGuestOS(s string) (ownsandv1.GuestOs, error) {
 
 // Build builds the image of opts.GuestOS and installs it.
 func Build(ctx context.Context, opts Options) error {
-	if opts.Logger == nil {
-		opts.Logger = slog.Default()
-	}
 	if opts.ImagesDir == "" {
 		return errors.New("imagebuild: the images directory is required")
 	}
-	if err := ValidateResources(opts.DiskGiB, int64(opts.CPUCount), opts.MemoryMiB); err != nil {
-		return err
-	}
-	dir, err := images.Dir(opts.ImagesDir, opts.GuestOS)
+	prepared, err := Prepare(opts)
 	if err != nil {
 		return err
 	}
+	return prepared.Build(ctx, opts.ImagesDir, opts.Logger)
+}
+
+// PreparedBuild holds the validated build options and the resolved helper.
+type PreparedBuild struct {
+	opts     Options
+	imageDir string
+	build    func(context.Context, string, Options) error
+}
+
+// Prepare checks the build inputs without opening agent state or taking a lock.
+// The images directory and logger are supplied when the prepared build runs.
+func Prepare(opts Options) (*PreparedBuild, error) {
+	if err := ValidateResources(opts.DiskGiB, int64(opts.CPUCount), opts.MemoryMiB); err != nil {
+		return nil, err
+	}
+	imageDir, err := images.Dir("", opts.GuestOS)
+	if err != nil {
+		return nil, err
+	}
+	prepared := &PreparedBuild{imageDir: imageDir}
 	switch opts.GuestOS {
 	case ownsandv1.GuestOs_GUEST_OS_MACOS:
-		guest, err := guestBinary(opts.GuestBinary, "ownsand-guest", checkDarwinARM64)
-		if err != nil {
-			return err
-		}
-		opts.GuestBinary = guest
-		return withBuildLock(dir, opts.Logger, func() error { return buildMacOS(ctx, dir, opts) })
+		opts.GuestBinary, err = guestBinary(opts.GuestBinary, "ownsand-guest", checkDarwinARM64)
+		prepared.build = buildMacOS
 	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
 		if opts.ISO == "" {
-			return errors.New("imagebuild: a Windows image build needs --iso <path to a Windows ISO>")
+			return nil, &UsageError{errors.New("imagebuild: a Windows image build needs --iso <path to a Windows ISO>")}
 		}
-		guest, err := guestBinary(opts.GuestBinary, "ownsand-guest.exe", checkWindowsAMD64)
-		if err != nil {
-			return err
-		}
-		opts.GuestBinary = guest
-		return withBuildLock(dir, opts.Logger, func() error { return buildWindows(ctx, dir, opts) })
+		opts.GuestBinary, err = guestBinary(opts.GuestBinary, "ownsand-guest.exe", checkWindowsAMD64)
+		prepared.build = buildWindows
+	default:
+		return nil, fmt.Errorf("%w: guest OS %v", ErrUnsupported, opts.GuestOS)
 	}
-	return fmt.Errorf("%w: guest OS %v", ErrUnsupported, opts.GuestOS)
+	if err != nil {
+		return nil, err
+	}
+	prepared.opts = opts
+	return prepared, nil
+}
+
+// Build takes the destination lock and runs the prepared build.
+func (p *PreparedBuild) Build(ctx context.Context, imagesDir string, logger *slog.Logger) error {
+	if imagesDir == "" {
+		return errors.New("imagebuild: the images directory is required")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	opts := p.opts
+	opts.ImagesDir = imagesDir
+	opts.Logger = logger
+	dir := filepath.Join(imagesDir, p.imageDir)
+	return withBuildLock(dir, logger, func() error { return p.build(ctx, dir, opts) })
 }
 
 // withBuildLock runs build while this process holds the exclusive build lock
@@ -146,6 +180,7 @@ func withBuildLock(dir string, logger *slog.Logger, build func() error) (err err
 // guestBinary finds the guest helper for the guest OS and checks that it is
 // an executable of the guest platform.
 func guestBinary(path, name string, check func(string) error) (string, error) {
+	explicit := path != ""
 	if path == "" {
 		if exe, err := os.Executable(); err == nil {
 			candidate := filepath.Join(filepath.Dir(exe), name)
@@ -163,17 +198,51 @@ func guestBinary(path, name string, check func(string) error) (string, error) {
 		return "", fmt.Errorf("imagebuild: the guest helper %s was not found next to the agent or on PATH; pass --guest-binary", name)
 	}
 	if err := check(path); err != nil {
+		if _, readFailure := errors.AsType[*os.PathError](err); explicit && !readFailure {
+			return "", &UsageError{err}
+		}
 		return "", err
 	}
 	return path, nil
 }
 
-func checkDarwinARM64(path string) error {
-	f, err := macho.Open(path)
-	if err != nil {
-		return fmt.Errorf("imagebuild: the guest helper %s is not a macOS executable: %w", path, err)
+// executableReader keeps filesystem errors that the format parsers may
+// include as text. EOF from a truncated executable is a format error.
+type executableReader struct {
+	*os.File
+	readErr error
+}
+
+func (r *executableReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.File.ReadAt(p, off)
+	if err != nil && err != io.EOF && r.readErr == nil {
+		r.readErr = err
 	}
-	defer f.Close()
+	return n, err
+}
+
+func readExecutable[T any](path, platform string, parse func(io.ReaderAt) (T, error)) (T, error) {
+	var executable T
+	file, err := os.Open(path)
+	if err == nil {
+		defer file.Close()
+		reader := &executableReader{File: file}
+		executable, err = parse(reader)
+		if reader.readErr != nil {
+			err = reader.readErr
+		}
+	}
+	if err != nil {
+		return executable, fmt.Errorf("imagebuild: the guest helper %s is not a %s executable: %w", path, platform, err)
+	}
+	return executable, nil
+}
+
+func checkDarwinARM64(path string) error {
+	f, err := readExecutable(path, "macOS", macho.NewFile)
+	if err != nil {
+		return err
+	}
 	if f.Cpu != macho.CpuArm64 {
 		return fmt.Errorf("imagebuild: the guest helper %s is built for %v; macOS guests need arm64 (GOOS=darwin GOARCH=arm64)", path, f.Cpu)
 	}
@@ -193,11 +262,10 @@ const (
 )
 
 func checkWindowsAMD64(path string) error {
-	f, err := pe.Open(path)
+	f, err := readExecutable(path, "Windows", pe.NewFile)
 	if err != nil {
-		return fmt.Errorf("imagebuild: the guest helper %s is not a Windows executable: %w", path, err)
+		return err
 	}
-	defer f.Close()
 	if f.Machine != pe.IMAGE_FILE_MACHINE_AMD64 {
 		return fmt.Errorf("imagebuild: the guest helper %s is not an amd64 executable; Windows guests need GOOS=windows GOARCH=amd64", path)
 	}
