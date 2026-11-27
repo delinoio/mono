@@ -211,6 +211,104 @@ func TestClientMalformedJSON(t *testing.T) {
 	}
 }
 
+type streamTransport func(*http.Request) (*http.Response, error)
+
+func (f streamTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type streamBody struct {
+	io.Reader
+	reads  int
+	closed bool
+}
+
+func (b *streamBody) Read(p []byte) (int, error) {
+	b.reads++
+	return b.Reader.Read(p)
+}
+
+func (b *streamBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestStreamMediaType(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		wantEvent   bool
+	}{
+		{name: "HTML", contentType: "text/html; vendor=private-header"},
+		{name: "missing"},
+		{name: "malformed", contentType: "text/event-stream; private-header"},
+		{name: "SSE", contentType: "text/event-stream", wantEvent: true},
+		{name: "SSE with parameters", contentType: "Text/Event-Stream; charset=utf-8", wantEvent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := "<html>Maintenance</html>"
+			if tc.wantEvent {
+				payload = "data: {}\n\n"
+			}
+			body := &streamBody{Reader: strings.NewReader(payload)}
+			header := make(http.Header)
+			if tc.contentType != "" {
+				header.Set("Content-Type", tc.contentType)
+			}
+			c := &Client{
+				Vendor: "TEST", BaseURL: "https://vendor.example", Auth: Bearer("test-credential"),
+				HTTP: &http.Client{Transport: streamTransport(func(r *http.Request) (*http.Response, error) {
+					if got := r.Header.Get("Accept"); got != "text/event-stream" {
+						t.Errorf("Accept = %q, want text/event-stream", got)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: header, Body: body}, nil
+				})},
+			}
+			var events []Event
+			err := c.Stream(t.Context(), "watch", "/stream", nil, nil, func(e Event) error {
+				events = append(events, e)
+				return nil
+			})
+			if !body.closed {
+				t.Error("response body was left open")
+			}
+			if tc.wantEvent {
+				if err != nil || len(events) != 1 || string(events[0].Data) != "{}" {
+					t.Fatalf("stream returned error %v and events %+v, want one event and clean EOF", err, events)
+				}
+				return
+			}
+			if err == nil || err.Error() != "TEST watch: expected Content-Type text/event-stream" {
+				t.Errorf("stream returned %v, want a sanitized media type error", err)
+			}
+			if body.reads != 0 || len(events) != 0 {
+				t.Errorf("stream read the body %d times and dispatched %d events", body.reads, len(events))
+			}
+		})
+	}
+}
+
+func TestStreamCanceledBeforeReadingResponse(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	body := &streamBody{Reader: strings.NewReader("data: {}\n\n")}
+	c := &Client{
+		Vendor: "TEST", BaseURL: "https://vendor.example",
+		HTTP: &http.Client{Transport: streamTransport(func(*http.Request) (*http.Response, error) {
+			cancel()
+			return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+		})},
+	}
+	err := c.Stream(ctx, "watch", "/stream", nil, nil, func(Event) error {
+		t.Error("canceled stream dispatched an event")
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("stream returned %v, want context.Canceled", err)
+	}
+	if body.reads != 0 || !body.closed {
+		t.Errorf("canceled stream read the body %d times, closed = %t", body.reads, body.closed)
+	}
+}
+
 func TestClientSuccessfulJSONAndSSE(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret-token" {

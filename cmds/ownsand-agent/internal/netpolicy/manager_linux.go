@@ -29,6 +29,14 @@ type dnsCloser interface {
 	Close()
 }
 
+type nftTableState uint8
+
+const (
+	nftTableUnknown nftTableState = iota
+	nftTablePresent
+	nftTableAbsent
+)
+
 // Manager attaches OUTBOUND sandboxes to tap devices and keeps the
 // nftables table of the agent current. It needs CAP_NET_ADMIN and the `ip`
 // (iproute2) and `nft` commands.
@@ -58,18 +66,15 @@ type Manager struct {
 	// them.
 	interval time.Duration
 	refresh  func() error
-	// run, listTaps, startDNS, setForwarding, tapExists, hostRoutes and
-	// applyRules are the host operations of the manager: the `ip` and `nft`
-	// commands, the tap device listing, the DNS
-	// forwarder, the IPv4 forwarding switch, the tap device probe, the
-	// routing table read and the `nft` script replacement. Tests replace
-	// them so that the manager runs without root.
+	// Tests replace these host operations so that the manager runs without
+	// root.
 	run           func(name string, args ...string) error
 	listTaps      func() ([]string, error)
 	startDNS      func(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsCloser, error)
 	setForwarding func() error
 	tapExists     func(tap string) bool
 	hostRoutes    func() ([]Route, []netip.Prefix, error)
+	tableState    func() (nftTableState, error)
 	applyRules    func(rules string) error
 }
 
@@ -90,6 +95,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		applyRules:    applyNftRules,
 	}
 	m.refresh = m.Refresh
+	m.tableState = m.probeNftTable
 	return m
 }
 
@@ -131,6 +137,18 @@ func applyNftRules(rules string) error {
 		return fmt.Errorf("netpolicy: apply nftables rules: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+func (m *Manager) probeNftTable() (nftTableState, error) {
+	err := m.run("nft", "list", "table", "inet", TableName)
+	switch {
+	case err == nil:
+		return nftTablePresent, nil
+	case isNftTableAbsent(err):
+		return nftTableAbsent, nil
+	default:
+		return nftTableUnknown, err
+	}
 }
 
 func run(name string, args ...string) error {
@@ -191,7 +209,8 @@ func HostRoutes() ([]Route, []netip.Prefix, error) {
 }
 
 // Refresh recomputes the ruleset from the host routes and the current DNS
-// assignments of the attached sandboxes and applies it when it changed.
+// assignments of the attached sandboxes. It applies a changed ruleset or
+// reapplies it when it cannot confirm that the table exists.
 // Concurrent calls run one after the other, so the ruleset of the call that
 // read the routes last is the one that stays applied.
 func (m *Manager) Refresh() error {
@@ -220,7 +239,18 @@ func (m *Manager) Refresh() error {
 	}
 	rules := Ruleset(v4, v6, assignments)
 	if rules == m.rules {
-		return nil
+		if m.rules == "" {
+			return nil
+		}
+		state, err := m.tableState()
+		switch state {
+		case nftTablePresent:
+			return nil
+		case nftTableAbsent:
+			m.logger.Error("network policy table missing; reapplying", "table", TableName, "attached_sandboxes", len(m.attached))
+		case nftTableUnknown:
+			m.logger.Warn("network policy table check failed; reapplying", "table", TableName, "error", err)
+		}
 	}
 	if err := m.applyRules(rules); err != nil {
 		return err
@@ -403,10 +433,8 @@ func listTapDevices() ([]string, error) {
 	return taps, nil
 }
 
-// isNftTableAbsent reports whether an `nft delete table` failure means that
-// the table does not exist (nft prints "No such file or directory" for a
-// missing table), or that nft is not installed, so that the host cannot hold
-// a table of the agent that the agent could delete.
+// isNftTableAbsent reports whether a table command failed because the table
+// is missing or nft is not installed.
 func isNftTableAbsent(err error) bool {
 	if errors.Is(err, exec.ErrNotFound) {
 		return true

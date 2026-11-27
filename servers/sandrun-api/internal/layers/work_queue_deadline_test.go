@@ -46,12 +46,12 @@ func TestWarmBindingQueueDeadline(t *testing.T) {
 				return true
 			})
 
-			commit := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
+			holder := holdTx(t, w.env, "SELECT 1 FROM runners WHERE runner_id = $1 FOR UPDATE", warm.GetRunnerId())
 			member := w.env.User(w.org.Member)
 			id := w.createSession(t, member, profileID).GetDevSessionId()
-			waitForLockWaiter(t, w.env)
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, query: "FROM runners WHERE runner_id = $1 FOR UPDATE"})
 			w.env.Clock.Advance(tc.advance)
-			commit()
+			holder.commit()
 
 			if tc.advance == time.Hour {
 				w.waitState(t, id, sandrunv1.RequestState_REQUEST_STATE_EXPIRED)

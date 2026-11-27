@@ -149,6 +149,44 @@ func TestConnectOfFirstChannelBecomesReady(t *testing.T) {
 	}
 }
 
+func TestFakeAgentReadStallEndsOnClose(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	_, agent := setupAgent(t, env, org, nil)
+	stallOnHeartbeat := func(seq uint64) {
+		agent.StallReadsAfter(func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetHeartbeatAck().GetSequence() == seq
+		})
+		agent.Heartbeat(seq)
+		waitHeartbeatAck(agent, seq)
+	}
+
+	stallOnHeartbeat(1)
+	agent.Close()
+	agent.Close()
+	t.Log("closed the stalled channel without resuming reads")
+
+	priorAcks := len(stateAcks(agent))
+	agent.OpenChannel()
+	agent.Eventually("a state report acknowledgement on the reopened channel", func() bool {
+		return len(stateAcks(agent)) > priorAcks
+	})
+	t.Log("received the reopened channel's state report acknowledgement")
+
+	stallOnHeartbeat(2)
+	agent.Heartbeat(3)
+	time.Sleep(250 * time.Millisecond)
+	for _, envelope := range agent.Received() {
+		if envelope.GetHeartbeatAck().GetSequence() == 3 {
+			t.Fatal("the reopened channel read the heartbeat acknowledgement before ResumeReads")
+		}
+	}
+	agent.ResumeReads()
+	agent.ResumeReads()
+	waitHeartbeatAck(agent, 3)
+	t.Log("the reopened channel read the pending heartbeat acknowledgement after ResumeReads")
+}
+
 // TestConnectWithoutAcknowledgementFails checks that a connection whose
 // first state report is never acknowledged cannot end in a successful
 // Connect. The first report fails in the database, so the server closes the

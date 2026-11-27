@@ -972,7 +972,10 @@ func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
 			t.Fatal("the device has no live channel")
 		}
 
-		unlock := conn.LockUpdates()
+		unlock, err := conn.LockUpdates(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		unlocked := false
 		defer func() {
 			if !unlocked {
@@ -1009,19 +1012,13 @@ func goroutineStacks() string {
 	}
 }
 
-// updateLockWaiters counts the goroutines in stacks that are parked on a
-// mutex inside an update evaluation, waiting for the update lock of a channel
-// (Service.evaluateUpdate calling Conn.LockUpdates). No production signal
-// reports a goroutine that waits for a sync.Mutex, so the test reads the
-// goroutine stacks. The match uses the two frames of this repository and the
-// blocked state in the goroutine header; the frames of the sync package differ
-// between Go versions, and the mutex Lock frame may be inlined, so it is not
-// matched.
+// updateLockWaiters counts the goroutines parked in an update evaluation
+// while they wait for the channel's update lock.
 func updateLockWaiters(stacks string) int {
 	waiters := 0
 	for _, trace := range strings.Split(stacks, "\n\n") {
 		header, _, _ := strings.Cut(trace, "\n")
-		blocked := strings.Contains(header, "sync.Mutex.Lock") || strings.Contains(header, "semacquire")
+		blocked := strings.Contains(header, "[select")
 		if blocked && strings.Contains(trace, "(*Service).evaluateUpdate") && strings.Contains(trace, "(*Conn).LockUpdates") {
 			waiters++
 		}

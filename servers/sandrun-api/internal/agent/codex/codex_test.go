@@ -149,7 +149,8 @@ func TestInstallScript(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell test")
 	}
-	run := func(stubs map[string]string) (int, string) {
+	run := func(t *testing.T, stubs map[string]string, systemCodex string) (int, string) {
+		t.Helper()
 		home := t.TempDir()
 		bin := filepath.Join(home, ".local", "bin")
 		tools := filepath.Join(home, "tools")
@@ -168,37 +169,51 @@ func TestInstallScript(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		if systemCodex != "" {
+			if err := os.WriteFile(filepath.Join(tools, "codex"), []byte("#!/bin/sh\n"+systemCodex+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
 		cmd := exec.Command("/bin/sh", "-c", InstallScript(sandrunv1.GuestOs_GUEST_OS_LINUX))
 		cmd.Env = []string{"HOME=" + home, "PATH=" + tools}
 		out, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(out)
 	}
-	npm := `[ "$NPM_CONFIG_PREFIX" = "$HOME/.local" ] || exit 9
+	npmChecks := `[ "$NPM_CONFIG_PREFIX" = "$HOME/.local" ] || exit 9
 [ "$3" = "@openai/codex@` + CodexVersion + `" ] || exit 8
-printf '#!/bin/sh\nexit 0\n' > "$BIN/codex"; chmod +x "$BIN/codex"`
-	cases := map[string]struct {
-		stubs map[string]string
-		code  int
-	}{
-		"codex present":        {map[string]string{"codex": "exit 0"}, 0},
-		"node 20 present":      {map[string]string{"node": "echo 20", "npm": npm}, 0},
-		"npm fails":            {map[string]string{"node": "echo 22", "npm": "exit 1"}, 14},
-		"node 14, no download": {map[string]string{"node": "echo 14", "npm": npm, "curl": "exit 22"}, 12},
-		"no node, no tools":    {map[string]string{}, 10},
+`
+	npm := npmChecks + `printf '#!/bin/sh\n[ "$1" = "--version" ]\n' > "$BIN/codex"; chmod +x "$BIN/codex"`
+	brokenNPM := npmChecks + `printf '#!/bin/sh\nexit 1\n' > "$BIN/codex"; chmod +x "$BIN/codex"`
+	type installCase struct {
+		stubs       map[string]string
+		systemCodex string
+		code        int
+	}
+	cases := map[string]installCase{
+		"codex present":        {stubs: map[string]string{"codex": `[ "$1" = "--version" ]`, "node": "echo 24", "npm": "exit 1"}},
+		"working install":      {stubs: map[string]string{"node": "echo 24", "npm": npm}},
+		"broken launcher":      {stubs: map[string]string{"node": "echo 24", "npm": brokenNPM}, code: 15},
+		"missing launcher":     {stubs: map[string]string{"node": "echo 24", "npm": npmChecks + "exit 0"}, code: 15},
+		"cached older codex":   {stubs: map[string]string{"node": "echo 24", "npm": npm}, systemCodex: "exit 1"},
+		"node 20 present":      {stubs: map[string]string{"node": "echo 20", "npm": npm}},
+		"npm fails":            {stubs: map[string]string{"node": "echo 22", "npm": "exit 1"}, code: 14},
+		"node 14, no download": {stubs: map[string]string{"node": "echo 14", "npm": npm, "curl": "exit 22"}, code: 12},
+		"no node, no tools":    {code: 10},
 	}
 	// Node.js 14 in $HOME/.local/bin and a download that succeeds: the
 	// downloaded Node.js comes first on PATH.
 	if arch := map[string]string{"amd64": "x64", "arm64": "arm64"}[runtime.GOARCH]; runtime.GOOS == "linux" && arch != "" {
-		cases["node 14, download"] = struct {
-			stubs map[string]string
-			code  int
-		}{map[string]string{"node": "echo 14", "npm": npm, "curl": "exit 0", "sha256sum": "echo " + nodeSHA256["linux-"+arch],
-			"tar": `mkdir -p "$4/bin" && printf '#!/bin/sh\necho 24\n' > "$4/bin/node" && chmod +x "$4/bin/node"`}, 0}
+		cases["node 14, download"] = installCase{stubs: map[string]string{
+			"node": "echo 14", "npm": npm, "curl": "exit 0", "sha256sum": "echo " + nodeSHA256["linux-"+arch],
+			"tar": `mkdir -p "$4/bin" && printf '#!/bin/sh\necho 24\n' > "$4/bin/node" && chmod +x "$4/bin/node"`,
+		}}
 	}
 	for name, tc := range cases {
-		if code, out := run(tc.stubs); code != tc.code {
-			t.Errorf("%s: exit %d, want %d: %s", name, code, tc.code, out)
-		}
+		t.Run(name, func(t *testing.T) {
+			if code, out := run(t, tc.stubs, tc.systemCodex); code != tc.code {
+				t.Errorf("exit %d, want %d: %s", code, tc.code, out)
+			}
+		})
 	}
 	if s := InstallScript(sandrunv1.GuestOs_GUEST_OS_WINDOWS); s != "exit 18\n" {
 		t.Fatalf("Windows: %q", s)

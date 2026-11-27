@@ -74,6 +74,47 @@ func TestResetDirKeepsHeldLockAndStateUntilRetry(t *testing.T) {
 	}
 }
 
+func TestResetDirKeepsStateAfterDeadline(t *testing.T) {
+	dir := t.TempDir()
+	lockEnrollment(t, openStore(t, dir))()
+	lockPath := filepath.Join(dir, EnrollmentLockFile)
+	before, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{IdentityFile, AgentFile} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := resetDir(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired reset = %v, want ErrEnrollmentBusy and DeadlineExceeded", err)
+	}
+	for _, name := range []string{IdentityFile, AgentFile} {
+		if data, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(data) != name {
+			t.Fatalf("expired reset changed %s: contents %q, error %v", name, data, err)
+		}
+	}
+	after, err := os.Stat(lockPath)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("expired reset changed the enrollment lock: %v", err)
+	}
+	if err := resetDir(t.Context(), dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{IdentityFile, AgentFile} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("live reset did not delete %s: %v", name, err)
+		}
+	}
+	after, err = os.Stat(lockPath)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("live reset changed the enrollment lock: %v", err)
+	}
+}
+
 func TestResetDirHandlesEnrollmentLockCasing(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, strings.ToUpper(EnrollmentLockFile))
