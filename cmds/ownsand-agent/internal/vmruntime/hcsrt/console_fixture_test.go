@@ -5,6 +5,7 @@ package hcsrt
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -136,7 +137,12 @@ func TestAcceptWithinReturnsConnection(t *testing.T) {
 // blocks until the peer reads.
 func TestWriteWithinTimeoutNamesAttemptAndClosesConn(t *testing.T) {
 	guest, runtimeSide := net.Pipe()
+	defer guest.Close()
 	defer runtimeSide.Close()
+
+	if err := runtimeSide.SetReadDeadline(time.Now().Add(consoleFixtureReclaimBound)); err != nil {
+		t.Fatalf("set peer read deadline: %v", err)
+	}
 
 	err := writeWithin(guest, 3, []byte("data"), 20*time.Millisecond)
 	if !errors.Is(err, errConsoleFixtureTimeout) {
@@ -145,8 +151,9 @@ func TestWriteWithinTimeoutNamesAttemptAndClosesConn(t *testing.T) {
 	if !strings.Contains(err.Error(), "guest write attempt 3 timed out") {
 		t.Fatalf("the error does not name the attempt: %q", err.Error())
 	}
-	if _, err := guest.Write([]byte("x")); err == nil {
-		t.Fatal("the connection is still open after the timeout")
+	var buf [1]byte
+	if n, err := runtimeSide.Read(buf[:]); n != 0 || err != io.EOF {
+		t.Fatalf("peer read after write timeout = (%d, %v), want (0, EOF)", n, err)
 	}
 }
 
