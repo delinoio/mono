@@ -11,6 +11,7 @@ import {
 import type * as React from "react";
 import { ButtonSize, ButtonVariant } from "./button.tsx";
 import { mergeClassName } from "./class-name.ts";
+import { DeferAutoFocusContext } from "./panel-autofocus.ts";
 
 export {
   createAlertDialogController,
@@ -29,9 +30,9 @@ export type AlertDialogProps = Omit<
 
 /**
  * A modal dialog that asks a question and waits for an answer, built from
- * UI SDK `AlertDialog`. It opens with focus on the first `AlertDialogClose`,
- * so put the least destructive answer first. Escape closes it; a press
- * outside does not.
+ * UI SDK `AlertDialog`. When no initial focus target is set, it focuses the
+ * first `AlertDialogClose`, so put the least destructive answer first.
+ * Escape closes the alert. A press outside leaves it open.
  */
 export function AlertDialog(props: AlertDialogProps) {
   // The type already omits `dismissible`, but types do not stop JS callers or
@@ -81,10 +82,12 @@ export function AlertDialogContent({
   return (
     <>
       <AlertDialogBackdrop className="dui-dialog-backdrop" />
-      <AlertDialogContentPart
-        className={mergeClassName("dui-dialog-content", className)}
-        {...props}
-      />
+      <DeferAutoFocusContext value={true}>
+        <AlertDialogContentPart
+          className={mergeClassName("dui-dialog-content", className)}
+          {...props}
+        />
+      </DeferAutoFocusContext>
     </>
   );
 }
