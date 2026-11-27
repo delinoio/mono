@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, test } from "@rstest/core";
 import { act, cleanup, render } from "@testing-library/react";
 import type * as React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
+import { renderToStaticMarkup, renderToString } from "react-dom/server";
 import { NumberInput } from "./number-input.tsx";
 import { PasswordInput } from "./password-input.tsx";
 import { RadioGroup, RadioGroupItem } from "./radio-group.tsx";
@@ -124,20 +124,64 @@ describe.each(FIELD_CASES)(
   },
 );
 
-describe("disabled field with an error", () => {
-  // The UI SDK does not show the error of a disabled field (an error part
-  // without `match` is inactive while the field is disabled).
-  test("shows no error text and keeps no dangling reference", () => {
-    const markup = renderToStaticMarkup(
-      <TextField
-        label="Name"
-        description="Your full name."
-        error={ERROR_MESSAGE}
-        disabled
-      />,
+describe.each([
+  ["TextField", TextField],
+  ["Textarea", Textarea],
+] as const)("%s error state when disabled", (_name, Component) => {
+  test.each(["", ERROR_MESSAGE])(
+    "keeps the description and suppresses the invalid state before and after hydration (%j)",
+    (error) => {
+      const field = (
+        <Component
+          label="Name"
+          description="Help text."
+          error={error}
+          disabled
+        />
+      );
+      const container = document.createElement("div");
+      container.innerHTML = renderToString(field);
+
+      function expectDisabledField() {
+        const control = container.querySelector("input, textarea");
+        expect(control?.hasAttribute("disabled")).toBe(true);
+        expect(control?.getAttribute("aria-invalid")).not.toBe("true");
+        expect(
+          control?.closest(".dui-text-field")?.hasAttribute("data-invalid"),
+        ).toBe(false);
+        expect(container.textContent).not.toContain(ERROR_MESSAGE);
+        const description = container.querySelector(
+          ".dui-text-field-description",
+        );
+        expect(description?.textContent).toBe("Help text.");
+        expect(
+          control?.getAttribute("aria-describedby")?.split(/\s+/),
+        ).toContain(description?.id);
+        expect(danglingDescribedByIds(container.innerHTML)).toEqual([]);
+      }
+
+      expectDisabledField();
+      render(field, { container, hydrate: true });
+      expectDisabledField();
+    },
+  );
+
+  test("restores the supplied error when reenabled", () => {
+    const field = (disabled: boolean) => (
+      <Component label="Name" error={ERROR_MESSAGE} disabled={disabled} />
     );
-    expect(markup).not.toContain(ERROR_MESSAGE);
-    expect(danglingDescribedByIds(markup)).toEqual([]);
+    const { container, getByRole, rerender } = render(field(false));
+    const control = getByRole("textbox", { name: "Name" });
+    const root = control.closest(".dui-text-field");
+
+    for (const disabled of [false, true, false]) {
+      rerender(field(disabled));
+      expect(control.hasAttribute("disabled")).toBe(disabled);
+      expect(control.getAttribute("aria-invalid") === "true").toBe(!disabled);
+      expect(root?.hasAttribute("data-invalid")).toBe(!disabled);
+      expect(container.textContent?.includes(ERROR_MESSAGE)).toBe(!disabled);
+      expect(danglingDescribedByIds(container.innerHTML)).toEqual([]);
+    }
   });
 });
 

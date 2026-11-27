@@ -16,9 +16,9 @@ export type TextFieldProps = React.ComponentProps<typeof Input> & {
   /** Help text shown below the input. */
   description?: React.ReactNode;
   /**
-   * An error message to show. A non-empty message marks the field as
-   * invalid. Without one (`undefined`, `null`, `false` or `""`), the field
-   * shows the browser's message after a failed submit.
+   * A non-empty error message marks an enabled field as invalid. Without
+   * one (`undefined`, `null`, `false` or `""`), an enabled field shows the
+   * browser's message after a failed submit.
    */
   error?: React.ReactNode;
 };
@@ -51,7 +51,7 @@ export function TextField({
     <Field
       className="dui-text-field"
       disabled={disabled}
-      invalid={hasError ? true : undefined}
+      invalid={hasError && !disabled ? true : undefined}
     >
       <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
       {/*
