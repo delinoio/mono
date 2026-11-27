@@ -377,6 +377,18 @@ func (r *Runtime) createVM(ctx context.Context, spec vmruntime.Spec, ops vmCreat
 		cleanup()
 		return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
 	}
+	// The image builder can replace the rootfs between the source check and the copy.
+	if spec.Snapshot == nil {
+		copiedDisk, err := os.Stat(disk)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("vzrt: stat copied base disk: %w", err)
+		}
+		if err := checkBaseDiskCapacity(copiedDisk.Size(), diskBytes); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
 	r.mu.Lock()
 	r.vms[spec.SandboxID] = v
 	r.mu.Unlock()
