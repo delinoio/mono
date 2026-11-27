@@ -203,7 +203,7 @@ Generated code does not log. Components never log credential fields of request m
 - After a schema change, run `pnpm install` and `scripts/protos.sh generate` from the repository root, and commit the schemas with the generated Go and TypeScript bindings. `scripts/protos.sh check` (lint, format and binding drift) and `scripts/protos.sh breaking <base>` cover `delino.sandrun.v1` together with the other packages under `protos/`, in the same CI job.
 - **Recorded decision (package rename).** The package was named `delino.tide.v1` until the project was renamed to SandRun. No client used it, so it was renamed in place without a new package version. `protos/buf.yaml` ignores the removed `delino/tide` path in the breaking-change check only because comparison bases from before the rename still contain it. Remove that `breaking.ignore` entry when no comparison base that CI uses contains `protos/delino/tide/`.
 - `protos/delino/sandrun/v1/schema_test.go` checks the general rules: `UNSPECIFIED` zero values, no client-streaming RPC, no credential in a response except the two one-time secrets, and `organization_id` on every RPC except the three documented ones.
-- The workspace package `@delino/sandrun-protos` has the scripts `build` and `typecheck`.
+- The private workspace package `@delino/sandrun-protos` has the scripts `build` and `typecheck`. Plain Node.js 24 resolves `@delino/sandrun-protos/v1/*` to JavaScript in `dist/v1/` after the build. Browser bundlers and workspace type checks resolve the generated TypeScript source.
 
 ## Dependencies and Integrations
 
