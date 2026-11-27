@@ -87,4 +87,24 @@ func TestRunClosesConnectionsAfterGrace(t *testing.T) {
 	if d := time.Since(start); d < 500*time.Millisecond {
 		t.Fatalf("Run returned after %v, before the grace period ended", d)
 	}
+
+	// Drain buffered output while the exec remains blocked and the request stays open.
+	// A pending HTTP/2 read can outlast the client context deadline.
+	receiveErr := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := s.s.Receive(); err != nil {
+				receiveErr <- err
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-receiveErr:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			t.Fatalf("exec stream did not close before the client context ended: receive: %v, context: %v", err, ctxErr)
+		}
+	case <-ctx.Done():
+		t.Fatalf("exec stream did not close before the client context ended: %v", ctx.Err())
+	}
 }
