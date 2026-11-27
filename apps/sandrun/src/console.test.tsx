@@ -3456,6 +3456,11 @@ describe("failed query refreshes", () => {
     const group = await within(dialog).findByRole("combobox", {
       name: "Runner group",
     });
+    const selectedGroup = "sandrun-private · selected";
+    expect(group.textContent).toBe("Default (default) · all");
+    await click(group);
+    await click(await screen.findByRole("option", { name: selectedGroup }));
+    expect(group.textContent).toBe(selectedGroup);
 
     fixture.fail(new ConnectError("offline", Code.Internal));
     await refetch(client);
@@ -3464,10 +3469,15 @@ describe("failed query refreshes", () => {
     expect(within(dialog).getByRole("combobox", { name: "Runner group" })).toBe(
       group,
     );
+    expect(group.textContent).toBe(selectedGroup);
     fixture.fail(undefined);
     await click(within(dialog).getByRole("button", { name: "Try again" }));
     expect(screen.getByRole("dialog")).toBe(dialog);
     expect(within(dialog).queryByText(refreshNotice)).toBeNull();
+    expect(
+      within(dialog).getByRole("combobox", { name: "Runner group" })
+        .textContent,
+    ).toBe(selectedGroup);
   });
 
   const infiniteLists = [
