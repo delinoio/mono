@@ -472,6 +472,9 @@ func TestVirtualizationIntegration(t *testing.T) {
 	t.Run("cancel-during-restored-readiness", func(t *testing.T) {
 		e.requireCanceledRestore(t, snapID, ownsandv1.GuestOs_GUEST_OS_LINUX)
 	})
+	t.Run("restored-clock", func(t *testing.T) {
+		e.checkRestoreClock(t, snapID, ownsandv1.GuestOs_GUEST_OS_LINUX)
+	})
 	if snap.GetHasMemoryState() {
 		e.invalidateMemoryState(snapID)
 		fallback := e.create(snapID, 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
