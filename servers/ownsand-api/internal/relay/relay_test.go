@@ -775,28 +775,19 @@ func TestUnknownKindOnAStreamSendsOneErrorFrameAndClosesOnlyThatStream(t *testin
 }
 
 func TestUnknownKindOnStreamZeroIsIgnored(t *testing.T) {
-	c := NewConn(context.Background(), "device", 1, testLimits)
-	s := openStream(t, c)
-	drainOut(c)
-	if err := c.dispatch(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind(99)}); err != nil {
-		t.Fatalf("unknown kind on stream 0: %v", err)
+	sc := runStepConn(t, stepLimits)
+	sc.awaitFrame(t) // Supported frame kinds.
+	s := openStream(t, sc.c)
+	sc.awaitFrame(t) // Stream open.
+	sc.deliver(t, &ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind(99)})
+	sc.deliver(t, echoRequest())
+	requireEchoReply(t, sc.awaitFrame(t))
+	if sc.c.StreamCount() != 1 {
+		t.Fatalf("StreamCount = %d, want 1", sc.c.StreamCount())
 	}
-	if frames := drainOut(c); len(frames) != 0 {
-		t.Fatalf("unknown kind on stream 0 queued %d frames", len(frames))
-	}
-	if err := c.dispatch(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{EchoRequested: true})); err != nil {
-		t.Fatal(err)
-	}
-	if frames := drainOut(c); len(frames) != 1 || frames[0].GetRelayKeepalive() == nil {
-		t.Fatalf("keepalive echo after the unknown kind = %v", frames)
-	}
-	if c.StreamCount() != 1 {
-		t.Fatalf("StreamCount = %d, want 1", c.StreamCount())
-	}
-	// Ordinary stream close is unchanged: it sends a stream close frame.
 	s.Close(true)
-	if frames := drainOut(c); len(frames) != 1 || frames[0].GetRelayStreamClose() == nil || frames[0].GetStreamId() != s.ID {
-		t.Fatalf("ordinary close frames = %v, want one stream close frame", frames)
+	if f := sc.awaitFrame(t); f.GetRelayStreamClose() == nil || f.GetStreamId() != s.ID {
+		t.Fatalf("sent %v, want one stream close frame", f)
 	}
 }
 
