@@ -119,6 +119,27 @@ describe("sign-in", () => {
 });
 
 describe("organizations", () => {
+  test("keeps the Requests section when switching organizations", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open(`/orgs/${ACME}/requests`);
+    const requests = screen.getByRole("heading", "Requests", { level: 1 });
+    await expect(requests).toBeVisible();
+
+    const switcher = screen.getByRole("combobox", "Organization");
+    await switcher.tap();
+    await screen.getByRole("option", "Northwind Labs").tap();
+
+    await expect(browser).toHaveURL(`/orgs/${NORTHWIND}/requests`);
+    await expect(switcher).toContainText("Northwind Labs");
+    await expect(requests).toBeVisible();
+  });
+
   test("shows the full error when the organization cannot load", async ({
     app,
     screen,
