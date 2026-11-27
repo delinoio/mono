@@ -68,6 +68,9 @@ type Client struct {
 	Auth Auth
 	// Logger receives vendor_api_error records.
 	Logger *slog.Logger
+	// StreamErrorBodyTimeout limits reads after non-2xx stream headers.
+	// Zero selects DefaultCallTimeout.
+	StreamErrorBodyTimeout time.Duration
 }
 
 // StatusError is a vendor API answer that is not 2xx.
@@ -257,7 +260,9 @@ type Event struct {
 // error) or the connection fails. A non-2xx answer returns a *StatusError.
 // header adds request headers, for example Last-Event-ID.
 func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, header http.Header, fn func(Event) error) error {
-	req, err := c.newRequest(ctx, http.MethodGet, path, query, nil)
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := c.newRequest(reqCtx, http.MethodGet, path, query, nil)
 	if err != nil {
 		return err
 	}
@@ -275,6 +280,13 @@ func (c *Client) Stream(ctx context.Context, op, path string, query url.Values, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		timeout := c.StreamErrorBodyTimeout
+		if timeout == 0 {
+			timeout = DefaultCallTimeout
+		}
+		// Cancel the HTTP request to interrupt a blocked response-body read.
+		timer := time.AfterFunc(timeout, cancel)
+		defer timer.Stop()
 		return c.statusError(ctx, op, resp)
 	}
 	err = ReadEvents(resp.Body, fn)
