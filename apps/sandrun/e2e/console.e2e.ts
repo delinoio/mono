@@ -403,11 +403,23 @@ describe("organization member pagination", () => {
     await picker.tap();
     await expect(screen.getByRole("option", "Mina Kim")).toBeHidden();
     await screen.getByRole("option", "Nora Lee").tap();
-    await screen.getByRole("button", "Transfer").tap();
-    await expect(
-      screen.getByRole("alertdialog", "Make Nora Lee the owner?"),
-    ).toBeVisible();
-    await screen.getByRole("button", "Transfer ownership").tap();
+    const transfer = screen.getByRole("button", "Transfer");
+    const confirmation = screen.getByRole(
+      "alertdialog",
+      "Make Nora Lee the owner?",
+    );
+    await transfer.tap();
+    await expect(confirmation).toBeVisible();
+    await confirmation.getByRole("button", "Cancel").tap();
+    await expect(confirmation).toBeHidden();
+
+    await transfer.tap();
+    await expect(confirmation).toBeVisible();
+    await browser.keyboard.press("Escape");
+    await expect(confirmation).toBeHidden();
+
+    await transfer.tap();
+    await confirmation.getByRole("button", "Transfer ownership").tap();
     await expect(
       screen.getByRole("heading", "Transfer ownership"),
     ).toBeHidden();
