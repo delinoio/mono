@@ -2,13 +2,14 @@
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { DescEnum, DescFile } from "@bufbuild/protobuf";
+import { Code } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { file_delino_ownsand_v1_agent } from "@delino/ownsand-protos/v1/agent_pb";
 import { file_delino_ownsand_v1_api_key } from "@delino/ownsand-protos/v1/api_key_pb";
 import { file_delino_ownsand_v1_audit } from "@delino/ownsand-protos/v1/audit_pb";
 import { file_delino_ownsand_v1_billing } from "@delino/ownsand-protos/v1/billing_pb";
 import {
-  ErrorCode,
+  ErrorCodeSchema,
   file_delino_ownsand_v1_common,
 } from "@delino/ownsand-protos/v1/common_pb";
 import {
@@ -103,7 +104,19 @@ describe("generated TypeScript bindings", () => {
   });
 
   test("ErrorCode values equal the Connect codes", () => {
-    expect(ErrorCode.CANCELED).toBe(1);
-    expect(ErrorCode.UNAUTHENTICATED).toBe(16);
+    const actual = Object.fromEntries(
+      ErrorCodeSchema.values
+        .filter((value) => value.number !== 0)
+        .map((value) => [value.name, value.number]),
+    );
+    const expected = Object.fromEntries(
+      Object.entries<string | number>(Code)
+        .filter(([, number]) => typeof number === "number" && number !== 0)
+        .map(([name, number]) => [
+          `ERROR_CODE_${name.replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase()}`,
+          number,
+        ]),
+    );
+    expect(actual).toEqual(expected);
   });
 });
