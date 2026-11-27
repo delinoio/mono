@@ -1556,7 +1556,7 @@ func newUpdateEnv(t *testing.T, block bool, revokedVersions ...string) *updateEn
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	sum := sha256.Sum256(artifact)
-	manifest, _ := json.Marshal(update.Manifest{Schema: 1, RevokedVersions: revokedVersions, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
+	manifest, _ := json.Marshal(update.Manifest{Schema: 1, Sequence: 1, RevokedVersions: revokedVersions, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
 	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifest))
 	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { w.Write(manifest) })
 	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(sig)) })
