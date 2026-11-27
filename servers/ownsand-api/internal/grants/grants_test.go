@@ -489,3 +489,103 @@ func TestGrantRetryKeepsMembershipSnapshot(t *testing.T) {
 		t.Fatalf("same-membership retry after admission expiry = %v, existing = %t, error = %v", g, existing, err)
 	}
 }
+
+func TestGrantRequestBinding(t *testing.T) {
+	for _, state := range []struct {
+		name      string
+		installed bool
+		advance   time.Duration
+	}{
+		{name: "pending"},
+		{name: "admittable", installed: true},
+		{name: "admission expired", installed: true, advance: Lifetime + AdmissionTolerance},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			c := &clock{t: time.Unix(1000, 0)}
+			r := New(c.now)
+			request := req("authorization", "user", "operation")
+			request.Membership.ID = "membership"
+			original, _, err := r.Reserve(request, newID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.installed {
+				r.Ack(original.ID, accepted, "")
+			}
+			c.t = c.t.Add(state.advance)
+
+			for _, change := range []struct {
+				name string
+				edit func(*Request)
+			}{
+				{"principal", func(r *Request) { r.Principal.ID = "other" }},
+				{"membership", func(r *Request) { r.Membership.ID = "other" }},
+				{"organization", func(r *Request) { r.OrgID = "other" }},
+				{"sandbox", func(r *Request) { r.SandboxID = "other" }},
+				{"device", func(r *Request) { r.DeviceID = "other" }},
+				{"operation kind", func(r *Request) { r.Kind = ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE }},
+				{"operation ID", func(r *Request) { r.OperationID = "other" }},
+				{"digest", func(r *Request) { r.Digest = []byte("other") }},
+				{"predecessor", func(r *Request) { r.ReplacesID = "other" }},
+			} {
+				t.Run(change.name, func(t *testing.T) {
+					conflict := request
+					change.edit(&conflict)
+					if g, existing, err := r.Reserve(conflict, newID); g != nil || existing || !errors.Is(err, ErrReuse) {
+						t.Fatalf("conflicting reservation: grant = %v, existing = %t, error = %v", g, existing, err)
+					}
+					if r.byAuth[request.AuthorizationID] != original || r.Get(original.ID) != original || r.Len() != 1 {
+						t.Fatal("conflict changed the original registration")
+					}
+				})
+			}
+
+			if state.advance == 0 {
+				if g, existing, err := r.Reserve(request, newID); err != nil || !existing || g != original {
+					t.Fatalf("identical retry: grant = %v, existing = %t, error = %v", g, existing, err)
+				}
+			}
+			c.t = original.RevocableUntil()
+			changed := request
+			changed.OperationID = "operation after removal"
+			if g, existing, err := r.Reserve(changed, newID); err != nil || existing || g == original || r.Get(original.ID) != nil {
+				t.Fatalf("reservation after sweep: grant = %v, existing = %t, error = %v", g, existing, err)
+			}
+		})
+	}
+}
+
+func TestGrantFailedRetryKeepsRequestBinding(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	request := req("authorization", "user", "operation")
+	original, _, err := r.Reserve(request, newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Ack(original.ID, accepted, "")
+	c.t = c.t.Add(Lifetime + AdmissionTolerance)
+
+	var last *Grant
+	for i := 1; i < MaxPerPrincipal; i++ {
+		last, _, err = r.Reserve(req(fmt.Sprintf("filler-%d", i), "user", "filler"), newID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := r.Reserve(request, newID); !errors.Is(err, ErrLimit) {
+		t.Fatalf("identical retry at the limit: %v", err)
+	}
+	r.Release(last.ID, request.DeviceID)
+	conflict := request
+	conflict.OperationID = "other"
+	if _, _, err := r.Reserve(conflict, newID); !errors.Is(err, ErrReuse) {
+		t.Fatalf("conflict after a failed retry: %v", err)
+	}
+	if r.byAuth[request.AuthorizationID] != original || r.Get(original.ID) != original {
+		t.Fatal("failed retries changed the original registration")
+	}
+	if g, existing, err := r.Reserve(request, newID); err != nil || existing || g == original {
+		t.Fatalf("identical retry with room: grant = %v, existing = %t, error = %v", g, existing, err)
+	}
+}
