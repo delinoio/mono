@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
@@ -557,17 +558,76 @@ func newLateRejectionFixture(t *testing.T) *lateRejectionFixture {
 // rejectOne makes the API reject one held call and returns that call's error.
 func (f *lateRejectionFixture) rejectOne(t *testing.T) error {
 	t.Helper()
-	f.h.reject <- struct{}{}
-	for {
-		for _, ch := range f.calls {
-			select {
-			case err := <-ch:
-				return err
-			default:
-			}
-		}
-		time.Sleep(time.Millisecond)
+	rpcErr, fixtureErr := f.waitForRejection(5 * time.Second)
+	if fixtureErr != nil {
+		t.Fatal(fixtureErr)
 	}
+	return rpcErr
+}
+
+func (f *lateRejectionFixture) waitForRejection(timeout time.Duration) (rpcErr, fixtureErr error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case f.h.reject <- struct{}{}:
+	case <-timer.C:
+		return nil, errors.New("timed out sending the rejection to the fake API")
+	}
+
+	select {
+	case err := <-f.calls[0]:
+		return err, nil
+	case err := <-f.calls[1]:
+		return err, nil
+	case <-timer.C:
+		return nil, errors.New("timed out waiting for the rejected RPC result")
+	}
+}
+
+func TestLateRejectionFixtureDeadline(t *testing.T) {
+	const timeout = 20 * time.Millisecond
+
+	t.Run("no rejection recipient", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &lateRejectionFixture{
+				h:     &gatedUsageHandler{reject: make(chan struct{})},
+				calls: [2]chan error{make(chan error, 1), make(chan error, 1)},
+			}
+			f.calls[0] <- errors.New("early RPC result")
+
+			start := time.Now()
+			rpcErr, fixtureErr := f.waitForRejection(timeout)
+			if rpcErr != nil || fixtureErr == nil || fixtureErr.Error() != "timed out sending the rejection to the fake API" {
+				t.Fatalf("RPC error = %v, fixture error = %v", rpcErr, fixtureErr)
+			}
+			if elapsed := time.Since(start); elapsed != timeout {
+				t.Fatalf("send wait = %v, want %v", elapsed, timeout)
+			}
+		})
+	})
+
+	t.Run("no RPC result", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &lateRejectionFixture{
+				h:     &gatedUsageHandler{reject: make(chan struct{})},
+				calls: [2]chan error{make(chan error, 1), make(chan error, 1)},
+			}
+			go func() {
+				time.Sleep(timeout / 2)
+				<-f.h.reject
+			}()
+
+			start := time.Now()
+			rpcErr, fixtureErr := f.waitForRejection(timeout)
+			if rpcErr != nil || fixtureErr == nil || fixtureErr.Error() != "timed out waiting for the rejected RPC result" {
+				t.Fatalf("RPC error = %v, fixture error = %v", rpcErr, fixtureErr)
+			}
+			if elapsed := time.Since(start); elapsed != timeout {
+				t.Fatalf("combined send and result wait = %v, want %v", elapsed, timeout)
+			}
+		})
+	})
 }
 
 func TestUsageClientLateRejectionKeepsTheReplacementToken(t *testing.T) {

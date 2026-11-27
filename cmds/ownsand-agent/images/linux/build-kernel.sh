@@ -125,9 +125,9 @@ docker run --rm \
     fi
     apt-get update -qq >/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $packages >/dev/null
-    # Fills the shared cache with a verified archive: a unique temporary file
-    # that is checked before an atomic rename, so concurrent builds never see
-    # a partial archive and a bad cached archive is replaced.
+    # Verify the archive in a private staging directory before publishing it
+    # with an atomic rename. Concurrent builds see only complete archives,
+    # and a successful fill replaces a corrupted cached archive.
     bash /src/fetch-kernel-source.sh "$VERSION" "$SHA256" \
       "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$VERSION.tar.xz" /cache
     tarball="/cache/linux-$VERSION.tar.xz"

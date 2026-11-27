@@ -309,22 +309,35 @@ func (h *handler) attach(ctx context.Context, req *ownsandv1.AttachExecRequest) 
 }
 
 // streamExec sends the event sequence of op from the offsets. On a paused
-// sandbox it sends only the kept output and result, and a paused event
-// when the exec has not ended.
+// sandbox it replays the available events and sends Paused if the exec
+// has not ended.
 func (h *handler) streamExec(ctx context.Context, op *execOp, stdoutOff, stderrOff int64, paused bool) (Outcome, error) {
 	c := op.log.Cursor(stdoutOff, stderrOff)
+	started := false
 	for {
 		var ev *ownsandv1.ExecEvent
 		if paused {
 			var changed <-chan struct{}
 			ev, changed = c.TryNext()
 			if ev == nil && changed != nil {
+				if !started {
+					// The exec is admitted, but the guest start is pending.
+					// Send Started on this stream so a later attach can
+					// replay the timestamp that the guest reports.
+					start := &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Started{
+						Started: &ownsandv1.ExecStarted{ExecId: op.log.ExecID()},
+					}}
+					if err := h.send(ctx, start); err != nil {
+						return Outcome{}, nil
+					}
+				}
 				ev = &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Paused{Paused: &ownsandv1.ExecPaused{}}}
 				return Outcome{}, h.send(ctx, ev)
 			}
 			if ev == nil {
 				return Outcome{Finished: true}, nil
 			}
+			started = started || ev.GetStarted() != nil
 		} else {
 			var err error
 			ev, err = c.Next(ctx, KeepaliveInterval)

@@ -3,6 +3,8 @@
 package main
 
 import (
+	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -28,15 +30,20 @@ func TestServiceEnvCarriesEveryAgentVariable(t *testing.T) {
 }
 
 func TestServiceEnvSkipsUnsetAndEmptyVariables(t *testing.T) {
-	for _, name := range config.EnvNames {
-		t.Setenv(name, "")
-	}
+	clearAgentEnv(t)
 	t.Setenv(config.EnvStateDir, "/var/lib/x")
 	t.Setenv(config.EnvLinuxKernel, "")
 	t.Setenv(config.EnvLinuxRootfs, "/rootfs")
+	if _, present := os.LookupEnv(config.EnvFirecrackerBinary); present {
+		t.Fatalf("%s must be unset", config.EnvFirecrackerBinary)
+	}
+	if value, present := os.LookupEnv(config.EnvLinuxKernel); !present || value != "" {
+		t.Fatalf("%s must be set to an empty string", config.EnvLinuxKernel)
+	}
+
 	got := serviceEnv("")
 	want := []string{config.EnvStateDir + "=/var/lib/x", config.EnvLinuxRootfs + "=/rootfs"}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+	if !slices.Equal(got, want) {
 		t.Fatalf("serviceEnv() = %v, want %v", got, want)
 	}
 }
@@ -62,13 +69,15 @@ func TestServiceEnvStateDirOverrideReplacesTheEnvironmentValue(t *testing.T) {
 }
 
 func TestServiceEnvStateDirOverrideIsAddedWhenTheEnvironmentHasNone(t *testing.T) {
-	for _, name := range config.EnvNames {
-		t.Setenv(name, "")
-	}
+	clearAgentEnv(t)
 	t.Setenv(config.EnvLinuxRootfs, "/rootfs")
+	if _, present := os.LookupEnv(config.EnvStateDir); present {
+		t.Fatalf("%s must be unset", config.EnvStateDir)
+	}
+
 	got := serviceEnv("/var/lib/from-flag")
 	want := []string{config.EnvStateDir + "=/var/lib/from-flag", config.EnvLinuxRootfs + "=/rootfs"}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+	if !slices.Equal(got, want) {
 		t.Fatalf("serviceEnv(override) = %v, want %v", got, want)
 	}
 }

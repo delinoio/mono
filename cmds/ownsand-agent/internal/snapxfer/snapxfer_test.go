@@ -371,7 +371,9 @@ func TestTransferRequestsEachPartURLRightBeforeUse(t *testing.T) {
 	if len(parts) <= 8 {
 		t.Fatalf("parts = %d, want more than 8", len(parts))
 	}
+	b.mu.Lock()
 	exportEvents := slices.Clone(b.events)
+	b.mu.Unlock()
 	dst := filepath.Join(t.TempDir(), "content")
 	if err := tr.Import(context.Background(), "snap", parts, dst); err != nil {
 		t.Fatal(err)
@@ -379,10 +381,15 @@ func TestTransferRequestsEachPartURLRightBeforeUse(t *testing.T) {
 	if got, _ := os.ReadFile(filepath.Join(dst, "disk")); string(got) != content {
 		t.Fatal("imported content differs")
 	}
-	if b.expired != 0 {
-		t.Fatalf("%d requests used an expired URL", b.expired)
+	b.mu.Lock()
+	importEvents := slices.Clone(b.events[len(exportEvents):])
+	expired := b.expired
+	batches := slices.Clone(b.batches)
+	b.mu.Unlock()
+	if expired != 0 {
+		t.Fatalf("%d requests used an expired URL", expired)
 	}
-	for _, n := range b.batches {
+	for _, n := range batches {
 		if n != 1 {
 			t.Fatalf("a URL request named %d parts, want 1", n)
 		}
@@ -400,8 +407,8 @@ func TestTransferRequestsEachPartURLRightBeforeUse(t *testing.T) {
 	for p := 1; p <= len(parts); p++ {
 		wantImport = append(wantImport, "URL "+strconv.Itoa(p), "GET /snap/"+strconv.Itoa(p))
 	}
-	if got := b.events[len(exportEvents):]; !slices.Equal(got, wantImport) {
-		t.Fatalf("import events = %v, want %v", got, wantImport)
+	if !slices.Equal(importEvents, wantImport) {
+		t.Fatalf("import events = %v, want %v", importEvents, wantImport)
 	}
 }
 
@@ -438,7 +445,9 @@ func TestImportRejectsACorruptDownload(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			b, parts := storeSnapshot(t, content, 4096)
 			last := "/snap/" + strconv.Itoa(len(parts))
+			b.mu.Lock()
 			b.objects[last] = tc.mutate(b.objects[last])
+			b.mu.Unlock()
 			tempDir := t.TempDir()
 			tr := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: quietLogger(), TempDir: tempDir}
 			base := t.TempDir()

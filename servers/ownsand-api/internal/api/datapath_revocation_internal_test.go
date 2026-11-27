@@ -83,7 +83,7 @@ func TestDeferredRevocationTerminalCleanup(t *testing.T) {
 			p.S.Hub.Unregister(replacement)
 		}},
 		{"device removal", func(_ *testing.T, p *DataPlane, conn *hub.Conn, _ *time.Time, _ time.Time) {
-			p.HandleEvent(context.Background(), events.Event{Kind: events.KindDeviceRemoved, DeviceID: conn.DeviceID})
+			p.HandleEvent(context.Background(), events.Event{Kind: events.KindDeviceRemoved, DeviceID: conn.DeviceID}, channelGenerations{first: conn.Generation, last: conn.Generation})
 		}},
 	}
 	for _, c := range cases {

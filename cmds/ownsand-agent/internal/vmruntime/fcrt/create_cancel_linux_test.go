@@ -265,6 +265,25 @@ func (f *createFixture) create(ctx context.Context) <-chan error {
 	return done
 }
 
+// stopCreateProcess ends the fake's blocked request so Create can clean up.
+func (f *createFixture) stopCreateProcess(t *testing.T) {
+	t.Helper()
+	f.r.mu.Lock()
+	v := f.r.vms[f.spec.SandboxID]
+	f.r.mu.Unlock()
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	l := v.launch
+	v.mu.Unlock()
+	if l != nil {
+		if _, err := l.signal(f.r.signalGroup); err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Errorf("stop fake firecracker: %v", err)
+		}
+	}
+}
+
 func (f *createFixture) createWithSurvivingProcess(t *testing.T) (context.CancelFunc, <-chan error) {
 	t.Helper()
 	signalGroup, stopTimeout := f.r.signalGroup, f.r.stopTimeout
@@ -289,7 +308,11 @@ func (f *createFixture) createWithSurvivingProcess(t *testing.T) (context.Cancel
 // a failing test; a passing test waits for the event itself.
 func (f *createFixture) waitEvent(t *testing.T, event string) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	f.waitEventBefore(t, event, time.Now().Add(30*time.Second))
+}
+
+func (f *createFixture) waitEventBefore(t *testing.T, event string, deadline time.Time) {
+	t.Helper()
 	for {
 		for _, e := range f.events(t) {
 			if e == event {
@@ -374,12 +397,36 @@ func TestCreateContextEndedDuringRestoreStartsNoReplacement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newCreateFixture(t, loadBlock)
 			ctx, end := tc.ctx()
-			t.Cleanup(end)
+			// Allow startup and process cleanup, with a deadline shorter
+			// than the independent 60-second HTTP client timeout.
+			const createTimeout = 25 * time.Second
+			deadline := time.Now().Add(createTimeout)
 			done := f.create(ctx)
-			f.waitEvent(t, "1 PUT /snapshot/load")
+			t.Cleanup(func() {
+				end()
+				select {
+				case <-done:
+				default:
+					f.stopCreateProcess(t)
+				}
+				// Join Create before closing the runtime or removing fixture files.
+				for range done {
+				}
+			})
+			f.waitEventBefore(t, "1 PUT /snapshot/load", deadline)
 			end()
-			if err := <-done; !errors.Is(err, tc.want) {
-				t.Fatalf("create error = %v, want %v", err, tc.want)
+			timer := time.NewTimer(time.Until(deadline))
+			defer timer.Stop()
+			select {
+			case err := <-done:
+				if time.Now().After(deadline) {
+					t.Fatalf("Create did not return within %s of starting", createTimeout)
+				}
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("create error = %v, want %v", err, tc.want)
+				}
+			case <-timer.C:
+				t.Fatalf("Create did not return within %s of starting", createTimeout)
 			}
 			if n := f.launches(t); n != 1 {
 				t.Fatalf("%d firecracker launches, want 1", n)
