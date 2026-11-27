@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+	"github.com/delinoio/mono/servers/accounts-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle/paddletest"
@@ -481,42 +484,67 @@ func TestCloseAccountCancelsSubscription(t *testing.T) {
 	}
 }
 
+type pendingTopUpScanKey struct{}
+
+type emptyTopUpScans chan struct{}
+
+func (scans emptyTopUpScans) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, " FROM top_ups WHERE status = 'pending'") {
+		return context.WithValue(ctx, pendingTopUpScanKey{}, true)
+	}
+	return ctx
+}
+
+func (scans emptyTopUpScans) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	// pgx traces the completed SELECT before QueryRow reports ErrNoRows.
+	if ctx.Value(pendingTopUpScanKey{}) == true && data.Err == nil && data.CommandTag.String() == "SELECT 0" {
+		select {
+		case scans <- struct{}{}:
+		case <-ctx.Done():
+		}
+	}
+}
+
 func TestWorkerWakeAndStop(t *testing.T) {
-	f := newFixture(t)
+	scans := make(emptyTopUpScans, 3)
+	cfg, err := pgxpool.ParseConfig(dbtest.NewURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.Tracer = scans
+	pool, err := pgxpool.NewWithConfig(ctx(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := newFixtureOn(t, &db.DB{Pool: pool})
 	acct := f.account()
 	f.activate(acct)
 	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
 	runCtx, cancel := context.WithCancel(ctx())
 	done := make(chan struct{})
-	go func() {
-		f.s.RunWorker(runCtx, time.Hour)
-		close(done)
-	}()
-	// An early fatal assertion must stop the worker and wait for it before
-	// the fixture closes the database and the provider, which t.Cleanup runs
-	// in reverse order of registration. Cancel is idempotent, so the normal
-	// path below may stop the worker first.
+	// Join the worker before the fixture closes the database and provider,
+	// including when an assertion fails.
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Errorf("RunWorker did not stop during cleanup")
-		}
+		<-done
 	})
-	// RunWorker reads the wake channel only after the startup RunOnce scan has
-	// returned. Send a wake with nothing queued and wait until the worker has
-	// received it: the drained channel proves the startup scan has finished,
-	// so the startup scan cannot be what charges the top-up queued below. The
-	// wake channel holds one signal and the idle wake handler does nothing.
-	f.s.Wake()
-	deadline := time.Now().Add(10 * time.Second)
-	for len(f.s.wake) != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the worker did not finish its startup scan")
+	go func() {
+		defer close(done)
+		f.s.RunWorker(runCtx, time.Hour)
+	}()
+	waitForEmptyScan := func(pass string) {
+		select {
+		case <-scans:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the %s pass did not finish an empty pending top-up scan", pass)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
+	waitForEmptyScan("startup")
+	// Wait for the setup wake's scan to find no pending work before queuing
+	// the top-up. Only the second wake should be able to charge it.
+	f.s.Wake()
+	waitForEmptyScan("setup wake")
 	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
 		t.Fatal("not queued")
 	}
@@ -524,12 +552,14 @@ func TestWorkerWakeAndStop(t *testing.T) {
 		t.Fatalf("%d charges before Wake", n)
 	}
 	f.s.Wake()
-	deadline = time.Now().Add(10 * time.Second)
-	for len(f.paddle.Charges()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("Wake did not charge the queued top-up")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// After charging, the worker scans once more before it returns to idle.
+	select {
+	case <-scans:
+	case <-time.After(10 * time.Second):
+		t.Error("Wake did not finish processing pending top-ups")
+	}
+	if n := len(f.paddle.Charges()); n != 1 {
+		t.Fatalf("%d charges after Wake, want 1", n)
 	}
 	cancel()
 	select {
