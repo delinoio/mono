@@ -3657,14 +3657,18 @@ func failCreateSave(t *testing.T, e *env, fault func(string) func()) (string, Re
 }
 
 func TestFailedCreateRetriesTerminalSaveBeforeCleanup(t *testing.T) {
-	for _, fault := range []string{"revision", "record"} {
+	for _, fault := range []string{"cleanup-marker", "revision", "record"} {
 		t.Run(fault, func(t *testing.T) {
 			e := newEnv(t)
 			id, creating, restore := failCreateSave(t, e, func(id string) func() {
-				if fault == "revision" {
+				switch fault {
+				case "cleanup-marker":
+					return blockCleanupMarkerSave(t, e.st, id)
+				case "revision":
 					return failRevisions(t, e.st)
+				default:
+					return breakFile(t, e.st.Path(store.SandboxesDir, id+".json"))
 				}
-				return breakFile(t, e.st.Path(store.SandboxesDir, id+".json"))
 			})
 
 			for attempt := range 3 {
@@ -3679,8 +3683,8 @@ func TestFailedCreateRetriesTerminalSaveBeforeCleanup(t *testing.T) {
 				if states := e.out.states(id); !slices.Equal(states, []ownsandv1.SandboxState{creating.State}) {
 					t.Fatalf("published states during storage fault = %v, want only CREATING", states)
 				}
-				if fault == "revision" && persistedRecord(t, e.st, id) != creating {
-					t.Fatal("failed revision write changed the saved CREATING record")
+				if fault != "record" && persistedRecord(t, e.st, id) != creating {
+					t.Fatal("failed storage write changed the saved CREATING record")
 				}
 			}
 			if calls := e.rt.deleteCallCount(); calls != 0 || e.pendingCleanups() != 1 {
@@ -3965,7 +3969,7 @@ func TestFailedCreateCleanupWaitsForLiveRecord(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(time.Hour, time.Hour).GetSandboxId()
 	e.m.mu.Lock()
-	e.m.cleanupPending[id] = struct{}{}
+	e.m.cleanupPending[id] = cleanupFromInventory
 	e.m.mu.Unlock()
 	e.tickAndWait()
 	if calls := e.rt.deleteCallCount(); calls != 0 {
