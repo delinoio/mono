@@ -47,7 +47,7 @@ func windowsMain(args []string) (int, bool) {
 // service-specific exit code, so the restart-on-failure actions of the
 // service apply.
 func runService(args []string) int {
-	h := &serviceHandler{args: args}
+	h := &serviceHandler{args: args, reportStartupError: writeStartupEvent}
 	if err := svc.Run(serviceName, h); err != nil {
 		return 1
 	}
@@ -55,8 +55,9 @@ func runService(args []string) int {
 }
 
 type serviceHandler struct {
-	args []string
-	code int
+	args               []string
+	code               int
+	reportStartupError func(string) error
 }
 
 func (h *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
@@ -64,7 +65,7 @@ func (h *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan int, 1)
-	go func() { done <- run(ctx, h.args, openServiceLog) }()
+	go func() { done <- run(ctx, h.args, h.openServiceLog) }()
 	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	for {
 		select {
@@ -89,12 +90,6 @@ func (h *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, 
 			}
 		}
 	}
-}
-
-// openServiceLog opens the service log in the state directory (see
-// openLogFile).
-func openServiceLog(stateDir string) (logOutput, error) {
-	return openLogFile(stateDir, logRotateBytes)
 }
 
 // runFlushVolumes flushes every fixed volume with FlushFileBuffers on the
