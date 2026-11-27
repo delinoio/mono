@@ -783,6 +783,28 @@ describe("keyboard scrolling in tables", () => {
 });
 
 describe("requests", () => {
+  test("shows only requests that match the selected kind and state", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/requests`);
+
+    const requests = screen.getByRole("table", "Requests");
+    await expect(requests).toContainText("sess_codex_4711");
+    await expect(requests).toContainText("build (ubuntu)");
+
+    await screen.getByRole("combobox", "Kind").tap();
+    await screen.getByRole("option", "GitHub job").tap();
+    await screen.getByRole("combobox", "State").tap();
+    await screen.getByRole("option", "Queued").tap();
+
+    await expect(requests).toContainText("test (ubuntu)");
+    await expect(requests).not.toContainText("sess_codex_4711");
+    await expect(requests).not.toContainText("build (ubuntu)");
+  });
+
   test("shows active requests in queue order before ended requests", async ({
     app,
     browser,
