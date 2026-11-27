@@ -1,0 +1,55 @@
+{
+  "gid": "inv-32-darwin-copied-base-disk-capacity",
+  "commit": "46478282108dc47e811437f7ce458c9e27a6b680",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "46478282108dc47e811437f7ce458c9e27a6b680",
+    "setup": "Run in Bash from a clean APFS checkout at the listed revision. Keep TMPDIR and the unpacked test image on the same APFS volume. Copy the supplied arm64 Linux guest archive into .t3-tmp/darwin-disk after creating that directory and before the checksum command. Native Apple clang, the macOS SDK and Go are required. Ad-hoc codesigning needs no administrator access.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"46478282108dc47e811437f7ce458c9e27a6b680\" && test \"$(uname -m)\" = arm64",
+      "D=\"$(git rev-parse --show-toplevel)/.t3-tmp/darwin-disk\"; mkdir -p \"$D/tmp\" \"$D/image\"; export TMPDIR=\"$D/tmp\" COPYFILE_DISABLE=1",
+      "PKG=\"./cmds/ownsand-agent/internal/vmruntime/vzrt\"; CGO_ENABLED=1 go vet \"$PKG\" 2>&1 | tee \"$D/vet.log\"",
+      "CGO_ENABLED=1 go test -c -o \"$D/vzrt.test\" \"$PKG\" 2>&1 | tee \"$D/compile.log\"",
+      "codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$D/vzrt.test\" && codesign --verify --strict \"$D/vzrt.test\"",
+      "\"$D/vzrt.test\" -test.v -test.count=1 -test.timeout=5m -test.run '^TestVirtualizationRejectsOversizedCopiedBaseDisk$' 2>&1 | tee \"$D/replaced-rootfs.log\"",
+      "\"$D/vzrt.test\" -test.v -test.count=1 -test.timeout=5m -test.run '^TestVirtualizationRejectsUndersizedSparseBaseDisk$/^Linux$' 2>&1 | tee \"$D/early-precheck.log\"",
+      "printf \"%s  %s\\n\" \"10110e100a44d284cdec0eb4874bd61280c0f950308a113f2d26905a8c96b1da\" \"$D/linux-guest-arm64.tar.gz\" | shasum -a 256 -c - && tar -xzf \"$D/linux-guest-arm64.tar.gz\" -C \"$D/image\"",
+      "OWNSAND_VZ_TEST_KERNEL=\"$D/image/vmlinux\" OWNSAND_VZ_TEST_ROOTFS=\"$D/image/rootfs.ext4\" \"$D/vzrt.test\" -test.v -test.count=1 -test.timeout=10m -test.run '^TestVirtualizationBaseImageDiskCapacity$/^Linux$' 2>&1 | tee \"$D/linux-guest-capacity.log\""
+    ],
+    "expectedResults": [
+      "Go vet and the cgo test build succeed, and codesign verifies the entitled test binary.",
+      "The APFS replacement fixture returns ErrUnsupported with required 2147483648 and requested 1073741824 bytes. Growth is never called, the sandbox directory and tracked VM are absent, and the replacement rootfs survives.",
+      "The existing Linux early-precheck fixture preserves the directory marker, reports FAILED_PRECONDITION and records FAILED / CREATE_FAILED through the manager. The rejected create leaves no sandbox directory or active VM.",
+      "The entitled Virtualization.framework run boots two disposable Linux guests. The 2 GiB and 3 GiB cases each report matching prepared file and guest device bytes (2147483648 and 3221225472) and preserve the source. All selected tests report PASS without SKIP."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-darwin-copied-base-disk-capacity/worker/.t3-tmp/darwin-disk-validation/linux-guest-arm64.tar.gz",
+      "copyTo": ".t3-tmp/darwin-disk/linux-guest-arm64.tar.gz",
+      "sha256": "10110e100a44d284cdec0eb4874bd61280c0f950308a113f2d26905a8c96b1da",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/create_disk_darwin_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/base_disk_darwin_test.go",
+        "cmds/ownsand-agent/entitlements.plist"
+      ],
+      "outputLogs": [
+        ".t3-tmp/darwin-disk/vet.log",
+        ".t3-tmp/darwin-disk/compile.log",
+        ".t3-tmp/darwin-disk/replaced-rootfs.log",
+        ".t3-tmp/darwin-disk/early-precheck.log",
+        ".t3-tmp/darwin-disk/linux-guest-capacity.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-darwin-copied-base-disk-capacity/worker/.t3-tmp/darwin-disk-validation/vzrt-darwin-arm64-nocgo.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-darwin-copied-base-disk-capacity/worker/.t3-tmp/darwin-disk-validation/ownsand-agent-darwin-arm64-nocgo"
+      ]
+    },
+    "limits": [
+      "The Linux worker could not compile or run the Darwin cgo implementation. These commands remain pending on m3-16.",
+      "macOS guest boot tests need a bootable macOS guest image. That image and an IPSW are unavailable and unnecessary for this Linux-guest-only change."
+    ]
+  }
+}
