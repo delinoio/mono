@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -163,6 +164,79 @@ func TestToolList(t *testing.T) {
 	}
 }
 
+func TestToolArgumentErrors(t *testing.T) {
+	var clientCalls atomic.Int32
+	h := newHarness(t, Config{Client: func(context.Context) (*sandrun.Client, error) {
+		clientCalls.Add(1)
+		return nil, errors.New("unexpected client initialization")
+	}})
+
+	for _, tc := range []struct {
+		tool string
+		args string
+		want string
+	}{
+		{"wait_session", `{"session_id":"test-session","wait_seconds":"1"}`, `validating "arguments":`},
+		{"wait_session", `{"session_id":"test-session","wait_seconds":1.5}`, `validating "arguments":`},
+		{"wait_session", `{"session_id":"test-session","wait_seconds":9223372036854775808}`, "json: cannot unmarshal"},
+		{"get_session", `{}`, `validating "arguments":`},
+	} {
+		res, err := h.session.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: json.RawMessage(tc.args)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.IsError || len(res.Content) != 1 {
+			t.Fatalf("%s %s: result = %+v", tc.tool, tc.args, res)
+		}
+		msg, ok := res.Content[0].(*mcp.TextContent)
+		if !ok || !strings.HasPrefix(msg.Text, "invalid_argument: "+tc.want) {
+			t.Errorf("%s %s: content = %+v, want invalid_argument: %s", tc.tool, tc.args, res.Content[0], tc.want)
+		}
+	}
+
+	_, err := h.session.CallTool(context.Background(), &mcp.CallToolParams{Name: "unknown_tool"})
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+		t.Errorf("unknown tool error = %v, want JSON-RPC invalid params", err)
+	}
+	if n := clientCalls.Load(); n != 0 {
+		t.Errorf("invalid calls initialized %d SandRun clients", n)
+	}
+}
+
+func TestFractionalToolWaits(t *testing.T) {
+	var clientCalls atomic.Int32
+	h := newHarness(t, Config{Client: func(context.Context) (*sandrun.Client, error) {
+		clientCalls.Add(1)
+		return nil, errors.New("unexpected client initialization")
+	}})
+
+	for tool, args := range map[string]map[string]any{
+		"wait_session":    {"session_id": "test-session"},
+		"exec":            {"session_id": "test-session", "command": []string{"true"}},
+		"exec_output":     {"session_id": "test-session", "exec_id": "exec", "stderr_offset": 0, "stdout_offset": 0},
+		"sync":            {"session_id": "test-session"},
+		"download":        {"session_id": "test-session", "guest_path": "in", "local_path": "out"},
+		"transfer_status": {"transfer_id": "transfer"},
+	} {
+		for _, seconds := range []json.RawMessage{
+			json.RawMessage("1.0000000000000000001"),
+			json.RawMessage("50.0000000000000000001"),
+			json.RawMessage("1e-1000000"),
+			json.RawMessage("1e1000000"),
+		} {
+			args["wait_seconds"] = seconds
+			text, isErr := h.call(tool, args, nil)
+			if !isErr || !strings.HasPrefix(text, "invalid_argument: ") || !strings.Contains(text, "wait_seconds") {
+				t.Errorf("%s wait_seconds %s = %q, isError = %v", tool, seconds, text, isErr)
+			}
+		}
+	}
+	if n := clientCalls.Load(); n != 0 {
+		t.Errorf("fractional waits initialized %d SandRun clients", n)
+	}
+}
+
 func TestWaitLimit(t *testing.T) {
 	h := newHarness(t, Config{})
 	id := h.running()
@@ -173,8 +247,16 @@ func TestWaitLimit(t *testing.T) {
 		t.Fatalf("wait_seconds -1 accepted: %q", text)
 	}
 	var r sessionResult
-	if text, isErr := h.call("wait_session", map[string]any{"session_id": id, "wait_seconds": 50}, &r); isErr || r.Session.State != "running" {
-		t.Fatalf("wait_seconds 50 = %q %+v", text, r)
+	args := map[string]any{"session_id": id}
+	for _, wait := range []string{"0", "50", "50.0", "5e1", "50000e-3", "null"} {
+		args["wait_seconds"] = json.RawMessage(wait)
+		if text, isErr := h.call("wait_session", args, &r); isErr || r.Session.State != "running" {
+			t.Errorf("wait_seconds %s = %q %+v", wait, text, r)
+		}
+	}
+	delete(args, "wait_seconds")
+	if text, isErr := h.call("wait_session", args, &r); isErr || r.Session.State != "running" {
+		t.Errorf("omitted wait_seconds = %q %+v", text, r)
 	}
 
 	// A queued session returns its state when the wait passes.
@@ -421,13 +503,13 @@ func TestExecTimeoutRange(t *testing.T) {
 	h := newHarness(t, Config{})
 	args := map[string]any{"session_id": h.running(), "command": []string{"sh", "-c", "exit 0"}}
 
-	for _, seconds := range []int64{-1, 9223372037, 18446744074} {
-		args["timeout_seconds"] = seconds
-		if text, isErr := h.call("exec", args, nil); !isErr || !strings.HasPrefix(text, "invalid_argument:") {
-			t.Errorf("timeout_seconds %d = %q, isError = %v", seconds, text, isErr)
+	for _, seconds := range []string{"-1", "9223372037", "18446744074", "9223372036.0000000001", "1.0000000000000000001"} {
+		args["timeout_seconds"] = json.RawMessage(seconds)
+		if text, isErr := h.call("exec", args, nil); !isErr || !strings.HasPrefix(text, "invalid_argument:") || !strings.Contains(text, "timeout_seconds") {
+			t.Errorf("timeout_seconds %s = %q, isError = %v", seconds, text, isErr)
 		}
 		if got := len(h.srv.ExecRequests()); got != 0 {
-			t.Fatalf("timeout_seconds %d sent %d exec requests", seconds, got)
+			t.Fatalf("timeout_seconds %s sent %d exec requests", seconds, got)
 		}
 	}
 
@@ -447,12 +529,18 @@ func TestExecTimeoutRange(t *testing.T) {
 	if text, isErr := h.call("exec", args, nil); isErr {
 		t.Fatalf("zero timeout: %s", text)
 	}
-	requests = h.srv.ExecRequests()
-	if len(requests) != 2 {
-		t.Fatalf("got %d exec requests, want 2", len(requests))
+	delete(args, "timeout_seconds")
+	if text, isErr := h.call("exec", args, nil); isErr {
+		t.Fatalf("omitted timeout: %s", text)
 	}
-	if requests[1].GetTimeout() != nil {
-		t.Fatalf("zero timeout sent %v, want absent field", requests[1].GetTimeout())
+	requests = h.srv.ExecRequests()
+	if len(requests) != 3 {
+		t.Fatalf("got %d exec requests, want 3", len(requests))
+	}
+	for _, request := range requests[1:] {
+		if request.GetTimeout() != nil {
+			t.Errorf("zero or omitted timeout sent %v, want absent field", request.GetTimeout())
+		}
 	}
 }
 
