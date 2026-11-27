@@ -1243,9 +1243,19 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 	if err != nil {
 		return err
 	}
-	capRes, err := c.Work().GetCapacity(ctx, connect.NewRequest(&sandrunv1.GetCapacityRequest{OrganizationId: org}))
+	linkRes, err := c.OwnSandLinks().GetOwnSandLink(ctx, connect.NewRequest(&sandrunv1.GetOwnSandLinkRequest{OrganizationId: org}))
 	if err != nil {
 		return err
+	}
+	link := linkRes.Msg.GetLink()
+	linkRequired := link.GetState() != sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE
+	var devices []*sandrunv1.DeviceCapacity
+	if !linkRequired {
+		capRes, err := c.Work().GetCapacity(ctx, connect.NewRequest(&sandrunv1.GetCapacityRequest{OrganizationId: org}))
+		if err != nil {
+			return err
+		}
+		devices = capRes.Msg.GetDevices()
 	}
 	byState := map[string]int{}
 	for _, r := range runners {
@@ -1256,11 +1266,15 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 		if err != nil {
 			return err
 		}
-		d, err := protoList(capRes.Msg.GetDevices())
+		d, err := protoList(devices)
 		if err != nil {
 			return err
 		}
-		return writeJSON(a.env.Stdout, map[string]any{"queue": q, "runners_by_state": byState, "devices": d})
+		summary := map[string]any{"queue": q, "runners_by_state": byState, "devices": d}
+		if linkRequired {
+			summary["ownsand_link_required"] = true
+		}
+		return writeJSON(a.env.Stdout, summary)
 	}
 	w := &stickyWriter{w: a.env.Stdout}
 	fmt.Fprintf(w, "%s (%d queued)\n", a.bold("Queue"), len(queued))
@@ -1282,9 +1296,21 @@ func (a *app) status(ctx context.Context, name string, args []string) error {
 	for _, s := range states {
 		fmt.Fprintf(w, "  %s: %d\n", s, byState[s])
 	}
-	fmt.Fprintf(w, "\n%s (%d)\n", a.bold("Devices"), len(capRes.Msg.GetDevices()))
-	drows := make([][]string, 0, len(capRes.Msg.GetDevices()))
-	for _, d := range capRes.Msg.GetDevices() {
+	if linkRequired {
+		fmt.Fprintf(w, "\n%s\n", a.bold("Devices"))
+		switch {
+		case link == nil:
+			fmt.Fprintln(w, "  An admin must link an OwnSand organization to see devices.")
+		case link.GetState() == sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID:
+			fmt.Fprintln(w, "  An admin must replace the OwnSand API key to see devices.")
+		default:
+			fmt.Fprintln(w, "  An admin must restore the OwnSand link to see devices.")
+		}
+		return w.err
+	}
+	fmt.Fprintf(w, "\n%s (%d)\n", a.bold("Devices"), len(devices))
+	drows := make([][]string, 0, len(devices))
+	for _, d := range devices {
 		al := d.GetAllocation()
 		drows = append(drows, []string{d.GetName(), enumName(d.GetState()), d.GetHostOs() + "/" + d.GetArch(),
 			fmt.Sprintf("%d/%d", al.GetVcpuCount(), d.GetEffectiveVcpuLimit()),
