@@ -1,0 +1,90 @@
+{
+  "gid": "inv-38-windows-guest-outbound-placement",
+  "commit": "f9e1e2d12a9104293f25a9d402cc51341a6b84cc",
+  "nativeValidation": {
+    "status": "pending",
+    "host": "delino-win-1",
+    "platform": "Windows amd64",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "setup": "Use non-elevated PowerShell. Run the first command, copy the four listed files into the printed directory, then run the remaining commands. The scheduler and HCS checks need no database, image, privilege, state-directory overlay, or tar extraction.",
+    "commands": [
+      "$validationPath = Join-Path $env:LOCALAPPDATA 'OwnSandPlacementValidation'; New-Item -ItemType Directory -Path $validationPath -Force -ErrorAction Stop | Out-Null; $validationPath",
+      "Get-Content (Join-Path $validationPath 'SHA256SUMS') | ForEach-Object { $hash, $name = $_ -split '  ', 2; if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $validationPath $name) -ErrorAction Stop).Hash -ne $hash) { throw \"SHA256 mismatch: $name\" } }",
+      "& (Join-Path $validationPath 'scheduler.test.exe') '-test.v' '-test.count=1' '-test.run=^TestWindowsGuestOutboundPlacement$'; if ($LASTEXITCODE -ne 0) { throw 'Scheduler placement check failed' }",
+      "& (Join-Path $validationPath 'hcsrt.test.exe') '-test.v' '-test.count=1' '-test.run=^TestWindowsOutboundUnsupported$'; if ($LASTEXITCODE -ne 0) { throw 'HCS outbound guard check failed' }"
+    ],
+    "expectedResults": [
+      "All artifact hashes match.",
+      "TestWindowsGuestOutboundPlacement runs four subtests. Windows OUTBOUND is permanent both online and offline. Windows NONE and Linux OUTBOUND are eligible.",
+      "TestWindowsOutboundUnsupported passes without skips. Runtime.Create returns vmruntime.ErrUnsupported for the Windows OUTBOUND request before it opens HCS."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-38-windows-guest-outbound-placement/worker/.t3-tmp/guest-placement/windows/scheduler.test.exe",
+      "copyTo": "%LOCALAPPDATA%\\OwnSandPlacementValidation\\scheduler.test.exe",
+      "copy": [
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-38-windows-guest-outbound-placement/worker/.t3-tmp/guest-placement/windows/scheduler.test.exe",
+          "copyTo": "%LOCALAPPDATA%\\OwnSandPlacementValidation\\scheduler.test.exe"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-38-windows-guest-outbound-placement/worker/.t3-tmp/guest-placement/windows/hcsrt.test.exe",
+          "copyTo": "%LOCALAPPDATA%\\OwnSandPlacementValidation\\hcsrt.test.exe"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-38-windows-guest-outbound-placement/worker/.t3-tmp/guest-placement/windows/api.test.exe",
+          "copyTo": "%LOCALAPPDATA%\\OwnSandPlacementValidation\\api.test.exe"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-38-windows-guest-outbound-placement/worker/.t3-tmp/guest-placement/windows/SHA256SUMS",
+          "copyTo": "%LOCALAPPDATA%\\OwnSandPlacementValidation\\SHA256SUMS"
+        }
+      ]
+    },
+    "apiFixture": {
+      "prerequisites": "Use a disposable PostgreSQL URL accessible from the Windows account. Its database user needs CREATE DATABASE. Set DISPOSABLE_DATABASE_URL in the PowerShell session without recording its value.",
+      "commands": [
+        "if (-not $env:DISPOSABLE_DATABASE_URL) { throw 'Set DISPOSABLE_DATABASE_URL to a disposable PostgreSQL server' }; $env:OWNSAND_TEST_DATABASE_URL = $env:DISPOSABLE_DATABASE_URL",
+        "& (Join-Path $validationPath 'api.test.exe') '-test.v' '-test.count=1' '-test.run=^(TestOutboundNetworkCheckPlacement|TestWindowsGuestOutboundPlacement)$'; if ($LASTEXITCODE -ne 0) { throw 'API placement fixture failed' }",
+        "Remove-Item Env:OWNSAND_TEST_DATABASE_URL"
+      ],
+      "expectedResults": [
+        "Both tests run without skips. All 24 Windows rejection cases return failed_precondition with the NONE reason. The unknown explicit device returns not_found.",
+        "PostgreSQL records exactly the two successful controls and their two create keys. The fake agents receive only the two control creates and zero imports."
+      ]
+    },
+    "requiresElevation": [
+      {
+        "scenario": "Boot real Windows NONE and Linux OUTBOUND guests on Hyper-V",
+        "prerequisites": "Run elevated on a disposable Hyper-V host. Set OWNSAND_HV_TEST_WINDOWS_IMAGE to a built Windows image directory. Set OWNSAND_HV_TEST_KERNEL and OWNSAND_HV_TEST_ROOTFS to the built Linux kernel and rootfs files. The Linux outbound test needs working internet access. Use the directory that contains the verified hcsrt.test.exe.",
+        "commands": [
+          "if (-not ($env:OWNSAND_HV_TEST_WINDOWS_IMAGE -and $env:OWNSAND_HV_TEST_KERNEL -and $env:OWNSAND_HV_TEST_ROOTFS)) { throw 'Set the three Hyper-V image paths before running native VM tests' }; $env:OWNSAND_HV_TEST_OUTBOUND = '1'",
+          "& (Join-Path $validationPath 'hcsrt.test.exe') '-test.v' '-test.count=1' '-test.run=^(TestHyperVWindowsIntegration|TestHyperVIntegration)$' '-test.timeout=60m'; if ($LASTEXITCODE -ne 0) { throw 'Hyper-V integration tests failed' }"
+        ],
+        "expectedResults": [
+          "Both tests run without skips. The native Windows guest boots with NONE, and the native Linux guest passes the OUTBOUND network checks."
+        ]
+      },
+      {
+        "scenario": "End-to-end acceptance with an enrolled Hyper-V agent",
+        "prerequisites": "Use a disposable control plane at the recorded SHA, a test organization, and an elevated Windows agent with both built images. Use a separate test agent as the source if checking snapshot import. The batch worker has no native host access and the validation account cannot enroll and run an elevated Hyper-V service. Configure the OwnSand CLI with OWNSAND_API_URL, OWNSAND_ORG and test-only credentials. Set OWN_PLACEMENT_TEST_DEVICE to the enrolled Windows device ID. For the exported source cases, set OWN_PLACEMENT_SNAPSHOT and OWN_PLACEMENT_TEMPLATE to an exported Windows snapshot on another device and its template.",
+        "expectedResults": [
+          "Repeat the rejection and control cases against the test organization. Rejections return before a reservation, create, or import reaches the agent. The Windows NONE and Linux OUTBOUND controls start on the enrolled device."
+        ],
+        "commands": [
+          "$resources = @('--vcpu','2','--memory','4096','--disk','40','--idle-ttl','10m','--max-ttl','20m')",
+          "ownsand sandbox list --format json",
+          "ownsand sandbox create @resources --image windows --network outbound",
+          "ownsand sandbox create @resources --image windows",
+          "ownsand sandbox create @resources --image windows --device $env:OWN_PLACEMENT_TEST_DEVICE --network outbound",
+          "ownsand sandbox create @resources --image windows --device $env:OWN_PLACEMENT_TEST_DEVICE",
+          "ownsand sandbox create @resources --snapshot $env:OWN_PLACEMENT_SNAPSHOT --device $env:OWN_PLACEMENT_TEST_DEVICE --network outbound",
+          "ownsand sandbox create @resources --template $env:OWN_PLACEMENT_TEMPLATE --device $env:OWN_PLACEMENT_TEST_DEVICE --network outbound",
+          "ownsand sandbox list --format json",
+          "ownsand sandbox create @resources --image windows --device $env:OWN_PLACEMENT_TEST_DEVICE --network none",
+          "ownsand sandbox create @resources --image linux --device $env:OWN_PLACEMENT_TEST_DEVICE --network outbound"
+        ]
+      }
+    ],
+    "sha": "f9e1e2d12a9104293f25a9d402cc51341a6b84cc"
+  }
+}
