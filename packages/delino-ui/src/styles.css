@@ -1251,6 +1251,19 @@
     height: 0;
   }
 
+  /* Keep the focus outline inside the button where the panel clips overflow. */
+  .dui-collapsible-panel[data-open] .dui-button:focus-visible {
+    outline-offset: -2px;
+  }
+
+  .dui-collapsible-panel[data-open]
+    .dui-button:where(
+      [data-variant="primary"],
+      [data-variant="danger"]
+    ):focus-visible {
+    outline-color: var(--dui-color-on-accent);
+  }
+
   /* Popover. Triggers and close buttons use the button rules. */
   .dui-popover {
     box-sizing: border-box;
@@ -2021,6 +2034,10 @@
      so every cue pairs a fill or a border with the idle state instead of
      relying on one fixed color. */
   @media (forced-colors: active) {
+    .dui-collapsible-panel[data-open] .dui-button:focus-visible {
+      outline-color: ButtonText;
+    }
+
     /* SegmentedControl: forced colors remove the inset shadow. Draw a
        Highlight border for selection and an offset CanvasText outline for
        keyboard focus. */
