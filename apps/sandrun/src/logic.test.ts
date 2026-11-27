@@ -476,7 +476,7 @@ describe("runner profile form", () => {
     expect(p.source).toEqual({ case: "baseImage", value: GuestOs.LINUX });
   });
 
-  test("checks the name, the agent integration and the OpenAI queue wait", () => {
+  test("checks the name and the agent integration", () => {
     const base = { ...emptyProfileForm(), name: "Bad Name" };
     expect(profileErrors(base, undefined).name).toBeDefined();
     const agent = {
@@ -485,20 +485,36 @@ describe("runner profile form", () => {
       workloadKind: WorkloadKind.AGENT_SESSION,
     };
     expect(profileErrors(agent, undefined).agentIntegrationId).toBeDefined();
+  });
+
+  test.each([GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS])(
+    "rejects guest OS %s for OpenAI Codex before verification",
+    (guestOs) => {
+      const codex = {
+        ...emptyProfileForm(),
+        name: "codex",
+        workloadKind: WorkloadKind.AGENT_SESSION,
+        agentIntegrationId: "i1",
+        maxQueueWaitMinutes: 5,
+        guestOs,
+      };
+      expect(profileErrors(codex, AgentVendor.OPENAI_CODEX)).toEqual({
+        guestOs: expect.stringContaining("has not verified a guest OS"),
+      });
+    },
+  );
+
+  test("checks the OpenAI queue wait and Claude Code guest OS", () => {
     const codex = {
-      ...agent,
+      ...emptyProfileForm(),
+      name: "codex",
+      workloadKind: WorkloadKind.AGENT_SESSION,
       agentIntegrationId: "i1",
       maxQueueWaitMinutes: 10,
     };
     expect(
       profileErrors(codex, AgentVendor.OPENAI_CODEX).maxQueueWaitMinutes,
     ).toContain("5 minutes");
-    expect(
-      profileErrors(
-        { ...codex, maxQueueWaitMinutes: 5 },
-        AgentVendor.OPENAI_CODEX,
-      ),
-    ).toEqual({});
     expect(
       profileErrors(
         { ...codex, maxQueueWaitMinutes: 5, guestOs: GuestOs.WINDOWS },
