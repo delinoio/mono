@@ -600,6 +600,83 @@ func TestDNSForwarderUpstreamClosesFirst(t *testing.T) {
 	requireTCPSlotFree(t, f)
 }
 
+// closeGatedDNSConn ends the reply stream once the request write starts.
+// Closing the connection unblocks the write, which can then finish when the
+// test releases it.
+type closeGatedDNSConn struct {
+	net.Conn
+	writeStarted   chan struct{}
+	writeUnblocked chan struct{}
+	finishWrite    chan struct{}
+	closed         chan struct{}
+	closeOnce      sync.Once
+}
+
+func (c *closeGatedDNSConn) Read([]byte) (int, error) {
+	select {
+	case <-c.writeStarted:
+		return 0, io.EOF
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *closeGatedDNSConn) Write([]byte) (int, error) {
+	close(c.writeStarted)
+	<-c.closed
+	close(c.writeUnblocked)
+	<-c.finishWrite
+	return 0, net.ErrClosed
+}
+
+func (c *closeGatedDNSConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func TestDNSForwarderUpstreamEOFUnblocksRequestWrite(t *testing.T) {
+	const bound = 2 * time.Second
+	pipe, peer := net.Pipe()
+	defer pipe.Close()
+	defer peer.Close()
+	blocked := &closeGatedDNSConn{
+		Conn:           pipe,
+		writeStarted:   make(chan struct{}),
+		writeUnblocked: make(chan struct{}),
+		finishWrite:    make(chan struct{}),
+		closed:         make(chan struct{}),
+	}
+	finishWrite := sync.OnceFunc(func() { close(blocked.finishWrite) })
+
+	up := startTCPUpstream(t, answerThenClose)
+	var firstDial atomic.Bool
+	var dialer net.Dialer
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{
+		maxUDPQueries: 1,
+		maxTCPConns:   1,
+		dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if !firstDial.Swap(true) {
+				return blocked, nil
+			}
+			return dialer.DialContext(ctx, network, address)
+		},
+	})
+	defer f.Close()
+	defer finishWrite()
+
+	c := dnsTCPConn(t, f, "first")
+	c.SetReadDeadline(time.Now().Add(bound))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("guest read = %v, want EOF", err)
+	}
+	requireClosedWithin(t, "upstream write unblock on close", blocked.writeUnblocked, bound)
+	if n := len(f.tcpSlots); n != 1 {
+		t.Fatalf("TCP slots in use while the request copy is still running = %d, want 1", n)
+	}
+	finishWrite()
+	requireTCPSlotFree(t, f)
+}
+
 func TestDNSForwarderGuestClosesFirst(t *testing.T) {
 	sawEOF := make(chan struct{}, 1)
 	up := startTCPUpstream(t, func(c net.Conn) {
@@ -765,16 +842,16 @@ func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
 	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
 	hook, paused, resume := pauseAfterAdmit()
 	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, afterAdmit: hook})
-	// Release the hook before Close: Close waits for serveTCP, which stays
-	// blocked in the hook until resume runs, so a t.Fatal between "paused" and
-	// the explicit resume would otherwise hang the test in Close.
+	var done <-chan struct{}
 	defer func() {
+		// Close waits for serveTCP, so release the hook even on failure.
 		resume()
-		f.Close()
+		if done == nil {
+			f.Close()
+		}
 	}()
 
-	// The only slot is held by the paused connection; a second connection is
-	// refused at capacity and does not disturb the paused one.
+	// The paused connection holds the only TCP slot.
 	first, err := net.Dial("tcp", f.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -785,15 +862,18 @@ func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("serveTCP did not admit the connection")
 	}
-	// serveTCP is paused, so it does not even accept the second connection;
-	// it waits in the kernel queue until the loop resumes and refuses it.
+	// The second connection stays in the listener's queue until shutdown.
 	second, err := net.Dial("tcp", f.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	done := closeInBackground(f)
-	time.Sleep(50 * time.Millisecond)
+	done = closeInBackground(f)
+	select {
+	case <-f.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not start")
+	}
 	resume()
 	select {
 	case <-done:

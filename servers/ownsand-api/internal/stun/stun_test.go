@@ -3,18 +3,75 @@
 package stun
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	pionstun "github.com/pion/stun/v3"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 )
+
+func TestLogStatsEmitsNonemptySamples(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var logs bytes.Buffer
+		s := New(slog.New(slog.NewJSONHandler(&logs, nil)), 2048, 8192)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go s.logStats(ctx)
+		synctest.Wait()
+
+		type sample struct {
+			Message     string `json:"msg"`
+			Requests    int64  `json:"requests"`
+			Responses   int64  `json:"responses"`
+			RateLimited int64  `json:"rate_limited"`
+			Invalid     int64  `json:"invalid"`
+		}
+		checkSample := func(want sample) {
+			t.Helper()
+			time.Sleep(statsInterval)
+			synctest.Wait()
+			if want == (sample{}) {
+				if logs.Len() != 0 {
+					t.Errorf("empty sample logged %s", logs.String())
+				}
+				logs.Reset()
+				return
+			}
+			want.Message = "stun_stats"
+			var got sample
+			if err := json.Unmarshal(logs.Bytes(), &got); err != nil {
+				t.Errorf("expected one record for %+v, got %q: %v", want, logs.String(), err)
+			} else if got != want {
+				t.Errorf("record = %+v, want %+v", got, want)
+			}
+			logs.Reset()
+		}
+
+		s.requests.Add(1)
+		checkSample(sample{Requests: 1})
+		s.responses.Add(1)
+		checkSample(sample{Responses: 1})
+		s.limited.Add(1)
+		checkSample(sample{RateLimited: 1})
+		s.invalid.Add(1)
+		checkSample(sample{Invalid: 1})
+		s.requests.Add(9)
+		s.responses.Add(4)
+		s.limited.Add(3)
+		s.invalid.Add(2)
+		checkSample(sample{Requests: 9, Responses: 4, RateLimited: 3, Invalid: 2})
+		checkSample(sample{})
+	})
+}
 
 // A 20-byte STUN header and four bytes per empty attribute fill maxDatagram.
 const maxUnknownRequiredAttributes = (maxDatagram - 20) / 4

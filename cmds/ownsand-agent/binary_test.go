@@ -249,6 +249,9 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 	id, _ := uuidv7.NewString()
 	cmdID := sendProcessRuntimeCreate(t, cp, id)
 	res := cp.CommandResult(30*time.Second, cmdID)
+	if detail := res.GetError(); detail != nil {
+		t.Fatalf("create result reported an error (code %v)\n%s", detail.GetCode(), logs.String())
+	}
 	if res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("create result %v\n%s", res, logs.String())
 	}
@@ -284,11 +287,15 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Signaling{Signaling: &ownsandv1.SignalingMessage{Message: &ownsandv1.SignalingMessage_Offer{Offer: &ownsandv1.SignalingOffer{
 		SessionId: sessionID, SandboxId: id, ExpiresIn: durationpb.New(time.Hour), Sdp: offerSDP,
 	}}}}})
-	answer, _ := cp.WaitFor(20*time.Second, 0, func(e *ownsandv1.AgentEnvelope) bool {
+	answerEnvelope, _ := cp.WaitFor(20*time.Second, 0, func(e *ownsandv1.AgentEnvelope) bool {
 		return e.GetSignaling().GetAnswer().GetSessionId() == sessionID
 	})
-	if answer.GetSignaling().GetAnswer().GetSdp() == "" {
-		t.Fatalf("signaling answer %v\n%s", answer, logs.String())
+	answer := answerEnvelope.GetSignaling().GetAnswer()
+	if detail := answer.GetError(); detail != nil {
+		t.Fatalf("signaling answer reported an error (code %v)\n%s", detail.GetCode(), logs.String())
+	}
+	if answer.GetSdp() == "" {
+		t.Fatalf("signaling answer missing SDP\n%s", logs.String())
 	}
 	grantID, _ := uuidv7.NewString()
 	execID, _ := uuidv7.NewString()
