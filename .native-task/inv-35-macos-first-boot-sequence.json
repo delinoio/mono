@@ -1,0 +1,48 @@
+{
+  "gid": "inv-35-macos-first-boot-sequence",
+  "commit": "72bb77c47051516fbe014eb4449ded7a250e4fe0",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "sha": "72bb77c47051516fbe014eb4449ded7a250e4fe0",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "reason": "The worker has no native host access. Run the cgo fixture and mutation checks on m3-16.",
+    "setup": "Run from a clean checkout of the worker commit on Apple silicon. Copy files.copyFrom to files.copyTo after creating .t3-tmp. The fixture tests a fake guest and synthetic VM states. It needs the native cgo toolchain and requires no administrator access, CMake, signing credentials, IPSW, or guest disk.",
+    "commands": [
+      "test \"$(git rev-parse HEAD)\" = \"72bb77c47051516fbe014eb4449ded7a250e4fe0\" && test \"$(uname -m)\" = arm64",
+      "mkdir -p '.t3-tmp'",
+      "test \"$(shasum -a 256 '.t3-tmp/validate-first-boot-macos.sh' | cut -d ' ' -f 1)\" = 'c0589f6ebb2efc6d0312fe723c6f794c5139c90d202310da0b0e3e760e72b5e4'",
+      "bash '.t3-tmp/validate-first-boot-macos.sh'"
+    ],
+    "expectedResults": [
+      "Native cgo vet exits zero. The unmodified fixture exits zero and reports five passing subtests.",
+      "The overlay that omits /bin/sync fails all five subtests with the guest command sequence diagnostic.",
+      "The overlay that adds /usr/bin/true fails all five subtests with the same diagnostic. The script exits zero after confirming both negative outcomes."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-macos-first-boot-sequence/worker/.t3-tmp/first-boot-validation/validate-first-boot-macos.sh",
+      "copyTo": ".t3-tmp/validate-first-boot-macos.sh",
+      "sha256": "c0589f6ebb2efc6d0312fe723c6f794c5139c90d202310da0b0e3e760e72b5e4",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/macos_darwin_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/first-boot-native/vet.log",
+        ".t3-tmp/first-boot-native/baseline.log",
+        ".t3-tmp/first-boot-native/missing-sync.log",
+        ".t3-tmp/first-boot-native/extra-command.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-macos-first-boot-sequence/worker/.t3-tmp/first-boot-validation/imagebuild-darwin-arm64.test"
+      ]
+    },
+    "unavailable": [
+      {
+        "scenario": "Boot a real macOS guest and run the provisioning commands in it.",
+        "status": "out-of-scope",
+        "reason": "The issue is test-only. The host also lacks a macOS guest image and IPSW."
+      }
+    ]
+  }
+}
