@@ -251,6 +251,8 @@ func TestResendErrorKind(t *testing.T) {
 		ctx func() (context.Context, func())
 		// closeServer closes the server before the send.
 		closeServer bool
+		// cancelInFlight cancels the send after the HTTP handler starts.
+		cancelInFlight bool
 	}{
 		{
 			name: "canceled before the send",
@@ -265,21 +267,9 @@ func TestResendErrorKind(t *testing.T) {
 			},
 		},
 		{
-			name: "canceled in flight",
-			want: "canceled",
-			handler: func(block chan struct{}) http.HandlerFunc {
-				return func(w http.ResponseWriter, r *http.Request) {
-					select {
-					case <-r.Context().Done():
-					case <-block:
-					}
-				}
-			},
-			ctx: func() (context.Context, func()) {
-				ctx, cancel := context.WithCancel(context.Background())
-				timer := time.AfterFunc(50*time.Millisecond, cancel)
-				return ctx, func() { timer.Stop(); cancel() }
-			},
+			name:           "canceled in flight",
+			want:           "canceled",
+			cancelInFlight: true,
 		},
 		{
 			name: "context deadline exceeded",
@@ -336,8 +326,20 @@ func TestResendErrorKind(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			block := make(chan struct{})
+			var handler http.HandlerFunc
+			var handlerEntered chan struct{}
+			if tc.cancelInFlight {
+				handlerEntered = make(chan struct{})
+				signalEntry := sync.OnceFunc(func() { close(handlerEntered) })
+				handler = func(http.ResponseWriter, *http.Request) {
+					signalEntry()
+					<-block
+				}
+			} else {
+				handler = tc.handler(block)
+			}
 			// close(block) is deferred after srv.Close, so it runs first.
-			srv := httptest.NewServer(tc.handler(block))
+			srv := httptest.NewServer(handler)
 			defer srv.Close()
 			defer close(block)
 			if tc.closeServer {
@@ -352,12 +354,35 @@ func TestResendErrorKind(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx, done := context.Background(), func() {}
-			if tc.ctx != nil {
-				ctx, done = tc.ctx()
+			msg := email.Message{Kind: email.KindInvitation, To: recipient}
+			if tc.cancelInFlight {
+				const waitTimeout = 5 * time.Second
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				// The sender can report its result even if the test has failed.
+				result := make(chan error, 1)
+				go func() { result <- sender.Send(ctx, msg) }()
+				select {
+				case <-handlerEntered:
+					cancel()
+				case err := <-result:
+					t.Fatalf("Send() returned before the Resend handler started: %v", err)
+				case <-time.After(waitTimeout):
+					t.Fatal("timed out waiting for the Resend handler to start")
+				}
+				select {
+				case err = <-result:
+				case <-time.After(waitTimeout):
+					t.Fatal("Send() did not return after cancellation")
+				}
+			} else {
+				ctx, done := context.Background(), func() {}
+				if tc.ctx != nil {
+					ctx, done = tc.ctx()
+				}
+				defer done()
+				err = sender.Send(ctx, msg)
 			}
-			defer done()
-			err = sender.Send(ctx, email.Message{Kind: email.KindInvitation, To: recipient})
 			if err == nil || strings.Contains(err.Error(), recipient) {
 				t.Fatalf("Send() error = %v", err)
 			}

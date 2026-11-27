@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+	"github.com/delinoio/mono/servers/accounts-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle/paddletest"
@@ -266,13 +269,54 @@ func TestWebhookRefundAndChargeback(t *testing.T) {
 	// The approval removes the credit, and the balance becomes negative.
 	f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_1", "refund", "approved", "txn_buy", 1000))
 	f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_1", "refund", "approved", "txn_buy", 1000))
-	// Another adjustment cannot remove more than the purchase added.
-	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_2", "chargeback", "approved", "txn_buy", 1000))
-	f.wantLedger(acct,
-		wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
-		wantEntry{LedgerUsage, -4 * usd, 6 * usd},
-		wantEntry{LedgerRefund, -10 * usd, -4 * usd},
-	)
+
+	type chargebackRecord struct {
+		TransactionID   string
+		AmountUSDMicros int64
+		HasLedgerEntry  bool
+		CreateTime      time.Time
+	}
+	checkChargeback := func(delivery string) chargebackRecord {
+		t.Helper()
+		rows, err := f.db.Pool.Query(ctx(), `SELECT g.paddle_transaction_id, r.amount_usd_micros,
+			r.ledger_entry_id IS NOT NULL, r.create_time
+			FROM credit_refunds r JOIN credit_grants g USING (credit_grant_id)
+			WHERE r.paddle_adjustment_id = 'adj_2'`)
+		if err != nil {
+			t.Fatalf("%s: query chargeback: %v", delivery, err)
+		}
+		record, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[chargebackRecord])
+		if err != nil {
+			t.Fatalf("%s: expected exactly one chargeback record for adj_2: %v", delivery, err)
+		}
+		if record.TransactionID != "txn_buy" || record.AmountUSDMicros != 0 || record.HasLedgerEntry {
+			t.Fatalf("%s: chargeback record = %+v, want txn_buy, zero amount and no ledger entry", delivery, record)
+		}
+		return record
+	}
+	want := []wantEntry{
+		{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
+		{LedgerUsage, -4 * usd, 6 * usd},
+		{LedgerRefund, -10 * usd, -4 * usd},
+	}
+	// Record the chargeback even though the full refund leaves no credit to reverse.
+	chargeback := paddletest.Adjustment("adj_2", "chargeback", "approved", "txn_buy", 1000)
+	if got := f.webhookResult(paddle.EventAdjustmentCreated, chargeback); got != webhookApplied {
+		t.Fatalf("chargeback result = %q, want %q", got, webhookApplied)
+	}
+	first := checkChargeback("first delivery")
+	f.wantLedger(acct, want...)
+
+	// A fresh event exercises adjustment-ID deduplication.
+	f.clock.Advance(time.Second)
+	if got := f.webhookResult(paddle.EventAdjustmentCreated, chargeback); got != webhookIgnored {
+		t.Fatalf("chargeback replay result = %q, want %q", got, webhookIgnored)
+	}
+	replayed := checkChargeback("replay")
+	if !replayed.CreateTime.Equal(first.CreateTime) {
+		t.Fatalf("chargeback creation time after replay = %v, want %v", replayed.CreateTime, first.CreateTime)
+	}
+	f.wantLedger(acct, want...)
 	// An unknown transaction is unmatched and changes nothing.
 	if code := f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_3", "refund", "approved", "txn_unknown", 500)); code != http.StatusOK {
 		t.Fatal(code)
@@ -505,42 +549,67 @@ func TestCloseAccountCancelsSubscription(t *testing.T) {
 	}
 }
 
+type pendingTopUpScanKey struct{}
+
+type emptyTopUpScans chan struct{}
+
+func (scans emptyTopUpScans) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, " FROM top_ups WHERE status = 'pending'") {
+		return context.WithValue(ctx, pendingTopUpScanKey{}, true)
+	}
+	return ctx
+}
+
+func (scans emptyTopUpScans) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	// pgx traces the completed SELECT before QueryRow reports ErrNoRows.
+	if ctx.Value(pendingTopUpScanKey{}) == true && data.Err == nil && data.CommandTag.String() == "SELECT 0" {
+		select {
+		case scans <- struct{}{}:
+		case <-ctx.Done():
+		}
+	}
+}
+
 func TestWorkerWakeAndStop(t *testing.T) {
-	f := newFixture(t)
+	scans := make(emptyTopUpScans, 3)
+	cfg, err := pgxpool.ParseConfig(dbtest.NewURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.Tracer = scans
+	pool, err := pgxpool.NewWithConfig(ctx(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := newFixtureOn(t, &db.DB{Pool: pool})
 	acct := f.account()
 	f.activate(acct)
 	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
 	runCtx, cancel := context.WithCancel(ctx())
 	done := make(chan struct{})
-	go func() {
-		f.s.RunWorker(runCtx, time.Hour)
-		close(done)
-	}()
-	// An early fatal assertion must stop the worker and wait for it before
-	// the fixture closes the database and the provider, which t.Cleanup runs
-	// in reverse order of registration. Cancel is idempotent, so the normal
-	// path below may stop the worker first.
+	// Join the worker before the fixture closes the database and provider,
+	// including when an assertion fails.
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Errorf("RunWorker did not stop during cleanup")
-		}
+		<-done
 	})
-	// RunWorker reads the wake channel only after the startup RunOnce scan has
-	// returned. Send a wake with nothing queued and wait until the worker has
-	// received it: the drained channel proves the startup scan has finished,
-	// so the startup scan cannot be what charges the top-up queued below. The
-	// wake channel holds one signal and the idle wake handler does nothing.
-	f.s.Wake()
-	deadline := time.Now().Add(10 * time.Second)
-	for len(f.s.wake) != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the worker did not finish its startup scan")
+	go func() {
+		defer close(done)
+		f.s.RunWorker(runCtx, time.Hour)
+	}()
+	waitForEmptyScan := func(pass string) {
+		select {
+		case <-scans:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the %s pass did not finish an empty pending top-up scan", pass)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
+	waitForEmptyScan("startup")
+	// Wait for the setup wake's scan to find no pending work before queuing
+	// the top-up. Only the second wake should be able to charge it.
+	f.s.Wake()
+	waitForEmptyScan("setup wake")
 	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
 		t.Fatal("not queued")
 	}
@@ -548,12 +617,14 @@ func TestWorkerWakeAndStop(t *testing.T) {
 		t.Fatalf("%d charges before Wake", n)
 	}
 	f.s.Wake()
-	deadline = time.Now().Add(10 * time.Second)
-	for len(f.paddle.Charges()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("Wake did not charge the queued top-up")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// After charging, the worker scans once more before it returns to idle.
+	select {
+	case <-scans:
+	case <-time.After(10 * time.Second):
+		t.Error("Wake did not finish processing pending top-ups")
+	}
+	if n := len(f.paddle.Charges()); n != 1 {
+		t.Fatalf("%d charges after Wake, want 1", n)
 	}
 	cancel()
 	select {

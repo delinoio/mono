@@ -73,6 +73,7 @@ export function MembersSection() {
   const [removingId, setRemovingId] = useState<string>();
   const [transferringId, setTransferringId] = useState<string>();
   const [leaving, setLeaving] = useState(false);
+  const canLeave = can(role, Permission.Leave);
   const canTransfer = can(role, Permission.TransferOwnership);
   const manageable = (member: BillingAccountMember) =>
     member.userId !== userId && canManageMember(role, member.role);
@@ -86,6 +87,9 @@ export function MembersSection() {
     : undefined;
 
   // Clear invalid selections before the dialog can render again.
+  if (leaving && !canLeave) {
+    setLeaving(false);
+  }
   if (removingId !== undefined && removing === undefined) {
     setRemovingId(undefined);
   }
@@ -98,7 +102,7 @@ export function MembersSection() {
       <section className="section" aria-labelledby="members-title">
         <div className="section-header">
           <h2 id="members-title">Members</h2>
-          {can(role, Permission.Leave) ? (
+          {canLeave ? (
             <Button
               variant={ButtonVariant.Secondary}
               onClick={() => setLeaving(true)}
@@ -219,12 +223,13 @@ export function MembersSection() {
         }}
       />
       <ConfirmDialog
-        open={leaving}
+        open={leaving && canLeave}
         onOpenChange={setLeaving}
         title="Leave this billing account?"
         description="You lose access to its balance, usage and settings. An owner or admin can invite you again."
         confirmLabel="Leave billing account"
         onConfirm={async () => {
+          if (!canLeave) return;
           await leave.mutateAsync({
             billingAccountId,
             userId: userId ?? "",

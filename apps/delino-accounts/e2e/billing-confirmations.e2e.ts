@@ -49,13 +49,45 @@ describe("billing confirmations after a role refresh", () => {
       restore: transferBack,
       revokedRole: "Admin",
     },
+    {
+      tab: "Members",
+      launch: "Leave billing account",
+      title: "Leave this billing account?",
+      rpc: "RemoveMember",
+      action: "Leave as an Admin",
+      path: FIXTURE,
+      revoke: transferToAdmin,
+      restore: transferBack,
+      revokedRole: "Owner",
+    },
+    {
+      tab: "Members",
+      launch: "Leave billing account",
+      title: "Leave this billing account?",
+      rpc: "RemoveMember",
+      action: "Leave as a Viewer",
+      path: FIXTURE,
+      startAsViewer: true,
+      revoke: transferToAdmin,
+      restore: { ...transferBack, ...toViewer },
+      revokedRole: "Owner",
+    },
   ]) {
-    test(`dismisses ${scenario.rpc} after permission is revoked`, async ({
+    test(`dismisses ${scenario.action ?? scenario.rpc} after permission is revoked`, async ({
       app,
       browser,
       screen,
     }) => {
       await app.open(scenario.path);
+      if (scenario.startAsViewer) {
+        await expect(screen.getByText("Your role: Admin")).toBeVisible();
+        await browser.evaluate(
+          (roles) =>
+            window.billingConfirmations.setRoles(roles).then(() => null),
+          toViewer,
+        );
+        await expect(screen.getByText("Your role: Viewer")).toBeVisible();
+      }
       await screen.getByRole("tab", scenario.tab).click();
       const launch = screen.getByRole("button", scenario.launch);
       await launch.last().click();
@@ -96,6 +128,38 @@ describe("billing confirmations after a role refresh", () => {
       ).toEqual([]);
     });
   }
+
+  test("keeps Leave open when an Admin becomes a Viewer", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open(FIXTURE);
+    await expect(screen.getByText("Your role: Admin")).toBeVisible();
+    await screen.getByRole("tab", "Members").click();
+    await screen.getByRole("button", "Leave billing account").click();
+    const dialog = screen.getByRole(
+      "alertdialog",
+      "Leave this billing account?",
+    );
+    await expect(dialog).toBeVisible();
+
+    await browser.evaluate(
+      (roles) => window.billingConfirmations.setRoles(roles).then(() => null),
+      toViewer,
+    );
+    await expect(screen.getByText("Your role: Viewer")).toBeVisible();
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", "Leave billing account").click();
+
+    await expect(browser).toHaveURL(app.baseUrl + "/billing");
+    await expect(screen.getByText("No billing accounts yet")).toBeVisible();
+    expect(
+      await browser.evaluate(() =>
+        window.billingConfirmations.actionRequests("RemoveMember"),
+      ),
+    ).toEqual([{ billingAccountId: ACCOUNT_ID, userId: ADMIN }]);
+  });
 
   test("keeps cancellation open when the last loaded role still permits it", async ({
     app,

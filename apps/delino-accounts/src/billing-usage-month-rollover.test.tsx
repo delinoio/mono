@@ -8,7 +8,6 @@ import {
   test,
 } from "@rstest/core";
 import { act, cleanup, fireEvent, screen } from "@testing-library/react";
-import { MAX_TIMER_DELAY_MS } from "./current-utc-month.ts";
 import { ACCOUNT_ID, createFakeApi, VIEWER } from "./testing/fake-api.ts";
 import { renderApp } from "./testing/render.tsx";
 
@@ -85,6 +84,8 @@ async function returnToTab() {
 describe("usage month limit", () => {
   test("Next becomes available when the UTC month changes while the page is open", async () => {
     const api = await renderUsage("2026-12-31T23:59:59Z");
+    const initialSummaryMonths = summaryMonths(api);
+    expect(initialSummaryMonths).toEqual([[2026, 12]]);
     expect(monthLabel()).toBe("December 2026 (UTC)");
     expect(nextButton().disabled).toBe(true);
 
@@ -92,9 +93,7 @@ describe("usage month limit", () => {
     // The selected month stays and its data is not read again.
     expect(monthLabel()).toBe("December 2026 (UTC)");
     expect(nextButton().disabled).toBe(false);
-    expect(new Set(summaryMonths(api).map(String))).toEqual(
-      new Set(["2026,12"]),
-    );
+    expect(summaryMonths(api)).toEqual(initialSummaryMonths);
 
     // The new current month is requested and is the limit again.
     await act(async () => {
@@ -106,14 +105,39 @@ describe("usage month limit", () => {
     expect(nextButton().disabled).toBe(true);
   });
 
-  test("the limit stays while the month does not change", async () => {
-    await renderUsage("2026-12-15T12:00:00Z");
-    // A visibility change inside the month does not move the limit.
-    await returnToTab();
+  test("a forward clock correction refreshes the limit within a minute while visible", async () => {
+    const api = await renderUsage("2026-12-15T12:00:00Z");
+    expect(monthLabel()).toBe("December 2026 (UTC)");
     expect(nextButton().disabled).toBe(true);
-    await advance(60 * 60 * 1000);
+    const initialRequests = summaryMonths(api);
+    expect(initialRequests).toEqual([[2026, 12]]);
+
+    rs.setSystemTime(new Date("2027-01-10T08:00:00Z"));
+    expect(nextButton().disabled).toBe(true);
+    await advance(60_000);
+    expect(nextButton().disabled).toBe(false);
+    expect(monthLabel()).toBe("December 2026 (UTC)");
+    expect(summaryMonths(api)).toEqual(initialRequests);
+
+    await act(async () => {
+      fireEvent.click(nextButton());
+    });
+    await advance(SETTLE_MS);
+    expect(monthLabel()).toBe("January 2027 (UTC)");
+    expect(summaryMonths(api)).toEqual([
+      [2026, 12],
+      [2027, 1],
+    ]);
+    expect(nextButton().disabled).toBe(true);
+  });
+
+  test("a scheduled recheck within the same month keeps the limit and query", async () => {
+    const api = await renderUsage("2026-12-15T12:00:00Z");
+    rs.setSystemTime(new Date("2026-12-20T12:00:00Z"));
+    await advance(60_000);
     expect(nextButton().disabled).toBe(true);
     expect(monthLabel()).toBe("December 2026 (UTC)");
+    expect(summaryMonths(api)).toEqual([[2026, 12]]);
   });
 
   test("a return to the tab updates the limit although the timers were delayed", async () => {
@@ -151,6 +175,7 @@ describe("usage month limit", () => {
     });
     try {
       await returnToTab();
+      await advance(60_000);
       expect(nextButton().disabled).toBe(true);
     } finally {
       if (visibility === undefined) {
@@ -161,25 +186,5 @@ describe("usage month limit", () => {
     }
     await returnToTab();
     expect(nextButton().disabled).toBe(false);
-  });
-
-  test("a wait longer than the timer limit is split and still ends at the rollover", async () => {
-    // December has 31 days, which is more than the longest timer delay.
-    const rollover = Date.parse("2027-01-01T00:00:00Z");
-    expect(rollover - Date.parse("2026-12-01T00:00:00Z")).toBeGreaterThan(
-      MAX_TIMER_DELAY_MS,
-    );
-    await renderUsage("2026-12-01T00:00:00Z");
-    expect(nextButton().disabled).toBe(true);
-
-    // The first step is as long as the timer limit allows; the page is
-    // still in December after it and one millisecond before the rollover.
-    await advance(MAX_TIMER_DELAY_MS);
-    expect(nextButton().disabled).toBe(true);
-    await advance(rollover - Date.now() - 1);
-    expect(nextButton().disabled).toBe(true);
-    await advance(1);
-    expect(nextButton().disabled).toBe(false);
-    expect(monthLabel()).toBe("December 2026 (UTC)");
   });
 });
