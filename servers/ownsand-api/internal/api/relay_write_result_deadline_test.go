@@ -50,12 +50,13 @@ func startWriteResultCall(t *testing.T, deadline time.Duration) *writeResultCall
 	return c
 }
 
-func startWriteCall(t *testing.T, deadline time.Duration, initialCredit int64) *writeResultCall {
+func startWriteCall(t *testing.T, deadline time.Duration, initialCredit int64, opts ...testenv.Option) *writeResultCall {
 	t.Helper()
-	env := testenv.New(t, func(o *app.Options) {
+	opts = append(opts, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
 			RequestDeadline: deadline, GrantAck: time.Second, Signaling: 2 * time.Second}
 	})
+	env := testenv.New(t, opts...)
 	org, agent, sandboxID := runningSandbox(t, env)
 	c := &writeResultCall{deadline: deadline, sandboxID: sandboxID, env: env, release: make(chan struct{}), done: make(chan error, 1), resp: make(chan *ownsandv1.WriteFileResponse, 1)}
 	c.relay = agent.ConnectRelayWithWindow(initialCredit, func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
