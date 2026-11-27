@@ -1,0 +1,45 @@
+{
+  "gid": "inv-15-mcp-windows-environment-precedence",
+  "commit": "899dee65820856a1d04c6e916ca6233248d8ec67",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "899dee65820856a1d04c6e916ca6233248d8ec67",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "reason": "The Linux implementation worker had no access to delino-win-1. The Windows process acceptance run is pending.",
+    "setup": "Use PowerShell in the checkout for the recorded commit. Run the first four commands, then copy the probe to the path in files.copyTo. Run the remaining commands in the same shell.",
+    "commands": [
+      "if ((git rev-parse HEAD) -ne '899dee65820856a1d04c6e916ca6233248d8ec67') { throw 'Unexpected checkout revision' }",
+      "go version; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "New-Item -ItemType Directory -Force '.t3-tmp' | Out-Null",
+      "$probeTemp = (Resolve-Path '.t3-tmp').Path; $env:TEMP = $probeTemp; $env:TMP = $probeTemp; $env:GOTMPDIR = $probeTemp",
+      "go test -mod=readonly -count=1 -timeout=60s ./cmds/sandrun/internal/mcpserver -run '^TestExecPassEnvGuestPrecedence$' 2>&1 | Tee-Object '.t3-tmp/windows-mcp-tests.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go build -mod=readonly -o '.t3-tmp/sandrun.exe' ./cmds/sandrun; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "go build -mod=readonly -o '.t3-tmp/mcp-windows-env-probe.exe' '.t3-tmp/mcp-windows-env-probe.go'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "& './.t3-tmp/mcp-windows-env-probe.exe' './.t3-tmp/sandrun.exe' 2>&1 | Tee-Object '.t3-tmp/windows-mcp-stdio.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The focused MCP test and both builds exit 0. The probe reports platform windows and exits 0.",
+      "windows-configured: LOCAL_PROCESS_ENV_OK, exit=0, session lookups=1",
+      "windows-empty: LOCAL_PROCESS_ENV_OK, exit=0, session lookups=1",
+      "failed-lookup: permission_denied, exec requests=0",
+      "exact-match: LOCAL_PROCESS_ENV_OK, exit=0, session lookups=0",
+      "The native child looks up the configured variable using both spellings, confirms its value or its presence with an empty value, and confirms KEEP=1. The probe checks that the configured value is absent from MCP tool output and logs."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-15-mcp-windows-environment-precedence/worker/.t3-tmp/mcp-windows-env-probe.go",
+      "copyTo": ".t3-tmp/mcp-windows-env-probe.go",
+      "regressionTest": "cmds/sandrun/internal/mcpserver/mcpserver_test.go",
+      "outputLogs": [
+        ".t3-tmp/windows-mcp-tests.log",
+        ".t3-tmp/windows-mcp-stdio.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-15-mcp-windows-environment-precedence/worker/.t3-tmp/mcpserver.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-15-mcp-windows-environment-precedence/worker/.t3-tmp/sandrun.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-15-mcp-windows-environment-precedence/worker/.t3-tmp/mcp-windows-env-probe.exe"
+      ]
+    }
+  }
+}
