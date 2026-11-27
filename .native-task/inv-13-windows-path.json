@@ -1,0 +1,57 @@
+{
+  "gid": "inv-13-windows-path",
+  "commit": "f5bf4e838ce6ad33b95a87b924522ef18d37381e",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows amd64",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "f5bf4e838ce6ad33b95a87b924522ef18d37381e",
+    "setup": "Run in elevated Windows PowerShell 5.1 inside a clean disposable Windows guest on delino-win-1. Run the first command, copy the listed files into that directory, then run the last two commands. The script registers and removes the LocalSystem SCM service and uses a loopback-only test listener. Keep the transcript and isolated guest.log.",
+    "commands": [
+      "New-Item -ItemType Directory -Path 'C:\\OwnSandPathValidation' -ErrorAction Stop | Out-Null",
+      "Get-Content 'C:\\OwnSandPathValidation\\windows-artifacts.sha256' | ForEach-Object { $hash, $name = $_ -split '  ', 2; if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path 'C:\\OwnSandPathValidation' $name)).Hash -ne $hash) { throw \"SHA256 mismatch: $name\" } }",
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File 'C:\\OwnSandPathValidation\\validate-windows-path.ps1'"
+    ],
+    "expectedResults": [
+      "The artifact hashes match and all three selected Windows regression tests pass. The hard-link alias and leading empty request PATH cases resolve to the expected absolute file.",
+      "The SCM service reports Running and LocalSystem. Bare cmd reports the System32 current directory with exit 0 when PATH is inherited, explicitly names System32, or starts with an empty entry followed by System32.",
+      "A relative-only match and a different cmd.exe earlier in the request PATH both report OTHER with no stdout or stderr.",
+      "An independent absolute fixture runs both by bare name with request PATH and by its direct absolute name. A missing program reports PROGRAM_NOT_FOUND.",
+      "The probe reports eight PASS lines and exits 0. The temporary service is stopped and removed."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/validate-windows-path.ps1",
+      "copyTo": "C:\\OwnSandPathValidation\\validate-windows-path.ps1",
+      "copy": [
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/validate-windows-path.ps1",
+          "copyTo": "C:\\OwnSandPathValidation\\validate-windows-path.ps1"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/ownsand-guest.exe",
+          "copyTo": "C:\\OwnSandPathValidation\\ownsand-guest.exe"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/guest.test.exe",
+          "copyTo": "C:\\OwnSandPathValidation\\guest.test.exe"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/exec-path-probe.exe",
+          "copyTo": "C:\\OwnSandPathValidation\\exec-path-probe.exe"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/windows-artifacts.sha256",
+          "copyTo": "C:\\OwnSandPathValidation\\windows-artifacts.sha256"
+        }
+      ],
+      "probeSource": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/exec-path-probe.go",
+      "regressionTests": ["cmds/ownsand-guest/guest/exec_path_windows_test.go"],
+      "buildRevision": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-path/worker/.t3-tmp/windows-path/windows-helper-build-revision.log",
+      "outputLogs": [
+        "C:\\OwnSandPathValidation\\windows-path-validation.log",
+        "C:\\OwnSandPathValidation\\state\\guest.log"
+      ]
+    }
+  }
+}
