@@ -140,7 +140,7 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 
 ### Billing status
 
-- `OrganizationBillingStatus` carries `service`, `organization_id`, `billing_account_id`, `status`, `reason`, `blocked_since`, `suspend_time` and `sequence`. `accounts-api` keeps a status only for linked organizations. The consuming service handles organizations without a link.
+- `OrganizationBillingStatus` carries `service`, `organization_id`, `billing_account_id`, `status`, `reason`, `blocked_since`, `suspend_time`, `sequence` and `last_allowed_sequence`. `accounts-api` keeps a status only for linked organizations. The consuming service handles organizations without a link.
 - Status rules for a linked organization:
 
 | Status      | When                                                                                                                                                                         |
@@ -152,7 +152,8 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 - Only `ACTIVE` is an active subscription. A canceled subscription stays `ACTIVE` until `current_period_end`. `NONE`, `PENDING`, `PAST_DUE` and `CANCELED` are not active.
 - `reason` is `NONE` for `ALLOWED`. Otherwise it is `NO_ACTIVE_SUBSCRIPTION` or `NON_POSITIVE_BALANCE`; when both apply, it is `NO_ACTIVE_SUBSCRIPTION`. `blocked_since` and `suspend_time` are unset for `ALLOWED`.
 - `BLOCKED` and `SUSPENDED` change back to `ALLOWED` when the balance is greater than zero and the subscription is `ACTIVE`.
-- `sequence` is greater than zero and increases with every change of any other status field for any organization of the service.
+- `sequence` is greater than zero and increases with every status change for any organization of the service.
+- `last_allowed_sequence` is the sequence of the latest recorded transition from `BLOCKED` or `SUSPENDED` to `ALLOWED` on the current link. It stays set across subsequent non-payment. Zero means Accounts has no recorded recovery for the link. Older releases omit the field.
 - `ListBillingStatusChanges(service, after_sequence, page_size)` returns a page of current statuses with `sequence` greater than `after_sequence`. Each page lists statuses in ascending `sequence` order, with at most one current status per linked organization. An unlink adds no entry. Set `after_sequence` to 0 to start a paginated traversal of the service's current links. A negative `after_sequence` fails with `invalid_argument`.
 - The effective page size is 50 when `page_size` is omitted or 0, the requested size for values from 1 through 200, and 200 for larger values. A negative `page_size` fails with `invalid_argument`.
 - `next_sequence` is the highest returned `sequence`. On an empty page, it equals the input `after_sequence`. Stop when the page contains fewer statuses than the effective page size. After a full page, make the next request with `after_sequence` set to `next_sequence`.
