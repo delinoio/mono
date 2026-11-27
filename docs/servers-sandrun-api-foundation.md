@@ -118,8 +118,9 @@ Installation and linking:
 
 - One GitHub installation links to exactly one SandRun organization. A SandRun organization can link several installations.
 - Installations of personal accounts fail with `failed_precondition`, because SandRun registers only organization-level runners.
-- When GitHub sends an `installation` event with `deleted` or `suspend`, the server marks the installation inactive, ends its queued requests with `CANCELED` and deletes its runners that wait for a job.
+- A verified `suspend` event or a `deleted` event marks the installation inactive, ends its queued requests with `CANCELED` and deletes its runners that wait for a job. A verified `unsuspend` event restores a suspended link. Deletion is terminal.
 - The installation webhook locks the SandRun organization before it locks the installation and its work. It uses the locked installation state and ignores the delivery if the organization or link disappears or the link moves to another organization while it waits.
+- Before changing the state for a `suspend` or `unsuspend` event, the webhook checks the current suspension state while it holds the installation lock. It uses the app JWT to call `GET /app/installations/{installation_id}` with a 3-second deadline. The response must identify the installation and include `suspended_at` as either a timestamp or an explicit null. If the event disagrees with GitHub, the webhook leaves the state and runner pools intact. If it cannot verify the state, it rolls back the delivery so GitHub can redeliver the same ID.
 
 Job matching:
 

@@ -2,8 +2,8 @@
 
 // Package githubfake is an in-memory fake of the GitHub REST API and of the
 // app webhook sender for sandrun-api tests. It serves, on an httptest server,
-// the endpoints that package githubapi calls: installation tokens (it
-// verifies the RS256 app JWT), the organization runner endpoints, the OAuth
+// the endpoints that package githubapi calls: installation state and tokens
+// (it verifies the RS256 app JWT), the organization runner endpoints, the OAuth
 // code exchange, GET /user/installations and the app webhook deliveries
 // with redelivery. Send and SendLost deliver signed webhooks to a target URL
 // and record the deliveries like GitHub, so tests can lose a delivery and
@@ -59,6 +59,8 @@ type Fake struct {
 	FailDelete int
 	// FailJIT makes generate-jitconfig answer this status once.
 	FailJIT int
+	// FailInstallationLookup makes the installation lookup answer this status once.
+	FailInstallationLookup int
 	// JITGate, when set, runs before a generate-jitconfig call is served,
 	// without the fake lock, so a test can hold a runner start there.
 	JITGate func()
@@ -281,6 +283,29 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	count := func(op string) { f.calls[op]++ }
 	switch {
+	case r.Method == http.MethodGet && len(parts) == 3 && parts[0] == "app" && parts[1] == "installations":
+		count("get_installation")
+		if !f.verifyJWT(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "bad jwt"})
+			return
+		}
+		if status := f.FailInstallationLookup; status != 0 {
+			f.FailInstallationLookup = 0
+			writeJSON(w, status, map[string]string{"message": "installation lookup failed"})
+			return
+		}
+		id, _ := strconv.ParseInt(parts[2], 10, 64)
+		inst := f.installations[id]
+		if inst == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			return
+		}
+		var suspendedAt *time.Time
+		if inst.Suspended {
+			now := f.now().UTC()
+			suspendedAt = &now
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "suspended_at": suspendedAt})
 	case r.Method == http.MethodPost && len(parts) == 4 && parts[0] == "app" && parts[1] == "installations" && parts[3] == "access_tokens":
 		count("create_installation_token")
 		if !f.verifyJWT(r) {

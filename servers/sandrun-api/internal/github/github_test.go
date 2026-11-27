@@ -1405,7 +1405,15 @@ func TestUpdateGitHubInstallationAfterLifecycleChange(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
+				if tc.action == "suspend" {
+					w.gh.SetSuspended(501, true)
+				}
 				w.send(t, "installation", installationEvent(tc.action, 501, "acme"))
+				if tc.action == "suspend" {
+					// Restore GitHub before it answers the group listing.
+					// SandRun still has a suspended link until the unsuspend delivery.
+					w.gh.SetSuspended(501, false)
+				}
 			}
 			close(release)
 			wantCode(t, "update after "+tc.action, <-result, tc.wantCode)
