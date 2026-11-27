@@ -1,0 +1,62 @@
+{
+  "gid": "inv-34-hyperv-exit-retry",
+  "commit": "abbf5d729de59f1d7f84d0adb9ba13e4ac3bef58",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "abbf5d729de59f1d7f84d0adb9ba13e4ac3bef58",
+    "setup": "Run the repository-root PowerShell setup and non-elevated fixture command on the normal validation account. The account needs no symbolic-link, protected-path ACL, service-control, DiskPart, or Hyper-V privilege for the fixtures.",
+    "commands": [
+      "git rev-parse HEAD",
+      "New-Item -ItemType Directory -Force .t3-tmp/validation | Out-Null",
+      "$validationDir = (Resolve-Path .t3-tmp/validation).Path",
+      "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+      "go test '-mod=readonly' '-count=5' '-v' './cmds/ownsand-agent/internal/vmruntime/hcsrt' '-run' '^Test(WaitExit.*|VMWatcher.*|BuildVMRequiresConfirmedExit|BuildVMWaitExitAcceptsConfirmation|ConfirmedSystemExit|IsNotFoundOrStopped|StopSystemNeedsConfirmedExit|DeleteKeepsTrackedVMWhenExitUnconfirmed|DeleteRemovesTrackedVMWhenExitConfirmed)$' 2>&1 | Tee-Object .t3-tmp/validation/windows-hcs-wait.log; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The worker revision is abbf5d729de59f1d7f84d0adb9ba13e4ac3bef58. Record the actual SHA from the checkout used on Windows.",
+      "Non-elevated fixtures pass five times. Running and transient first results keep VM.Exited open. A later stopped or absent result releases VM.Exited and watchDone. Callback-only waiting makes zero queries. A blocked query preserves prompt callback, closure, and cancellation behavior. Stop and image-build fixtures preserve unconfirmed-stop safeguards.",
+      "Elevated probe passes. Native HCS reports the VM running after the injected disconnect. After direct native termination with callbacks withheld, a native HCS retry closes the VM and watcher signals, and the sandbox manager emits FAILED / LOST_ON_DEVICE for the test VM."
+    ],
+    "elevatedOnly": {
+      "status": "pending",
+      "setup": "Use an isolated Hyper-V-enabled Windows amd64 host and elevated PowerShell. Ensure there are no existing OwnSand compute systems, make a writable disposable copy of the Linux kernel and rootfs image fixtures, and point OWNSAND_HV_TEST_KERNEL and OWNSAND_HV_TEST_ROOTFS at them. See the image requirements in integration_windows_test.go. Run these commands after copying the probe source. This probe injects a disconnect for one VM and withholds its exit callback while running real HCS queries and termination.",
+      "commands": [
+        "git rev-parse HEAD",
+        "New-Item -ItemType Directory -Force .t3-tmp/validation | Out-Null",
+        "$validationDir = (Resolve-Path .t3-tmp/validation).Path",
+        "$env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+        "if (-not $env:OWNSAND_HV_TEST_KERNEL -or -not $env:OWNSAND_HV_TEST_ROOTFS -or -not (Test-Path -LiteralPath $env:OWNSAND_HV_TEST_KERNEL -PathType Leaf) -or -not (Test-Path -LiteralPath $env:OWNSAND_HV_TEST_ROOTFS -PathType Leaf)) { throw 'Set OWNSAND_HV_TEST_KERNEL and OWNSAND_HV_TEST_ROOTFS to existing isolated Linux image fixtures' }",
+        "$overlayFile = Join-Path $validationDir 'hyperv-exit-overlay.json'",
+        "$replace = @{}; $replace[(Join-Path $PWD.Path 'cmds/ownsand-agent/internal/vmruntime/hcsrt/hyperv_exit_probe_windows_test.go')] = (Join-Path $validationDir 'hyperv_exit_probe_windows_test.go')",
+        "[System.IO.File]::WriteAllText($overlayFile, (@{ Replace = $replace } | ConvertTo-Json -Depth 3))",
+        "go test '-mod=readonly' \"-overlay=$overlayFile\" '-timeout=8m' '-count=1' '-v' './cmds/ownsand-agent/internal/vmruntime/hcsrt' '-run' '^TestHyperVDisconnectExitProbe$' 2>&1 | Tee-Object .t3-tmp/validation/windows-hyperv-exit-probe.log; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+      ],
+      "expectedResults": [
+        "Elevated probe passes. Native HCS reports the VM running after the injected disconnect. After direct native termination with callbacks withheld, a native HCS retry closes the VM and watcher signals, and the sandbox manager emits FAILED / LOST_ON_DEVICE for the test VM."
+      ],
+      "blocker": "The configured native account is non-elevated. It cannot boot or terminate Hyper-V VMs or apply the VM file ACLs."
+    },
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-hyperv-exit-retry/worker/.t3-tmp/validation/hyperv_exit_probe_windows_test.go",
+      "copyTo": ".t3-tmp/validation/hyperv_exit_probe_windows_test.go",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/system_exit_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/hcs_windows_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/runtime_windows_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/console_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/validation/windows-hcs-wait.log",
+        ".t3-tmp/validation/windows-hyperv-exit-probe.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-hyperv-exit-retry/worker/.t3-tmp/validation/ownsand-agent.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-hyperv-exit-retry/worker/.t3-tmp/validation/hcsrt.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-hyperv-exit-retry/worker/.t3-tmp/validation/hyperv-exit-probe.test.exe"
+      ]
+    }
+  }
+}
