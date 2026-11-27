@@ -4017,9 +4017,14 @@ describe("invitations", () => {
     expect(invitationInput().value).toBe(MOCK_INVITATION_SECRET);
   });
 
-  test.each(["success", "error"] as const)(
-    "keeps a replacement link active after a late accept %s",
-    async (result) => {
+  test.each([
+    { replacement: "link", result: "success" },
+    { replacement: "link", result: "error" },
+    { replacement: "edit", result: "success" },
+    { replacement: "edit", result: "error" },
+  ] as const)(
+    "keeps a replacement $replacement active after a late accept $result",
+    async ({ replacement, result }) => {
       const { transport, release, requested } = holdInvitationAccept();
       const queryClient = renderConsole("/", {
         transport,
@@ -4045,9 +4050,14 @@ describe("invitations", () => {
       });
       await click(join);
       expect(join.disabled).toBe(true);
-      await changeInvitationHash("#secret=sri_follow_up_invitation");
+      const replacementSecret = "sri_follow_up_invitation";
+      if (replacement === "link") {
+        await changeInvitationHash(`#secret=${replacementSecret}`);
+      } else {
+        await type(invitationInput(), replacementSecret);
+      }
 
-      expect(join.disabled).toBe(false);
+      await waitFor(() => expect(join.disabled).toBe(false));
       expect(requested).toHaveBeenCalledTimes(1);
       await act(async () => release());
       await waitFor(() =>
@@ -4056,7 +4066,8 @@ describe("invitations", () => {
         ),
       );
       expect(window.location.pathname).toBe("/invitations/accept");
-      expect(invitationInput().value).toBe("sri_follow_up_invitation");
+      expect(invitationInput().value).toBe(replacementSecret);
+      expect(join.disabled).toBe(false);
       expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
 
       if (result === "success") {
@@ -4202,28 +4213,6 @@ describe("invitations", () => {
       ).toBeTruthy();
     },
   );
-
-  test("keeps the new invitation when an earlier accept succeeds", async () => {
-    const { transport, release, requested } = holdInvitationAccept();
-    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
-      transport,
-    });
-    const join = screen.getByRole<HTMLButtonElement>("button", {
-      name: "Join organization",
-    });
-    await click(join);
-    expect(requested).toHaveBeenCalledTimes(1);
-
-    const input = screen.getByLabelText<HTMLInputElement>(
-      "Invitation link or secret",
-    );
-    await type(input, "sri_follow_up_invitation");
-    await act(async () => release());
-    await waitFor(() => expect(join.disabled).toBe(false));
-
-    expect(window.location.pathname).toBe("/invitations/accept");
-    expect(input.value).toBe("sri_follow_up_invitation");
-  });
 
   test("asks a signed-out user to sign in and open the link again", async () => {
     renderConsole("/invitations/accept", { signedIn: false });
