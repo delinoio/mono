@@ -1,0 +1,67 @@
+{
+  "gid": "inv-33-macos-none-probe-status",
+  "commit": "b3d80ef5963676e3e3920f77f33ccef6b9b8c757",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "b3d80ef5963676e3e3920f77f33ccef6b9b8c757",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "setup": "Run the commands in one Bash session at the repository root on the recorded revision. The signed fixture uses the native SDK and requires no guest image, IPSW, administrator access, or CMake.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"b3d80ef5963676e3e3920f77f33ccef6b9b8c757\"",
+      "test \"$(go env GOOS)\" = darwin",
+      "test \"$(go env GOARCH)\" = arm64",
+      "validation=\"$PWD/.t3-tmp/validation\"",
+      "mkdir -p \"$validation\"",
+      "export TMPDIR=\"$validation\" COPYFILE_DISABLE=1 CGO_ENABLED=1",
+      "unset OWNSAND_VZ_TEST_MACOS_IMAGE OWNSAND_VZ_TEST_KERNEL OWNSAND_VZ_TEST_ROOTFS OWNSAND_VZ_TEST_OUTBOUND",
+      "sw_vers && go version && xcrun --sdk macosx --show-sdk-path",
+      "go vet ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+      "go test -c -o \"$validation/ownsand-vzrt.test\" ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+      "codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$validation/ownsand-vzrt.test\"",
+      "codesign --verify \"$validation/ownsand-vzrt.test\"",
+      "\"$validation/ownsand-vzrt.test\" -test.v -test.count=1 -test.run '^TestMacOSNoneInterfaceProbe$' 2>&1 | tee \"$validation/macos-none-probe.log\"",
+      "grep -E '^--- PASS: TestMacOSNoneInterfaceProbe ' \"$validation/macos-none-probe.log\""
+    ],
+    "expectedResults": [
+      "The checkout is the recorded revision and the host reports darwin/arm64. Native cgo vet, compilation, ad-hoc signing, and signature verification succeed.",
+      "The signed test binary runs all six cases. Only exit 0 with no expected MAC is accepted. Exit 0 with the MAC is rejected. Exit 1, SIGTERM, unset status and a missing terminal event are rejected with the available terminal event and output."
+    ],
+    "files": {
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_macos_darwin_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_probe_test.go"
+      ],
+      "entitlements": "cmds/ownsand-agent/entitlements.plist",
+      "outputLogs": [
+        ".t3-tmp/validation/macos-none-probe.log",
+        ".t3-tmp/validation/macos-none-guest.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-33-macos-none-probe-status/worker/.t3-tmp/validation/ownsand-vzrt-darwin-arm64-nocgo.test"
+      ]
+    },
+    "unperformedOnAvailableHost": [
+      "The real guest check needs a prebuilt compatible macOS images/macos directory. The available host has no guest image or IPSW. The image-free signed fixture does not boot a VM."
+    ],
+    "guestIntegration": {
+      "status": "blocked-missing-image",
+      "setup": "When a compatible, readable macOS guest image is available, set OWNSAND_VZ_TEST_MACOS_IMAGE to its images/macos directory. Run from a checkout on the same APFS volume as the image. The lifecycle test uses APFS clonefile. Use the signed binary built by the image-free commands.",
+      "commands": [
+        ": \"${OWNSAND_VZ_TEST_MACOS_IMAGE:?Set to the built macOS images/macos directory}\"",
+        "for image_file in image.json disk.img aux.img hardware-model; do test -r \"$OWNSAND_VZ_TEST_MACOS_IMAGE/$image_file\"; done",
+        "test \"$(stat -f %d \"$TMPDIR\")\" = \"$(stat -f %d \"$OWNSAND_VZ_TEST_MACOS_IMAGE\")\"",
+        "volume=\"$(df -P \"$TMPDIR\" | awk 'END {print $1}')\"",
+        "diskutil info \"$volume\" | grep -E 'Type \\(Bundle\\):[[:space:]]+apfs'",
+        "export OWNSAND_VZ_TEST_MACOS_IMAGE",
+        "\"$validation/ownsand-vzrt.test\" -test.v -test.count=1 -test.timeout=30m -test.run '^TestVirtualizationMacOSIntegration$' 2>&1 | tee \"$validation/macos-none-guest.log\"",
+        "grep -E '^--- PASS: TestVirtualizationMacOSIntegration ' \"$validation/macos-none-guest.log\""
+      ],
+      "expectedResults": [
+        "The lifecycle runs without skipping. A real NONE guest exits 0 from /sbin/ifconfig -a, its listing omits the expected virtio MAC, and the test passes."
+      ]
+    }
+  }
+}
