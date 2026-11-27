@@ -451,6 +451,8 @@ The server reads its configuration from environment variables. `servers/ownsand-
 
 Add each `planned` variable to `.env.example` (name and placeholder only) and to the Turbo `passThroughEnv` list in the change that makes the server read it. Development and end-to-end runs point `ACCOUNTS_API_ORIGIN` and `LOGTO_TOKEN_ENDPOINT` at a local or fake `accounts-api` and token endpoint.
 
+`LOGTO_ISSUER`, `LOGTO_JWKS_URL`, `LOGTO_TOKEN_ENDPOINT`, `R2_ENDPOINT` and `ACCOUNTS_API_ORIGIN` accept explicit decimal ports from 0 to 65535. A port above 65535 stops startup. The error names the variable and omits its value. Correct any out-of-range port before upgrading.
+
 At startup, the server rejects a percent sign in the decoded hostname of any `CORS_ORIGINS` entry.
 
 `ADDR` and `STUN_ADDR` must be `host:port` addresses with a port from 0 to 65535. The host must be empty (all interfaces), an IP address (IPv6 in brackets, with an optional zone) or an RFC 1123 hostname. Configuration validation checks only the syntax and does not resolve the host, so a hostname that does not resolve still fails when the server listens. `accounts-api` applies the same rule to its `ADDR` through the shared `servers/internal/listenaddr` package.
