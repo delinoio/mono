@@ -149,7 +149,7 @@ func TestJITRegistrationSkipsStartWhenWindowsACLPreparationFails(t *testing.T) {
 	w := newGHWorld(t, worldOpts{})
 	guest := sandrunv1.GuestOs_GUEST_OS_WINDOWS
 	w.os.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
-		if !strings.Contains(strings.Join(p.Command, " "), "Set-Acl ") {
+		if !strings.Contains(strings.Join(p.Command, " "), "runner directory ACL verification failed after repair") {
 			return w.progs.exec(ctx, sandboxID, p)
 		}
 		code := int64(1)

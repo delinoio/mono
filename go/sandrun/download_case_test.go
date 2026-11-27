@@ -150,15 +150,7 @@ func TestDownloadDestinationHardLinkCaseCollision(t *testing.T) {
 						checkDownloadedFiles(t, dest, []string{first, anchor, second}, []string{tc.first.body, "a", tc.second.body})
 					}
 
-					if matches, err := filepath.Glob(filepath.Join(parent, ".sandrun-download-*")); err != nil || len(matches) != 0 {
-						t.Fatalf("local staging remains: %v, %v", matches, err)
-					}
-					fake.mu.Lock()
-					guestArchive := fake.path
-					fake.mu.Unlock()
-					if guestArchive != "" {
-						t.Fatalf("guest archive remains: %s", guestArchive)
-					}
+					checkDownloadCleanup(t, parent, fake)
 				})
 			}
 		})
@@ -191,6 +183,30 @@ func TestDownloadArchiveSeparatorCollision(t *testing.T) {
 					checkDownloadedFiles(t, filepath.Join(dest, "folder"), []string{"report.txt"}, []string{"x"})
 				})
 			}
+		})
+	}
+}
+
+func TestDownloadArchiveCollisionBelowAliasedDirectory(t *testing.T) {
+	const first, second = "./Reports/output.txt", "./reports/output.txt"
+	const firstDir, secondDir = "Reports", "reports"
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%t", existing), func(t *testing.T) {
+			parent := t.TempDir()
+			caseSensitive := caseSensitiveDir(t, parent)
+			dest, result, err := downloadCaseArchive(t, parent, existing,
+				&tar.Header{Name: first, Typeflag: tar.TypeReg, Mode: 0o644, Size: 1},
+				&tar.Header{Name: second, Typeflag: tar.TypeReg, Mode: 0o644, Size: 2},
+			)
+			if !caseSensitive {
+				checkArchiveCollision(t, dest, result, err, existing, first, second)
+				return
+			}
+			if err != nil || result == nil || !result.Directory || result.Files != 2 || result.Bytes != 3 {
+				t.Fatalf("case-distinct download = %+v, %v", result, err)
+			}
+			checkDownloadedFiles(t, filepath.Join(dest, firstDir), []string{"output.txt"}, []string{"x"})
+			checkDownloadedFiles(t, filepath.Join(dest, secondDir), []string{"output.txt"}, []string{"xx"})
 		})
 	}
 }
@@ -292,7 +308,7 @@ func downloadCaseArchive(t *testing.T, parent string, existing bool, entries ...
 		}
 	}
 	result, err := client.Download(t.Context(), DownloadParams{OrganizationID: "org", DevSessionID: "session", GuestPath: "out", LocalPath: dest})
-	checkDownloadArchiveCleanup(t, parent, fake)
+	checkDownloadCleanup(t, parent, fake)
 	return dest, result, err
 }
 
@@ -309,7 +325,111 @@ func checkArchiveCollision(t *testing.T, dest string, result *DownloadResult, er
 	}
 }
 
-func checkDownloadArchiveCleanup(t *testing.T, parent string, fake *scriptedDownloadSession) {
+func TestDownloadDirectoryCaseCollision(t *testing.T) {
+	const first, second = "Reports", "reports"
+	parent := t.TempDir()
+	probe := filepath.Join(parent, "probe")
+	if err := os.MkdirAll(filepath.Join(probe, first), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Stat(filepath.Join(probe, first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternate, err := os.Stat(filepath.Join(probe, second))
+	aliases := err == nil && os.SameFile(original, alternate)
+	if !aliases && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected directory case probe result: %v", err)
+	}
+	t.Logf("the staging volume aliases %q and %q: %t", first, second, aliases)
+
+	for _, tc := range []struct {
+		name     string
+		prefix   string
+		explicit bool
+	}{
+		{name: "explicit", explicit: true},
+		{name: "implicit", prefix: "nested/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			firstDir, secondDir := tc.prefix+first, tc.prefix+second
+			left := &tar.Header{Typeflag: tar.TypeReg, Name: "./" + firstDir + "/left.txt", Mode: 0o644, Size: 1}
+			right := &tar.Header{Typeflag: tar.TypeReg, Name: "./" + secondDir + "/right.txt", Mode: 0o644, Size: 2}
+			entries := []*tar.Header{left, right}
+			if tc.explicit {
+				entries = []*tar.Header{
+					{Typeflag: tar.TypeDir, Name: "./" + firstDir + "/", Mode: 0o755},
+					left,
+					{Typeflag: tar.TypeDir, Name: "./" + secondDir + "/", Mode: 0o755},
+					right,
+				}
+			}
+			chunk, err := io.ReadAll(tarOf(t, entries...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			size := int64(len(chunk))
+			fake := &scriptedDownloadSession{probe: fmt.Sprintf("dir %d", size), chunks: [][]byte{chunk}, endSize: size}
+			client := newScriptedDownloadClient(t, fake)
+
+			for _, existing := range []bool{false, true} {
+				t.Run(fmt.Sprintf("existing=%t", existing), func(t *testing.T) {
+					dest := filepath.Join(parent, fmt.Sprintf("%s-%t", tc.name, existing))
+					if existing {
+						if err := os.Mkdir(dest, 0o755); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(dest, "keep.txt"), []byte("old"), 0o644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					res, err := client.Download(t.Context(), DownloadParams{
+						OrganizationID: "org", DevSessionID: "session", GuestPath: "out", LocalPath: dest,
+					})
+					if aliases {
+						if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition ||
+							!strings.Contains(err.Error(), fmt.Sprintf("%q", firstDir)) ||
+							!strings.Contains(err.Error(), fmt.Sprintf("%q", secondDir)) {
+							t.Fatalf("directory collision = %+v, %v", res, err)
+						}
+						if existing {
+							checkDownloadedFiles(t, dest, []string{"keep.txt"}, []string{"old"})
+						} else if _, err := os.Lstat(dest); !errors.Is(err, os.ErrNotExist) {
+							t.Fatalf("failed download changed absent destination: %v", err)
+						}
+					} else {
+						if err != nil || res == nil || !res.Directory || res.Files != 2 || res.Bytes != 3 {
+							t.Fatalf("case-distinct directory download = %+v, %v", res, err)
+						}
+						dirs, err := os.ReadDir(filepath.Join(dest, tc.prefix))
+						if err != nil || len(dirs) != 2 || dirs[0].Name() != first || dirs[1].Name() != second {
+							t.Fatalf("downloaded directories = %v, %v", dirs, err)
+						}
+						checkDownloadedFiles(t, filepath.Join(dest, firstDir), []string{"left.txt"}, []string{"x"})
+						checkDownloadedFiles(t, filepath.Join(dest, secondDir), []string{"right.txt"}, []string{"xx"})
+					}
+					checkDownloadCleanup(t, parent, fake)
+				})
+			}
+		})
+	}
+}
+
+func TestDownloadArchiveRepeatedDirectoryName(t *testing.T) {
+	dir := t.TempDir()
+	extractor := archiveExtractor{fileLimit: 100, totalLimit: 1000, link: (*os.Root).Link}
+	_, err := extractor.extractArchive(t.Context(), tarOf(t,
+		&tar.Header{Typeflag: tar.TypeReg, Name: "./Reports/left.txt", Mode: 0o644, Size: 1},
+		&tar.Header{Typeflag: tar.TypeDir, Name: "Reports/", Mode: 0o755},
+		&tar.Header{Typeflag: tar.TypeReg, Name: "Reports/right.txt", Mode: 0o644, Size: 2},
+	), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkDownloadedFiles(t, filepath.Join(dir, "Reports"), []string{"left.txt", "right.txt"}, []string{"x", "xx"})
+}
+
+func checkDownloadCleanup(t *testing.T, parent string, fake *scriptedDownloadSession) {
 	t.Helper()
 	if matches, err := filepath.Glob(filepath.Join(parent, ".sandrun-download-*")); err != nil || len(matches) != 0 {
 		t.Fatalf("local staging remains: %v, %v", matches, err)

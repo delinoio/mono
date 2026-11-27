@@ -5,7 +5,9 @@ package hcsrt
 import (
 	"fmt"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 )
 
 // The HCS schema-v2 compute system document of a sandbox VM: the subset of
@@ -150,8 +152,7 @@ func kernelCmdLine(tunnel *netpolicy.Link) string {
 // newComputeSystemDoc returns the compute system document of a sandbox VM.
 // No network adapter is attached: OUTBOUND sandboxes use the tunnel.
 func newComputeSystemDoc(s vmSpec) computeSystemDoc {
-	// Hyper-V needs the memory size in whole 2 MiB pages.
-	mem := uint64(s.MemoryMiB+1) &^ 1
+	mem := vmruntime.EffectiveMemoryMiB(config.RuntimeKindHyperV, s.MemoryMiB)
 	owner := s.Owner
 	if owner == "" {
 		owner = Owner

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -115,7 +116,8 @@ type archiveExtractor struct {
 // extractArchive extracts the tar archive r into the directory dir, which
 // must exist and be empty. It rejects entries with absolute paths, entries
 // that resolve outside dir, symbolic links whose targets point outside dir
-// and hard links to paths outside the archive. After the last entry, it
+// and hard links to paths outside the archive. Distinct guest directory
+// names must resolve to distinct directory entries. After the last entry, it
 // checks every symbolic link again with the other links of the tree
 // resolved (verifyLinks). Each regular file may hold at
 // most fileLimit bytes and all files together at most totalLimit bytes.
@@ -130,6 +132,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 	st := &extractStats{}
 	regular := map[string]bool{}
 	fileNames := map[string][]archiveFileName{}
+	directoryNames := archiveDirectoryNames{}
 	tr := tar.NewReader(r)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -152,7 +155,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 		mode := fs.FileMode(hdr.Mode).Perm()
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := root.MkdirAll(name, mode|0o700); err != nil {
+			if err := directoryNames.mkdirAll(root, name, mode|0o700); err != nil {
 				return st, err
 			}
 		case tar.TypeReg:
@@ -164,6 +167,9 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 				var err error
 				previous, err = checkArchiveNameCollision(root, entry, names)
 				if err != nil {
+					return err
+				}
+				if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
 					return err
 				}
 				return writeEntry(root, name, mode, tr, hdr.Size)
@@ -184,7 +190,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			if err != nil {
 				return st, err
 			}
-			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
 				return st, err
 			}
 			if err := root.Remove(name); err == nil && previous >= 0 {
@@ -212,7 +218,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			if err != nil {
 				return st, err
 			}
-			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
 				return st, err
 			}
 			_ = root.Remove(name)
@@ -228,6 +234,76 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			st.warnings = append(st.warnings, fmt.Sprintf("%s: skipped an archive entry of an unsupported type", filepath.ToSlash(name)))
 		}
 	}
+}
+
+type archiveDirectoryNames map[string]fs.FileInfo
+
+// mkdirAll checks each directory spelling against the staging filesystem.
+// Directory identity catches aliases even when their spellings do not fold
+// to the same case. A newly created directory cannot alias an existing one.
+func (names archiveDirectoryNames) mkdirAll(root *os.Root, dir string, mode fs.FileMode) error {
+	if runtime.GOOS == "windows" {
+		// os.Root cleans Windows paths before looking up their components.
+		dir = filepath.Clean(dir)
+	}
+	var prefix string
+	for _, component := range splitPath(dir) {
+		if component == "." {
+			continue
+		}
+		if prefix == "" {
+			prefix = component
+		} else {
+			// Keep ".." after a symbolic link for os.Root to resolve.
+			prefix += string(filepath.Separator) + component
+		}
+		if component == ".." {
+			continue
+		}
+
+		info, err := root.Lstat(prefix)
+		if errors.Is(err, fs.ErrNotExist) {
+			if err := root.MkdirAll(prefix, mode); err != nil {
+				return err
+			}
+			info, err = root.Lstat(prefix)
+			if err != nil {
+				return err
+			}
+			names[prefix] = info
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.IsDir() && !os.SameFile(names[prefix], info) {
+			if err := names.claim(root, prefix, component, info); err != nil {
+				return err
+			}
+		}
+	}
+	// Let os.Root validate a final symbolic link or navigation component.
+	return root.MkdirAll(dir, mode)
+}
+
+func (names archiveDirectoryNames) claim(root *os.Root, name, component string, info fs.FileInfo) error {
+	for previous, identity := range names {
+		if !os.SameFile(identity, info) {
+			continue
+		}
+		current, err := root.Lstat(previous)
+		if err != nil || !os.SameFile(current, info) {
+			continue // A later entry can replace an empty directory or a symbolic link to its parent.
+		}
+		if filepath.Base(previous) != component {
+			return &archiveCaseCollision{earlier: filepath.ToSlash(previous), later: filepath.ToSlash(name)}
+		}
+		// A symbolic link can lead to the same directory with the same
+		// final component. Keep the original claim in that case.
+		return nil
+	}
+	names[name] = info
+	return nil
 }
 
 type archiveFileName struct {
@@ -252,6 +328,8 @@ func rememberArchiveFileName(names []archiveFileName, previous int, entry archiv
 // A case-folded match is only a candidate. Use Lstat to identify the staged
 // entry itself, including a symbolic link. Return its record index so an
 // allowed replacement can update the archive name and type in the record.
+// Check entry names before parent aliases so an entry collision reports the
+// full archive names.
 func checkArchiveNameCollision(root *os.Root, entry archiveFileName, names []archiveFileName) (int, error) {
 	if len(names) == 0 {
 		return -1, nil
@@ -366,12 +444,9 @@ func normalizedArchiveName(name string) string {
 	return strings.TrimSuffix(strings.TrimPrefix(name, "./"), "/")
 }
 
-// writeEntry writes one regular file inside root, replacing an existing
-// entry of the same name.
+// writeEntry writes one regular file in an existing directory inside root,
+// replacing an existing entry of the same name.
 func writeEntry(root *os.Root, name string, mode fs.FileMode, r io.Reader, size int64) error {
-	if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
-		return err
-	}
 	_ = root.Remove(name)
 	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode|0o600)
 	if err != nil {

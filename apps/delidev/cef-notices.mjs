@@ -18,7 +18,7 @@ const cargoLock = new URL("../../Cargo.lock", import.meta.url);
 const licenseName = "LICENSE.txt";
 const creditsName = "CREDITS.html";
 
-async function resolveDistribution() {
+async function resolveDistribution(platform) {
   const lock = await readFile(cargoLock, "utf8");
   const [, version] =
     /^\[\[package\]\]\r?\nname = "cef"\r?\nversion = "([^"]+)"/m.exec(lock) ??
@@ -30,19 +30,25 @@ async function resolveDistribution() {
   const cefVersion = version.split("+")[1] ?? version;
   const arch = TAURI_ENV_TARGET_TRIPLE.split("-")[0];
   const cache =
-    XDG_CACHE_HOME && isAbsolute(XDG_CACHE_HOME)
-      ? XDG_CACHE_HOME
-      : join(homedir(), ".cache");
+    platform === "macos"
+      ? join(homedir(), "Library", "Caches")
+      : XDG_CACHE_HOME && isAbsolute(XDG_CACHE_HOME)
+        ? XDG_CACHE_HOME
+        : join(homedir(), ".cache");
   const cefPath = resolve(tauriDir, CEF_PATH ?? join(cache, "tauri-cef"));
-  const versioned = join(cefPath, cefVersion, `cef_linux_${arch}`);
+  const versioned = join(cefPath, cefVersion, `cef_${platform}_${arch}`);
   const distribution = existsSync(versioned) ? versioned : cefPath;
-  if (!existsSync(join(distribution, "libcef.so"))) {
-    throw new Error(`no libcef.so in ${distribution}`);
+  const marker =
+    platform === "macos"
+      ? "Chromium Embedded Framework.framework"
+      : "libcef.so";
+  if (!existsSync(join(distribution, marker))) {
+    throw new Error(`no ${marker} in ${distribution}`);
   }
   return realpath(distribution);
 }
 
-async function readArchivedLicense(distribution) {
+async function readArchivedLicense(distribution, platform) {
   // download-cef 3.0.1 retains CREDITS.html and the verified archive, but
   // discards LICENSE.txt when it flattens the archive into the cache.
   const { name, sha1 } = JSON.parse(
@@ -61,34 +67,38 @@ async function readArchivedLicense(distribution) {
     throw new Error(`CEF archive checksum mismatch for ${archive}`);
 
   const member = join(name.slice(0, -".tar.bz2".length), licenseName);
-  return execFileSync("tar", [
-    "--extract",
-    "--to-stdout",
-    "--occurrence=1",
-    "--file",
-    archive,
-    "--",
-    member,
-  ]);
+  // BSD tar on macOS does not support GNU tar's --occurrence flag.
+  const flags = platform === "macos" ? [] : ["--occurrence=1"];
+  return execFileSync("tar", ["-xOf", archive, ...flags, "--", member]);
 }
 
-if (TAURI_ENV_TARGET_TRIPLE?.includes("-linux-")) {
+const platform = TAURI_ENV_TARGET_TRIPLE?.endsWith("-apple-darwin")
+  ? "macos"
+  : TAURI_ENV_TARGET_TRIPLE?.includes("-linux-")
+    ? "linux"
+    : undefined;
+
+if (platform) {
   try {
-    const distribution = await resolveDistribution();
+    const distribution = await resolveDistribution(platform);
     const license = join(distribution, licenseName);
     const output = join(DELIDEV_CEF_NOTICE_DIR, licenseName);
     await copyFile(
       join(distribution, creditsName),
       join(DELIDEV_CEF_NOTICE_DIR, creditsName),
     );
-    if (existsSync(license)) {
+    try {
       await copyFile(license, output);
-    } else {
-      await writeFile(output, await readArchivedLicense(distribution));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      await writeFile(
+        output,
+        await readArchivedLicense(distribution, platform),
+      );
     }
   } catch (error) {
     console.error(
-      `Cannot bundle the original CEF notices for Debian: ${error.message}`,
+      `Cannot bundle the original CEF notices for ${platform === "macos" ? "macOS" : "Debian"}: ${error.message}`,
     );
     process.exitCode = 1;
   }
