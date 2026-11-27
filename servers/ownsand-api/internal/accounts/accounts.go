@@ -195,7 +195,7 @@ func (s *TokenSource) refresh(ctx context.Context, f *tokenFlight, now time.Time
 	close(f.done)
 }
 
-// Invalidate drops the cached token, for example after the API rejected it.
+// Invalidate drops the cached token and detaches any active request.
 // It never waits for a token request: a request in progress still answers its
 // callers, but its token is not cached, and the next Token call starts a new
 // request.
@@ -206,16 +206,9 @@ func (s *TokenSource) Invalidate() {
 	s.mu.Unlock()
 }
 
-// InvalidateToken drops the cached token after the API rejected rejected,
-// the token that the failed call sent. It never waits for a token request.
-//
-// The rejection can arrive late: when several calls carry the same token and
-// the API rejects them one after the other, the first rejection drops the
-// token and a call caches a replacement before the later rejections arrive.
-// A rejection of a token that is no longer the cached token therefore changes
-// nothing: it keeps the replacement and a replacement request in progress, so
-// the next call does not need the token endpoint. A rejection of the cached
-// token behaves like Invalidate.
+// InvalidateToken drops the cached token if it matches the token sent by a
+// rejected API call. An active refresh stays available for other callers and
+// can cache its result.
 func (s *TokenSource) InvalidateToken(rejected string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -223,7 +216,6 @@ func (s *TokenSource) InvalidateToken(rejected string) {
 		return
 	}
 	s.token, s.refreshAt = "", time.Time{}
-	s.flight = nil
 }
 
 // errMalformedTokenResponse reports a successful token response that is not a
