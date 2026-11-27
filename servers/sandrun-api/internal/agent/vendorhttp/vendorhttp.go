@@ -11,8 +11,7 @@
 // operation name and the HTTP status. The client never logs the
 // credential, a request or response body, or query values: request and
 // response bodies can carry credentials, session tokens or connect tokens.
-// Only the `code` and `error` fields of an error body are kept, cut to a
-// short length, because the vendors put their stable error titles there.
+// For Codex, the client can report an allowlisted error code.
 package vendorhttp
 
 import (
@@ -39,12 +38,14 @@ const (
 	maxBody = 4 << 20
 	// maxEventLine bounds one line of an event stream.
 	maxEventLine = 1 << 20
-	// maxErrorText bounds the error text that the client keeps.
-	maxErrorText = 200
+	// maxErrorBody bounds the body used to check for a known error code.
+	maxErrorBody = 64 << 10
 	// DefaultCallTimeout bounds one unary call when the caller's context has
 	// no earlier deadline.
 	DefaultCallTimeout = 30 * time.Second
 )
+
+const codexInvalidAPIKey = "invalid_api_key"
 
 // Auth sets the credential header of a request.
 type Auth func(h http.Header)
@@ -56,7 +57,7 @@ func Bearer(token string) Auth {
 
 // Client is one vendor API with one credential.
 type Client struct {
-	// Vendor is the vendor label in logs (CURSOR, DEVIN).
+	// Vendor is the vendor label in logs (CURSOR, DEVIN, OPENAI_CODEX).
 	Vendor string
 	// BaseURL is the API origin, without a trailing slash.
 	BaseURL string
@@ -74,11 +75,9 @@ type StatusError struct {
 	Vendor string
 	Op     string
 	Status int
-	// Code and Text are the `code` and `error` (or `message`) fields of the
-	// error body, cut to a short length.
+	// Code is an allowlisted vendor error code, when present.
 	Code string
-	Text string
-	// RetryAfter is the Retry-After header in seconds, when present.
+	// RetryAfter is the duration from a numeric Retry-After header, when present.
 	RetryAfter time.Duration
 }
 
@@ -86,9 +85,6 @@ func (e *StatusError) Error() string {
 	msg := fmt.Sprintf("%s %s: HTTP %d", e.Vendor, e.Op, e.Status)
 	if e.Code != "" {
 		msg += " " + e.Code
-	}
-	if e.Text != "" {
-		msg += ": " + e.Text
 	}
 	return msg
 }
@@ -150,7 +146,7 @@ func (c *Client) newRequest(ctx context.Context, method, path string, query url.
 	return req, nil
 }
 
-// statusError reads the error body of a non-2xx response and logs it.
+// statusError builds and logs diagnostics for a non-2xx response.
 func (c *Client) statusError(ctx context.Context, op string, resp *http.Response) *StatusError {
 	se := &StatusError{Vendor: c.Vendor, Op: op, Status: resp.StatusCode}
 	if s := resp.Header.Get("Retry-After"); s != "" {
@@ -158,51 +154,36 @@ func (c *Client) statusError(ctx context.Context, op string, resp *http.Response
 			se.RetryAfter = time.Duration(n) * time.Second
 		}
 	}
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	var body struct {
-		Code    any    `json:"code"`
-		Error   any    `json:"error"`
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(b, &body) == nil {
-		se.Code = cut(textOf(body.Code))
-		se.Text = cut(textOf(body.Error))
-		if se.Text == "" {
-			se.Text = cut(body.Message)
+	body := io.LimitReader(resp.Body, maxErrorBody+1)
+	if c.Vendor == "OPENAI_CODEX" {
+		if b, err := io.ReadAll(body); err == nil && len(b) <= maxErrorBody {
+			se.Code = codexStatusCode(b)
 		}
+	} else {
+		_, _ = io.Copy(io.Discard, body)
 	}
-	c.logger().LogAttrs(ctx, slog.LevelWarn, "vendor_api_error", slog.String("vendor", c.Vendor), slog.String("op", op),
-		slog.Int("status", se.Status), slog.String("code", se.Code), slog.String("error", se.Text))
+	attrs := []slog.Attr{slog.String("vendor", c.Vendor), slog.String("op", op), slog.Int("status", se.Status)}
+	if se.Code != "" {
+		attrs = append(attrs, slog.String("code", se.Code))
+	}
+	c.logger().LogAttrs(ctx, slog.LevelWarn, "vendor_api_error", attrs...)
 	return se
 }
 
-// textOf returns a string field, or the `message` of an object field.
-func textOf(v any) string {
-	switch t := v.(type) {
-	case string:
-		return t
-	case map[string]any:
-		if s, ok := t["message"].(string); ok {
-			return s
-		}
-		if s, ok := t["code"].(string); ok {
-			return s
+func codexStatusCode(body []byte) string {
+	var fields, nested map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil {
+		return ""
+	}
+	// Codex can place the code at the top level or under the error object.
+	_ = json.Unmarshal(fields["error"], &nested)
+	for _, rawCode := range []json.RawMessage{fields["code"], nested["code"]} {
+		var code string
+		if json.Unmarshal(rawCode, &code) == nil && code == codexInvalidAPIKey {
+			return codexInvalidAPIKey
 		}
 	}
 	return ""
-}
-
-func cut(s string) string {
-	s = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return ' '
-		}
-		return r
-	}, s)
-	if len(s) > maxErrorText {
-		s = s[:maxErrorText]
-	}
-	return s
 }
 
 // Do sends one JSON request. A non-nil out requires a JSON document in a
