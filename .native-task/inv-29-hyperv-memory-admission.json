@@ -1,0 +1,106 @@
+{
+  "gid": "inv-29-hyperv-memory-admission",
+  "commit": "f324a6ce0285715ab274af4bd23da7030c07418f",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "f324a6ce0285715ab274af4bd23da7030c07418f",
+    "reason": "This worker ran on Linux without access to a Windows host. The native HCS probe requires an elevated account on a Windows amd64 host with Hyper-V enabled.",
+    "setup": "Run commands in order in PowerShell from a checkout at the indicated commit, with native Go on PATH. The commands at this level run as the non-elevated validation account. They need no service or HCS access and create no symbolic links.",
+    "commands": [
+      "$ErrorActionPreference = \"Stop\"",
+      "$rev = (git rev-parse HEAD).Trim(); if ($LASTEXITCODE -ne 0 -or $rev -ne \"f324a6ce0285715ab274af4bd23da7030c07418f\") { throw \"Unexpected source revision $rev\" }",
+      "$repo = (Get-Location).Path; $dir = Join-Path $repo '.t3-tmp\\hyperv-memory-native'; $testTemp = Join-Path $dir 'tests'; New-Item -ItemType Directory -Force -Path $testTemp | Out-Null; $env:TEMP = $testTemp; $env:TMP = $testTemp",
+      "go test ./cmds/ownsand-agent/internal/sandboxes ./cmds/ownsand-agent/internal/vmruntime/hcsrt -run '^(TestCreateMemoryLimits|TestComputeSystemDocMemory|TestComputeSystemDoc|TestWindowsComputeSystemDoc)$' -count=1 -timeout=2m -v 2>&1 | Tee-Object -FilePath (Join-Path $dir 'windows-fixtures.log'); if ($LASTEXITCODE -ne 0) { throw 'Windows fixtures failed' }"
+    ],
+    "expectedResults": [
+      "Both packages exit 0. All selected cases run without skips. The fixture matrix verifies both runtime kinds, exact limits, absence of records or runtime calls on rejection, and both HCS document guest branches."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-29-hyperv-memory-admission/worker/.t3-tmp/memory_admission_probe_test.go",
+      "copyTo": ".t3-tmp/hyperv-memory-native/memory_admission_probe_test.go",
+      "sha256": "ee42b48c4a8e6ad6a43c6a9246e2e7801c1428cc43d10123800994c9753bbc09",
+      "assetBundle": {
+        "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-29-hyperv-memory-admission/worker/.t3-tmp/hyperv-native-validation.zip",
+        "copyTo": ".t3-tmp/hyperv-memory-native/hyperv-native-validation.zip",
+        "sha256": "cf446b5308e52c234879b3095b5269b45feff2eb626a282769b555c2bbca3384",
+        "contains": [
+          "vmlinux",
+          "rootfs.ext4",
+          "memory_admission_probe_test.go"
+        ],
+        "note": "The archive contains the same source as the standalone probe, so copying the archive alone is sufficient. The kernel is the verified repository Linux 6.18.64 build from the sibling Hyper-V validation. The full image tooling tree is identical at both inspected revisions. The rootfs contains the guest binary built from this checkout and verified with debugfs and cmp."
+      },
+      "outputLogs": [
+        ".t3-tmp/hyperv-memory-native/windows-fixtures.log",
+        ".t3-tmp/hyperv-memory-native/windows-hyperv-runtime.log"
+      ]
+    },
+    "elevatedValidation": {
+      "status": "pending",
+      "setup": "Use a disposable Windows amd64 Hyper-V environment and elevated PowerShell. Copy the asset bundle to its destination before extraction. The probe filters startup inventory to its own two fresh sandbox IDs and runs with network mode NONE, a fresh state directory and no installed agent service.",
+      "commands": [
+        "$ErrorActionPreference = \"Stop\"",
+        "$rev = (git rev-parse HEAD).Trim(); if ($LASTEXITCODE -ne 0 -or $rev -ne \"f324a6ce0285715ab274af4bd23da7030c07418f\") { throw \"Unexpected source revision $rev\" }",
+        "$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this probe from an elevated PowerShell session' }",
+        "$repo = (Get-Location).Path; $dir = Join-Path $repo '.t3-tmp\\hyperv-memory-native'; $testTemp = Join-Path $dir 'tests'; New-Item -ItemType Directory -Force -Path $testTemp | Out-Null; $env:TEMP = $testTemp; $env:TMP = $testTemp",
+        "$zip = Join-Path $dir 'hyperv-native-validation.zip'; if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'cf446b5308e52c234879b3095b5269b45feff2eb626a282769b555c2bbca3384') { throw 'Native asset SHA-256 mismatch' }; Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force",
+        "$source = Join-Path $dir 'memory_admission_probe_test.go'; if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'ee42b48c4a8e6ad6a43c6a9246e2e7801c1428cc43d10123800994c9753bbc09') { throw 'Probe source SHA-256 mismatch' }",
+        "$virtual = Join-Path $repo 'cmds\\ownsand-agent\\internal\\sandboxes\\memory_admission_probe_test.go'; $replace = @{}; $replace[$virtual] = $source; $overlayPath = Join-Path $dir 'overlay.json'; $json = @{ Replace = $replace } | ConvertTo-Json -Depth 4; [System.IO.File]::WriteAllText($overlayPath, $json, [System.Text.UTF8Encoding]::new($false))",
+        "$env:OWNSAND_MEMORY_ADMISSION_PROBE = '1'; $env:OWNSAND_HV_TEST_KERNEL = Join-Path $dir 'vmlinux'; $env:OWNSAND_HV_TEST_ROOTFS = Join-Path $dir 'rootfs.ext4'",
+        "go test -overlay $overlayPath ./cmds/ownsand-agent/internal/sandboxes -run '^TestRuntimeMemoryAdmissionProbe$' -count=1 -timeout=7m -v 2>&1 | Tee-Object -FilePath (Join-Path $dir 'windows-hyperv-runtime.log'); if ($LASTEXITCODE -ne 0) { throw 'Native Hyper-V admission probe failed' }"
+      ],
+      "expectedResults": [
+        "The 511 MiB Linux guest starts and answers CheckReady. The probe records the requested 511 MiB.",
+        "The agent rejects the 512 MiB create at a latest limit of 1023 MiB with RESOURCE_EXHAUSTED and the existing memory-limit message. The request still carries the original 1024 MiB scheduling limit. Only the first VM remains in HCS inventory and the rejected VM has no record or folder.",
+        "The agent admits the same request and ID when the latest limit is 1024 MiB. Both guests answer CheckReady. Both test VMs are deleted and the filtered HCS inventory is empty."
+      ]
+    },
+    "crossBuild": {
+      "status": "passed",
+      "sha": "f324a6ce0285715ab274af4bd23da7030c07418f",
+      "commands": [
+        "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...",
+        "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -overlay='.t3-tmp/memory-probe-overlay.json' -o '.t3-tmp/sandboxes-windows-amd64.test.exe' ./cmds/ownsand-agent/internal/sandboxes && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o '.t3-tmp/hcsrt-windows-amd64.test.exe' ./cmds/ownsand-agent/internal/vmruntime/hcsrt",
+        "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o '.t3-tmp/ownsand-agent-windows-amd64.exe' ./cmds/ownsand-agent && GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o '.t3-tmp/ownsand-agent-windows-arm64.exe' ./cmds/ownsand-agent"
+      ],
+      "checks": [
+        {
+          "id": "windows-vet",
+          "command": "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...",
+          "status": "passed",
+          "exitCode": 0,
+          "sha": "f324a6ce0285715ab274af4bd23da7030c07418f",
+          "log": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-29-hyperv-memory-admission/worker/.t3-tmp/winvet.log",
+          "startedAt": "2026-11-27T17:31:18Z",
+          "finishedAt": "2026-11-27T17:31:18Z",
+          "durationSeconds": 1
+        },
+        {
+          "id": "windows-test-build",
+          "command": "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -overlay='.t3-tmp/memory-probe-overlay.json' -o '.t3-tmp/sandboxes-windows-amd64.test.exe' ./cmds/ownsand-agent/internal/sandboxes && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o '.t3-tmp/hcsrt-windows-amd64.test.exe' ./cmds/ownsand-agent/internal/vmruntime/hcsrt",
+          "status": "passed",
+          "exitCode": 0,
+          "sha": "f324a6ce0285715ab274af4bd23da7030c07418f",
+          "log": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-29-hyperv-memory-admission/worker/.t3-tmp/wintest.log",
+          "startedAt": "2026-11-27T17:33:10Z",
+          "finishedAt": "2026-11-27T17:33:10Z",
+          "durationSeconds": 0
+        },
+        {
+          "id": "windows-agent-build",
+          "command": "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o '.t3-tmp/ownsand-agent-windows-amd64.exe' ./cmds/ownsand-agent && GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o '.t3-tmp/ownsand-agent-windows-arm64.exe' ./cmds/ownsand-agent",
+          "status": "passed",
+          "exitCode": 0,
+          "sha": "f324a6ce0285715ab274af4bd23da7030c07418f",
+          "log": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-29-hyperv-memory-admission/worker/.t3-tmp/winbuild.log",
+          "startedAt": "2026-11-27T17:33:11Z",
+          "finishedAt": "2026-11-27T17:33:11Z",
+          "durationSeconds": 0
+        }
+      ]
+    }
+  }
+}
