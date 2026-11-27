@@ -329,6 +329,11 @@ h2 {
   border-radius: var(--dui-radius-panel, 16px);
 }
 
+.table-wrap:focus-visible {
+  outline: 2px solid var(--dui-color-focus-ring);
+  outline-offset: 2px;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;
