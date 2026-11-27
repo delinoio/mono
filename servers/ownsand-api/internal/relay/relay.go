@@ -121,6 +121,10 @@ type Conn struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
+	// pendingEcho coalesces echo requests while the writer is busy. It
+	// lets the receiver keep reading even when no ordinary slot is free.
+	pendingEcho chan struct{}
+
 	// sendInterrupt is set by SetSendInterrupt before Run starts.
 	sendInterrupt func() error
 	// wireBytes is set by SetWireBytes before Run starts.
@@ -204,7 +208,7 @@ func NewConnWithClock(parent context.Context, deviceID string, gen uint64, limit
 	ctx, cancel := context.WithCancelCause(parent)
 	reserved := max(limits.MaxStreamsPerConn, 0)
 	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan outFrame, outboundQueue+reserved),
-		slots: make(chan struct{}, outboundQueue), ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}, clk: clk}
+		slots: make(chan struct{}, outboundQueue), pendingEcho: make(chan struct{}, 1), ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}, clk: clk}
 	c.lastRecv.Store(int64(clk.Elapsed()))
 	c.lastSend.Store(int64(clk.Elapsed()))
 	c.lastRecvWall.Store(clk.Now().UnixNano())
@@ -407,27 +411,45 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		defer close(writerDone)
 		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
+		sendKeepalive := func() error {
+			if err := guardedSend(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
+				return err
+			}
+			c.lastSend.Store(int64(c.clk.Elapsed()))
+			return nil
+		}
 		for {
+			// Serve an echo that arrived during a send before taking more
+			// queued frames. Then give the ordinary queue a turn in the select.
 			select {
-			case of := <-c.out:
-				c.dequeued(of)
-				err := c.sendMeasured(of, guardedSend)
-				c.sent(of)
-				if err != nil {
+			case <-c.pendingEcho:
+				if err := sendKeepalive(); err != nil {
 					c.Close(err)
 					return
 				}
-				c.lastSend.Store(int64(c.clk.Elapsed()))
+			default:
+			}
+
+			var err error
+			select {
+			case of := <-c.out:
+				c.dequeued(of)
+				err = c.sendMeasured(of, guardedSend)
+				c.sent(of)
+				if err == nil {
+					c.lastSend.Store(int64(c.clk.Elapsed()))
+				}
+			case <-c.pendingEcho:
+				err = sendKeepalive()
 			case <-ticker.C:
-				now := c.clk.Elapsed()
-				if now-time.Duration(c.lastSend.Load()) >= c.limits.Keepalive {
-					if err := guardedSend(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
-						c.Close(err)
-						return
-					}
-					c.lastSend.Store(int64(now))
+				if c.clk.Elapsed()-time.Duration(c.lastSend.Load()) >= c.limits.Keepalive {
+					err = sendKeepalive()
 				}
 			case <-c.ctx.Done():
+				return
+			}
+			if err != nil {
+				c.Close(err)
 				return
 			}
 		}
@@ -474,7 +496,10 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 		switch p := f.GetPayload().(type) {
 		case *ownsandv1.DataFrame_RelayKeepalive:
 			if p.RelayKeepalive.GetEchoRequested() {
-				return c.enqueue(c.ctx, datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{}))
+				select {
+				case c.pendingEcho <- struct{}{}:
+				default:
+				}
 			}
 		case *ownsandv1.DataFrame_SupportedFrameKinds:
 			kinds := map[ownsandv1.DataFrameKind]bool{}

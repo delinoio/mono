@@ -28,6 +28,9 @@ import (
 // passes to delino-accounts.
 const maxAccountsPageToken = 1024
 
+// billingLinkDBTimeout bounds each completion or cleanup of a committed attempt.
+const billingLinkDBTimeout = 15 * time.Second
+
 // billingRestriction names the enforcement list of a gated RPC
 // (docs/servers-ownsand-api-foundation.md#enforcement).
 type billingRestriction int
@@ -424,13 +427,20 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 		return billing.Status{}, billing.Change{}, "", err
 	}
 	detached := context.WithoutCancel(ctx)
-	// The first transaction can use up the dispatch window before it commits.
-	if billing.LinkCallBudget(attempt.deadline, h.now()) <= 0 {
-		return billing.Status{}, billing.Change{}, "", h.expireLinkAttempt(detached, orgID, attempt)
+	// The dispatch window includes the ownership lookup, including its pool
+	// wait. Sample the context clock first so conversion cannot extend it.
+	lookupStarted := time.Now()
+	dispatchCtx, cancelDispatch := context.WithDeadline(detached, lookupStarted.Add(billing.LinkCallBudget(attempt.deadline, h.now())))
+	defer cancelDispatch()
+	if dispatchCtx.Err() != nil {
+		return billing.Status{}, billing.Change{}, "", h.expireLinkAttempt(ctx, orgID, attempt)
 	}
-	running, err := billing.LinkAttemptRunning(detached, h.DB.Pool, orgID, attempt.id)
+	running, err := billing.LinkAttemptRunning(dispatchCtx, h.DB.Pool, orgID, attempt.id)
+	if dispatchCtx.Err() != nil {
+		return billing.Status{}, billing.Change{}, "", h.expireLinkAttempt(ctx, orgID, attempt)
+	}
 	if err != nil {
-		h.releaseLinkAttempt(detached, orgID, attempt)
+		h.releaseLinkAttempt(ctx, orgID, attempt)
 		return billing.Status{}, billing.Change{}, "", err
 	}
 	if !running {
@@ -442,16 +452,16 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 	// clock first so converting the service-clock budget cannot extend it.
 	admittedAt := time.Now()
 	budget := billing.LinkCallBudget(attempt.deadline, h.now())
-	callCtx, cancel := context.WithDeadline(detached, admittedAt.Add(budget))
+	callCtx, cancel := context.WithDeadline(dispatchCtx, admittedAt.Add(budget))
 	if callCtx.Err() != nil {
 		cancel()
-		return billing.Status{}, billing.Change{}, "", h.expireLinkAttempt(detached, orgID, attempt)
+		return billing.Status{}, billing.Change{}, "", h.expireLinkAttempt(ctx, orgID, attempt)
 	}
 	resp, cerr := client.LinkOrganization(callCtx, connect.NewRequest(attempt.request))
 	cancel()
 	if cerr != nil {
 		if definitiveLinkFailure(cerr) {
-			h.abandonLinkAttempt(detached, orgID, attempt)
+			h.abandonLinkAttempt(ctx, orgID, attempt)
 			return billing.Status{}, billing.Change{}, "", h.accountsError(ctx, "LinkOrganization", cerr, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeAlreadyExists, connect.CodeInvalidArgument)
 		}
 		// Accounts may still commit the link after the client gives up.
@@ -461,7 +471,7 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 	}
 	var st billing.Status
 	var change billing.Change
-	txCtx, cancelTx := context.WithTimeout(detached, billing.LinkCallTimeout)
+	txCtx, cancelTx := context.WithTimeout(detached, billingLinkDBTimeout)
 	defer cancelTx()
 	err = h.DB.InTx(txCtx, func(tx pgx.Tx) error {
 		if err := lockOrganizationNoKey(txCtx, tx, orgID); err != nil {
@@ -487,7 +497,7 @@ func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, att
 	}
 	if err != nil {
 		// The record stays for the reconciliation.
-		h.releaseLinkAttempt(detached, orgID, attempt)
+		h.releaseLinkAttempt(ctx, orgID, attempt)
 		return billing.Status{}, billing.Change{}, "", err
 	}
 	return st, change, resp.Msg.GetBillingAccountName(), nil
@@ -507,11 +517,13 @@ func (h BillingHandler) expireLinkAttempt(ctx context.Context, orgID string, att
 // that delino-accounts rejected. If deletion fails, reconciliation can send
 // a harmless unlink after the call deadline.
 func (h BillingHandler) abandonLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) {
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
-		if err := lockOrganizationNoKey(ctx, tx, orgID); err != nil {
+	txCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), billingLinkDBTimeout)
+	defer cancel()
+	err := h.DB.InTx(txCtx, func(tx pgx.Tx) error {
+		if err := lockOrganizationNoKey(txCtx, tx, orgID); err != nil {
 			return err
 		}
-		return h.Billing.AbandonLinkAttempt(ctx, tx, orgID, attempt.id)
+		return h.Billing.AbandonLinkAttempt(txCtx, tx, orgID, attempt.id)
 	})
 	if err != nil {
 		h.Logger.WarnContext(ctx, "billing_link_attempt_abandon_failed", slog.String("organization_id", orgID), slog.String("link_attempt_id", attempt.id), slog.Any("error", err))
@@ -521,7 +533,9 @@ func (h BillingHandler) abandonLinkAttempt(ctx context.Context, orgID string, at
 // releaseLinkAttempt allows early reconciliation when dispatch did not start
 // or Accounts confirmed the link but the local write failed.
 func (h BillingHandler) releaseLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) {
-	if err := h.Billing.ReleaseLinkAttempt(ctx, orgID, attempt.id); err != nil {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), billingLinkDBTimeout)
+	defer cancel()
+	if err := h.Billing.ReleaseLinkAttempt(releaseCtx, orgID, attempt.id); err != nil {
 		h.Logger.WarnContext(ctx, "billing_link_attempt_release_failed", slog.String("organization_id", orgID), slog.String("link_attempt_id", attempt.id), slog.Any("error", err))
 		return
 	}

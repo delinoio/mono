@@ -379,7 +379,6 @@ func (f *DNSForwarder) serveTCP() {
 			if err != nil {
 				return
 			}
-			defer up.Close()
 			// Close cancels f.ctx: close the upstream connection then, so the
 			// copy below ends even when the upstream stays silent. AfterFunc
 			// runs at once when f.ctx ended during the dial, so there is no
@@ -399,14 +398,10 @@ func (f *DNSForwarder) serveTCP() {
 				close(done)
 			}()
 			io.Copy(c, up)
-			// The upstream ended its answer direction (it closed, or the
-			// deadline passed). Close the guest connection now: the guest
-			// observes EOF, the guest-to-upstream copy above stops reading
-			// and the TCP slot is released, instead of waiting for the guest
-			// to close or for the deadline. A guest that closes first keeps
-			// the path above: CloseWrite on the upstream lets a pending
-			// answer still reach the guest.
+			// Close both sockets before joining the request copy. It can be
+			// blocked on a guest read or an upstream write.
 			c.Close()
+			up.Close()
 			<-done
 		}()
 	}
