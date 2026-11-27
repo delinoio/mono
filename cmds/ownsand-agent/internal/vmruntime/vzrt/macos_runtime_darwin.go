@@ -48,10 +48,8 @@ func (r *Runtime) macOSImage() ([]byte, string) {
 	if _, err := images.Resolve(dir); err != nil {
 		return nil, "the macOS base image is not built; run `ownsand-agent image build`"
 	}
-	for _, name := range []string{images.MacOSDisk, images.MacOSAuxStorage} {
-		if !fileExists(filepath.Join(dir, name)) {
-			return nil, "the macOS base image is incomplete; build it again"
-		}
+	if _, err := images.MacOSStorage(dir); err != nil {
+		return nil, "the macOS base image is incomplete; build it again"
 	}
 	model, err := os.ReadFile(filepath.Join(dir, images.MacOSHardwareModel))
 	if err != nil {
