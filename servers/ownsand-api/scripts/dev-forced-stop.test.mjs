@@ -84,9 +84,8 @@ function parentOf(pid) {
 //   child       like drain, and the server runs a descendant that also lives
 //               until it is killed and reports its pid.
 // SIGQUIT ends the server at once like the Go runtime does.
-const fakeServer = `#!${process.execPath}
-// getBuiltinModule works whether the file is treated as CommonJS or as an ES
-// module, which depends on the package.json above the temporary directory.
+const fakeServer = `#!/bin/sh
+exec "$FIXTURE_NODE" - <<'SERVER_JS'
 const net = process.getBuiltinModule("node:net");
 const { spawn } = process.getBuiltinModule("node:child_process");
 const mode = process.env.FAKE_MODE || "drain";
@@ -117,6 +116,7 @@ net
   .listen(Number(process.env.FAKE_SERVER_PORT), "127.0.0.1", () => {
     log({ event: "fake_server", pid: process.pid, descendant: descendant && descendant.pid });
   });
+SERVER_JS
 `;
 
 // The fake build reports readiness after both processes install handlers.
@@ -174,7 +174,7 @@ while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done
 cat > "$out" <<'PROGRAM'
 ${fakeServer}PROGRAM
 chmod 755 "$out"
-if [ "$FAKE_PHASE" = build ]; then exec "$FAKE_NODE" "$0.mjs"; fi
+if [ "$FAKE_PHASE" = build ]; then exec "$FIXTURE_NODE" "$0.mjs"; fi
 `,
   );
   chmodSync(file, 0o755);
@@ -194,7 +194,7 @@ async function startLauncher(t, { env = {} } = {}) {
     ...process.env,
     DATABASE_URL: "postgres://placeholder@127.0.0.1:1/placeholder",
     FAKE_SERVER_PORT: String(port),
-    FAKE_NODE: process.execPath,
+    FIXTURE_NODE: process.execPath,
     MARKER_DIR: markerDir,
     PATH: `${fakeGo(t)}${delimiter}${process.env.PATH}`,
     TMPDIR: buildTmp,
