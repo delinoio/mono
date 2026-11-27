@@ -1,0 +1,42 @@
+{
+  "gid": "inv-13-windows-service-log-errors",
+  "commit": "5ee113e59733ea5d15595bcc89d9306125f165e6",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "5ee113e59733ea5d15595bcc89d9306125f165e6",
+    "setup": "Use elevated Windows PowerShell in a clean checkout at the worker revision inside a disposable Windows guest. LocalSystem must have read and execute access to the binary and write access to the scratch directory. The probe requires that no ownsand-guest service or Application Event Log source already exists. Create the scratch directory, copy the probe there, and run the remaining commands from the checkout root.",
+    "commands": [
+      "New-Item -ItemType Directory -Path '.t3-tmp/service-log' -Force | Out-Null",
+      "if ((git rev-parse HEAD) -ne '5ee113e59733ea5d15595bcc89d9306125f165e6') { throw 'Wrong validation revision' }; if ((go env GOOS) -ne 'windows') { throw 'Go must target Windows' }",
+      "$env:TEMP = (Resolve-Path '.t3-tmp').Path; $env:TMP = $env:TEMP",
+      "go test -mod=readonly -v -count=1 -timeout=2m ./cmds/ownsand-guest -run 'Test(OpenLogFile|OpenServiceLog|Service)' | Tee-Object -FilePath '.t3-tmp/service-log/native-tests.log'; if ($LASTEXITCODE -ne 0) { throw 'Native guest log tests failed' }",
+      "go build -mod=readonly -trimpath -o '.t3-tmp/service-log/ownsand-guest.exe' ./cmds/ownsand-guest; if ($LASTEXITCODE -ne 0) { throw 'Native guest build failed' }",
+      "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.t3-tmp/service-log/probe-windows.ps1' -Binary '.t3-tmp/service-log/ownsand-guest.exe' | Tee-Object -FilePath '.t3-tmp/service-log/native-scm.log'; if ($LASTEXITCODE -ne 0) { throw 'Native SCM probe failed' }"
+    ],
+    "expectedResults": [
+      "All commands succeed. The Windows handler fixtures inject an event reporter error and verify a single sanitized diagnostic attempt and service-specific exit code 1 for both filesystem failures.",
+      "The fresh LocalSystem service registers the source. Each manual failed start records one readable Application event under source ownsand-guest, level Error, ID 1. The operations are 'could not create the service state directory' (3) and 'could not open guest.log' (5). Each contains the system message and omits the configured state path. SCM reports 1066 / 1.",
+      "The valid LocalSystem start serves CheckReady and appends to guest.log without an Application fallback event. An archive with an open handle stays intact and the active file receives exactly one initial rotation warning during a successful start.",
+      "The configured 1 s / 2 s / 5 s SCM recovery policy remains visible and generates an automatic restart after a failed start. The probe prints its PASS line and removes the disposable service, registry source and fixture files."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-service-log-errors/worker/.t3-tmp/service-log/probe-windows.ps1",
+      "copyTo": ".t3-tmp/service-log/probe-windows.ps1",
+      "regressionTests": [
+        "cmds/ownsand-guest/logfile_test.go",
+        "cmds/ownsand-guest/service_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/service-log/native-tests.log",
+        ".t3-tmp/service-log/native-scm.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-service-log-errors/worker/.t3-tmp/service-log/ownsand-guest.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-13-windows-service-log-errors/worker/.t3-tmp/service-log/ownsand-guest.test.exe"
+      ]
+    }
+  }
+}
