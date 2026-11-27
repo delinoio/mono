@@ -120,14 +120,51 @@ func requireVsockSocket(t *testing.T) {
 	}
 	syscall.ForkLock.RUnlock()
 
+	if err == nil {
+		return
+	}
+	if reason := rawVsockSocketUnavailableReason(err); reason != "" {
+		t.Skipf("raw AF_VSOCK stream socket %s: %v", reason, err)
+	}
+	t.Fatalf("open raw AF_VSOCK stream socket: %v", err)
+}
+
+func rawVsockSocketUnavailableReason(err error) string {
 	switch err {
-	case nil:
-	case unix.EAFNOSUPPORT, unix.EPROTONOSUPPORT, unix.ESOCKTNOSUPPORT:
-		t.Skipf("raw AF_VSOCK stream socket unsupported: %v", err)
+	case unix.EAFNOSUPPORT, unix.EPROTONOSUPPORT, unix.ESOCKTNOSUPPORT, unix.EOPNOTSUPP:
+		return "unsupported"
+	case unix.ENODEV:
+		return "device unavailable"
 	case unix.EACCES, unix.EPERM:
-		t.Skipf("raw AF_VSOCK stream socket denied: %v", err)
+		return "denied"
 	default:
-		t.Fatalf("open raw AF_VSOCK stream socket: %v", err)
+		return ""
+	}
+}
+
+func TestRawVsockSocketUnavailableReason(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "available"},
+		{name: "unsupported address family", err: unix.EAFNOSUPPORT, want: "unsupported"},
+		{name: "unsupported protocol", err: unix.EPROTONOSUPPORT, want: "unsupported"},
+		{name: "unsupported socket type", err: unix.ESOCKTNOSUPPORT, want: "unsupported"},
+		{name: "unsupported operation", err: unix.EOPNOTSUPP, want: "unsupported"},
+		{name: "missing device", err: unix.ENODEV, want: "device unavailable"},
+		{name: "access denied", err: unix.EACCES, want: "denied"},
+		{name: "operation denied", err: unix.EPERM, want: "denied"},
+		{name: "unexpected I/O error", err: unix.EIO},
+		// socket(2) takes no device path.
+		{name: "unexpected missing path", err: unix.ENOENT},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rawVsockSocketUnavailableReason(tt.err); got != tt.want {
+				t.Errorf("reason for %v = %q, want %q", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 
