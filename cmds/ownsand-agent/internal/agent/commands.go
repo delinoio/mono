@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/snapxfer"
@@ -27,6 +28,8 @@ func commandKind(cmd *ownsandv1.AgentCommand) string {
 		return "pause_sandbox"
 	case *ownsandv1.AgentCommand_ResumeSandbox:
 		return "resume_sandbox"
+	case *ownsandv1.AgentCommand_FenceResume:
+		return "fence_resume"
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		return "create_snapshot"
 	case *ownsandv1.AgentCommand_ExportSnapshot:
@@ -100,21 +103,39 @@ func (a *Agent) handleCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.
 type commandReceipt struct {
 	snapshotCreate *sandboxes.SnapshotCreateClaim
 	snapshotDelete func() error
+	resumeDone     chan struct{}
 }
 
-// receiveCommand registers snapshot commands before their workers start.
+// receiveCommand registers commands in channel receive order, before their workers start.
 func (a *Agent) receiveCommand(cmd *ownsandv1.AgentCommand) commandReceipt {
 	switch c := cmd.GetCommand().(type) {
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		return commandReceipt{snapshotCreate: a.Sandboxes.ClaimSnapshotCreate(c.CreateSnapshot.GetSnapshotId())}
 	case *ownsandv1.AgentCommand_DeleteSnapshot:
 		return commandReceipt{snapshotDelete: a.Sandboxes.ReceiveSnapshotDelete(c.DeleteSnapshot)}
+	case *ownsandv1.AgentCommand_ResumeSandbox:
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.resumes == nil {
+			a.resumes = make(map[string]chan struct{})
+		}
+		done := make(chan struct{})
+		a.resumes[cmd.GetCommandId()] = done
+		return commandReceipt{resumeDone: done}
 	default:
 		return commandReceipt{}
 	}
 }
 
 func (a *Agent) handleReceivedCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64, receipt commandReceipt) {
+	if receipt.resumeDone != nil {
+		defer func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			delete(a.resumes, cmd.GetCommandId())
+			close(receipt.resumeDone)
+		}()
+	}
 	if receipt.snapshotCreate != nil {
 		defer receipt.snapshotCreate.Release()
 	}
@@ -142,6 +163,12 @@ func (a *Agent) handleReceivedCommand(chanCtx, agentCtx context.Context, cmd *ow
 		var e *ownsandv1.SandboxStateEntry
 		e, err = a.Sandboxes.Resume(agentCtx, c.ResumeSandbox)
 		setSandboxResult(res, e)
+	case *ownsandv1.AgentCommand_FenceResume:
+		var result *ownsandv1.FenceResumeResult
+		result, err = a.fenceResume(chanCtx, c.FenceResume)
+		if result != nil {
+			res.Result = &ownsandv1.AgentCommandResult_FenceResume{FenceResume: result}
+		}
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
 		e, err = a.Sandboxes.CreateClaimedSnapshot(chanCtx, c.CreateSnapshot, receipt.snapshotCreate)
@@ -189,6 +216,30 @@ func (a *Agent) handleReceivedCommand(chanCtx, agentCtx context.Context, cmd *ow
 		// sandbox update.
 		logger.Warn("command result not sent")
 	}
+}
+
+// fenceResume waits for a received resume, including one from a closed channel.
+// The server sends each resume ID once. The reader registers it before it can
+// receive a fence on that stream. A replacement stream starts after the old
+// reader exits, so a resume that is absent here cannot arrive later.
+func (a *Agent) fenceResume(ctx context.Context, cmd *ownsandv1.FenceResumeCommand) (*ownsandv1.FenceResumeResult, error) {
+	a.mu.Lock()
+	done := a.resumes[cmd.GetResumeCommandId()]
+	a.mu.Unlock()
+	if done != nil {
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, Message: "the resume is still in progress"}
+		}
+	}
+	entry := a.Sandboxes.StateEntry(cmd.GetSandboxId())
+	if entry == nil {
+		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, Message: "sandbox is unknown on this device"}
+	}
+	return &ownsandv1.FenceResumeResult{ResumeCommandId: cmd.GetResumeCommandId(), Sandbox: entry}, nil
 }
 
 func setSandboxResult(res *ownsandv1.AgentCommandResult, e *ownsandv1.SandboxStateEntry) {

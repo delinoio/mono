@@ -250,6 +250,13 @@ func TestOfflineDeleteAndReconciliation(t *testing.T) {
 		t.Fatalf("offline delete: %v %v", del, err)
 	}
 
+	retry, err := callDeleteSandbox(ctx, env.User(org.Member), org.ID, idA)
+	if err != nil || retry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE ||
+		retry.GetLastKnownState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("offline delete retry: %v %v", retry, err)
+	}
+	waitForDeleteEvents(t, env, idA, 2)
+
 	// The agent lost sandbox B while offline (for example a host reboot) and
 	// still runs A: on reconnect, B fails with LOST_ON_DEVICE and A gets the
 	// pending delete.
@@ -264,6 +271,9 @@ func TestOfflineDeleteAndReconciliation(t *testing.T) {
 	sb = waitState(t, c, org.ID, idA, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
 	if sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatalf("A end reason = %v", sb.GetEndReason())
+	}
+	if got := len(deleteCommands(agent2, idA)); got != 1 {
+		t.Fatalf("delete commands on reconnect after the offline retry = %d, want 1", got)
 	}
 	sb = getSandbox(t, c, org.ID, idB)
 	if sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
@@ -1959,23 +1969,77 @@ func TestImportWaitExpiryFailsCreate(t *testing.T) {
 	_ = again
 }
 
-// TestImportBeforeWaitExpiryCreates is the control: a timely import result
-// leads to the create command and RUNNING.
+// TestImportBeforeWaitExpiryCreates checks that a timely import result
+// registers the destination copy before the server sends the create command.
 func TestImportBeforeWaitExpiryCreates(t *testing.T) {
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: 5 * time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
 	snapID, devB, agentB := importFixture(t, env, org)
+	if n := copyRowCount(t, env, snapID, devB.ID); n != 0 {
+		t.Fatalf("destination copy rows before create request = %d, want 0", n)
+	}
+
+	replyToCreate := make(chan struct{})
+	agentB.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		if cmd.GetImportSnapshot() != nil {
+			return nil // The test sends the result after checking the pending import.
+		}
+		if cmd.GetCreateSandbox() != nil {
+			select {
+			case <-replyToCreate:
+			case <-ctx.Done():
+				return nil
+			}
+		}
+		return fa.DefaultAnswer(cmd)
+	})
+
 	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitState(t, c, org.ID, created.Msg.GetSandbox().GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	agentB.WaitFor("create after import", func(e *ownsandv1.AgentEnvelope) bool {
-		return e.GetCommand().GetCreateSandbox().GetSandboxId() == created.Msg.GetSandbox().GetSandboxId()
+	id := created.Msg.GetSandbox().GetSandboxId()
+	importCmd := agentB.WaitFor("import command for the requested snapshot", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetImportSnapshot().GetSnapshot().GetSnapshotId() == snapID
+	}).GetCommand()
+	importID := importCmd.GetCommandId()
+	if importID == "" {
+		t.Fatal("import command has no command ID")
+	}
+	if n := copyRowCount(t, env, snapID, devB.ID); n != 0 {
+		t.Fatalf("destination copy rows while import result is withheld = %d, want 0", n)
+	}
+
+	// Read through a heartbeat acknowledgement while the import result is
+	// withheld, so commands already queued on the stream appear in history.
+	const sequence = 7
+	agentB.Heartbeat(sequence)
+	agentB.WaitFor("heartbeat acknowledgement during import", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetHeartbeatAck().GetSequence() == sequence
 	})
+	for _, cmd := range agentB.Commands() {
+		if cmd.GetCreateSandbox().GetSandboxId() == id {
+			t.Fatal("create command arrived before the import result was sent")
+		}
+	}
+
+	agentB.AddSnapshot(importCmd.GetImportSnapshot().GetSnapshot())
+	sendImportResult(agentB, importID)
+	agentB.WaitFor("create command after import", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetCreateSandbox().GetSandboxId() == id
+	})
+	if n := copyRowCount(t, env, snapID, devB.ID); n != 1 {
+		t.Fatalf("destination copy rows when create arrived = %d, want 1", n)
+	}
+	if !importResultLogged(env, importID, snapID, "ok") {
+		t.Fatalf("no successful result logged for import command %s", importID)
+	}
+	close(replyToCreate)
+	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 }
 
 // offsetClock is the real clock plus an offset that a test moves forward.

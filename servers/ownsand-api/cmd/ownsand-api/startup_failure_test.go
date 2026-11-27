@@ -4,15 +4,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"runtime"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // The errno rules run on every host: the errno values and the platform name
@@ -133,5 +136,47 @@ func TestLogServerExitedCarriesTheReasonAndTheError(t *testing.T) {
 	}
 	if m["error"] != other.Error() {
 		t.Errorf("error = %v, want %q", m["error"], other.Error())
+	}
+}
+
+func TestStartupRejectsMalformedDatabaseURL(t *testing.T) {
+	const helper = "OWNSAND_TEST_MALFORMED_DATABASE_URL_PROCESS"
+	if os.Getenv(helper) == "1" {
+		main()
+		return
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestStartupRejectsMalformedDatabaseURL$")
+	const marker = "synthetic-database-name"
+	cmd.Env = []string{
+		helper + "=1",
+		"DATABASE_URL=postgres://test:synthetic-password@127.0.0.1:badport/" + marker,
+		"LOGTO_ISSUER=http://127.0.0.1:9/oidc",
+	}
+	output, err := cmd.Output()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("startup exit = %v, want exit status 1", err)
+	}
+
+	var record struct {
+		Message string `json:"msg"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(output, &record); err != nil {
+		t.Fatalf("startup output is not one JSON record: %v", err)
+	}
+	const want = "parse database url: invalid connection string"
+	if record.Message != "server_exited" || record.Error != want {
+		t.Errorf("startup did not log server_exited with error %q", want)
+	}
+	if bytes.Contains(output, []byte(marker)) || bytes.Contains(exitErr.Stderr, []byte(marker)) {
+		t.Error("startup output contains the synthetic database name")
 	}
 }

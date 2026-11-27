@@ -17,7 +17,9 @@ import (
 // cleanupPacketConn is a net.PacketConn whose ReadFrom either fails at once with
 // readErr or blocks until Close, like a real UDP socket.
 type cleanupPacketConn struct {
-	readErr error
+	readErr     error
+	readOnce    sync.Once
+	readEntered chan struct{}
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -25,13 +27,18 @@ type cleanupPacketConn struct {
 }
 
 func newCleanupPacketConn(readErr error) *cleanupPacketConn {
-	return &cleanupPacketConn{readErr: readErr, closed: make(chan struct{})}
+	return &cleanupPacketConn{
+		readErr:     readErr,
+		readEntered: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
 }
 
 func (c *cleanupPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
 	if c.readErr != nil {
 		return 0, nil, c.readErr
 	}
+	c.readOnce.Do(func() { close(c.readEntered) })
 	<-c.closed
 	return 0, nil, net.ErrClosed
 }
@@ -40,8 +47,12 @@ func (c *cleanupPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return 
 
 func (c *cleanupPacketConn) Close() error {
 	c.closes.Add(1)
-	c.closeOnce.Do(func() { close(c.closed) })
+	c.releaseRead()
 	return nil
+}
+
+func (c *cleanupPacketConn) releaseRead() {
+	c.closeOnce.Do(func() { close(c.closed) })
 }
 
 func (c *cleanupPacketConn) LocalAddr() net.Addr { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)} }
@@ -99,18 +110,30 @@ func TestServeReadErrorReleasesResources(t *testing.T) {
 }
 
 func TestServeCancelReleasesBlockedRead(t *testing.T) {
+	const waitTimeout = 5 * time.Second
 	pc := newCleanupPacketConn(nil)
+	// Release the read during teardown if Serve failed to close the connection.
+	t.Cleanup(pc.releaseRead)
 	s, stopped := newCleanupServer()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx, pc) }()
-	// Serve is blocked in ReadFrom until the parent context ends and the
-	// closer releases the connection.
+	select {
+	case <-pc.readEntered:
+	case <-time.After(waitTimeout):
+		t.Fatal("ReadFrom did not enter the blocking path before cancellation")
+	}
+
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Serve after cancellation returned an error: %v", errors.Is(err, net.ErrClosed))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve after cancellation returned an error: %v", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Serve did not return after cancellation with a pending ReadFrom")
 	}
 	if got := pc.closes.Load(); got != 1 {
 		t.Fatalf("PacketConn closed %d times, want 1", got)
