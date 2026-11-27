@@ -24,12 +24,14 @@ func openEnrollmentLock(dir string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 }
 
-// tryLockFile takes an exclusive LockFileEx lock on the first byte without
+// tryLockFile takes an LockFileEx lock on the first byte without
 // waiting. It reports false when another handle holds the lock.
-func tryLockFile(f *os.File) (bool, error) {
-	ol := new(windows.Overlapped)
-	err := windows.LockFileEx(windows.Handle(f.Fd()),
-		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, ol)
+func tryLockFile(f *os.File, mode enrollmentLockAccess) (bool, error) {
+	flags := uint32(windows.LOCKFILE_FAIL_IMMEDIATELY)
+	if mode == enrollmentExclusive {
+		flags |= windows.LOCKFILE_EXCLUSIVE_LOCK
+	}
+	err := windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, 1, 0, new(windows.Overlapped))
 	switch {
 	case err == nil:
 		return true, nil

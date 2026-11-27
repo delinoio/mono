@@ -4,6 +4,7 @@ package imagebuild
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"io"
 	"log/slog"
@@ -92,6 +93,18 @@ func TestAttachedWholeDisk(t *testing.T) {
 			}
 		})
 	}
+}
+
+// disk4EntryEnd follows the complete dev-entry value inside the first entity.
+var disk4EntryEnd = strings.Index(attachPlist, "/dev/disk4</string>") + len("/dev/disk4</string>")
+
+func diskInfoPlist(image, dev string) string {
+	var path strings.Builder
+	_ = xml.EscapeText(&path, []byte(image))
+	return `<plist version="1.0"><dict><key>images</key><array><dict>
+	<key>system-entities</key><array><dict><key>dev-entry</key><string>` + dev + `</string></dict></array>
+	<key>image-path</key><string>` + path.String() + `</string>
+	</dict></array></dict></plist>`
 }
 
 // fakeHdiutil is a hostRunner that records every call. The attach call
@@ -209,6 +222,95 @@ func TestWithAttachedDiskNoDetachWithoutAttach(t *testing.T) {
 	f = &fakeHdiutil{attachOut: "<plist><dict/></plist>"}
 	if err := withAttachedDisk(context.Background(), f.run, "/build/disk.img", discardLogger(), func(string) error { return nil }); err == nil || len(f.detaches()) != 0 {
 		t.Fatalf("err = %v, detaches = %v", err, f.detaches())
+	}
+}
+
+func TestWithAttachedDiskRecoversInterruptedAttach(t *testing.T) {
+	disk := filepath.Join(t.TempDir(), "disk.img")
+	const device = "/dev/disk4"
+	matched := diskInfoPlist(disk, device)
+	reused := diskInfoPlist(disk+".old", device)
+	absent := diskInfoPlist(disk, "/dev/disk5")
+	ambiguous := strings.Replace(attachPlist, "</array>", `<dict><key>dev-entry</key><string>/dev/disk9</string></dict></array>`, 1)
+	doubleAssociation := strings.Replace(matched, "</dict></array></dict></plist>", `</dict><dict>
+		<key>image-path</key><string>/other/disk.img</string>
+		<key>system-entities</key><array><dict><key>dev-entry</key><string>/dev/disk4</string></dict></array>
+		</dict></array></dict></plist>`, 1)
+	info := []string{"info", "-plist"}
+	detach := []string{"detach", device}
+	force := []string{"detach", "-force", device}
+	for _, tc := range []struct {
+		name, output string
+		inventories  []string
+		infoErr      error
+		detachErr    error
+		wantCalls    [][]string
+	}{
+		{name: "complete output", output: attachPlist, inventories: []string{matched}, wantCalls: [][]string{info, detach}},
+		{name: "tail truncated after complete entry", output: attachPlist[:disk4EntryEnd], inventories: []string{matched}, wantCalls: [][]string{info, detach}},
+		{name: "force retry with fresh verification", output: attachPlist, inventories: []string{matched, matched}, detachErr: errors.New("busy"), wantCalls: [][]string{info, detach, info, force}},
+		{name: "reuse after normal detach error", output: attachPlist, inventories: []string{matched, reused}, detachErr: errors.New("busy"), wantCalls: [][]string{info, detach, info}},
+		{name: "already gone after normal detach error", output: attachPlist, inventories: []string{matched, absent}, detachErr: errors.New("not found"), wantCalls: [][]string{info, detach, info}},
+		{name: "device already gone", output: attachPlist, inventories: []string{absent}, wantCalls: [][]string{info}},
+		{name: "device now belongs to an unrelated image", output: attachPlist, inventories: []string{reused}, wantCalls: [][]string{info}},
+		{name: "same device reported by two images", output: attachPlist, inventories: []string{doubleAssociation}, wantCalls: [][]string{info}},
+		{name: "whole-disk device missing from inventory", output: attachPlist, inventories: []string{diskInfoPlist(disk, device+"s1")}, wantCalls: [][]string{info}},
+		{name: "inventory lookup fails with output", output: attachPlist, inventories: []string{matched}, infoErr: errors.New("info failed"), wantCalls: [][]string{info}},
+		{name: "inventory is incomplete", output: attachPlist, inventories: []string{strings.TrimSuffix(matched, "</plist>")}, wantCalls: [][]string{info}},
+		{name: "ambiguous attach output", output: ambiguous},
+		{name: "ambiguous attach output with a truncated tail", output: strings.Split(ambiguous, "</array>")[0]},
+		{name: "device string is incomplete", output: strings.TrimSuffix(attachPlist[:disk4EntryEnd], "</string>")},
+		{name: "partition paths only", output: strings.Replace(attachPlist, "/dev/disk4<", "/dev/disk4s9<", 1)},
+		{name: "unrelated plist array", output: strings.Replace(attachPlist, "system-entities", "other", 1)},
+		{name: "unstructured device text", output: "attached /dev/disk4"},
+		{name: "empty attach output"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var calls [][]string
+			run := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if name != hdiutilPath {
+					t.Fatalf("unexpected command %q %v", name, args)
+				}
+				if args[0] == "attach" {
+					cancel()
+					return []byte(tc.output), ctx.Err()
+				}
+				calls = append(calls, args)
+				timeout := detachTimeout
+				if args[0] == "info" {
+					timeout = attachmentInfoTimeout
+				}
+				if left, ok := ctx.Deadline(); !ok || ctx.Err() != nil || time.Until(left) > timeout {
+					t.Fatalf("%v used an invalid cleanup context (deadline %v, error %v)", args, left, ctx.Err())
+				}
+				switch args[0] {
+				case "info":
+					if len(tc.inventories) == 0 {
+						t.Fatal("unexpected info lookup")
+					}
+					out := tc.inventories[0]
+					tc.inventories = tc.inventories[1:]
+					return []byte(out), tc.infoErr
+				case "detach":
+					return nil, tc.detachErr
+				default:
+					t.Fatalf("unexpected hdiutil arguments %v", args)
+					return nil, nil
+				}
+			}
+			err := withAttachedDisk(ctx, run, disk, discardLogger(), func(string) error {
+				t.Fatal("use called after a failed attach")
+				return nil
+			})
+			if want := "imagebuild: attach the guest disk: context canceled"; !errors.Is(err, context.Canceled) || err.Error() != want {
+				t.Fatalf("error = %v, want %q", err, want)
+			}
+			if !reflect.DeepEqual(calls, tc.wantCalls) {
+				t.Fatalf("cleanup calls = %v, want %v", calls, tc.wantCalls)
+			}
+		})
 	}
 }
 

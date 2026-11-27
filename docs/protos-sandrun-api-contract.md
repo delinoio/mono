@@ -132,6 +132,7 @@ Each `GetAgentIntegration` response and each `ListAgentIntegrations` page use on
 | `OPENAI_CODEX` | none           | `environment_key`, `webhook_secret`, `api_key` |
 | `DEVIN`        | `outpost_name` | `api_token`, `outpost_token`                   |
 
+- A Cursor `pool_name` must be free of double quotes (`"`). When a name contains a double quote, create and update return `invalid_argument` with `invalid settings.cursor.pool_name: must not contain a double quote`.
 - `OPENAI_CODEX` `api_key` (`AgentCredential` `API_KEY`, field 3 of `OpenAiCodexCredentials`) is an OpenAI API key of the project with the `api.agents.read` permission. The OpenAI `agent.session.action_required` webhook carries only the session ID and the action type, so `sandrun-api` reads the session's environment ID and remote URL with this key; the key stays in SandRun. The field and the enum value are additive changes of `v1`.
 
 ### Personal API key and dev session messages

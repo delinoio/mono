@@ -44,7 +44,8 @@ func identityOfFile(f *os.File) (fileIdentity, error) {
 // shares every mode, so it neither fails on nor blocks a file that is open
 // elsewhere.
 func identityOfPath(path string) (fileIdentity, error) {
-	p, err := syscall.UTF16PtrFromString(path)
+	// Match the long paths that os.OpenFile accepts when it creates staging.
+	p, err := syscall.UTF16PtrFromString(extendedPath(path))
 	if err != nil {
 		return fileIdentity{}, err
 	}

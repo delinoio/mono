@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"testing"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
@@ -28,11 +27,11 @@ func TestBinaryVirtualizationEntitlement(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name, value string
-		wantSupport bool
+		name, value     string
+		wantEntitlement bool
 	}{
 		{name: "disabled", value: "<false/>"},
-		{name: "enabled", value: "<true/>", wantSupport: true},
+		{name: "enabled", value: "<true/>", wantEntitlement: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cp := testcp.New(t)
@@ -73,31 +72,11 @@ func TestBinaryVirtualizationEntitlement(t *testing.T) {
 				t.Fatalf("no capability report\n%s", agent.logs.String())
 			}
 			caps := report.GetCapabilityReport().GetCapabilities()
-			checks := caps.GetHypervisorChecks()
-			passed := func(id string) bool {
-				i := slices.IndexFunc(checks, func(check *ownsandv1.HypervisorCheck) bool {
-					return check.GetCheckId() == id
-				})
-				if i < 0 {
-					t.Fatalf("missing check %s in %v", id, checks)
-				}
-				return checks[i].GetPassed()
+			if err := checkVirtualizationEntitlementCapabilities(caps, tc.wantEntitlement); err != nil {
+				t.Fatal(err)
 			}
-			if !passed("virtualization-framework") {
-				t.Skip("Virtualization.framework is unavailable on this host")
-			}
-			if !passed("linux-base-image") || passed("virtualization-entitlement") != tc.wantSupport {
-				t.Fatalf("unexpected checks: %v", checks)
-			}
-			guests, images := caps.GetGuestOses(), caps.GetBuiltBaseImages()
-			if tc.wantSupport {
-				if !slices.Contains(guests, ownsandv1.GuestOs_GUEST_OS_LINUX) || !slices.Contains(images, ownsandv1.BaseImage_BASE_IMAGE_LINUX) {
-					t.Fatalf("missing Linux guest or image support: guests = %v, images = %v", guests, images)
-				}
-			} else if len(guests) != 0 || len(images) != 0 || caps.GetMacosGuestsSupported() {
-				t.Fatalf("reported support with a disabled entitlement: %v", caps)
-			}
-			t.Logf("entitlement check passed = %t, guests = %v, images = %v", tc.wantSupport, guests, images)
+			t.Logf("validated entitlement = %t and Linux image presence, guests = %v, images = %v",
+				tc.wantEntitlement, caps.GetGuestOses(), caps.GetBuiltBaseImages())
 			stopBinaryAgent(t, agent)
 		})
 	}
