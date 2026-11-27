@@ -2,7 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
+import { describe, expect, rstest, test } from "@rstest/core";
 import { Role } from "@delino/sandrun-protos/v1/common_pb";
 import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
@@ -46,10 +46,27 @@ describe("client configuration", () => {
     }
   });
 
+  test.each(["https://@api.example.test", "https://:@api.example.test/"])(
+    "rejects a written origin with empty userinfo (%s)",
+    (origin) => {
+      const fetch = rstest.fn<typeof globalThis.fetch>();
+      const resolveOrigin = () => resolveApiOrigin(origin);
+      const createClient = () =>
+        new SandRunClient({ origin, token: "test-token", fetch });
+      const expectedMessage = /^origin must not contain credentials$/;
+      expect(resolveOrigin).toThrow(SandRunConfigError);
+      expect(resolveOrigin).toThrow(expectedMessage);
+      expect(createClient).toThrow(SandRunConfigError);
+      expect(createClient).toThrow(expectedMessage);
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
+
   test.each([
     "https://api.example.test\\tenant\\..",
     "https://api.example.test\\",
     "https://api.example.test/tenant/..",
+    "https://api.example.test/tenant@name/..",
     "https:///api.example.test/tenant/..",
     "https:///api.example.test/tenant/../",
     "https:api.example.test/tenant/..",
@@ -71,7 +88,7 @@ describe("client configuration", () => {
     ["", DEFAULT_API_ORIGIN],
     ["https://sandrun.api.delino.io", DEFAULT_API_ORIGIN],
     ["HTTPS://API.EXAMPLE.TEST", "https://api.example.test"],
-    ["https://a.test/", "https://a.test"],
+    ["https://api.example.test/", "https://api.example.test"],
     [" \t https://A.TEST/ \r\n", "https://a.test"],
     ["http://[::1]:8080/", "http://[::1]:8080"],
   ])("canonicalizes a valid explicit origin (%s)", (origin, expected) => {

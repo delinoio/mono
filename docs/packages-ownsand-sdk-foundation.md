@@ -64,6 +64,7 @@ The Go SDK client lives in the package root `ownsand`. Recorded decisions of the
 ### Client construction
 
 - The client takes the API origin (default `https://ownsand.api.delino.io`) and one credential: an API key or a function that returns a current Logto access token.
+- In the TypeScript SDK, an `@` delimiter in the written authority counts as credentials even when the username and password are empty. Client construction throws `OwnSandConfigError` with `origin must not contain credentials` before any request. The message omits the supplied origin.
 - Without an explicit credential, both SDKs read the `OWNSAND_API_KEY` environment variable. They read no other environment variables for credentials. The TypeScript SDK treats an API key that is empty after trimming as empty. An explicit empty key causes an `OwnSandConfigError` at construction. An empty `OWNSAND_API_KEY` counts as unset.
 - The client takes an optional organization ID and uses it for every RPC that needs one. If the option is omitted or empty, the SDKs read `OWNSAND_ORG`. An empty environment value leaves the default unset. A call with a nonempty organization ID overrides the default. An RPC that needs an organization fails locally if no organization is available.
 - The client never logs or includes the credential in errors.
