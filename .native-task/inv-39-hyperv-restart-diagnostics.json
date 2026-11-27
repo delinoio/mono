@@ -1,0 +1,57 @@
+{
+  "gid": "inv-39-hyperv-restart-diagnostics",
+  "commit": "20519334dd0c8c71ea13dfe800ff35f8c5aa1e19",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "20519334dd0c8c71ea13dfe800ff35f8c5aa1e19",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "reason": "The Linux implementation worker could not reach the Windows host. The normal Windows account can run the process fixtures. The real VM lifecycle and injected lifecycle failure require an elevated Windows session with Hyper-V, guest images, and disposable PostgreSQL.",
+    "platform": "Windows amd64",
+    "setup": "Use a short, clean checkout at the exact worker commit on delino-win-1. Run commands in the listed order from the repository root in one non-elevated PowerShell session. Use Go 1.26.1 or a compatible newer version. The fixtures only use executables in temporary directories, loopback HTTP, and spawned processes.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne '20519334dd0c8c71ea13dfe800ff35f8c5aa1e19') { throw 'Worker revision mismatch' }",
+      "New-Item -ItemType Directory -Path '.\\.t3-tmp' -Force | Out-Null",
+      "$validationDir = (Resolve-Path '.\\.t3-tmp').Path; $env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+      "go version",
+      "go test '-mod=readonly' '-count=3' '-v' '-timeout=3m' './servers/ownsand-api/e2e' '-run=^TestLifecycleHyperV(RestartDiagnostics|ReplacementCleanup)$' 2>&1 | Tee-Object -FilePath '.\\.t3-tmp\\windows-restart-fixtures.log'; if ($LASTEXITCODE -ne 0) { throw 'Windows restart fixtures did not pass' }"
+    ],
+    "expectedResults": [
+      "All six diagnostic and selection scenarios pass on each run. The intentional subprocess failures report under the initiating case. An independent sibling passes. Later dependent cases skip with the stated reason.",
+      "The replacement agent remains live for a later sibling. Parent cleanup terminates the process and drains both log streams. The command exits 0 without skips."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-39-hyperv-restart-diagnostics/worker/.t3-tmp/validation/validate-hyperv-restart-overlay.ps1",
+      "copyTo": ".t3-tmp/validate-hyperv-restart-overlay.ps1",
+      "sha256": "3b898e3195b254562ba003ada55af9123f91303b60724c3264fc5498ca4adac7",
+      "outputLogs": [
+        ".t3-tmp/windows-restart-fixtures.log",
+        ".t3-tmp/hyperv-lifecycle.log",
+        ".t3-tmp/hyperv-failed-replacement.log",
+        ".t3-tmp/hyperv-direct-removal.log"
+      ]
+    },
+    "elevated": {
+      "setup": "Copy files.copyFrom to files.copyTo after creating the scratch directory. Open an elevated PowerShell session in the exact checkout with Hyper-V and hcsdiag available. Supply a non-production disposable PostgreSQL URL and the documented amd64 kernel and root file system to this session. Run the commands in order. The overlay only changes the source seen by one test build and leaves the checkout clean.",
+      "commands": [
+        "if ((git rev-parse HEAD).Trim() -ne '20519334dd0c8c71ea13dfe800ff35f8c5aa1e19') { throw 'Worker revision mismatch' }",
+        "New-Item -ItemType Directory -Path '.\\.t3-tmp' -Force | Out-Null",
+        "$validationDir = (Resolve-Path '.\\.t3-tmp').Path; $env:TEMP = $validationDir; $env:TMP = $validationDir; $env:GOTMPDIR = $validationDir",
+        "$env:OWNSAND_E2E = '1'; if (-not $env:OWNSAND_TEST_DATABASE_URL) { throw 'Set OWNSAND_TEST_DATABASE_URL for an isolated database whose role can create databases' }; if (-not $env:OWNSAND_HV_TEST_KERNEL -or -not $env:OWNSAND_HV_TEST_ROOTFS -or -not (Test-Path -LiteralPath $env:OWNSAND_HV_TEST_KERNEL -PathType Leaf) -or -not (Test-Path -LiteralPath $env:OWNSAND_HV_TEST_ROOTFS -PathType Leaf)) { throw 'Provide the Hyper-V test kernel and root file system' }",
+        "go test '-mod=readonly' '-count=1' '-v' '-timeout=45m' './servers/ownsand-api/e2e' '-run=^TestLifecycleHyperV$' 2>&1 | Tee-Object -FilePath '.\\.t3-tmp\\hyperv-lifecycle.log'; if ($LASTEXITCODE -ne 0) { throw 'Hyper-V lifecycle did not pass' }",
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '.\\.t3-tmp\\validate-hyperv-restart-overlay.ps1'; if ($LASTEXITCODE -ne 0) { throw 'Could not generate the temporary fault overlay' }",
+        "go test '-mod=readonly' '-count=1' '-v' '-timeout=45m' '-overlay=.t3-tmp/hyperv-failed-replacement.json' './servers/ownsand-api/e2e' '-run=^TestLifecycleHyperV$/^(control-plane-restart|agent-crash|device-removal)$' 2>&1 | Tee-Object -FilePath '.\\.t3-tmp\\hyperv-failed-replacement.log'; if ($LASTEXITCODE -ne 1) { throw 'Expected the injected test failure' }",
+        "go test '-mod=readonly' '-count=1' '-v' '-timeout=45m' '-overlay=.t3-tmp/hyperv-failed-replacement.json' './servers/ownsand-api/e2e' '-run=^TestLifecycleHyperV$/^device-removal$' 2>&1 | Tee-Object -FilePath '.\\.t3-tmp\\hyperv-direct-removal.log'; if ($LASTEXITCODE -ne 0) { throw 'Directly selected removal did not pass' }"
+      ],
+      "expectedResults": [
+        "The unmodified suite exits 0. Every SDK and CLI case, control-plane-restart, agent-crash, and device-removal passes without skips.",
+        "The injected run exits 1. The original start api-restarted executable error is under TestLifecycleHyperV/control-plane-restart. Agent-crash and device-removal skip with the shared control plane reason. Go emits no parent FailNow diagnostic.",
+        "The direct device-removal run exits 0 and that case passes with both restart cases filtered."
+      ]
+    },
+    "unprivilegedLimits": [
+      "The normal validation account can run the listed process fixtures with no symbolic links, archive extraction, protected state directories, or service-control privileges.",
+      "Native VM-backed lifecycle runs require elevation for the Host Compute Service and agent state-directory setup."
+    ]
+  }
+}
