@@ -161,7 +161,12 @@ func TestOwnSandLinkRemovalFailureClearsMark(t *testing.T) {
 	if _, err := w.setLink(w.org.Admin, osOrg, ownsandKey('a')); err != nil {
 		t.Fatal(err)
 	}
-	w.l.Links.OnRemoval(link.RemovalHook{Name: "fail", InTx: func(context.Context, pgx.Tx, string) error { return errors.New("deletion failed") }})
+	w.l.Links.OnRemoval(link.RemovalHook{
+		Name: "fail",
+		InTx: func(context.Context, pgx.Tx, string) (func(context.Context), error) {
+			return nil, errors.New("deletion failed")
+		},
+	})
 	_, err := w.env.User(w.org.Admin).OwnSandLink.RemoveOwnSandLink(ctx, connect.NewRequest(&sandrunv1.RemoveOwnSandLinkRequest{OrganizationId: w.org.ID}))
 	wantCode(t, "failed removal", err, connect.CodeInternal)
 	lk, ok, err := w.l.Links.Get(ctx, w.env.DB.Pool, w.org.ID)

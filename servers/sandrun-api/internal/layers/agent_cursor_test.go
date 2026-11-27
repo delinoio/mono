@@ -726,6 +726,28 @@ func TestCursorWatchReconnect(t *testing.T) {
 	}
 }
 
+func TestCursorWatchReconnectExpiredCursor(t *testing.T) {
+	fake := cursorfake.New(t, cursorKey, "sandrun-pool")
+	fake.AddRequest("bc-relisted", false)
+	fake.ScriptPages(cursorfake.Page{}, cursorfake.Page{
+		Requests: []cursorfake.Request{{ID: "bc-relisted"}}, StreamCursor: "fresh-cursor",
+	})
+	timing := fastAgentTiming()
+	timing.BackoffMin, timing.BackoffMax = time.Hour, time.Hour
+	w := startCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, timing, fake)
+	eventually(t, "the Cursor watch after a 410", func() bool { return fake.Streams() == 1 })
+	w.requestBySource(t, "bc-relisted")
+	lists, claims, streams := fake.WatchCalls()
+	if len(lists) != 2 || !slices.Equal(claims, []string{"bc-relisted"}) || !slices.Equal(streams, []string{"", "fresh-cursor"}) {
+		t.Fatalf("after Cursor 410: got %d lists, claims %q, stream cursors %q", len(lists), claims, streams)
+	}
+	logs := w.env.Logs.String()
+	if !strings.Contains(logs, `"status":410`) || strings.Count(logs, `"cause":"scheduled"`) != 1 || strings.Contains(logs, `"cause":"error"`) {
+		t.Fatal("Cursor did not log HTTP 410 and a single scheduled reconnect")
+	}
+	t.Log("Cursor immediately relisted after HTTP 410 and admitted the pending request once")
+}
+
 // TestCursorWindowsNeedsGitBash: on Windows, Prepare fails clearly when
 // the guest has no Git Bash, and the request returns to the queue.
 func TestCursorWindowsNeedsGitBash(t *testing.T) {

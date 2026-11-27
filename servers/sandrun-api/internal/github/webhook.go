@@ -530,10 +530,16 @@ func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID,
 		registered := false
 		var d *work.Runner
 		err := l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
-			registered, d = false, nil
+			current, err := l.lockIdleRunnerInstallation(ctx, tx, orgID, inst)
+			if err != nil {
+				return err
+			}
+			if reason == sandrunv1.RunnerEndReason_RUNNER_END_REASON_SURPLUS && (current == nil || !current.Active()) {
+				return nil
+			}
 			var state int16
 			var bound bool
-			err := tx.QueryRow(ctx, "SELECT state, request_id IS NOT NULL FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE", orgID, runnerID).
+			err = tx.QueryRow(ctx, "SELECT state, request_id IS NOT NULL FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE", orgID, runnerID).
 				Scan(&state, &bound)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
@@ -560,6 +566,9 @@ func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID,
 			d, err = l.engine.DeleteIdleRunnerTx(ctx, tx, orgID, runnerID, reason)
 			return err
 		})
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return false, nil
+		}
 		if err != nil {
 			return false, err
 		}
@@ -576,15 +585,45 @@ func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID,
 			l.svc.WorkChanged(orgID)
 			return true, nil
 		}
-		if !l.Configured() || inst == nil || !inst.Active() {
+		if !l.Configured() || inst == nil {
 			return false, nil
 		}
-		refused, err := l.removeRegistration(ctx, l.svc.DB.Pool, inst, runnerID)
-		if err != nil || refused {
+		// Keep the installation active during GitHub I/O. Job deliveries
+		// can still take the installation share lock and update the runner.
+		removed := false
+		err = l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+			current, err := l.lockIdleRunnerInstallation(ctx, tx, orgID, inst)
+			if err != nil || current == nil || !current.Active() {
+				return err
+			}
+			refused, err := l.removeRegistration(ctx, tx, current, runnerID)
+			removed = !refused
+			return err
+		})
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return false, nil
+		}
+		if err != nil || !removed {
 			return false, err
 		}
 	}
 	return false, nil
+}
+
+// lockIdleRunnerInstallation uses the organization deletion lock order.
+// The caller's installation is a snapshot and might have changed.
+func (l *Layer) lockIdleRunnerInstallation(ctx context.Context, tx pgx.Tx, orgID string, inst *Installation) (*Installation, error) {
+	if err := api.LockOrganizationShare(ctx, tx, orgID); err != nil {
+		return nil, err
+	}
+	if inst == nil {
+		return nil, nil
+	}
+	current, err := l.installation(ctx, tx, orgID, inst.ID, lockShare)
+	if connect.CodeOf(err) == connect.CodeNotFound {
+		return nil, nil
+	}
+	return current, err
 }
 
 // installationEvent applies deleted, suspend and unsuspend. deleted and
@@ -602,14 +641,29 @@ func (l *Layer) installationEvent(ctx context.Context, tx pgx.Tx, body []byte, o
 	if ev.Installation.ID <= 0 {
 		return o.ignore("no installation")
 	}
-	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, lockUpdate)
+	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, lockNone)
 	if err != nil {
 		return err
 	}
 	if inst == nil {
 		return o.ignore("installation not linked")
 	}
-	o.organizationID = inst.OrganizationID
+	org := inst.OrganizationID
+	o.organizationID = org
+	// Organization deletion locks the organization before work and cascades
+	// to the installation. Lock the organization first, then recheck the link.
+	if err := api.LockOrganizationShare(ctx, tx, org); err != nil {
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return o.ignore("organization is being deleted")
+		}
+		return err
+	}
+	if inst, err = l.byGitHubID(ctx, tx, ev.Installation.ID, lockUpdate); err != nil {
+		return err
+	}
+	if inst == nil || inst.OrganizationID != org {
+		return o.ignore("installation not linked to this organization")
+	}
 	now := l.svc.NowUTC()
 	if login := ev.Installation.Account.Login; login != "" && login != inst.Login {
 		if _, err := tx.Exec(ctx, "UPDATE github_installations SET github_account_login = $2, update_time = $3 WHERE installation_id = $1", inst.ID, login, now); err != nil {
@@ -648,7 +702,6 @@ func (l *Layer) installationEvent(ctx context.Context, tx pgx.Tx, body []byte, o
 	if err != nil {
 		return err
 	}
-	org := inst.OrganizationID
 	o.after = append(o.after, func(ctx context.Context) {
 		for _, id := range deleted {
 			l.engine.DeleteSandboxOf(ctx, org, id)

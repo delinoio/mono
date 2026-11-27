@@ -165,15 +165,16 @@ func scanInstallation(row pgx.Row) (*Installation, error) {
 
 // installation loads an installation link of an organization by its SandRun ID
 // (not_found otherwise).
-func (l *Layer) installation(ctx context.Context, q db.Querier, orgID, id string) (*Installation, error) {
-	i, err := scanInstallation(q.QueryRow(ctx, "SELECT "+installationColumns+" FROM github_installations WHERE organization_id = $1 AND installation_id = $2", orgID, id))
+func (l *Layer) installation(ctx context.Context, q db.Querier, orgID, id string, lock rowLock) (*Installation, error) {
+	sql := "SELECT " + installationColumns + " FROM github_installations WHERE organization_id = $1 AND installation_id = $2" + lock.clause()
+	i, err := scanInstallation(q.QueryRow(ctx, sql, orgID, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrNotFound("GitHub installation")
 	}
 	return i, err
 }
 
-// rowLock is the row lock that byGitHubID takes.
+// rowLock is the lock taken when reading an installation.
 type rowLock int
 
 const (
@@ -187,17 +188,21 @@ const (
 	lockUpdate
 )
 
-// byGitHubID loads the link of a GitHub installation ID, or nil, with the
-// row lock lock, so a webhook and an RPC on the same installation
-// serialize.
-func (l *Layer) byGitHubID(ctx context.Context, q db.Querier, githubID int64, lock rowLock) (*Installation, error) {
-	sql := "SELECT " + installationColumns + " FROM github_installations WHERE github_installation_id = $1"
+func (lock rowLock) clause() string {
 	switch lock {
 	case lockShare:
-		sql += " FOR SHARE"
+		return " FOR SHARE"
 	case lockUpdate:
-		sql += " FOR UPDATE"
+		return " FOR UPDATE"
+	default:
+		return ""
 	}
+}
+
+// byGitHubID loads the link of a GitHub installation ID, or nil, with the
+// requested row lock.
+func (l *Layer) byGitHubID(ctx context.Context, q db.Querier, githubID int64, lock rowLock) (*Installation, error) {
+	sql := "SELECT " + installationColumns + " FROM github_installations WHERE github_installation_id = $1" + lock.clause()
 	i, err := scanInstallation(q.QueryRow(ctx, sql, githubID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

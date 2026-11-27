@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/lease"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
@@ -181,6 +182,81 @@ func TestSurplusAcknowledgmentPreservesNewerGeneration(t *testing.T) {
 	})
 	if got := pendingSurplusGeneration(t, w); got != "" {
 		t.Fatalf("new generation was not acknowledged: %q", got)
+	}
+}
+
+func TestSurplusLocksOrganizationBeforeInstallation(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	runSurplusTestDrivers(t, w)
+	w.send(t, "workflow_job", job("queued", 501, 1, sandRunLinux, ""))
+	w.l.GitHub.Wait()
+	w.l.Engine.Pass(t.Context(), w.org.ID)
+	waiting := sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	eventually(t, "idle runner", func() bool { return len(w.runnersIn(t, waiting)) == 1 })
+	runnerID := w.runnersIn(t, waiting)[0].GetRunnerId()
+	w.send(t, "workflow_job", job("completed", 501, 1, sandRunLinux, ""))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	pool := w.env.DB.Pool
+	barrier, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = barrier.Rollback(context.Background()) }()
+	if _, err := barrier.Exec(ctx, "SELECT 1 FROM github_installations WHERE github_installation_id = 501 FOR UPDATE"); err != nil {
+		t.Fatal(err)
+	}
+	checked := make(chan struct{})
+	go func() {
+		defer close(checked)
+		w.l.GitHub.CheckSurplusOnce(ctx)
+	}()
+	workerPID, query := waitForInstallationTestBlock(t, w, ctx, barrier.Conn().PgConn().PID(), "surplus check at the installation lock")
+	if !strings.Contains(query, "FROM github_installations") || !strings.Contains(query, "FOR SHARE") {
+		t.Errorf("surplus check waited on %q, want the installation share lock", query)
+	}
+
+	// Organization deletion takes this lock first. It must wait for the
+	// surplus check even while the check waits for the installation.
+	locked := make(chan error, 1)
+	go func() {
+		locked <- pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			return api.LockOrganization(ctx, tx, w.org.ID)
+		})
+	}()
+	_, query = waitForInstallationTestBlock(t, w, ctx, workerPID, "organization update behind the surplus check")
+	if !strings.Contains(query, "FROM organizations") || !strings.Contains(query, "FOR UPDATE") {
+		t.Errorf("organization update waited on %q, want the organization update lock", query)
+	}
+
+	// Change only the link state so the test can observe any runner cleanup
+	// initiated by the surplus check.
+	suspended := sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED
+	if _, err := barrier.Exec(ctx, "UPDATE github_installations SET state = $1 WHERE github_installation_id = 501", int16(suspended)); err != nil {
+		t.Fatal(err)
+	}
+	if err := barrier.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-checked:
+	case <-ctx.Done():
+		t.Fatal("surplus check did not complete after release")
+	}
+	if err := <-locked; err != nil {
+		t.Fatalf("lock organization: %v", err)
+	}
+	if got := pendingSurplusGeneration(t, w); got != "" {
+		t.Fatalf("pending check for a suspended installation: %q", got)
+	}
+	if runner := w.runner(t, runnerID); runner.GetState() != waiting {
+		t.Fatalf("surplus check changed the runner of a suspended installation: %v", runner)
+	}
+	if _, ok := w.gh.RunnerByName("sandrun-" + runnerID); !ok {
+		t.Fatal("surplus check removed the registration of a suspended installation")
 	}
 }
 

@@ -97,6 +97,7 @@ import {
   RequestSchema,
   type Runner,
   RunnerSchema,
+  RunnerStateCountSchema,
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
@@ -180,6 +181,15 @@ const IDLE_GITHUB_RUNNER_STATES = new Set([
   RunnerState.PREPARING,
   RunnerState.WARM,
   RunnerState.WAITING_FOR_WORK,
+]);
+
+const OPEN_RUNNER_STATES: ReadonlySet<RunnerState> = new Set([
+  RunnerState.CREATING,
+  RunnerState.PREPARING,
+  RunnerState.WARM,
+  RunnerState.WAITING_FOR_WORK,
+  RunnerState.BUSY,
+  RunnerState.DELETING,
 ]);
 
 const now = () => Date.now();
@@ -610,10 +620,6 @@ function seed(
       },
       effectiveVcpuLimit: 24n,
       allocation: { vcpuCount: 8n, memoryMib: 16384n, diskGib: 128n },
-      runners: [
-        { state: RunnerState.BUSY, count: 1 },
-        { state: RunnerState.WARM, count: 1 },
-      ],
     }),
     create(DeviceCapacitySchema, {
       ownsandDeviceId: MOCK_IDS.macDevice,
@@ -849,6 +855,8 @@ export interface MockTransportOptions {
   userId?: string;
   /** The Acme runner profile count. Larger lists put linux-build last. */
   runnerProfileCount?: number;
+  /** Fail the first Acme roster continuation for retry tests. Default: true. */
+  failFirstAcmeMemberContinuation?: boolean;
   /** Caps integration pages and seeds a profile that uses the second page. */
   agentIntegrationPageSize?: number;
   /** Adds work fixtures to seeded organizations without changing the defaults. */
@@ -901,7 +909,7 @@ export function createMockTransport(
       ),
     );
   }
-  let failAcmeContinuation = true;
+  let failAcmeContinuation = options.failFirstAcmeMemberContinuation ?? true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
     string,
@@ -1931,24 +1939,26 @@ export function createMockTransport(
         const { org } = membership(req.organizationId);
         validateListFilter("kind", WorkloadKindSchema, [req.kind]);
         validateListFilter("states", RequestStateSchema, req.states);
+        const hasStateFilter = req.states.length > 0;
         const active = org.requests
           .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
           .sort(compareQueueOrder);
-        const ended = req.includeEnded
-          ? org.requests
-              .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
-              .sort(
-                (a, b) =>
-                  compareTimestamps(b.endedAt, a.endedAt) ||
-                  a.requestId.localeCompare(b.requestId),
-              )
-          : [];
+        const ended =
+          hasStateFilter || req.includeEnded
+            ? org.requests
+                .filter((r) => TERMINAL_REQUEST_STATES.has(r.state))
+                .sort(
+                  (a, b) =>
+                    compareTimestamps(b.endedAt, a.endedAt) ||
+                    a.requestId.localeCompare(b.requestId),
+                )
+            : [];
         const items = [...active, ...ended].filter(
           (r) =>
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
             (req.kind === WorkloadKind.UNSPECIFIED || r.kind === req.kind) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (!hasStateFilter || req.states.includes(r.state)),
         );
         const p = page(items, req);
         return { requests: p.items, nextPageToken: p.nextPageToken };
@@ -1990,10 +2000,11 @@ export function createMockTransport(
         validateListFilter("states", RunnerStateSchema, req.states);
         const items = org.runners.filter(
           (r) =>
-            (req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)) &&
             (req.runnerProfileId === "" ||
               r.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(r.state)),
+            (req.states.length > 0
+              ? req.states.includes(r.state)
+              : req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)),
         );
         const p = page(items, req);
         return { runners: p.items, nextPageToken: p.nextPageToken };
@@ -2011,6 +2022,12 @@ export function createMockTransport(
         const r = org.runners.find((x) => x.runnerId === req.runnerId);
         if (r === undefined)
           throw new ConnectError("runner not found", Code.NotFound);
+        if (
+          r.state === RunnerState.DELETING ||
+          TERMINAL_RUNNER_STATES.has(r.state)
+        ) {
+          return { runner: r };
+        }
         endRunner(org, r, RunnerEndReason.DELETED_BY_USER);
         audit(
           org,
@@ -2032,7 +2049,27 @@ export function createMockTransport(
             "the OwnSand link is invalid; an admin must set a new OwnSand API key",
             Code.FailedPrecondition,
           );
-        return { devices: org.devices };
+        const countsByDevice = new Map<string, Map<RunnerState, number>>();
+        for (const { ownsandDeviceId, state } of org.runners) {
+          if (ownsandDeviceId === "" || !OPEN_RUNNER_STATES.has(state)) {
+            continue;
+          }
+          const counts = countsByDevice.get(ownsandDeviceId) ?? new Map();
+          counts.set(state, (counts.get(state) ?? 0) + 1);
+          countsByDevice.set(ownsandDeviceId, counts);
+        }
+        return {
+          devices: org.devices.map((device) => ({
+            ...device,
+            runners: Array.from(
+              countsByDevice.get(device.ownsandDeviceId) ?? [],
+            )
+              .sort(([a], [b]) => a - b)
+              .map(([state, count]) =>
+                create(RunnerStateCountSchema, { state, count }),
+              ),
+          })),
+        };
       },
       async *watchQueue(req, ctx: HandlerContext) {
         const { org } = membership(req.organizationId);
@@ -2154,15 +2191,17 @@ export function createMockTransport(
         );
         if (k === undefined)
           throw new ConnectError("API key not found", Code.NotFound);
-        k.state = ApiKeyState.REVOKED;
-        k.revokedAt = ts();
-        audit(
-          org,
-          AuditAction.API_KEY_REVOKED,
-          AuditTargetKind.API_KEY,
-          k.apiKeyId,
-          userId,
-        );
+        if (k.state !== ApiKeyState.REVOKED) {
+          k.state = ApiKeyState.REVOKED;
+          k.revokedAt = ts();
+          audit(
+            org,
+            AuditAction.API_KEY_REVOKED,
+            AuditTargetKind.API_KEY,
+            k.apiKeyId,
+            userId,
+          );
+        }
         const { userId: _u, ...apiKey } = k;
         return { apiKey };
       },
@@ -2209,7 +2248,6 @@ export function createMockTransport(
         validateListFilter("states", RequestStateSchema, req.states);
         const items = org.devSessions.filter(
           (s) =>
-            (req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)) &&
             (req.owner.case !== "ownedByCaller" ||
               !req.owner.value ||
               s.ownerUserId === userId) &&
@@ -2217,7 +2255,9 @@ export function createMockTransport(
               s.ownerUserId === req.owner.value) &&
             (req.runnerProfileId === "" ||
               s.runnerProfileId === req.runnerProfileId) &&
-            (req.states.length === 0 || req.states.includes(s.state)),
+            (req.states.length > 0
+              ? req.states.includes(s.state)
+              : req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)),
         );
         const p = page(items, req);
         return { devSessions: p.items, nextPageToken: p.nextPageToken };

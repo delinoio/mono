@@ -183,6 +183,88 @@ describe("brand colors", () => {
       return true;
     };
 
+  const readSearchResults = () =>
+    function () {
+      const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
+      return Array.from(
+        document.querySelectorAll(".rp-suggest-item__title"),
+        (title) => {
+          const link = title.closest(".rp-suggest-item__link");
+          if (!link) {
+            throw new Error("The search result title has no row link");
+          }
+          const foreground = getComputedStyle(title).color;
+          const background = getComputedStyle(link).backgroundColor;
+          const surface = kit.over(
+            kit.parse(background),
+            kit.resolve("--rp-c-bg"),
+          );
+          return {
+            title: title.textContent?.trim(),
+            current: Boolean(link.closest(".rp-suggest-item--current")),
+            foreground,
+            background,
+            contrast: kit.ratio(
+              kit.over(kit.parse(foreground), surface),
+              surface,
+            ),
+          };
+        },
+      );
+    };
+
+  for (const mode of ["light", "dark"] as const) {
+    test(`keeps search result titles readable in ${mode} mode`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await browser.evaluate(installColorKit());
+      await browser.evaluate((dark) => {
+        document.documentElement.classList.toggle("rp-dark", dark);
+        return true;
+      }, mode === "dark");
+
+      await screen.getByRole("button", /^Search/).tap();
+      await screen.getByRole("textbox", "SearchPanelInput").fill("placeholder");
+      const readResults = () => browser.evaluate(readSearchResults());
+      await expect
+        .poll(async () => {
+          const titles = (await readResults()).map((result) => result.title);
+          return (
+            titles.includes("Introduction") &&
+            titles.includes("Getting started")
+          );
+        })
+        .toBe(true);
+
+      const before = await readResults();
+      const initialIndex = before.findIndex((result) => result.current);
+      expect(initialIndex).toBeGreaterThanOrEqual(0);
+      const nextIndex = (initialIndex + 1) % before.length;
+
+      await browser.keyboard.press("ArrowDown");
+      await expect
+        .poll(async () =>
+          (await readResults()).findIndex((result) => result.current),
+        )
+        .toBe(nextIndex);
+
+      const after = await readResults();
+      expect(after[initialIndex]?.current).toBe(false);
+      for (const results of [before, after]) {
+        const current = results.filter((result) => result.current);
+        expect(current).toHaveLength(1);
+        expect(current[0]?.foreground).toBe("rgb(255, 255, 255)");
+        expect(current[0]?.background).toBe("rgb(59, 91, 253)");
+        for (const result of results) {
+          expect(result.contrast).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    });
+  }
+
   // Adds a minimal overview group, which Rspress renders on its overview
   // pages, because neither app has such a page. It reuses the Rspress class
   // names, so the real Rspress and theme styles apply.

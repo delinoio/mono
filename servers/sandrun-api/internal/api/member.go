@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -323,6 +324,16 @@ func (h MemberHandler) ListMembers(ctx context.Context, req *connect.Request[san
 	return connect.NewResponse(resp), nil
 }
 
+func validateMembershipTargetUserID(userID string) error {
+	if userID == "" {
+		return ErrInvalidf("invalid user_id: is required")
+	}
+	if strings.IndexByte(userID, 0) >= 0 {
+		return ErrInvalidf("invalid user_id: must not contain NUL")
+	}
+	return nil
+}
+
 // loadMembershipForUpdate locks and returns the membership ID and role of
 // userID.
 func loadMembershipForUpdate(ctx context.Context, q db.Querier, orgID, userID string) (string, sandrunv1.Role, error) {
@@ -344,8 +355,8 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 		if err != nil {
 			return err
 		}
-		if target == "" {
-			return ErrInvalidf("invalid user_id: is required")
+		if err := validateMembershipTargetUserID(target); err != nil {
+			return err
 		}
 		if role != sandrunv1.Role_ROLE_ADMIN && role != sandrunv1.Role_ROLE_MEMBER {
 			return ErrInvalidf("invalid role: must be ROLE_ADMIN or ROLE_MEMBER; use TransferOwnership for the owner")
@@ -417,8 +428,8 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[sa
 			}
 			return err
 		}
-		if target == "" {
-			return ErrInvalidf("invalid user_id: is required")
+		if err := validateMembershipTargetUserID(target); err != nil {
+			return err
 		}
 		if err := LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err

@@ -8,10 +8,11 @@ import {
   DialogTitle as DialogTitlePart,
   DialogTrigger as DialogTriggerPart,
 } from "@ui-sdk/react/dialog";
-import type * as React from "react";
+import { renderElement } from "@ui-sdk/react/primitive";
+import * as React from "react";
 import { ButtonSize, ButtonVariant } from "./button.tsx";
 import { mergeClassName } from "./class-name.ts";
-import { DeferAutoFocusContext } from "./panel-autofocus.ts";
+import { PanelAutoFocus, PanelAutoFocusContext } from "./panel-autofocus.ts";
 
 export { createDialogController } from "@ui-sdk/react/dialog";
 export type { DialogController } from "@ui-sdk/react/dialog";
@@ -78,17 +79,52 @@ export function DialogTrigger({
 
 export type DialogContentProps = React.ComponentProps<typeof DialogContentPart>;
 
+function DialogAutoFocusScope({
+  open,
+  children,
+}: {
+  open: boolean;
+  children: React.ReactNode;
+}) {
+  const [openingCommitted, setOpeningCommitted] = React.useState(false);
+  React.useLayoutEffect(() => {
+    // Suppress React autofocus on the opening commit so the SDK captures the
+    // opener before any field can take focus. Update before the next event can
+    // mount a field. React only applies autofocus when the input mounts.
+    setOpeningCommitted(open);
+  }, [open]);
+
+  return (
+    <PanelAutoFocusContext
+      value={
+        open && openingCommitted
+          ? PanelAutoFocus.DialogOpen
+          : PanelAutoFocus.DialogOpening
+      }
+    >
+      {children}
+    </PanelAutoFocusContext>
+  );
+}
+
 /** The dialog panel, centered over a dimmed page. */
-export function DialogContent({ className, ...props }: DialogContentProps) {
+export function DialogContent({
+  className,
+  render,
+  ...props
+}: DialogContentProps) {
   return (
     <>
       <DialogBackdrop className="dui-dialog-backdrop" />
-      <DeferAutoFocusContext value={true}>
-        <DialogContentPart
-          className={mergeClassName("dui-dialog-content", className)}
-          {...props}
-        />
-      </DeferAutoFocusContext>
+      <DialogContentPart
+        className={mergeClassName("dui-dialog-content", className)}
+        {...props}
+        render={(elementProps, state) => (
+          <DialogAutoFocusScope open={state.open}>
+            {renderElement("div", elementProps, render, state)}
+          </DialogAutoFocusScope>
+        )}
+      />
     </>
   );
 }

@@ -92,7 +92,7 @@ func (l *Layer) processSurplusCheck(ctx context.Context, check surplusCheck) {
 // process, or its profile or active installation no longer exists.
 func (l *Layer) removeSurplus(ctx context.Context, check surplusCheck) bool {
 	orgID, profileID := check.organizationID, check.profileID
-	inst, err := l.installation(ctx, l.svc.DB.Pool, orgID, check.installationID)
+	inst, err := l.installation(ctx, l.svc.DB.Pool, orgID, check.installationID, lockNone)
 	if connect.CodeOf(err) == connect.CodeNotFound || (err == nil && !inst.Active()) {
 		return true
 	}

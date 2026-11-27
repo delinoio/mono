@@ -90,7 +90,8 @@ func TestJobLifecycle(t *testing.T) {
 		if strings.Contains(joined, reg.JIT) {
 			t.Fatal("a command contains the JIT configuration")
 		}
-		install = install || strings.Contains(joined, "actions-runner-linux-$arch-"+github.RunnerVersion+".tar.gz") && strings.Contains(joined, "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40")
+		install = install || strings.Contains(joined, "actions-runner-linux-$arch-"+github.RunnerVersion+".tar.gz") &&
+			strings.Contains(joined, `if [ "$actual" != "$sum" ]; then`)
 		start = start || strings.Contains(joined, "./run.sh --jitconfig") && strings.Contains(joined, github.LogFilePath(sandrunv1.GuestOs_GUEST_OS_LINUX))
 	}
 	if !install || !start {
@@ -1365,6 +1366,85 @@ func TestLinkFlow(t *testing.T) {
 	}
 	if strings.Contains(w.env.Logs.String(), "oauthcode4") && strings.Contains(w.env.Logs.String(), `"code":"oauthcode4"`) {
 		t.Fatal("an OAuth code was logged")
+	}
+}
+
+func TestUpdateGitHubInstallationAfterLifecycleChange(t *testing.T) {
+	for _, tc := range []struct {
+		action    string
+		wantCode  connect.Code
+		wantState sandrunv1.GitHubInstallationState
+	}{
+		{"suspend", connect.CodeFailedPrecondition, sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED},
+		{"deleted", connect.CodeFailedPrecondition, sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_DELETED},
+		{"unlink", connect.CodeNotFound, sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_UNSPECIFIED},
+	} {
+		t.Run(tc.action, func(t *testing.T) {
+			w := newGHWorld(t, worldOpts{})
+			inst := w.link(t, 501, "acme")
+			admin := w.env.User(w.org.Admin).GitHub
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+
+			entered, release := make(chan struct{}), make(chan struct{})
+			w.gh.Update(func() {
+				w.gh.RunnerGroupsGate = func() {
+					close(entered)
+					select {
+					case <-release:
+					case <-ctx.Done():
+					}
+				}
+			})
+			result := make(chan error, 1)
+			go func() {
+				_, err := admin.UpdateGitHubInstallation(ctx, connect.NewRequest(&sandrunv1.UpdateGitHubInstallationRequest{
+					OrganizationId: w.org.ID, InstallationId: inst.GetInstallationId(), GithubRunnerGroupId: 7,
+				}))
+				result <- err
+			}()
+			select {
+			case <-entered:
+			case err := <-result:
+				t.Fatalf("update returned before the GitHub group listing: %v", err)
+			case <-ctx.Done():
+				t.Fatal("update did not reach the GitHub group listing")
+			}
+			if tc.action == "unlink" {
+				if _, err := admin.UnlinkGitHubInstallation(ctx, connect.NewRequest(&sandrunv1.UnlinkGitHubInstallationRequest{
+					OrganizationId: w.org.ID, InstallationId: inst.GetInstallationId(),
+				})); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				w.send(t, "installation", installationEvent(tc.action, 501, "acme"))
+			}
+			close(release)
+			wantCode(t, "update after "+tc.action, <-result, tc.wantCode)
+
+			if tc.action == "unlink" {
+				if installationPresent(t, w, inst.GetInstallationId()) {
+					t.Fatal("unlinked installation still exists")
+				}
+			} else {
+				var state int16
+				var groupID int64
+				var groupName string
+				err := w.env.DB.Pool.QueryRow(ctx, `SELECT state, github_runner_group_id, runner_group_name
+					FROM github_installations WHERE installation_id = $1`, inst.GetInstallationId()).Scan(&state, &groupID, &groupName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state != int16(tc.wantState) || groupID != inst.GetGithubRunnerGroupId() || groupName != inst.GetRunnerGroupName() {
+					t.Fatalf("installation after %s has state %d and group %d (%q)", tc.action, state, groupID, groupName)
+				}
+			}
+			var count int
+			if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = $2",
+				w.org.ID, int16(sandrunv1.AuditAction_AUDIT_ACTION_GITHUB_INSTALLATION_UPDATED)).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("update audit count = %d, err = %v", count, err)
+			}
+		})
 	}
 }
 

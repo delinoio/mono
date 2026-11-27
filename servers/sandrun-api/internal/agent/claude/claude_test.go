@@ -5,6 +5,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -25,6 +26,68 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/profile"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/work"
 )
+
+func TestClaudeLogWriter(t *testing.T) {
+	const (
+		omitted = "<oversized diagnostic omitted>"
+		values  = "person@example.test eyJabcd.ZZZZ.signature"
+	)
+	atLimit := strings.Repeat("x", maxLogLine-len(values)-1) + " "
+	growsWhenMasked := strings.Repeat("x ", (maxLogLine-len("a@b.co"))/2) + "a@b.co"
+	huge := strings.Repeat("oversized fixture ", maxLogLine)
+	for _, tc := range []struct {
+		name       string
+		writes     []string
+		want       []string
+		flushCount int
+	}{
+		{"exact limit", []string{atLimit + values, "\n"}, []string{atLimit + "<email> <token>"}, 0},
+		{"single write", []string{huge + "\nnext\n" + huge + "\n"}, []string{omitted, "next", omitted}, 0},
+		{"split writes", []string{huge[:maxLogLine], huge[maxLogLine : maxLogLine+1], huge[maxLogLine+1:], values + "\nnext\n"}, []string{omitted, "next"}, 0},
+		{"carriage return counts", []string{strings.Repeat("x", maxLogLine) + "\r\n"}, []string{omitted}, 0},
+		{"masked output grows", []string{growsWhenMasked + "\n"}, []string{omitted}, 0},
+		{"oversized on flush", []string{huge[:maxLogLine], huge[maxLogLine:]}, []string{omitted}, 1},
+		{"blank lines and flush", []string{"\n \t\r\nnormal\r\nlast " + values + "\r"}, []string{"normal", "last <email> <token>"}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil)).With("agent_integration_id", "fixture")
+			w := &logWriter{log: logger, ctx: t.Context()}
+			for _, input := range tc.writes {
+				if n, err := w.Write([]byte(input)); n != len(input) || err != nil {
+					t.Fatalf("Write consumed %d of %d bytes, error %v", n, len(input), err)
+				}
+				if w.pending > maxLogLine || (w.oversized && w.pending != 0) {
+					t.Fatalf("retained %d bytes with oversized=%t", w.pending, w.oversized)
+				}
+			}
+			if got, want := bytes.Count(logs.Bytes(), []byte{'\n'}), len(tc.want)-tc.flushCount; got != want {
+				t.Errorf("logged %d lines before flush, want %d", got, want)
+			}
+			w.flush()
+			w.flush()
+			var lines []string
+			for raw := range strings.SplitSeq(strings.TrimSuffix(logs.String(), "\n"), "\n") {
+				var event struct {
+					Message       string `json:"msg"`
+					Level         string `json:"level"`
+					IntegrationID string `json:"agent_integration_id"`
+					Line          string `json:"line"`
+				}
+				if err := json.Unmarshal([]byte(raw), &event); err != nil {
+					t.Fatal(err)
+				}
+				if event.Message != "claude_orchestrator_output" || event.Level != "INFO" || event.IntegrationID != "fixture" {
+					t.Errorf("unexpected diagnostic event fields: %s", raw)
+				}
+				lines = append(lines, event.Line)
+			}
+			if !slices.Equal(lines, tc.want) {
+				t.Errorf("logged %q, want %q", lines, tc.want)
+			}
+		})
+	}
+}
 
 type acceptUnixFunc func() (*net.UnixConn, error)
 
