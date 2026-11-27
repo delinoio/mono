@@ -103,13 +103,18 @@ func (r *relay) abortStream(c *rconn, id uint64, sandboxID string, code ownsandv
 	}
 }
 
-// openStream admits a relay stream open frame for a live grant of the
-// current channel, within the stream and credit caps, and sends the first
-// receive window.
+// openStream admits a stream on the active relay connection for a live
+// grant of the current channel and sends the first receive window.
 func (r *relay) openStream(c *rconn, f *ownsandv1.DataFrame, open *ownsandv1.RelayStreamOpen) {
 	id := f.GetStreamId()
 	now := time.Now()
 	r.mu.Lock()
+	// Check under the same lock as connClosed's stream snapshot so every
+	// admitted stream is visible to cleanup.
+	if r.conn != c || c.ctx.Err() != nil {
+		r.mu.Unlock()
+		return
+	}
 	if id <= c.highest {
 		// The control plane never reuses a stream_id; drop the frame.
 		r.mu.Unlock()
