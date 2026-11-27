@@ -152,6 +152,8 @@ describe("credentials", () => {
       [
         "--unhandled-rejections=strict",
         "--experimental-transform-types",
+        // This fixture loads SDK source, so resolve the bindings to source too.
+        "--conditions=browser",
         "--test",
         fixture,
       ],
