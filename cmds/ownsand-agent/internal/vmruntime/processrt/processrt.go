@@ -46,12 +46,12 @@ const ReadyTimeout = 30 * time.Second
 // stopTimeout bounds the wait for a killed helper to be reaped.
 const stopTimeout = 10 * time.Second
 
-// helperStopTimeout bounds the wait until the kernel has stopped the helper
-// after the runtime sent it SIGSTOP, and helperStopPoll is the interval between
-// two observations of the helper's state.
+// The helper and the worker groups each have a stop confirmation budget.
+// stopPoll is the interval between process state observations.
 const (
 	helperStopTimeout = 5 * time.Second
-	helperStopPoll    = 10 * time.Millisecond
+	stopPoll          = 10 * time.Millisecond
+	workerStopTimeout = 5 * time.Second
 )
 
 // errHelperExited reports that the runtime has ended signaling for an exited
@@ -197,11 +197,13 @@ type vm struct {
 	onSignal func(syscall.Signal)
 	// observeStopped and stopWait are test seams: they are nil and zero in
 	// production. observeStopped replaces the observation of the helper's
-	// state (helperStopped), so that a test can separate the delivery of
+	// state (processStopped), so that a test can separate the delivery of
 	// SIGSTOP from the moment the runtime observes it. stopWait replaces
 	// helperStopTimeout.
 	observeStopped func(ctx context.Context, pid int) (bool, error)
 	stopWait       time.Duration
+	// observeWorkerStopped overrides worker stop observations in tests.
+	observeWorkerStopped func(ctx context.Context, pid int) (bool, error)
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -261,14 +263,14 @@ func (v *vm) waitHelperStopped(ctx context.Context) error {
 	if v.stopWait > 0 {
 		timeout = v.stopWait
 	}
-	observe := helperStopped
+	observe := processStopped
 	if v.observeStopped != nil {
 		observe = v.observeStopped
 	}
 	pid := v.helper.pid
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	ticker := time.NewTicker(helperStopPoll)
+	ticker := time.NewTicker(stopPoll)
 	defer ticker.Stop()
 	var observeErr error
 	for {
@@ -461,7 +463,8 @@ func (r *Runtime) lookup(id string) (*vm, error) {
 // signal to the helper's group does not reach the exec workers. Pause stops
 // the helper's group first and waits until the helper is observed stopped, so
 // that the helper cannot start another worker while Pause enumerates the
-// process tree, and then stops each worker group.
+// process tree. Pause signals each worker group and waits until all its
+// live members have stopped.
 //
 // A failed Pause rolls back: the caller keeps the sandbox in the running
 // state when Pause fails, and a later Resume of that state does not reach the
@@ -487,6 +490,9 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err == nil {
 		err = r.signalGroups(v, groups, sigStop)
 	}
+	if err == nil {
+		err = v.waitWorkersStopped(ctx, groups)
+	}
 	if err != nil {
 		// groups is empty when the wait or the enumeration failed, so only
 		// the helper was stopped. A group that was not stopped ignores SIGCONT.
@@ -497,6 +503,40 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 		return errors.Join(err, rollbackErr)
 	}
 	return nil
+}
+
+// waitWorkersStopped uses one deadline for process listings and observations
+// after the worker group signals have been sent.
+func (v *vm) waitWorkersStopped(ctx context.Context, groups []int) error {
+	ctx, cancel := context.WithTimeout(ctx, workerStopTimeout)
+	defer cancel()
+	groupIDs := make(map[int]bool, len(groups))
+	for _, pgid := range groups {
+		groupIDs[pgid] = true
+	}
+	observe := processStopped
+	if v.observeWorkerStopped != nil {
+		observe = v.observeWorkerStopped
+	}
+	ticker := time.NewTicker(stopPoll)
+	defer ticker.Stop()
+	for {
+		stopped, err := workerGroupsStopped(ctx, groupIDs, observe)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		if err != nil {
+			return fmt.Errorf("processrt: confirm exec workers of sandbox %s stopped: %w", v.id, err)
+		}
+		if stopped {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("processrt: confirm exec workers of sandbox %s stopped: %w", v.id, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // Resume continues the process groups of the exec workers and then the

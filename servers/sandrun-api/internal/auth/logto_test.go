@@ -293,22 +293,41 @@ func TestLogtoValidatorCallerCancelDoesNotAbortFetch(t *testing.T) {
 		started: make(chan struct{}, 1),
 	}
 	srv := httptest.NewServer(o)
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	release := sync.OnceFunc(func() { close(o.block) })
+	t.Cleanup(release)
 	now := time.Now()
 	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://sandrun.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
 	token := o.f.sign(t, "at+jwt", outageClaims(o.f, now))
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
 	go func() {
 		_, err := v.Validate(ctx, token)
 		done <- err
 	}()
-	<-o.started
+	select {
+	case <-o.started:
+	case err := <-done:
+		t.Fatalf("initiating caller returned before the JWKS fetch started: %v", err)
+	case <-time.After(jwksTestWait):
+		t.Fatal("JWKS fetch did not reach the test server")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("initiating caller returned before cancellation: %v", err)
+	default:
+	}
 	cancel()
-	// The shared fetch keeps running after the caller left.
-	time.Sleep(50 * time.Millisecond)
-	close(o.block)
-	<-done
+	select {
+	case err := <-done:
+		if err != ErrInvalidToken {
+			t.Fatalf("canceled caller returned %v, want ErrInvalidToken", err)
+		}
+	case <-time.After(jwksTestWait):
+		t.Fatal("canceled caller did not return while the JWKS response was held")
+	}
+	release()
 	if sub, err := v.Validate(context.Background(), token); err != nil || sub != "user-1" {
 		t.Fatalf("live caller after mid-flight cancel: %q %v", sub, err)
 	}
