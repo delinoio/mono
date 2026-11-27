@@ -66,6 +66,7 @@ import {
   type SetOwnSandLinkRequest,
 } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import {
+  type CreateRunnerProfileRequest,
   CreateRunnerProfileRequestSchema,
   type ListRunnerProfilesRequest,
   type ListRunnerProfilesResponse,
@@ -3046,8 +3047,22 @@ describe("runner profiles", () => {
     ).toBeNull();
   });
 
-  test("requires the workspace path for a dev session profile", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
+  test("blocks missing and invalid workspace paths on create", async () => {
+    const mock = createMockTransport();
+    const creates: CreateRunnerProfileRequest[] = [];
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+      transport: {
+        ...mock,
+        unary(method, ...args) {
+          if (
+            method.name === RunnerProfileService.method.createRunnerProfile.name
+          ) {
+            creates.push(args[3] as CreateRunnerProfileRequest);
+          }
+          return mock.unary(method, ...args);
+        },
+      },
+    });
     await click(
       await screen.findByRole("button", { name: "Create runner profile" }),
     );
@@ -3063,18 +3078,93 @@ describe("runner profiles", () => {
       within(dialog).getByRole("combobox", { name: "Workload kind" }),
     );
     await click(await screen.findByRole("option", { name: "Dev session" }));
-    const path = within(dialog).getByRole("textbox", {
+    const form = within(dialog);
+    const path = form.getByRole("textbox", {
       name: "Workspace path",
     });
-    await click(within(dialog).getByRole("button", { name: "Create profile" }));
-    await settle(60);
-    expect(dialog.textContent).toContain("Enter the workspace path");
-    await type(path, "/home/dev/work");
-    await click(within(dialog).getByRole("button", { name: "Create profile" }));
-    await settle(80);
-    expect(screen.queryByRole("dialog")).toBeNull();
+    const save = form.getByRole("button", { name: "Create profile" });
+    await click(save);
+    expect(form.getByText(/^Enter the workspace path/)).toBeTruthy();
+    await type(path, "/work/");
+    await click(save);
+    expect(form.getByText(/with no empty, \. or \.\. components/)).toBeTruthy();
+    expect(path.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(creates).toHaveLength(0);
+
+    await type(path, "/work");
+    await click(save);
     expect(await screen.findByText(/linux-dev · Dev session/)).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(creates).toHaveLength(1);
+    expect(creates[0]?.profile?.workspacePath).toBe("/work");
   });
+
+  test.each(["entered", "legacy"] as const)(
+    "replaces a %s reserved Windows workspace path in one edit",
+    async (origin) => {
+      const mock = createMockTransport();
+      const invalid = "C:\\work\\nUl.tar.gz";
+      const target = {
+        organizationId: MOCK_IDS.acme,
+        runnerProfileId: MOCK_IDS.devProfile,
+      };
+      if (origin === "legacy") {
+        await createClient(RunnerProfileService, mock).updateRunnerProfile({
+          ...target,
+          profile: { workspacePath: invalid },
+          updateMask: { paths: ["workspace_path"] },
+        });
+      }
+      const updates: UpdateRunnerProfileRequest[] = [];
+      renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+        transport: {
+          ...mock,
+          unary(method, ...args) {
+            if (
+              method.name ===
+              RunnerProfileService.method.updateRunnerProfile.name
+            ) {
+              updates.push(args[3] as UpdateRunnerProfileRequest);
+            }
+            return mock.unary(method, ...args);
+          },
+        },
+      });
+      const row = (
+        await screen.findByText(/windows-dev · Dev session/)
+      ).closest("li")!;
+      await click(within(row).getByRole("button", { name: "Edit" }));
+      const dialog = await screen.findByRole("dialog", {
+        name: "Edit windows-dev",
+      });
+      const form = within(dialog);
+      const path = form.getByRole<HTMLInputElement>("textbox", {
+        name: "Workspace path",
+      });
+      if (origin === "entered") await type(path, invalid);
+      expect(path.value).toBe(invalid);
+      const save = form.getByRole("button", { name: "Save changes" });
+      await click(save);
+      expect(
+        form.getByText(/^Replace reserved Windows device names/),
+      ).toBeTruthy();
+      expect(path.getAttribute("aria-invalid")).toBe("true");
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(updates).toHaveLength(0);
+
+      const valid = "C:\\work\\console.txt";
+      await type(path, valid);
+      await click(save);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(updates).toHaveLength(1);
+      expect(updates[0]).toMatchObject({
+        ...target,
+        profile: { workspacePath: valid },
+        updateMask: { paths: ["workspace_path"] },
+      });
+    },
+  );
 });
 
 describe("overview", () => {
