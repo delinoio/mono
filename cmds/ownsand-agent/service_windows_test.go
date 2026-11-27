@@ -136,12 +136,15 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 		eventError error
 		wantEvent  string
 	}{
-		{name: "directory creation fails", blockMkdir: true, wantEvent: "could not create the service state directory"},
+		{name: "directory creation fails", blockMkdir: true, wantEvent: "could not prepare the service state directory"},
 		{name: "file open fails", blockOpen: true, wantEvent: "could not open agent.log"},
 		{name: "Event Log write fails", blockOpen: true, eventError: errors.New("write failed"), wantEvent: "could not open agent.log"},
 		{name: "file log works"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if !tc.blockMkdir {
+				requireElevatedServiceLogTest(t)
+			}
 			dir := filepath.Join(t.TempDir(), rawPath)
 			path := filepath.Join(dir, "agent.log")
 			if tc.blockMkdir {
@@ -157,6 +160,13 @@ func TestStartupDiagnosticForInvalidConfiguration(t *testing.T) {
 			dispatch := func(name string, h svc.Handler) error {
 				if name != service.Name {
 					t.Fatalf("dispatched service %q, want %q", name, service.Name)
+				}
+				if tc.wantEvent == "" {
+					assertServiceStateACL(t, dir, true)
+					assertServiceStateACL(t, path, false)
+					if before, err := os.ReadFile(path); err != nil || len(before) != 0 {
+						t.Fatalf("log before the configuration error = %q, %v", before, err)
+					}
 				}
 				status := make(chan svc.Status, 8)
 				specific, exit := h.Execute(nil, make(chan svc.ChangeRequest), status)

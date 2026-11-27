@@ -14,14 +14,34 @@ import (
 
 func openEnrollmentLock(dir string) (*os.File, error) {
 	path := filepath.Join(dir, EnrollmentLockFile)
-	info, err := os.Lstat(path)
-	if err == nil && !info.Mode().IsRegular() {
-		return nil, errors.New("enrollment lock must be a regular file")
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	name, err := statePathName(path)
+	if err != nil {
 		return nil, err
 	}
-	return os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	// Omit delete sharing so concurrent callers keep locking the same file.
+	h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_ALWAYS,
+		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	var info windows.ByHandleFileInformation
+	err = windows.GetFileInformationByHandle(h, &info)
+	if err == nil {
+		switch {
+		case info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0:
+			err = &StatePathError{Path: path, Reason: StatePathReparsePoint}
+		case info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0:
+			err = &StatePathError{Path: path, Reason: StatePathNotRegularFile}
+		case info.NumberOfLinks != 1:
+			err = &StatePathError{Path: path, Reason: StatePathMultipleLinks}
+		}
+	}
+	if err != nil {
+		windows.CloseHandle(h)
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), path), nil
 }
 
 // tryLockFile takes an exclusive LockFileEx lock on the first byte without

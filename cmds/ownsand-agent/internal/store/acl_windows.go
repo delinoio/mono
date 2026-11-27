@@ -140,34 +140,15 @@ func sidIn(sid *windows.SID, set []*windows.SID) bool {
 	return false
 }
 
-// restrictStateDir protects the state directory root, corrects the ACLs of
-// the entries that already exist and fails closed when an entry belongs to
-// an untrusted owner (anyone except SYSTEM, Administrators and the user of an
-// elevated administrator process). An owner can always change the DACL of its
-// own object, so a directory that a standard user created cannot be made
-// private.
-func restrictStateDir(dir string) error {
-	p, err := loadPrincipals()
-	if err != nil {
-		return err
-	}
-	if err := checkOwner(dir, p, p.rootOwners); err != nil {
-		return err
-	}
-	if err := protectRoot(dir, p); err != nil {
-		return err
-	}
-	return resetChildren(dir, p)
-}
-
 // ownerAllowed reports whether owner is one of the allowed SIDs.
 func ownerAllowed(owner *windows.SID, allowed []*windows.SID) bool {
 	return owner != nil && sidIn(owner, allowed)
 }
 
-// checkOwner fails unless the owner of path is one of the allowed SIDs.
-func checkOwner(path string, p *principals, allowed []*windows.SID) error {
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+// checkHandleOwner checks the owner of the object behind h, including a link
+// itself when opened with FILE_FLAG_OPEN_REPARSE_POINT.
+func checkHandleOwner(path string, h windows.Handle, allowed []*windows.SID) error {
+	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		return fmt.Errorf("read the owner of %s: %w", path, err)
 	}
@@ -176,7 +157,11 @@ func checkOwner(path string, p *principals, allowed []*windows.SID) error {
 		return fmt.Errorf("read the owner of %s: %w", path, err)
 	}
 	if !ownerAllowed(owner, allowed) {
-		return fmt.Errorf("%s is owned by %s, but the state directory and its content must be owned by NT AUTHORITY\\SYSTEM, BUILTIN\\Administrators or, in an elevated administrator process, that process's own user; delete it or take its ownership as an administrator", path, describeSID(owner))
+		rejection := &StatePathError{Path: path, Reason: StatePathUntrustedOwner, ownerDescription: describeSID(owner)}
+		if owner != nil {
+			rejection.OwnerSID = owner.String()
+		}
+		return rejection
 	}
 	return nil
 }
@@ -229,14 +214,17 @@ func readACEs(acl *windows.ACL) ([]aceInfo, error) {
 	return out, nil
 }
 
-// readDACL returns the entries of the DACL of path, whether the DACL is
-// protected from inheritance, and keeps the security descriptor alive until
-// the entries are no longer used through the returned release function.
-func readDACL(path string) (aces []aceInfo, protected bool, nullDACL bool, release func(), err error) {
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+// readHandleDACL reads the DACL of the open object.
+func readHandleDACL(path string, h windows.Handle) ([]aceInfo, bool, bool, func(), error) {
+	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return nil, false, false, nil, fmt.Errorf("read the ACL of %s: %w", path, err)
 	}
+	return readDACL(path, sd)
+}
+
+// readDACL keeps the descriptor alive until the returned release function runs.
+func readDACL(path string, sd *windows.SECURITY_DESCRIPTOR) (aces []aceInfo, protected bool, nullDACL bool, release func(), err error) {
 	release = func() { runtime.KeepAlive(sd) }
 	control, _, err := sd.Control()
 	if err != nil {
@@ -286,12 +274,12 @@ func trustee(sid *windows.SID) windows.TRUSTEE {
 }
 
 // protectRoot replaces the DACL of the root with the protected DACL.
-// SetNamedSecurityInfo propagates the inheritable entries to existing
+// SetSecurityInfo propagates the inheritable entries to existing
 // children, which replaces the inherited entries of the old parent. The
 // DACL is written only when it differs, because a write touches every
 // descendant, including the files of a running VM.
-func protectRoot(dir string, p *principals) error {
-	aces, protected, nullDACL, release, err := readDACL(dir)
+func protectRoot(dir string, h windows.Handle, p *principals) error {
+	aces, protected, nullDACL, release, err := readHandleDACL(dir, h)
 	if err != nil {
 		return err
 	}
@@ -307,7 +295,15 @@ func protectRoot(dir string, p *principals) error {
 	if err != nil {
 		return fmt.Errorf("build the ACL of %s: %w", dir, err)
 	}
-	err = windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
+	writable, info, err := openStateEntry(dir, windows.WRITE_DAC)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(writable)
+	if err := verifyStateDirectory(dir, info.FileAttributes); err != nil {
+		return err
+	}
+	err = windows.SetSecurityInfo(writable, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, acl, nil)
 	if err != nil {
@@ -324,33 +320,22 @@ func protectRoot(dir string, p *principals) error {
 // the rest from its parent. Explicit entries of the Virtual Machines group
 // stay because a running VM needs them.
 func resetChildren(root string, p *principals) error {
-	// An owner of a child may be the Virtual Machines group too: the group
-	// has no logon, but Hyper-V can create files for a VM in its name.
-	childOwners := p.childOwners
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// An entry that disappears during the walk (a VM file that a
-			// runtime deletes) is not an error.
 			if errors.Is(err, fs.ErrNotExist) {
-				return nil
+				return nil // A VM file can disappear during the walk.
 			}
 			return fmt.Errorf("walk %s: %w", path, err)
 		}
 		if path == root {
 			return nil
 		}
-		// A link must not redirect the ACL change to another object.
-		if d.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if err := resetChild(path, p, childOwners); err != nil {
-			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-				return nil
-			}
+		reparse, err := resetChild(path, p)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
+		}
+		if d.IsDir() && (reparse || err != nil) {
+			return filepath.SkipDir
 		}
 		return nil
 	})
@@ -369,13 +354,23 @@ func aclFromEntries(entries []windows.EXPLICIT_ACCESS) (*windows.ACL, error) {
 	return windows.ACLFromEntries(entries, nil)
 }
 
-func resetChild(path string, p *principals, owners []*windows.SID) error {
-	if err := checkOwner(path, p, owners); err != nil {
-		return err
-	}
-	aces, protected, nullDACL, release, err := readDACL(path)
+// resetChild reports a reparse point so the caller can avoid descending.
+func resetChild(path string, p *principals) (bool, error) {
+	h, info, err := openStateEntry(path, windows.READ_CONTROL)
 	if err != nil {
-		return err
+		return false, err
+	}
+	defer windows.CloseHandle(h)
+	// Hyper-V can create VM files that the Virtual Machines group owns.
+	if err := checkHandleOwner(path, h, p.childOwners); err != nil {
+		return false, err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return true, nil
+	}
+	aces, protected, nullDACL, release, err := readHandleDACL(path, h)
+	if err != nil {
+		return false, err
 	}
 	defer release()
 	dirty := protected || nullDACL
@@ -396,18 +391,28 @@ func resetChild(path string, p *principals, owners []*windows.SID) error {
 		}
 	}
 	if !dirty {
-		return nil
+		return false, nil
 	}
 	acl, err := aclFromEntries(keep)
 	if err != nil {
-		return fmt.Errorf("build the ACL of %s: %w", path, err)
+		return false, fmt.Errorf("build the ACL of %s: %w", path, err)
+	}
+	// Keep the checked entry open without delete sharing while opening it
+	// with write access. The second handle also opens the entry itself.
+	writable, current, err := openStateEntry(path, windows.WRITE_DAC)
+	if err != nil {
+		return false, err
+	}
+	defer windows.CloseHandle(writable)
+	if current.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return true, nil
 	}
 	// UNPROTECTED makes Windows add the entries that the parent passes on.
-	err = windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+	err = windows.SetSecurityInfo(writable, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, acl, nil)
 	if err != nil {
-		return fmt.Errorf("reset the ACL of %s: %w", path, err)
+		return false, fmt.Errorf("reset the ACL of %s: %w", path, err)
 	}
-	return nil
+	return false, nil
 }

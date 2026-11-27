@@ -62,6 +62,39 @@ const (
 // ErrNotFound reports a missing record.
 var ErrNotFound = errors.New("store: record not found")
 
+// ErrUntrustedStateDir reports a state path that fails the Windows trust checks.
+var ErrUntrustedStateDir = errors.New("store: untrusted state path")
+
+// StatePathReason identifies why Windows rejected a state path.
+type StatePathReason string
+
+const (
+	StatePathReparsePoint   StatePathReason = "reparse point"
+	StatePathUntrustedOwner StatePathReason = "untrusted owner"
+	StatePathNotDirectory   StatePathReason = "not a directory"
+	StatePathNotRegularFile StatePathReason = "not a regular file"
+	StatePathMultipleLinks  StatePathReason = "multiple hard links"
+)
+
+// StatePathError describes a rejected Windows state path.
+type StatePathError struct {
+	Path             string
+	Reason           StatePathReason
+	OwnerSID         string
+	ownerDescription string
+}
+
+func (e *StatePathError) Error() string {
+	if e.Reason == StatePathUntrustedOwner {
+		return fmt.Sprintf("%v: %q is owned by %s, but it must be owned by a trusted principal; take its ownership as an administrator or remove it", ErrUntrustedStateDir, e.Path, e.ownerDescription)
+	}
+	return fmt.Sprintf("%v: %q: %s", ErrUntrustedStateDir, e.Path, e.Reason)
+}
+
+func (e *StatePathError) Unwrap() error { return ErrUntrustedStateDir }
+
+var stateSubdirs = [...]string{SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir}
+
 // Store is the agent state directory. It is safe for concurrent use.
 type Store struct {
 	dir string
@@ -79,21 +112,14 @@ func OpenForRead(dir string) (*Store, error) {
 
 // Open creates the state directory and its subdirectories and restricts the
 // directory to the service account: mode 0700 on Linux and macOS, and a
-// protected ACL for SYSTEM and Administrators on Windows (see
-// restrictStateDir).
+// protected ACL for SYSTEM and Administrators on Windows.
 func Open(dir string) (*Store, error) {
 	s, err := OpenForRead(dir)
 	if err != nil {
 		return nil, err
 	}
-	for _, sub := range []string{"", SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
-			return nil, fmt.Errorf("store: create %s: %w", filepath.Join(dir, sub), err)
-		}
-	}
-	// The directory may exist with wider permissions from an operator.
-	if err := restrictStateDir(dir); err != nil {
-		return nil, fmt.Errorf("store: restrict state directory: %w", err)
+	if err := prepareStateLayout(dir); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -485,7 +511,7 @@ func (s *Store) LoadExecs(v any) error {
 // files, base images, update downloads and exec records. It keeps the identity
 // and agent.json.
 func (s *Store) WipeLocalData() error {
-	for _, sub := range []string{SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
+	for _, sub := range stateSubdirs {
 		if err := removeAll(s.Path(sub)); err != nil {
 			return err
 		}
