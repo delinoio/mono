@@ -149,8 +149,8 @@ type Manager struct {
 	// waits for the running snapshot imports and wipes the local data, and
 	// nothing clears it, because the removal notice is final (a failed
 	// removal retries in the same process or after a restart that sets the
-	// fence again). While it is set, fresh creates and snapshot imports
-	// cannot register or write new records. imports counts the imports
+	// fence again). While it is set, fresh creates, snapshot captures and
+	// snapshot imports cannot start. imports counts the imports
 	// that passed BeginSnapshotImport and did not end; importsDrained is
 	// closed (and cleared) when the count reaches zero while a RemoveAll
 	// waits for it.
@@ -185,8 +185,9 @@ type Manager struct {
 	// beforeSnapshotCapture is a test hook called before the manager marks
 	// a capture as started, while the source sandbox command lock is held.
 	beforeSnapshotCapture func()
-	// Snapshot tests can pause publication or fail removal with these hooks.
+	// Snapshot tests can pause admission or publication, or fail removal.
 	hookMu                sync.Mutex
+	afterSnapshotLookup   func(id string)
 	beforeSnapshotPublish func(id string)
 	removalHook           func(id string) error
 	// bg tracks the background sandbox ends (TTL expiries and unexpected
