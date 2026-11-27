@@ -1,0 +1,60 @@
+{
+  "gid": "inv-31-macos-image-publication-cancel",
+  "commit": "97032c24c10a0b4158b3d78555ffa1391570cdbe",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "97032c24c10a0b4158b3d78555ffa1391570cdbe",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "platform": "darwin/arm64",
+    "setup": "Run the commands in Bash at the root of a disposable checkout on APFS. The focused fixtures use local files and a loopback guest-helper server. Use the host Go and Xcode command-line tools. The signed fixture requires no administrator privileges, CMake or macOS guest image.",
+    "requiresElevation": false,
+    "reason": "The assigned implementation worker runs on Linux and the assignment reserves native host access for the coordinator.",
+    "commands": [
+      "set -e",
+      "set -o pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"97032c24c10a0b4158b3d78555ffa1391570cdbe\"",
+      "test \"$(uname -s)\" = \"Darwin\" && test \"$(uname -m)\" = \"arm64\"",
+      "mkdir -p \"$PWD/.t3-tmp/macos-image-publication\"",
+      "export TMPDIR=\"$PWD/.t3-tmp/macos-image-publication\" COPYFILE_DISABLE=1 CGO_ENABLED=1",
+      "sw_vers && go version && xcrun --sdk macosx --show-sdk-path",
+      "device=\"$(df -P \"$TMPDIR\" | awk 'END {print $1}')\"; diskutil info \"$device\" > \"$TMPDIR/volume.log\"; grep -E 'Type \\(Bundle\\):[[:space:]]+apfs' \"$TMPDIR/volume.log\"",
+      "go vet ./cmds/ownsand-agent/internal/imagebuild ./cmds/ownsand-agent/internal/images",
+      "go test -c -race -o \"$TMPDIR/imagebuild.test\" ./cmds/ownsand-agent/internal/imagebuild",
+      "codesign --force --sign - --entitlements cmds/ownsand-agent/entitlements.plist \"$TMPDIR/imagebuild.test\"",
+      "codesign --verify \"$TMPDIR/imagebuild.test\"",
+      "\"$TMPDIR/imagebuild.test\" -test.count=1 -test.v -test.run '^TestMacOSImage(Publication|FirstBootShutdown)$' | tee \"$TMPDIR/native-imagebuild.log\"",
+      "go test -count=1 -race -v -run 'Test.*(Install|Publication|Recover)' ./cmds/ownsand-agent/internal/images | tee \"$TMPDIR/native-images.log\"",
+      "grep -E '^--- PASS: TestMacOSImagePublication ' \"$TMPDIR/native-imagebuild.log\"",
+      "grep -E '^--- PASS: TestMacOSImageFirstBootShutdown ' \"$TMPDIR/native-imagebuild.log\"",
+      "grep -E '^--- PASS: TestInstallCancellationAroundExchange ' \"$TMPDIR/native-images.log\""
+    ],
+    "expectedResults": [
+      "The checkout is the recorded revision and diskutil identifies the fixture volume as APFS. CGO-enabled vet, build, signing and signature verification succeed.",
+      "The shutdown fixture publishes after the simulated Stopped transition and preserves the previous image on an error, timeout or cancellation.",
+      "All eight publication subtests run. Cancellation after first boot returns context.Canceled without writing staged metadata. Cancellation or expiry before the exchange returns context.Canceled or context.DeadlineExceeded. Replacement preserves the previous disk and metadata bytes. Canceled first install leaves the destination absent. Canceled builds remove staging and preserve the caller-supplied IPSW fixture.",
+      "Both active-context controls publish the staged disk and the guest helper version. Cancellation after recovery preserves the recovered backup. Cancellation after the first exchange rename allows the exchange to complete."
+    ],
+    "files": {
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/macos_build_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/macos_darwin_test.go",
+        "cmds/ownsand-agent/internal/images/images_test.go"
+      ],
+      "entitlements": "cmds/ownsand-agent/entitlements.plist",
+      "outputLogs": [
+        ".t3-tmp/macos-image-publication/volume.log",
+        ".t3-tmp/macos-image-publication/native-imagebuild.log",
+        ".t3-tmp/macos-image-publication/native-images.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-macos-image-publication-cancel/worker/.t3-tmp/imagebuild-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-macos-image-publication-cancel/worker/.t3-tmp/images-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-macos-image-publication-cancel/worker/.t3-tmp/ownsand-agent-darwin-arm64"
+      ]
+    },
+    "unperformedOnAvailableHost": [
+      "A full ownsand-agent image build with a real first-boot VM requires a compatible macOS IPSW and administrator privileges to provision root-owned guest files. The available Mac account has neither."
+    ]
+  }
+}
