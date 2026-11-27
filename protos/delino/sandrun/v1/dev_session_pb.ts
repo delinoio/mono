@@ -805,6 +805,9 @@ export const DevSessionExecEventSchema: GenMessage<DevSessionExecEvent> = /*@__P
   messageDesc(file_delino_sandrun_v1_dev_session, 23);
 
 /**
+ * To continue the same snapshot after rotation, keep organization_id,
+ * dev_session_id, read_id, and path unchanged.
+ *
  * @generated from message delino.sandrun.v1.ReadDevSessionFileRequest
  */
 export type ReadDevSessionFileRequest = Message<"delino.sandrun.v1.ReadDevSessionFileRequest"> & {
@@ -833,6 +836,10 @@ export type ReadDevSessionFileRequest = Message<"delino.sandrun.v1.ReadDevSessio
   path: string;
 
   /**
+   * On continuation, use the offset of the last accepted chunk plus the byte
+   * length of its data. If the previous call delivered no chunks, reuse its
+   * requested offset.
+   *
    * @generated from field: int64 offset = 5;
    */
   offset: bigint;
@@ -874,7 +881,7 @@ export const DevSessionFileChunkSchema: GenMessage<DevSessionFileChunk> = /*@__P
  */
 export type DevSessionFileEnd = Message<"delino.sandrun.v1.DevSessionFileEnd"> & {
   /**
-   * Size of the whole file.
+   * Size in bytes of the whole file snapshot.
    *
    * @generated from field: int64 size_bytes = 1;
    */
@@ -903,7 +910,8 @@ export type ReadDevSessionFileResponse = Message<"delino.sandrun.v1.ReadDevSessi
     case: "chunk";
   } | {
     /**
-     * The final message.
+     * Marks completion of the logical read and reports the whole snapshot size.
+     * A stream that closes with OK due to relay rotation can omit this event.
      *
      * @generated from field: delino.sandrun.v1.DevSessionFileEnd end = 2;
      */
@@ -1111,6 +1119,9 @@ export const DevSessionService: GenService<{
   },
   /**
    * Stream a guest file from an offset in chunks of at most 1 MiB.
+   * Relay rotation can close the stream with OK before the end event. On
+   * clean EOF without end, call ReadDevSessionFile again to continue the
+   * same snapshot. The end event marks completion of the logical read.
    *
    * @generated from rpc delino.sandrun.v1.DevSessionService.ReadDevSessionFile
    */

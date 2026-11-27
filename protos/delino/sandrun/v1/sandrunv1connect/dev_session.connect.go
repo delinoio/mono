@@ -85,6 +85,9 @@ type DevSessionServiceClient interface {
 	// offsets.
 	AttachDevSessionExec(context.Context, *connect.Request[v1.AttachDevSessionExecRequest]) (*connect.ServerStreamForClient[v1.AttachDevSessionExecResponse], error)
 	// Stream a guest file from an offset in chunks of at most 1 MiB.
+	// Relay rotation can close the stream with OK before the end event. On
+	// clean EOF without end, call ReadDevSessionFile again to continue the
+	// same snapshot. The end event marks completion of the logical read.
 	ReadDevSessionFile(context.Context, *connect.Request[v1.ReadDevSessionFileRequest]) (*connect.ServerStreamForClient[v1.ReadDevSessionFileResponse], error)
 	// Write one chunk of at most 1 MiB to a guest file at an offset.
 	WriteDevSessionFile(context.Context, *connect.Request[v1.WriteDevSessionFileRequest]) (*connect.Response[v1.WriteDevSessionFileResponse], error)
@@ -237,6 +240,9 @@ type DevSessionServiceHandler interface {
 	// offsets.
 	AttachDevSessionExec(context.Context, *connect.Request[v1.AttachDevSessionExecRequest], *connect.ServerStream[v1.AttachDevSessionExecResponse]) error
 	// Stream a guest file from an offset in chunks of at most 1 MiB.
+	// Relay rotation can close the stream with OK before the end event. On
+	// clean EOF without end, call ReadDevSessionFile again to continue the
+	// same snapshot. The end event marks completion of the logical read.
 	ReadDevSessionFile(context.Context, *connect.Request[v1.ReadDevSessionFileRequest], *connect.ServerStream[v1.ReadDevSessionFileResponse]) error
 	// Write one chunk of at most 1 MiB to a guest file at an offset.
 	WriteDevSessionFile(context.Context, *connect.Request[v1.WriteDevSessionFileRequest]) (*connect.Response[v1.WriteDevSessionFileResponse], error)

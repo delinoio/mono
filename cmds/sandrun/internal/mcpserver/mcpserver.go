@@ -106,9 +106,12 @@ func New(cfg Config) *Server {
 }
 
 // Run serves MCP on t until the client disconnects or ctx ends. Background
-// transfers stop when Run returns.
+// transfers are canceled on either event.
 func (s *Server) Run(ctx context.Context, t mcp.Transport) error {
 	defer s.cancel()
+	// The SDK waits for active handlers during graceful shutdown.
+	stop := context.AfterFunc(ctx, s.cancel)
+	defer stop()
 	return s.mcp.Run(ctx, t)
 }
 
@@ -858,6 +861,10 @@ func (s *Server) awaitTransfer(ctx context.Context, t *transfer, wait time.Durat
 	case <-t.done:
 	case <-timer.C:
 	case <-ctx.Done():
+	case <-s.ctx.Done():
+	}
+	if err := s.ctx.Err(); err != nil {
+		return transferResult{}, toolError(err)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()

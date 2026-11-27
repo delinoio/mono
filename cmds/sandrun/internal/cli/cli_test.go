@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -64,9 +65,16 @@ type result struct {
 }
 
 type execJSONLine struct {
-	Event  string `json:"event"`
-	Offset int64  `json:"offset"`
-	Data   string `json:"data"`
+	Event         string         `json:"event"`
+	Offset        int64          `json:"offset,omitempty"`
+	Data          string         `json:"data,omitempty"`
+	MissingStdout *execJSONRange `json:"missing_stdout,omitempty"`
+	MissingStderr *execJSONRange `json:"missing_stderr,omitempty"`
+}
+
+type execJSONRange struct {
+	From *int64 `json:"from"`
+	To   *int64 `json:"to"`
 }
 
 func parseExecJSONLines(t *testing.T, output string) []execJSONLine {
@@ -85,8 +93,9 @@ func parseExecJSONLines(t *testing.T, output string) []execJSONLine {
 func checkExecJSONLines(t *testing.T, output string, want ...execJSONLine) {
 	t.Helper()
 	got := parseExecJSONLines(t, output)
-	if !slices.Equal(got, want) {
-		t.Fatalf("exec events = %+v, want %+v", got, want)
+	if !reflect.DeepEqual(got, want) {
+		wantJSON, _ := json.Marshal(want)
+		t.Fatalf("exec events:\n%s\nwant: %s", output, wantJSON)
 	}
 }
 
@@ -119,12 +128,34 @@ func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
 		execJSONLine{Event: "stdout", Offset: 4, Data: "€"},
 		execJSONLine{Event: "stdout", Offset: 7, Data: "�a"},
 		execJSONLine{Event: "stdout", Offset: 9, Data: "�"},
-		execJSONLine{Event: "output_truncated"},
+		execJSONLine{
+			Event:         "output_truncated",
+			MissingStdout: &execJSONRange{From: new(int64(11)), To: new(int64(13))},
+			MissingStderr: &execJSONRange{From: new(int64(0)), To: new(int64(0))},
+		},
 		execJSONLine{Event: "stderr", Offset: 3, Data: "é"},
 		execJSONLine{Event: "stdout", Offset: 13, Data: "�z"},
 		execJSONLine{Event: "stdout", Offset: 15, Data: "�"},
 		execJSONLine{Event: "stdout", Offset: 17, Data: "b"},
 	)
+}
+
+func TestExecJSONWritesDistinctTruncationRanges(t *testing.T) {
+	var output bytes.Buffer
+	w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
+	if err := w.event(sandrun.ExecEvent{
+		Kind:          sandrun.ExecEventOutputTruncated,
+		ExecID:        "exec",
+		MissingStdout: sandrun.ByteRange{From: 11, To: 13},
+		MissingStderr: sandrun.ByteRange{From: 21, To: 24},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkExecJSONLines(t, output.String(), execJSONLine{
+		Event:         "output_truncated",
+		MissingStdout: &execJSONRange{From: new(int64(11)), To: new(int64(13))},
+		MissingStderr: &execJSONRange{From: new(int64(21)), To: new(int64(24))},
+	})
 }
 
 func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {

@@ -7,12 +7,14 @@
 // - the SDK runs in browsers too, so runtime sources do not import `node:`
 //   modules (tests and the test helpers under `testing/` may).
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 // URL.pathname is a URL path (percent-encoded, with a leading slash before a
 // Windows drive letter), not a filesystem path, so convert the file URL.
-const root = fileURLToPath(new URL("../src/", import.meta.url));
+const sourceRoot = fileURLToPath(new URL("../src/", import.meta.url));
+const root = process.argv[2] ? resolve(process.argv[2]) : sourceRoot;
 const spdxHeader = /^\/\/ SPDX-License-Identifier: Apache-2\.0\r?\n/;
 const failures = [];
 
@@ -37,12 +39,41 @@ function check(path) {
     failures.push(`${name}: the SDK must not log through console`);
   }
   const runtime = !name.endsWith(".test.ts") && !name.startsWith("testing");
-  if (runtime && /from\s+["']node:/.test(source)) {
+  const specifiers = moduleSpecifiers(name, source);
+  if (
+    runtime &&
+    specifiers.some((specifier) => specifier.startsWith("node:"))
+  ) {
     failures.push(`${name}: runtime sources must not import node: modules`);
   }
-  if (/from\s+["'][^"']*servers\//.test(source)) {
+  if (specifiers.some((specifier) => specifier.includes("servers/"))) {
     failures.push(`${name}: the SDK must not import from servers/`);
   }
+}
+
+function moduleSpecifiers(name, source) {
+  const file = ts.createSourceFile(name, source, ts.ScriptTarget.Latest);
+  const specifiers = [];
+
+  function visit(node) {
+    let specifier;
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      specifier = node.moduleSpecifier;
+    } else if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      specifier = node.arguments[0];
+    }
+
+    if (specifier && ts.isStringLiteral(specifier)) {
+      specifiers.push(specifier.text);
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(file);
+  return specifiers;
 }
 
 walk(root);
