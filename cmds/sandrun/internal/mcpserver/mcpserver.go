@@ -501,19 +501,22 @@ type execResult struct {
 
 // window keeps the first headBytes and up to tailBytes after the last gap.
 type window struct {
-	from    int64
-	next    int64
-	head    []byte
-	headEnd int64
-	tail    []byte
-	total   int64
+	from       int64
+	next       int64
+	head       []byte
+	headBreaks []int // Index of the first byte after each gap within head.
+	headEnd    int64
+	tail       []byte
+	total      int64
 }
 
 func (w *window) add(offset int64, data []byte) {
 	w.next = offset + int64(len(data))
 	w.total += int64(len(data))
-	if room := headBytes - len(w.head); room > 0 {
-		n := min(room, len(data))
+	if n := min(headBytes-len(w.head), len(data)); n > 0 {
+		if len(w.head) > 0 && w.headEnd != offset {
+			w.headBreaks = append(w.headBreaks, len(w.head))
+		}
 		w.head = append(w.head, data[:n]...)
 		w.headEnd = offset + int64(n)
 		data = data[n:]
@@ -534,13 +537,29 @@ func (w *window) skipTo(offset int64) {
 
 func (w *window) output() Output {
 	o := Output{From: w.from, To: w.next}
+	tailStart := w.next - int64(len(w.tail))
 	kept := int64(len(w.head) + len(w.tail))
-	text := string(w.head) + string(w.tail)
 	if w.total > kept {
-		o.Omitted = &sandrun.ByteRange{From: w.headEnd, To: w.next - int64(len(w.tail))}
-		text = string(w.head) + "\n[... output omitted ...]\n" + string(w.tail)
+		o.Omitted = &sandrun.ByteRange{From: w.headEnd, To: tailStart}
 	}
-	o.Text = strings.ToValidUTF8(text, "�")
+
+	var text strings.Builder
+	start := 0
+	for _, end := range w.headBreaks {
+		text.WriteString(strings.ToValidUTF8(string(w.head[start:end]), "�"))
+		start = end
+	}
+	lastHead := string(w.head[start:])
+	if o.Omitted == nil && w.headEnd == tailStart {
+		text.WriteString(strings.ToValidUTF8(lastHead+string(w.tail), "�"))
+	} else {
+		text.WriteString(strings.ToValidUTF8(lastHead, "�"))
+		if o.Omitted != nil {
+			text.WriteString("\n[... output omitted ...]\n")
+		}
+		text.WriteString(strings.ToValidUTF8(string(w.tail), "�"))
+	}
+	o.Text = text.String()
 	return o
 }
 

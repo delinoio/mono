@@ -770,6 +770,108 @@ func TestExecOutputWindowAndOffsetsWithGaps(t *testing.T) {
 	}
 }
 
+func TestExecOutputWindowUTF8Boundaries(t *testing.T) {
+	prefix := strings.Repeat("a", headBytes-1)
+	for _, tc := range []struct {
+		name          string
+		events        []sandrun.ExecEvent
+		wantStdout    Output
+		wantStderr    Output
+		wantTruncated []Truncated
+	}{
+		{
+			name: "stdout gap with adjacent stderr",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte{0xC3}},
+				{Kind: sandrun.ExecEventStderr, Data: []byte{0xC3}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 1, To: 3}},
+				{Kind: sandrun.ExecEventStdout, Offset: 3, Data: []byte{0xA9}},
+				{Kind: sandrun.ExecEventStderr, Offset: 1, Data: []byte{0xA9}},
+			},
+			wantStdout:    Output{Text: "��", To: 4},
+			wantStderr:    Output{Text: "é", To: 2},
+			wantTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{From: 1, To: 3}}},
+		},
+		{
+			name: "stderr gap with adjacent stdout",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStderr, Data: []byte{0xC2}},
+				{Kind: sandrun.ExecEventStdout, Data: []byte{0xC2}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStderr: sandrun.ByteRange{From: 1, To: 3}},
+				{Kind: sandrun.ExecEventStderr, Offset: 3, Data: []byte{0xA9}},
+				{Kind: sandrun.ExecEventStdout, Offset: 1, Data: []byte{0xA9}},
+			},
+			wantStdout:    Output{Text: "©", To: 2},
+			wantStderr:    Output{Text: "��", To: 4},
+			wantTruncated: []Truncated{{MissingStderr: &sandrun.ByteRange{From: 1, To: 3}}},
+		},
+		{
+			name: "gap between head and tail",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte(prefix + "\xC2")},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: headBytes, To: headBytes + 2}},
+				{Kind: sandrun.ExecEventStdout, Offset: headBytes + 2, Data: []byte{0xA9}},
+			},
+			wantStdout:    Output{Text: prefix + "��", To: headBytes + 3},
+			wantTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{From: headBytes, To: headBytes + 2}}},
+		},
+		{
+			name: "adjacent head and tail",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte(prefix + "\xC2")},
+				{Kind: sandrun.ExecEventStdout, Offset: headBytes, Data: []byte{0xA9}},
+			},
+			wantStdout: Output{Text: prefix + "©", To: headBytes + 1},
+		},
+		{
+			name: "leading gap",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{To: 3}},
+				{Kind: sandrun.ExecEventStdout, Offset: 3, Data: []byte{0xC2, 0xA9}},
+			},
+			wantStdout:    Output{Text: "©", To: 5},
+			wantTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{To: 3}}},
+		},
+		{
+			name: "multiple gaps in head",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStdout, Data: []byte{0xC2}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 1, To: 3}},
+				{Kind: sandrun.ExecEventStdout, Offset: 3, Data: []byte{0xA9}},
+				{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 4, To: 6}},
+				{Kind: sandrun.ExecEventStdout, Offset: 6, Data: []byte{0xC2, 0xA9}},
+			},
+			wantStdout: Output{Text: "��©", To: 8},
+			wantTruncated: []Truncated{
+				{MissingStdout: &sandrun.ByteRange{From: 1, To: 3}},
+				{MissingStdout: &sandrun.ByteRange{From: 4, To: 6}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCollector(0, 0)
+			for _, ev := range tc.events {
+				if err := c.on(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := c.result("exec", nil)
+			if r.Stdout.Text != tc.wantStdout.Text || r.Stderr.Text != tc.wantStderr.Text {
+				t.Error("preview text differs from the expected text")
+			}
+			if r.Stdout.From != tc.wantStdout.From || r.Stdout.To != tc.wantStdout.To || r.NextStdoutOffset != tc.wantStdout.To || r.Stdout.Omitted != nil {
+				t.Errorf("stdout from = %d, to = %d, next = %d, omitted = %+v", r.Stdout.From, r.Stdout.To, r.NextStdoutOffset, r.Stdout.Omitted)
+			}
+			if r.Stderr.From != tc.wantStderr.From || r.Stderr.To != tc.wantStderr.To || r.NextStderrOffset != tc.wantStderr.To || r.Stderr.Omitted != nil {
+				t.Errorf("stderr from = %d, to = %d, next = %d, omitted = %+v", r.Stderr.From, r.Stderr.To, r.NextStderrOffset, r.Stderr.Omitted)
+			}
+			if !reflect.DeepEqual(r.OutputTruncated, tc.wantTruncated) {
+				t.Errorf("truncated = %+v, want %+v", r.OutputTruncated, tc.wantTruncated)
+			}
+		})
+	}
+}
+
 func TestPassEnvValuesNeverInResults(t *testing.T) {
 	needPOSIX(t)
 	const secret = "s3cr3t-value-for-test"
