@@ -29,6 +29,7 @@ import {
 } from "react";
 import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
+import { useRouter } from "../router.tsx";
 
 export function PageHeader({
   title,
@@ -53,6 +54,29 @@ export function PageHeader({
 /** Shows a failed action in a toast. */
 export function toastError(error: unknown): void {
   toast.error(errorMessage(error));
+}
+
+/** Reports direct action failures while keeping successful page data visible. */
+export function useActionSignInNotice() {
+  const { isCurrentVisit } = useRouter();
+  const [failure, setFailure] = useState<{
+    visit: typeof isCurrentVisit;
+    error: ConnectError;
+  }>();
+
+  function reportActionError(error: unknown) {
+    if (error instanceof ConnectError && error.code === Code.Unauthenticated) {
+      if (isCurrentVisit()) setFailure({ visit: isCurrentVisit, error });
+      return;
+    }
+    toastError(error);
+  }
+
+  return {
+    // A batched leave and return can reuse this component for a new visit.
+    signInError: failure?.visit === isCurrentVisit ? failure.error : undefined,
+    reportActionError,
+  };
 }
 
 /** A loading placeholder for a list. */

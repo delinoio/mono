@@ -379,15 +379,16 @@ func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 	id := resp.Msg.GetProfile().GetRunnerProfileId()
 	// The held update stands in for another admin's warm_count update that
 	// commits after this name update read the profile.
-	commit := holdTx(t, w.env, "UPDATE runner_profiles SET warm_count = 3 WHERE runner_profile_id = $1", id)
+	holder := holdTx(t, w.env, "UPDATE runner_profiles SET warm_count = 3 WHERE runner_profile_id = $1", id)
 	errc := make(chan error, 1)
 	go func() {
 		_, err := admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&sandrunv1.UpdateRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: id,
 			Profile: &sandrunv1.RunnerProfile{Name: "renamed"}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"name"}}}))
 		errc <- err
 	}()
-	waitForLockWaiter(t, w.env)
-	commit()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR UPDATE"})
+	holder.commit()
 	if err := <-errc; err != nil {
 		t.Fatalf("name update: %v", err)
 	}
@@ -429,7 +430,7 @@ func TestRunnerProfileResourceUpdates(t *testing.T) {
 	}
 
 	// Commit the memory change after the vCPU update tries to lock the row.
-	commit := holdTx(t, w.env, "UPDATE runner_profiles SET memory_mib = 16384 WHERE runner_profile_id = $1", id)
+	holder := holdTx(t, w.env, "UPDATE runner_profiles SET memory_mib = 16384 WHERE runner_profile_id = $1", id)
 	type result struct {
 		resp *connect.Response[sandrunv1.UpdateRunnerProfileResponse]
 		err  error
@@ -439,8 +440,9 @@ func TestRunnerProfileResourceUpdates(t *testing.T) {
 		resp, err := update(&sandrunv1.Resources{VcpuCount: 8}, "resources.vcpu_count")
 		done <- result{resp: resp, err: err}
 	}()
-	waitForLockWaiter(t, w.env)
-	commit()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR UPDATE"})
+	holder.commit()
 	concurrent := <-done
 	if concurrent.err != nil {
 		t.Fatal(concurrent.err)
@@ -559,6 +561,56 @@ func TestRunnerProfileSubMillisecondDurations(t *testing.T) {
 	_, err = admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&sandrunv1.UpdateRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: resp.Msg.GetProfile().GetRunnerProfileId(),
 		Profile: &sandrunv1.RunnerProfile{MaxQueueWait: durationpb.New(500 * time.Microsecond)}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"max_queue_wait"}}}))
 	wantCode(t, "update with sub-millisecond max_queue_wait", err, connect.CodeInvalidArgument)
+}
+
+func TestCreateRunnerProfileIntegrationDeletedDuringInsert(t *testing.T) {
+	w := newWorld(t)
+	ctx := t.Context()
+	admin := w.env.User(w.org.Admin)
+	created, err := admin.Integration.CreateAgentIntegration(ctx, connect.NewRequest(&sandrunv1.CreateAgentIntegrationRequest{
+		OrganizationId: w.org.ID, Vendor: sandrunv1.AgentVendor_AGENT_VENDOR_CURSOR, Name: "cursor",
+		Settings:    &sandrunv1.CreateAgentIntegrationRequest_Cursor{Cursor: &sandrunv1.CursorSettings{PoolName: "pool-a"}},
+		Credentials: &sandrunv1.CreateAgentIntegrationRequest_CursorCredentials{CursorCredentials: &sandrunv1.CursorCredentials{ServiceAccountApiKey: "k"}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := linuxDevProfile()
+	input.Name = "cursor-linux"
+	input.WorkloadKind = sandrunv1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION
+	input.AgentIntegrationId = created.Msg.GetIntegration().GetAgentIntegrationId()
+	input.WorkspacePath = ""
+
+	// The vendor lookup sees the integration until the deletion commits.
+	// The insert's foreign-key check waits for that transaction to finish.
+	holder := holdTx(t, w.env, "DELETE FROM agent_integrations WHERE agent_integration_id = $1", input.AgentIntegrationId)
+	result := make(chan error, 1)
+	go func() {
+		_, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&sandrunv1.CreateRunnerProfileRequest{
+			OrganizationId: w.org.ID, Profile: input,
+		}))
+		result <- err
+	}()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "INSERT INTO runner_profiles (runner_profile_id, organization_id, name, workload_kind, agent_integration_id"})
+	holder.commit()
+
+	select {
+	case err := <-result:
+		var got *connect.Error
+		if !errors.As(err, &got) || got.Code() != connect.CodeNotFound || got.Message() != "agent integration not found" {
+			t.Fatalf("create after integration deletion: got %v, want not_found: agent integration not found", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("create did not finish after integration deletion")
+	}
+	list, err := admin.Profile.ListRunnerProfiles(ctx, connect.NewRequest(&sandrunv1.ListRunnerProfilesRequest{OrganizationId: w.org.ID}))
+	if err != nil || len(list.Msg.GetProfiles()) != 0 {
+		t.Fatalf("profiles after failed create: %v (%v)", list, err)
+	}
+	if got := countAudit(t, w.env, w.org.ID, sandrunv1.AuditAction_AUDIT_ACTION_RUNNER_PROFILE_CREATED); got != 0 {
+		t.Fatalf("profile creation audit events after failed create: got %d, want 0", got)
+	}
 }
 
 // TestIntegrationDeleteBlockedByProfile checks that an integration cannot be

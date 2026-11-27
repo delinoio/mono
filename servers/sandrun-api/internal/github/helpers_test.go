@@ -140,7 +140,7 @@ type worldOpts struct {
 	warm           int32
 }
 
-func newGHWorld(t *testing.T, o worldOpts) *ghWorld {
+func newGHWorld(t *testing.T, o worldOpts, extra ...testenv.Option) *ghWorld {
 	t.Helper()
 	w := &ghWorld{os: ownsandfake.New(), l: &layers.Layers{}, progs: &programs{running: map[string]chan struct{}{}}, reader: sdkmetric.NewManualReader(),
 		ghLogs: &testenv.SafeBuffer{}}
@@ -161,7 +161,7 @@ func newGHWorld(t *testing.T, o worldOpts) *ghWorld {
 		opts.GitHub = w.githubOptions(now)
 	}
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(w.reader))
-	w.env = testenv.New(t, testenv.WithLayerOptions(opts, w.l), func(ao *app.Options) {
+	options := []testenv.Option{testenv.WithLayerOptions(opts, w.l), func(ao *app.Options) {
 		ao.Metrics = provider
 		if o.manualDispatch {
 			// Hold the lease elsewhere so only explicit passes run in the test.
@@ -170,7 +170,8 @@ func newGHWorld(t *testing.T, o worldOpts) *ghWorld {
 				t.Fatal(err)
 			}
 		}
-	})
+	}}
+	w.env = testenv.New(t, append(options, extra...)...)
 	clock.Store(w.env.Clock)
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -198,7 +199,7 @@ func (w *ghWorld) githubOptions(now func() time.Time) github.Options {
 	return github.Options{
 		Client:        githubapi.New(w.gh.Config(), nil, slog.New(slog.NewJSONHandler(w.ghLogs, nil)), now),
 		WebhookSecret: w.gh.WebhookSecret,
-		Timing:        github.Timing{RedeliveryInterval: time.Hour, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: time.Minute, RegistrationGiveUp: time.Minute},
+		Timing:        github.Timing{SurplusInterval: 50 * time.Millisecond, RedeliveryInterval: time.Hour, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: time.Minute, RegistrationGiveUp: time.Minute},
 	}
 }
 

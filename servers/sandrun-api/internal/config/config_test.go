@@ -100,6 +100,39 @@ func TestOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsValidEndpointPorts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		port string
+	}{
+		{"maximum", ":65535"},
+		{"zero", ":0"},
+		{"absent", ""},
+		{"empty", ":"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			origin := "http://127.0.0.1" + tc.port
+			endpoint := "https://example.test" + tc.port
+			env := baseEnv(t)
+			env[EnvPublicOrigin] = origin + "/"
+			env[EnvOwnSandAPIOrigin] = origin + "/"
+			env[EnvLogtoIssuer] = endpoint + "/oidc"
+			env[EnvLogtoJWKSURL] = endpoint + "/keys/jwks.json"
+
+			cfg, err := Load(lookup(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.PublicOrigin != origin || cfg.OwnSandAPIOrigin != origin {
+				t.Errorf("origins = %q and %q, want %q", cfg.PublicOrigin, cfg.OwnSandAPIOrigin, origin)
+			}
+			if cfg.LogtoIssuer != env[EnvLogtoIssuer] || cfg.LogtoJWKSURL != env[EnvLogtoJWKSURL] {
+				t.Errorf("Logto URLs = %q and %q, want %q and %q", cfg.LogtoIssuer, cfg.LogtoJWKSURL, env[EnvLogtoIssuer], env[EnvLogtoJWKSURL])
+			}
+		})
+	}
+}
+
 func TestLoadCanonicalizesCORSOrigins(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -147,8 +180,11 @@ func TestInvalid(t *testing.T) {
 		{EnvLogtoIssuer, "", EnvLogtoIssuer},
 		{EnvLogtoIssuer, "ftp://x", EnvLogtoIssuer},
 		{EnvLogtoIssuer, "https://:443/oidc", EnvLogtoIssuer},
+		{EnvLogtoIssuer, "https://example.test:65536/oidc", EnvLogtoIssuer},
+		{EnvLogtoIssuer, "https://example.test:999999999999999999999999/oidc", EnvLogtoIssuer},
 		{EnvLogtoJWKSURL, "nope", EnvLogtoJWKSURL},
 		{EnvLogtoJWKSURL, "https://:443/oidc/jwks", EnvLogtoJWKSURL},
+		{EnvLogtoJWKSURL, "https://example.test:65536/oidc/jwks", EnvLogtoJWKSURL},
 		{EnvAddr, "nope", EnvAddr},
 		{EnvMetricsAddr, "127.0.0.1:99999", EnvMetricsAddr},
 		{EnvLogLevel, "İNFO", EnvLogLevel},
@@ -168,9 +204,12 @@ func TestInvalid(t *testing.T) {
 		{EnvOwnSandAPIOrigin, "https://ownsand.example/api", EnvOwnSandAPIOrigin},
 		{EnvOwnSandAPIOrigin, "ftp://x", EnvOwnSandAPIOrigin},
 		{EnvOwnSandAPIOrigin, "http://:18300", EnvOwnSandAPIOrigin},
+		{EnvOwnSandAPIOrigin, "https://example.test:65536", EnvOwnSandAPIOrigin},
 		{EnvPublicOrigin, "https://sandrun.example?", EnvPublicOrigin},
 		{EnvPublicOrigin, "https://u@sandrun.example", EnvPublicOrigin},
 		{EnvPublicOrigin, "http://:18400/", EnvPublicOrigin},
+		{EnvPublicOrigin, "https://example.test:65536", EnvPublicOrigin},
+		{EnvPublicOrigin, "https://example.test:999999999999999999999999", EnvPublicOrigin},
 		{EnvSecretKeys, "k1", EnvSecretKeys},
 		{EnvSecretKeys, "k1:" + secretKey[:20], EnvSecretKeys},
 		{EnvSecretKeys, "k1:" + secretKey + ",k1:" + secretKey, EnvSecretKeys},

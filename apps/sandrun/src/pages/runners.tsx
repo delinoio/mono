@@ -14,10 +14,14 @@ import { type Runner, WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { useMemo, useState } from "react";
 import { invalidateServices, PAGE_SIZE } from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
+import {
+  RunnerProfileFilter,
+  RunnerProfileNotice,
+  useWorkRunnerProfiles,
+} from "../components/work-runner-profiles.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
-  ErrorNotice,
   ListPagination,
   PageHeader,
   QueryBoundary,
@@ -26,7 +30,6 @@ import {
 } from "../components/ui.tsx";
 import { formatTime, labels, TERMINAL_RUNNER_STATES } from "../format.ts";
 import { can, Permission } from "../roles.ts";
-import { useRunnerProfiles } from "../runner-profiles.ts";
 
 const ALL = "all";
 
@@ -52,15 +55,12 @@ export function RunnersPage() {
   const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const [state, setState] = useState<string>(ALL);
-  const [profileId, setProfileId] = useState<string>(ALL);
+  const [profileId, setProfileId] = useState("");
   const [includeEnded, setIncludeEnded] = useState(false);
   const [deleting, setDeleting] = useState<Runner>();
-  const profiles = useRunnerProfiles(organizationId);
-  const profileNames = useMemo(
-    () =>
-      new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
-    [profiles.data],
-  );
+  const { query: profiles, profileNames } =
+    useWorkRunnerProfiles(organizationId);
+  const effectiveProfileId = profileNames?.has(profileId) ? profileId : "";
   const devices = useQuery(WorkService.method.getCapacity, { organizationId });
   const deviceNames = useMemo(
     () =>
@@ -76,7 +76,7 @@ export function RunnersPage() {
       organizationId,
       pageSize: PAGE_SIZE,
       pageToken: "",
-      runnerProfileId: profileId === ALL ? "" : profileId,
+      runnerProfileId: effectiveProfileId,
       states: stateFilter,
       includeEnded:
         includeEnded || stateFilter.some((s) => TERMINAL_RUNNER_STATES.has(s)),
@@ -110,32 +110,18 @@ export function RunnersPage() {
             </SelectOption>
           ))}
         </Select>
-        <Select
-          label="Runner profile"
-          disabled={!profiles.isSuccess}
-          value={profileId}
-          onValueChange={(v) => setProfileId(v ?? ALL)}
-        >
-          <SelectOption value={ALL}>All profiles</SelectOption>
-          {(profiles.data ?? []).map((p) => (
-            <SelectOption key={p.runnerProfileId} value={p.runnerProfileId}>
-              {p.name}
-            </SelectOption>
-          ))}
-        </Select>
+        <RunnerProfileFilter
+          profileNames={profileNames}
+          value={effectiveProfileId}
+          onValueChange={setProfileId}
+        />
         <Checkbox
           label="Show ended runners"
           checked={includeEnded}
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
-      {profiles.error ? (
-        <ErrorNotice
-          title="Could not load runner profiles."
-          error={profiles.error}
-          onRetry={() => void profiles.refetch()}
-        />
-      ) : null}
+      <RunnerProfileNotice query={profiles} />
       <QueryBoundary query={list} loading="Loading runners">
         {(data) => {
           const runners = data.pages.flatMap((p) => p.runners);
@@ -171,7 +157,7 @@ export function RunnersPage() {
                           <ShortId id={r.runnerId} />
                         </td>
                         <td>
-                          {profileNames.get(r.runnerProfileId) ?? (
+                          {profileNames?.get(r.runnerProfileId) ?? (
                             <ShortId id={r.runnerProfileId} />
                           )}
                         </td>

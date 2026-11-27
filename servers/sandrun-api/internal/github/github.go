@@ -3,8 +3,8 @@
 // Package github is the GitHub App layer of sandrun-api: GitHubService (the
 // installation links), POST /webhooks/github (workflow_job and installation
 // events), the GITHUB_JOB workload adapter (the GitHub Actions runner in the
-// guest with a JIT configuration) and the lease component that requests
-// redeliveries of failed webhook deliveries. The owning contract is the
+// guest with a JIT configuration) and the lease components for webhook
+// redelivery and surplus runner checks. The owning contract is the
 // GitHub App integration, Webhooks, Runner lifecycle and Runner
 // installation sections of docs/servers-sandrun-api-foundation.md.
 //
@@ -44,6 +44,8 @@ import (
 
 // Timing holds the intervals of the layer.
 type Timing struct {
+	// SurplusInterval is the interval between passes over pending surplus checks.
+	SurplusInterval time.Duration
 	// RedeliveryInterval is the interval of the redelivery job (5 minutes).
 	RedeliveryInterval time.Duration
 	// RedeliveryWindow is how far back the job looks (24 hours).
@@ -57,7 +59,7 @@ type Timing struct {
 
 // DefaultTiming returns the production intervals.
 func DefaultTiming() Timing {
-	return Timing{RedeliveryInterval: 5 * time.Minute, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: 15 * time.Minute, RegistrationGiveUp: 10 * time.Minute}
+	return Timing{SurplusInterval: 5 * time.Second, RedeliveryInterval: 5 * time.Minute, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: 15 * time.Minute, RegistrationGiveUp: 10 * time.Minute}
 }
 
 // Options configures the layer.
@@ -82,16 +84,19 @@ type Layer struct {
 	secret   []byte
 	timing   Timing
 
-	// bg tracks the surplus removals that run after a webhook answer.
+	// bg tracks the callbacks that run after a webhook answer.
 	bg sync.WaitGroup
 }
 
 // Register wires the layer: GitHubService, POST /webhooks/github, the
-// GITHUB_JOB adapter, the redelivery lease component and the daily
+// GITHUB_JOB adapter, the GitHub lease components and the daily
 // deletion of expired installation states.
 func Register(r *app.Registry, engine *work.Engine, m *metrics.Metrics, opts Options) *Layer {
 	if opts.Timing.RedeliveryInterval == 0 {
 		opts.Timing = DefaultTiming()
+	}
+	if opts.Timing.SurplusInterval == 0 {
+		opts.Timing.SurplusInterval = DefaultTiming().SurplusInterval
 	}
 	l := &Layer{svc: r.Service, engine: engine, profiles: engine.Profiles(), m: m, gh: opts.Client, secret: []byte(opts.WebhookSecret), timing: opts.Timing}
 	if l.gh == nil {
@@ -103,6 +108,7 @@ func Register(r *app.Registry, engine *work.Engine, m *metrics.Metrics, opts Opt
 	r.AddDailyJob(jobs.SQLJob(r.Service.DB, "github_install_states", "DELETE FROM github_install_states WHERE expire_time < $1::timestamptz"))
 	if l.gh != nil {
 		r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "github_redelivery", RunFunc: l.runRedelivery})
+		r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "github_surplus", RunFunc: l.runSurplusChecks})
 	}
 	return l
 }
@@ -110,7 +116,7 @@ func Register(r *app.Registry, engine *work.Engine, m *metrics.Metrics, opts Opt
 // Configured reports whether the GitHub App is configured.
 func (l *Layer) Configured() bool { return l.gh != nil }
 
-// Wait waits for the surplus removals that webhooks started (tests).
+// Wait waits for the callbacks that webhooks started (tests).
 func (l *Layer) Wait() { l.bg.Wait() }
 
 var errNotConfigured = api.ErrPrecondition("the GitHub App is not configured on this server")
@@ -159,15 +165,16 @@ func scanInstallation(row pgx.Row) (*Installation, error) {
 
 // installation loads an installation link of an organization by its SandRun ID
 // (not_found otherwise).
-func (l *Layer) installation(ctx context.Context, q db.Querier, orgID, id string) (*Installation, error) {
-	i, err := scanInstallation(q.QueryRow(ctx, "SELECT "+installationColumns+" FROM github_installations WHERE organization_id = $1 AND installation_id = $2", orgID, id))
+func (l *Layer) installation(ctx context.Context, q db.Querier, orgID, id string, lock rowLock) (*Installation, error) {
+	sql := "SELECT " + installationColumns + " FROM github_installations WHERE organization_id = $1 AND installation_id = $2" + lock.clause()
+	i, err := scanInstallation(q.QueryRow(ctx, sql, orgID, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrNotFound("GitHub installation")
 	}
 	return i, err
 }
 
-// rowLock is the row lock that byGitHubID takes.
+// rowLock is the lock taken when reading an installation.
 type rowLock int
 
 const (
@@ -181,17 +188,21 @@ const (
 	lockUpdate
 )
 
-// byGitHubID loads the link of a GitHub installation ID, or nil, with the
-// row lock lock, so a webhook and an RPC on the same installation
-// serialize.
-func (l *Layer) byGitHubID(ctx context.Context, q db.Querier, githubID int64, lock rowLock) (*Installation, error) {
-	sql := "SELECT " + installationColumns + " FROM github_installations WHERE github_installation_id = $1"
+func (lock rowLock) clause() string {
 	switch lock {
 	case lockShare:
-		sql += " FOR SHARE"
+		return " FOR SHARE"
 	case lockUpdate:
-		sql += " FOR UPDATE"
+		return " FOR UPDATE"
+	default:
+		return ""
 	}
+}
+
+// byGitHubID loads the link of a GitHub installation ID, or nil, with the
+// requested row lock.
+func (l *Layer) byGitHubID(ctx context.Context, q db.Querier, githubID int64, lock rowLock) (*Installation, error) {
+	sql := "SELECT " + installationColumns + " FROM github_installations WHERE github_installation_id = $1" + lock.clause()
 	i, err := scanInstallation(q.QueryRow(ctx, sql, githubID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

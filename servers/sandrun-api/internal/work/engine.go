@@ -127,9 +127,6 @@ type Engine struct {
 	// runCtx and runWG belong to the running reconciler component.
 	runCtx context.Context
 	runWG  *sync.WaitGroup
-	// pendingReleases holds the requests that a clean-up hook ended in a
-	// transaction, for the claim releases after the commit.
-	pendingReleases sync.Map
 }
 
 // New returns an engine. Register adapters before the app runs.
@@ -236,7 +233,8 @@ func (e *Engine) GetRunner(ctx context.Context, q db.Querier, orgID, id string) 
 	return r, err
 }
 
-func (e *Engine) lockOrganizationRunner(ctx context.Context, tx pgx.Tx, orgID, id string) (*Runner, error) {
+// LockOrganizationRunner loads and locks a runner of the organization.
+func (e *Engine) LockOrganizationRunner(ctx context.Context, tx pgx.Tx, orgID, id string) (*Runner, error) {
 	r, err := scanRunner(tx.QueryRow(ctx, "SELECT "+runnerColumns+" FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE", orgID, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrNotFound("runner")
@@ -252,23 +250,48 @@ func (e *Engine) lockRunner(ctx context.Context, tx pgx.Tx, id string) (*Runner,
 	return r, err
 }
 
-func (e *Engine) logRequest(ctx context.Context, r *Request, prev sandrunv1.RequestState) {
-	e.svc.Logger.LogAttrs(ctx, slog.LevelInfo, "request_state_changed",
+// observeRequestTransition captures the log fields and measurements before
+// the request can change again in the same transaction.
+func (e *Engine) observeRequestTransition(ctx context.Context, tx pgx.Tx, r *Request, prev sandrunv1.RequestState, now time.Time) {
+	kind, state, reason := kindLabel(r.Kind), reqStateLabel(r.State), reqReasonLabel(r.EndReason)
+	attrs := []slog.Attr{
 		slog.String("organization_id", r.OrganizationID), slog.String("request_id", r.ID), slog.String("runner_profile_id", r.ProfileID),
-		slog.String("runner_id", r.RunnerID), slog.String("kind", kindLabel(r.Kind)), slog.String("previous_state", reqStateLabel(prev)),
-		slog.String("state", reqStateLabel(r.State)), slog.String("end_reason", reqReasonLabel(r.EndReason)))
+		slog.String("runner_id", r.RunnerID), slog.String("kind", kind), slog.String("previous_state", reqStateLabel(prev)),
+		slog.String("state", state), slog.String("end_reason", reason),
+	}
+	ended := RequestTerminal(r.State)
+	leftQueue := prev == reqQueued && r.State != reqQueued
+	priority, waitSeconds := priorityLabel(r.Priority), now.Sub(r.QueueTime).Seconds()
+	db.AfterCommit(tx, func() {
+		e.svc.Logger.LogAttrs(ctx, slog.LevelInfo, "request_state_changed", attrs...)
+		if ended {
+			e.m.RequestEnded(kind, state, reason)
+		}
+		if leftQueue {
+			e.m.QueueWait(kind, priority, waitSeconds)
+		}
+	})
 }
 
-func (e *Engine) logRunner(ctx context.Context, r *Runner, prev sandrunv1.RunnerState) {
+func (e *Engine) observeRunnerTransition(ctx context.Context, tx pgx.Tx, r *Runner, prev sandrunv1.RunnerState, now time.Time, firstReady bool) {
 	reason := "NONE"
 	if r.EndReason != 0 {
 		reason = label(r.EndReason, "RUNNER_END_REASON_")
 	}
-	e.svc.Logger.LogAttrs(ctx, slog.LevelInfo, "runner_state_changed",
+	kind, guestOS := kindLabel(r.Kind), guestLabel(r.GuestOS)
+	attrs := []slog.Attr{
 		slog.String("organization_id", r.OrganizationID), slog.String("runner_id", r.ID), slog.String("runner_profile_id", r.ProfileID),
-		slog.String("request_id", r.RequestID), slog.String("sandbox_id", r.SandboxID), slog.String("kind", kindLabel(r.Kind)),
+		slog.String("request_id", r.RequestID), slog.String("sandbox_id", r.SandboxID), slog.String("kind", kind),
 		slog.String("previous_state", runStateLabel(prev)), slog.String("state", runStateLabel(r.State)), slog.String("end_reason", reason),
-		slog.String("ownsand_end_reason", r.OwnSandEndReason))
+		slog.String("ownsand_end_reason", r.OwnSandEndReason),
+	}
+	startSeconds := now.Sub(r.CreateTime).Seconds()
+	db.AfterCommit(tx, func() {
+		e.svc.Logger.LogAttrs(ctx, slog.LevelInfo, "runner_state_changed", attrs...)
+		if firstReady {
+			e.m.RunnerStart(kind, guestOS, startSeconds)
+		}
+	})
 }
 
 // NewRequest describes a new request.
@@ -328,13 +351,13 @@ func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*R
 	if err != nil {
 		return nil, false, err
 	}
-	e.logRequest(ctx, r, sandrunv1.RequestState_REQUEST_STATE_UNSPECIFIED)
+	e.observeRequestTransition(ctx, tx, r, sandrunv1.RequestState_REQUEST_STATE_UNSPECIFIED, now)
 	return r, true, nil
 }
 
 // endRequestTx ends an open request of tx. It returns the ended request, or
-// nil when the request was already terminal. It records the metric and the
-// log and clears the stored work order. Run ReleaseClaim with
+// nil when the request was already terminal. It queues telemetry for commit
+// and clears the stored work order. Run ReleaseClaim with
 // releaseAfterCommit when the request ended before a runner took its work.
 func (e *Engine) endRequestTx(ctx context.Context, tx pgx.Tx, id string, end RequestEnd) (*Request, sandrunv1.RequestState, error) {
 	r, err := e.LockRequest(ctx, tx, id)
@@ -351,11 +374,7 @@ func (e *Engine) endRequestTx(ctx context.Context, tx pgx.Tx, id string, end Req
 	if err != nil {
 		return nil, 0, err
 	}
-	e.logRequest(ctx, r, prev)
-	e.m.RequestEnded(kindLabel(r.Kind), reqStateLabel(r.State), reqReasonLabel(r.EndReason))
-	if prev == reqQueued {
-		e.m.QueueWait(kindLabel(r.Kind), priorityLabel(r.Priority), now.Sub(r.QueueTime).Seconds())
-	}
+	e.observeRequestTransition(ctx, tx, r, prev, now)
 	return r, prev, nil
 }
 
@@ -419,7 +438,13 @@ func (e *Engine) setRunnerTx(ctx context.Context, tx pgx.Tx, id string, from []s
 	if !ok {
 		return nil, nil
 	}
+	return e.updateLockedRunnerTx(ctx, tx, r, to, fields, args...)
+}
+
+// updateLockedRunnerTx changes the state of a runner already locked by tx.
+func (e *Engine) updateLockedRunnerTx(ctx context.Context, tx pgx.Tx, r *Runner, to sandrunv1.RunnerState, fields string, args ...any) (*Runner, error) {
 	prev := r.State
+	id := r.ID
 	set := "state = $2, update_time = $3"
 	if RunnerTerminal(to) {
 		set += ", end_time = $3"
@@ -428,17 +453,17 @@ func (e *Engine) setRunnerTx(ctx context.Context, tx pgx.Tx, id string, from []s
 		set += ", " + fields
 	}
 	now := e.svc.NowUTC()
-	r, err = scanRunner(tx.QueryRow(ctx, "UPDATE runners SET "+set+" WHERE runner_id = $1 RETURNING "+runnerColumns, append([]any{id, int16(to), now}, args...)...))
+	r, err := scanRunner(tx.QueryRow(ctx, "UPDATE runners SET "+set+" WHERE runner_id = $1 RETURNING "+runnerColumns, append([]any{id, int16(to), now}, args...)...))
 	if err != nil {
 		return nil, err
 	}
-	e.logRunner(ctx, r, prev)
-	if prev != to && (to == runWarm || to == runWaiting || to == runBusy) && r.ReadyTime == nil {
+	firstReady := prev != to && (to == runWarm || to == runWaiting || to == runBusy) && r.ReadyTime == nil
+	if firstReady {
 		if _, err := tx.Exec(ctx, "UPDATE runners SET ready_time = $2 WHERE runner_id = $1", id, now); err != nil {
 			return nil, err
 		}
-		e.m.RunnerStart(kindLabel(r.Kind), guestLabel(r.GuestOS), now.Sub(r.CreateTime).Seconds())
 	}
+	e.observeRunnerTransition(ctx, tx, r, prev, now, firstReady)
 	return r, nil
 }
 
@@ -560,10 +585,7 @@ func (e *Engine) startRequestTx(ctx context.Context, tx pgx.Tx, requestID, runne
 	if err != nil {
 		return err
 	}
-	e.logRequest(ctx, req, prev)
-	if prev == reqQueued {
-		e.m.QueueWait(kindLabel(req.Kind), priorityLabel(req.Priority), now.Sub(req.QueueTime).Seconds())
-	}
+	e.observeRequestTransition(ctx, tx, req, prev, now)
 	return nil
 }
 

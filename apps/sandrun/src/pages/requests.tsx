@@ -10,13 +10,17 @@ import {
   WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
 import { type Request, WorkService } from "@delino/sandrun-protos/v1/work_pb";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { invalidateServices, PAGE_SIZE } from "../api.ts";
 import { SetupEmpty } from "../components/setup.tsx";
+import {
+  RunnerProfileFilter,
+  RunnerProfileNotice,
+  useWorkRunnerProfiles,
+} from "../components/work-runner-profiles.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
-  ErrorNotice,
   ListPagination,
   PageHeader,
   QueryBoundary,
@@ -31,7 +35,6 @@ import {
   TERMINAL_REQUEST_STATES,
 } from "../format.ts";
 import { can, Permission } from "../roles.ts";
-import { useRunnerProfiles } from "../runner-profiles.ts";
 
 const ALL = "all";
 
@@ -72,15 +75,12 @@ export function RequestsPage() {
   const queryClient = useQueryClient();
   const [kind, setKind] = useState<string>(ALL);
   const [state, setState] = useState<string>(ALL);
-  const [profileId, setProfileId] = useState<string>(ALL);
+  const [profileId, setProfileId] = useState("");
   const [includeEnded, setIncludeEnded] = useState(false);
   const [canceling, setCanceling] = useState<Request>();
-  const profiles = useRunnerProfiles(organizationId);
-  const profileNames = useMemo(
-    () =>
-      new Map((profiles.data ?? []).map((p) => [p.runnerProfileId, p.name])),
-    [profiles.data],
-  );
+  const { query: profiles, profileNames } =
+    useWorkRunnerProfiles(organizationId);
+  const effectiveProfileId = profileNames?.has(profileId) ? profileId : "";
   const stateFilter = state === ALL ? [] : [Number(state) as RequestState];
   const list = useInfiniteQuery(
     WorkService.method.listRequests,
@@ -92,7 +92,7 @@ export function RequestsPage() {
         kind === ALL
           ? WorkloadKind.UNSPECIFIED
           : (Number(kind) as WorkloadKind),
-      runnerProfileId: profileId === ALL ? "" : profileId,
+      runnerProfileId: effectiveProfileId,
       states: stateFilter,
       includeEnded:
         includeEnded || stateFilter.some((s) => TERMINAL_REQUEST_STATES.has(s)),
@@ -139,36 +139,30 @@ export function RequestsPage() {
             </SelectOption>
           ))}
         </Select>
-        <Select
-          label="Runner profile"
-          disabled={!profiles.isSuccess}
-          value={profileId}
-          onValueChange={(v) => setProfileId(v ?? ALL)}
-        >
-          <SelectOption value={ALL}>All profiles</SelectOption>
-          {(profiles.data ?? []).map((p) => (
-            <SelectOption key={p.runnerProfileId} value={p.runnerProfileId}>
-              {p.name}
-            </SelectOption>
-          ))}
-        </Select>
+        <RunnerProfileFilter
+          profileNames={profileNames}
+          value={effectiveProfileId}
+          onValueChange={setProfileId}
+        />
         <Checkbox
           label="Show ended requests"
           checked={includeEnded}
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
-      {profiles.error ? (
-        <ErrorNotice
-          title="Could not load runner profiles."
-          error={profiles.error}
-          onRetry={() => void profiles.refetch()}
-        />
-      ) : null}
+      <RunnerProfileNotice query={profiles} />
       <QueryBoundary query={list} loading="Loading requests">
         {(data) => {
-          const requests = data.pages.flatMap((p) => p.requests);
-          return requests.length === 0 ? (
+          const requests = new Map<string, Request>();
+          // A change in queue order can repeat a request at a page boundary.
+          for (const page of data.pages) {
+            for (const request of page.requests) {
+              if (!requests.has(request.requestId)) {
+                requests.set(request.requestId, request);
+              }
+            }
+          }
+          return requests.size === 0 ? (
             <SetupEmpty
               organizationId={organizationId}
               title="No requests match"
@@ -195,7 +189,7 @@ export function RequestsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {requests.map((r) => {
+                  {Array.from(requests.values(), (r) => {
                     const wait = queueWaitMs(r, now);
                     return (
                       <tr key={r.requestId}>
@@ -204,7 +198,7 @@ export function RequestsPage() {
                         </td>
                         <td>{labels.workloadKind[r.kind]}</td>
                         <td>
-                          {profileNames.get(r.runnerProfileId) ?? (
+                          {profileNames?.get(r.runnerProfileId) ?? (
                             <ShortId id={r.runnerProfileId} />
                           )}
                         </td>

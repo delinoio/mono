@@ -2418,6 +2418,7 @@ const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 //                 fails for.
 //   STUB_UNLABELLED_IMAGES space-separated image references and IDs without
 //                 the claim-time cap capability label.
+//   STUB_IMAGE_ID overrides the installed image ID resolved by a digest.
 //   STUB_INVENTORY_REMAINS 1 leaves removed IDs in the inventory.
 //   STUB_RUN_EXIT   exit code of `docker run` (default 0), printed with a
 //                 Docker diagnostic when not 0.
@@ -2541,6 +2542,15 @@ case "$1" in
     done ;;
   inspect)
     case "$3" in
+      *State.Status*Image*) echo "running ${olderImage.split("@")[1]}" ;;
+      *Config.Env*)
+        for container in "\${@:4}"; do
+          if [[ "$container" == old1 && "\${STUB_SANDRUN_DB_MISMATCH:-}" == 1 ]]; then
+            echo '["DATABASE_URL=postgres://local/other-password-marker"]'
+          else
+            echo '["DATABASE_URL=postgres://local/password-marker"]'
+          fi
+        done ;;
       *State.Status*)
         if [[ -n "\${STUB_STATUS_DELAY:-}" ]]; then sleep "$STUB_STATUS_DELAY"; fi
         echo "\${STUB_STATUS:-running}" ;;
@@ -2566,6 +2576,20 @@ case "$1" in
     [[ "\$code" == 0 ]] || echo "docker: Error response from daemon: OCI runtime create failed" >&2
     exit "\$code" ;;
   exec)
+    if [[ "$4" == ownsand-rollback ]]; then
+      case "$5" in
+        status) echo "\${STUB_SANDRUN_STATUS:-open}" ;;
+        fence)
+          result="\${STUB_SANDRUN_FENCE_RESULT:-ready}"
+          echo "$result"
+          if [[ "$result" != ready ]]; then
+            echo 'guard-internal-password-marker' >&2
+            exit 1
+          fi ;;
+        cancel|resume) echo ready ;;
+      esac
+      exit 0
+    fi
     active="$STUB_DIR/active-caddy.json"
     read -r checksum _ < <(cksum < "$active")
     etag="$(printf '"/config/ %s"' "$checksum")"
@@ -2611,7 +2635,15 @@ case "$1" in
   image)
     case "$2" in
       inspect)
-        if [[ " \${STUB_UNLABELLED_IMAGES:-} " != *" $5 "* ]]; then echo claim-time; fi ;;
+        if [[ "$4" == '{{.Id}}' ]]; then
+          echo "\${STUB_IMAGE_ID:-\${5##*@}}"
+        elif [[ " \${STUB_UNLABELLED_IMAGES:-} " != *" $5 "* ]]; then
+          case "$4" in
+            *ownsand.pending-unlinks*) echo nullable-account-v1 ;;
+            *sandrun.*) echo rollback-guard-v1 ;;
+            *) echo claim-time ;;
+          esac
+        fi ;;
       rm) [[ " \${STUB_IMAGE_RM_FAIL:-} " != *" $3 "* ]] || exit 1 ;;
     esac ;;
   rm)
@@ -3236,6 +3268,134 @@ test(
 );
 
 test(
+  "SandRun verifies legacy targets and never switches on a failed removal proof",
+  { skip: skipDroplet },
+  (t) => {
+    const route = "api.example.com {\n\treverse_proxy before:8080\n}\n";
+    const env = { STUB_UNLABELLED_IMAGES: olderImage };
+    for (const [allowlisted, extraEnv, diagnostic] of [
+      [false, {}, /has no verified OwnSand removal capability/],
+      [true, { STUB_SANDRUN_DB_MISMATCH: "1" }, /matching database settings/],
+      [
+        true,
+        { STUB_SANDRUN_FENCE_RESULT: "tokens-remain" },
+        /unfinished OwnSand removal/,
+      ],
+      [
+        true,
+        { STUB_SANDRUN_FENCE_RESULT: "drain-incomplete" },
+        /could not drain/,
+      ],
+      [
+        true,
+        { STUB_SANDRUN_FENCE_RESULT: "database-error" },
+        /could not verify OwnSand removal state/,
+      ],
+    ]) {
+      const result = runDroplet(
+        t,
+        [sandrunArgs[0], olderImage, ...sandrunArgs.slice(2)],
+        {
+          old: ["old1"],
+          route,
+          state: `${dropletImage}\n`,
+          env: { ...env, ...extraEnv },
+          prepare(root) {
+            if (allowlisted) {
+              writeFileSync(
+                join(root, "state/sandrun-api.removal-images"),
+                `pre-lease ${olderImage}\n`,
+              );
+            }
+          },
+        },
+      );
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, diagnostic);
+      assert.doesNotMatch(result.stderr, /password-marker/);
+      assert.equal(result.read("caddy/sites/sandrun-api.caddy"), route);
+      assert.equal(
+        result.read("state/sandrun-api.current"),
+        `${dropletImage}\n`,
+      );
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker exec -i caddy")),
+      );
+      assert.ok(!result.calls.includes("docker stop --time 80 old1"));
+      if (!allowlisted)
+        assert.ok(!result.calls.some((call) => call.startsWith("docker run ")));
+    }
+  },
+);
+
+test(
+  "SandRun keeps the pre-lease fence through cutover and on an unresolved route",
+  { skip: skipDroplet },
+  (t) => {
+    for (const [reload, stopFail, cancels, retired] of [
+      ["0", "", false, true],
+      ["1", "", true, false],
+      ["lost", "", false, false],
+      ["0", "old1", false, false],
+    ]) {
+      const result = runDroplet(
+        t,
+        [sandrunArgs[0], olderImage, ...sandrunArgs.slice(2)],
+        {
+          old: ["old1"],
+          route: "api.example.com {\n\treverse_proxy before:8080\n}\n",
+          state: `${dropletImage}\n`,
+          env: {
+            STUB_UNLABELLED_IMAGES: olderImage,
+            STUB_RELOAD: reload,
+            STUB_STOP_FAIL: stopFail,
+          },
+          prepare(root) {
+            writeFileSync(
+              join(root, "state/sandrun-api.removal-images"),
+              `pre-lease ${olderImage}\n`,
+            );
+          },
+        },
+      );
+      assert.equal(result.status, retired ? 0 : 1, result.stderr);
+      const fence = result.calls.findIndex((call) =>
+        call.includes("ownsand-rollback fence "),
+      );
+      const reloadCall = result.calls.findIndex((call) =>
+        call.startsWith("docker exec -i caddy"),
+      );
+      assert.ok(fence >= 0 && fence < reloadCall, result.calls.join("\n"));
+      assert.equal(
+        result.calls.some((call) => call.includes("ownsand-rollback cancel ")),
+        cancels,
+      );
+      assert.equal(result.calls.includes("docker rm old1"), retired);
+      assert.ok(
+        !result.calls.some((call) => call.endsWith("ownsand-rollback resume")),
+      );
+    }
+  },
+);
+
+test(
+  "SandRun resumes teardown only after retiring the pre-lease container",
+  { skip: skipDroplet },
+  (t) => {
+    const result = runDroplet(t, sandrunArgs, {
+      old: ["old1"],
+      env: { STUB_SANDRUN_STATUS: "fenced" },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const retire = result.calls.indexOf("docker rm old1");
+    const resume = result.calls.findIndex((call) =>
+      call.endsWith("ownsand-rollback resume"),
+    );
+    assert.ok(retire >= 0 && retire < resume, result.calls.join("\n"));
+  },
+);
+
+test(
   "droplet deploy keeps the previous image for a rollback",
   { skip: skipDroplet },
   (t) => {
@@ -3295,6 +3455,134 @@ const udpArgs = [
   "h2c",
   "3478,5349",
 ];
+
+const ownsandArgs = ["ownsand-api", ...udpArgs.slice(1)];
+const ownsandRoute =
+  "api.example.com {\n  reverse_proxy h2c://ownsand-old:8080\n}\n";
+const ownsandCurrent = "state/ownsand-api.current";
+const ownsandSite = "caddy/sites/ownsand-api.caddy";
+
+test(
+  "OwnSand refuses an unverified rollback target or automatic fallback before changing serving state",
+  { skip: skipDroplet },
+  async (t) => {
+    const legacyId = olderImage.split("@")[1];
+    const cases = [
+      [
+        "rollback target",
+        olderImage,
+        olderImage,
+        /OwnSand target .* no verified/,
+      ],
+      [
+        "running fallback",
+        dropletImage,
+        legacyId,
+        /OwnSand fallback container old1 .* no verified/,
+      ],
+    ];
+    for (const [name, target, unlabelled, diagnostic] of cases) {
+      await t.test(name, (t) => {
+        const result = runDroplet(
+          t,
+          ["ownsand-api", target, ...udpArgs.slice(2)],
+          {
+            old: ["old1"],
+            route: ownsandRoute,
+            state: `${olderImage}\n`,
+            env: { STUB_UNLABELLED_IMAGES: unlabelled },
+          },
+        );
+        assert.equal(result.status, 1, result.stdout);
+        assert.match(result.stderr, diagnostic);
+        assert.ok(
+          result.calls.every((call) =>
+            /^docker (pull|ps|inspect|image inspect) /.test(call),
+          ),
+        );
+        assert.equal(result.read(ownsandSite), ownsandRoute);
+        assert.equal(result.read(ownsandCurrent), `${olderImage}\n`);
+      });
+    }
+  },
+);
+
+test(
+  "OwnSand accepts a reviewed fallback digest only if it resolves to the running image",
+  { skip: skipDroplet },
+  async (t) => {
+    for (const matches of [true, false]) {
+      await t.test(
+        matches ? "matching image ID" : "different image ID",
+        (t) => {
+          const result = runDroplet(t, ownsandArgs, {
+            old: ["old1"],
+            route: ownsandRoute,
+            state: `${olderImage}\n`,
+            prepare(deployRoot) {
+              writeFileSync(
+                join(
+                  deployRoot,
+                  "state/ownsand-api.pending-unlink-compatible-images",
+                ),
+                `${olderImage}\n`,
+              );
+            },
+            env: {
+              STUB_UNLABELLED_IMAGES: olderImage.split("@")[1],
+              ...(matches ? {} : { STUB_IMAGE_ID: dropletImage.split("@")[1] }),
+            },
+          });
+          assert.equal(
+            result.status,
+            matches ? 0 : 1,
+            result.stdout + result.stderr,
+          );
+          assert.equal(
+            result.calls.includes("docker stop --time 30 old1"),
+            matches,
+          );
+          assert.equal(
+            result.read(ownsandCurrent),
+            `${matches ? dropletImage : olderImage}\n`,
+          );
+        },
+      );
+    }
+  },
+);
+
+test(
+  "OwnSand restores a compatible UDP fallback on replacement failure and accepts it as a rollback target",
+  { skip: skipDroplet },
+  (t) => {
+    const options = {
+      old: ["old1"],
+      route: ownsandRoute,
+      state: `${olderImage}\n`,
+      previous: `${dropletImage}\n`,
+    };
+    const failed = runDroplet(t, ownsandArgs, {
+      ...options,
+      env: { STUB_START_FAIL: "ownsand-api-*" },
+    });
+    assert.equal(failed.status, 1, failed.stdout);
+    assert.ok(failed.calls.includes("docker stop --time 30 old1"));
+    assert.ok(failed.calls.includes("docker start old1"));
+    assert.ok(!failed.calls.some(isProxyLoad));
+    assert.equal(failed.read(ownsandSite), ownsandRoute);
+    assert.equal(failed.read(ownsandCurrent), `${olderImage}\n`);
+
+    const rollback = runDroplet(t, ownsandArgs, options);
+    assert.equal(rollback.status, 0, rollback.stderr);
+    assert.ok(rollback.calls.some(isProxyLoad));
+    assert.equal(rollback.read(ownsandCurrent), `${dropletImage}\n`);
+    assert.equal(
+      rollback.read("state/ownsand-api.previous"),
+      `${olderImage}\n`,
+    );
+  },
+);
 
 test(
   "droplet deploy stops the old container before it starts a replacement with UDP ports",

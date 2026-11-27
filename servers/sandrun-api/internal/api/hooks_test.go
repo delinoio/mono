@@ -108,8 +108,9 @@ func TestMembershipEndHookErrorRollsBack(t *testing.T) {
 	}))
 	ctx := context.Background()
 	org := env.NewOrg("alice")
-	env.NewAPIKey(org.ID, org.Member)
-	_, err := env.User(org.Owner).Member.RemoveMember(ctx, connect.NewRequest(&sandrunv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: org.Member}))
+	env.NewAPIKey(org.ID, org.Admin)
+	inv := newMembershipInvitation(t, env, org.ID, org.Admin, sandrunv1.Role_ROLE_MEMBER)
+	_, err := env.User(org.Owner).Member.RemoveMember(ctx, connect.NewRequest(&sandrunv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: org.Admin}))
 	wantCode(t, "failing hook", err, connect.CodeInternal)
 	var members, active int
 	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM memberships WHERE organization_id = $1", org.ID).Scan(&members)
@@ -117,6 +118,8 @@ func TestMembershipEndHookErrorRollsBack(t *testing.T) {
 	if members != 3 || active != 1 {
 		t.Fatalf("members %d, active keys %d after a rollback", members, active)
 	}
+	assertPendingInvitationIDs(t, env, org, inv.GetInvitation().GetInvitationId())
+	assertInvitationRevocationEvents(t, env, org, nil)
 }
 
 func TestDeleteOrganizationHooks(t *testing.T) {
@@ -179,7 +182,10 @@ func TestDeleteOrganizationHooks(t *testing.T) {
 	wantCode(t, "after deletion", err, connect.CodeNotFound)
 	for _, table := range []string{"memberships", "invitations", "api_keys"} {
 		var n int
-		_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE organization_id = $1", org.ID).Scan(&n)
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE organization_id = $1", org.ID).Scan(&n); err != nil {
+			t.Errorf("count rows in %s after deletion: %v", table, err)
+			continue
+		}
 		if n != 0 {
 			t.Errorf("%d rows left in %s", n, table)
 		}

@@ -685,6 +685,254 @@ func TestDevSessionFiles(t *testing.T) {
 	}
 }
 
+func TestDevSessionFilesWriteRanges(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	session, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+
+	type chunk struct {
+		offset int64
+		data   string
+		final  bool
+		code   connect.Code
+	}
+	for _, tc := range []struct {
+		name     string
+		chunks   []chunk
+		existing string
+		want     string
+	}{
+		{
+			name: "equal overlap",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 1, data: "bc"},
+				{offset: 3, final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "equal overlap at finish",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 1, data: "bc", final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "same start extension",
+			chunks: []chunk{
+				{offset: 0, data: "ab"},
+				{offset: 0, data: "abc", final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "overlap bridges ranges",
+			chunks: []chunk{
+				{offset: 4, data: "efg"},
+				{offset: 0, data: "ab"},
+				{offset: 1, data: "bcde"},
+				{offset: 7, final: true},
+			},
+			want: "abcdefg",
+		},
+		{
+			name: "conflict with unpublished target",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 1, data: "XY", code: connect.CodeFailedPrecondition},
+				{offset: 3, final: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "conflict in second range preserves target and staged bytes",
+			chunks: []chunk{
+				{offset: 0, data: "ab"},
+				{offset: 4, data: "ef"},
+				{offset: 1, data: "bCDXfg", code: connect.CodeFailedPrecondition},
+				{offset: 2, data: "cd"},
+				{offset: 6, final: true},
+			},
+			existing: "previous file",
+			want:     "abcdef",
+		},
+		{
+			name: "gap",
+			chunks: []chunk{
+				{offset: 0, data: "a"},
+				{offset: 2, data: "c"},
+				{offset: 3, final: true, code: connect.CodeFailedPrecondition},
+			},
+		},
+		{
+			name: "range exceeds final size",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 2, final: true, code: connect.CodeFailedPrecondition},
+			},
+		},
+		{
+			name: "empty file",
+			chunks: []chunk{
+				{offset: 42},
+				{offset: 0, final: true},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeID := api.NewID()
+			path := "/home/dev/work/out/" + writeID
+			content, exists := tc.existing, tc.existing != ""
+			if exists {
+				w.fake.SetFile(w.osOrg, sandboxID, path, []byte(content))
+			}
+			for i, c := range tc.chunks {
+				res, err := owner.DevSession.WriteDevSessionFile(t.Context(), connect.NewRequest(&sandrunv1.WriteDevSessionFileRequest{
+					OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(), WriteId: writeID,
+					Path: path, Offset: c.offset, Data: []byte(c.data), Final: c.final,
+				}))
+				if c.code != 0 {
+					wantCode(t, fmt.Sprintf("chunk %d", i), err, c.code)
+				} else {
+					if err != nil {
+						t.Fatalf("chunk %d: %v", i, err)
+					}
+					ack := res.Msg
+					if ack.GetOffset() != c.offset || ack.GetLength() != int64(len(c.data)) || ack.GetFinished() != c.final {
+						t.Fatalf("chunk %d acknowledgment: %v", i, ack)
+					}
+					if c.final {
+						if ack.GetSizeBytes() != int64(len(tc.want)) {
+							t.Fatalf("finished size %d, want %d", ack.GetSizeBytes(), len(tc.want))
+						}
+						content, exists = tc.want, true
+					}
+				}
+				got, found := w.fake.File(w.osOrg, sandboxID, path)
+				if found != exists || string(got) != content {
+					t.Fatalf("after chunk %d: file exists %t with bytes %q, want exists %t with bytes %q", i, found, got, exists, content)
+				}
+			}
+		})
+	}
+}
+
+func TestDevSessionFilesReadPathBinding(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	session, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+	const firstPath = "/home/dev/work/out/a.txt"
+	w.fake.SetFile(w.osOrg, sandboxID, firstPath, []byte("abcde"))
+	w.fake.SetFile(w.osOrg, sandboxID, "/home/dev/work/out/b.txt", []byte("vwxyz"))
+
+	read := func(readID, path string, offset int64) ([]*sandrunv1.ReadDevSessionFileResponse, error) {
+		stream, err := owner.DevSession.ReadDevSessionFile(t.Context(), connect.NewRequest(&sandrunv1.ReadDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(),
+			ReadId: readID, Path: path, Offset: offset,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		var events []*sandrunv1.ReadDevSessionFileResponse
+		for stream.Receive() {
+			events = append(events, stream.Msg())
+		}
+		return events, stream.Err()
+	}
+	wantRead := func(readID, path string, offset int64, data string, size int64) {
+		t.Helper()
+		events, err := read(readID, path, offset)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("read %q at %d returned %v, error %v", path, offset, events, err)
+		}
+		chunk, end := events[0].GetChunk(), events[1].GetEnd()
+		if chunk.GetOffset() != offset || string(chunk.GetData()) != data || end.GetSizeBytes() != size {
+			t.Fatalf("read %q at %d returned %v", path, offset, events)
+		}
+	}
+
+	readID := api.NewID()
+	wantRead(readID, "out/a.txt", 0, "abcde", 5)
+
+	events, err := read(readID, "out/b.txt", 2)
+	if len(events) != 0 {
+		t.Errorf("changed path returned events: %v", events)
+	}
+	wantCode(t, "changed path for the same read ID", err, connect.CodeFailedPrecondition)
+	const restart = "Restart the file transfer from the beginning with a new operation ID."
+	var ce *connect.Error
+	if !errors.As(err, &ce) || ce.Message() != restart {
+		t.Fatalf("changed path returned %v, want %q", err, restart)
+	}
+
+	w.fake.SetFile(w.osOrg, sandboxID, firstPath, []byte("changed"))
+	wantRead(readID, firstPath, 2, "cde", 5)
+	wantRead(api.NewID(), "out/b.txt", 2, "xyz", 5)
+}
+
+func TestDevSessionFileReadSnapshotEOF(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	session, sandboxID := w.runningSession(t)
+	owner := w.env.User(w.org.Member)
+	const path = "/home/dev/work/read.txt"
+	w.fake.SetFile(w.osOrg, sandboxID, path, []byte("abc"))
+
+	read := func(readID string, offset int64) ([]*sandrunv1.ReadDevSessionFileResponse, error) {
+		stream, err := owner.DevSession.ReadDevSessionFile(t.Context(), connect.NewRequest(&sandrunv1.ReadDevSessionFileRequest{
+			OrganizationId: w.org.ID, DevSessionId: session.GetDevSessionId(),
+			ReadId: readID, Path: path, Offset: offset,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		var events []*sandrunv1.ReadDevSessionFileResponse
+		for stream.Receive() {
+			events = append(events, stream.Msg())
+		}
+		return events, stream.Err()
+	}
+	wantPastEOF := func(t *testing.T, readID string) {
+		t.Helper()
+		events, err := read(readID, 4)
+		if len(events) != 0 {
+			t.Errorf("past EOF returned events: %v", events)
+		}
+		wantCode(t, "past EOF", err, connect.CodeOutOfRange)
+		var ce *connect.Error
+		if !errors.As(err, &ce) || ce.Message() != "OwnSand: offset is beyond the end of the file" {
+			t.Fatalf("past EOF returned %v", err)
+		}
+	}
+
+	t.Run("fresh read past EOF", func(t *testing.T) {
+		wantPastEOF(t, api.NewID())
+	})
+	readID := api.NewID()
+	t.Run("read suffix", func(t *testing.T) {
+		events, err := read(readID, 2)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("suffix read returned %v, error %v", events, err)
+		}
+		chunk, end := events[0].GetChunk(), events[1].GetEnd()
+		if chunk.GetOffset() != 2 || string(chunk.GetData()) != "c" || end.GetSizeBytes() != 3 {
+			t.Fatalf("suffix read returned %v", events)
+		}
+	})
+
+	w.fake.SetFile(w.osOrg, sandboxID, path, []byte("replaced"))
+	t.Run("resumed read past snapshot EOF", func(t *testing.T) {
+		wantPastEOF(t, readID)
+	})
+	t.Run("resumed read at snapshot EOF", func(t *testing.T) {
+		events, err := read(readID, 3)
+		if err != nil || len(events) != 1 || events[0].GetEnd().GetSizeBytes() != 3 {
+			t.Fatalf("read at EOF returned %v, error %v", events, err)
+		}
+	})
+}
+
 func TestDevSessionWindowsUNCPaths(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{})
 	const workspace = `C:\work`

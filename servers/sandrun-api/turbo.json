@@ -9,6 +9,7 @@
         "LOG_LEVEL",
         "DATABASE_URL",
         "RUN_MIGRATIONS",
+        "RECLAIM_LEGACY_OWNSAND_REMOVALS",
         "LOGTO_ISSUER",
         "LOGTO_JWKS_URL",
         "LOGTO_JWKS_FILE",
