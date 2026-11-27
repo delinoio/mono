@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -886,21 +888,126 @@ func TestOrgUseAndSettings(t *testing.T) {
 }
 
 func TestStatus(t *testing.T) {
-	f := newFixture(t)
-	f.srv.AddRequest(&sandrunv1.Request{RequestId: "r1", OrganizationId: f.org, State: sandrunv1.RequestState_REQUEST_STATE_QUEUED, Kind: sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB})
-	f.srv.AddRunner(&sandrunv1.Runner{RunnerId: "n1", OrganizationId: f.org, State: sandrunv1.RunnerState_RUNNER_STATE_BUSY})
-	f.srv.AddDevice(&sandrunv1.DeviceCapacity{OwnsandDeviceId: "d1", Name: "mac-mini", State: sandrunv1.DeviceState_DEVICE_STATE_ONLINE})
-	r := f.ok("", "--org", f.org, "status")
-	for _, want := range []string{"1 queued", "busy: 1", "mac-mini", "github-job"} {
-		if !strings.Contains(r.stdout, want) {
-			t.Errorf("status lacks %q: %s", want, r.stdout)
+	const (
+		active  = sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_ACTIVE
+		invalid = sandrunv1.OwnSandLinkState_OWN_SAND_LINK_STATE_INVALID
+	)
+	for _, tc := range []struct {
+		name      string
+		state     sandrunv1.OwnSandLinkState
+		hasDevice bool
+		wantText  string
+	}{
+		{name: "absent", wantText: "Devices\n  An admin must link an OwnSand organization to see devices."},
+		{name: "invalid", state: invalid, wantText: "Devices\n  An admin must replace the OwnSand API key to see devices."},
+		{name: "active with device", state: active, hasDevice: true, wantText: "mac-mini"},
+		{name: "active without devices", state: active, wantText: "Devices (0)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.srv.AddRequest(&sandrunv1.Request{RequestId: "r1", OrganizationId: f.org, State: sandrunv1.RequestState_REQUEST_STATE_QUEUED, Kind: sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB})
+			f.srv.AddRunner(&sandrunv1.Runner{RunnerId: "n1", OrganizationId: f.org, State: sandrunv1.RunnerState_RUNNER_STATE_BUSY})
+			switch tc.state {
+			case active:
+				f.ok("fixture-key\n", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org")
+			case invalid:
+				// The shared fake provisions active links. Override the read to model an invalid link.
+				proxyURL, err := url.Parse(f.srv.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				const procedure = sandrunv1connect.OwnSandLinkServiceGetOwnSandLinkProcedure
+				mux := http.NewServeMux()
+				mux.Handle("/", httputil.NewSingleHostReverseProxy(proxyURL))
+				mux.Handle(procedure, connect.NewUnaryHandler(procedure,
+					func(context.Context, *connect.Request[sandrunv1.GetOwnSandLinkRequest]) (*connect.Response[sandrunv1.GetOwnSandLinkResponse], error) {
+						return connect.NewResponse(&sandrunv1.GetOwnSandLinkResponse{
+							Link: &sandrunv1.OwnSandLink{State: invalid},
+						}), nil
+					}))
+				srv := httptest.NewUnstartedServer(mux)
+				srv.Config.Protocols = new(http.Protocols)
+				srv.Config.Protocols.SetUnencryptedHTTP2(true)
+				srv.Start()
+				t.Cleanup(srv.Close)
+				f.env[EnvAPIURL] = srv.URL
+			}
+			if tc.hasDevice {
+				f.srv.AddDevice(&sandrunv1.DeviceCapacity{OwnsandDeviceId: "d1", Name: "mac-mini", State: sandrunv1.DeviceState_DEVICE_STATE_ONLINE})
+			}
+
+			text := f.ok("", "--org", f.org, "status")
+			for _, want := range []string{"1 queued", "busy: 1", "r1", "github-job", tc.wantText} {
+				if !strings.Contains(text.stdout, want) {
+					t.Errorf("status lacks %q: %s", want, text.stdout)
+				}
+			}
+			if tc.state == active && strings.Contains(text.stdout, "An admin") {
+				t.Errorf("active status includes setup guidance: %s", text.stdout)
+			}
+			jsonResult := f.ok("", "--org", f.org, "--output", "json", "status")
+			if text.stderr != "" || jsonResult.stderr != "" {
+				t.Errorf("status wrote to stderr: text = %q, JSON = %q", text.stderr, jsonResult.stderr)
+			}
+			var got map[string]any
+			if err := json.Unmarshal([]byte(jsonResult.stdout), &got); err != nil {
+				t.Fatalf("decode status JSON %q: %v", jsonResult.stdout, err)
+			}
+			want := map[string]any{
+				"queue": []any{map[string]any{
+					"request_id": "r1", "organization_id": f.org, "state": "REQUEST_STATE_QUEUED", "kind": "WORKLOAD_KIND_GITHUB_JOB",
+				}},
+				"runners_by_state": map[string]any{"busy": float64(1)},
+				"devices":          []any{},
+			}
+			wantCalls := 0
+			if tc.state == active {
+				wantCalls = 2
+			} else {
+				want["ownsand_link_required"] = true
+			}
+			if tc.hasDevice {
+				want["devices"] = []any{map[string]any{"ownsand_device_id": "d1", "name": "mac-mini", "state": "DEVICE_STATE_ONLINE"}}
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("status JSON = %s, want %v", jsonResult.stdout, want)
+			}
+			if got := f.srv.Calls(sandrunv1connect.WorkServiceGetCapacityProcedure); got != wantCalls {
+				t.Errorf("capacity calls = %d, want %d", got, wantCalls)
+			}
+		})
+	}
+}
+
+func TestStatusRPCError(t *testing.T) {
+	for _, tc := range []struct {
+		procedure string
+		code      connect.Code
+	}{
+		{sandrunv1connect.WorkServiceListRequestsProcedure, connect.CodeUnavailable},
+		{sandrunv1connect.WorkServiceListRunnersProcedure, connect.CodeUnavailable},
+		{sandrunv1connect.OwnSandLinkServiceGetOwnSandLinkProcedure, connect.CodeUnavailable},
+		{sandrunv1connect.WorkServiceGetCapacityProcedure, connect.CodeUnavailable},
+		{sandrunv1connect.WorkServiceGetCapacityProcedure, connect.CodeFailedPrecondition},
+	} {
+		for _, output := range []string{"text", "json"} {
+			t.Run(tc.procedure+"/"+tc.code.String()+"/"+output, func(t *testing.T) {
+				f := newFixture(t)
+				f.ok("fixture-key\n", "--org", f.org, "ownsand", "link", "--ownsand-org", "os-org")
+				const message = "status fixture failure"
+				f.srv.Fail(tc.procedure, connect.NewError(tc.code, errors.New(message)))
+				r := f.run("", "--org", f.org, "--output", output, "status")
+				if r.code != ExitError || r.stdout != "" || !strings.Contains(r.stderr, tc.code.String()+": "+message) {
+					t.Errorf("status exit = %d, stdout = %q, stderr = %q", r.code, r.stdout, r.stderr)
+				}
+			})
 		}
 	}
-	r = f.ok("", "--org", f.org, "--output", "json", "status")
-	var st map[string]any
-	if err := json.Unmarshal([]byte(r.stdout), &st); err != nil || st["runners_by_state"].(map[string]any)["busy"] != float64(1) {
-		t.Fatalf("status json = %s %v", r.stdout, err)
-	}
+}
+
+func TestRequestCancel(t *testing.T) {
+	f := newFixture(t)
+	f.srv.AddRequest(&sandrunv1.Request{RequestId: "r1", OrganizationId: f.org, State: sandrunv1.RequestState_REQUEST_STATE_QUEUED, Kind: sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB})
 	if r := f.run("", "--org", f.org, "request", "cancel", "r1"); r.code != 0 {
 		t.Fatalf("cancel = %d %s", r.code, r.stderr)
 	}
