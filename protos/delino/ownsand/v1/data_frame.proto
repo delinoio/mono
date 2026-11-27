@@ -101,11 +101,15 @@ message ExecStarted {
   google.protobuf.Timestamp start_time = 2;
 }
 
-// The requested offsets are older than the kept output.
+// On relay and peer-to-peer streams, AttachExec sends one output_truncated
+// event after started if either requested offset is below its stream's retained
+// start. The event gives the effective resume offsets for both streams.
 message ExecOutputTruncated {
-  // First available stdout offset.
+  // Effective stdout resume offset, the larger of the requested stdout offset
+  // and the retained stdout start.
   int64 stdout_offset = 1;
-  // First available stderr offset.
+  // Effective stderr resume offset, the larger of the requested stderr offset
+  // and the retained stderr start.
   int64 stderr_offset = 2;
 }
 
