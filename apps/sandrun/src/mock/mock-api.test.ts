@@ -132,6 +132,154 @@ const invalidInstallationState = {
   rawMessage: "the installation state is not valid or has expired",
 };
 
+test("rejects undefined kind filters on runner profiles and requests", async () => {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const work = createClient(WorkService, transport);
+  const organizationId = MOCK_IDS.acme;
+  const unknownKind = 99 as WorkloadKind;
+
+  await expect(
+    profiles.listRunnerProfiles({ organizationId, workloadKind: unknownKind }),
+  ).rejects.toMatchObject({
+    code: Code.InvalidArgument,
+    rawMessage: "invalid workload_kind: must be a defined WorkloadKind value",
+  });
+  await expect(
+    work.listRequests({ organizationId, kind: unknownKind }),
+  ).rejects.toMatchObject({
+    code: Code.InvalidArgument,
+    rawMessage: "invalid kind: must be a defined WorkloadKind value",
+  });
+});
+
+test.each([
+  { includeEnded: false, mixed: false },
+  { includeEnded: false, mixed: true },
+  { includeEnded: true, mixed: false },
+  { includeEnded: true, mixed: true },
+])(
+  "rejects undefined state filters (includeEnded=$includeEnded, mixed=$mixed)",
+  async ({ includeEnded, mixed }) => {
+    const transport = createMockTransport();
+    const work = createClient(WorkService, transport);
+    const sessions = createClient(DevSessionService, transport);
+    const request = { organizationId: MOCK_IDS.acme, includeEnded };
+    const requestStates = mixed ? [RequestState.QUEUED] : [];
+    requestStates.push(99 as RequestState);
+    const runnerStates = mixed ? [RunnerState.BUSY] : [];
+    runnerStates.push(99 as RunnerState);
+    const invalidRequestState = {
+      code: Code.InvalidArgument,
+      rawMessage: "invalid states: must be a defined RequestState value",
+    };
+
+    await expect(
+      work.listRequests({ ...request, states: requestStates }),
+    ).rejects.toMatchObject(invalidRequestState);
+    await expect(
+      work.listRunners({ ...request, states: runnerStates }),
+    ).rejects.toMatchObject({
+      code: Code.InvalidArgument,
+      rawMessage: "invalid states: must be a defined RunnerState value",
+    });
+    await expect(
+      sessions.listDevSessions({ ...request, states: requestStates }),
+    ).rejects.toMatchObject(invalidRequestState);
+  },
+);
+
+test("keeps defined filters, zero values and omitted filters working", async () => {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const work = createClient(WorkService, transport);
+  const sessions = createClient(DevSessionService, transport);
+  const request = { organizationId: MOCK_IDS.acme };
+
+  const allProfiles = await profiles.listRunnerProfiles(request);
+  expect(allProfiles.profiles.map((profile) => profile.workloadKind)).toEqual([
+    WorkloadKind.GITHUB_JOB,
+    WorkloadKind.AGENT_SESSION,
+    WorkloadKind.DEV_SESSION,
+  ]);
+  expect(
+    await profiles.listRunnerProfiles({
+      ...request,
+      workloadKind: WorkloadKind.UNSPECIFIED,
+    }),
+  ).toEqual(allProfiles);
+  const githubProfiles = await profiles.listRunnerProfiles({
+    ...request,
+    workloadKind: WorkloadKind.GITHUB_JOB,
+  });
+  expect(
+    githubProfiles.profiles.map((profile) => profile.runnerProfileId),
+  ).toEqual([MOCK_IDS.linuxProfile]);
+
+  const githubRequests = await work.listRequests({
+    ...request,
+    kind: WorkloadKind.GITHUB_JOB,
+    states: [RequestState.QUEUED],
+  });
+  expect(githubRequests.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.queuedJob,
+  ]);
+  expect(
+    await work.listRequests({ ...request, kind: WorkloadKind.UNSPECIFIED }),
+  ).toEqual(await work.listRequests(request));
+  const busyRunners = await work.listRunners({
+    ...request,
+    states: [RunnerState.BUSY],
+  });
+  expect(busyRunners.runners.map((runner) => runner.runnerId)).toEqual([
+    MOCK_IDS.busyRunner,
+  ]);
+  const queuedSessions = await sessions.listDevSessions({
+    ...request,
+    states: [RequestState.QUEUED],
+  });
+  expect(
+    queuedSessions.devSessions.map((session) => session.devSessionId),
+  ).toEqual([MOCK_IDS.queuedDev]);
+  expect(
+    await work.listRequests({ ...request, states: [RequestState.UNSPECIFIED] }),
+  ).toMatchObject({ requests: [] });
+  expect(
+    await work.listRunners({ ...request, states: [RunnerState.UNSPECIFIED] }),
+  ).toMatchObject({ runners: [] });
+  expect(
+    await sessions.listDevSessions({
+      ...request,
+      states: [RequestState.UNSPECIFIED],
+    }),
+  ).toMatchObject({ devSessions: [] });
+});
+
+test("paginates filtered requests in queue order before ended requests", async () => {
+  const work = createClient(WorkService, createMockTransport());
+  const request = {
+    organizationId: MOCK_IDS.acme,
+    kind: WorkloadKind.GITHUB_JOB,
+    includeEnded: true,
+    pageSize: 2,
+  };
+  const first = await work.listRequests(request);
+  expect(first.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.runningJob,
+    MOCK_IDS.queuedJob,
+  ]);
+  expect(first.nextPageToken).not.toBe("");
+
+  const last = await work.listRequests({
+    ...request,
+    pageToken: first.nextPageToken,
+  });
+  expect(last.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.endedJob,
+  ]);
+  expect(last.nextPageToken).toBe("");
+});
+
 async function runnerProfileFixture() {
   const transport = createMockTransport();
   const profiles = createClient(RunnerProfileService, transport);
