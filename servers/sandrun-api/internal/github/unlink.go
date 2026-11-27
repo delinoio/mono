@@ -10,6 +10,7 @@ import (
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 )
 
 // retireUnlinkRunners runs while lockTx holds the installation lock. The
@@ -56,7 +57,7 @@ func (l *Layer) retireUnlinkRunners(ctx context.Context, lockTx pgx.Tx, inst *In
 }
 
 func (l *Layer) retireUnlinkRunner(ctx context.Context, conn *pgx.Conn, inst *Installation, runnerID string, expected *registration) (retired, refused bool, err error) {
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+	err = db.InTxWithContexts(ctx, ctx, conn.Begin, func(tx pgx.Tx) error {
 		var current registration
 		err := tx.QueryRow(ctx, `
 			SELECT g.github_installation_id, g.github_runner_id, g.registration_removed
