@@ -109,17 +109,38 @@ func TestCreateCloexecCreateFailureSkipsMark(t *testing.T) {
 	}
 }
 
-// TestSocketCloexec checks the socket of the listener is close-on-exec on
-// every platform; it skips when the host has no vsock.
+func requireVsockSocket(t *testing.T) {
+	t.Helper()
+
+	// Keep the unmarked probe descriptor out of children started by os/exec.
+	syscall.ForkLock.RLock()
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err == nil {
+		unix.Close(fd)
+	}
+	syscall.ForkLock.RUnlock()
+
+	switch err {
+	case nil:
+	case unix.EAFNOSUPPORT, unix.EPROTONOSUPPORT, unix.ESOCKTNOSUPPORT:
+		t.Skipf("raw AF_VSOCK stream socket unsupported: %v", err)
+	case unix.EACCES, unix.EPERM:
+		t.Skipf("raw AF_VSOCK stream socket denied: %v", err)
+	default:
+		t.Fatalf("open raw AF_VSOCK stream socket: %v", err)
+	}
+}
+
 func TestSocketCloexec(t *testing.T) {
+	requireVsockSocket(t)
 	fd, err := socketCloexec()
 	if err != nil {
-		t.Skipf("vsock unavailable: %v", err)
+		t.Fatalf("socketCloexec: %v", err)
 	}
 	defer unix.Close(fd)
 	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read listener socket descriptor flags: %v", err)
 	}
 	if flags&unix.FD_CLOEXEC == 0 {
 		t.Fatal("listener socket is not close-on-exec")
