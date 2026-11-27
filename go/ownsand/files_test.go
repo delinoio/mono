@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1498,6 +1499,131 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 			big, _ := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/big"})
 			if _, err := big.WriteChunk(ctx, 0, make([]byte, datapath.MaxFileChunkSize+1)); !validate.IsValidationError(err) {
 				t.Fatalf("chunk above 1 MiB: %v", err)
+			}
+		})
+	}
+}
+
+func TestFileWriteQueuedCalls(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		finish bool
+		want   error
+	}{
+		{name: "canceled chunk", want: context.Canceled},
+		{name: "canceled finish", finish: true, want: context.Canceled},
+		{name: "chunk deadline", want: context.DeadlineExceeded},
+		{name: "finish deadline", finish: true, want: context.DeadlineExceeded},
+		{name: "live finish", finish: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			firstEntered, release := make(chan struct{}), make(chan struct{})
+			releaseFirst := sync.OnceFunc(func() { close(release) })
+			defer releaseFirst()
+			cp.relayScript = func(method string, n int) relayAction {
+				if method == "WriteFile" && n == 1 {
+					close(firstEntered)
+					<-release
+				}
+				return relayAction{}
+			}
+			c := cp.client(t, TransportRelay)
+			c.timing.writeAttemptDeadline = 20 * time.Second
+			s := cp.handle(t, c)
+			id := mustID(t)
+			salt := bytes.Repeat([]byte{0x42}, relaybinding.SaltSize)
+			fw, err := s.OpenFileWrite(FileWriteParams{WriteID: id, Path: "/out", BindingSalt: salt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkCalls := func(writes, auths int) {
+				t.Helper()
+				if w, a, ice, peers := cp.relayCount("WriteFile"), len(cp.authRequests()), cp.iceCallCount(), cp.openSessionCount(); w != writes || a != auths || ice != 0 || peers != 0 {
+					t.Fatalf("relay writes, authorizations, ICE calls, peer opens = %d, %d, %d, %d, want %d, %d, 0, 0", w, a, ice, peers, writes, auths)
+				}
+			}
+			preCanceled, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, err := fw.WriteChunk(preCanceled, 0, []byte("a")); err != context.Canceled {
+				t.Fatalf("pre-canceled chunk: got %v, want context.Canceled", err)
+			}
+			checkCalls(0, 0)
+
+			firstDone := make(chan error, 1)
+			go func() {
+				_, err := fw.WriteChunk(t.Context(), 0, []byte("a"))
+				firstDone <- err
+			}()
+			select {
+			case <-firstEntered:
+			case err := <-firstDone:
+				t.Fatalf("first chunk returned before reaching the relay: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("first chunk did not reach the relay")
+			}
+
+			finish := func(ctx context.Context) error {
+				res, err := fw.Finish(ctx, 1, []byte("b"), 2, 0o644)
+				if err == nil && (!res.GetFinished() || res.GetSizeBytes() != 2) {
+					return fmt.Errorf("unexpected finish result: %v", res)
+				}
+				return err
+			}
+			var ctx context.Context
+			if tc.want == context.DeadlineExceeded {
+				ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+			} else {
+				ctx, cancel = context.WithCancel(t.Context())
+			}
+			defer cancel()
+			waiting := make(chan bool, 1)
+			ctx = setupWaitContext{Context: ctx, observeSlot: sync.OnceFunc(func() { waiting <- len(fw.busy) == 1 })}
+			queuedDone := make(chan error, 1)
+			go func() {
+				if tc.finish {
+					queuedDone <- finish(ctx)
+					return
+				}
+				_, err := fw.WriteChunk(ctx, 1, []byte("b"))
+				queuedDone <- err
+			}()
+			waitForSetupWaiter(t, tc.name, waiting)
+			if tc.want != nil {
+				if tc.want == context.Canceled {
+					cancel()
+				}
+				select {
+				case err := <-queuedDone:
+					if err != tc.want {
+						t.Fatalf("queued call: got %v, want %v", err, tc.want)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("queued call did not return while the first response was held")
+				}
+			}
+			checkCalls(1, 1)
+			releaseFirst()
+			if err := waitOpErr(t, firstDone); err != nil {
+				t.Fatalf("first chunk: %v", err)
+			}
+			if tc.want == nil {
+				err = waitOpErr(t, queuedDone)
+			} else {
+				err = finish(t.Context())
+			}
+			if err != nil {
+				t.Fatalf("finish: %v", err)
+			}
+			checkCalls(2, 1)
+			reqs := cp.agent.writeRequests()
+			if len(reqs) != 2 || reqs[0].GetWriteId() != id || reqs[1].GetWriteId() != id ||
+				reqs[0].GetPath() != "/out" || !bytes.Equal(reqs[0].GetBindingSalt(), salt) ||
+				reqs[1].GetPath() != "" || len(reqs[1].GetBindingSalt()) != 0 {
+				t.Fatalf("unexpected first and final write requests: %v", reqs)
+			}
+			if got, ok := cp.agent.file("/out"); !ok || string(got) != "ab" {
+				t.Fatalf("file = %q, exists = %t", got, ok)
 			}
 		})
 	}

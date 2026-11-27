@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 
 	"google.golang.org/protobuf/proto"
 
@@ -531,14 +530,15 @@ type FileWriteParams struct {
 // helper records the written ranges, and Finish moves the file into place
 // when the ranges cover exactly [0, size). Each call sends one chunk and
 // retries it after a lost response or a session end with the same request,
-// like WriteFile. A FileWrite is safe for concurrent use; its calls are
-// serialized.
+// like WriteFile. Calls on a FileWrite run one at a time. If a caller's
+// context ends while it waits for another call, it returns the context
+// error without sending a request.
 type FileWrite struct {
 	s     *Sandbox
 	op    *writeOp
 	path  string
 	salt  []byte
-	mu    sync.Mutex
+	busy  chan struct{}
 	first bool
 }
 
@@ -563,6 +563,7 @@ func (s *Sandbox) OpenFileWrite(p FileWriteParams) (*FileWrite, error) {
 		s:     s,
 		path:  p.Path,
 		salt:  salt,
+		busy:  make(chan struct{}, 1),
 		first: true,
 		op: &writeOp{
 			s:     s,
@@ -588,8 +589,19 @@ func (fw *FileWrite) Finish(ctx context.Context, offset int64, data []byte, size
 }
 
 func (fw *FileWrite) send(ctx context.Context, offset int64, data []byte, finish *ownsandv1.WriteFileFinish) (*ownsandv1.WriteFileResponse, error) {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case fw.busy <- struct{}{}:
+	}
+	defer func() { <-fw.busy }()
+	// Cancellation can race with the previous call releasing its turn.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s := fw.s
 	req := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: fw.op.id, Offset: offset, Data: data, Finish: finish}
 	if fw.first {
