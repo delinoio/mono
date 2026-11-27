@@ -377,7 +377,11 @@ func (s *Service) failTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, 
 		return nil
 	}
 	prev = t.Status
-	if _, err := tx.Exec(ctx, `UPDATE top_ups SET status = 'failed', failure_reason = $2, update_time = $3
+	// The previous release recorded acceptance of a charged manual top-up
+	// in update_time. Preserve that evidence before writing the timeout.
+	if _, err := tx.Exec(ctx, `UPDATE top_ups SET status = 'failed', failure_reason = $2, update_time = $3,
+			provider_accept_time = CASE WHEN $2 = 'timed_out' AND kind = 'manual' AND status = 'charged'
+				THEN COALESCE(provider_accept_time, update_time) ELSE provider_accept_time END
 		WHERE top_up_id = $1`, topUpID, string(reason), now); err != nil {
 		return err
 	}
