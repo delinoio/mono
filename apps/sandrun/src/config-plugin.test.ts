@@ -44,6 +44,19 @@ describe("console configuration plugin", () => {
   );
 
   describe.each(["production", "development"] as const)("%s mode", (mode) => {
+    test.each(["PUBLIC_API_ORIGIN", "PUBLIC_LOGTO_ENDPOINT"] as const)(
+      "rejects a malformed authority in %s",
+      async (name) => {
+        await expect(
+          initConsoleConfig(mode, { [name]: "https://@fixture.test" }),
+        ).rejects.toThrow(
+          new Error(
+            `${name} must use an authority without @, tabs or line breaks`,
+          ),
+        );
+      },
+    );
+
     test("rejects a Logto endpoint with a path and a blank app ID", async () => {
       await expect(
         initConsoleConfig(mode, {
