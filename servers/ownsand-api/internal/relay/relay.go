@@ -309,6 +309,12 @@ func (c *Conn) enqueueFrame(ctx context.Context, of outFrame) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// The token and ctx.Done() can both be ready. Check the request before
+	// publishing the frame and return the token if the request ended.
+	if err := ctx.Err(); err != nil {
+		<-c.slots
+		return err
+	}
 	// The token guarantees room: ordinary frames never exceed outboundQueue,
 	// and the queue also holds the reserved places of the finals.
 	c.out <- of
@@ -604,6 +610,10 @@ func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, er
 		c.mu.Unlock()
 		return nil, ErrConnClosed
 	default:
+	}
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return nil, err
 	}
 	if len(c.streams)+c.pendingFinals >= c.limits.MaxStreamsPerConn || c.perGrant[grantID] >= c.limits.MaxStreamsPerGrant {
 		c.mu.Unlock()
