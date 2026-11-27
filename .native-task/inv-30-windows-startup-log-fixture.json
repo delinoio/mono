@@ -1,0 +1,40 @@
+{
+  "gid": "inv-30-windows-startup-log-fixture",
+  "commit": "262184cfa48ebc6f7ad66db2d1dbd79386990d9b",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "262184cfa48ebc6f7ad66db2d1dbd79386990d9b",
+    "setup": "Use a clean disposable checkout at this revision. Run at the repository root in non-elevated Windows PowerShell. Run the first command, copy files.copyFrom to files.copyTo, then run the second command. Keep the positive and negative logs.",
+    "commands": [
+      "New-Item -ItemType Directory -Path '.t3-tmp' -Force | Out-Null",
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '.\\.t3-tmp\\validate-windows-startup-log-fixture.ps1' -ExpectedSha '262184cfa48ebc6f7ad66db2d1dbd79386990d9b'"
+    ],
+    "expectedResults": [
+      "The original fixture exits 0 and passes all four subtests, including file_log_works. The fixture requires one diagnostic with the expected validation reason, no Event Log calls in the working-file case, and service-specific exit 2.",
+      "The overlay runs file_log_works with only private-fixture-state appended to the temporary agent.log. Go test exits 1 at unexpected log contents and prints the synthetic path marker. The log-level marker is absent.",
+      "The script exits 0 after observing the expected failure and removes the overlay files. The tracked checkout remains clean."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-startup-log-fixture/worker/.t3-tmp/startup-log-fixture/validate-windows-startup-log-fixture.ps1",
+      "copyTo": ".t3-tmp/validate-windows-startup-log-fixture.ps1",
+      "regressionTests": ["cmds/ownsand-agent/service_windows_test.go"],
+      "outputLogs": [
+        ".t3-tmp/windows-startup-log-fixture/positive.log",
+        ".t3-tmp/windows-startup-log-fixture/negative.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-startup-log-fixture/worker/.t3-tmp/startup-log-fixture/ownsand-agent-windows-amd64.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-windows-startup-log-fixture/worker/.t3-tmp/startup-log-fixture/ownsand-agent-windows-amd64-mutant.test.exe"
+      ]
+    },
+    "limits": [
+      "Both fixture runs use a temporary file and fake service dispatch and Event Log callbacks. They require no elevation, symbolic links, tar extraction, or Hyper-V."
+    ],
+    "outOfScope": [
+      "Live SCM installation or control, registry provisioning, real Event Log writes, and Hyper-V operations. Those system-level checks can require elevation."
+    ]
+  }
+}
