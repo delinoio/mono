@@ -58,7 +58,7 @@ func TestOpenSessionDeferredRevocation(t *testing.T) {
 	// context ends before the hub would close the saturated channel.
 	eventCtx, cancelEvent := context.WithTimeout(t.Context(), enqueueFailureDeadline)
 	defer cancelEvent()
-	env.App.Plane.HandleEvent(eventCtx, events.Event{Kind: events.KindAPIKeyRevoked, APIKeyID: org.APIKeyID})
+	env.App.Plane.HandleEventForTest(eventCtx, events.Event{Kind: events.KindAPIKeyRevoked, APIKeyID: org.APIKeyID}, conn.Generation)
 	grantRevocationID := deferredRevocationID(t, env, agent.Device.ID, "relay_grant")
 	if grantRevocationID == "" || grantRevocationID == sessionRevocationID {
 		t.Fatalf("expected a distinct deferred relay grant revocation, got %q", grantRevocationID)

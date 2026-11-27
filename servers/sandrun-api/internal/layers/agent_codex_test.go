@@ -116,22 +116,34 @@ func TestCreateDirectDuringProfileChange(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
-			ctx := t.Context()
+			ctx, cancel := context.WithTimeout(t.Context(), 2*lockWaitTimeout)
+			defer cancel()
 			in, err := w.l.Integrations.Get(ctx, w.env.DB.Pool, w.org.ID, w.integrationID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			args := append([]any{w.profileID}, tc.args...)
-			commit := holdTx(t, w.env, tc.change, args...)
+			holder := holdTx(t, w.env, tc.change, args...)
+			waiterPID := make(chan int32, 1)
 			done := make(chan error, 1)
 			go func() {
 				done <- w.env.DB.InTx(ctx, func(tx pgx.Tx) error {
+					waiterPID <- int32(tx.Conn().PgConn().PID())
 					_, _, err := w.l.Agents.CreateDirectTx(ctx, tx, w.l.Codex, in, agent.DirectDemand{VendorRequestID: "sess_profile_changed"})
 					return err
 				})
 			}()
-			waitForLockWaiter(t, w.env)
-			commit()
+			var pid int32
+			select {
+			case pid = <-waiterPID:
+			case err := <-done:
+				t.Fatalf("direct admission finished before its transaction started: %v", err)
+			case <-ctx.Done():
+				t.Fatalf("start direct admission transaction: %v", ctx.Err())
+			}
+			waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid, waiterPID: pid,
+				query: "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE"})
+			holder.commit()
 			if err := <-done; !errors.Is(err, agent.ErrNoProfile) {
 				t.Fatalf("create direct: %v, want ErrNoProfile", err)
 			}

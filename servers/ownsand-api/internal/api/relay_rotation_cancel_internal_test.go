@@ -215,13 +215,10 @@ func stdout(data string) *ownsandv1.ExecEvent {
 }
 
 // TestRotationAfterRequestCancelReturnsContextError checks that a rotation
-// that finds the request context ended does not return OK. The agent frame
-// behind the accepted event is already queued, and Next returns a queued
-// frame before it looks at the context, so only the check in the rotation
-// branch sees the cancellation. A canceled call must not count as a completed
-// billable stream (the call meter counts only an OK result) and must be logged
-// as canceled; the queued frame is not forwarded and the agent still gets its
-// stream close frame.
+// that finds the request context ended does not return OK. The caller
+// cancels during the accepted event while another agent frame is already
+// queued. The call is logged as canceled, the queued frame stays unsent, and
+// the agent receives a stream close frame.
 func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
 	h := newRotationHarness(t, pastRotation)
 	h.feed(&ownsandv1.RequestAccepted{})
@@ -248,8 +245,8 @@ func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
 
 // expiringContext reports context.DeadlineExceeded from Err once expire ran.
 // A real deadline would also end the request upload and the first Next before
-// the handler reaches the rotation branch, and Done stays open here for the
-// same reason; the rotation branch reads only Err.
+// the handler sends the accepted event. Done stays open here to simulate a
+// deadline first observed through Err while the handler is sending.
 type expiringContext struct {
 	context.Context
 	expired atomic.Bool
@@ -286,10 +283,8 @@ func TestRotationAfterRequestDeadlineReturnsDeadlineExceeded(t *testing.T) {
 	h.waitClose()
 }
 
-// TestRotationWithEmptyQueueAfterRequestCancel covers the other way into the
-// rotation branch: no frame is queued, and the handler's wake timer ticks. The
-// select in Next chooses between the ended context and the tick at random, so
-// the test passes only when both outcomes end the call with the context error.
+// TestRotationWithEmptyQueueAfterRequestCancel checks cancellation at
+// rotation with no queued frame after the accepted event.
 func TestRotationWithEmptyQueueAfterRequestCancel(t *testing.T) {
 	timing := pastRotation
 	timing.Keepalive = 4 * time.Millisecond // the handler wakes every millisecond

@@ -210,7 +210,7 @@ func (s *Server) logStats(ctx context.Context) {
 		case <-t.C:
 		}
 		req, resp, lim, inv := s.requests.Swap(0), s.responses.Swap(0), s.limited.Swap(0), s.invalid.Swap(0)
-		if req > 0 {
+		if req != 0 || resp != 0 || lim != 0 || inv != 0 {
 			s.Logger.Info("stun_stats", slog.Int64("requests", req), slog.Int64("responses", resp), slog.Int64("rate_limited", lim), slog.Int64("invalid", inv))
 		}
 	}

@@ -180,7 +180,7 @@ func TestControlHandleDeleteLookup(t *testing.T) {
 				lookups++
 				return tc.row, tc.err
 			}
-			err := h.c.handle(context.Background(), events.Event{ID: 1, Kind: events.KindSandboxDeleteRequested, OrganizationID: "org-1", DeviceID: "dev-1", SandboxID: "sb-1"})
+			err := h.c.handle(context.Background(), events.Event{ID: 1, Kind: events.KindSandboxDeleteRequested, OrganizationID: "org-1", DeviceID: "dev-1", SandboxID: "sb-1"}, channelGenerations{last: h.c.S.Hub.LastGeneration()})
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("handle returned a different error than the wanted one (got nil: %t)", err == nil)
 			}
@@ -196,6 +196,7 @@ func TestControlHandleDeleteLookup(t *testing.T) {
 // events after it are delivered and stored.
 func TestControlObsoleteDeleteDoesNotBlockLaterEvents(t *testing.T) {
 	h := newCursorHarness(t, 0)
+	h.acquire(0, nil)
 	h.c.S.Hub.Register(context.Background(), "dev-1", "org-1").SetReconciled()
 	h.all = []events.Event{
 		{ID: 1, Kind: events.KindSandboxDeleteRequested, OrganizationID: "org-1", DeviceID: "dev-1", SandboxID: "gone"},
@@ -205,7 +206,6 @@ func TestControlObsoleteDeleteDoesNotBlockLaterEvents(t *testing.T) {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("sandbox not found"))
 	}
 	h.c.handleEvent = h.c.handle
-	h.acquire(0, nil)
 	h.c.processEvents(context.Background())
 	if got := h.cursor(); got != 2 {
 		t.Fatalf("cursor = %d, want 2", got)
