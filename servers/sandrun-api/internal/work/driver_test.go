@@ -30,6 +30,45 @@ func (c *exitedProgramClient) AttachExec(_ context.Context, _, execID string, _ 
 	return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
 }
 
+func TestSaveStartResultCancelsRetry(t *testing.T) {
+	// A closed pool fails the write without connecting to PostgreSQL.
+	pool, err := pgxpool.New(t.Context(), "postgres://postgres@127.0.0.1/postgres?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Close()
+
+	synctest.Test(t, func(t *testing.T) {
+		var logs bytes.Buffer
+		e := New(&api.Service{DB: &db.DB{Pool: pool}, Logger: slog.New(slog.NewTextHandler(&logs, nil))},
+			nil, nil, nil, Timing{SandboxPoll: time.Hour})
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			e.saveStartResult(ctx, &Runner{ID: "runner"}, StartResult{ProgramExecID: "exec"})
+		}()
+
+		synctest.Wait()
+		if !strings.Contains(logs.String(), "runner_update_failed") {
+			t.Fatal("the start outcome transaction did not fail")
+		}
+		select {
+		case <-done:
+			t.Fatal("the driver exited before retrying")
+		default:
+		}
+		start := time.Now()
+		cancel()
+		<-done
+		if spent := time.Since(start); spent != 0 || strings.Count(logs.String(), "runner_update_failed") != 1 {
+			t.Fatalf("cancellation took %v and logged %d failures, want immediate exit after one write attempt",
+				spent, strings.Count(logs.String(), "runner_update_failed"))
+		}
+	})
+}
+
 func TestFollowProgramCancelsExitRetry(t *testing.T) {
 	// A closed pool fails the exit transaction without a database connection.
 	pool, err := pgxpool.New(t.Context(), "postgres://postgres@127.0.0.1/postgres?sslmode=disable")

@@ -316,42 +316,71 @@ func (e *Engine) stepStart(ctx context.Context, client ownsandclient.Client, r *
 		}
 		return
 	}
-	err = e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
-		from := []sandrunv1.RunnerState{runPrep, runWarm}
+	e.saveStartResult(ctx, r, res)
+}
+
+// saveStartResult retries only the write. Starting again could register and
+// launch a second program while the original exec is still running.
+func (e *Engine) saveStartResult(ctx context.Context, r *Runner, res StartResult) {
+	for ctx.Err() == nil {
+		err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+			return e.applyStartResult(ctx, tx, r, res)
+		})
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(e.timing.SandboxPoll):
+		}
+	}
+}
+
+func (e *Engine) applyStartResult(ctx context.Context, tx pgx.Tx, r *Runner, res StartResult) error {
+	if !res.Busy {
+		if err := lockWarmOutcomeProfile(ctx, tx, r); err != nil {
+			return err
+		}
+	}
+	current, err := e.lockRunner(ctx, tx, r.ID)
+	if connect.CodeOf(err) == connect.CodeNotFound {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current.ProgramExecID != "" {
+		return nil
+	}
+	switch current.State {
+	case runPrep, runWarm:
 		if res.Busy {
-			n, err := e.setRunnerTx(ctx, tx, r.ID, from, runBusy, "")
-			if err != nil || n == nil || n.RequestID == "" {
+			n, err := e.updateLockedRunnerTx(ctx, tx, current, runBusy, "")
+			if err != nil || n.RequestID == "" {
 				return err
 			}
 			return e.startRequestTx(ctx, tx, n.RequestID, n.ID, []sandrunv1.RequestState{reqStarting}, reqRunning)
 		}
-		if err := lockWarmOutcomeProfile(ctx, tx, r); err != nil {
-			return err
-		}
-		n, err := e.setRunnerTx(ctx, tx, r.ID, from, runWaiting, "program_exec_id = $4", nullable(res.ProgramExecID))
+		n, err := e.updateLockedRunnerTx(ctx, tx, current, runWaiting, "program_exec_id = $4", nullable(res.ProgramExecID))
 		if err != nil {
 			return err
 		}
-		if n != nil {
-			return resetWarmRetry(ctx, tx, n)
+		return resetWarmRetry(ctx, tx, n)
+	case runBusy:
+		// GitHub can bind the request before Start returns. Keep its BUSY
+		// transition and store the missing ID for the program follower.
+		if !res.Busy && res.ProgramExecID != "" {
+			_, err := tx.Exec(ctx, "UPDATE runners SET program_exec_id = $2, update_time = $3 WHERE runner_id = $1",
+				r.ID, res.ProgramExecID, e.svc.NowUTC())
+			if err != nil {
+				return err
+			}
+			return resetWarmRetry(ctx, tx, r)
 		}
-		if res.ProgramExecID == "" {
-			return nil
-		}
-		// A source that binds work later (GITHUB_JOB: an early in_progress
-		// webhook, MarkBusy) can mark the runner BUSY before Start returns.
-		// The runner keeps the exec ID, so its driver follows the program
-		// and deletes the sandbox when the program exits.
-		tag, err := tx.Exec(ctx, "UPDATE runners SET program_exec_id = $2, update_time = $3 WHERE runner_id = $1 AND state = $4 AND program_exec_id IS NULL",
-			r.ID, res.ProgramExecID, e.svc.NowUTC(), int16(runBusy))
-		if err != nil || tag.RowsAffected() == 0 {
-			return err
-		}
-		return resetWarmRetry(ctx, tx, r)
-	})
-	if err != nil {
-		e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 	}
+	return nil
 }
 
 // checkSandbox ends the runner when OwnSand ended its sandbox.
