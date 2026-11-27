@@ -1692,8 +1692,12 @@ describe("Forced colors", () => {
       forced,
       ".dui-toggle[data-pressed], .dui-pagination-link[data-current]",
     );
+    expect(filled).toContain("forced-color-adjust: none;");
     expect(filled).toContain("background: Highlight;");
     expect(filled).toContain("color: HighlightText;");
+    expect(findRuleBlock(forced, ".dui-toggle[data-pressed]")).toContain(
+      "box-shadow: none;",
+    );
     // A border would widen both controls, so neither gets one.
     expect(findRuleBlock(forced, ".dui-toggle")).toBeNull();
     expect(block(".dui-toggle")).toContain("border: 0;");
