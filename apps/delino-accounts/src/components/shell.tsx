@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import type { QueryKey } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { createContext, type ReactNode, useContext } from "react";
 import { useAuth } from "../auth.tsx";
@@ -61,6 +62,8 @@ export interface BillingAccountContextValue {
   name: string;
   /** The role of the signed-in user in the billing account. */
   role: BillingAccountRole;
+  queryKey: QueryKey;
+  readVersion: number;
 }
 
 const BillingAccountContext = createContext<
