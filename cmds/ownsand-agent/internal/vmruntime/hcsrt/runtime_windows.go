@@ -226,6 +226,12 @@ const copyFileFailIfExists = 0x1
 // copy is canceled. A caller whose copy must not be interrupted passes
 // context.Background().
 func copyFile(ctx context.Context, src, dst string) error {
+	return copyFileWithProgress(ctx, src, dst, nil)
+}
+
+// copyFileWithProgress lets tests attach a native progress routine to this call
+// and observe the cancellation flag and watcher's completion.
+func copyFileWithProgress(ctx context.Context, src, dst string, progress func(*int32, <-chan struct{}) (uintptr, unsafe.Pointer)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -243,6 +249,11 @@ func copyFile(ctx context.Context, src, dst string) error {
 	cancel := new(int32)
 	copying := make(chan struct{})
 	watcherDone := make(chan struct{})
+	var progressRoutine uintptr
+	var progressData unsafe.Pointer
+	if progress != nil {
+		progressRoutine, progressData = progress(cancel, watcherDone)
+	}
 	go func() {
 		defer close(watcherDone)
 		select {
@@ -251,7 +262,7 @@ func copyFile(ctx context.Context, src, dst string) error {
 		case <-copying:
 		}
 	}()
-	ok, _, e := procCopyFileExW.Call(uintptr(unsafe.Pointer(s)), uintptr(unsafe.Pointer(d)), 0, 0, uintptr(unsafe.Pointer(cancel)), copyFileFailIfExists)
+	ok, _, e := procCopyFileExW.Call(uintptr(unsafe.Pointer(s)), uintptr(unsafe.Pointer(d)), progressRoutine, uintptr(progressData), uintptr(unsafe.Pointer(cancel)), copyFileFailIfExists)
 	close(copying)
 	<-watcherDone
 	runtime.KeepAlive(cancel)

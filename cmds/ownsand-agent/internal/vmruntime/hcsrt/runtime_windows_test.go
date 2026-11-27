@@ -8,12 +8,18 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -418,49 +424,119 @@ func TestDeleteRemovesTrackedVMWhenExitConfirmed(t *testing.T) {
 // a live context, refuses a context that already ended, and removes the
 // partial destination of a copy that a context cancellation interrupted.
 func TestCopyFileEndsWithItsContext(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "src")
-	if err := os.WriteFile(src, bytes.Repeat([]byte{7}, 1<<20), 0o600); err != nil {
-		t.Fatal(err)
+	t.Run("live", func(t *testing.T) {
+		dir := t.TempDir()
+		src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+		want := []byte("source contents")
+		if err := os.WriteFile(src, want, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := copyFile(t.Context(), src, dst); err != nil {
+			t.Fatalf("copy on a live context = %v", err)
+		}
+		if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("destination = %q, %v, want %q", got, err, want)
+		}
+	})
+	t.Run("already_canceled", func(t *testing.T) {
+		dir := t.TempDir()
+		src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+		if err := os.WriteFile(src, []byte("source contents"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		want := []byte("existing destination")
+		if err := os.WriteFile(dst, want, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := copyFile(ctx, src, dst); !errors.Is(err, context.Canceled) {
+			t.Fatalf("copy on a canceled context = %v, want context.Canceled", err)
+		}
+		if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("destination = %q, %v, want %q", got, err, want)
+		}
+	})
+	t.Run("in_flight", func(t *testing.T) {
+		const size = 64 << 20
+		dir := t.TempDir()
+		src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+		if err := os.WriteFile(src, bytes.Repeat([]byte{7}, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		progress := &copyProgressFixture{ctx: ctx, cancel: cancel}
+		err := copyFileWithProgress(ctx, src, dst, progress.attach)
+		if progress.transferred <= 0 || progress.transferred >= progress.total || progress.total != size {
+			t.Fatalf("CopyFileExW reported no strictly partial progress for the %d-byte source (observed %d of %d, copy error: %v)", size, progress.transferred, progress.total, err)
+		}
+		if progress.err != nil {
+			t.Fatal(progress.err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled copy = %v, want context.Canceled", err)
+		}
+		if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat of partial destination = %v, want os.ErrNotExist", err)
+		}
+		t.Logf("CopyFileExW reported %d of %d bytes with a live context, then aborted with pbCancel set and removed the destination", progress.transferred, progress.total)
+	})
+}
+
+type copyProgressFixture struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	flag        *int32
+	watcherDone <-chan struct{}
+	transferred int64
+	total       int64
+	err         error
+}
+
+// NewCallback retains the trampoline for the process lifetime. The native
+// call receives separate fixture data for each copy through lpData.
+var copyProgressRoutine = sync.OnceValue(func() uintptr {
+	if bits.UintSize == 32 {
+		// On windows/386 each LARGE_INTEGER occupies two stack slots.
+		return windows.NewCallback(func(totalLo, totalHi, transferredLo, transferredHi, _, _, _, _, _, _, _, _ uintptr, data *copyProgressFixture) uintptr {
+			return data.observe(int64(totalHi)<<32|int64(totalLo), int64(transferredHi)<<32|int64(transferredLo))
+		})
 	}
-	dst := filepath.Join(dir, "dst")
-	if err := copyFile(context.Background(), src, dst); err != nil {
-		t.Fatalf("copy on a live context = %v", err)
+	return windows.NewCallback(func(total, transferred int64, _, _, _, _, _, _ uintptr, data *copyProgressFixture) uintptr {
+		return data.observe(total, transferred)
+	})
+})
+
+func (p *copyProgressFixture) attach(flag *int32, watcherDone <-chan struct{}) (uintptr, unsafe.Pointer) {
+	p.flag = flag
+	p.watcherDone = watcherDone
+	return copyProgressRoutine(), unsafe.Pointer(p)
+}
+
+func (p *copyProgressFixture) observe(total, transferred int64) uintptr {
+	const progressContinue = 0
+	if p.transferred != 0 || transferred <= 0 || transferred >= total {
+		return progressContinue
 	}
-	if got, err := os.ReadFile(dst); err != nil || len(got) != 1<<20 {
-		t.Fatalf("copy = %d bytes, %v", len(got), err)
+	p.total, p.transferred = total, transferred
+	if p.err = p.ctx.Err(); p.err != nil {
+		return progressContinue
 	}
-	canceled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := copyFile(canceled, src, dst); !errors.Is(err, context.Canceled) {
-		t.Fatalf("copy on a canceled context = %v, want context.Canceled", err)
+	p.cancel()
+	// Hold the native copy at partial progress until the watcher sets
+	// pbCancel. PROGRESS_CONTINUE lets CopyFileExW observe the flag itself.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-p.watcherDone:
+		if atomic.LoadInt32(p.flag) != 1 {
+			p.err = errors.New("copy watcher returned without setting pbCancel")
+		}
+	case <-timer.C:
+		p.err = errors.New("copy watcher did not set pbCancel within 5 seconds")
 	}
-	// A copy that is canceled while it runs. The file is large so that the
-	// copy outlasts the cancellation; the test skips when the file system
-	// copies it before the cancellation arrives (for example a ReFS clone).
-	big := filepath.Join(dir, "big")
-	f, err := os.Create(big)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(2 << 30); err != nil {
-		f.Close()
-		t.Skipf("the large source file could not be created: %v", err)
-	}
-	f.Close()
-	bigDst := filepath.Join(dir, "big-dst")
-	ctx, cancelMid := context.WithCancel(context.Background())
-	time.AfterFunc(time.Millisecond, cancelMid)
-	err = copyFile(ctx, big, bigDst)
-	if err == nil {
-		t.Skip("the copy finished before the cancellation arrived")
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled copy = %v, want context.Canceled", err)
-	}
-	if _, err := os.Stat(bigDst); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("partial copy remains after a canceled copy: %v", err)
-	}
+	return progressContinue
 }
 
 func TestCreateRejectsUndersizedLinuxBaseDisk(t *testing.T) {
