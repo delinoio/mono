@@ -1,0 +1,34 @@
+{
+  "gid": "inv-07-native-prepare",
+  "commit": "f632cf7b8d3e778f18df1ab7a2c29d553b9ded74",
+  "nativeValidation": {
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "status": "pending",
+    "sha": "f632cf7b8d3e778f18df1ab7a2c29d553b9ded74",
+    "setup": "Run in native Windows PowerShell from a short-path checkout containing 8c90863a7ecce91e40fb0ac20ce57e67d5200bda. Put Git for Windows, Node.js 24.22.3 and pnpm 10.26.2 on PATH. Run the first command, copy the script and bundle to the listed paths, then run the validation command. The bundle transfers the worker commit without a push.",
+    "commands": [
+      "New-Item -ItemType Directory -Force .t3-tmp/validation | Out-Null",
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '.t3-tmp/validation/verify-native-prepare.ps1' -Repository '.' -Bundle '.t3-tmp/validation/native-prepare.bundle' -Revision 'f632cf7b8d3e778f18df1ab7a2c29d553b9ded74' -ScratchRoot '.t3-tmp/validation' 2>&1 | Tee-Object '.t3-tmp/validation/windows-prepare.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "The probe prints Node.js 24, pnpm 10.26.2, Git for Windows, and verifies the absence of sh and Git Bash from PATH.",
+      "At f632cf7b8d3e778f18df1ab7a2c29d553b9ded74, the default frozen install creates a Lefthook-managed pre-commit hook in a fresh clone with spaces in its path. The explicit pnpm run prepare and focused hook suite pass. The focused suite has four POSIX-only cases on Windows.",
+      "A second fresh clone at f632cf7b8d3e778f18df1ab7a2c29d553b9ded74 installs with --ignore-scripts and has no pre-commit hook. The probe exits 0."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-07-native-prepare/worker/.t3-tmp/validation/verify-native-prepare.ps1",
+      "copyTo": ".t3-tmp/validation/verify-native-prepare.ps1",
+      "bundleCopyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-07-native-prepare/worker/.t3-tmp/validation/native-prepare.bundle",
+      "bundleCopyTo": ".t3-tmp/validation/native-prepare.bundle",
+      "regressionTest": "scripts/ci/install-git-hooks.test.mjs",
+      "outputLogs": [".t3-tmp/validation/windows-prepare.log"]
+    },
+    "crossBuild": {
+      "status": "not-applicable",
+      "reason": "The modified entry point and fixtures are JavaScript. The installer invokes the existing pinned, prebuilt Lefthook executable for the host.",
+      "command": "node --check scripts/install-git-hooks.mjs && node --check scripts/ci/install-git-hooks.test.mjs && node --check scripts/ci/plan.mjs && node --check scripts/ci/plan.test.mjs"
+    }
+  }
+}
