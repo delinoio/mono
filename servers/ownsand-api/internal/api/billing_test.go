@@ -1019,7 +1019,11 @@ func newLinkAttemptFixture(t *testing.T, owner string, opts ...testenv.Option) *
 }
 
 func (f *linkAttemptFixture) link(c *testenv.Clients, account string) error {
-	_, err := c.Billing.LinkBillingAccount(context.Background(), connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: f.org.ID, BillingAccountId: account}))
+	return f.linkWithContext(context.Background(), c, account)
+}
+
+func (f *linkAttemptFixture) linkWithContext(ctx context.Context, c *testenv.Clients, account string) error {
+	_, err := c.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: f.org.ID, BillingAccountId: account}))
 	return err
 }
 
