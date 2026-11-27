@@ -1,0 +1,59 @@
+{
+  "gid": "inv-34-macos-build-detach",
+  "commit": "63f3b8e5dec4a5fb00b3847b597419c596df03fb",
+  "nativeValidation": {
+    "status": "pending",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "platform": "macOS Apple silicon",
+    "runnerElevated": false,
+    "setup": "Use an ordinary macOS account with the Go toolchain and Xcode Command Line Tools. Run all commands in one shell from the clean checkout of the commit in this result, or from a source-identical integration checkout. Copy the probe to files.copyTo after creating the directory. Record the actual revision and check that the probe is the only overlay.",
+    "commands": [
+      "set -e; set -o pipefail",
+      "git rev-parse HEAD && git status --porcelain=v1 && go version && go env GOHOSTOS GOHOSTARCH && sw_vers",
+      "mkdir -p \".t3-tmp/macos-build-detach\"",
+      "macos_validation_dir=\"$(git rev-parse --show-toplevel)/.t3-tmp/macos-build-detach\"; export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp\" COPYFILE_DISABLE=1 CGO_ENABLED=1 GOOS=darwin GOARCH=arm64",
+      "test -f \"$macos_validation_dir/native_staging_probe_test.go\"",
+      "printf '%s\\n' '{\"Replace\":{\"cmds/ownsand-agent/internal/imagebuild/native_staging_probe_test.go\":\".t3-tmp/macos-build-detach/native_staging_probe_test.go\"}}' > \"$macos_validation_dir/native-overlay.json\"",
+      "go vet -mod=readonly ./cmds/ownsand-agent/internal/imagebuild 2>&1 | tee \"$macos_validation_dir/native-vet.log\"",
+      "go build -mod=readonly -o \"$macos_validation_dir/ownsand-agent-darwin-arm64\" ./cmds/ownsand-agent 2>&1 | tee \"$macos_validation_dir/native-build.log\"",
+      "go test -mod=readonly -overlay \"$macos_validation_dir/native-overlay.json\" -c -o \"$macos_validation_dir/imagebuild.test\" ./cmds/ownsand-agent/internal/imagebuild",
+      "/usr/bin/codesign --force --sign - --entitlements \"cmds/ownsand-agent/entitlements.plist\" \"$macos_validation_dir/imagebuild.test\"",
+      "/usr/bin/codesign --verify --strict \"$macos_validation_dir/imagebuild.test\"",
+      "\"$macos_validation_dir/imagebuild.test\" -test.v -test.timeout=8m -test.run \"^TestMacOSNativeStagingProbe$\" 2>&1 | tee \"$macos_validation_dir/native-probe.log\"",
+      "\"$macos_validation_dir/imagebuild.test\" -test.v -test.timeout=5m -test.run \"^Test(WithAttachedDisk.*|DataVolumeUnmountBeforeDetach|MacOSBuildCleanupRealProcesses|MacOSStaleBuildRemoval|MacOSImageFirstBootShutdown)$\" 2>&1 | tee \"$macos_validation_dir/native-fixtures.log\""
+    ],
+    "expectedResults": [
+      "Native vet succeeds and the cgo agent builds on Darwin arm64. The ad-hoc signature verifies.",
+      "The probe attaches two disposable GUID-partitioned HFS+ disk images. With unmount and detach failures injected, the build error identifies provisioning, unmount, detach and the staging path. The guest sentinel remains readable from the native mount.",
+      "The real mount inventory refuses cleanup when a mounted volume is below staging, including a volume from an image outside staging. The real hdiutil inventory refuses cleanup when only the staged disk remains attached. After actual detach clears both states, staging is removed.",
+      "The native fixtures pass. They include successful forced detach with failure cleanup, and normal image publication after the first-boot guest fixture reports Stopped."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-macos-build-detach/worker/.t3-tmp/macos-build-detach/native_staging_probe_test.go",
+      "copyTo": ".t3-tmp/macos-build-detach/native_staging_probe_test.go",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/attach_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/attach_unix_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/macos_staging_test.go",
+        "cmds/ownsand-agent/internal/imagebuild/macos_darwin_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/macos-build-detach/native-vet.log",
+        ".t3-tmp/macos-build-detach/native-build.log",
+        ".t3-tmp/macos-build-detach/native-probe.log",
+        ".t3-tmp/macos-build-detach/native-fixtures.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-macos-build-detach/worker/.t3-tmp/macos-build-detach/imagebuild-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-macos-build-detach/worker/.t3-tmp/macos-build-detach/ownsand-agent-darwin-arm64",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-34-macos-build-detach/worker/.t3-tmp/macos-build-detach/native-staging-probe-darwin-arm64.test"
+      ]
+    },
+    "unavailableScenarios": [
+      "The complete privileged macOS base-image build and real VM publication require a compatible Apple IPSW and administrator privileges. The assigned native host has neither. The publication fixture uses the native build path with a loopback guest helper and synthetic VM state.",
+      "The unprivileged disk probe uses HFS+ and injects unmount and detach errors while preserving a real mount. It does not reproduce an actual APFS Data-volume provisioning failure. That end-to-end case needs a disposable macOS guest image and privileged mounting."
+    ],
+    "sha": "63f3b8e5dec4a5fb00b3847b597419c596df03fb"
+  }
+}
