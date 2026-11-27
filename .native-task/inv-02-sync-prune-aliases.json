@@ -1,0 +1,94 @@
+{
+  "gid": "inv-02-sync-prune-aliases",
+  "commit": "60f139d010d9dd38a3c1f18c29b5678fc6bdc1ae",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "60f139d010d9dd38a3c1f18c29b5678fc6bdc1ae",
+    "windows": {
+      "status": "pending",
+      "host": "delino-win-1",
+      "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+      "setup": "Run in Windows PowerShell 5.1 at the repository root of a disposable checkout. Create the validation directory, then copy the standalone probe to the listed destination. Use local NTFS storage. Record the revision and filesystem.",
+      "commands": [
+        "git rev-parse HEAD",
+        "$PSVersionTable.PSVersion",
+        "& \"$env:SystemRoot\\System32\\tar.exe\" --version",
+        "New-Item -ItemType Directory -Force '.t3-tmp/native', '.t3-tmp/validation' | Out-Null",
+        "$fixtureTemp = (Resolve-Path '.t3-tmp/native').Path",
+        "$env:TEMP = $fixtureTemp; $env:TMP = $fixtureTemp; $env:GOTMPDIR = $fixtureTemp",
+        "Get-Volume -DriveLetter ($fixtureTemp.Substring(0,1)) | Select-Object DriveLetter,FileSystem",
+        "go test -v -count=1 ./go/sandrun -run '^(TestWindowsGuestSyncDirectoryAliasReplacement|TestWindowsGuestAliasPruneIdentity|TestWindowsGuestCleanup|TestPruneDirsAliases)$' 2>&1 | Tee-Object '.t3-tmp/validation/windows-alias-tests.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "go build -o '.t3-tmp/validation/sandrun.exe' ./cmds/sandrun; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        "go run '.t3-tmp/validation/alias-cli-smoke.go' '.t3-tmp/validation/sandrun.exe' 2>&1 | Tee-Object '.t3-tmp/validation/windows-cli-smoke.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+      ],
+      "expectedResults": [
+        "The recorded checkout is the worker revision or a verified copy of its source. Windows PowerShell reports 5.1, system tar.exe reports its version, and the workspace volume reports NTFS.",
+        "The CLI probe logs alias=true for both case scenarios. The replacement reports one upload and one deletion, installs bytes new at assets, and records only assets in the manifest. The guest-only scenario fails during apply and preserves the sentinel bytes and the previous manifest bytes. Both scenarios remove their auxiliary inputs and lock.",
+        "The exact-spelling cases use the ordinary prune list. The native identity test keeps existing distinct directories, skips a missing incoming ancestor and a nested junction with its target, and removes a matching directory chain.",
+        "The case-sensitive scenarios report alias=false, remove the tracked leaf, retain Assets/nested and the sentinel when present, and install assets independently. If fsutil cannot enable the flag, record its diagnostic and the skipped case-sensitive scenarios. The distinct existing-directory identity test is an independent control.",
+        "Cleanup removes the alias list and continues through all other cleanup inputs when one input is held open."
+      ],
+      "files": {
+        "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/alias-cli-smoke.go",
+        "copyTo": ".t3-tmp/validation/alias-cli-smoke.go",
+        "source": [
+          "go/sandrun/guest.go",
+          "go/sandrun/sync.go",
+          "go/sandrun/sync_case_test.go",
+          "go/sandrun/sync_test.go",
+          "go/sandrun/guest_windows_test.go"
+        ],
+        "outputLogs": [
+          ".t3-tmp/validation/windows-alias-tests.log",
+          ".t3-tmp/validation/windows-cli-smoke.log"
+        ],
+        "crossBuildArtifacts": [
+          "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/sandrun-windows.test.exe",
+          "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/sandrun-windows.exe",
+          "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/alias-cli-smoke-windows.exe"
+        ]
+      }
+    },
+    "macos": {
+      "status": "pending",
+      "host": "m3-16",
+      "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+      "setup": "Run in Bash at the repository root of a disposable APFS checkout. Create the validation directory, then copy the standalone probe to the listed destination. Record the revision and filesystem.",
+      "commands": [
+        "set -o pipefail",
+        "git rev-parse HEAD",
+        "mkdir -p '.t3-tmp/native' '.t3-tmp/validation'",
+        "export TMPDIR=\"$PWD/.t3-tmp/native\" GOTMPDIR=\"$PWD/.t3-tmp/native\"",
+        "diskutil info \"$(df -P \"$TMPDIR\" | awk 'NR == 2 { print $1 }')\"",
+        "tar --version",
+        "go test -v -count=1 ./go/sandrun -run '^(TestPruneDirs.*|TestSyncCaseOnlyReplacement|TestSyncNormalization.*|TestSyncReplacesDirectoryWithFile)$' 2>&1 | tee '.t3-tmp/validation/macos-alias-tests.log'",
+        "go build -o '.t3-tmp/validation/sandrun' ./cmds/sandrun",
+        "go run '.t3-tmp/validation/alias-cli-smoke.go' '.t3-tmp/validation/sandrun' 2>&1 | tee '.t3-tmp/validation/macos-cli-smoke.log'"
+      ],
+      "expectedResults": [
+        "The recorded checkout is the worker revision or a verified copy of its source. The test volume reports APFS and the normalization scenarios log alias=true.",
+        "On the normalization-alias volume, the CLI installs the incoming regular file with bytes new, reports one upload and one deletion, and records the decomposed incoming spelling as the only manifest key. With a guest-only file, apply fails and preserves its bytes and the previous manifest bytes. Both runs remove their auxiliary inputs and lock.",
+        "The case-only and exact-spelling controls and collision checks pass. The Linux ext4 runs already cover the distinct-normalization control."
+      ],
+      "files": {
+        "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/alias-cli-smoke.go",
+        "copyTo": ".t3-tmp/validation/alias-cli-smoke.go",
+        "source": [
+          "go/sandrun/guest.go",
+          "go/sandrun/sync.go",
+          "go/sandrun/sync_case_test.go",
+          "go/sandrun/sync_test.go"
+        ],
+        "outputLogs": [
+          ".t3-tmp/validation/macos-alias-tests.log",
+          ".t3-tmp/validation/macos-cli-smoke.log"
+        ],
+        "crossBuildArtifacts": [
+          "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/sandrun-darwin-arm64.test",
+          "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/sandrun-darwin-arm64",
+          "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-02-sync-prune-aliases/worker/.t3-tmp/alias-cli-smoke-darwin-arm64"
+        ]
+      }
+    }
+  }
+}
