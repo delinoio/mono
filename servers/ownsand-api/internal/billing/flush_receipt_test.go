@@ -9,11 +9,14 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
@@ -190,17 +193,9 @@ type proxiedFixture struct {
 func newProxiedFixture(t *testing.T, start time.Time) *proxiedFixture {
 	t.Helper()
 	direct := dbtest.NewURL(t)
-	u, err := url.Parse(direct)
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxy := newCommitProxy(t, u.Host)
-	u.Host = proxy.addr
-	q := u.Query()
-	q.Set("sslmode", "disable")
-	u.RawQuery = q.Encode()
+	proxy := newCommitProxy(t, commitProxyUpstream(t, direct))
 	ctx := context.Background()
-	writer, err := db.Open(ctx, u.String())
+	writer, err := db.Open(ctx, commitProxyWriterURL(t, direct, proxy.addr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,6 +208,92 @@ func newProxiedFixture(t *testing.T, start time.Time) *proxiedFixture {
 	f := newFixture(t, start)
 	f.db = reader
 	return &proxiedFixture{fixture: f, proxy: proxy, writer: writer}
+}
+
+func commitProxyUpstream(t *testing.T, direct string) string {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(direct)
+	if err != nil {
+		t.Fatal("parse commit proxy upstream: invalid database configuration")
+	}
+	conn := cfg.ConnConfig
+	return net.JoinHostPort(conn.Host, strconv.Itoa(int(conn.Port)))
+}
+
+func commitProxyWriterURL(t *testing.T, direct, proxyAddr string) string {
+	t.Helper()
+	u, err := url.Parse(direct)
+	if err != nil {
+		t.Fatal("rewrite commit proxy writer: invalid database URL")
+	}
+	u.Host = proxyAddr
+
+	// pgx gives query settings precedence over the authority. Keep the
+	// remaining pairs verbatim and in order so the generated dbname stays
+	// last and pgx decodes other settings as it did for the direct URL.
+	var query []string
+	for pair := range strings.SplitSeq(u.RawQuery, "&") {
+		rawKey, _, _ := strings.Cut(pair, "=")
+		key, _ := url.PathUnescape(strings.Trim(rawKey, " "))
+		switch key {
+		case "", "host", "port", "sslmode":
+			continue
+		}
+		query = append(query, pair)
+	}
+	u.RawQuery = strings.Join(append(query, "sslmode=disable"), "&")
+	return u.String()
+}
+
+func TestCommitProxyEndpoints(t *testing.T) {
+	t.Setenv("PGSERVICE", "")
+	t.Setenv("PGSERVICEFILE", "")
+
+	for _, test := range []struct {
+		name      string
+		authority string
+		pgport    string
+		query     string
+		upstream  string
+	}{
+		{name: "default port", authority: "127.0.0.1", upstream: "127.0.0.1:5432"},
+		{name: "IPv6", authority: "[::1]", upstream: "[::1]:5432"},
+		{name: "PGPORT", authority: "127.0.0.1", pgport: "55432", upstream: "127.0.0.1:55432"},
+		{name: "authority port overrides PGPORT", authority: "127.0.0.1:55433", pgport: "55432", upstream: "127.0.0.1:55433"},
+		{name: "query port without authority port", authority: "127.0.0.1", query: "&port=55434", upstream: "127.0.0.1:55434"},
+		{
+			name:      "query settings override authority and PGPORT",
+			authority: "127.0.0.1:55433",
+			pgport:    "55432",
+			query:     "&host=127.0.0.2&port=55433&%70ort=55434&ssl=true",
+			upstream:  "127.0.0.2:55434",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PGPORT", test.pgport)
+			const database = "ownsand_test_example"
+			const proxyAddr = "127.0.0.1:55555"
+			direct := "postgres://fixture@" + test.authority + "/" + database +
+				"?sslmode=disable&database=postgres&application_name=receipt+test" + test.query + "&dbname=" + database
+			if upstream := commitProxyUpstream(t, direct); upstream != test.upstream {
+				t.Fatalf("proxy upstream = %q, want %q", upstream, test.upstream)
+			}
+			cfg, err := pgxpool.ParseConfig(commitProxyWriterURL(t, direct, proxyAddr))
+			if err != nil {
+				t.Fatal("parse proxy writer: invalid database configuration")
+			}
+			conn := cfg.ConnConfig
+			if conn.Host != "127.0.0.1" || conn.Port != 55555 {
+				t.Fatalf("writer host and port = %q and %d, want %s", conn.Host, conn.Port, proxyAddr)
+			}
+			if conn.Database != database || conn.TLSConfig != nil {
+				t.Fatalf("writer database = %q and TLS enabled = %t, want %q and plaintext", conn.Database, conn.TLSConfig != nil, database)
+			}
+			if name := conn.RuntimeParams["application_name"]; name != "receipt+test" {
+				t.Fatalf("writer application_name = %q, want receipt+test", name)
+			}
+		})
+	}
 }
 
 func (f *proxiedFixture) meteringViaProxy() *billing.Metering {

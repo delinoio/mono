@@ -19,6 +19,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 const (
@@ -662,6 +663,8 @@ func TestRunPollOnLeaseReacquisition(t *testing.T) {
 			states := make(chan ownership)
 			statuses := billing.NewStatuses(billing.StatusOptions{
 				DB: f.db, Logger: f.logger, Client: f.fake.Client(), Timing: &timing,
+				// Only the poll loop takes a step on the fixture's channel.
+				WhileHeld: func(func(*lease.Period)) bool { return false },
 				Ownership: func() (uint64, bool) {
 					select {
 					case samples <- struct{}{}:

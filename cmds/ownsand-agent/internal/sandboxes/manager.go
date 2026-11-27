@@ -1473,6 +1473,16 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 }
 
+// StateEntry returns the current entry of a known sandbox.
+func (m *Manager) StateEntry(id string) *ownsandv1.SandboxStateEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sb := m.sandboxes[id]; sb != nil {
+		return sb.rec.Entry(m.epoch)
+	}
+	return nil
+}
+
 // StateReport returns the full state of the device for a new channel.
 func (m *Manager) StateReport(seq uint64, builtImages []ownsandv1.BaseImage) *ownsandv1.StateReport {
 	m.mu.Lock()

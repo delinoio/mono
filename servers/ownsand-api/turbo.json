@@ -30,6 +30,7 @@
         "LOGTO_TOKEN_ENDPOINT",
         "ACCOUNTS_M2M_CLIENT_ID",
         "ACCOUNTS_M2M_CLIENT_SECRET",
+        "BILLING_WRITE_OWNER_UNLINKS",
         "METRICS_ADDR",
         "OTEL_*"
       ]
