@@ -31,8 +31,8 @@ func runConn(c *Conn, recv func() (*ownsandv1.DataFrame, error), send func(*owns
 	return done
 }
 
-// blockedSend returns a send that blocks until the returned release function
-// runs, like a stream.Send stalled on flow control.
+// blockedSend returns a send that blocks until test cleanup, like a
+// stream.Send stalled on flow control.
 func blockedSend(t *testing.T) (send func(*ownsandv1.DataFrame) error, entered <-chan struct{}) {
 	t.Helper()
 	release := make(chan struct{})
@@ -71,7 +71,7 @@ func TestRunClosesIdleConnectionWhileSendBlocks(t *testing.T) {
 	c, clk := newIdleTestConn(t)
 	send, entered := blockedSend(t)
 	done := runConn(c, blockingRecv(c), send)
-	awaitIdleSendEntry(t, entered, done)
+	awaitSendEntry(t, entered, done)
 	s := openStream(t, c)
 	clk.advance(testLimits.IdleTimeout + time.Millisecond)
 	if err := waitRun(t, done, time.Second); !errors.Is(err, ErrIdle) {
@@ -142,8 +142,9 @@ func TestRunReturnsOnCloseWhileSendBlocks(t *testing.T) {
 			limits.IdleTimeout = time.Minute
 			c := NewConn(context.Background(), "device", 1, limits)
 			send, entered := blockedSend(t)
+			t.Cleanup(func() { c.Close(ErrConnClosed) })
 			done := runConn(c, blockingRecv(c), send)
-			<-entered
+			awaitSendEntry(t, entered, done)
 			c.Close(cause)
 			if err := waitRun(t, done, time.Second); !errors.Is(err, cause) {
 				t.Fatalf("Run = %v, want %v", err, cause)
