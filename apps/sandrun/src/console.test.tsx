@@ -56,6 +56,7 @@ import {
 } from "@delino/sandrun-protos/v1/member_pb";
 import {
   GetOrganizationResponseSchema,
+  type Organization,
   OrganizationService,
 } from "@delino/sandrun-protos/v1/organization_pb";
 import {
@@ -161,6 +162,12 @@ async function click(element: HTMLElement) {
 async function type(element: HTMLElement, value: string) {
   await act(async () => {
     fireEvent.input(element, { target: { value } });
+  });
+}
+
+async function refetch(queryClient: QueryClient) {
+  await act(async () => {
+    await queryClient.refetchQueries({ type: "active" });
   });
 }
 
@@ -1469,7 +1476,7 @@ describe("GitHub setup callback", () => {
       ...mock,
       async unary(method, ...args) {
         if (method.name === GitHubService.method.linkGitHubInstallation.name) {
-          linkRequest();
+          linkRequest(args[3]);
           const error = await response;
           if (error !== undefined) throw error;
         }
@@ -1479,13 +1486,278 @@ describe("GitHub setup callback", () => {
     return { transport, completeLink, linkRequest };
   }
 
-  async function submitToGlobex() {
-    await click(
-      await screen.findByRole("combobox", { name: "SandRun organization" }),
-    );
-    await click(await screen.findByRole("option", { name: /Globex/ }));
-    await click(screen.getByRole("button", { name: "Link installation" }));
+  const picker = () =>
+    screen.getByRole("combobox", { name: "SandRun organization" });
+  const submitButton = () =>
+    screen.getByRole<HTMLButtonElement>("button", {
+      name: "Link installation",
+    });
+  const refreshNotice = /The last refresh failed/;
+  const eligibilityNotice = /Only an owner or admin/;
+  const restartNotice = /The installation link is single-use/;
+
+  async function chooseOrganization(name: string) {
+    await screen.findByRole("combobox", { name: "SandRun organization" });
+    await click(picker());
+    await click(await screen.findByRole("option", { name }));
   }
+
+  async function submitToGlobex() {
+    await chooseOrganization("Globex (admin)");
+    await click(submitButton());
+  }
+
+  async function setupRefreshFixture() {
+    const heldLink = holdLinkRequest();
+    const client = createClient(OrganizationService, heldLink.transport);
+    const { organizations } = await client.listOrganizations({});
+    const eligible = organizations.map((org) =>
+      org.organizationId === MOCK_IDS.northwind
+        ? { ...org, callerRole: Role.ADMIN }
+        : org,
+    );
+    let list = async () => eligible;
+    const listRequest = rs.fn();
+    const transport: Transport = {
+      ...heldLink.transport,
+      async unary(method, ...args) {
+        if (method.name !== "ListOrganizations") {
+          return heldLink.transport.unary(method, ...args);
+        }
+        listRequest();
+        const organizations = await list();
+        const response = await heldLink.transport.unary(method, ...args);
+        Object.assign(response.message, { organizations });
+        return response;
+      },
+    };
+    return {
+      ...heldLink,
+      transport,
+      eligible,
+      listRequest,
+      setList(read: () => Promise<Organization[]>) {
+        list = read;
+      },
+      holdList() {
+        let resolve!: (value: Organization[]) => void;
+        let reject!: (error: Error) => void;
+        const response = new Promise<Organization[]>((accept, fail) => {
+          resolve = accept;
+          reject = fail;
+        });
+        list = () => response;
+        return { resolve, reject };
+      },
+    };
+  }
+
+  test("clears a choice that loses eligibility and waits for another choice", async () => {
+    const fixture = await setupRefreshFixture();
+    const queryClient = renderConsole(callbackPath, fixture);
+    await chooseOrganization("Acme Robotics (owner)");
+    const demoted = fixture.eligible.map((org) =>
+      org.organizationId === MOCK_IDS.acme
+        ? { ...org, callerRole: Role.MEMBER }
+        : org,
+    );
+    fixture.setList(async () => demoted);
+    await refetch(queryClient);
+
+    await waitFor(() => expect(submitButton().disabled).toBe(true));
+    expect(picker().textContent?.trim()).toBe("");
+    const form = picker().closest("form")!;
+    fireEvent.submit(form);
+    expect(queryClient.getMutationCache().getAll()).toHaveLength(0);
+    expect(fixture.linkRequest).not.toHaveBeenCalled();
+
+    await click(picker());
+    await screen.findByRole("option", { name: "Globex (admin)" });
+    expect(screen.queryByRole("option", { name: /Acme Robotics/ })).toBeNull();
+    await act(async () => fireEvent.keyDown(picker(), { key: "Escape" }));
+    fixture.setList(async () => fixture.eligible);
+    await refetch(queryClient);
+    if (picker().getAttribute("aria-expanded") !== "true")
+      await click(picker());
+    await screen.findByRole("option", { name: "Acme Robotics (owner)" });
+    await act(async () => fireEvent.keyDown(picker(), { key: "Escape" }));
+    expect(picker().textContent?.trim()).toBe("");
+    expect(submitButton().disabled).toBe(true);
+
+    await chooseOrganization("Globex (admin)");
+    await click(submitButton());
+    expect(fixture.linkRequest).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        organizationId: MOCK_IDS.globex,
+        githubInstallationId: 51000001n,
+        code: "gh_code",
+        state: "mock-state",
+      }),
+    );
+    fixture.completeLink();
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+  });
+
+  test.each([
+    ["unavailable", new ConnectError("offline", Code.Unavailable)],
+    ["internal", new ConnectError("internal", Code.Internal)],
+    ["deadline", new ConnectError("deadline", Code.DeadlineExceeded)],
+    ["network", new TypeError("Failed to fetch")],
+  ] as const)(
+    "keeps the chosen organization through a pending refresh and %s failure",
+    async (failure, error) => {
+      const fixture = await setupRefreshFixture();
+      const queryClient = renderConsole(callbackPath, fixture);
+      await chooseOrganization("Globex (admin)");
+      const originalPicker = picker();
+      const originalForm = originalPicker.closest("form");
+      const pending = fixture.holdList();
+      const refreshing = queryClient.refetchQueries({ type: "active" });
+      await waitFor(() => expect(fixture.listRequest).toHaveBeenCalledTimes(2));
+      expect(
+        screen.queryByRole("status", { name: "Loading your organizations" }),
+      ).toBeNull();
+      expect(picker()).toBe(originalPicker);
+      expect(picker().textContent).toBe("Globex (admin)");
+      expect(submitButton().disabled).toBe(false);
+
+      await act(async () => {
+        pending.reject(error);
+        await refreshing;
+      });
+      const notice = await screen.findByText(refreshNotice);
+      expect(picker()).toBe(originalPicker);
+      expect(picker().closest("form")).toBe(originalForm);
+      expect(picker().textContent).toBe("Globex (admin)");
+      expect(submitButton().disabled).toBe(false);
+      expect(notice.compareDocumentPosition(originalForm!)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+
+      // Exercise both recovery paths: retry the list, or submit from the cache.
+      if (failure === "internal") {
+        fixture.setList(async () => fixture.eligible);
+        await click(screen.getByRole("button", { name: "Try again" }));
+        expect(screen.queryByText(refreshNotice)).toBeNull();
+        expect(picker()).toBe(originalPicker);
+        expect(picker().textContent).toBe("Globex (admin)");
+      }
+      await click(submitButton());
+      expect(fixture.linkRequest).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ organizationId: MOCK_IDS.globex }),
+      );
+      fixture.completeLink();
+      expect(await screen.findByText(installationName)).toBeTruthy();
+    },
+  );
+
+  test("keeps the eligibility notice through a transient failure and retry", async () => {
+    const fixture = await setupRefreshFixture();
+    fixture.setList(async () => []);
+    const queryClient = renderConsole(callbackPath, fixture);
+    const notice = await screen.findByText(eligibilityNotice);
+    fixture.setList(async () => {
+      throw new ConnectError("internal", Code.Internal);
+    });
+    await refetch(queryClient);
+    expect(await screen.findByText(refreshNotice)).toBeTruthy();
+    expect(screen.getByText(eligibilityNotice)).toBe(notice);
+    expect(fixture.linkRequest).not.toHaveBeenCalled();
+
+    fixture.setList(async () => []);
+    await click(screen.getByRole("button", { name: "Try again" }));
+    expect(screen.queryByText(refreshNotice)).toBeNull();
+    expect(screen.getByText(eligibilityNotice)).toBe(notice);
+  });
+
+  test.each([
+    ["not found", Code.NotFound],
+    ["permission denied", Code.PermissionDenied],
+    ["unauthenticated", Code.Unauthenticated],
+  ] as const)(
+    "shows a full notice after a %s refresh error",
+    async (_, code) => {
+      const fixture = await setupRefreshFixture();
+      const queryClient = renderConsole(callbackPath, fixture);
+      await chooseOrganization("Globex (admin)");
+      fixture.setList(async () => {
+        throw new ConnectError("List failed", code);
+      });
+      await refetch(queryClient);
+
+      const main = within(screen.getByRole("main"));
+      expect(await main.findByRole("alert")).toBeTruthy();
+      expect(main.queryByRole("combobox")).toBeNull();
+      expect(main.queryByText(refreshNotice)).toBeNull();
+      expect(window.location.search).toBe("");
+      expect(fixture.linkRequest).not.toHaveBeenCalled();
+      if (code === Code.Unauthenticated) {
+        expect(
+          main.getByRole("button", { name: "Sign in with Delino" }),
+        ).toBeTruthy();
+        expect(main.queryByRole("button", { name: "Try again" })).toBeNull();
+        return;
+      }
+
+      fixture.setList(async () => fixture.eligible);
+      await click(main.getByRole("button", { name: "Try again" }));
+      expect(picker().textContent).toBe("Globex (admin)");
+      expect(submitButton().disabled).toBe(false);
+      await click(submitButton());
+      expect(fixture.linkRequest).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ code: "gh_code", state: "mock-state" }),
+      );
+      fixture.completeLink();
+      expect(await screen.findByText(installationName)).toBeTruthy();
+    },
+  );
+
+  test.each(["error", "zero eligible"] as const)(
+    "keeps the link operation in view after a late organization refresh returns %s",
+    async (result) => {
+      const fixture = await setupRefreshFixture();
+      const queryClient = renderConsole(callbackPath, fixture);
+      await chooseOrganization("Globex (admin)");
+      const pending = fixture.holdList();
+      const refreshing = queryClient.refetchQueries({ type: "active" });
+      await waitFor(() => expect(fixture.listRequest).toHaveBeenCalledTimes(2));
+      await click(submitButton());
+      expect(fixture.linkRequest).toHaveBeenCalledTimes(1);
+
+      const linkStatus = screen.getByRole("status", {
+        name: "Linking the GitHub installation",
+      });
+      await act(async () => {
+        if (result === "error") {
+          pending.reject(new ConnectError("List failed", Code.Unauthenticated));
+        } else {
+          pending.resolve([]);
+        }
+        await refreshing;
+      });
+      expect(linkStatus.isConnected).toBe(true);
+      expect(screen.queryByText(eligibilityNotice)).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Sign in with Delino" }),
+      ).toBeNull();
+      await refetch(queryClient);
+      expect(fixture.listRequest).toHaveBeenCalledTimes(2);
+
+      fixture.completeLink(
+        new ConnectError(
+          "The installation state expired",
+          Code.FailedPrecondition,
+        ),
+      );
+      expect(await screen.findByText(restartNotice)).toBeTruthy();
+      await refetch(queryClient);
+      expect(screen.getByText("The installation state expired")).toBeTruthy();
+      expect(screen.queryByText(eligibilityNotice)).toBeNull();
+      expect(fixture.listRequest).toHaveBeenCalledTimes(2);
+      expect(fixture.linkRequest).toHaveBeenCalledTimes(1);
+    },
+  );
 
   test("waits for the last page before offering every eligible organization", async () => {
     let releaseLastPage!: () => void;
@@ -3494,12 +3766,6 @@ describe("failed query refreshes", () => {
         failContinuationOnly = continuationOnly;
       },
     };
-  }
-
-  async function refetch(queryClient: QueryClient) {
-    await act(async () => {
-      await queryClient.refetchQueries({ type: "active" });
-    });
   }
 
   for (const [name, error] of [
