@@ -14,6 +14,8 @@ import (
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 // Control runs the lease holder's background work: the control event
@@ -33,6 +35,8 @@ type Control struct {
 	// cursorGen changes when acquisition starts or the lease is lost.
 	// Reads and event batches use it to detect a change of lease period.
 	cursorGen uint64
+	// firstChannelGen is the first generation this period can register.
+	firstChannelGen uint64
 	// retryBaseline allows polling to establish the baseline after the
 	// acquisition read has failed in this lease period.
 	retryBaseline bool
@@ -46,7 +50,7 @@ type Control struct {
 	// not be handled for a transient reason and must be delivered again:
 	// processEvents stops the batch at that event and the next poll reads
 	// from it. A nil return means the event is done or deliberately skipped.
-	handleEvent func(ctx context.Context, e events.Event) error
+	handleEvent func(ctx context.Context, e events.Event, channels channelGenerations) error
 	// loadDeleteTarget reads the sandbox of a delete event. NewControl sets
 	// it to loadSandbox on the pool; tests replace it to fail the lookup.
 	loadDeleteTarget func(ctx context.Context, orgID, sandboxID string) (*sandboxRow, error)
@@ -103,6 +107,7 @@ func (c *Control) LeaseAcquired(ctx context.Context) {
 	c.mu.Lock()
 	c.cursorGen++
 	gen := c.cursorGen
+	c.firstChannelGen = c.S.Hub.LastGeneration() + 1
 	c.cursor = -1
 	c.retryBaseline = false
 	c.mu.Unlock()
@@ -206,9 +211,7 @@ func (c *Control) runEvents(ctx context.Context) {
 		case <-t.C:
 		case <-c.kick:
 		}
-		if c.held() {
-			c.processEvents(ctx)
-		}
+		c.processEvents(ctx)
 	}
 }
 
@@ -228,9 +231,28 @@ func (c *Control) runEvents(ctx context.Context) {
 // later events and the janitor's cleanup (it deletes only up to the cursor)
 // for as long as it lasts; there is no retry bound.
 func (c *Control) processEvents(ctx context.Context) {
-	c.mu.Lock()
-	cursor, gen, retryBaseline := c.cursor, c.cursorGen, c.retryBaseline
-	c.mu.Unlock()
+	if c.S.Lease == nil {
+		return
+	}
+	var (
+		period        *lease.Period
+		cursor        int64
+		gen           uint64
+		retryBaseline bool
+	)
+	if !c.S.Lease.WhileHeld(func(held *lease.Period) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		period = held
+		cursor, gen, retryBaseline = c.cursor, c.cursorGen, c.retryBaseline
+	}) {
+		return
+	}
+	if period != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = period.ContextUntilLoss(ctx)
+		defer cancel()
+	}
 	if cursor < 0 {
 		if retryBaseline {
 			c.initCursor(ctx, gen)
@@ -238,7 +260,7 @@ func (c *Control) processEvents(ctx context.Context) {
 		return
 	}
 	for {
-		if !c.cursorCurrent(gen) {
+		if ctx.Err() != nil || !c.cursorCurrent(gen) {
 			return
 		}
 		batch, err := c.readEvents(ctx, cursor, 500)
@@ -249,11 +271,16 @@ func (c *Control) processEvents(ctx context.Context) {
 			return
 		}
 		for _, e := range batch {
-			if !c.cursorCurrent(gen) {
+			channels, admitted := c.admitEvent(period, gen)
+			if !admitted {
 				c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", cursor))
 				return
 			}
-			if err := c.handleEvent(ctx, e); err != nil {
+			if ctx.Err() != nil {
+				c.storeCursor(gen, cursor)
+				return
+			}
+			if err := c.handleEvent(ctx, e, channels); err != nil {
 				// The cursor stays at the event before e, so the next poll
 				// delivers e again. A canceled context is a shutdown, not a
 				// failure of the event.
@@ -292,27 +319,56 @@ func (c *Control) storeCursor(gen uint64, cursor int64) bool {
 	return true
 }
 
-// cursorCurrent reports whether the lease generation still matches gen.
 func (c *Control) cursorCurrent(gen uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.cursorGen == gen
 }
 
+// channelGenerations identifies the channels registered in a lease period by
+// the time an event was admitted. Data path records use the same generations.
+type channelGenerations struct {
+	first, last uint64
+}
+
+func (g channelGenerations) contains(generation uint64) bool {
+	return g.first <= generation && generation <= g.last
+}
+
+func (g channelGenerations) includes(conn *hub.Conn) bool {
+	return conn != nil && g.contains(conn.Generation)
+}
+
+// admitEvent checks ownership and the cursor generation before capturing the
+// channel range. Channel registration uses the same ownership lock. A later
+// channel reads state after the event committed, so it reconciles that state
+// without this delivery.
+func (c *Control) admitEvent(period *lease.Period, gen uint64) (channels channelGenerations, admitted bool) {
+	c.S.Lease.WhileHeld(func(held *lease.Period) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if held == period && c.cursorGen == gen {
+			channels = channelGenerations{first: c.firstChannelGen, last: c.S.Hub.LastGeneration()}
+			admitted = true
+		}
+	})
+	return channels, admitted
+}
+
 // handle delivers one control event. It returns an error only for a failure
 // that a later attempt can recover from (see Control.handleEvent); every
 // other outcome, including a skipped event, returns nil.
-func (c *Control) handle(ctx context.Context, e events.Event) error {
+func (c *Control) handle(ctx context.Context, e events.Event, channels channelGenerations) error {
 	s := c.S
 	switch e.Kind {
 	case events.KindDeviceConfigChanged:
-		if conn := s.Hub.Get(e.DeviceID); conn != nil {
+		if conn := s.Hub.Get(e.DeviceID); channels.includes(conn) {
 			_ = s.sendConfiguration(ctx, conn)
 		}
 	case events.KindAgentPolicyChanged:
 		var retryErr error
 		for _, conn := range s.Hub.All() {
-			if conn.OrganizationID != e.OrganizationID || s.Hub.Live(conn.DeviceID) != conn {
+			if !channels.includes(conn) || conn.OrganizationID != e.OrganizationID || s.Hub.Live(conn.DeviceID) != conn {
 				continue
 			}
 			// Keep delivering to healthy channels. If a send closes the
@@ -326,7 +382,7 @@ func (c *Control) handle(ctx context.Context, e events.Event) error {
 		return retryErr
 	case events.KindSandboxDeleteRequested:
 		conn := s.Hub.Live(e.DeviceID)
-		if conn == nil {
+		if !channels.includes(conn) {
 			return nil
 		}
 		c.mu.Lock()
@@ -350,15 +406,15 @@ func (c *Control) handle(ctx context.Context, e events.Event) error {
 		}
 		s.sendDelete(ctx, conn, e.OrganizationID, pendingDelete{sandboxID: sb.ID, reason: sb.DeleteEndReason})
 	case events.KindSnapshotDeleted:
-		if conn := s.Hub.Live(e.DeviceID); conn != nil {
+		if conn := s.Hub.Live(e.DeviceID); channels.includes(conn) {
 			s.sendDeleteSnapshot(ctx, conn, e.OrganizationID, e.SnapshotID)
 		}
 	case events.KindDeviceRemoved:
 		if s.DataPath != nil {
-			s.DataPath.HandleEvent(ctx, e)
+			s.DataPath.HandleEvent(ctx, e, channels)
 		}
 		conn := s.Hub.Get(e.DeviceID)
-		if conn == nil {
+		if !channels.includes(conn) {
 			return nil
 		}
 		// The clean-up command goes out first; the nil envelope makes the
@@ -371,7 +427,7 @@ func (c *Control) handle(ctx context.Context, e events.Event) error {
 	if s.DataPath != nil {
 		switch e.Kind {
 		case events.KindAPIKeyRevoked, events.KindMembershipEnded, events.KindSandboxDeleted, events.KindOrganizationDeleted:
-			s.DataPath.HandleEvent(ctx, e)
+			s.DataPath.HandleEvent(ctx, e, channels)
 		}
 	}
 	return nil

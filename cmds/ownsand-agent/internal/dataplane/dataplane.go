@@ -78,7 +78,7 @@ type Timing struct {
 	AdmissionTolerance time.Duration
 	// FlushDeadline bounds how long a relay connection of a lost agent
 	// channel may stay open while it flushes its queued session-end frames
-	// and closes its request side (see rconn.closeAfterFlush).
+	// and closes its request side. It counts from channel loss.
 	FlushDeadline time.Duration
 	// ReconnectReset is the time an open relay connection must have lived
 	// before the reconnect back-off restarts at its first step after the
@@ -171,6 +171,7 @@ func (d *DataPlane) ChannelOpened(ch agent.Channel) {
 
 // ChannelLost ends every session and relay grant of the channel.
 func (d *DataPlane) ChannelLost(ch agent.Channel) {
+	d.relay.channelLost(ch, time.Now())
 	gen := ch.Generation()
 	d.mu.Lock()
 	for _, p := range d.pendingSessions {
@@ -186,9 +187,12 @@ func (d *DataPlane) ChannelLost(ch agent.Channel) {
 	}
 	d.mu.Unlock()
 	for _, s := range ended {
-		s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
+		// Stop admission and sends before returning to the reconnect loop.
+		// A buffered peer can finish its bounded drain on its own.
+		if teardown, ok := s.beginEnd(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST); ok {
+			go s.finishEnd(teardown)
+		}
 	}
-	d.relay.channelLost(ch)
 }
 
 // Configure applies the STUN URLs of a configuration message.

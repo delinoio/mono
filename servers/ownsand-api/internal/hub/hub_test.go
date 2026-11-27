@@ -223,14 +223,15 @@ func TestRegisterAdmittedWaitsForFenceOutsideOwnershipLock(t *testing.T) {
 	inFn := make(chan struct{})
 	releaseFn := make(chan struct{})
 	fnDone := make(chan struct{})
-	registrarDone := make(chan struct{})
-	// A fatal assertion ends the test with runtime.Goexit before the normal
-	// release, so the cleanup releases the fence callback and waits for both
-	// workers; otherwise they would stay blocked after the test fails.
+	var registrarDone chan struct{}
+	// Cleanup releases the fence before waiting for the workers that started.
 	release := sync.OnceFunc(func() { close(releaseFn) })
 	t.Cleanup(func() {
 		release()
 		for name, done := range map[string]chan struct{}{"fence holder": fnDone, "registrar": registrarDone} {
+			if done == nil {
+				continue
+			}
 			select {
 			case <-done:
 			case <-time.After(10 * time.Second):
@@ -245,9 +246,16 @@ func TestRegisterAdmittedWaitsForFenceOutsideOwnershipLock(t *testing.T) {
 			<-releaseFn
 		})
 	}()
-	<-inFn
+	select {
+	case <-inFn:
+	case <-fnDone:
+		t.Fatal("IfNoChannel returned before entering the fence callback")
+	case <-time.After(10 * time.Second):
+		t.Fatal("IfNoChannel did not enter the fence callback within 10 seconds")
+	}
 
 	registered := make(chan *Conn, 1)
+	registrarDone = make(chan struct{})
 	go func() {
 		defer close(registrarDone)
 		registered <- h.RegisterAdmitted(context.Background(), "dev", "org", own.admit)
@@ -317,14 +325,20 @@ func TestRegisterAdmittedRefusedLeavesHubUnchanged(t *testing.T) {
 func TestConfigLockWaitersCountsBlockedSenders(t *testing.T) {
 	h := New()
 	conn := h.Register(context.Background(), "device", "org")
-	unlockFirst := conn.LockConfig()
+	unlockFirst, err := conn.LockConfig(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := conn.ConfigLockWaiters(); got != 0 {
 		t.Fatalf("waiters with the lock held and nobody waiting = %d, want 0", got)
 	}
-	acquired := make(chan struct{})
+	acquired := make(chan error, 1)
 	go func() {
-		defer close(acquired)
-		conn.LockConfig()()
+		unlock, err := conn.LockConfig(t.Context())
+		if err == nil {
+			unlock()
+		}
+		acquired <- err
 	}()
 	deadline := time.Now().Add(10 * time.Second)
 	for conn.ConfigLockWaiters() != 1 {
@@ -334,7 +348,9 @@ func TestConfigLockWaitersCountsBlockedSenders(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	unlockFirst()
-	<-acquired
+	if err := <-acquired; err != nil {
+		t.Fatal(err)
+	}
 	if got := conn.ConfigLockWaiters(); got != 0 {
 		t.Fatalf("waiters after both released = %d, want 0", got)
 	}

@@ -165,6 +165,20 @@ func (p *Period) Context(parent context.Context) (context.Context, context.Cance
 	}
 }
 
+// ContextUntilLoss cancels work when this period ends. Renewals extend the
+// period, so the context keeps the parent's deadline.
+func (p *Period) ContextUntilLoss(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(p.ctx, cancel)
+	if p.ctx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
 // LockRow shares the lock on this period's lease row through the end of tx.
 // Release, renewal and takeover need a conflicting row lock. The caller
 // must check the returned expiry against the database clock at the write.

@@ -53,6 +53,7 @@ RUN base="https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}"; \
       "(https://www.anthropic.com/legal/commercial-terms)." > NOTICE
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+LABEL io.delino.sandrun.ownsand-removal="rollback-guard-v1"
 COPY dist/sandrun-api /usr/local/bin/sandrun-api
 COPY --from=claude /claude/claude /usr/local/bin/claude
 # FSL-1.1-ALv2 terms and copyright notice (servers/LICENSE).
