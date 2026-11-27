@@ -23,7 +23,7 @@ export type AvatarProps = Omit<
 > & {
   /** The image URL. Without one, with a blank one, or when it fails to load, the fallback shows. */
   src?: string;
-  /** The image's text alternative, usually the person's name. */
+  /** The avatar's text alternative. Use an empty string for a decorative avatar. */
   alt: string;
   /** What shows until the image loads, usually initials. */
   fallback: React.ReactNode;
@@ -42,6 +42,8 @@ export function Avatar({
   className,
   ...props
 }: AvatarProps) {
+  const isDecorative = alt === "";
+
   return (
     <AvatarRoot
       data-size={size}
@@ -55,11 +57,11 @@ export function Avatar({
       {typeof src === "string" && src.trim() !== "" ? (
         <AvatarImage className="dui-avatar-image" src={src} alt={alt} />
       ) : null}
-      {/* The fallback stands in for the image, so it carries the same name. */}
       <AvatarFallback
         className="dui-avatar-fallback"
-        role="img"
-        aria-label={alt}
+        role={isDecorative ? undefined : "img"}
+        aria-label={isDecorative ? undefined : alt}
+        aria-hidden={isDecorative ? true : undefined}
       >
         {fallback}
       </AvatarFallback>
