@@ -42,6 +42,7 @@ import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import {
   CreateSandboxRequestSchema,
+  type CreateSandboxResponse,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
@@ -304,40 +305,47 @@ export class OwnSandClient {
             ? bound.signal
             : AbortSignal.any([input.signal, bound.signal]);
       }
+      let result: { response: CreateSandboxResponse } | { error: unknown };
       try {
-        const res = await this.sandboxes.createSandbox(request, { signal });
+        result = {
+          response: await this.sandboxes.createSandbox(request, { signal }),
+        };
+      } catch (error) {
+        result = { error };
+      } finally {
         stopBound.abort();
-        if (res.sandbox === undefined) {
+      }
+      input.signal?.throwIfAborted();
+      // Check the clock in case the retry timer callback has not run.
+      if (
+        bound.signal.aborted ||
+        (budget !== undefined && budget.remainingMs() <= 0)
+      ) {
+        throw lastFailure;
+      }
+      if ("response" in result) {
+        const { sandbox } = result.response;
+        if (sandbox === undefined) {
           throw new OwnSandError("CreateSandbox returned no sandbox");
         }
-        return this.#handle(res.sandbox.sandboxId, organizationId, res.sandbox);
-      } catch (error) {
-        // The timer of this attempt is no longer needed, also not while the
-        // back-off sleeps.
-        stopBound.abort();
-        if (input.signal?.aborted) {
-          throw input.signal.reason;
-        }
-        if (bound.signal.aborted) {
-          // The window ended while the retry was in flight.
-          throw lastFailure;
-        }
-        const failure = createFailureOf(error);
-        if (failure === undefined) {
-          throw error;
-        }
-        budget ??= new FixedBudget(this.#clock);
-        // A rate limit waits at least as long as the server asks.
-        const delay =
-          failure === FailureClass.ResourceExhausted
-            ? Math.max(backoffMs(attempt), retryAfterMs(error))
-            : backoffMs(attempt);
-        if (delay >= budget.remainingMs()) {
-          throw error;
-        }
-        lastFailure = error;
-        await this.#clock.sleep(delay, input.signal);
+        return this.#handle(sandbox.sandboxId, organizationId, sandbox);
       }
+      const { error } = result;
+      const failure = createFailureOf(error);
+      if (failure === undefined) {
+        throw error;
+      }
+      budget ??= new FixedBudget(this.#clock);
+      // A rate limit waits at least as long as the server asks.
+      const delay =
+        failure === FailureClass.ResourceExhausted
+          ? Math.max(backoffMs(attempt), retryAfterMs(error))
+          : backoffMs(attempt);
+      if (delay >= budget.remainingMs()) {
+        throw error;
+      }
+      lastFailure = error;
+      await this.#clock.sleep(delay, input.signal);
     }
   }
 
