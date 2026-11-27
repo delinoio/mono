@@ -43,6 +43,78 @@ import {
 } from "./mock-api.ts";
 import { walkFixturePages } from "./walk-fixture-pages.ts";
 
+describe("mock template deletion", () => {
+  const organizationId = MOCK_IDS.acme;
+  const unknownTemplateId = "0193a000-0000-7000-8000-0000000000ff";
+  const missingTemplate = {
+    code: Code.NotFound,
+    rawMessage: "template not found",
+  };
+
+  test("rejects an unknown template without changing the list", async () => {
+    const client = createClient(SnapshotService, createMockTransport());
+    const before = await client.listTemplates({ organizationId });
+
+    await expect(
+      client.deleteTemplate({ organizationId, templateId: unknownTemplateId }),
+    ).rejects.toMatchObject(missingTemplate);
+
+    expect(await client.listTemplates({ organizationId })).toEqual(before);
+  });
+
+  test("removes only the requested template and keeps its snapshot", async () => {
+    const client = createClient(
+      SnapshotService,
+      createMockTransport({ extraTemplates: 1 }),
+    );
+    const { templates } = await client.listTemplates({ organizationId });
+    expect(templates).toHaveLength(2);
+    const request = { organizationId, templateId: MOCK_IDS.template };
+    const remaining = templates.filter(
+      (t) => t.templateId !== request.templateId,
+    );
+
+    expect(await client.deleteTemplate(request)).toEqual({
+      $typeName: "delino.ownsand.v1.DeleteTemplateResponse",
+    });
+    expect(remaining).toHaveLength(1);
+    expect((await client.listTemplates({ organizationId })).templates).toEqual(
+      remaining,
+    );
+    expect(
+      (
+        await client.getSnapshot({
+          organizationId,
+          snapshotId: MOCK_IDS.snapshot,
+        })
+      ).snapshot?.snapshotId,
+    ).toBe(MOCK_IDS.snapshot);
+
+    await expect(client.deleteTemplate(request)).rejects.toMatchObject(
+      missingTemplate,
+    );
+    expect((await client.listTemplates({ organizationId })).templates).toEqual(
+      remaining,
+    );
+  });
+
+  test.each([MOCK_IDS.template, unknownTemplateId])(
+    "checks membership before looking up template %s",
+    async (templateId) => {
+      const client = createClient(
+        SnapshotService,
+        createMockTransport({ userId: "user-outside-acme" }),
+      );
+      await expect(
+        client.deleteTemplate({ organizationId, templateId }),
+      ).rejects.toMatchObject({
+        code: Code.NotFound,
+        rawMessage: "organization not found",
+      });
+    },
+  );
+});
+
 describe("mock agent version policy", () => {
   afterEach(() => {
     rs.useRealTimers();
