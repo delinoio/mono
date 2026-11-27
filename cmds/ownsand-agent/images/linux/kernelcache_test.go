@@ -35,8 +35,8 @@ const (
 // so the overlap does not depend on timing), then writes $STUB_BODY to the
 // -o file. With STUB_FAIL set, it writes the full body before returning a
 // curl error so that a matching checksum cannot hide an ignored exit status.
-// With STUB_MKDIR set it first creates that directory, like another process
-// that puts a directory at the archive path during the download.
+// With STUB_MKDIR set, it creates an obstructing directory with a sentinel
+// before writing the download.
 const stubCurl = `#!/usr/bin/env bash
 out=""
 while [ "$#" -gt 0 ]; do
@@ -47,7 +47,8 @@ while [ "$#" -gt 0 ]; do
 done
 echo call >> "$STUB_CALLS"
 if [ -n "${STUB_MKDIR:-}" ]; then
-  mkdir -p "$STUB_MKDIR"
+  mkdir -p "$STUB_MKDIR" || exit $?
+  printf keep > "$STUB_MKDIR/sentinel" || exit $?
 fi
 if [ -n "${STUB_BARRIER:-}" ]; then
   : > "$STUB_BARRIER/started.$$"
@@ -64,6 +65,16 @@ cp "$STUB_BODY" "$out" || exit $?
 if [ -n "${STUB_FAIL:-}" ]; then
   exit 56
 fi
+`
+
+// stubSignalMove runs the native mv, then signals the helper before it can
+// handle the publication result. The marker shows that mv returned.
+const stubSignalMove = `#!/usr/bin/env bash
+status=0
+"$STUB_REAL_MV" "$@" || status=$?
+: > "$STUB_MOVE_DONE"
+kill -s "$STUB_SIGNAL" "$PPID"
+exit "$status"
 `
 
 type fill struct {
@@ -226,6 +237,15 @@ func (f *fill) requireNoLeftovers() {
 	}
 }
 
+// The checksum command prints a matching digest but reports an error.
+func writeFailingSHA256Sum(t *testing.T, stub, digest string) {
+	t.Helper()
+	script := "#!/usr/bin/env bash\nprintf '%s  -\\n' '" + digest + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(stub, "sha256sum"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestColdCacheDownloadsAndPublishesOnce(t *testing.T) {
 	f := newFill(t)
 	body := f.body("good", goodBody)
@@ -250,6 +270,65 @@ func TestValidCachedArchiveIsReusedWithoutDownload(t *testing.T) {
 	f.requireArchiveMode(0o600)
 	if got := f.callCount(); got != 0 {
 		t.Fatalf("downloader calls = %d, want 0", got)
+	}
+}
+
+func TestCachePathWithNewlineAcceptsUppercaseDigest(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		warm      bool
+		wantCalls int
+		wantMode  os.FileMode
+	}{
+		{name: "warm", warm: true, wantCalls: 0, wantMode: 0o600},
+		{name: "cold", wantCalls: 1, wantMode: 0o644},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFill(t)
+			f.cache = filepath.Join(filepath.Dir(f.cache), "cache\npath")
+			f.sum = strings.ToUpper(f.sum)
+			if test.warm {
+				f.seedMode(goodBody, test.wantMode)
+			}
+			if out, err := f.run(f.body("good", goodBody)); err != nil {
+				t.Fatalf("fill: %v\n%s", err, out)
+			}
+			f.requireArchive(goodBody)
+			f.requireArchiveMode(test.wantMode)
+			if got := f.callCount(); got != test.wantCalls {
+				t.Fatalf("downloader calls = %d, want %d", got, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestCachePathWithNewlinePreservesArchiveAfterVerificationFailure(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		body     []byte
+		hashFail bool
+	}{
+		{name: "digest mismatch", body: []byte("wrong bytes")},
+		{name: "hash command fails", body: goodBody, hashFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFill(t)
+			f.cache = filepath.Join(filepath.Dir(f.cache), "cache\npath")
+			older := []byte("a truncated archive")
+			f.seed(older)
+			if test.hashFail {
+				writeFailingSHA256Sum(t, f.stub, f.sum)
+			}
+			out, err := f.run(f.body("fixture", test.body))
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Fatalf("fill with failed verification: err = %v, want nonzero exit\n%s", err, out)
+			}
+			f.requireArchive(older)
+			if got := f.callCount(); got != 1 {
+				t.Fatalf("downloader calls = %d, want 1", got)
+			}
+		})
 	}
 }
 
@@ -302,19 +381,21 @@ func TestDirectoryAtArchivePathIsRejected(t *testing.T) {
 	if got := f.callCount(); got != 0 {
 		t.Fatalf("downloader calls = %d, want 0", got)
 	}
-	// The directory holds its sentinel and nothing else: no temporary
-	// download was moved into it.
+	f.requireObstructingDirectory()
+}
+
+func (f *fill) requireObstructingDirectory() {
+	f.t.Helper()
 	entries, err := os.ReadDir(f.archive())
 	if err != nil {
-		t.Fatalf("read the directory: %v", err)
+		f.t.Fatalf("read the obstructing directory: %v", err)
 	}
 	if len(entries) != 1 || entries[0].Name() != "sentinel" {
-		t.Fatalf("the directory changed: %v", entries)
+		f.t.Fatalf("the obstructing directory changed: %v", entries)
 	}
-	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
-		t.Fatalf("the sentinel changed: %q, %v", got, err)
+	if got, err := os.ReadFile(filepath.Join(f.archive(), "sentinel")); err != nil || string(got) != "keep" {
+		f.t.Fatalf("the sentinel changed: %q, %v", got, err)
 	}
-	// Nothing beside the directory either.
 	f.requireNoLeftovers()
 }
 
@@ -329,14 +410,55 @@ func TestDirectoryAppearingBeforePublishIsRejected(t *testing.T) {
 	if err == nil {
 		t.Fatalf("fill succeeded although a directory took the archive path\n%s", out)
 	}
-	entries, err := os.ReadDir(f.archive())
-	if err != nil {
-		t.Fatalf("read the directory: %v", err)
+	if !strings.Contains(out, f.archive()) || !strings.Contains(out, "became a directory") {
+		t.Fatalf("output does not name the late directory:\n%s", out)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("the archive or a temporary file was moved into the directory: %v", entries)
+	f.requireObstructingDirectory()
+}
+
+func TestInterruptedCachePublication(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		signal     string
+		code       int
+		obstructed bool
+	}{
+		{"INT/published", "INT", 130, false},
+		{"INT/obstructed", "INT", 130, true},
+		{"TERM/published", "TERM", 143, false},
+		{"TERM/obstructed", "TERM", 143, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFill(t)
+			mv, err := exec.LookPath("mv")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(f.stub, "mv"), []byte(stubSignalMove), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(f.stub, "move-done")
+			env := []string{"STUB_REAL_MV=" + mv, "STUB_MOVE_DONE=" + marker, "STUB_SIGNAL=" + tc.signal}
+			if tc.obstructed {
+				env = append(env, "STUB_MKDIR="+f.archive())
+			}
+
+			out, err := f.run(f.body("good", goodBody), env...)
+			if _, statErr := os.Stat(marker); statErr != nil {
+				t.Fatalf("native mv did not return: %v\n%s", statErr, out)
+			}
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != tc.code {
+				t.Fatalf("fill exit = %v, want status %d\n%s", err, tc.code, out)
+			}
+			if tc.obstructed {
+				f.requireObstructingDirectory()
+			} else {
+				f.requireArchive(goodBody)
+				f.requireArchiveMode(0o644)
+			}
+		})
 	}
-	f.requireNoLeftovers()
 }
 
 func TestFailedDownloadLeavesTheCacheUntouched(t *testing.T) {

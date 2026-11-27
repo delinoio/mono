@@ -68,13 +68,23 @@ type Store struct {
 	mu  sync.Mutex
 }
 
+// OpenForRead returns a store for read operations without accessing the
+// filesystem. Each read reports errors for its own path.
+func OpenForRead(dir string) (*Store, error) {
+	if dir == "" {
+		return nil, errors.New("store: state directory is required")
+	}
+	return &Store{dir: dir}, nil
+}
+
 // Open creates the state directory and its subdirectories and restricts the
 // directory to the service account: mode 0700 on Linux and macOS, and a
 // protected ACL for SYSTEM and Administrators on Windows (see
 // restrictStateDir).
 func Open(dir string) (*Store, error) {
-	if dir == "" {
-		return nil, errors.New("store: state directory is required")
+	s, err := OpenForRead(dir)
+	if err != nil {
+		return nil, err
 	}
 	for _, sub := range []string{"", SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
@@ -85,7 +95,7 @@ func Open(dir string) (*Store, error) {
 	if err := restrictStateDir(dir); err != nil {
 		return nil, fmt.Errorf("store: restrict state directory: %w", err)
 	}
-	return &Store{dir: dir}, nil
+	return s, nil
 }
 
 // Dir returns the state directory.

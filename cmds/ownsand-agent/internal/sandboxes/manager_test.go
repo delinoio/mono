@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -310,6 +311,8 @@ type env struct {
 	ex  *execs
 	// logger is the manager logger; nil selects the default logger.
 	logger *slog.Logger
+
+	freeDiskCalls atomic.Int64
 }
 
 func newEnv(t *testing.T) *env { return newEnvWithLogger(t, nil) }
@@ -332,7 +335,16 @@ func (e *env) restart() {
 	if e.m != nil {
 		e.m.Close()
 	}
-	m, err := New(context.Background(), Options{Store: e.st, Runtime: e.rt, Now: e.clk.Now, Logger: e.logger, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
+	m, err := New(context.Background(), Options{
+		Store:   e.st,
+		Runtime: e.rt,
+		Now:     e.clk.Now,
+		Logger:  e.logger,
+		FreeDisk: func() (int64, error) {
+			e.freeDiskCalls.Add(1)
+			return 1 << 50, nil
+		},
+	})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -417,9 +429,7 @@ func TestCreateDeleteLifecycle(t *testing.T) {
 		ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING,
 		ownsandv1.SandboxState_SANDBOX_STATE_DELETING, ownsandv1.SandboxState_SANDBOX_STATE_DELETED,
 	}
-	if got := e.out.states(id); len(got) != 4 || got[0] != want[0] || got[3] != want[3] {
-		t.Fatalf("updates %v", got)
-	}
+	requireStates(t, e.out.states(id), want)
 	if e.ex.ended[id] != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatal("execs not ended with the sandbox")
 	}
@@ -939,25 +949,43 @@ func TestCreateLimits(t *testing.T) {
 // INVALID_ARGUMENT that names resources.disk_gib, before the limit check, the
 // free disk probe and the runtime see it, and keeps no record.
 func TestCreateRejectsDiskThatOverflowsBytes(t *testing.T) {
-	e := newEnv(t)
 	for _, disk := range []int64{validate.MaxDiskGiB + 1, math.MaxInt64} {
-		cmd := e.createCmd(1, time.Hour, time.Hour)
-		cmd.Resources.DiskGib = disk
-		// A huge device limit proves that the rejection comes from the
-		// validation and not from the capacity check.
-		cmd.Limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: math.MaxInt64, VcpuOvercommitPercent: 100}
-		_, err := e.m.Create(context.Background(), cmd)
-		var ce *CommandError
-		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || !strings.Contains(ce.Error(), "resources.disk_gib") {
-			t.Fatalf("disk_gib %d: err = %v, want INVALID_ARGUMENT naming resources.disk_gib", disk, err)
+		t.Run(fmt.Sprintf("disk_gib=%d", disk), func(t *testing.T) {
+			e := newEnv(t)
+			cmd := e.createCmd(1, time.Hour, time.Hour)
+			cmd.Resources.DiskGib = disk
+			// A permissive device limit isolates resource validation from capacity checks.
+			cmd.Limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: math.MaxInt64, VcpuOvercommitPercent: 100}
+			_, err := e.m.Create(t.Context(), cmd)
+			var ce *CommandError
+			if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || !strings.Contains(ce.Error(), "resources.disk_gib") {
+				t.Fatalf("err = %v, want INVALID_ARGUMENT naming resources.disk_gib", err)
+			}
+			if n := e.freeDiskCalls.Load(); n != 0 {
+				t.Fatalf("free disk probes = %d, want 0", n)
+			}
+			if n := e.rt.startCount(); n != 0 {
+				t.Fatalf("runtime starts = %d, want 0", n)
+			}
+			if n := len(e.m.Entries()); n != 0 {
+				t.Fatalf("entries = %d, want 0", n)
+			}
+		})
+	}
+
+	t.Run("valid_disk", func(t *testing.T) {
+		e := newEnv(t)
+		entry := e.create(time.Hour, time.Hour)
+		if n := e.freeDiskCalls.Load(); n != 1 {
+			t.Fatalf("free disk probes = %d, want 1", n)
 		}
-	}
-	if n := e.rt.startCount(); n != 0 {
-		t.Fatalf("runtime starts = %d, want 0", n)
-	}
-	if n := len(e.m.Entries()); n != 0 {
-		t.Fatalf("entries = %d, want 0", n)
-	}
+		if n := e.rt.startCount(); n != 1 {
+			t.Fatalf("runtime starts = %d, want 1", n)
+		}
+		if state := entry.GetState(); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Fatalf("sandbox state = %v, want RUNNING", state)
+		}
+	})
 }
 
 func TestTTLExpiry(t *testing.T) {
@@ -1301,23 +1329,73 @@ func TestCallerDeleteEndsFailedTTLEnd(t *testing.T) {
 // ends that Tick started have written their records, and that a Tick after
 // Close starts no end.
 func TestCloseWaitsForTTLEnds(t *testing.T) {
-	e := newEnv(t)
-	first := e.create(time.Minute, time.Hour).GetSandboxId()
-	second := e.create(time.Minute, time.Hour).GetSandboxId()
-	e.clk.Advance(2 * time.Minute)
-	e.m.Tick(context.Background(), false)
-	e.m.Close()
-	for _, id := range []string{first, second} {
-		if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-			t.Fatalf("sandbox %s state %v after Close", id, s)
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		block := make(chan struct{})
+		e.rt.deleteBlock = block
+		release := sync.OnceFunc(func() { close(block) })
+		defer func() {
+			release()
+			// Let the VM watchers exit even if an assertion fails.
+			e.rt.mu.Lock()
+			for _, vm := range e.rt.vms {
+				vm.stop()
+			}
+			e.rt.mu.Unlock()
+		}()
+
+		first := e.create(time.Minute, time.Hour).GetSandboxId()
+		second := e.create(time.Minute, time.Hour).GetSandboxId()
+		third := e.create(3*time.Minute, time.Hour).GetSandboxId()
+		e.clk.Advance(2 * time.Minute)
+		e.m.Tick(t.Context(), false)
+		synctest.Wait()
+		if calls := e.rt.deleteCallCount(); calls != 2 {
+			t.Fatalf("Delete calls while the gate is closed = %d, want 2", calls)
 		}
-	}
-	third := e.create(time.Minute, time.Hour).GetSandboxId()
-	e.clk.Advance(2 * time.Minute)
-	e.m.Tick(context.Background(), false)
-	if s, _ := e.m.State(third); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		t.Fatalf("Tick after Close ended sandbox: %v", s)
-	}
+
+		closeDone := make(chan struct{})
+		go func() {
+			e.m.Close()
+			close(closeDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-closeDone:
+			t.Fatal("Close returned while both TTL deletes were blocked")
+		default:
+		}
+
+		release()
+		synctest.Wait()
+		select {
+		case <-closeDone:
+		default:
+			t.Fatal("Close did not return after the delete gate opened")
+		}
+		for _, id := range []string{first, second} {
+			if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				t.Errorf("sandbox %s state after Close = %v, want DELETED", id, state)
+			}
+		}
+
+		e.clk.Advance(2 * time.Minute)
+		e.m.Tick(t.Context(), false)
+		synctest.Wait()
+		e.m.mu.Lock()
+		sb := e.m.sandboxes[third]
+		ending := sb != nil && sb.ending
+		e.m.mu.Unlock()
+		if ending {
+			t.Error("Tick after Close marked the due sandbox as ending")
+		}
+		if state, _ := e.m.State(third); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Errorf("due sandbox state after post-close Tick = %v, want RUNNING", state)
+		}
+		if calls := e.rt.deleteCallCount(); calls != 2 {
+			t.Errorf("Delete calls after post-close Tick = %d, want 2", calls)
+		}
+	})
 }
 
 func TestEqualDeadlinesGiveMaxTTL(t *testing.T) {
@@ -1399,26 +1477,67 @@ func TestRestartReconcile(t *testing.T) {
 func TestRestartFailsWhenRuntimeInventoryFails(t *testing.T) {
 	e := newEnv(t)
 	live := e.create(time.Hour, 2*time.Hour).GetSandboxId()
-	// The agent restarts: the VM ended, its files stay, and the inventory
-	// fails with an ID that it did know.
+	loadRecord := func() Record {
+		t.Helper()
+		var record Record
+		if err := e.st.LoadSandboxes(func(data []byte) error {
+			var decoded Record
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				return err
+			}
+			if decoded.SandboxID == live {
+				record = decoded
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("load sandbox records: %v", err)
+		}
+		if record.SandboxID == "" {
+			t.Fatalf("persisted sandbox %s is missing", live)
+		}
+		return record
+	}
+	before := loadRecord()
+	if before.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("persisted state before restart = %v, want RUNNING", before.State)
+	}
+
+	// The VM survives the restart, but the runtime can only return a
+	// partial inventory.
 	cause := errors.New("enumeration denied")
 	rt := newFakeRuntime()
+	rt.vms[live] = &fakeVM{id: live, exited: make(chan struct{})}
 	rt.files[live] = true
 	rt.runningErr = cause
+	ctx := context.Background()
+	if ids, err := rt.Running(ctx); !slices.Equal(ids, []string{live}) || !errors.Is(err, cause) {
+		t.Fatalf("Running = %v, %v, want [%s] and %v", ids, err, live, cause)
+	}
+
 	e.rt = rt
 	e.m.Close()
-	_, err := New(context.Background(), Options{Store: e.st, Runtime: rt, Now: e.clk.Now, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
+	_, err := New(ctx, Options{Store: e.st, Runtime: rt, Now: e.clk.Now, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
 	if !errors.Is(err, cause) {
 		t.Fatalf("New = %v, want an error that wraps %v", err, cause)
 	}
-	if rt.deleteCalls != 0 || !rt.hasFiles(live) {
-		t.Fatalf("reconcile deleted before the inventory succeeded (delete calls %d)", rt.deleteCalls)
+	if calls, hasVM, hasFiles := rt.deleteCalls, rt.vms[live] != nil, rt.hasFiles(live); calls != 0 || !hasVM || !hasFiles {
+		t.Fatalf("after failed inventory: delete calls = %d, VM present = %t, files present = %t, want 0, true, true", calls, hasVM, hasFiles)
 	}
-	// The record stays live: no transition was committed.
+	afterFailure := loadRecord()
+	if afterFailure.State != before.State || afterFailure.EndReason != before.EndReason || afterFailure.Revision != before.Revision {
+		t.Fatalf("persisted record after failed inventory = (%v, %v, revision %d), want (%v, %v, revision %d)",
+			afterFailure.State, afterFailure.EndReason, afterFailure.Revision, before.State, before.EndReason, before.Revision)
+	}
+
 	rt.runningErr = nil
 	e.restart()
-	if s, _ := e.m.State(live); s != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || endReason(e.m, live) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
-		t.Fatalf("after a successful retry the sandbox is %v %v, want FAILED LOST_ON_DEVICE", s, endReason(e.m, live))
+	if calls, hasVM, hasFiles := rt.deleteCalls, rt.vms[live] != nil, rt.hasFiles(live); calls != 1 || hasVM || hasFiles {
+		t.Fatalf("after retry: delete calls = %d, VM present = %t, files present = %t, want 1, false, false", calls, hasVM, hasFiles)
+	}
+	afterRetry := loadRecord()
+	if afterRetry.State != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || afterRetry.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE || afterRetry.Revision <= before.Revision {
+		t.Fatalf("persisted record after retry = (%v, %v, revision %d), want (FAILED, LOST_ON_DEVICE, revision > %d)",
+			afterRetry.State, afterRetry.EndReason, afterRetry.Revision, before.Revision)
 	}
 }
 
@@ -2074,30 +2193,113 @@ func TestCreateRecoversFromOneRevisionFailure(t *testing.T) {
 	}
 }
 
-// TestCreateRecoversFromOneRecordSaveFailure checks the same recovery for a
-// failed record save. Unlike a revision failure, a save failure leaves the new
-// state in the record, and the retry still publishes it.
 func TestCreateRecoversFromOneRecordSaveFailure(t *testing.T) {
+	t.Run("unacknowledged", func(t *testing.T) {
+		testCreateRunningRecordSaveFailures(t, 1, false)
+	})
+	t.Run("acknowledged", func(t *testing.T) {
+		testCreateRunningRecordSaveFailures(t, 1, true)
+	})
+}
+
+func TestCreateStopsVMWhenRunningRecordCannotBePublishedAfterSaveFailures(t *testing.T) {
+	testCreateRunningRecordSaveFailures(t, DefaultRunningAttempts, false)
+}
+
+func testCreateRunningRecordSaveFailures(t *testing.T, failures int, acked bool) {
+	t.Helper()
 	e := newEnv(t)
 	e.m.runningBackoff = time.Millisecond
+	ctx := context.Background()
 	cmd := e.createCmd(1, time.Hour, time.Hour)
 	id := cmd.GetSandboxId()
-	e.rt.onCreate = func(vmruntime.Spec) { blockRecord(t, e.st, id) }
-	e.m.onRunningCommitFailed = func(int, bool) {
-		if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-			t.Errorf("a save failure left the record in %v, want the new RUNNING state", state)
+	var creating *ownsandv1.SandboxStateEntry
+	e.rt.onCreate = func(vmruntime.Spec) {
+		rec := persistedRecord(t, e.st, id)
+		creating = rec.Entry(e.m.Epoch())
+		if acked {
+			e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: creating.GetRevision()})
 		}
-		unblockRecord(t, e.st, id)
+		blockRecord(t, e.st, id)
 	}
-	entry, err := e.m.Create(context.Background(), cmd)
-	if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		t.Fatalf("create %v %v", entry, err)
+	attempts := 0
+	e.m.onRunningCommitFailed = func(attempt int, willRetry bool) {
+		attempts++
+		if attempt != attempts || willRetry != (attempt < DefaultRunningAttempts) {
+			t.Errorf("attempt %d willRetry %v after %d failures", attempt, willRetry, attempts)
+		}
+		if state, _ := e.m.State(id); state != creating.GetState() {
+			t.Errorf("state = %v, want CREATING", state)
+		}
+		report := e.m.StateReport(uint64(attempt), nil).GetSandboxes()
+		if len(report) != 1 || !proto.Equal(report[0], creating) {
+			t.Errorf("report = %v, want the original CREATING entry %v", report, creating)
+		}
+		e.m.mu.Lock()
+		gotAcked := e.m.sandboxes[id].rec.Acked
+		e.m.mu.Unlock()
+		if gotAcked != acked {
+			t.Errorf("Acked = %t, want %t", gotAcked, acked)
+		}
+		wantUpdates := 1
+		if !acked {
+			wantUpdates += attempts - 1
+		}
+		if got := len(e.out.entries); got != wantUpdates {
+			t.Errorf("updates before resend = %d, want %d", got, wantUpdates)
+		}
+		e.m.Tick(ctx, true)
+		if !acked {
+			wantUpdates++
+		}
+		if got := len(e.out.entries); got != wantUpdates {
+			t.Errorf("updates after resend = %d, want %d", got, wantUpdates)
+		}
+		for _, update := range e.out.entries {
+			if !proto.Equal(update, creating) {
+				t.Errorf("update = %v, want the original CREATING entry %v", update, creating)
+			}
+		}
+		called := false
+		if e.m.WithRunning(id, func() { called = true }) || called {
+			t.Error("WithRunning admitted a sandbox whose RUNNING save failed")
+		}
+		if attempt == failures {
+			unblockRecord(t, e.st, id)
+		}
 	}
-	if got := persistedState(t, e.st, id); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		t.Fatalf("saved record state %v, want RUNNING", got)
+	entry, err := e.m.Create(ctx, cmd)
+	if attempts != failures || e.rt.startCount() != 1 {
+		t.Fatalf("failed attempts %d, VM starts %d, want %d and 1", attempts, e.rt.startCount(), failures)
 	}
-	if e.rt.startCount() != 1 {
-		t.Fatalf("VM starts %d, want 1", e.rt.startCount())
+	rec := persistedRecord(t, e.st, id)
+	if !proto.Equal(rec.Entry(e.m.Epoch()), entry) {
+		t.Fatalf("saved entry = %v, want create result %v", rec.Entry(e.m.Epoch()), entry)
+	}
+	if failures == DefaultRunningAttempts {
+		requireInternal(t, err)
+		if rec.State != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || rec.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+			t.Fatalf("saved record state = %v, reason = %v, want FAILED / CREATE_FAILED", rec.State, rec.EndReason)
+		}
+		if ids, _ := e.rt.Running(ctx); len(ids) != 0 || e.rt.hasFiles(id) {
+			t.Fatalf("VM %v or its files remain", ids)
+		}
+		requireStates(t, e.out.states(id), []ownsandv1.SandboxState{
+			ownsandv1.SandboxState_SANDBOX_STATE_CREATING,
+			ownsandv1.SandboxState_SANDBOX_STATE_DELETING,
+			ownsandv1.SandboxState_SANDBOX_STATE_FAILED,
+		})
+		return
+	}
+	if err != nil || rec.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING || rec.Revision <= creating.GetRevision().GetCounter() || rec.Acked {
+		t.Fatalf("create result = %v, saved Acked = %t, error = %v, want an unacknowledged RUNNING entry with a new revision", entry, rec.Acked, err)
+	}
+	if last := e.out.entries[len(e.out.entries)-1]; !proto.Equal(last, entry) {
+		t.Fatalf("last update = %v, want saved RUNNING entry %v", last, entry)
+	}
+	called := false
+	if !e.m.WithRunning(id, func() { called = true }) || !called {
+		t.Fatal("WithRunning refused the sandbox after its RUNNING save succeeded")
 	}
 }
 

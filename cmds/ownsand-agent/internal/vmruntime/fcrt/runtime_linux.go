@@ -636,10 +636,14 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
+	r.syncBeforePause(ctx, v)
+	return r.setState(ctx, m, "Paused", true)
+}
+
+func (r *Runtime) syncBeforePause(ctx context.Context, v *vm) {
 	if err := guestsync.Sync(ctx, v.id, v.Dial); err != nil {
 		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
 	}
-	return r.setState(ctx, m, "Paused", true)
 }
 
 // Resume continues the vCPUs.
@@ -662,9 +666,16 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (inf
 	v.mu.Lock()
 	wasPaused := v.paused
 	v.mu.Unlock()
-	// A paused VM was flushed by its Pause; Pause flushes a running one.
+	// An already paused VM was flushed before it paused.
 	if !wasPaused {
-		if err := r.Pause(ctx, m); err != nil {
+		r.syncBeforePause(ctx, v)
+		if err := ctx.Err(); err != nil {
+			return vmruntime.SnapshotInfo{}, err
+		}
+		// Firecracker can pause the VM before it replies. Let the request
+		// finish within the API client timeout so cancellation cannot hide
+		// a successful pause that we need to undo.
+		if err := r.setState(context.WithoutCancel(ctx), m, "Paused", true); err != nil {
 			return vmruntime.SnapshotInfo{}, err
 		}
 		defer func() {
@@ -682,6 +693,9 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (inf
 				err = fmt.Errorf("fcrt: resume after snapshot: %w", rerr)
 			}
 		}()
+	}
+	if err := ctx.Err(); err != nil {
+		return vmruntime.SnapshotInfo{}, err
 	}
 	if v.network == ownsandv1.NetworkMode_NETWORK_MODE_NONE {
 		absDir, _ := filepath.Abs(dir)

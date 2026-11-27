@@ -163,7 +163,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	c := colors{on: !*noColor && os.Getenv("NO_COLOR") == ""}
 	switch cmd {
 	case "version":
-		fmt.Fprintln(stdout, version.Version)
+		if _, err := fmt.Fprintln(stdout, version.Version); err != nil {
+			fmt.Fprintln(stderr, "ownsand-agent: write version:", err)
+			return exitError
+		}
 		return exitOK
 	case "enroll":
 		return enroll(cfg, *apiURL, *tokenFile, *name, stdin, stdout, stderr, c)
@@ -354,7 +357,7 @@ func runLaunchd(cfg config.Config) int {
 }
 
 func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
-	st, err := store.Open(cfg.StateDir)
+	st, err := store.OpenForRead(cfg.StateDir)
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
@@ -503,6 +506,9 @@ func servicePrint(stateDir string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ownsand-agent: render service definition:", err)
 		return exitError
 	}
-	fmt.Fprint(stdout, def)
+	if _, err := fmt.Fprint(stdout, def); err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: write service definition:", err)
+		return exitError
+	}
 	return exitOK
 }

@@ -7,10 +7,10 @@ package dataplane
 import (
 	"context"
 	"net"
-	"os"
-	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -312,23 +312,44 @@ func TestSessionIdleEndNeedsQuietAndNoOpenRequest(t *testing.T) {
 // the dispatcher.
 func TestSessionRejectsRequestAfterIdleEnd(t *testing.T) {
 	w := newWorld(t)
-	c, s := idleSession(t, w, time.Hour)
-	s.setActivity(time.Now().Add(-2 * time.Hour))
-	if !s.endIdle() {
-		t.Fatal("a quiet session did not end as idle")
-	}
-	marker := filepath.Join(t.TempDir(), "ran")
-	s.onFrame(datapath.MustNewFrame(7, w.sandbox, w.execReq("/bin/sh", "-c", "touch '"+marker+"'")))
-	s.mu.Lock()
-	open := len(s.streams)
-	s.mu.Unlock()
-	if open != 0 {
-		t.Fatalf("%d streams registered after the idle end", open)
-	}
-	c.waitClosed()
-	time.Sleep(200 * time.Millisecond)
-	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("request reached the dispatcher after the idle end")
+	const streamID = 7
+	frame := datapath.MustNewFrame(streamID, w.sandbox, w.execReq("/bin/true"))
+	for _, tc := range []struct {
+		name        string
+		endIdle     bool
+		wantStarted []uint64
+	}{
+		{name: "active", wantStarted: []uint64{streamID}},
+		{name: "after idle end", endIdle: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, dispatcher, c, s := limitedSession(t, w, SessionLimits{}, Timing{SessionIdle: time.Hour})
+			if tc.endIdle {
+				s.setActivity(time.Now().Add(-2 * time.Hour))
+				if !s.endIdle() {
+					t.Fatal("a quiet session did not end as idle")
+				}
+			}
+
+			// Release the gate before delivery so the handler records the
+			// call and returns immediately without sending a response.
+			dispatcher.releaseStream(streamID)
+			// Deliver the frame at the handler so the test can wait for any
+			// dispatch goroutine. The WebRTC peers run outside this scope.
+			synctest.Test(t, func(t *testing.T) {
+				s.onFrame(frame)
+				synctest.Wait()
+				if open := s.openStreams(); open != 0 {
+					t.Errorf("%d streams still registered after handling the frame", open)
+				}
+				if got := dispatcher.startedStreams(); !slices.Equal(got, tc.wantStarted) {
+					t.Errorf("dispatcher started streams %v, want %v", got, tc.wantStarted)
+				}
+			})
+			if tc.endIdle {
+				c.waitClosed()
+			}
+		})
 	}
 }
 
@@ -537,12 +558,16 @@ func TestChannelLostDuringOfferGathering(t *testing.T) {
 	lost.Close()
 	dp.ChannelLost(lost)
 	requireEndedAnswer(t, lostAnswers, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION)
+	waitFor(t, "lost offer cleanup", func() bool {
+		dp.mu.Lock()
+		defer dp.mu.Unlock()
+		return dp.sessions[lostID] == nil
+	})
 	dp.mu.Lock()
-	_, lostKept := dp.sessions[lostID]
 	_, liveKept := dp.sessions[liveID]
 	dp.mu.Unlock()
-	if lostKept || !liveKept {
-		t.Fatalf("lost session in map: %v, live session in map: %v", lostKept, liveKept)
+	if !liveKept {
+		t.Fatal("the live session was removed")
 	}
 	if st := lostSession.pc.ConnectionState(); st != webrtc.PeerConnectionStateClosed {
 		t.Fatalf("peer connection state %v", st)
