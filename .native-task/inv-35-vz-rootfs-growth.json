@@ -1,0 +1,86 @@
+{
+  "gid": "inv-35-vz-rootfs-growth",
+  "commit": "1b3a5a3c5bad40423edca9c9adb602dd5dbbfeb7",
+  "nativeValidation": {
+    "status": "pending",
+    "sha": "1b3a5a3c5bad40423edca9c9adb602dd5dbbfeb7",
+    "reason": "The implementation worker runs Linux and cannot access m3-16. The native no-image checks still need to run. The real Virtualization.framework cold boot additionally needs a compatible arm64 OwnSand Linux kernel and ext4 disk, which are unavailable on m3-16.",
+    "targets": [
+      {
+        "host": "m3-16",
+        "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+        "platform": "darwin/arm64"
+      }
+    ],
+    "commands": {
+      "m3-16": [
+        "set -euo pipefail",
+        "test \"$(git rev-parse HEAD)\" = \"1b3a5a3c5bad40423edca9c9adb602dd5dbbfeb7\"",
+        "test \"$(uname -s)\" = Darwin",
+        "test \"$(uname -m)\" = arm64",
+        "go version",
+        "mkdir -p \"$PWD/.t3-tmp/vz-rootfs\"",
+        "export TMPDIR=\"$PWD/.t3-tmp/vz-rootfs\" COPYFILE_DISABLE=1 CGO_ENABLED=1 GOOS=darwin GOARCH=arm64",
+        "go vet ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+        "go test -c -o \"$TMPDIR/vzrt.test\" ./cmds/ownsand-agent/internal/vmruntime/vzrt",
+        "codesign --force --sign - --entitlements 'cmds/ownsand-agent/entitlements.plist' \"$TMPDIR/vzrt.test\"",
+        "codesign --verify --strict \"$TMPDIR/vzrt.test\"",
+        "\"$TMPDIR/vzrt.test\" -test.count=1 -test.v -test.run '^(TestLinuxRootfsGrowth|TestVirtualizationEntitlementPlist)$' | tee \"$TMPDIR/vz-rootfs-no-image.log\"",
+        "grep -E '^--- PASS: TestLinuxRootfsGrowth \\(' \"$TMPDIR/vz-rootfs-no-image.log\"",
+        "grep -E '^--- PASS: TestVirtualizationEntitlementPlist \\(' \"$TMPDIR/vz-rootfs-no-image.log\"",
+        "if grep -E '^[[:space:]]*--- SKIP:' \"$TMPDIR/vz-rootfs-no-image.log\"; then exit 1; fi"
+      ],
+      "m3-16-with-linux-fixtures": [
+        "test -f \"${OWNSAND_VZ_TEST_KERNEL:?Set the path to a compatible arm64 OwnSand Linux kernel}\"",
+        "test -f \"${OWNSAND_VZ_TEST_ROOTFS:?Set the path to a compatible arm64 OwnSand ext4 base disk}\"",
+        "base_bytes=\"$(stat -f '%z' \"$OWNSAND_VZ_TEST_ROOTFS\")\"",
+        "test \"$base_bytes\" -gt 0 && test \"$base_bytes\" -lt 1610612736",
+        "printf 'base disk logical size: %s bytes\\n' \"$base_bytes\"",
+        "unset OWNSAND_VZ_TEST_OUTBOUND",
+        "\"$TMPDIR/vzrt.test\" -test.count=1 -test.timeout=25m -test.v -test.run '^TestVirtualizationIntegration$' | tee \"$TMPDIR/vz-rootfs-integration.log\"",
+        "grep -E '^--- PASS: TestVirtualizationIntegration \\(' \"$TMPDIR/vz-rootfs-integration.log\"",
+        "awk '/guest: hello[[:space:]]*$/ { getline; if ($1 == \"Linux\" && $2 == \"aarch64\") { getline; if ($2 ~ /^[0-9]+$/ && $2 >= 1572864) { printf \"guest root capacity: %s KiB\\n\", $2; ok=1 } } } END { exit !ok }' \"$TMPDIR/vz-rootfs-integration.log\""
+      ]
+    },
+    "expectedResults": [
+      "The native cgo package passes vet and compiles. Ad hoc signing and signature verification succeed. Both selected tests pass with no skips and the seven root capacity cases execute. These commands need no guest images, CMake, IPSW, or administrator password.",
+      "When compatible Linux fixtures are available, run the image-dependent commands in the same shell. The base disk logical size is below 1.5 GiB. The opt-in integration test cold-boots the 2 GiB sandbox, reports Linux aarch64 and at least 1,572,864 KiB of root filesystem capacity, then finishes its lifecycle assertions with a PASS."
+    ],
+    "files": [
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_darwin_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_rootfs_test.go"
+      },
+      {
+        "path": "cmds/ownsand-agent/entitlements.plist"
+      },
+      {
+        "path": ".t3-tmp/vz-rootfs/vzrt.test",
+        "generatedOnHost": true
+      },
+      {
+        "path": ".t3-tmp/vz-rootfs/vz-rootfs-no-image.log",
+        "generatedOnHost": true
+      },
+      {
+        "path": ".t3-tmp/vz-rootfs/vz-rootfs-integration.log",
+        "generatedOnHost": true
+      },
+      {
+        "path": "$OWNSAND_VZ_TEST_KERNEL",
+        "requiredFor": "m3-16-with-linux-fixtures",
+        "description": "Compatible arm64 OwnSand Linux kernel."
+      },
+      {
+        "path": "$OWNSAND_VZ_TEST_ROOTFS",
+        "requiredFor": "m3-16-with-linux-fixtures",
+        "description": "Compatible arm64 OwnSand ext4 disk with the normal guest helper and logical size below 1.5 GiB."
+      }
+    ],
+    "cannotRunWithKnownHostLimits": [
+      "The real Virtualization.framework Linux cold boot cannot run on m3-16 until a compatible arm64 Linux kernel and an undersized OwnSand ext4 base disk are available. The Linux QEMU fixture and kernel are amd64."
+    ]
+  }
+}
