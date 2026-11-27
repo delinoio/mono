@@ -1540,6 +1540,35 @@ describe("invitations", () => {
     );
   });
 
+  test("clears a failed acceptance when the user edits the invitation", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open("/invitations/accept#secret=sri_fixture_a");
+
+    const join = screen.getByRole("button", "Join organization");
+    const invalid = screen.getByText(
+      "It was not found, or you no longer have access to it.",
+    );
+    await join.tap();
+    await expect(invalid).toBeVisible();
+    await expect(join).toBeEnabled();
+    await join.tap();
+    await expect(invalid).toBeVisible();
+
+    await screen.getByLabel("Invitation link or secret").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type(INVITATION_SECRET);
+
+    await expect(invalid).toBeHidden();
+    await join.tap();
+    await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
+  });
+
   test("accepts an invitation link and removes the secret from the address", async ({
     app,
     screen,
