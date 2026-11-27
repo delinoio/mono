@@ -604,11 +604,8 @@ func TestStatusUnreadableStatusFile(t *testing.T) {
 }
 
 // makeUnlistable removes every permission from the inventory directory at
-// path so that listing it fails. store.Open runs before the inventory reads
-// and fails on a path that is not a directory, so a permission change is the
-// way to make only the read fail. The test is skipped where the change has no
-// effect: on Windows (mode bits do not restrict directory reads) and for a
-// user that bypasses permission checks, such as root.
+// path so that listing it fails. It skips the test if the change has no
+// effect, for example on Windows or when the user is root.
 func makeUnlistable(t *testing.T, path string) {
 	t.Helper()
 	if err := os.Chmod(path, 0); err != nil {
@@ -649,6 +646,85 @@ func TestStatusInventoryCounts(t *testing.T) {
 	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
 	if code != exitOK || !strings.Contains(out.String(), "Sandboxes: 2 records") || !strings.Contains(out.String(), "Snapshots: 1\n") || errb.Len() != 0 {
 		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+func TestStatusDamagedOrMissingInventory(t *testing.T) {
+	for _, tc := range []struct {
+		inventory      string
+		wantSandbox    string
+		wantSnapshot   string
+		wantDiagnostic string
+	}{
+		{store.SandboxesDir, "Sandboxes: unavailable (", "Snapshots: 1\n", "ownsand-agent: read sandbox records:"},
+		{store.SnapshotsDir, "Sandboxes: 1 records\n", "Snapshots: unavailable\n", "ownsand-agent: read snapshots:"},
+	} {
+		for _, asFile := range []bool{true, false} {
+			name := tc.inventory + "/missing"
+			if asFile {
+				name = tc.inventory + "/file"
+			}
+			t.Run(name, func(t *testing.T) {
+				st := statusFixture(t)
+				if err := st.SaveStatus(agent.Status{Connected: true}); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.SaveSandbox("sandbox", struct{}{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(st.Path(store.SnapshotsDir, "snapshot"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				path := st.Path(tc.inventory)
+				if err := os.RemoveAll(path); err != nil {
+					t.Fatal(err)
+				}
+				const contents = "damaged inventory"
+				if asFile {
+					if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var out, errb bytes.Buffer
+				code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+				if code != exitError || !strings.HasPrefix(errb.String(), tc.wantDiagnostic) {
+					t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+				}
+				for _, want := range []string{
+					"Enrollment: enrolled (device dev-1, organization org-1)",
+					"Connection: connected",
+					tc.wantSandbox,
+					tc.wantSnapshot,
+				} {
+					if !strings.Contains(out.String(), want) {
+						t.Errorf("stdout = %q, want %q", out.String(), want)
+					}
+				}
+				if asFile {
+					data, err := os.ReadFile(path)
+					if err != nil || string(data) != contents {
+						t.Errorf("inventory file = %q, %v, want %q", data, err, contents)
+					}
+				} else if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Errorf("inventory lookup = %v, want a missing path", err)
+				}
+			})
+		}
+	}
+}
+
+func TestStatusMissingStateDirectory(t *testing.T) {
+	clearAgentEnv(t)
+	dir := filepath.Join(t.TempDir(), "missing")
+	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitNotEnrolled || out.String() != "Enrollment: not enrolled\n" || errb.Len() != 0 {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Errorf("state directory lookup = %v, want a missing path", err)
 	}
 }
 
