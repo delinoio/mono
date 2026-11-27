@@ -1,0 +1,60 @@
+{
+  "gid": "inv-31-windows-console-fixture-pipes",
+  "commit": "5a2d5ae1281c6976055e91603189e1a381ead002",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows amd64",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "5a2d5ae1281c6976055e91603189e1a381ead002",
+    "setup": "Use PowerShell at the root of a writable native validation worktree. Create .t3-tmp/console-pipe-validation, then copy the script and the two test executables to the paths below. Run the remaining commands in the same shell. The script uses its directory for test temporary files and logs.",
+    "commands": [
+      "New-Item -ItemType Directory -Force '.t3-tmp/console-pipe-validation' | Out-Null",
+      "$validationDir = (Resolve-Path '.t3-tmp/console-pipe-validation').Path",
+      "if ((Get-FileHash -Algorithm SHA256 \"$validationDir/hcsrt-start.test.exe\").Hash -ne '8e98ee94659d28b809508a960b919c1ef5f2dc71f2237c4bbd05e66a2afec68c') { throw 'SHA256 mismatch for hcsrt-start.test.exe' }",
+      "if ((Get-FileHash -Algorithm SHA256 \"$validationDir/hcsrt-fixed.test.exe\").Hash -ne '42c59f8490a21512842935bf69a03b1e809c06bf50c6d075320451248ae515f0') { throw 'SHA256 mismatch for hcsrt-fixed.test.exe' }",
+      "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$validationDir/validate-console-pipes.ps1\" 2>&1 | Tee-Object \"$validationDir/native-validation.log\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    ],
+    "expectedResults": [
+      "Both SHA256 checks match the cross-built executables.",
+      "The START binary exits nonzero, reporting a listener error for each held legacy pipe name.",
+      "The fixed binary passes both fixtures with both legacy pipe names held.",
+      "Two fixed test processes with distinct PIDs overlap. Each process exits 0 and reports exactly 20 passes for each fixture. The script logs each process interval."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-console-fixture-pipes/worker/.t3-tmp/validation/validate-console-pipes.ps1",
+      "copyTo": ".t3-tmp/console-pipe-validation/validate-console-pipes.ps1",
+      "regressionTest": "cmds/ownsand-agent/internal/vmruntime/hcsrt/console_windows_test.go",
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-console-fixture-pipes/worker/.t3-tmp/validation/hcsrt-start.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-console-fixture-pipes/worker/.t3-tmp/validation/hcsrt-fixed.test.exe"
+      ],
+      "binaries": [
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-console-fixture-pipes/worker/.t3-tmp/validation/hcsrt-start.test.exe",
+          "copyTo": ".t3-tmp/console-pipe-validation/hcsrt-start.test.exe",
+          "sha": "98205462668a08a75168510e9c97a275beb9ad19",
+          "sha256": "8e98ee94659d28b809508a960b919c1ef5f2dc71f2237c4bbd05e66a2afec68c"
+        },
+        {
+          "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-windows-console-fixture-pipes/worker/.t3-tmp/validation/hcsrt-fixed.test.exe",
+          "copyTo": ".t3-tmp/console-pipe-validation/hcsrt-fixed.test.exe",
+          "sha": "5a2d5ae1281c6976055e91603189e1a381ead002",
+          "sha256": "42c59f8490a21512842935bf69a03b1e809c06bf50c6d075320451248ae515f0"
+        }
+      ],
+      "outputLogs": [
+        ".t3-tmp/console-pipe-validation/native-validation.log",
+        ".t3-tmp/console-pipe-validation/baseline-held.stdout.log",
+        ".t3-tmp/console-pipe-validation/baseline-held.stderr.log",
+        ".t3-tmp/console-pipe-validation/fixed-held.stdout.log",
+        ".t3-tmp/console-pipe-validation/fixed-held.stderr.log",
+        ".t3-tmp/console-pipe-validation/fixed-concurrent-1.stdout.log",
+        ".t3-tmp/console-pipe-validation/fixed-concurrent-1.stderr.log",
+        ".t3-tmp/console-pipe-validation/fixed-concurrent-2.stdout.log",
+        ".t3-tmp/console-pipe-validation/fixed-concurrent-2.stderr.log"
+      ]
+    },
+    "privilegedChecks": []
+  }
+}
