@@ -12,7 +12,7 @@ import {
 } from "@ui-sdk/react/password-input";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./dialog-context.ts";
+import { useForwardedAutoFocus } from "./panel-autofocus.ts";
 
 export type PasswordInputProps = Omit<
   React.ComponentProps<typeof PasswordInputRoot>,

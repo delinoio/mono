@@ -16,7 +16,7 @@ import {
 import { useImperativeHandle, useRef } from "react";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./dialog-context.ts";
+import { useForwardedAutoFocus } from "./panel-autofocus.ts";
 
 export interface NumberInputDraft {
   /** Whether the text currently contains a fractional value. */

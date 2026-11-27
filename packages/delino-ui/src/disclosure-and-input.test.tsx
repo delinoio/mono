@@ -1588,8 +1588,8 @@ describe("SegmentedControl", () => {
   });
 
   // happy-dom does not compute the cascade, so this checks the stylesheet
-  // text. The optional UI SDK stylesheet draws a 1px border on the track and
-  // the indicator, which the borderless design must reset.
+  // text. Reset the optional UI SDK borders to keep the track and indicator
+  // sizes when the selection uses an inset shadow.
   test("resets the UI SDK border on the track and the indicator", () => {
     expect(block(".dui-segmented-control")).toContain("border: 0;");
     expect(block(".dui-segmented-control-indicator")).toContain("border: 0;");
@@ -1613,8 +1613,6 @@ describe("SegmentedControl", () => {
     );
     expect(focus).toContain("outline: 2px solid CanvasText;");
     expect(focus).toContain("outline-offset: 2px;");
-    // The default (non-forced) indicator keeps its borderless design.
-    expect(block(".dui-segmented-control-indicator")).toContain("border: 0;");
   });
 });
 
@@ -1692,8 +1690,12 @@ describe("Forced colors", () => {
       forced,
       ".dui-toggle[data-pressed], .dui-pagination-link[data-current]",
     );
+    expect(filled).toContain("forced-color-adjust: none;");
     expect(filled).toContain("background: Highlight;");
     expect(filled).toContain("color: HighlightText;");
+    expect(findRuleBlock(forced, ".dui-toggle[data-pressed]")).toContain(
+      "box-shadow: none;",
+    );
     // A border would widen both controls, so neither gets one.
     expect(findRuleBlock(forced, ".dui-toggle")).toBeNull();
     expect(block(".dui-toggle")).toContain("border: 0;");

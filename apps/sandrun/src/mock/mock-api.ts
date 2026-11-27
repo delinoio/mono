@@ -815,6 +815,13 @@ export interface MockTransportOptions {
   runnerProfileCount?: number;
   /** Caps integration pages and seeds a profile that uses the second page. */
   agentIntegrationPageSize?: number;
+  /** Adds work fixtures to seeded organizations without changing the defaults. */
+  workFixtures?: readonly {
+    organizationId: string;
+    requests?: readonly MessageInitShape<typeof RequestSchema>[];
+    runners?: readonly MessageInitShape<typeof RunnerSchema>[];
+    devSessions?: readonly MessageInitShape<typeof DevSessionSchema>[];
+  }[];
   /**
    * Ends each WatchQueue stream after its snapshot and this many
    * milliseconds, like the control plane before 14 minutes. Default: the
@@ -837,6 +844,27 @@ export function createMockTransport(
     options.runnerProfileCount ?? 3,
     options.agentIntegrationPageSize,
   );
+  for (const {
+    organizationId,
+    requests = [],
+    runners = [],
+    devSessions = [],
+  } of options.workFixtures ?? []) {
+    const org = orgs.get(organizationId);
+    if (org === undefined)
+      throw new Error(`Unknown fixture organization ${organizationId}`);
+    org.requests.push(
+      ...requests.map((r) => create(RequestSchema, { ...r, organizationId })),
+    );
+    org.runners.push(
+      ...runners.map((r) => create(RunnerSchema, { ...r, organizationId })),
+    );
+    org.devSessions.push(
+      ...devSessions.map((s) =>
+        create(DevSessionSchema, { ...s, organizationId }),
+      ),
+    );
+  }
   let failAcmeContinuation = true;
   const watchers = new Map<string, Set<Watcher>>();
   const issuedStates = new Map<
@@ -1321,18 +1349,51 @@ export function createMockTransport(
       removeOwnSandLink(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
+        const requestsOnNewlyDeletedRunners = new Set<string>();
+        for (const runner of org.runners) {
+          if (TERMINAL_RUNNER_STATES.has(runner.state)) continue;
+          // Finishing an existing deletion does not apply the runner-specific request outcome again.
+          if (
+            runner.state !== RunnerState.DELETING &&
+            runner.requestId !== ""
+          ) {
+            requestsOnNewlyDeletedRunners.add(runner.requestId);
+          }
+          endRunner(org, runner, RunnerEndReason.CLEAN_UP);
+        }
         for (const r of org.requests) {
-          if (r.state === RequestState.QUEUED)
+          if (r.state === RequestState.QUEUED) {
             endRequest(
               org,
               r,
               RequestState.CANCELED,
               RequestEndReason.INTEGRATION_REMOVED,
             );
-        }
-        for (const r of org.runners) {
-          if (!TERMINAL_RUNNER_STATES.has(r.state))
-            endRunner(org, r, RunnerEndReason.CLEAN_UP);
+          } else if (
+            r.state === RequestState.STARTING ||
+            r.state === RequestState.RUNNING
+          ) {
+            const runnerDeleted = requestsOnNewlyDeletedRunners.has(
+              r.requestId,
+            );
+            if (runnerDeleted && r.kind === WorkloadKind.DEV_SESSION) {
+              endRequest(
+                org,
+                r,
+                RequestState.ENDED,
+                RequestEndReason.SESSION_DELETED,
+              );
+            } else {
+              endRequest(
+                org,
+                r,
+                RequestState.FAILED,
+                runnerDeleted && r.kind === WorkloadKind.AGENT_SESSION
+                  ? RequestEndReason.RUNNER_LOST
+                  : RequestEndReason.INTEGRATION_REMOVED,
+              );
+            }
+          }
         }
         org.link = undefined;
         audit(
@@ -2007,8 +2068,17 @@ export function createMockTransport(
           org.apiKeys.filter((k) => k.userId === userId),
           req,
         );
+        const listedAt = ts();
         return {
-          apiKeys: p.items.map(({ userId: _u, ...k }) => k),
+          apiKeys: p.items.map(({ userId: _u, ...key }) => {
+            if (key.state !== ApiKeyState.REVOKED) {
+              const expired =
+                key.expiresAt !== undefined &&
+                compareTimestamps(key.expiresAt, listedAt) <= 0;
+              key.state = expired ? ApiKeyState.EXPIRED : ApiKeyState.ACTIVE;
+            }
+            return key;
+          }),
           nextPageToken: p.nextPageToken,
         };
       },

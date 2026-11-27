@@ -886,6 +886,33 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
+  test("moves the running GitHub job into request history after removing the OwnSand link", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}`);
+    await expect(
+      screen.getByText("1 request is starting or running."),
+    ).toBeVisible();
+
+    await screen.getByRole("link", "Integrations", { exact: true }).tap();
+    await screen.getByRole("button", "Remove link").tap();
+    const confirm = screen.getByRole("alertdialog", "Remove the OwnSand link?");
+    await confirm.getByRole("button", "Remove link").tap();
+    await expect(screen.getByRole("button", "Link OwnSand")).toBeVisible();
+
+    await screen.getByRole("link", "Requests", { exact: true }).tap();
+    await expect(screen.getByText("No requests match")).toBeVisible();
+    await screen.getByRole("checkbox", "Show ended requests").tap();
+    const job = screen
+      .getByRole("row")
+      .filter({ hasText: "acme-robotics/firmware · build (ubuntu)" });
+    await expect(job.getByRole("cell", "Failed")).toBeVisible();
+    await expect(job.getByRole("cell", "Integration removed")).toBeVisible();
+  });
+
   test("the GitHub callback links the installation and removes code and state", async ({
     app,
     screen,
@@ -1092,6 +1119,50 @@ describe("integrations", () => {
 });
 
 describe("runner profiles", () => {
+  for (const mode of ["create", "edit"] as const) {
+    test(`blocks ${mode} when no OpenAI Codex guest OS is verified`, async ({
+      app,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/profiles`);
+      if (mode === "create") {
+        await screen.getByRole("button", "Create runner profile").tap();
+        await screen.getByRole("combobox", "Workload kind").tap();
+        await screen.getByRole("option", "Agent session").tap();
+        await screen.getByRole("combobox", "Agent integration").tap();
+        await screen.getByRole("option", "codex-prod (OpenAI Codex)").tap();
+      } else {
+        await screen
+          .getByRole("listitem")
+          .filter({ hasText: "codex-linux ·" })
+          .getByRole("button", "Edit")
+          .tap();
+      }
+
+      const dialog = screen.getByRole(
+        "dialog",
+        mode === "create" ? "Create a runner profile" : "Edit codex-linux",
+      );
+      await expect(
+        dialog.getByText(
+          "SandRun has not verified a guest OS for OpenAI Codex. You cannot save this profile yet.",
+        ),
+      ).toBeVisible();
+      await expect(dialog.getByRole("combobox", "Guest OS")).toHaveAttribute(
+        "disabled",
+        "",
+      );
+      await expect(
+        dialog.getByRole(
+          "button",
+          mode === "create" ? "Create profile" : "Save changes",
+        ),
+      ).toHaveAttribute("disabled", "");
+    });
+  }
+
   test("uses a later profile across pages and refreshes after profile changes", async ({
     app,
     browser,
@@ -1384,6 +1455,55 @@ describe("personal API keys", () => {
     await expect(screen.getByText(name, { exact: false })).toBeVisible();
   });
 
+  test("shows a key as expired after a fresh list request", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    const issuedAt = await browser.evaluate(() => {
+      const issuedAt = Date.now();
+      Date.now = () => issuedAt;
+      return issuedAt;
+    });
+
+    await screen.getByRole("button", "Create API key").tap();
+    await browser.keyboard.type("expiring-key");
+    await screen.getByRole("combobox", "Expires after").tap();
+    await screen.getByRole("option", "30 days").tap();
+    await screen.getByRole("button", "Create key").tap();
+    const dialog = screen.getByRole("dialog", "Your new personal API key");
+    await browser.evaluate(() => {
+      Date.now = () => new Date().getTime();
+      return null;
+    });
+    await dialog.getByRole("button", "Done").tap();
+    await expect(browser.locator('[role="dialog"]')).toBeHidden();
+
+    const row = screen
+      .getByRole("listitem")
+      .filter({ hasText: "expiring-key" });
+    const revoke = row.getByRole("button", "Revoke", { exact: true });
+    await expect(row).toContainText("expiring-key · Active");
+    await expect(revoke).toBeVisible();
+
+    await screen.getByRole("link", "Members", { exact: true }).tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/members`);
+    await browser.evaluate(
+      (expiresAt) => {
+        Date.now = () => expiresAt;
+        return null;
+      },
+      issuedAt + 30 * 24 * 60 * 60 * 1000,
+    );
+    await screen.getByRole("link", "API keys", { exact: true }).tap();
+
+    await expect(row).toContainText("expiring-key · Expired");
+    await expect(revoke).toBeHidden();
+  });
+
   test("creates a key without an expiry when Never is selected", async ({
     app,
     browser,
@@ -1495,6 +1615,35 @@ describe("invitations", () => {
     await expect(screen.getByRole("combobox", "Organization")).toContainText(
       "Contoso",
     );
+  });
+
+  test("clears a failed acceptance when the user edits the invitation", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await app.open("/invitations/accept#secret=sri_fixture_a");
+
+    const join = screen.getByRole("button", "Join organization");
+    const invalid = screen.getByText(
+      "It was not found, or you no longer have access to it.",
+    );
+    await join.tap();
+    await expect(invalid).toBeVisible();
+    await expect(join).toBeEnabled();
+    await join.tap();
+    await expect(invalid).toBeVisible();
+
+    await screen.getByLabel("Invitation link or secret").tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type(INVITATION_SECRET);
+
+    await expect(invalid).toBeHidden();
+    await join.tap();
+    await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
   });
 
   test("accepts an invitation link and removes the secret from the address", async ({
