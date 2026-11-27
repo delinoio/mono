@@ -59,20 +59,10 @@ const (
 // ErrNotFound reports a missing record.
 var ErrNotFound = errors.New("store: record not found")
 
-// syncDir flushes a directory's entries to stable storage; see
-// syncDirectory. It is a variable so that a test can record the calls or make
-// one fail. Production code never assigns it.
-var syncDir = syncDirectory
-
 // Store is the agent state directory. It is safe for concurrent use.
 type Store struct {
 	dir string
 	mu  sync.Mutex
-	// createdParents lists the parent of every directory that Open created
-	// on the way to the state directory (the state directory itself
-	// included), deepest first. Their entries are flushed with the first
-	// durable identity write.
-	createdParents []string
 }
 
 // Open creates the state directory and its subdirectories and restricts the
@@ -83,7 +73,6 @@ func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("store: state directory is required")
 	}
-	createdParents := missingDirParents(dir)
 	for _, sub := range []string{"", SandboxesDir, SnapshotsDir, VMsDir, ImagesDir, UpdateDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
 			return nil, fmt.Errorf("store: create %s: %w", filepath.Join(dir, sub), err)
@@ -93,26 +82,7 @@ func Open(dir string) (*Store, error) {
 	if err := restrictStateDir(dir); err != nil {
 		return nil, fmt.Errorf("store: restrict state directory: %w", err)
 	}
-	return &Store{dir: dir, createdParents: createdParents}, nil
-}
-
-// missingDirParents returns the parent of dir and of each of its ancestors
-// that does not exist yet, deepest first. Open is about to create these
-// directories.
-func missingDirParents(dir string) []string {
-	var parents []string
-	for p := filepath.Clean(dir); ; {
-		if _, err := os.Lstat(p); err == nil || !errors.Is(err, fs.ErrNotExist) {
-			break
-		}
-		parent := filepath.Dir(p)
-		if parent == p {
-			break
-		}
-		parents = append(parents, parent)
-		p = parent
-	}
-	return parents
+	return &Store{dir: dir}, nil
 }
 
 // Dir returns the state directory.
@@ -203,23 +173,14 @@ func (s *Store) SaveIdentity(id *Identity) error {
 	return s.writeJSON(s.Path(IdentityFile), id)
 }
 
-// SaveIdentityDurable writes the identity like SaveIdentity and then, on
-// Linux, flushes the directory entries that make the file reachable after a
-// power loss: the state directory and the parent of every directory that
-// Open created for it. Enrollment uses it for the pending key, which must
-// survive before the one-time token is spent: the control plane accepts a
-// retry of the token only for the key of the first call. When a flush
-// fails, the error is returned and the caller must not go on.
+// SaveIdentityDurable saves the pending identity and, on Linux, flushes the
+// resolved state directory and its ancestors before enrollment can spend the
+// token. If a flush fails, it returns the error and keeps the key for retry.
 func (s *Store) SaveIdentityDurable(id *Identity) error {
 	if err := s.SaveIdentity(id); err != nil {
 		return err
 	}
-	for _, d := range append([]string{s.dir}, s.createdParents...) {
-		if err := syncDir(d); err != nil {
-			return fmt.Errorf("store: sync directory %s: %w", d, err)
-		}
-	}
-	return nil
+	return s.SyncPendingIdentityDirectories()
 }
 
 // DeleteIdentity deletes the device key.
@@ -244,6 +205,12 @@ type PendingUpdate struct {
 	PreviousVersion string `json:"previous_version"`
 }
 
+// RunningRevocation records a verified revocation and its recovery target.
+type RunningRevocation struct {
+	Version       string `json:"version"`
+	TargetVersion string `json:"target_version"`
+}
+
 // AgentState is the agent record apart from the identity.
 type AgentState struct {
 	APIURL string `json:"api_url"`
@@ -251,9 +218,10 @@ type AgentState struct {
 	// reset state directory.
 	StateEpoch string `json:"state_epoch"`
 	// RevisionCounter is the last sandbox revision counter of the epoch.
-	RevisionCounter uint64         `json:"revision_counter"`
-	Removal         RemovalRecord  `json:"removal"`
-	PendingUpdate   *PendingUpdate `json:"pending_update,omitempty"`
+	RevisionCounter   uint64             `json:"revision_counter"`
+	Removal           RemovalRecord      `json:"removal"`
+	PendingUpdate     *PendingUpdate     `json:"pending_update,omitempty"`
+	RunningRevocation *RunningRevocation `json:"running_revocation,omitempty"`
 	// Limits and STUN URLs of the last configuration message.
 	Limits   *Limits  `json:"limits,omitempty"`
 	STUNURLs []string `json:"stun_urls,omitempty"`

@@ -16,6 +16,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 func TestHTTPClientRedirectPolicy(t *testing.T) {
@@ -154,6 +155,90 @@ func TestDefaultAuthTimeout(t *testing.T) {
 	}
 }
 
+type authRPCStub struct {
+	ownsandv1connect.AgentServiceClient
+	step    string
+	failure func(context.Context) error
+}
+
+func (s authRPCStub) CreateChallenge(ctx context.Context, _ *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
+	if s.step == "create challenge" {
+		return nil, s.failure(ctx)
+	}
+	return connect.NewResponse(&ownsandv1.CreateChallengeResponse{Nonce: []byte("test nonce")}), nil
+}
+
+func (s authRPCStub) Authenticate(ctx context.Context, _ *connect.Request[ownsandv1.AuthenticateRequest]) (*connect.Response[ownsandv1.AuthenticateResponse], error) {
+	return nil, s.failure(ctx)
+}
+
+func (s authRPCStub) ConfirmRemoval(ctx context.Context, _ *connect.Request[ownsandv1.ConfirmRemovalRequest]) (*connect.Response[ownsandv1.ConfirmRemovalResponse], error) {
+	return nil, s.failure(ctx)
+}
+
+func TestAuthRPCDeadlineAttribution(t *testing.T) {
+	key, _, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const remoteMessage = "control plane ended the RPC"
+	const agentTimeout = 20 * time.Second
+	for _, step := range []string{"create challenge", "authenticate", "confirm removal"} {
+		t.Run(step, func(t *testing.T) {
+			remoteErr := connect.NewError(connect.CodeDeadlineExceeded, errors.New(remoteMessage))
+			c := &Client{
+				Agent:       authRPCStub{step: step, failure: func(context.Context) error { return remoteErr }},
+				AuthTimeout: agentTimeout,
+			}
+			call := func(ctx context.Context) error {
+				if step == "confirm removal" {
+					return c.ConfirmRemoval(ctx, "test-device", key)
+				}
+				_, err := c.Authenticate(ctx, "test-device", key, "")
+				return err
+			}
+
+			t.Run("caller deadline", func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				err := call(ctx)
+				if ctx.Err() != nil {
+					t.Fatalf("caller context ended early: %v", ctx.Err())
+				}
+				want := "cpclient: " + step + ": deadline_exceeded: " + remoteMessage
+				if !errors.Is(err, remoteErr) || connect.CodeOf(err) != connect.CodeDeadlineExceeded || err.Error() != want {
+					t.Fatalf("call error = %v, want %q wrapping the original Connect error", err, want)
+				}
+			})
+
+			t.Run("agent timeout", func(t *testing.T) {
+				err := call(context.Background())
+				want := "cpclient: " + step + ": no answer within " + agentTimeout.String()
+				if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), want) {
+					t.Fatalf("call error = %v, want %q wrapping context.DeadlineExceeded", err, want)
+				}
+			})
+		})
+	}
+}
+
+func TestAuthenticateKeepsExpiredCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	c := &Client{Agent: authRPCStub{
+		step: "create challenge",
+		failure: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}}
+	_, err := c.Authenticate(ctx, "test-device", nil, "")
+	want := "cpclient: create challenge: context deadline exceeded"
+	if !errors.Is(err, context.DeadlineExceeded) || err.Error() != want {
+		t.Fatalf("Authenticate error = %v, want %q wrapping the caller context error", err, want)
+	}
+}
+
 func TestAuthenticateEndsWhenTheControlPlaneStalls(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -174,6 +259,9 @@ func TestAuthenticateEndsWhenTheControlPlaneStalls(t *testing.T) {
 			}
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("error %v does not match context.DeadlineExceeded", err)
+			}
+			if want := "cpclient: " + tc.name + ": no answer within " + authTestTimeout.String(); !strings.Contains(err.Error(), want) {
+				t.Fatalf("Authenticate error = %v, want %q", err, want)
 			}
 			if errors.Is(err, ErrUnknownDevice) {
 				t.Fatalf("a stalled attempt was reported as an unknown device: %v", err)
@@ -206,6 +294,9 @@ func TestAuthenticateKeepsTheCallerContext(t *testing.T) {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a canceled caller was reported as a deadline: %v", err)
+	}
+	if strings.Contains(err.Error(), "no answer within") {
+		t.Fatalf("a canceled caller was reported as an agent timeout: %v", err)
 	}
 }
 

@@ -53,6 +53,8 @@ func TestReadEventsLineEndingsAndBOM(t *testing.T) {
 		{"LF", "data: ok\n\n", []Event{{Name: "message", Data: []byte("ok")}}},
 		{"CRLF", "data: ok\r\n\r\n", []Event{{Name: "message", Data: []byte("ok")}}},
 		{"CR", "data: ok\r\r", []Event{{Name: "message", Data: []byte("ok")}}},
+		{"empty data", "data\n\n", []Event{{Name: "message", Data: []byte{}}}},
+		{"empty data lines", "data:\ndata: ok\ndata:\n\n", []Event{{Name: "message", Data: []byte("\nok\n")}}},
 		{
 			"mixed with split CRLF",
 			"event: created\r\nid: c1\rdata: first\n: comment\rdata: second\r\n\r\ndata: after\n\n",
@@ -117,6 +119,50 @@ func TestReadEventsReaderErrorAndLineLimit(t *testing.T) {
 		if err := ReadEvents(strings.NewReader(line+ending+ending), unexpectedEvent); err == nil {
 			t.Errorf("ReadEvents accepted an oversized line ending in %q", ending)
 		}
+	}
+}
+
+func TestReadEventsPayloadLimit(t *testing.T) {
+	const limit = 1 << 20
+	first := strings.Repeat("é", limit/4)
+	second := strings.Repeat("b", limit-len(first)-1)
+	for _, tc := range []struct {
+		name   string
+		suffix string
+	}{
+		{name: "at limit"},
+		{name: "over limit from data", suffix: "b"},
+		{name: "over limit from separator", suffix: "\rdata:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "id: cursor\ndata: before\n\nevent: large\r\ndata: " + first +
+				"\r\ndata: " + second + tc.suffix + "\r\n\r\ndata: after\n\n"
+			var got []Event
+			err := ReadEvents(strings.NewReader(body), func(e Event) error {
+				got = append(got, e)
+				return nil
+			})
+			if tc.suffix != "" {
+				if err == nil || err.Error() != fmt.Sprintf("event stream payload exceeds %d bytes", limit) {
+					t.Errorf("ReadEvents returned %v, want a payload limit error", err)
+				}
+				if len(got) != 1 || got[0].ID != "cursor" || string(got[0].Data) != "before" {
+					t.Errorf("want only the preceding event, got %d events", len(got))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []Event{
+				{ID: "cursor", Name: "message", Data: []byte("before")},
+				{ID: "cursor", Name: "large", Data: []byte(first + "\n" + second)},
+				{ID: "cursor", Name: "message", Data: []byte("after")},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("want three ordered events with ID carryover and complete payloads, got %d events", len(got))
+			}
+		})
 	}
 }
 
@@ -192,6 +238,84 @@ func TestClientSuccessfulJSONAndSSE(t *testing.T) {
 	if err := c.Stream(ctx, "watch", "/stream", nil, nil, func(e Event) error { events = append(events, e); return nil }); err != nil || len(events) != 1 || events[0].ID != "1" {
 		t.Fatalf("stream: %v %+v", err, events)
 	}
+}
+
+func TestStreamErrorBodyDeadline(t *testing.T) {
+	const budget = 150 * time.Millisecond
+	for _, path := range []string{"/diagnostic-timeout", "/parent-cancellation", "/healthy"} {
+		t.Run(path[1:], func(t *testing.T) {
+			requestCanceled := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/healthy" {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.(http.Flusher).Flush()
+					time.Sleep(2 * budget)
+					fmt.Fprint(w, "data: delayed event\n\n")
+					return
+				}
+				w.Header().Set("Retry-After", "7")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprint(w, "partial diagnostic")
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+				close(requestCanceled)
+			}))
+			t.Cleanup(srv.Close)
+			deadline, stop := context.WithTimeout(t.Context(), 5*time.Second)
+			defer stop()
+			ctx, cancel := context.WithCancel(deadline)
+			defer cancel()
+			c := Client{Vendor: "DEVIN", BaseURL: srv.URL, StreamErrorBodyTimeout: budget}
+			if path == "/parent-cancellation" {
+				c.StreamErrorBodyTimeout = time.Minute
+				c.HTTP = &http.Client{Transport: cancelOnBodyRead{cancel: cancel}}
+			}
+
+			var data string
+			err := c.Stream(ctx, "watch_queue", path, nil, nil, func(e Event) error {
+				data = string(e.Data)
+				return nil
+			})
+			if path == "/healthy" {
+				if err != nil || data != "delayed event" {
+					t.Fatalf("healthy stream: data %q, error %v", data, err)
+				}
+				return
+			}
+			if deadline.Err() != nil || (path == "/diagnostic-timeout" && ctx.Err() != nil) {
+				t.Fatalf("read returned only after caller timeout: %v", err)
+			}
+			want := StatusError{Vendor: "DEVIN", Op: "watch_queue", Status: http.StatusServiceUnavailable, RetryAfter: 7 * time.Second}
+			if got, ok := AsStatus(err); !ok || *got != want {
+				t.Fatalf("status error = %#v, want %+v", err, want)
+			}
+			select {
+			case <-requestCanceled:
+			case <-deadline.Done():
+				t.Fatal("blocked diagnostic read did not cancel the HTTP request")
+			}
+		})
+	}
+}
+
+type cancelOnBodyRead struct{ cancel context.CancelFunc }
+
+func (tr cancelOnBodyRead) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err == nil {
+		resp.Body = cancelingBody{ReadCloser: resp.Body, cancel: tr.cancel}
+	}
+	return resp, err
+}
+
+type cancelingBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelingBody) Read(p []byte) (int, error) {
+	b.cancel()
+	return b.ReadCloser.Read(p)
 }
 
 func TestClientErrorsAndLogs(t *testing.T) {

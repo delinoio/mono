@@ -1630,20 +1630,29 @@ func TestRestartPendingCleanupRejectsVMOperations(t *testing.T) {
 	e.rt.files[running], e.rt.files[paused] = true, true
 	e.rt.deleteFails = 2
 	e.restart()
-	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: running}); err == nil {
-		t.Fatal("pause accepted while the restart cleanup is pending")
+
+	checkFailedPrecondition := func(operation string, err error) {
+		t.Helper()
+		const want = ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION
+		var commandErr *CommandError
+		if !errors.As(err, &commandErr) || commandErr == nil {
+			t.Errorf("%s during pending restart cleanup: got %T (%v), want *CommandError with code %v", operation, err, err, want)
+		} else if commandErr.Code != want {
+			t.Errorf("%s during pending restart cleanup: got code %v, want %v", operation, commandErr.Code, want)
+		}
 	}
-	if _, err := e.m.Resume(ctx, &ownsandv1.ResumeSandboxCommand{SandboxId: paused}); err == nil {
-		t.Fatal("resume accepted while the restart cleanup is pending")
-	}
+
+	_, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: running})
+	checkFailedPrecondition("pause", err)
+	_, err = e.m.Resume(ctx, &ownsandv1.ResumeSandboxCommand{SandboxId: paused})
+	checkFailedPrecondition("resume", err)
 	for _, id := range []string{running, paused} {
 		snapshotID, err := uuidv7.NewString()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapshotID, SandboxId: id}); err == nil {
-			t.Fatalf("snapshot of %s accepted while the restart cleanup is pending", id)
-		}
+		_, err = e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapshotID, SandboxId: id})
+		checkFailedPrecondition("snapshot of "+id, err)
 	}
 	if s, _ := e.m.State(running); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("state %v, want RUNNING", s)
@@ -2065,30 +2074,113 @@ func TestCreateRecoversFromOneRevisionFailure(t *testing.T) {
 	}
 }
 
-// TestCreateRecoversFromOneRecordSaveFailure checks the same recovery for a
-// failed record save. Unlike a revision failure, a save failure leaves the new
-// state in the record, and the retry still publishes it.
 func TestCreateRecoversFromOneRecordSaveFailure(t *testing.T) {
+	t.Run("unacknowledged", func(t *testing.T) {
+		testCreateRunningRecordSaveFailures(t, 1, false)
+	})
+	t.Run("acknowledged", func(t *testing.T) {
+		testCreateRunningRecordSaveFailures(t, 1, true)
+	})
+}
+
+func TestCreateStopsVMWhenRunningRecordCannotBePublishedAfterSaveFailures(t *testing.T) {
+	testCreateRunningRecordSaveFailures(t, DefaultRunningAttempts, false)
+}
+
+func testCreateRunningRecordSaveFailures(t *testing.T, failures int, acked bool) {
+	t.Helper()
 	e := newEnv(t)
 	e.m.runningBackoff = time.Millisecond
+	ctx := context.Background()
 	cmd := e.createCmd(1, time.Hour, time.Hour)
 	id := cmd.GetSandboxId()
-	e.rt.onCreate = func(vmruntime.Spec) { blockRecord(t, e.st, id) }
-	e.m.onRunningCommitFailed = func(int, bool) {
-		if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-			t.Errorf("a save failure left the record in %v, want the new RUNNING state", state)
+	var creating *ownsandv1.SandboxStateEntry
+	e.rt.onCreate = func(vmruntime.Spec) {
+		rec := persistedRecord(t, e.st, id)
+		creating = rec.Entry(e.m.Epoch())
+		if acked {
+			e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: creating.GetRevision()})
 		}
-		unblockRecord(t, e.st, id)
+		blockRecord(t, e.st, id)
 	}
-	entry, err := e.m.Create(context.Background(), cmd)
-	if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		t.Fatalf("create %v %v", entry, err)
+	attempts := 0
+	e.m.onRunningCommitFailed = func(attempt int, willRetry bool) {
+		attempts++
+		if attempt != attempts || willRetry != (attempt < DefaultRunningAttempts) {
+			t.Errorf("attempt %d willRetry %v after %d failures", attempt, willRetry, attempts)
+		}
+		if state, _ := e.m.State(id); state != creating.GetState() {
+			t.Errorf("state = %v, want CREATING", state)
+		}
+		report := e.m.StateReport(uint64(attempt), nil).GetSandboxes()
+		if len(report) != 1 || !proto.Equal(report[0], creating) {
+			t.Errorf("report = %v, want the original CREATING entry %v", report, creating)
+		}
+		e.m.mu.Lock()
+		gotAcked := e.m.sandboxes[id].rec.Acked
+		e.m.mu.Unlock()
+		if gotAcked != acked {
+			t.Errorf("Acked = %t, want %t", gotAcked, acked)
+		}
+		wantUpdates := 1
+		if !acked {
+			wantUpdates += attempts - 1
+		}
+		if got := len(e.out.entries); got != wantUpdates {
+			t.Errorf("updates before resend = %d, want %d", got, wantUpdates)
+		}
+		e.m.Tick(ctx, true)
+		if !acked {
+			wantUpdates++
+		}
+		if got := len(e.out.entries); got != wantUpdates {
+			t.Errorf("updates after resend = %d, want %d", got, wantUpdates)
+		}
+		for _, update := range e.out.entries {
+			if !proto.Equal(update, creating) {
+				t.Errorf("update = %v, want the original CREATING entry %v", update, creating)
+			}
+		}
+		called := false
+		if e.m.WithRunning(id, func() { called = true }) || called {
+			t.Error("WithRunning admitted a sandbox whose RUNNING save failed")
+		}
+		if attempt == failures {
+			unblockRecord(t, e.st, id)
+		}
 	}
-	if got := persistedState(t, e.st, id); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		t.Fatalf("saved record state %v, want RUNNING", got)
+	entry, err := e.m.Create(ctx, cmd)
+	if attempts != failures || e.rt.startCount() != 1 {
+		t.Fatalf("failed attempts %d, VM starts %d, want %d and 1", attempts, e.rt.startCount(), failures)
 	}
-	if e.rt.startCount() != 1 {
-		t.Fatalf("VM starts %d, want 1", e.rt.startCount())
+	rec := persistedRecord(t, e.st, id)
+	if !proto.Equal(rec.Entry(e.m.Epoch()), entry) {
+		t.Fatalf("saved entry = %v, want create result %v", rec.Entry(e.m.Epoch()), entry)
+	}
+	if failures == DefaultRunningAttempts {
+		requireInternal(t, err)
+		if rec.State != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || rec.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+			t.Fatalf("saved record state = %v, reason = %v, want FAILED / CREATE_FAILED", rec.State, rec.EndReason)
+		}
+		if ids, _ := e.rt.Running(ctx); len(ids) != 0 || e.rt.hasFiles(id) {
+			t.Fatalf("VM %v or its files remain", ids)
+		}
+		requireStates(t, e.out.states(id), []ownsandv1.SandboxState{
+			ownsandv1.SandboxState_SANDBOX_STATE_CREATING,
+			ownsandv1.SandboxState_SANDBOX_STATE_DELETING,
+			ownsandv1.SandboxState_SANDBOX_STATE_FAILED,
+		})
+		return
+	}
+	if err != nil || rec.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING || rec.Revision <= creating.GetRevision().GetCounter() || rec.Acked {
+		t.Fatalf("create result = %v, saved Acked = %t, error = %v, want an unacknowledged RUNNING entry with a new revision", entry, rec.Acked, err)
+	}
+	if last := e.out.entries[len(e.out.entries)-1]; !proto.Equal(last, entry) {
+		t.Fatalf("last update = %v, want saved RUNNING entry %v", last, entry)
+	}
+	called := false
+	if !e.m.WithRunning(id, func() { called = true }) || !called {
+		t.Fatal("WithRunning refused the sandbox after its RUNNING save succeeded")
 	}
 }
 
@@ -2354,28 +2446,50 @@ func TestAcksDropEndedRecords(t *testing.T) {
 
 func TestResendAndIdleReports(t *testing.T) {
 	e := newEnv(t)
-	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
-	n := len(e.out.entries)
+	const idleTTL = 10 * time.Minute
+	created := e.create(idleTTL, 2*time.Hour)
+	id := created.GetSandboxId()
+	n := e.out.count()
 	e.m.Tick(context.Background(), true)
-	if len(e.out.entries) != n+1 {
-		t.Fatal("unacknowledged update not resent")
+	if e.out.count() != n+1 {
+		t.Fatalf("resend: %d entries, want %d", e.out.count(), n+1)
 	}
-	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: e.out.entries[len(e.out.entries)-1].GetRevision()})
-	n = len(e.out.entries)
+	resent := e.out.lastEntry(id)
+	if !proto.Equal(resent, created) {
+		t.Fatalf("resent update %v, want %v", resent, created)
+	}
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: resent.GetRevision()})
+	n = e.out.count()
+
+	e.clk.Advance(10 * time.Second)
 	e.m.Touch(id)
+	wantDeadline := e.clk.Now().Add(idleTTL)
 	e.m.Tick(context.Background(), true)
-	if len(e.out.entries) != n+1 {
-		t.Fatal("moved idle deadline not reported")
+	if e.out.count() != n+1 {
+		t.Fatalf("moved idle deadline: %d entries, want %d", e.out.count(), n+1)
 	}
+	got := e.out.lastEntry(id)
+	if got.GetRevision().GetCounter() <= resent.GetRevision().GetCounter() {
+		t.Fatalf("revision %d, want newer than %d", got.GetRevision().GetCounter(), resent.GetRevision().GetCounter())
+	}
+	if !got.GetIdleDeadline().AsTime().Equal(wantDeadline) {
+		t.Fatalf("idle deadline %v, want %v", got.GetIdleDeadline().AsTime(), wantDeadline)
+	}
+
+	e.clk.Advance(10 * time.Second)
 	e.m.Touch(id)
+	wantDeadline = e.clk.Now().Add(idleTTL)
 	e.m.Tick(context.Background(), false)
-	if len(e.out.entries) != n+1 {
+	if e.out.count() != n+1 {
 		t.Fatal("idle deadline reported twice within a minute")
 	}
-	e.clk.Advance(time.Minute)
+	e.clk.Advance(50 * time.Second)
 	e.m.Tick(context.Background(), false)
-	if len(e.out.entries) != n+2 {
-		t.Fatal("idle deadline not reported after a minute")
+	if e.out.count() != n+2 {
+		t.Fatalf("idle deadline at the one-minute boundary: %d entries, want %d", e.out.count(), n+2)
+	}
+	if deadline := e.out.lastEntry(id).GetIdleDeadline().AsTime(); !deadline.Equal(wantDeadline) {
+		t.Fatalf("idle deadline %v, want %v", deadline, wantDeadline)
 	}
 }
 
@@ -3181,14 +3295,15 @@ func TestLockSnapshotImportCanceledContextAbortsWithFreeLock(t *testing.T) {
 // another activity event, and a successful report still follows the throttle.
 func TestIdleReportRetriesAfterRevisionWriteFailure(t *testing.T) {
 	e := newEnv(t)
-	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	const idleTTL = 10 * time.Minute
+	id := e.create(idleTTL, 2*time.Hour).GetSandboxId()
 	acked := e.out.lastEntry(id)
 	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: acked.GetRevision()})
 	n := e.out.count()
 
 	e.clk.Advance(30 * time.Second)
 	e.m.Touch(id)
-	wantDeadline := e.clk.Now().Add(10 * time.Minute)
+	wantDeadline := e.clk.Now().Add(idleTTL)
 
 	// A directory in place of agent.json makes the revision write fail: the
 	// store cannot read the file that holds the revision counter. The fault
@@ -3239,15 +3354,20 @@ func TestIdleReportRetriesAfterRevisionWriteFailure(t *testing.T) {
 
 	// The successful report starts the one-minute throttle.
 	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: got.GetRevision()})
+	e.clk.Advance(10 * time.Second)
 	e.m.Touch(id)
+	wantDeadline = e.clk.Now().Add(idleTTL)
 	e.m.Tick(context.Background(), false)
 	if e.out.count() != n+1 {
 		t.Fatal("idle deadline reported again within a minute of a successful report")
 	}
-	e.clk.Advance(time.Minute)
+	e.clk.Advance(50 * time.Second)
 	e.m.Tick(context.Background(), false)
 	if e.out.count() != n+2 {
-		t.Fatal("idle deadline not reported after the throttle")
+		t.Fatalf("idle deadline at the one-minute boundary: %d entries, want %d", e.out.count(), n+2)
+	}
+	if deadline := e.out.lastEntry(id).GetIdleDeadline().AsTime(); !deadline.Equal(wantDeadline) {
+		t.Fatalf("idle deadline %v, want %v", deadline, wantDeadline)
 	}
 }
 

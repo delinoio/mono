@@ -618,7 +618,7 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 		e.dropRunner(ctx, r, false)
 		return createUnavailable
 	case rejected(err, connect.CodeFailedPrecondition):
-		// No device of the OwnSand organization can ever run the profile.
+		// No device in the OwnSand organization is eligible for the profile.
 		e.dropRunner(ctx, r, true)
 		return createFailed
 	case rejected(err, connect.CodeInvalidArgument), rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
@@ -656,10 +656,15 @@ func rejected(err error, code connect.Code) bool {
 
 // dropRunner handles a runner whose sandbox was never created. For a
 // capacity rejection it removes the runner. For a no-device rejection it
-// records the failure and ends the request if it is still queued.
+// records the failure, backs off warm fill, or ends demand that is still queued.
 func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
 	var ended *Request
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if noDevice {
+			if err := lockWarmOutcomeProfile(ctx, tx, r); err != nil {
+				return err
+			}
+		}
 		if noDevice && r.RequestID == "" && r.sponsorRequestID != "" {
 			// Profile deletion locks queued requests before runners. Hold the
 			// profile lock before taking those same locks in the reverse order.
@@ -691,6 +696,11 @@ func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
 			requestID = cur.sponsorRequestID
 		}
 		if requestID == "" {
+			if cur.warmProfileRevision != "" {
+				// Device eligibility can change without a profile or link edit.
+				_, err := e.recordWarmFailure(ctx, tx, cur, false)
+				return err
+			}
 			return nil
 		}
 		req, err := e.LockRequest(ctx, tx, requestID)

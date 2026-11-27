@@ -172,7 +172,7 @@ func (e *Engine) drive(ctx context.Context, runnerID string, kick chan struct{})
 		case runWaiting, runBusy:
 			if r.ProgramExecID != "" && !following {
 				following = true
-				go e.followProgram(followCtx, client, r)
+				go e.followProgram(followCtx, r)
 			}
 			e.checkSandbox(ctx, client, r)
 		case runDeleting:
@@ -223,14 +223,13 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 		}
 	}
 	sb, err := client.GetSandbox(ctx, r.SandboxID)
-	if err != nil {
-		if isCode(err, connect.CodeNotFound) {
-			e.startFailed(ctx, r, "sandbox_not_found")
-		}
-		return e.timing.SandboxPoll
-	}
 	switch {
-	case sb.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING:
+	case ctx.Err() != nil:
+		return e.timing.SandboxPoll
+	case isCode(err, connect.CodeNotFound):
+		e.startFailed(ctx, r, "sandbox_not_found")
+		return e.timing.SandboxPoll
+	case err == nil && sb.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING:
 		err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 			_, err := e.setRunnerTx(ctx, tx, r.ID, []sandrunv1.RunnerState{runCreating}, runPrep, "ownsand_device_id = $4", sb.GetDeviceId())
 			return err
@@ -239,12 +238,15 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 			e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 		}
 		return 0
-	case ownsand.IsTerminal(sb.GetState()):
+	case err == nil && ownsand.IsTerminal(sb.GetState()):
 		e.startFailed(ctx, r, "sandbox_ended_while_creating")
 		return 0
 	case e.svc.NowUTC().Sub(r.CreateTime) > e.timing.StartTimeout:
 		e.startFailed(ctx, r, "sandbox_start_timeout")
 		return 0
+	}
+	if err != nil {
+		return e.timing.SandboxPoll
 	}
 	return min(e.timing.SandboxPoll, 2*time.Second)
 }
@@ -447,21 +449,24 @@ func (e *Engine) sandboxEnded(ctx context.Context, runnerID string, reason ownsa
 }
 
 // followProgram follows the runner program with AttachExec. The SDK
-// resumes the stream after each relay rotation; when the result arrives,
-// the request ends as the adapter says and SandRun deletes the sandbox. The
-// follower keeps the result until the exit transaction succeeds or its
-// context ends. When SandRun misses the exit (for example, the exec result
+// resumes the stream after each relay rotation. Before starting a new attach,
+// the follower looks up the active link in case the API key changed. Once it
+// receives the result, it keeps the result until the exit transaction succeeds
+// or its context ends. If SandRun misses the exit (for example, the exec result
 // expired), the profile's idle_ttl deletes the sandbox.
-func (e *Engine) followProgram(ctx context.Context, client ownsandclient.Client, r *Runner) {
+func (e *Engine) followProgram(ctx context.Context, r *Runner) {
 	var result *ownsand.ExecResult
 	for ctx.Err() == nil {
 		if result == nil {
-			res, err := client.AttachExec(ctx, r.SandboxID, r.ProgramExecID, ownsand.AttachParams{OnEvent: func(ownsand.ExecEvent) error { return nil }})
-			if isCode(err, connect.CodeNotFound) {
-				return
-			}
+			client, _, err := e.links.Client(ctx, r.OrganizationID)
 			if err == nil {
-				result = res
+				res, err := client.AttachExec(ctx, r.SandboxID, r.ProgramExecID, ownsand.AttachParams{OnEvent: func(ownsand.ExecEvent) error { return nil }})
+				if isCode(err, connect.CodeNotFound) {
+					return
+				}
+				if err == nil {
+					result = res
+				}
 			}
 		}
 		if result != nil && e.programExited(ctx, r.ID, result) == nil {
@@ -737,7 +742,7 @@ func (e *Engine) deleteRunnerMatching(ctx context.Context, orgID, runnerID strin
 	var ended *Request
 	var prevReq sandrunv1.RequestState
 	err := e.svc.InOrganizationDeletionTx(ctx, func(tx pgx.Tx) error {
-		cur, err := e.lockOrganizationRunner(ctx, tx, orgID, runnerID)
+		cur, err := e.LockOrganizationRunner(ctx, tx, orgID, runnerID)
 		if err != nil {
 			return err
 		}
@@ -808,7 +813,7 @@ type Deletion struct {
 // adapter says for cause, in one transaction. It returns nil when the runner
 // is already ended or being deleted. After the commit, call FinishDeletion.
 func (e *Engine) DeleteRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason sandrunv1.RunnerEndReason, cause DeleteCause) (*Deletion, error) {
-	cur, err := e.lockOrganizationRunner(ctx, tx, orgID, runnerID)
+	cur, err := e.LockOrganizationRunner(ctx, tx, orgID, runnerID)
 	if err != nil {
 		return nil, err
 	}
