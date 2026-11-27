@@ -796,7 +796,9 @@ func TestCleanUps(t *testing.T) {
 		t.Fatal("a sandbox survived the organization deletion")
 	}
 	var rows int
-	_ = w.env.DB.Pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM requests WHERE organization_id = $1) + (SELECT count(*) FROM runners WHERE organization_id = $1)", w.org.ID).Scan(&rows)
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM requests WHERE organization_id = $1) + (SELECT count(*) FROM runners WHERE organization_id = $1)", w.org.ID).Scan(&rows); err != nil {
+		t.Fatalf("count work rows after organization deletion: %v", err)
+	}
 	if rows != 0 {
 		t.Fatalf("%d work rows left", rows)
 	}
