@@ -1369,6 +1369,55 @@ describe("personal API keys", () => {
     await expect(dialog).toBeHidden();
     await expect(screen.getByText(name, { exact: false })).toBeVisible();
   });
+
+  test("shows a key as expired after a fresh list request", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/api-keys`);
+    const issuedAt = await browser.evaluate(() => {
+      const issuedAt = Date.now();
+      Date.now = () => issuedAt;
+      return issuedAt;
+    });
+
+    await screen.getByRole("button", "Create API key").tap();
+    await browser.keyboard.type("expiring-key");
+    await screen.getByRole("combobox", "Expires after").tap();
+    await screen.getByRole("option", "30 days").tap();
+    await screen.getByRole("button", "Create key").tap();
+    const dialog = screen.getByRole("dialog", "Your new personal API key");
+    await browser.evaluate(() => {
+      Date.now = () => new Date().getTime();
+      return null;
+    });
+    await dialog.getByRole("button", "Done").tap();
+    await expect(browser.locator('[role="dialog"]')).toBeHidden();
+
+    const row = screen
+      .getByRole("listitem")
+      .filter({ hasText: "expiring-key" });
+    const revoke = row.getByRole("button", "Revoke", { exact: true });
+    await expect(row).toContainText("expiring-key · Active");
+    await expect(revoke).toBeVisible();
+
+    await screen.getByRole("link", "Members", { exact: true }).tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/members`);
+    await browser.evaluate(
+      (expiresAt) => {
+        Date.now = () => expiresAt;
+        return null;
+      },
+      issuedAt + 30 * 24 * 60 * 60 * 1000,
+    );
+    await screen.getByRole("link", "API keys", { exact: true }).tap();
+
+    await expect(row).toContainText("expiring-key · Expired");
+    await expect(revoke).toBeHidden();
+  });
 });
 
 describe("API key revocation", () => {
