@@ -59,64 +59,6 @@ func TestTerminateEndsTheProcessTree(t *testing.T) {
 	_ = cmd.Wait()
 }
 
-// helperModeEnv selects what TestHelperProcess does when a test starts the
-// test binary as a child process (the usual Go pattern for a portable
-// fixture, so that the tests need neither cmd.exe nor ping timing).
-const (
-	helperModeEnv    = "OWNSAND_GUEST_TEST_HELPER_MODE"
-	helperPidFileEnv = "OWNSAND_GUEST_TEST_HELPER_PID_FILE"
-	// helperLifetime bounds a helper that nothing killed, so that a failed
-	// test cannot leave a process behind for long.
-	helperLifetime = 60 * time.Second
-)
-
-// TestHelperProcess is not a test. The tests below start the test binary with
-// -test.run=^TestHelperProcess$ and a helperModeEnv value:
-//
-//   - "exit" exits at once with code 0;
-//   - "sleep" writes its process ID to helperPidFileEnv when that is set and
-//     sleeps for helperLifetime;
-//   - "spawn" starts a "sleep" child that inherits stdout and stderr, writes
-//     the child's process ID to helperPidFileEnv and exits with code 0, so
-//     the direct child of the exec ends while a descendant holds the output
-//     pipes.
-func TestHelperProcess(t *testing.T) {
-	mode := os.Getenv(helperModeEnv)
-	if mode == "" {
-		return
-	}
-	pidFile := os.Getenv(helperPidFileEnv)
-	switch mode {
-	case "exit":
-		os.Exit(0)
-	case "sleep":
-		if pidFile != "" {
-			_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o600)
-		}
-		time.Sleep(helperLifetime)
-		os.Exit(0)
-	case "spawn":
-		child := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
-		child.Env = append(os.Environ(), helperModeEnv+"=sleep", helperPidFileEnv+"=")
-		child.Stdout = os.Stdout
-		child.Stderr = os.Stderr
-		if err := child.Start(); err != nil {
-			os.Exit(2)
-		}
-		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
-			os.Exit(3)
-		}
-		os.Exit(0)
-	}
-	os.Exit(4)
-}
-
-// helperCommand returns the exec request command that runs the test binary
-// as a helper process.
-func helperCommand() []string {
-	return []string{os.Args[0], "-test.run=^TestHelperProcess$"}
-}
-
 // helperExecReq returns an exec request that runs the test binary as a helper
 // in the given mode. The POSIX-only execReq lives in exec_test.go.
 func helperExecReq(t *testing.T, mode, pidFile string, timeout time.Duration) *ownsandv1.ExecRequest {
@@ -144,29 +86,6 @@ func waitForPidFile(t *testing.T, path string) uint32 {
 	}
 	t.Fatalf("pid file %s was not written", path)
 	return 0
-}
-
-// killPidFileOnCleanup ends the process whose ID the helper wrote to pidFile
-// at the end of the test, even when the test failed before it checked the
-// process. A missing pid file or a process that already ended is not an
-// error.
-func killPidFileOnCleanup(t *testing.T, pidFile string) {
-	t.Cleanup(func() {
-		b, err := os.ReadFile(pidFile)
-		if err != nil {
-			return
-		}
-		pid, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 32)
-		if err != nil {
-			return
-		}
-		h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
-		if err != nil {
-			return
-		}
-		defer windows.CloseHandle(h)
-		_ = windows.TerminateProcess(h, 1)
-	})
 }
 
 // processEnded reports whether pid is gone, waiting up to wait for it.
@@ -235,10 +154,9 @@ func TestProcessExited(t *testing.T) {
 // so the margins on both sides are about a second.
 func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
 	h := newHarness(t, nil)
-	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	pidFile, stopFile := execSurvivorFiles(t)
 	req := helperExecReq(t, "spawn", pidFile, 1500*time.Millisecond)
-	// Registered before the run so that the descendant dies on a failure too.
-	killPidFileOnCleanup(t, pidFile)
+	req.Env[helperStopFileEnv] = stopFile
 	start := time.Now()
 	evs := h.runExec(req)
 	elapsed := time.Since(start)
@@ -260,7 +178,6 @@ func TestExecTimeoutKillsLiveChild(t *testing.T) {
 	h := newHarness(t, nil)
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	req := helperExecReq(t, "sleep", pidFile, 1500*time.Millisecond)
-	killPidFileOnCleanup(t, pidFile)
 	start := time.Now()
 	evs := h.runExec(req)
 	ex := evs[len(evs)-1].GetExited()
