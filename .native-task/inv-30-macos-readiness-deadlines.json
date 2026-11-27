@@ -1,0 +1,56 @@
+{
+  "gid": "inv-30-macos-readiness-deadlines",
+  "commit": "0276c82c15e42e419d40242fc0b0ad99bf403e2f",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "darwin/arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "0276c82c15e42e419d40242fc0b0ad99bf403e2f",
+    "reason": "The implementation worker has Linux access only. Apple silicon, Virtualization.framework, a signed test binary, a prepared macOS image, and outbound connectivity are required.",
+    "setup": "Run the commands in order in one Bash session from a checkout at the stated SHA on the same APFS volume as the prepared guest image. The account must be able to read the image and its metadata and the host must have internet access. Ad hoc signing with the repository entitlement requires no administrator access.",
+    "commands": [
+      "set -eo pipefail",
+      "test \"$(git rev-parse HEAD)\" = \"0276c82c15e42e419d40242fc0b0ad99bf403e2f\"",
+      "test \"$(uname -s)\" = Darwin && test \"$(uname -m)\" = arm64",
+      "go version",
+      ": \"${OWNSAND_VZ_TEST_MACOS_IMAGE:?Set this to the absolute path to a prepared images/macos directory}\"",
+      "test -d \"$OWNSAND_VZ_TEST_MACOS_IMAGE\" && test -r \"$OWNSAND_VZ_TEST_MACOS_IMAGE/image.json\"",
+      "export SCRATCH=\"$PWD/.t3-tmp/macos-readiness-native\"",
+      "mkdir -p \"$SCRATCH\"",
+      "test \"$(stat -f %d \"$SCRATCH\")\" = \"$(stat -f %d \"$OWNSAND_VZ_TEST_MACOS_IMAGE\")\"",
+      "export TMPDIR=\"$SCRATCH\" COPYFILE_DISABLE=1 OWNSAND_VZ_TEST_OUTBOUND=1 OWNSAND_VZ_TEST_MACOS_IMAGE",
+      "CGO_ENABLED=1 go vet -mod=readonly ./cmds/ownsand-agent/internal/vmruntime/vzrt 2>&1 | tee \"$SCRATCH/native-vet.log\"",
+      "CGO_ENABLED=1 go test -mod=readonly -c -o \"$SCRATCH/vzrt.test\" ./cmds/ownsand-agent/internal/vmruntime/vzrt 2>&1 | tee \"$SCRATCH/native-build.log\"",
+      "codesign --force --sign - --entitlements \"cmds/ownsand-agent/entitlements.plist\" \"$SCRATCH/vzrt.test\"",
+      "codesign --verify --strict \"$SCRATCH/vzrt.test\"",
+      "\"$SCRATCH/vzrt.test\" -test.v -test.count=1 -test.timeout=2m -test.run '^TestWaitForOutput' 2>&1 | tee \"$SCRATCH/readiness-fixtures.log\"",
+      "\"$SCRATCH/vzrt.test\" -test.v -test.count=1 -test.timeout=30m -test.run '^(TestVirtualizationMacOSIntegration|TestVirtualizationMacOSOutbound)$' 2>&1 | tee \"$SCRATCH/macos-vms.log\"",
+      "grep -F -- '--- PASS: TestVirtualizationMacOSIntegration (' \"$SCRATCH/macos-vms.log\"",
+      "grep -F -- '--- PASS: TestVirtualizationMacOSOutbound (' \"$SCRATCH/macos-vms.log\""
+    ],
+    "expectedResults": [
+      "Darwin arm64, native cgo vet and build succeed, and codesign verifies the ad hoc signature.",
+      "The readiness fixtures accept early markers and reject markers at or after the exact cutoff. They start no probe after expiration, cancel an in-flight probe and interrupt backoff, retain last output, and enforce the 60-second exec cap.",
+      "TestVirtualizationMacOSIntegration reports PASS after the APFS readiness check and lifecycle checks.",
+      "TestVirtualizationMacOSOutbound reports PASS after the outbound readiness check and network boundary checks."
+    ],
+    "files": {
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_darwin_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_macos_darwin_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/vzrt/integration_readiness_test.go"
+      ],
+      "entitlements": "cmds/ownsand-agent/entitlements.plist",
+      "outputLogs": [
+        ".t3-tmp/macos-readiness-native/native-vet.log",
+        ".t3-tmp/macos-readiness-native/native-build.log",
+        ".t3-tmp/macos-readiness-native/readiness-fixtures.log",
+        ".t3-tmp/macos-readiness-native/macos-vms.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-macos-readiness-deadlines/worker/.t3-tmp/macos-readiness/vzrt-darwin-arm64.test"
+      ]
+    }
+  }
+}
