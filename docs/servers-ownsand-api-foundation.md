@@ -75,6 +75,8 @@ Three public RPCs take no `organization_id`. They accept only a Logto access tok
 - `ListOrganizations` returns only the organizations in which the caller has a membership.
 - `AcceptInvitation` takes the organization from the validated invitation, not from the request. An expired, revoked or used invitation fails with `not_found` and the same message. When the caller already has a membership in the organization, the call fails with `already_exists` and the invitation stays unused. The caller's Logto token is valid in this case, so the server does not use `unauthenticated`.
 
+An organization member with permission to call `RevokeInvitation` can revoke a pending invitation. The server checks expiry after it reads the locked invitation row. An invitation at or past expiry returns `failed_precondition` and the server writes no revocation timestamp or event. A successful call stores the time of the expiry check as `revoke_time` and writes the revocation event in the same transaction.
+
 | Action                                                                                                              | `owner` | `admin` | `member` | API key |
 | ------------------------------------------------------------------------------------------------------------------- | ------- | ------- | -------- | ------- |
 | Delete the organization, transfer ownership                                                                         | yes     | no      | no       | no      |
