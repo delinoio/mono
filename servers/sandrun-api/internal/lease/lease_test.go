@@ -337,8 +337,7 @@ func TestWaitRechecksOwnershipAfterWake(t *testing.T) {
 // the full I/O timeout.
 func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
 	l, lost := newTestLease()
-	expireAt := time.Now().Add(200 * time.Millisecond)
-	var deadline time.Time
+	var expireAt, deadline time.Time
 	var hasDeadline bool
 	started := make(chan struct{})
 	returned := make(chan time.Time, 1)
@@ -356,9 +355,24 @@ func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
 	applied := make(chan struct{})
 	go func() {
 		defer close(applied)
+		expireAt = time.Now().Add(200 * time.Millisecond)
 		l.applyRenewal(0, true, "", expireAt)
 	}()
-	<-started
+	var startupFailure string
+	select {
+	case <-started:
+	case <-applied:
+		startupFailure = "applyRenewal returned before the acquisition callback started"
+	case <-time.After(2 * time.Second):
+		startupFailure = "acquisition callback did not start within two seconds"
+	}
+	// The callback can start and return before this goroutine runs. Receiving
+	// from started also publishes expireAt and the callback's deadline.
+	select {
+	case <-started:
+	default:
+		t.Fatal(startupFailure)
+	}
 	// The context is a timeout of the remaining time, so its deadline can
 	// differ from the expiry by the time that the call took.
 	if !hasDeadline || deadline.Sub(expireAt) > 50*time.Millisecond {
@@ -431,6 +445,7 @@ func TestLeaseReleaseDrain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); a.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
 	if err := a.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}

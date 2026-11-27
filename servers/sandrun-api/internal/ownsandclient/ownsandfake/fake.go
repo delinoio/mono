@@ -72,6 +72,8 @@ type Org struct {
 	// creates the sandbox (or finds the one of its key) and returns this
 	// error instead of it.
 	CreateResponseError error
+	// GetError, when set, is returned by GetSandbox for existing sandboxes.
+	GetError error
 	// DeleteError, when set, is the error of the next DeleteSandbox calls
 	// (for example a transient OwnSand failure).
 	DeleteError error
@@ -97,8 +99,13 @@ type fakeSandbox struct {
 	// writes holds FileWrite operations by ID. A nil entry marks an expired
 	// completion so a late retry cannot start a new write.
 	writes map[string]*fakeWrite
-	// reads keeps the snapshot of each read ID.
-	reads map[string][]byte
+	// reads keeps the path and snapshot of each read ID.
+	reads map[string]fakeRead
+}
+
+type fakeRead struct {
+	path string
+	data []byte
 }
 
 type fakeWrite struct {
@@ -351,7 +358,7 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 		SandboxId: id, OrganizationId: o.ID, DeviceId: "device-" + strconv.Itoa(len(o.sandboxes)%2), State: state,
 		Source: req.GetSource(), Resources: req.GetResources(), Labels: req.GetLabels(), IdleTtl: req.GetIdleTtl(), MaxTtl: req.GetMaxTtl(),
 	}
-	o.sandboxes[id] = &fakeSandbox{sb: sb, files: map[string][]byte{}, writes: map[string]*fakeWrite{}, reads: map[string][]byte{}}
+	o.sandboxes[id] = &fakeSandbox{sb: sb, files: map[string][]byte{}, writes: map[string]*fakeWrite{}, reads: map[string]fakeRead{}}
 	o.keys[req.GetIdempotencyKey()] = id
 	o.requests[req.GetIdempotencyKey()] = encoded
 	if o.CreateResponseError != nil {
@@ -374,11 +381,14 @@ func (c *client) sandbox(rpc, id string) (*Org, *fakeSandbox, error) {
 }
 
 func (c *client) GetSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error) {
-	_, s, err := c.sandbox("GetSandbox", sandboxID)
+	o, s, err := c.sandbox("GetSandbox", sandboxID)
 	if err != nil {
 		return nil, err
 	}
 	defer c.f.mu.Unlock()
+	if o.GetError != nil {
+		return nil, o.GetError
+	}
 	return proto.Clone(s.sb).(*ownsandv1.Sandbox), nil
 }
 
@@ -479,13 +489,17 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 	}
 	s := org.sandboxes[sandboxID]
 	snap, ok := s.reads[p.ReadID]
+	if ok && snap.path != p.Path {
+		c.f.mu.Unlock()
+		return 0, connect.NewWireError(connect.CodePermissionDenied, errors.New("request does not match the recorded operation"))
+	}
 	if !ok {
 		src, exists := s.files[p.Path]
 		if !exists {
 			c.f.mu.Unlock()
 			return 0, connect.NewWireError(connect.CodeNotFound, errors.New("no such file"))
 		}
-		snap = append([]byte(nil), src...)
+		snap = fakeRead{path: p.Path, data: bytes.Clone(src)}
 		s.reads[p.ReadID] = snap
 	}
 	onRead := org.OnFileRead
@@ -493,7 +507,7 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 	if onRead != nil {
 		onRead(ctx, p)
 	}
-	size := int64(len(snap))
+	size := int64(len(snap.data))
 	if p.Offset > size {
 		return p.Offset, connect.NewWireError(connect.CodeOutOfRange, errors.New("offset is beyond the end of the file"))
 	}
@@ -502,7 +516,7 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 			return off, err
 		}
 		end := min(off+readChunk, size)
-		if _, err := w.Write(snap[off:end]); err != nil {
+		if _, err := w.Write(snap.data[off:end]); err != nil {
 			return off, err
 		}
 		off = end

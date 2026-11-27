@@ -198,7 +198,7 @@ func (w *ghWorld) githubOptions(now func() time.Time) github.Options {
 	return github.Options{
 		Client:        githubapi.New(w.gh.Config(), nil, slog.New(slog.NewJSONHandler(w.ghLogs, nil)), now),
 		WebhookSecret: w.gh.WebhookSecret,
-		Timing:        github.Timing{RedeliveryInterval: time.Hour, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: time.Minute, RegistrationGiveUp: time.Minute},
+		Timing:        github.Timing{SurplusInterval: 50 * time.Millisecond, RedeliveryInterval: time.Hour, RedeliveryWindow: 24 * time.Hour, PrepareTimeout: time.Minute, RegistrationGiveUp: time.Minute},
 	}
 }
 
