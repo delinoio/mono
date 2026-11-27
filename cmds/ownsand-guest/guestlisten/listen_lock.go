@@ -107,7 +107,7 @@ func lockUnixAddress(address string) (func(), error) {
 
 func openUnixLockFile(path string, wait func() bool) (*os.File, error) {
 	const mode = 0o600
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		return os.OpenFile(path, os.O_RDWR|os.O_CREATE, mode)
 	}
 
