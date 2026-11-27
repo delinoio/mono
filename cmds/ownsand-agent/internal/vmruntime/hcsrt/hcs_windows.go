@@ -158,20 +158,12 @@ func hcsRunWithin(name string, deadline time.Time, call func(op uintptr) uintptr
 
 // system is an open compute system handle.
 type system struct {
-	id     string
-	handle uintptr
-	// Only confirmed exit closes exited. A disconnect calls for a status
-	// check, and closed signals completion of handle and callback cleanup.
-	exited         chan struct{}
-	disconnected   chan struct{}
-	closed         chan struct{}
-	exitOnce       sync.Once
+	systemExit
+	handle         uintptr
 	disconnectOnce sync.Once
 	closeOnce      sync.Once
 	cbKey          uintptr
-	// These functions replace HCS calls in tests without a Hyper-V host.
-	terminateFn  func() error
-	verifyExitFn func(string, time.Time) (bool, error)
+	terminateFn    func() error
 }
 
 // Exit callbacks. windows.NewCallback never releases a callback, so one
@@ -212,71 +204,6 @@ func systemCallback(event *hcsEvent, key uintptr) uintptr {
 	return 0
 }
 
-func (s *system) markExited() { s.exitOnce.Do(func() { close(s.exited) }) }
-
-func (s *system) exitConfirmed() bool {
-	select {
-	case <-s.exited:
-		return true
-	default:
-		return false
-	}
-}
-
-var errSystemHandleClosed = errors.New("hcsrt: the compute system handle closed before exit was confirmed")
-
-// waitExit waits for a confirmed exit. A disconnect starts one independent
-// status query per wait. An inconclusive result leaves the exit event armed.
-func (s *system) waitExit(ctx context.Context) error {
-	type exitResult struct {
-		confirmed bool
-		err       error
-	}
-	disconnected := s.disconnected
-	var result <-chan exitResult
-	var statusErr error
-	for !s.exitConfirmed() {
-		select {
-		case <-s.exited:
-			return nil
-		case <-s.closed:
-			// Closing the handle can deliver a final exit callback.
-			if s.exitConfirmed() {
-				return nil
-			}
-			return errSystemHandleClosed
-		case <-ctx.Done():
-			if s.exitConfirmed() {
-				return nil
-			}
-			return errors.Join(ctx.Err(), statusErr)
-		case <-disconnected:
-			disconnected = nil
-			id, verify := s.id, s.verifyExitFn
-			deadline := time.Now().Add(stopTimeout)
-			if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
-				deadline = end
-			}
-			// The HCS call can finish after this waiter. It holds no
-			// reference to the VM or its original handle.
-			done := make(chan exitResult, 1)
-			result = done
-			go func() {
-				confirmed, err := verify(id, deadline)
-				done <- exitResult{confirmed, err}
-			}()
-		case status := <-result:
-			result = nil
-			if status.confirmed {
-				s.markExited()
-				return nil
-			}
-			statusErr = status.err
-		}
-	}
-	return nil
-}
-
 // watch registers the system callback.
 func (s *system) watch() error {
 	callbackOnce.Do(func() { callbackPtr = windows.NewCallback(systemCallback) })
@@ -297,10 +224,7 @@ func (s *system) watch() error {
 }
 
 func newSystem(id string, handle uintptr) *system {
-	return &system{
-		id: id, handle: handle, exited: make(chan struct{}), disconnected: make(chan struct{}),
-		closed: make(chan struct{}), verifyExitFn: verifySystemExit,
-	}
+	return &system{systemExit: newSystemExit(id, verifySystemExit), handle: handle}
 }
 
 // createSystem creates (but does not start) a compute system from doc.
