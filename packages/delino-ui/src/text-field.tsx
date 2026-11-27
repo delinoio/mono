@@ -8,7 +8,7 @@ import {
 import { Input } from "@ui-sdk/react/input";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
-import { useForwardedAutoFocus } from "./panel-autofocus.ts";
+import { useFieldAutoFocus } from "./panel-autofocus.ts";
 
 export type TextFieldProps = React.ComponentProps<typeof Input> & {
   /** The visible name of the field. */
@@ -38,7 +38,7 @@ export function TextField({
   disabled,
   ...props
 }: TextFieldProps) {
-  const autoFocus = useForwardedAutoFocus(props.autoFocus);
+  const { autoFocus, marker } = useFieldAutoFocus(props.autoFocus, disabled);
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -54,20 +54,10 @@ export function TextField({
       invalid={hasError && !disabled ? true : undefined}
     >
       <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
-      {/*
-        Workaround: the UI SDK Dialog chooses its initial focus target with a
-        `[autofocus], [data-autofocus]` DOM query, but React handles the
-        `autoFocus` prop by calling `focus()` and renders no `autofocus`
-        attribute. Without `data-autofocus`, a Dialog focuses its first
-        tabbable element (usually the close button) instead of this input.
-        Scope: only when `autoFocus` is true; a caller-supplied
-        `data-autofocus` wins. Remove when the UI SDK reads the React
-        `autoFocus` prop itself.
-      */}
       <Input
         className={mergeClassName("dui-text-field-input", className)}
         disabled={disabled}
-        data-autofocus={props.autoFocus ? "" : undefined}
+        data-autofocus={marker}
         {...props}
         autoFocus={autoFocus}
       />
