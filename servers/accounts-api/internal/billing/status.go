@@ -522,13 +522,34 @@ func (s *Service) ListStatusChanges(ctx context.Context, service string, after i
 	if err := s.SuspendDue(ctx, SuspendFilter{Service: service}); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Pool.Query(ctx, `SELECT `+statusColumns+` FROM organization_links l
-		WHERE l.service = $1 AND l.unlink_time IS NULL AND l.status_sequence > $2
-		ORDER BY l.status_sequence LIMIT $3`, service, after, limit)
-	if err != nil {
-		return nil, err
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rows, err := s.db.Pool.Query(ctx, `SELECT `+statusColumns+` FROM organization_links l
+			WHERE l.service = $1 AND l.unlink_time IS NULL AND l.status_sequence > $2
+			ORDER BY l.status_sequence LIMIT $3`, service, after, limit)
+		if err != nil {
+			return nil, err
+		}
+		statuses, err := collectStatuses(rows)
+		if err != nil {
+			return nil, err
+		}
+
+		// Deadlines can pass during the sweep or a previous recomputation.
+		// Read the same page again after syncing because new sequences can
+		// move links out of the page and make room for other links.
+		due := s.dueAccounts(statuses)
+		if len(due) == 0 {
+			return statuses, nil
+		}
+		for _, accountID := range due {
+			if err := s.SyncAccount(ctx, accountID); err != nil {
+				return nil, err
+			}
+		}
 	}
-	return collectStatuses(rows)
 }
 
 // RefreshStatusMetrics sets the number of linked organizations for each

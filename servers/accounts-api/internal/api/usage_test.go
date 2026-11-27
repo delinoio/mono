@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/uuidv7"
@@ -667,6 +668,115 @@ func TestBillingStatusPollCursor(t *testing.T) {
 	wantCode(t, err, connect.CodeInvalidArgument)
 	_, err = env.Service().ListBillingStatusChanges(ctx(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{Service: ownsand, PageSize: -1}))
 	wantCode(t, err, connect.CodeInvalidArgument)
+}
+
+func TestBillingStatusPollRechecksSuspensionAfterLockWait(t *testing.T) {
+	const suspended = accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED
+	for _, tc := range []struct {
+		name     string
+		advance  time.Duration
+		pageSize int32
+	}{
+		{name: "deadline passes", advance: time.Minute},
+		{name: "deadline stays in the future"},
+		{name: "deadline passes with pagination", advance: time.Minute, pageSize: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t)
+			owner := newPerson(env, "owner")
+			accountA := createAccount(t, owner, "Account A").GetBillingAccountId()
+			accountB := createAccount(t, owner, "Account B").GetBillingAccountId()
+			orgA, orgB := newOrg(t), newOrg(t)
+			statusA := link(t, env, accountA, orgA, owner.ID, "A").GetStatus()
+			env.Clock.Advance(time.Minute)
+			statusB := link(t, env, accountB, orgB, owner.ID, "B").GetStatus()
+
+			// This future link moves into the first page when B's sequence changes.
+			var future *accountsv1.OrganizationBillingStatus
+			if tc.pageSize == 1 {
+				env.Clock.Advance(30 * time.Second)
+				future = link(t, env, accountB, newOrg(t), owner.ID, "Future").GetStatus()
+			}
+			pollStart := statusA.GetSuspendTime().AsTime().Add(15 * time.Second)
+			env.Clock.Advance(pollStart.Sub(env.Clock.Now()))
+			if statusA.GetStatus() != blocked || statusB.GetStatus() != blocked ||
+				!env.Clock.Now().Before(statusB.GetSuspendTime().AsTime()) {
+				t.Fatalf("want A due and B blocked before the poll, got A = %v, B = %v", statusA, statusB)
+			}
+
+			client := env.Service()
+			var first *connect.Response[accountsv1.ListBillingStatusChangesResponse]
+			err := raceMembershipChange(t, env, accountA, func(pgx.Tx) {
+				env.Clock.Advance(tc.advance)
+			}, func() error {
+				var err error
+				first, err = client.ListBillingStatusChanges(ctx(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
+					Service: ownsand, PageSize: tc.pageSize,
+				}))
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Check what the first poll persisted before any follow-up poll can
+			// perform its own sweep.
+			stored, found, err := billing.CurrentStatus(ctx(), env.DB.Pool, "ownsand", orgB)
+			if err != nil || !found {
+				t.Fatalf("read stored status B: found = %t, error = %v", found, err)
+			}
+			wantB := blocked
+			if tc.advance > 0 {
+				wantB = suspended
+			}
+			if stored.Status.Proto() != wantB ||
+				(wantB == suspended && stored.Sequence <= statusB.GetSequence()) ||
+				(wantB == blocked && stored.Sequence != statusB.GetSequence()) {
+				t.Fatalf("stored B = %s at sequence %d, want %s with the corresponding change from sequence %d",
+					stored.Status, stored.Sequence, wantB, statusB.GetSequence())
+			}
+
+			type expectedStatus struct {
+				org    string
+				status accountsv1.BillingStatus
+			}
+			want := []expectedStatus{{orgA, suspended}, {orgB, wantB}}
+			if wantB == blocked {
+				want[0], want[1] = want[1], want[0]
+			}
+			if future != nil {
+				want = append([]expectedStatus{{future.GetOrganizationId(), blocked}}, want...)
+			}
+			page, cursor := first.Msg, int64(0)
+			for i, expected := range want {
+				if tc.pageSize == 1 && i > 0 {
+					page = poll(t, env, cursor, 1)
+				}
+				statuses := page.GetStatuses()
+				index, count := i, len(want)
+				if tc.pageSize == 1 {
+					index, count = 0, 1
+				}
+				if len(statuses) != count {
+					t.Fatalf("page after sequence %d = %v, want %d statuses", cursor, page, count)
+				}
+				status := statuses[index]
+				if status.GetOrganizationId() != expected.org || status.GetStatus() != expected.status || status.GetService() != ownsand ||
+					status.GetSequence() <= cursor || (expected.org == orgB && status.GetSequence() != stored.Sequence) {
+					t.Fatalf("status after sequence %d = %v, want %s for organization %s", cursor, status, expected.status, expected.org)
+				}
+				cursor = status.GetSequence()
+				if index == count-1 && page.GetNextSequence() != cursor {
+					t.Fatalf("page cursor = %d, want %d", page.GetNextSequence(), cursor)
+				}
+			}
+			if head := poll(t, env, cursor, tc.pageSize); len(head.GetStatuses()) != 0 || head.GetNextSequence() != cursor {
+				t.Fatalf("poll at the head = %v", head)
+			}
+			t.Logf("confirmed PostgreSQL lock wait and stored B at sequence %d -> %d (%s); head cursor %d",
+				statusB.GetSequence(), stored.Sequence, stored.Status, cursor)
+		})
+	}
 }
 
 func TestLinkOrganizationRoles(t *testing.T) {
