@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -102,16 +101,16 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec, ops vmCr
 	if memoryRestore {
 		err := r.restoreMacOS(ctx, v, spec)
 		if err == nil && ctx.Err() == nil {
+			err = syncRestoreClock(ctx, r.logger, v.id, func(ctx context.Context, now time.Time) error {
+				return ops.setClock(ctx, v, now)
+			})
+		}
+		if err == nil && ctx.Err() == nil {
 			v.restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE
-			clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := guestclient.SetClockOnce(clockCtx, v.Dial, time.Now()); err != nil {
-				r.logger.Warn("set guest clock after memory restore failed", "sandbox_id", v.id, "error", err)
-			}
-			cancel()
 			r.logger.Info("macOS VM restored from memory state", "sandbox_id", v.id, "total_ms", time.Since(start).Milliseconds())
 			return v, nil
 		}
-		if err := finishFailedRestore(ctx, func() error { return r.stopVM(v) }, cleanup); err != nil {
+		if err := finishFailedRestore(ctx, func() error { return ops.stopRestore(v) }, cleanup); err != nil {
 			return nil, err
 		}
 		r.logger.Warn("macOS memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)

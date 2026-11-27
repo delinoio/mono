@@ -1265,6 +1265,85 @@ func TestInvalidWindowsPath(t *testing.T) {
 	}
 }
 
+func TestSyncPOSIXListPaths(t *testing.T) {
+	needPOSIX(t)
+	t.Run("single deletion", func(t *testing.T) {
+		const name = "\ufeffnote.txt"
+		c, srv, org := newTestClient(t, "")
+		ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+		dir := newRepo(t, map[string]string{name: "original"}, nil, "")
+		p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+		if _, err := c.Sync(t.Context(), p); err != nil {
+			t.Fatal(err)
+		}
+		if got := readGuest(t, ds, name); got != "original" {
+			t.Fatalf("initial guest file = %q", got)
+		}
+		git(t, dir, "rm", "--", name)
+		res, err := c.Sync(t.Context(), p)
+		if err != nil || res.Deleted != 1 {
+			t.Fatalf("deletion sync = %+v, %v", res, err)
+		}
+		if _, err := os.Lstat(filepath.Join(ds.GetWorkspacePath(), name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("guest file should be removed, lstat returned %v", err)
+		}
+		if files := guestManifest(t, ds).Files; len(files) != 0 {
+			t.Fatalf("manifest contains deleted paths: %+v", files)
+		}
+	})
+
+	for _, tc := range []struct{ name, first string }{
+		{"U+FEFF first", "\ufefffirst"},
+		{"ordinary first", "plain"},
+	} {
+		t.Run("replace and prune with "+tc.name, func(t *testing.T) {
+			prefixes := []string{tc.first, "\ufefflater"}
+			tracked := map[string]string{}
+			for _, prefix := range prefixes {
+				tracked[prefix+"-config"] = "old file"
+				tracked[prefix+"-prune/child.txt"] = "old child"
+			}
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			dir := newRepo(t, tracked, nil, "")
+			p := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(t.Context(), p); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{}
+			for _, prefix := range prefixes {
+				config, prune := prefix+"-config", prefix+"-prune"
+				git(t, dir, "rm", "-r", "--", config, prune)
+				if err := os.Mkdir(filepath.Join(dir, config), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				want[config+"/child.txt"], want[prune] = "new child", "new file"
+			}
+			for path, content := range want {
+				if err := os.WriteFile(filepath.Join(dir, path), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res, err := c.Sync(t.Context(), p)
+			if err != nil || res.Uploaded != len(want) || res.Deleted != len(tracked) {
+				t.Fatalf("replacement and prune sync = %+v, %v", res, err)
+			}
+			files := guestManifest(t, ds).Files
+			if len(files) != len(want) {
+				t.Fatalf("manifest has %d paths, want %d", len(files), len(want))
+			}
+			for path, content := range want {
+				if got := readGuest(t, ds, path); got != content {
+					t.Errorf("guest %q = %q, want %q", path, got, content)
+				}
+				if _, ok := files[path]; !ok {
+					t.Errorf("manifest omits %q", path)
+				}
+			}
+		})
+	}
+}
+
 func TestSyncRetryFileToDirectory(t *testing.T) {
 	needPOSIX(t)
 	// Exercise a nested archive parent with a leading dash and a newline.
@@ -3337,6 +3416,43 @@ fi
 	}
 	if m := guestManifest(t, ds); len(m.Files) != 0 {
 		t.Fatalf("manifest contains the failed link: %+v", m)
+	}
+}
+
+func TestSyncPathListEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		windows bool
+		paths   []string
+		want    string
+	}{
+		{"Windows ordinary first", true, []string{"dir/plain", "\ufefflater"}, "\xef\xbb\xbfdir\\plain\n\ufefflater\n"},
+		{"Windows U+FEFF first", true, []string{"\ufefffirst", "dir/\ufefflater"}, "\xef\xbb\xbf\ufefffirst\ndir\\\ufefflater\n"},
+		{"POSIX", false, []string{"\ufefffirst", "dir/\ufefflater\nname"}, "\ufefffirst\x00dir/\ufefflater\nname\x00"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pathList(tc.paths, tc.windows); string(got) != tc.want {
+				t.Errorf("path list = % x, want % x", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSyncWindowsLinkListEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first string
+		want  string
+	}{
+		{"ordinary first", "plain", "\xef\xbb\xbfplain\ttarget\\file\n\ufefflater\ttarget\\\ufefffile\n"},
+		{"U+FEFF first", "\ufefffirst", "\xef\xbb\xbf\ufefffirst\ttarget\\file\n\ufefflater\ttarget\\\ufefffile\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			links := []localFile{localSymlink(tc.first, "target/file"), localSymlink("\ufefflater", "target/\ufefffile")}
+			if got := windowsLinkList(links); string(got) != tc.want {
+				t.Errorf("link list = % x, want % x", got, tc.want)
+			}
+		})
 	}
 }
 

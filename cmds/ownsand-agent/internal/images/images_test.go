@@ -3,6 +3,7 @@
 package images_test
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -245,6 +246,53 @@ func TestInstallAfterAnInterruptedExchangeKeepsAndThenReplacesTheOnlyImage(t *te
 		if exists(p) {
 			t.Fatalf("%s left behind", p)
 		}
+	}
+}
+
+func TestInstallCancellationAroundExchange(t *testing.T) {
+	for _, afterRecovery := range []bool{true, false} {
+		name := "after exchange starts"
+		if afterRecovery {
+			name = "after recovery"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), images.MacOSDir)
+			old := images.OldDir(dir)
+			from, to := dir, old
+			if afterRecovery {
+				from, to = old, dir
+			}
+			writeImage(t, from, "previous")
+			writeImage(t, images.BuildDir(dir), "staged")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			t.Cleanup(images.SetRename(func(src, dst string) error {
+				err := os.Rename(src, dst)
+				if err == nil && src == from && dst == to {
+					cancel()
+				}
+				return err
+			}))
+			err := images.Install(ctx, dir)
+			if ctx.Err() != context.Canceled {
+				t.Fatal("the fixture did not cancel at the expected rename")
+			}
+			if afterRecovery {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("install error after recovery = %v, want context.Canceled", err)
+				}
+				if got := diskOf(t, dir); got != "previous" {
+					t.Errorf("installed disk = %q, want previous", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("install error after exchange starts = %v, want nil", err)
+			}
+			if got := diskOf(t, dir); got != "staged" {
+				t.Errorf("installed disk = %q, want staged", got)
+			}
+		})
 	}
 }
 
