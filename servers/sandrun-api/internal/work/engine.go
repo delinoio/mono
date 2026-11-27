@@ -419,7 +419,13 @@ func (e *Engine) setRunnerTx(ctx context.Context, tx pgx.Tx, id string, from []s
 	if !ok {
 		return nil, nil
 	}
+	return e.updateLockedRunnerTx(ctx, tx, r, to, fields, args...)
+}
+
+// updateLockedRunnerTx changes the state of a runner already locked by tx.
+func (e *Engine) updateLockedRunnerTx(ctx context.Context, tx pgx.Tx, r *Runner, to sandrunv1.RunnerState, fields string, args ...any) (*Runner, error) {
 	prev := r.State
+	id := r.ID
 	set := "state = $2, update_time = $3"
 	if RunnerTerminal(to) {
 		set += ", end_time = $3"
@@ -428,7 +434,7 @@ func (e *Engine) setRunnerTx(ctx context.Context, tx pgx.Tx, id string, from []s
 		set += ", " + fields
 	}
 	now := e.svc.NowUTC()
-	r, err = scanRunner(tx.QueryRow(ctx, "UPDATE runners SET "+set+" WHERE runner_id = $1 RETURNING "+runnerColumns, append([]any{id, int16(to), now}, args...)...))
+	r, err := scanRunner(tx.QueryRow(ctx, "UPDATE runners SET "+set+" WHERE runner_id = $1 RETURNING "+runnerColumns, append([]any{id, int16(to), now}, args...)...))
 	if err != nil {
 		return nil, err
 	}
