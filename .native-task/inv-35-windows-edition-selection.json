@@ -1,0 +1,39 @@
+{
+  "gid": "inv-35-windows-edition-selection",
+  "commit": "12cafe67250b865cfc87c86cc600d3d8b2b42887",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "12cafe67250b865cfc87c86cc600d3d8b2b42887",
+    "setup": "Use a clean non-production checkout at the stated revision. Run commands from the repository root in the same non-elevated PowerShell session. After the first command, copy the ZIP to files.copyTo. Preserve the three test logs.",
+    "commands": [
+      "$ErrorActionPreference = 'Stop'; if ((git rev-parse HEAD).Trim() -ne '12cafe67250b865cfc87c86cc600d3d8b2b42887') { throw 'Unexpected validation revision' }; if ((go env GOOS).Trim() -ne 'windows') { throw 'Set Go to target native Windows' }; $scratch = (New-Item -ItemType Directory -Path '.t3-tmp/windows-edition-selection' -Force).FullName; $temp = (New-Item -ItemType Directory -Path (Join-Path $scratch 'tmp') -Force).FullName; $env:TEMP = $temp; $env:TMP = $temp; $env:GOTMPDIR = $temp",
+      "go test '-v' '-count=1' './cmds/ownsand-agent/internal/imagebuild' '-run' '^TestSelectEdition$' 2>&1 | Tee-Object -FilePath (Join-Path $scratch 'native-fixture.log'); if ($LASTEXITCODE -ne 0) { throw 'Windows edition selection test failed' }; $fixtureLog = Get-Content -LiteralPath (Join-Path $scratch 'native-fixture.log') -Raw; if ($fixtureLog -notmatch '(?m)^--- PASS: TestSelectEdition \\(') { throw 'TestSelectEdition did not run' }",
+      "$archive = Join-Path $scratch 'selector-regression-overlays.zip'; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne '9da43bc8a64b178c82f34a197ea0fcc08b4eb3920e29741a0449e98360389556') { throw 'Unexpected selector overlay archive' }; Expand-Archive -LiteralPath $archive -DestinationPath $scratch -Force",
+      "$target = (Resolve-Path 'cmds/ownsand-agent/internal/imagebuild/winiso_windows.go').Path\n$expected = @{ 'first-entry' = @('default_index'); 'first-folded' = @('ambiguous_folded_name', 'exact_mixed-case_name') }\nforeach ($variant in @('first-entry', 'first-folded')) {\n    $replace = @{}\n    $replace[$target] = Join-Path $scratch \"$variant.go\"\n    $overlay = Join-Path $scratch \"$variant-overlay.json\"\n    [IO.File]::WriteAllText($overlay, (ConvertTo-Json -InputObject @{ Replace = $replace } -Depth 4))\n    $log = Join-Path $scratch \"$variant.log\"\n    go test '-v' '-count=1' '-overlay' $overlay './cmds/ownsand-agent/internal/imagebuild' '-run' '^TestSelectEdition$' 2>&1 | Tee-Object -FilePath $log\n    $testExit = $LASTEXITCODE\n    $logText = Get-Content -LiteralPath $log -Raw\n    $failed = @([regex]::Matches($logText, '(?m)^[ \\t]+--- FAIL: TestSelectEdition/(\\S+)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)\n    if ($testExit -ne 1 -or ($failed -join ',') -ne ($expected[$variant] -join ',')) {\n        throw \"Unexpected test result for $variant. Exit $testExit. Failed subtests $($failed -join ',').\"\n    }\n    Write-Output \"Verified expected failures for $variant\"\n}"
+    ],
+    "expectedResults": [
+      "The native TestSelectEdition run exits 0. The ten subtests pass. Empty input selects the second listed image at index 1. Exact mixed-case and uppercase names select indices 1 and 4. The unique folded name selects index 1. The ambiguous folded name returns an error.",
+      "The first-entry overlay makes the test exit 1 with only default_index failing. The first-folded overlay makes the test exit 1 with only exact_mixed-case_name and ambiguous_folded_name failing. The PowerShell checks accept exactly these results."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-35-windows-edition-selection/worker/.t3-tmp/edition-selection/selector-regression-overlays.zip",
+      "copyTo": ".t3-tmp/windows-edition-selection/selector-regression-overlays.zip",
+      "sha256": "9da43bc8a64b178c82f34a197ea0fcc08b4eb3920e29741a0449e98360389556",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/imagebuild/windows_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/windows-edition-selection/native-fixture.log",
+        ".t3-tmp/windows-edition-selection/first-entry.log",
+        ".t3-tmp/windows-edition-selection/first-folded.log"
+      ]
+    },
+    "requiresElevation": [],
+    "outOfScope": [
+      "WIM or ISO enumeration, applying real installation media, and Hyper-V image-build acceptance."
+    ]
+  }
+}
