@@ -19,13 +19,14 @@ export enum LiveState {
    * last state until the new snapshot is complete.
    */
   Reconnecting = "reconnecting",
-  /** The stream stopped with an error. The view keeps the last state. */
+  /** The stream stopped with an error. The view keeps any published snapshot. */
   Disconnected = "disconnected",
 }
 
 /** The live queue view: non-terminal requests and runners by ID. */
 export interface QueueView {
   live: LiveState;
+  hasSnapshot: boolean;
   requests: ReadonlyMap<string, Request>;
   runners: ReadonlyMap<string, Runner>;
   /** The state that the current stream builds until its snapshot completes. */
@@ -55,6 +56,7 @@ export type QueueViewAction =
 export function initialQueueView(): QueueView {
   return {
     live: LiveState.Connecting,
+    hasSnapshot: false,
     requests: new Map(),
     runners: new Map(),
     pending: { requests: new Map(), runners: new Map() },
@@ -90,25 +92,17 @@ export function applyQueueEvent(
 ): QueueView {
   switch (event.kind) {
     case QueueViewActionKind.StreamFailed:
-      return view.live === LiveState.Connecting
-        ? view
-        : { ...view, live: LiveState.Disconnected, pending: undefined };
+      return { ...view, live: LiveState.Disconnected, pending: undefined };
     case QueueViewActionKind.Restart:
       return {
         ...view,
-        live:
-          view.live === LiveState.Connecting
-            ? LiveState.Connecting
-            : LiveState.Reconnecting,
+        live: view.hasSnapshot ? LiveState.Reconnecting : LiveState.Connecting,
         pending: { requests: new Map(), runners: new Map() },
       };
     case WatchQueueEventKind.Gap:
       return {
         ...view,
-        live:
-          view.live === LiveState.Connecting
-            ? LiveState.Connecting
-            : LiveState.Reconnecting,
+        live: view.hasSnapshot ? LiveState.Reconnecting : LiveState.Connecting,
         pending: { requests: new Map(), runners: new Map() },
         reconnects: view.reconnects + 1,
       };
@@ -117,6 +111,7 @@ export function applyQueueEvent(
       return {
         ...view,
         live: LiveState.Live,
+        hasSnapshot: true,
         requests: view.pending.requests,
         runners: view.pending.runners,
         pending: undefined,

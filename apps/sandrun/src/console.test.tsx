@@ -49,6 +49,7 @@ import {
 import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import {
+  AcceptInvitationResponseSchema,
   type ListInvitationsRequest,
   type ListMembersRequest,
   MemberService,
@@ -65,6 +66,7 @@ import {
   type SetOwnSandLinkRequest,
 } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import {
+  type CreateRunnerProfileRequest,
   CreateRunnerProfileRequestSchema,
   type ListRunnerProfilesRequest,
   type ListRunnerProfilesResponse,
@@ -73,6 +75,7 @@ import {
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import {
   type ListRequestsRequest,
+  type ListRequestsResponseSchema,
   type ListRunnersRequest,
   type WatchQueueResponseSchema,
   WorkService,
@@ -1289,6 +1292,130 @@ describe("OwnSand link", () => {
 });
 
 describe("integrations", () => {
+  function renderCreateIntegrationFixture({ holdFirstPage = false } = {}) {
+    const { transport, calls } = gatedTransport("CreateAgentIntegration");
+    const listRequested = rs.fn();
+    let releaseFirstPage = () => {};
+    const firstPage = new Promise<void>((resolve) => {
+      releaseFirstPage = resolve;
+    });
+    renderConsole(`/orgs/${MOCK_IDS.globex}/integrations`, {
+      staleTime: 10_000,
+      transport: {
+        ...transport,
+        async unary(method, ...args) {
+          const response = await transport.unary(method, ...args);
+          const request = create(method.input, args[3]);
+          if (
+            isMessage(request, ListAgentIntegrationsRequestSchema) &&
+            request.pageSize === MAX_PAGE_SIZE
+          ) {
+            listRequested(request);
+            if (holdFirstPage && listRequested.mock.calls.length === 1) {
+              // Hold the response after the mock has captured the empty page.
+              await firstPage;
+            }
+          }
+          return response;
+        },
+      },
+    });
+    return { calls, listRequested, releaseFirstPage };
+  }
+
+  async function submitFirstIntegration() {
+    await click(
+      await screen.findByRole("button", { name: "Create agent integration" }),
+    );
+    const form = within(
+      screen.getByRole("dialog", { name: "Create an agent integration" }),
+    );
+    await type(
+      form.getByRole("textbox", { name: "Name" }),
+      "first-integration",
+    );
+    await type(form.getByLabelText("Environment key"), "fixture-key");
+    await click(form.getByRole("button", { name: "Create integration" }));
+    return form;
+  }
+
+  const firstIntegrationPage = expect.objectContaining({
+    organizationId: MOCK_IDS.globex,
+    pageSize: MAX_PAGE_SIZE,
+    pageToken: "",
+  });
+
+  test("restarts an uncached first integration page after creating an integration", async () => {
+    const { calls, listRequested, releaseFirstPage } =
+      renderCreateIntegrationFixture({ holdFirstPage: true });
+    try {
+      await waitFor(() => expect(listRequested).toHaveBeenCalledTimes(1));
+      await submitFirstIntegration();
+      expect(calls).toHaveLength(1);
+      await act(async () => calls[0].settle());
+
+      await screen.findByText("first-integration · Claude Code");
+      expect(listRequested.mock.calls).toEqual([
+        [firstIntegrationPage],
+        [firstIntegrationPage],
+      ]);
+    } finally {
+      await act(async () => releaseFirstPage());
+    }
+    expect(screen.getByText("first-integration · Claude Code")).toBeTruthy();
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.globex}/integrations`,
+    );
+  });
+
+  test("refreshes the cached integration page shared with the profile form", async () => {
+    const { calls, listRequested } = renderCreateIntegrationFixture();
+    await screen.findByText("No agent integrations");
+    await submitFirstIntegration();
+    expect(calls).toHaveLength(1);
+    await act(async () => calls[0].settle());
+
+    await screen.findByText("first-integration · Claude Code");
+    expect(listRequested.mock.calls).toEqual([
+      [firstIntegrationPage],
+      [firstIntegrationPage],
+    ]);
+
+    await click(screen.getByRole("link", { name: "Runner profiles" }));
+    await click(screen.getByRole("button", { name: "Create runner profile" }));
+    const form = within(
+      screen.getByRole("dialog", { name: "Create a runner profile" }),
+    );
+    await click(form.getByRole("combobox", { name: "Workload kind" }));
+    await click(await screen.findByRole("option", { name: "Agent session" }));
+    await click(form.getByRole("combobox", { name: "Agent integration" }));
+    await screen.findByRole("option", {
+      name: "first-integration (Claude Code)",
+    });
+    expect(listRequested).toHaveBeenCalledTimes(2);
+  });
+
+  test("keeps the pending first integration page when creation fails", async () => {
+    const { calls, listRequested, releaseFirstPage } =
+      renderCreateIntegrationFixture({ holdFirstPage: true });
+    try {
+      await waitFor(() => expect(listRequested).toHaveBeenCalledTimes(1));
+      const form = await submitFirstIntegration();
+      expect(calls).toHaveLength(1);
+      await act(async () =>
+        calls[0].settle(
+          new ConnectError("Integration rejected", Code.InvalidArgument),
+        ),
+      );
+
+      await form.findByText("Integration rejected");
+    } finally {
+      await act(async () => releaseFirstPage());
+    }
+    await screen.findByText("No agent integrations");
+    expect(listRequested.mock.calls).toEqual([[firstIntegrationPage]]);
+  });
+
   test("retries the failed cursor and scopes loaded integrations to the active organization", async () => {
     const mock = createMockTransport({ agentIntegrationPageSize: 1 });
     const requests: Array<[string, number, string]> = [];
@@ -2920,8 +3047,22 @@ describe("runner profiles", () => {
     ).toBeNull();
   });
 
-  test("requires the workspace path for a dev session profile", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
+  test("blocks missing and invalid workspace paths on create", async () => {
+    const mock = createMockTransport();
+    const creates: CreateRunnerProfileRequest[] = [];
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+      transport: {
+        ...mock,
+        unary(method, ...args) {
+          if (
+            method.name === RunnerProfileService.method.createRunnerProfile.name
+          ) {
+            creates.push(args[3] as CreateRunnerProfileRequest);
+          }
+          return mock.unary(method, ...args);
+        },
+      },
+    });
     await click(
       await screen.findByRole("button", { name: "Create runner profile" }),
     );
@@ -2937,18 +3078,93 @@ describe("runner profiles", () => {
       within(dialog).getByRole("combobox", { name: "Workload kind" }),
     );
     await click(await screen.findByRole("option", { name: "Dev session" }));
-    const path = within(dialog).getByRole("textbox", {
+    const form = within(dialog);
+    const path = form.getByRole("textbox", {
       name: "Workspace path",
     });
-    await click(within(dialog).getByRole("button", { name: "Create profile" }));
-    await settle(60);
-    expect(dialog.textContent).toContain("Enter the workspace path");
-    await type(path, "/home/dev/work");
-    await click(within(dialog).getByRole("button", { name: "Create profile" }));
-    await settle(80);
-    expect(screen.queryByRole("dialog")).toBeNull();
+    const save = form.getByRole("button", { name: "Create profile" });
+    await click(save);
+    expect(form.getByText(/^Enter the workspace path/)).toBeTruthy();
+    await type(path, "/work/");
+    await click(save);
+    expect(form.getByText(/with no empty, \. or \.\. components/)).toBeTruthy();
+    expect(path.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(creates).toHaveLength(0);
+
+    await type(path, "/work");
+    await click(save);
     expect(await screen.findByText(/linux-dev · Dev session/)).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(creates).toHaveLength(1);
+    expect(creates[0]?.profile?.workspacePath).toBe("/work");
   });
+
+  test.each(["entered", "legacy"] as const)(
+    "replaces a %s reserved Windows workspace path in one edit",
+    async (origin) => {
+      const mock = createMockTransport();
+      const invalid = "C:\\work\\nUl.tar.gz";
+      const target = {
+        organizationId: MOCK_IDS.acme,
+        runnerProfileId: MOCK_IDS.devProfile,
+      };
+      if (origin === "legacy") {
+        await createClient(RunnerProfileService, mock).updateRunnerProfile({
+          ...target,
+          profile: { workspacePath: invalid },
+          updateMask: { paths: ["workspace_path"] },
+        });
+      }
+      const updates: UpdateRunnerProfileRequest[] = [];
+      renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+        transport: {
+          ...mock,
+          unary(method, ...args) {
+            if (
+              method.name ===
+              RunnerProfileService.method.updateRunnerProfile.name
+            ) {
+              updates.push(args[3] as UpdateRunnerProfileRequest);
+            }
+            return mock.unary(method, ...args);
+          },
+        },
+      });
+      const row = (
+        await screen.findByText(/windows-dev · Dev session/)
+      ).closest("li")!;
+      await click(within(row).getByRole("button", { name: "Edit" }));
+      const dialog = await screen.findByRole("dialog", {
+        name: "Edit windows-dev",
+      });
+      const form = within(dialog);
+      const path = form.getByRole<HTMLInputElement>("textbox", {
+        name: "Workspace path",
+      });
+      if (origin === "entered") await type(path, invalid);
+      expect(path.value).toBe(invalid);
+      const save = form.getByRole("button", { name: "Save changes" });
+      await click(save);
+      expect(
+        form.getByText(/^Replace reserved Windows device names/),
+      ).toBeTruthy();
+      expect(path.getAttribute("aria-invalid")).toBe("true");
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(updates).toHaveLength(0);
+
+      const valid = "C:\\work\\console.txt";
+      await type(path, valid);
+      await click(save);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(updates).toHaveLength(1);
+      expect(updates[0]).toMatchObject({
+        ...target,
+        profile: { workspacePath: valid },
+        updateMask: { paths: ["workspace_path"] },
+      });
+    },
+  );
 });
 
 describe("overview", () => {
@@ -3047,27 +3263,172 @@ describe("overview", () => {
   });
 
   test("reconnects when the WatchQueue stream ends", async () => {
-    const mock = createMockTransport({ watchQueueEndsAfterMs: 20 });
+    let endFirstStream!: () => void;
+    const firstStreamEnd = new Promise<void>((resolve) => {
+      endFirstStream = resolve;
+    });
     let streams = 0;
+    const queue = createRouterTransport((router) => {
+      router.service(WorkService, {
+        async *watchQueue(
+          _request,
+          { signal },
+        ): AsyncGenerator<MessageInitShape<typeof WatchQueueResponseSchema>> {
+          const first = ++streams === 1;
+          yield {
+            event: {
+              case: "request",
+              value: {
+                requestId: first ? "first-queue" : "second-queue",
+                state: RequestState.QUEUED,
+              },
+            },
+          };
+          yield { event: { case: "snapshotComplete", value: {} } };
+          if (first) {
+            await firstStreamEnd;
+            return;
+          }
+          // Keep the replacement stream open until the console unmounts.
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) => {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          }
+        },
+      });
+    });
+    const mock = createMockTransport();
     const transport: Transport = {
       ...mock,
-      stream: (method, ...rest) => {
-        if (method.name === "WatchQueue") streams += 1;
-        return mock.stream(method, ...rest);
-      },
+      stream: (method, ...rest) =>
+        (method.name === "WatchQueue" ? queue : mock).stream(method, ...rest),
     };
     renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
-    await screen.findByRole("table", { name: "Waiting requests" });
-    // The SDK waits 1 second before it reconnects.
-    await settle(1300);
-    expect(streams).toBeGreaterThanOrEqual(2);
-    expect(
-      screen.getByRole("status", { name: "Queue updates" }).textContent,
-    ).toBe("Live");
-    expect(
-      screen.getByRole("table", { name: "Waiting requests" }),
-    ).toBeTruthy();
+
+    try {
+      const table = await screen.findByRole("table", {
+        name: "Waiting requests",
+      });
+      expect(
+        within(table).getByRole("cell", { name: "first-queue" }),
+      ).toBeTruthy();
+      expect(streams).toBe(1);
+    } finally {
+      endFirstStream();
+    }
+
+    await waitFor(
+      () => {
+        const table = screen.getByRole("table", { name: "Waiting requests" });
+        expect(
+          within(table).getByRole("cell", { name: "second-queue" }),
+        ).toBeTruthy();
+        expect(
+          within(table).queryByRole("cell", { name: "first-queue" }),
+        ).toBeNull();
+        expect(
+          screen.getByRole("status", { name: "Queue updates" }).textContent,
+        ).toBe("Live");
+        expect(streams).toBe(2);
+      },
+      { timeout: 3000 },
+    );
   });
+
+  test.each([false, true])(
+    "recovers from a terminal error before the first snapshot (partial data: %s)",
+    async (withPartialData) => {
+      let failStream!: () => void;
+      const streamFailure = new Promise<void>((resolve) => {
+        failStream = resolve;
+      });
+      let completeSnapshot!: () => void;
+      const replacementSnapshot = new Promise<void>((resolve) => {
+        completeSnapshot = resolve;
+      });
+      let streams = 0;
+      const queue = createRouterTransport((router) => {
+        router.service(WorkService, {
+          async *watchQueue(): AsyncGenerator<
+            MessageInitShape<typeof WatchQueueResponseSchema>
+          > {
+            if (++streams === 1) {
+              if (withPartialData) {
+                yield {
+                  event: {
+                    case: "request",
+                    value: { requestId: "partial", state: RequestState.QUEUED },
+                  },
+                };
+                yield {
+                  event: {
+                    case: "runner",
+                    value: { runnerId: "partial", state: RunnerState.WARM },
+                  },
+                };
+              }
+              await streamFailure;
+              throw new ConnectError("internal error", Code.Internal);
+            }
+            await replacementSnapshot;
+            yield { event: { case: "snapshotComplete", value: {} } };
+          },
+        });
+      });
+      const mock = createMockTransport();
+      const transport: Transport = {
+        ...mock,
+        stream: (method, ...rest) =>
+          (method.name === "WatchQueue" ? queue : mock).stream(method, ...rest),
+      };
+      renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
+
+      const status = within(
+        await screen.findByRole("status", { name: "Queue updates" }),
+      );
+      const queueLoading = { name: "Loading the queue" };
+      const runnersLoading = { name: "Loading the runners" };
+      expect(status.getByText("Connecting")).toBeTruthy();
+      expect(screen.getByRole("status", queueLoading)).toBeTruthy();
+      expect(screen.getByRole("status", runnersLoading)).toBeTruthy();
+      expect(
+        screen.queryByRole("region", { name: "Waiting requests table" }),
+      ).toBeNull();
+
+      await act(async () => failStream());
+      const disconnected = await status.findByText("Disconnected");
+      expect(disconnected.getAttribute("data-variant")).toBe("neutral");
+      const errorMessage = "Something went wrong. Try again.";
+      expect(screen.getByText(errorMessage)).toBeTruthy();
+      const retry = screen.getByRole("button", { name: "Try again" });
+      expect(screen.queryByRole("status", queueLoading)).toBeNull();
+      expect(screen.queryByRole("status", runnersLoading)).toBeNull();
+      expect(
+        screen.queryByRole("region", { name: "Waiting requests table" }),
+      ).toBeNull();
+      expect(screen.queryByText("No request is waiting")).toBeNull();
+      expect(screen.queryByText("Warm", { selector: "dt" })).toBeNull();
+      expect(streams).toBe(1);
+
+      await click(retry);
+      expect(streams).toBe(2);
+      expect(status.getByText("Connecting")).toBeTruthy();
+      expect(screen.getByRole("status", queueLoading)).toBeTruthy();
+      expect(screen.getByRole("status", runnersLoading)).toBeTruthy();
+      expect(screen.queryByText(errorMessage)).toBeNull();
+
+      await act(async () => completeSnapshot());
+      expect(status.getByText("Live").getAttribute("data-variant")).toBe(
+        "accent",
+      );
+      expect(screen.getByText("No request is waiting")).toBeTruthy();
+      expect(
+        screen.getByText("Warm", { selector: "dt" }).nextElementSibling
+          ?.textContent,
+      ).toBe("0");
+    },
+  );
 
   test.each([false, true])(
     "keeps the last snapshot after a terminal stream error (after an automatic reconnect: %s)",
@@ -3595,43 +3956,6 @@ describe("table scroll regions without data", () => {
       expect(screen.queryByRole("region", { name })).toBeNull();
     },
   );
-
-  test("omits the waiting requests region when the first queue snapshot fails", async () => {
-    let failStream!: () => void;
-    const streamFailure = new Promise<void>((resolve) => {
-      failStream = resolve;
-    });
-    const queue = createRouterTransport((router) => {
-      router.service(WorkService, {
-        async *watchQueue() {
-          await streamFailure;
-          throw new ConnectError("Queue failed", Code.Internal);
-        },
-      });
-    });
-    const mock = createMockTransport();
-    const transport: Transport = {
-      ...mock,
-      stream: (method, ...args) =>
-        (method.name === "WatchQueue" ? queue : mock).stream(method, ...args),
-    };
-    renderConsole(`/orgs/${MOCK_IDS.acme}`, { transport });
-
-    const name = "Waiting requests table";
-    expect(
-      await screen.findByRole("status", { name: "Loading the queue" }),
-    ).toBeTruthy();
-    expect(screen.queryByRole("region", { name })).toBeNull();
-
-    await act(async () => failStream());
-    expect(
-      await screen.findByRole("button", { name: "Try again" }),
-    ).toBeTruthy();
-    expect(
-      screen.getByRole("status", { name: "Loading the queue" }),
-    ).toBeTruthy();
-    expect(screen.queryByRole("region", { name })).toBeNull();
-  });
 });
 
 describe("audit", () => {
@@ -3785,6 +4109,124 @@ describe("work", () => {
         { name: "Cancel" },
       ).length,
     ).toBe(2);
+  });
+
+  describe("request pagination", () => {
+    const path = (organizationId: string) => `/orgs/${organizationId}/requests`;
+    const request = (number: number, sourceKey = `request-${number}`) => ({
+      requestId: `request-${number}`,
+      state: RequestState.QUEUED,
+      sourceKey,
+    });
+    const firstPage = Array.from({ length: PAGE_SIZE }, (_, i) =>
+      request(i + 1),
+    );
+
+    function requestPages(
+      listRequests: (
+        token: string,
+      ) => MessageInitShape<typeof ListRequestsResponseSchema>,
+    ) {
+      const mock = createMockTransport();
+      const calls: ListRequestsRequest[] = [];
+      const pages = createRouterTransport((router) => {
+        router.service(WorkService, {
+          listRequests(req) {
+            calls.push(req);
+            return listRequests(req.pageToken);
+          },
+        });
+      });
+      const transport: Transport = {
+        ...mock,
+        unary: (method, ...args) =>
+          (method.name === WorkService.method.listRequests.name
+            ? pages
+            : mock
+          ).unary(method, ...args),
+      };
+      return { transport, calls };
+    }
+
+    function rows() {
+      return within(screen.getByRole("table", { name: "Requests" }))
+        .getAllByRole("row")
+        .slice(1);
+    }
+
+    const sources = () =>
+      rows().map((row) => within(row).getAllByRole("cell")[3]?.textContent);
+
+    test.each([
+      { role: "admin", organizationId: MOCK_IDS.globex, overlap: true },
+      { role: "admin", organizationId: MOCK_IDS.globex, overlap: false },
+      { role: "member", organizationId: MOCK_IDS.northwind, overlap: true },
+    ])(
+      "shows unique requests in order for a $role (overlap: $overlap)",
+      async ({ organizationId, role, overlap }) => {
+        const later = [request(51), request(52)];
+        const continuation = overlap
+          ? [request(50, "changed source"), ...later]
+          : later;
+        const { transport, calls } = requestPages((token) =>
+          token === ""
+            ? { requests: firstPage, nextPageToken: "50" }
+            : { requests: continuation },
+        );
+        renderConsole(path(organizationId), { transport });
+
+        await click(await screen.findByRole("button", { name: "Show more" }));
+
+        expect(sources()).toEqual(
+          [...firstPage, ...later].map((row) => row.sourceKey),
+        );
+        const boundary = screen.getByRole("row", { name: /\brequest-50\b/ });
+        expect(
+          within(boundary).queryAllByRole("button", { name: "Cancel" }),
+        ).toHaveLength(role === "admin" ? 1 : 0);
+        expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+        expect(
+          calls.map(({ pageSize, pageToken }) => [pageSize, pageToken]),
+        ).toEqual([
+          [PAGE_SIZE, ""],
+          [PAGE_SIZE, "50"],
+        ]);
+      },
+    );
+
+    test("keeps the next token after a duplicate-only page", async () => {
+      const { transport, calls } = requestPages((token) => {
+        switch (token) {
+          case "":
+            return { requests: firstPage, nextPageToken: "50" };
+          case "50":
+            return { requests: firstPage, nextPageToken: "100" };
+          case "100":
+            return { requests: [request(51)] };
+          default:
+            throw new ConnectError(
+              "Unexpected page token",
+              Code.InvalidArgument,
+            );
+        }
+      });
+      renderConsole(path(MOCK_IDS.globex), { transport });
+
+      await click(await screen.findByRole("button", { name: "Show more" }));
+      expect(sources()).toEqual(firstPage.map((row) => row.sourceKey));
+
+      await click(screen.getByRole("button", { name: "Show more" }));
+      expect(sources()).toEqual([
+        ...firstPage.map((row) => row.sourceKey),
+        "request-51",
+      ]);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+      expect(calls.map(({ pageToken }) => pageToken)).toEqual([
+        "",
+        "50",
+        "100",
+      ]);
+    });
   });
 
   test("dev sessions show only metadata and delete actions by role", async () => {
@@ -4190,6 +4632,7 @@ describe("failed query refreshes", () => {
       },
     };
     return {
+      underlyingTransport: mock,
       transport,
       pageTokens,
       fail(error: Error | undefined, continuationOnly = false) {
@@ -4198,6 +4641,117 @@ describe("failed query refreshes", () => {
       },
     };
   }
+
+  describe("the organization switcher", () => {
+    const path = `/orgs/${MOCK_IDS.acme}/requests`;
+    const orgListKey = createConnectQueryKey({
+      schema: OrganizationService.method.listOrganizations,
+      cardinality: undefined,
+    });
+    const combobox = { name: "Organization" };
+    const retry = { name: "Try again" };
+    const signIn = { name: "Sign in with Delino" };
+
+    async function refreshList(client: QueryClient) {
+      await act(async () => {
+        await client.refetchQueries({ queryKey: orgListKey });
+      });
+    }
+
+    test("offers retry after a first-load error", async () => {
+      const fixture = queryFixture("ListOrganizations");
+      fixture.fail(new ConnectError("offline", Code.Internal));
+      renderConsole(path, fixture);
+      const topBar = within(screen.getByRole("banner"));
+
+      expect((await topBar.findByRole("alert")).textContent).toContain(
+        "Something went wrong. Try again.",
+      );
+      expect(topBar.queryByRole("combobox", combobox)).toBeNull();
+      expect(topBar.queryByText(refreshNotice)).toBeNull();
+      await screen.findByRole("heading", { name: "Requests", level: 1 });
+
+      fixture.fail(undefined);
+      await click(topBar.getByRole("button", retry));
+      expect(await topBar.findByRole("combobox", combobox)).toBeTruthy();
+      expect(topBar.queryByRole("alert")).toBeNull();
+    });
+
+    test.each([
+      [
+        Code.NotFound,
+        "It was not found, or you no longer have access to it.",
+        retry,
+      ],
+      [Code.PermissionDenied, "You do not have permission to do this.", retry],
+      [Code.Unauthenticated, "Your session ended. Sign in again.", signIn],
+    ] as const)(
+      "closes the open switcher after %s",
+      async (code, message, action) => {
+        const fixture = queryFixture("ListOrganizations");
+        const client = renderConsole(path, fixture);
+        const topBar = within(screen.getByRole("banner"));
+        await click(await topBar.findByRole("combobox", combobox));
+        await screen.findByRole("option", { name: "Northwind Labs" });
+
+        fixture.fail(new ConnectError("list unavailable", code));
+        await refreshList(client);
+
+        expect(await topBar.findByText(message)).toBeTruthy();
+        expect(topBar.getByRole("button", action)).toBeTruthy();
+        expect(topBar.queryByText(refreshNotice)).toBeNull();
+        expect(topBar.queryByRole("combobox", combobox)).toBeNull();
+        expect(screen.queryAllByRole("option")).toHaveLength(0);
+        expect(topBar.getByRole("link", { name: "SandRun" })).toBeTruthy();
+        expect(
+          topBar.getByRole("link", { name: "Account settings" }),
+        ).toBeTruthy();
+        expect(topBar.getByRole("button", { name: "Sign out" })).toBeTruthy();
+        expect(
+          screen.getByRole("heading", { name: "Requests", level: 1 }),
+        ).toBeTruthy();
+        expect(window.location.pathname).toBe(path);
+      },
+    );
+
+    test("keeps open options after a transient error and updates them after retry", async () => {
+      const fixture = queryFixture("ListOrganizations");
+      const client = renderConsole(path, fixture);
+      const topBar = within(screen.getByRole("banner"));
+      const selector = await topBar.findByRole("combobox", combobox);
+      await click(selector);
+      const northwind = await screen.findByRole("option", {
+        name: "Northwind Labs",
+      });
+
+      fixture.fail(new ConnectError("offline", Code.Internal));
+      await refreshList(client);
+
+      expect(await topBar.findByText(refreshNotice)).toBeTruthy();
+      expect(topBar.getByRole("combobox", combobox)).toBe(selector);
+      expect(screen.getByRole("option", { name: "Northwind Labs" })).toBe(
+        northwind,
+      );
+
+      const { organization } = await createClient(
+        OrganizationService,
+        fixture.underlyingTransport,
+      ).createOrganization({ name: "Fabrikam" });
+      fixture.fail(undefined);
+      await click(topBar.getByRole("button", retry));
+      await waitFor(() => expect(topBar.queryByText(refreshNotice)).toBeNull());
+      if (selector.getAttribute("aria-expanded") !== "true")
+        await click(selector);
+      await click(await screen.findByRole("option", { name: "Fabrikam" }));
+
+      expect(window.location.pathname).toBe(
+        `/orgs/${organization!.organizationId}/requests`,
+      );
+      expect(
+        await screen.findByRole("heading", { name: "Requests", level: 1 }),
+      ).toBeTruthy();
+    });
+  });
 
   for (const [name, error] of [
     ["unavailable", new ConnectError("offline", Code.Unavailable)],
@@ -5068,7 +5622,7 @@ describe("invitations", () => {
     ]);
   });
 
-  function holdInvitationAccept() {
+  function holdInvitationAccept(organizationId?: string | null) {
     const mock = createMockTransport();
     let release = () => {};
     const promise = new Promise<void>((resolve) => {
@@ -5082,7 +5636,22 @@ describe("invitations", () => {
           requested();
           await promise;
         }
-        return mock.unary(method, ...args);
+        const response = await mock.unary(method, ...args);
+        if (
+          organizationId !== undefined &&
+          isMessage(response.message, AcceptInvitationResponseSchema)
+        ) {
+          if (organizationId === null) {
+            delete response.message.organization;
+          } else if (response.message.organization) {
+            response.message.organization.organizationId = organizationId;
+          } else {
+            throw new Error(
+              "The seeded acceptance must return an organization.",
+            );
+          }
+        }
+        return response;
       },
     };
     return { transport, release, requested };
@@ -5102,6 +5671,7 @@ describe("invitations", () => {
 
   const invalidInvitationNotice =
     "It was not found, or you no longer have access to it.";
+  const invitationRecoveryNotice = "You may have joined the organization.";
 
   function invitationInput() {
     return screen.getByLabelText<HTMLInputElement>("Invitation link or secret");
@@ -5113,6 +5683,70 @@ describe("invitations", () => {
       window.dispatchEvent(new HashChangeEvent("hashchange"));
     });
   }
+
+  test.each([
+    { response: "an omitted organization", organizationId: null },
+    { response: "an empty organization ID", organizationId: "" },
+    { response: "a whitespace-only organization ID", organizationId: "   " },
+  ])(
+    "offers the organization list after an acceptance with $response",
+    async ({ organizationId }) => {
+      const { transport, release, requested } =
+        holdInvitationAccept(organizationId);
+      const queryClient = renderConsole(
+        `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+        { transport, staleTime: Infinity },
+      );
+      await click(screen.getByRole("button", { name: "Join organization" }));
+      await act(async () => release());
+
+      expect(
+        (await within(screen.getByRole("main")).findByRole("alert"))
+          .textContent,
+      ).toBe(invitationRecoveryNotice);
+      expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+        "success",
+      );
+      expect(window.location.pathname).toBe("/invitations/accept");
+      expect(window.location.hash).toBe("");
+      expect(screen.queryByLabelText("Invitation link or secret")).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Join organization" }),
+      ).toBeNull();
+      expect(storedText()).not.toContain(MOCK_INVITATION_SECRET);
+      expect(requested).toHaveBeenCalledTimes(1);
+
+      await click(
+        screen.getByRole("link", { name: "Go to your organizations" }),
+      );
+      expect(window.location.pathname).toBe("/");
+      expect(await screen.findByRole("link", { name: /Contoso/ })).toBeTruthy();
+    },
+  );
+
+  test("restores the form when a replacement link opens after recovery", async () => {
+    const { transport, release, requested } = holdInvitationAccept(null);
+    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
+      transport,
+    });
+    await click(screen.getByRole("button", { name: "Join organization" }));
+    await act(async () => release());
+    await screen.findByText(invitationRecoveryNotice);
+
+    await changeInvitationHash("#source=fixture");
+    expect(screen.getByText(invitationRecoveryNotice)).toBeTruthy();
+    await changeInvitationHash("#secret=sri_follow_up_invitation");
+
+    expect(screen.queryByText(invitationRecoveryNotice)).toBeNull();
+    expect(invitationInput().value).toBe("sri_follow_up_invitation");
+    expect(window.location.hash).toBe("");
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", {
+        name: "Join organization",
+      }).disabled,
+    ).toBe(false);
+    expect(requested).toHaveBeenCalledTimes(1);
+  });
 
   test("consumes a replacement link in place and submits only its secret", async () => {
     const path = "/invitations/accept?source=fixture";
@@ -5178,14 +5812,18 @@ describe("invitations", () => {
   });
 
   test.each([
-    { replacement: "link", result: "success" },
-    { replacement: "link", result: "error" },
-    { replacement: "edit", result: "success" },
-    { replacement: "edit", result: "error" },
+    { replacement: "link", result: "success", response: "complete" },
+    { replacement: "link", result: "success", response: "incomplete" },
+    { replacement: "link", result: "error", response: "rejected" },
+    { replacement: "edit", result: "success", response: "complete" },
+    { replacement: "edit", result: "success", response: "incomplete" },
+    { replacement: "edit", result: "error", response: "rejected" },
   ] as const)(
-    "keeps a replacement $replacement active after a late accept $result",
-    async ({ replacement, result }) => {
-      const { transport, release, requested } = holdInvitationAccept();
+    "keeps a replacement $replacement active after a late $response accept",
+    async ({ replacement, result, response }) => {
+      const { transport, release, requested } = holdInvitationAccept(
+        response === "incomplete" ? null : undefined,
+      );
       const queryClient = renderConsole("/", {
         transport,
         staleTime: Infinity,
@@ -5229,6 +5867,7 @@ describe("invitations", () => {
       expect(invitationInput().value).toBe(replacementSecret);
       expect(join.disabled).toBe(false);
       expect(screen.queryByText(invalidInvitationNotice)).toBeNull();
+      expect(screen.queryByText(invitationRecoveryNotice)).toBeNull();
 
       if (result === "success") {
         await click(screen.getByRole("link", { name: "SandRun" }));
@@ -5340,10 +5979,17 @@ describe("invitations", () => {
     expect(window.location.pathname).toBe("/");
   });
 
-  test.each(["the SandRun link", "browser Back"])(
-    "refreshes organizations without navigating after the user leaves via %s",
-    async (departure) => {
-      const { transport, release, requested } = holdInvitationAccept();
+  test.each([
+    { departure: "the SandRun link", response: "complete" },
+    { departure: "the SandRun link", response: "incomplete" },
+    { departure: "browser Back", response: "complete" },
+    { departure: "browser Back", response: "incomplete" },
+  ] as const)(
+    "refreshes organizations after leaving via $departure before a $response response",
+    async ({ departure, response }) => {
+      const { transport, release, requested } = holdInvitationAccept(
+        response === "incomplete" ? null : undefined,
+      );
       renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
         transport,
       });
@@ -5368,6 +6014,7 @@ describe("invitations", () => {
       await act(async () => release());
 
       expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}`);
+      expect(screen.queryByText(invitationRecoveryNotice)).toBeNull();
       expect(
         await screen.findByRole("option", { name: /Contoso/ }),
       ).toBeTruthy();
@@ -5448,7 +6095,30 @@ describe("settings", () => {
   });
 
   test("an admin changes the dev session limit; the owner actions stay hidden", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.globex}/settings`);
+    const organizationId = MOCK_IDS.globex;
+    const mock = createMockTransport();
+    const client = createClient(OrganizationService, mock);
+    const { organization: before } = await client.getOrganization({
+      organizationId,
+    });
+    expect(before?.settings?.maxDevSessionsPerUser).toBeUndefined();
+
+    const updates: unknown[] = [];
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (
+          method.name ===
+          OrganizationService.method.updateOrganizationSettings.name
+        ) {
+          updates.push(args[3]);
+        }
+        return mock.unary(method, ...args);
+      },
+    };
+    const queryClient = renderConsole(`/orgs/${organizationId}/settings`, {
+      transport,
+    });
     const input = await screen.findByRole("textbox", {
       name: "Limit per user",
     });
@@ -5456,9 +6126,23 @@ describe("settings", () => {
       screen.queryByRole("button", { name: "Delete organization" }),
     ).toBeNull();
     await type(input, "3");
-    await click(screen.getByRole("button", { name: "Save limit" }));
-    await settle(60);
-    expect(document.body.textContent).not.toContain("Enter a whole number");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    });
+    await waitFor(() => {
+      expect(updates).toMatchObject([
+        {
+          organizationId,
+          settings: { maxDevSessionsPerUser: 3 },
+          updateMask: { paths: [limitPath] },
+        },
+      ]);
+      expect(queryClient.isMutating()).toBe(0);
+    });
+    const { organization: after } = await client.getOrganization({
+      organizationId,
+    });
+    expect(after?.settings?.maxDevSessionsPerUser).toBe(3);
   });
 
   test.each([

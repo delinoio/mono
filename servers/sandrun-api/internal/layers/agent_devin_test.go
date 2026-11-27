@@ -135,14 +135,26 @@ func TestDevinSessionLifecycle(t *testing.T) {
 	w.devin.SetSessionStatus("ses-1", "running")
 	w.waitRunner(t, runner.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_BUSY)
 	w.waitRequest(t, req.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
-	w.devin.SetSessionStatus("ses-1", "terminated")
+	w.devin.SetEmptyLookup("ses-1", true)
 	w.guest.exitProgram(sandboxID, 0)
 	r := w.waitRequest(t, req.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_ENDED)
 	if r.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_COMPLETED {
 		t.Fatalf("end reason %v", r.GetEndReason())
 	}
 	w.waitRunner(t, runner.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_DELETED)
+	eventually(t, "the empty queue-entry lookup fails during release", func() bool {
+		logs := w.env.Logs.String()
+		return strings.Contains(logs, "agent_claim_release_failed") && strings.Contains(logs, "DEVIN get_queue_entry: decode response: empty body")
+	})
+	w.assertClaim(t, req.GetRequestId(), agent.ClaimHeld)
+	w.assertNoRelease(t, "ses-1")
+	w.devin.SetSessionStatusSilently("ses-1", "terminated")
+	w.devin.SetEmptyLookup("ses-1", false)
 	eventually(t, "claim released", func() bool { return w.devin.Releases("ses-1") == 1 })
+	eventually(t, "the release is recorded", func() bool {
+		cl, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
+		return err == nil && cl.State == agent.ClaimReleased
+	})
 	if len(w.devin.Messages("ses-1")) != 0 {
 		t.Fatal("operator message for a served session")
 	}
@@ -534,6 +546,18 @@ func TestDevinLookupFailureReleaseGrace(t *testing.T) {
 // entry of one STARTING session, it still marks the runner of another
 // session BUSY when that session runs (a missed watch event).
 func TestDevinStartCheckPartialFailure(t *testing.T) {
+	t.Run("missing entry", func(t *testing.T) {
+		testDevinStartCheckPartialFailure(t, (*devinfake.Fake).Forget, "DEVIN get_queue_entry: HTTP 404")
+	})
+	t.Run("empty response", func(t *testing.T) {
+		testDevinStartCheckPartialFailure(t, func(fake *devinfake.Fake, sid string) {
+			fake.SetEmptyLookup(sid, true)
+		}, "DEVIN get_queue_entry: decode response: empty body")
+	})
+}
+
+func testDevinStartCheckPartialFailure(t *testing.T, failLookup func(*devinfake.Fake, string), wantError string) {
+	t.Helper()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	waiting := func(sid string) *sandrunv1.Runner {
 		req := w.requestBySource(t, sid)
@@ -548,18 +572,20 @@ func TestDevinStartCheckPartialFailure(t *testing.T) {
 		})
 		return runner
 	}
-	w.devin.AddSession("ses-gone", true)
-	waiting("ses-gone")
+	w.devin.AddSession("ses-failed", true)
+	failed := waiting("ses-failed")
 	w.devin.AddSession("ses-ok", true)
 	ok := waiting("ses-ok")
-	w.devin.Forget("ses-gone")
-	// A poll might already have read ses-gone before it disappeared.
-	// Let that poll finish before making the other session ready.
+	failLookup(w.devin, "ses-failed")
 	eventually(t, "the failed session check to be logged", func() bool {
-		return strings.Contains(w.env.Logs.String(), "agent_session_check_failed")
+		logs := w.env.Logs.String()
+		return strings.Contains(logs, "agent_session_check_failed") && strings.Contains(logs, wantError)
 	})
 	w.devin.SetSessionStatusSilently("ses-ok", "running")
 	w.waitRunner(t, ok.GetRunnerId(), sandrunv1.RunnerState_RUNNER_STATE_BUSY)
+	if state := w.runner(t, failed.GetRunnerId()).GetState(); state != sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK {
+		t.Fatalf("runner with a failed queue-entry lookup is %v, want WAITING_FOR_WORK", state)
+	}
 }
 
 // TestDevinWatchReconnect: a stream end (scheduled, at most 5 minutes) and

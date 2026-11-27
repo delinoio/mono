@@ -514,15 +514,120 @@ describe("runner profile form", () => {
     expect(profileErrors(linux, undefined).workspacePath).toBeDefined();
   });
 
-  test("does not send workspace_path for other kinds", () => {
-    const p = profileFromForm({
+  test.each([
+    [GuestOs.LINUX, ["/work/", "/a//b", "//work", "/work/../repo"]],
+    [GuestOs.MACOS, ["/", "/Users/dev/./work"]],
+    [
+      GuestOs.WINDOWS,
+      [
+        "C:\\",
+        "\\\\host\\share",
+        "C:\\work/nested",
+        "C:\\work\\\\nested",
+        "C:\\work\\..",
+        "C:\\work\\nUl.tar.gz",
+        "C:\\AUX\\app",
+        "C:\\work\\COM¹.log",
+        "C:\\work\\lPt².log",
+        "C:\\work\\conout$.log",
+        "C:\\work\\conın$.log",
+        "C:\\work\\PRN .log",
+        "C:\\work\\name.",
+        "C:\\work\\name ",
+        "C:\\work\\name:stream",
+      ],
+    ],
+  ] as const)(
+    "rejects invalid workspace paths for guest OS %s",
+    (guestOs, paths) => {
+      const form = {
+        ...emptyProfileForm(),
+        name: "dev-session",
+        workloadKind: WorkloadKind.DEV_SESSION,
+        guestOs,
+      };
+      for (const workspacePath of paths) {
+        expect(profileErrors({ ...form, workspacePath }, undefined)).toEqual({
+          workspacePath: expect.any(String),
+        });
+      }
+    },
+  );
+
+  const maxWorkspacePath = "/" + "é".repeat(511) + "a";
+  test("rejects oversized paths, control characters and unpaired surrogates", () => {
+    const form = {
       ...emptyProfileForm(),
-      name: "linux-build",
-      workspacePath: "/ignored",
-    });
-    expect(p.workspacePath).toBe("");
-    expect(p.source).toEqual({ case: "baseImage", value: GuestOs.LINUX });
+      name: "linux-dev",
+      workloadKind: WorkloadKind.DEV_SESSION,
+    };
+    for (const workspacePath of [
+      maxWorkspacePath + "b",
+      "/work/\u001f",
+      "/work/\u007f",
+      "/work/\ud800",
+    ]) {
+      expect(profileErrors({ ...form, workspacePath }, undefined)).toEqual({
+        workspacePath: expect.any(String),
+      });
+    }
   });
+
+  test.each([
+    [GuestOs.LINUX, "/work/NUL"],
+    [GuestOs.LINUX, maxWorkspacePath],
+    [GuestOs.MACOS, "/work/NUL"],
+    [GuestOs.MACOS, "/My work/📁 "],
+    [GuestOs.WINDOWS, "C:\\work\\console.txt"],
+    [GuestOs.WINDOWS, "d:\\My Work\\COM10"],
+  ] as const)(
+    "serializes valid workspace paths for guest OS %s verbatim",
+    (guestOs, workspacePath) => {
+      const form = {
+        ...emptyProfileForm(),
+        name: "dev-session",
+        workloadKind: WorkloadKind.DEV_SESSION,
+        guestOs,
+        workspacePath,
+      };
+      expect(profileErrors(form, undefined)).toEqual({});
+      const request = create(CreateRunnerProfileRequestSchema, {
+        profile: profileFromForm(form),
+      });
+      const decoded = fromBinary(
+        CreateRunnerProfileRequestSchema,
+        toBinary(CreateRunnerProfileRequestSchema, request),
+      );
+      expect(decoded.profile?.workspacePath).toBe(workspacePath);
+    },
+  );
+
+  test.each([WorkloadKind.GITHUB_JOB, WorkloadKind.AGENT_SESSION])(
+    "does not send workspace_path for workload kind %s",
+    (workloadKind) => {
+      const form = {
+        ...emptyProfileForm(),
+        name: "linux-build",
+        workloadKind,
+        agentIntegrationId: "integration",
+        workspacePath: "/ignored/",
+      };
+      expect(profileErrors(form, undefined)).toEqual({});
+      const request = create(CreateRunnerProfileRequestSchema, {
+        profile: profileFromForm(form),
+      });
+      const withoutPath = { ...request.profile!, workspacePath: "" };
+      expect(toBinary(CreateRunnerProfileRequestSchema, request)).toEqual(
+        toBinary(CreateRunnerProfileRequestSchema, {
+          ...request,
+          profile: withoutPath,
+        }),
+      );
+      expect(
+        profileUpdateMask({ ...form, workspacePath: "" }, form).paths,
+      ).toEqual([]);
+    },
+  );
 
   test("checks the name and the agent integration", () => {
     const base = { ...emptyProfileForm(), name: "Bad Name" };
@@ -625,11 +730,25 @@ describe("queue view", () => {
     expect(view.requests.size).toBe(0);
   });
 
-  test("keeps the loading state when the stream fails before the first snapshot", () => {
-    const view = initialQueueView();
-    expect(
-      applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed }),
-    ).toBe(view);
+  test("discards an incomplete first snapshot when the stream fails", () => {
+    let view = applyQueueEvent(initialQueueView(), {
+      kind: WatchQueueEventKind.Request,
+      request: request("partial", RequestState.QUEUED),
+    });
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.StreamFailed });
+    expect(view.live).toBe(LiveState.Disconnected);
+    expect(view.hasSnapshot).toBe(false);
+    expect(view.pending).toBeUndefined();
+    expect(view.requests.size).toBe(0);
+
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.Restart });
+    expect(view.live).toBe(LiveState.Connecting);
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    expect(view.live).toBe(LiveState.Live);
+    expect(view.hasSnapshot).toBe(true);
+    expect(view.requests.size).toBe(0);
   });
 
   test("keeps the last state across a gap and replaces it with the new snapshot", () => {

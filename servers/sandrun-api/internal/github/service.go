@@ -243,7 +243,7 @@ func (l *Layer) activeInstallation(ctx context.Context, orgID, installationID st
 	if !l.Configured() {
 		return c, nil, errNotConfigured
 	}
-	inst, err := l.installation(ctx, s.DB.Pool, c.OrganizationID, id)
+	inst, err := l.installation(ctx, s.DB.Pool, c.OrganizationID, id, lockNone)
 	if err != nil {
 		return c, nil, s.Internal(ctx, "get github installation", err)
 	}
@@ -306,6 +306,14 @@ func (h *Handler) UpdateGitHubInstallation(ctx context.Context, req *connect.Req
 	}
 	var out *Installation
 	err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// A lifecycle event or unlink can commit while GitHub lists the groups.
+		current, err := l.installation(ctx, tx, c.OrganizationID, inst.ID, lockUpdate)
+		if err != nil {
+			return err
+		}
+		if !current.Active() {
+			return api.ErrPrecondition("the installation is not active in GitHub")
+		}
 		out, err = scanInstallation(tx.QueryRow(ctx, `UPDATE github_installations SET github_runner_group_id = $3, runner_group_name = $4, update_time = $5
 			WHERE organization_id = $1 AND installation_id = $2 RETURNING `+installationColumns, c.OrganizationID, inst.ID, group.ID, group.Name, s.NowUTC()))
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -342,7 +350,7 @@ func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Req
 	if err != nil {
 		return nil, err
 	}
-	inst, err := l.installation(ctx, s.DB.Pool, c.OrganizationID, id)
+	inst, err := l.installation(ctx, s.DB.Pool, c.OrganizationID, id, lockNone)
 	if err != nil {
 		return nil, s.Internal(ctx, "get github installation", err)
 	}

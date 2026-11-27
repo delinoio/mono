@@ -41,6 +41,13 @@ export const MAX_MEMORY_MIB = 16_777_216;
 export const MAX_DISK_GIB = 1_048_576;
 
 const PROFILE_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const MAX_WORKSPACE_PATH_BYTES = 1024;
+const WORKSPACE_PATH_INVALID_CHARACTER = /[\x00-\x1f\x7f\p{Surrogate}]/u;
+const WINDOWS_DRIVE_ROOT = /^[A-Za-z]:\\/;
+const WINDOWS_PATH_INVALID_CHARACTER = /[/:*?"<>|]/;
+const WINDOWS_DEVICE_NAME =
+  /^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³])$/;
+const utf8 = new TextEncoder();
 
 /** How a runner profile form names its source. */
 export enum SourceKind {
@@ -101,10 +108,55 @@ const VENDOR_GUEST_OSES: Readonly<
   [AgentVendor.DEVIN]: [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS],
 };
 
-/** Reports whether a path is absolute in the syntax of the guest OS. */
-export function isAbsoluteGuestPath(guestOs: GuestOs, path: string): boolean {
-  if (guestOs === GuestOs.WINDOWS) return /^[A-Za-z]:\\/.test(path);
-  return path.startsWith("/");
+// Keep these checks in sync with ValidWorkspacePath in the control plane.
+function workspacePathError(
+  guestOs: GuestOs,
+  path: string,
+): string | undefined {
+  if (path.trim() === "") {
+    return "Enter the workspace path. Dev session sync writes into it.";
+  }
+  if (
+    path.length > MAX_WORKSPACE_PATH_BYTES ||
+    utf8.encode(path).length > MAX_WORKSPACE_PATH_BYTES
+  ) {
+    return "Use a workspace path of at most 1,024 UTF-8 bytes.";
+  }
+  if (WORKSPACE_PATH_INVALID_CHARACTER.test(path)) {
+    return "Use valid Unicode and remove control characters from the workspace path.";
+  }
+
+  const windows = guestOs === GuestOs.WINDOWS;
+  if (windows) {
+    if (!WINDOWS_DRIVE_ROOT.test(path)) {
+      return "Enter an absolute Windows path, for example C:\\work.";
+    }
+  } else if (
+    (guestOs !== GuestOs.LINUX && guestOs !== GuestOs.MACOS) ||
+    !path.startsWith("/")
+  ) {
+    return "Enter an absolute path, for example /home/dev/work.";
+  }
+
+  const components = path.slice(windows ? 3 : 1).split(windows ? "\\" : "/");
+  for (const component of components) {
+    if (component === "" || component === "." || component === "..") {
+      return "Use a path below the root with no empty, . or .. components and no trailing separator.";
+    }
+    if (!windows) continue;
+    if (WINDOWS_PATH_INVALID_CHARACTER.test(component)) {
+      return 'Use backslashes as separators and remove / : * ? " < > | from Windows path components.';
+    }
+    if (component.endsWith(".") || component.endsWith(" ")) {
+      return "Remove trailing dots and spaces from Windows path components.";
+    }
+    // Windows reserves device names even before extensions and ASCII spaces.
+    const base = component.split(".", 1)[0]!.replace(/ +$/, "").toUpperCase();
+    if (WINDOWS_DEVICE_NAME.test(base)) {
+      return "Replace reserved Windows device names such as NUL, AUX or COM1.";
+    }
+  }
+  return undefined;
 }
 
 function positive(value: number | null): boolean {
@@ -153,15 +205,8 @@ export function profileErrors(
     errors.agentIntegrationId = "Select the agent integration of the profile.";
   }
   if (values.workloadKind === WorkloadKind.DEV_SESSION) {
-    if (values.workspacePath.trim() === "") {
-      errors.workspacePath =
-        "Enter the workspace path. Dev session sync writes into it.";
-    } else if (!isAbsoluteGuestPath(values.guestOs, values.workspacePath)) {
-      errors.workspacePath =
-        values.guestOs === GuestOs.WINDOWS
-          ? "Enter an absolute Windows path, for example C:\\work."
-          : "Enter an absolute path, for example /home/dev/work.";
-    }
+    const error = workspacePathError(values.guestOs, values.workspacePath);
+    if (error !== undefined) errors.workspacePath = error;
   }
   if (codex && guestOses?.length === 0) {
     errors.guestOs = CODEX_GUEST_OS_UNAVAILABLE;

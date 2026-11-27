@@ -70,8 +70,8 @@ function renderAt(path: string) {
   render(<App config={config} />);
 }
 
-function findSignIn() {
-  return screen.findByRole<HTMLButtonElement>(
+function findSignIn(scope: Pick<typeof screen, "findByRole"> = screen) {
+  return scope.findByRole<HTMLButtonElement>(
     "button",
     { name: "Sign in with Delino" },
     SDK_WAIT,
@@ -112,25 +112,30 @@ describe("Logto sign-in before the redirect", () => {
     { path: "/", method: undefined },
     { path: "/", method: "ListOrganizations" },
     { path: `/orgs/${ORGANIZATION_ID}`, method: "GetOrganization" },
+    {
+      path: `/orgs/${ORGANIZATION_ID}`,
+      method: "ListOrganizations",
+      region: "banner",
+    },
   ])(
     "handles failure and retry on $path (RPC: $method)",
-    async ({ path, method }) => {
+    async ({ path, method, region = "main" }) => {
       if (method !== undefined) restoreLogtoSession();
       renderAt(path);
-      const signIn = await findSignIn();
-      const main = signInScreen();
+      const area = within(await screen.findByRole(region, {}, SDK_WAIT));
+      const signIn = await findSignIn(area);
       const alert = { selector: '[role="alert"]' };
-      expect(main.queryByText(FAILURE_TEXT)).toBeNull();
+      expect(area.queryByText(FAILURE_TEXT)).toBeNull();
       if (method !== undefined) {
         expect(protectedRequests).toContain(`${ORGANIZATION_RPC}/${method}`);
-        expect(main.getByText(SESSION_ENDED_TEXT)).toBeTruthy();
+        expect(area.getByText(SESSION_ENDED_TEXT)).toBeTruthy();
       }
 
       fireEvent.click(signIn);
-      const failure = await main.findByText(FAILURE_TEXT, alert, SDK_WAIT);
+      const failure = await area.findByText(FAILURE_TEXT, alert, SDK_WAIT);
       expect(failure.parentElement?.closest('[role="alert"]')).toBeNull();
       if (method !== undefined) {
-        expect(main.getByText(SESSION_ENDED_TEXT, alert)).toBeTruthy();
+        expect(area.getByText(SESSION_ENDED_TEXT, alert)).toBeTruthy();
       }
       expect(document.body.textContent).not.toContain(DIAGNOSTIC);
       expect(signIn.disabled).toBe(false);
@@ -147,11 +152,11 @@ describe("Logto sign-in before the redirect", () => {
         throw new TypeError(DIAGNOSTIC);
       };
       fireEvent.click(signIn);
-      expect(main.queryByText(FAILURE_TEXT)).toBeNull();
+      expect(area.queryByText(FAILURE_TEXT)).toBeNull();
       await act(async () => {
         finishRetry();
       });
-      expect(await main.findByText(FAILURE_TEXT, alert, SDK_WAIT)).toBeTruthy();
+      expect(await area.findByText(FAILURE_TEXT, alert, SDK_WAIT)).toBeTruthy();
       expect(signIn.disabled).toBe(false);
 
       requestDiscovery = async () =>
@@ -173,7 +178,7 @@ describe("Logto sign-in before the redirect", () => {
       expect(
         new URLSearchParams(window.location.search).get("redirect_uri"),
       ).toBe(`${APP_URL}/callback`);
-      expect(main.queryByText(FAILURE_TEXT)).toBeNull();
+      expect(area.queryByText(FAILURE_TEXT)).toBeNull();
     },
     30_000,
   );

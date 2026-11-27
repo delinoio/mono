@@ -50,12 +50,13 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 		Prepare: func(ctx context.Context, orgID string) error {
 			return e.cleanUpOrganizationRunners(ctx, orgID)
 		},
-		InTx: func(ctx context.Context, tx pgx.Tx, orgID string) error {
+		InTx: func(ctx context.Context, tx pgx.Tx, orgID string) (func(context.Context), error) {
 			ended, err := e.endOpenTx(ctx, tx, orgID, "", RequestEnd{State: reqCanceled, Reason: sandrunv1.RequestEndReason_REQUEST_END_REASON_INTEGRATION_REMOVED})
-			e.pendingReleases.Store("link/"+orgID, ended)
-			return err
+			if err != nil {
+				return nil, err
+			}
+			return func(ctx context.Context) { e.releaseClaims(ctx, ended) }, nil
 		},
-		AfterCommit: func(ctx context.Context, orgID string) { e.releasePending(ctx, "link/"+orgID) },
 	})
 	profiles.OnDeletion(profile.DeletionHook{
 		Name: "work",
@@ -143,16 +144,6 @@ func (e *Engine) deleteProfileWorkTx(ctx context.Context, tx pgx.Tx, orgID, prof
 			e.FinishDeletion(ctx, d)
 		}
 	}, nil
-}
-
-// releasePending releases the vendor claims of the requests that a clean-up
-// transaction ended (after its commit).
-func (e *Engine) releasePending(ctx context.Context, key string) {
-	v, ok := e.pendingReleases.LoadAndDelete(key)
-	if !ok {
-		return
-	}
-	e.releaseClaims(ctx, v.([]*Request))
 }
 
 func (e *Engine) releaseClaims(ctx context.Context, requests []*Request) {

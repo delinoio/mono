@@ -2,6 +2,7 @@
 import { create } from "@bufbuild/protobuf";
 import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
 import {
+  createConnectQueryKey,
   createQueryOptions,
   useInfiniteQuery,
   useMutation,
@@ -798,7 +799,22 @@ function IntegrationDialog({
     invalidateServices(queryClient, AgentIntegrationService);
   const createIntegration = useMutation(
     AgentIntegrationService.method.createAgentIntegration,
-    { onSuccess: refresh },
+    {
+      onSuccess: async (_, { organizationId }) => {
+        // Invalidation alone reuses an in-flight fetch when no page is cached.
+        // That first response may contain the list from before creation.
+        await queryClient.cancelQueries({
+          queryKey: createConnectQueryKey({
+            schema: AgentIntegrationService.method.listAgentIntegrations,
+            input: { organizationId },
+            cardinality: "infinite",
+          }),
+          fetchStatus: "fetching",
+          predicate: (query) => query.state.data === undefined,
+        });
+        await refresh();
+      },
+    },
   );
   const updateIntegration = useMutation(
     AgentIntegrationService.method.updateAgentIntegration,

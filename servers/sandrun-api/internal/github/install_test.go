@@ -24,22 +24,23 @@ func TestRunnerChecksums(t *testing.T) {
 }
 
 func TestInstallAndStartCommands(t *testing.T) {
+	releaseURL := "https://github.com/actions/runner/releases/download/v" + RunnerVersion + "/"
 	for _, tc := range []struct {
 		guest       sandrunv1.GuestOs
 		program     string
 		asset, sums []string
 		start       string
 	}{
-		{sandrunv1.GuestOs_GUEST_OS_LINUX, "/bin/sh", []string{"actions-runner-linux-$arch-2.338.2.tar.gz", "installdependencies.sh", "/opt/actions-runner"},
+		{sandrunv1.GuestOs_GUEST_OS_LINUX, "/bin/sh", []string{"actions-runner-linux-$arch-" + RunnerVersion + ".tar.gz", "installdependencies.sh", "/opt/actions-runner"},
 			[]string{runnerSHA256["linux-x64"], runnerSHA256["linux-arm64"]}, "./run.sh --jitconfig"},
-		{sandrunv1.GuestOs_GUEST_OS_MACOS, "/bin/sh", []string{"actions-runner-osx-$arch-2.338.2.tar.gz", "/opt/actions-runner"},
+		{sandrunv1.GuestOs_GUEST_OS_MACOS, "/bin/sh", []string{"actions-runner-osx-$arch-" + RunnerVersion + ".tar.gz", "/opt/actions-runner"},
 			[]string{runnerSHA256["osx-x64"], runnerSHA256["osx-arm64"]}, "./run.sh --jitconfig"},
-		{sandrunv1.GuestOs_GUEST_OS_WINDOWS, "powershell.exe", []string{"actions-runner-win-$a-2.338.2.zip", `C:\actions-runner`, "Get-FileHash", "Set-Acl"},
+		{sandrunv1.GuestOs_GUEST_OS_WINDOWS, "powershell.exe", []string{"actions-runner-win-$a-" + RunnerVersion + ".zip", `C:\actions-runner`, "Get-FileHash", "Set-Acl"},
 			[]string{runnerSHA256["win-x64"], runnerSHA256["win-arm64"]}, "run.cmd --jitconfig"},
 	} {
 		install := InstallCommand(tc.guest)
 		joined := strings.Join(install, " ")
-		if install[0] != tc.program || !strings.Contains(joined, "https://github.com/actions/runner/releases/download/v2.338.2/") {
+		if install[0] != tc.program || !strings.Contains(joined, releaseURL) {
 			t.Errorf("%v install %v", tc.guest, install)
 		}
 		for _, s := range append(tc.asset, tc.sums...) {
