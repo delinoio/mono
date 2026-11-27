@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
+import { describe, expect, rs, test } from "@rstest/core";
 import { RequestState, RunnerState } from "@delino/sandrun-protos/v1/common_pb";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import {
@@ -491,20 +491,95 @@ describe("watchQueue", () => {
     expect(streams).toBe(1);
   });
 
-  test("ends without an error when the signal aborts an open stream", async () => {
-    const server = watchServer([["snapshot", "hang"]]);
-    const client = new SandRunClient({
-      origin: FAKE_ORIGIN,
-      fetch: server.fetch,
-      token: "test-token",
-      clock: new RecordingClock(),
-    });
-    const abort = new AbortController();
-    const events = await take(
-      client.watchQueue({ organizationId: ORG, signal: abort.signal }),
-      3,
-      abort,
-    );
-    expect(events.at(-1)).toBe("snapshot complete");
-  });
+  test(
+    "ends without an error when abort interrupts a pending queue read",
+    { timeout: 5_000 },
+    async ({ onTestFinished }) => {
+      const pendingBodyRead = Promise.withResolvers<void>();
+      const handlerWaiting = Promise.withResolvers<void>();
+      const handlerClosed = Promise.withResolvers<void>();
+      const server = fakeServer((router) => {
+        router.service(WorkService, {
+          async *watchQueue(req, ctx) {
+            expect(req.organizationId).toBe(ORG);
+            try {
+              yield { event: { case: "snapshotComplete", value: {} } };
+              // Fill Connect-Web's prefetch slot until the reader asks for
+              // the next queue event. The SDK skips keepalives.
+              yield { event: { case: "keepalive", value: {} } };
+              await new Promise<never>((_, reject) => {
+                ctx.signal.throwIfAborted();
+                ctx.signal.addEventListener(
+                  "abort",
+                  () => reject(ctx.signal.reason),
+                  { once: true },
+                );
+                handlerWaiting.resolve();
+              });
+            } finally {
+              handlerClosed.resolve();
+            }
+          },
+        });
+      });
+
+      const abort = new AbortController();
+      onTestFinished(() => abort.abort());
+      const clock = new RecordingClock();
+      const sleep = rs.spyOn(clock, "sleep");
+      let bodyReads = 0;
+      const client = new SandRunClient({
+        origin: FAKE_ORIGIN,
+        fetch: async (input, init) => {
+          const response = await server.fetch(input, init);
+          const reader = response.body!.getReader();
+          const body = new ReadableStream<Uint8Array>(
+            {
+              async pull(controller) {
+                const read = reader.read();
+                // The first two chunks carry the snapshot and the keepalive.
+                if (++bodyReads === 3) {
+                  pendingBodyRead.resolve();
+                }
+                const chunk = await read;
+                if (chunk.done) {
+                  controller.close();
+                } else {
+                  controller.enqueue(chunk.value);
+                }
+              },
+              cancel: (reason) => reader.cancel(reason),
+            },
+            { highWaterMark: 0 },
+          );
+          return new Response(body, response);
+        },
+        token: "test-token",
+        clock,
+      });
+      const stream = client.watchQueue({
+        organizationId: ORG,
+        signal: abort.signal,
+      });
+      expect(await stream.next()).toEqual({
+        done: false,
+        value: { kind: WatchQueueEventKind.SnapshotComplete },
+      });
+      expect(bodyReads).toBeLessThan(3);
+
+      const pending = stream.next();
+      await Promise.race([
+        Promise.all([pendingBodyRead.promise, handlerWaiting.promise]),
+        pending.then(() => {
+          throw new Error("Queue read finished before abort");
+        }),
+      ]);
+      abort.abort();
+
+      expect(await pending).toEqual({ done: true, value: undefined });
+      await handlerClosed.promise;
+      expect(server.callsOf("WatchQueue")).toHaveLength(1);
+      expect(sleep).not.toHaveBeenCalled();
+    },
+  );
 });

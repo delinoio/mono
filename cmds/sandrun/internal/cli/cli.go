@@ -181,12 +181,12 @@ func describeError(err error) string {
 }
 
 func (a *app) errorf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := safeText(fmt.Sprintf(format, args...))
 	fmt.Fprintf(a.env.Stderr, "%s %s\n", a.paint(ansiRed, "error:"), msg)
 }
 
 func (a *app) warnf(format string, args ...any) error {
-	msg := fmt.Sprintf(format, args...)
+	msg := safeText(fmt.Sprintf(format, args...))
 	_, err := fmt.Fprintf(a.env.Stderr, "%s %s\n", a.paint(ansiYellow, "warning:"), msg)
 	return err
 }
@@ -567,6 +567,10 @@ func (a *app) requireOrg() (string, error) {
 // sdk returns the SDK client. SANDRUN_API_KEY takes precedence over the
 // stored Logto tokens.
 func (a *app) sdk() (*sandrun.Client, error) {
+	return a.sdkWithTokenSource(a.tokenSource)
+}
+
+func (a *app) sdkWithTokenSource(loadTokenSource func() (sandrun.TokenSource, error)) (*sandrun.Client, error) {
 	if a.client != nil {
 		return a.client, nil
 	}
@@ -575,7 +579,7 @@ func (a *app) sdk() (*sandrun.Client, error) {
 		opts.APIKey = key
 		a.logger.Debug("SandRun credential selected", "kind", "api_key")
 	} else {
-		src, err := a.tokenSource()
+		src, err := loadTokenSource()
 		if err != nil {
 			return nil, err
 		}

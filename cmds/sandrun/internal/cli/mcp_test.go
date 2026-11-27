@@ -52,7 +52,7 @@ func TestMCPCommandUnknownTransferWithAPIKey(t *testing.T) {
 	got := mcpCommandToolError(t, ctx, cs, "transfer_status", map[string]any{
 		"transfer_id": unknownTransferID, "wait_seconds": 0,
 	})
-	want := "not_found: no transfer with this transfer_id runs in this server process; transfers stop when the server exits, so sync again"
+	want := "not_found: no transfer with this transfer_id is available in this server process. The process keeps only the 64 most recent sync or download outcomes, including failures"
 	if got != want {
 		t.Errorf("transfer_status with API key = %q, want %q", got, want)
 	}
