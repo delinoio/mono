@@ -243,19 +243,29 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 		return resp.Body
 	}
 	retiredBody := open(retired)
-	read := func(body io.ReadCloser) <-chan struct{} {
+	read := func(gate *gatedBody, body io.Reader) func() {
 		done := make(chan struct{})
+		release := sync.OnceFunc(func() { close(gate.release) })
+		releaseAndWait := func() {
+			release()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("relay response reader did not finish after release")
+			}
+		}
+		t.Cleanup(releaseAndWait)
 		go func() {
 			defer close(done)
 			if _, err := body.Read(make([]byte, 16)); err != nil {
 				t.Errorf("read: %v", err)
 			}
 		}()
-		return done
+		return releaseAndWait
 	}
 	// The retired response has a read in flight while the loop installs the
 	// replacement connection.
-	lateRead := read(retiredBody)
+	finishRetiredRead := read(bodies[retired], retiredBody)
 	<-bodies[retired].started
 	r.mu.Lock()
 	r.conn = active
@@ -265,8 +275,7 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 	old := int64(time.Hour)
 	retired.lastRecv.Store(old)
 	active.lastRecv.Store(old)
-	close(bodies[retired].release)
-	<-lateRead
+	finishRetiredRead()
 	if got := active.lastRecv.Load(); got != old {
 		t.Fatalf("a late read of the retired response moved the replacement's receive clock by %v", time.Duration(got-old))
 	}
@@ -276,13 +285,12 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 
 	// A partial frame of the active response refreshes the active clock
 	// before any frame is decoded.
-	activeRead := read(activeBody)
+	finishActiveRead := read(bodies[active], activeBody)
 	<-bodies[active].started
 	if active.lastRecv.Load() != old {
 		t.Fatal("the receive clock moved before any byte arrived")
 	}
-	close(bodies[active].release)
-	<-activeRead
+	finishActiveRead()
 	if active.lastRecv.Load() == old {
 		t.Fatal("a read of the active response did not refresh its receive clock")
 	}
@@ -1276,6 +1284,7 @@ func (f *revokeFixture) grant(deadlineIn time.Duration, received time.Time, ids 
 		st := &rstream{id: id, g: g, conn: f.c, ctx: ctx, cancel: cancel}
 		g.streams[st] = true
 		f.c.streams[id] = st
+		f.c.highest = max(f.c.highest, id)
 		streams = append(streams, st)
 	}
 	return g, streams
@@ -1649,10 +1658,10 @@ func closeFrame(id uint64) *ownsandv1.DataFrame {
 // queue drains, and that no frame of the closed stream is queued afterwards,
 // while the connection keeps serving other streams.
 func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
-	f, g, st := blockedSendFixture(t)
+	f, _, st := blockedSendFixture(t)
 	frame := datapath.MustNewFrame(1, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("payload")}}})
 	result := make(chan error, 1)
-	go func() { result <- relaySink{st}.Send(st.ctx, frame) }()
+	go func() { result <- relaySink{f.r, st}.Send(st.ctx, frame) }()
 	select {
 	case err := <-result:
 		t.Fatalf("send returned %v while the queue was full", err)
@@ -1681,7 +1690,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 		t.Fatalf("a frame of the closed stream was queued after the drain: %d frames", len(f.c.out))
 	}
 	// A send on the canceled stream context queues nothing, even with room.
-	if err := (relaySink{st}).Send(st.ctx, frame); !errors.Is(err, context.Canceled) || len(f.c.out) != 0 {
+	if err := (relaySink{f.r, st}).Send(st.ctx, frame); !errors.Is(err, context.Canceled) || len(f.c.out) != 0 {
 		t.Fatalf("send after the close returned %v with %d queued", err, len(f.c.out))
 	}
 
@@ -1689,14 +1698,34 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 	if f.c.ctx.Err() != nil {
 		t.Fatal("the connection was closed")
 	}
-	ctx, cancel := context.WithCancel(f.c.ctx)
-	defer cancel()
-	other := &rstream{id: 3, g: g, conn: f.c, ctx: ctx, cancel: cancel}
+	_, otherStreams := f.grant(time.Hour, time.Now(), 3)
+	other := otherStreams[0]
 	other.send, _ = datapath.NewSendWindow(1 << 20)
-	if err := (relaySink{other}).Send(ctx, datapath.MustNewFrame(3, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("other")}}})); err != nil {
-		t.Fatalf("send on another stream: %v", err)
+	probe := newWaitProbeContext(other.ctx)
+	other.ctx = probe
+	probe.arm()
+	f.fillQueue()
+	go func() {
+		result <- (relaySink{f.r, other}).Send(probe, relayStdout(other.id, "other"))
+	}()
+	select {
+	case <-probe.waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second stream did not reach the full queue")
 	}
-	if got := <-f.c.out; got.GetStreamId() != 3 {
+	if got := <-f.c.out; got.GetRelayKeepalive() == nil {
+		t.Fatalf("first queued frame %v, want connection keepalive", got)
+	}
+	f.r.outboundDequeued(f.c)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("send on another stream: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second stream did not resume when the queue had space")
+	}
+	if got := <-f.c.out; got.GetStreamId() != other.id {
 		t.Fatalf("queued frame %v", got)
 	}
 }
@@ -1709,7 +1738,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 // original keepalive. The test proves with a probe context (see
 // waitProbeContext) that the notice reached its wait on the stream context
 // with a live stream and a full queue before it delivers the close. A close
-// that arrived earlier would take the early return of enqueueCtx and pass
+// that arrived earlier would take the early return of enqueueStream and pass
 // without the wait. After the close, the dispatcher must return while the
 // queue is still full, which a wait on the connection context would not allow
 // because nothing cancels the connection. Every wait has a bound that only
@@ -1929,11 +1958,31 @@ func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T)
 		t.Run(tc, func(t *testing.T) {
 			_, c := newManualConn(t, Timing{}, 4)
 			c.flushDeadline = deadline
+			var markerReceived chan bool
 			switch tc {
 			case "marker_taken_close_request_stalls":
-				// The writer dequeues the marker and then blocks in the
-				// request close; it never starts its own 2-second timer.
-				go func() { <-c.out; select {} }()
+				markerReceived = make(chan bool, 1)
+				release := make(chan struct{})
+				writerDone := make(chan struct{})
+				t.Cleanup(func() {
+					close(release)
+					select {
+					case <-writerDone:
+					case <-time.After(5 * time.Second):
+						t.Error("the simulated writer did not exit after release")
+					}
+				})
+				go func() {
+					defer close(writerDone)
+					select {
+					case frame, ok := <-c.out:
+						markerReceived <- ok && frame == nil
+					case <-release:
+						return
+					}
+					// Stall the request close until cleanup releases the writer.
+					<-release
+				}()
 			case "queue_full":
 				for i := 0; i < cap(c.out); i++ {
 					c.out <- keepaliveFrame(false)
@@ -1941,6 +1990,21 @@ func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T)
 			}
 			start := time.Now()
 			go c.closeAfterFlush()
+			if markerReceived != nil {
+				select {
+				case received := <-markerReceived:
+					if !received {
+						t.Fatal("the writer did not dequeue the nil flush marker")
+					}
+					if c.ctx.Err() != nil {
+						t.Fatal("the connection was canceled before the test observed the flush marker")
+					}
+				case <-c.ctx.Done():
+					t.Fatal("the connection was canceled before the test observed the flush marker")
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for the writer to dequeue the flush marker")
+				}
+			}
 			select {
 			case <-c.ctx.Done():
 			case <-time.After(5 * time.Second):

@@ -1159,46 +1159,89 @@ func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	f.requireRestorable(t, id)
 }
 
-// TestImportStopsWithItsChannelContext checks that an import whose channel
-// context ends during a download publishes nothing: no ready snapshot, no
-// content directory and no leftover files, and that an import of the same
-// snapshot afterwards still succeeds.
+// TestImportStopsWithItsChannelContext checks the command result and log
+// when the context ends during a download. A later import can restore the
+// snapshot after the interrupted attempt removes its partial files.
 func TestImportStopsWithItsChannelContext(t *testing.T) {
-	id, _ := uuidv7.NewString()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var downloads atomic.Int32
-	f := newImportFixture(t, func(r *http.Request) int {
-		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+id+"/") && downloads.Add(1) == 2 {
-			// The channel closes while the import still downloads.
-			cancel()
-		}
-		return 0
-	})
-	cmd := f.stage(t, id, false).GetImportSnapshot()
-	if len(cmd.GetParts()) < 3 {
-		t.Fatalf("the fixture needs at least 3 parts, has %d", len(cmd.GetParts()))
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+		code    ownsandv1.ErrorCode
+		message string
+	}{
+		{"canceled", 10 * time.Second, ownsandv1.ErrorCode_ERROR_CODE_CANCELED, "snapshot import canceled"},
+		{"deadline", 2 * time.Second, ownsandv1.ErrorCode_ERROR_CODE_DEADLINE_EXCEEDED, "snapshot import deadline exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, _ := uuidv7.NewString()
+			secondDownload := make(chan struct{})
+			var downloads atomic.Int32
+			rec := newRecordingHandler()
+			f := newImportFixtureWith(t, func(r *http.Request) int {
+				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+id+"/") && downloads.Add(1) == 2 {
+					close(secondDownload)
+					<-r.Context().Done()
+				}
+				return 0
+			}, func(o *Options) { o.Logger = slog.New(rec) })
+			cmd := f.stage(t, id, false)
+			if parts := len(cmd.GetImportSnapshot().GetParts()); parts < 3 {
+				t.Fatalf("the fixture needs at least 3 parts, has %d", parts)
+			}
+			cmd.CommandId, _ = uuidv7.NewString()
+			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
+			defer cancel()
+			if tc.code == ownsandv1.ErrorCode_ERROR_CODE_CANCELED {
+				go func() {
+					select {
+					case <-secondDownload:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+			f.h.agent.handleCommand(ctx, context.Background(), cmd, 0)
+			if got := downloads.Load(); got != 2 {
+				t.Fatalf("interrupted after %d downloads, want 2", got)
+			}
+			if res := f.h.result(cmd.GetCommandId()); res.GetError().GetCode() != tc.code || res.GetError().GetMessage() != tc.message || res.GetImportSnapshot() != nil {
+				t.Fatalf("interrupted import = %v, want %v (%s)", res, tc.code, tc.message)
+			}
+			rec.mu.Lock()
+			var loggedCode, loggedError string
+			for _, r := range *rec.records {
+				if r.Message != "command failed" {
+					continue
+				}
+				attrs := map[string]string{}
+				r.Attrs(func(a slog.Attr) bool { attrs[a.Key] = a.Value.String(); return true })
+				if attrs["command_id"] == cmd.GetCommandId() {
+					loggedCode, loggedError = attrs["code"], attrs["error"]
+				}
+			}
+			rec.mu.Unlock()
+			if loggedCode != tc.code.String() || loggedError != tc.message {
+				t.Fatalf("command failed log = (%q, %q), want (%q, %q)", loggedCode, loggedError, tc.code, tc.message)
+			}
+			if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
+				t.Fatal("an interrupted import left a ready snapshot")
+			}
+			dir, err := f.h.st.SnapshotDir(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("snapshot directory after an interrupted import: %v", err)
+			}
+			if left, err := filepath.Glob(filepath.Join(f.h.st.Path(store.SnapshotsDir), ".import-*")); err != nil || len(left) != 0 {
+				t.Fatalf("temporary archives after interruption: %v, %v", left, err)
+			}
+			if res := f.h.command(f.command(id, false)); res.GetError() != nil {
+				t.Fatalf("import after the interrupted one = %v", res)
+			}
+			f.requireRestorable(t, id)
+		})
 	}
-	if _, err := f.h.agent.importSnapshot(ctx, cmd); err == nil {
-		t.Fatal("import succeeded with a closed channel context")
-	}
-	if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
-		t.Fatal("a cancelled import left a ready snapshot")
-	}
-	dir, err := f.h.st.SnapshotDir(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("snapshot directory after a cancelled import: %v", err)
-	}
-	if left, _ := filepath.Glob(filepath.Join(f.h.st.Path(store.SnapshotsDir), ".import-*")); len(left) != 0 {
-		t.Fatalf("temporary archives left: %v", left)
-	}
-	if res := f.h.command(f.command(id, false)); res.GetError() != nil {
-		t.Fatalf("import after the cancelled one = %v", res)
-	}
-	f.requireRestorable(t, id)
 }
 
 // TestImportCanceledBeforeSnapshotPublication cancels the channel after
@@ -1207,14 +1250,15 @@ func TestImportCanceledBeforeSnapshotPublication(t *testing.T) {
 	f := newImportFixture(t, nil)
 	a := f.h.agent
 	id, _ := uuidv7.NewString()
-	cmd := f.stage(t, id, false).GetImportSnapshot()
+	cmd := f.stage(t, id, false)
+	cmd.CommandId, _ = uuidv7.NewString()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	a.beforeSnapshotPublishHook = cancel
-	entry, err := a.importSnapshot(ctx, cmd)
+	a.handleCommand(ctx, context.Background(), cmd, 0)
 	a.beforeSnapshotPublishHook = nil
-	if entry != nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("import at publication = (%v, %v), want (nil, context canceled)", entry, err)
+	if res := f.h.result(cmd.GetCommandId()); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_CANCELED || res.GetImportSnapshot() != nil {
+		t.Fatalf("import at publication = %v, want CANCELED and no snapshot", res)
 	}
 	if a.Sandboxes.HasSnapshot(id) {
 		t.Fatal("the canceled import left a snapshot record in memory")
@@ -1234,7 +1278,7 @@ func TestImportCanceledBeforeSnapshotPublication(t *testing.T) {
 
 	retryCtx, cancelRetry := context.WithCancel(context.Background())
 	defer cancelRetry()
-	entry, err = a.importSnapshot(retryCtx, cmd)
+	entry, err := a.importSnapshot(retryCtx, cmd.GetImportSnapshot())
 	cancelRetry()
 	if err != nil || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
 		t.Fatalf("retry import = (%v, %v), want READY", entry, err)

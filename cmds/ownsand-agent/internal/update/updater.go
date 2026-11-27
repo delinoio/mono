@@ -152,8 +152,8 @@ type Updater struct {
 	applied uint64
 }
 
-// New removes abandoned downloads and confirms any installation that the
-// previous process recorded. The running version must equal the recorded target.
+// New removes abandoned downloads, confirms the recorded installation and
+// restores a verified revocation that applies to the running version.
 func New(opts Options) (*Updater, error) {
 	if opts.HTTP == nil {
 		opts.HTTP = http.DefaultClient
@@ -180,7 +180,21 @@ func New(opts Options) (*Updater, error) {
 			return nil, err
 		}
 	}
+	if st != nil && revocationApplies(st.RunningRevocation, opts.Running) {
+		u.revokedRunning = true
+		u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+		u.target = st.RunningRevocation.TargetVersion
+		opts.Logger.Info("restored agent update revocation", "running_version", opts.Running, "target_version", u.target)
+	}
 	return u, nil
+}
+
+func revocationApplies(record *store.RunningRevocation, running string) bool {
+	if record == nil {
+		return false
+	}
+	comparison, err := semver.CompareStrings(record.Version, running)
+	return err == nil && comparison == 0
 }
 
 // These patterns match the file names from download and store.WriteFileAtomic,
@@ -319,10 +333,10 @@ func (u *Updater) setStateFor(order uint64, s ownsandv1.AgentUpdateState, target
 		u.mu.Unlock()
 		return err
 	}
-	// A retry keeps the last verified revocation while it fetches and
-	// verifies a new manifest.
-	if s == ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING && u.revokedRunning {
-		s = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+	// Only a verified manifest can replace the recovery target or lift the gate.
+	if u.revokedRunning {
+		u.mu.Unlock()
+		return nil
 	}
 	u.state, u.target = s, target
 	u.mu.Unlock()
@@ -341,19 +355,38 @@ func (u *Updater) clearPendingLocked() {
 	u.artifact = ""
 }
 
-// recordRunningRevocation applies a verified manifest to the create gate
-// and the heartbeat state before the artifact download begins.
+// recordRunningRevocation saves the verified decision under the command
+// lock before applying it and fetching the artifact.
 func (u *Updater) recordRunningRevocation(order uint64, revoked bool, target string) error {
 	u.mu.Lock()
 	if err := u.commandInvalidationLocked(order); err != nil {
 		u.mu.Unlock()
 		return err
 	}
-	u.revokedRunning = revoked
 	state := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING
 	if revoked {
 		state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
 	}
+	if revoked || u.revokedRunning {
+		if _, err := u.opts.Store.UpdateAgent(func(a *store.AgentState) error {
+			if revoked {
+				a.RunningRevocation = &store.RunningRevocation{Version: u.opts.Running, TargetVersion: target}
+			} else if revocationApplies(a.RunningRevocation, u.opts.Running) {
+				a.RunningRevocation = nil
+			}
+			return nil
+		}); err != nil {
+			// A verified revocation must close the gate even if it cannot
+			// survive a restart. Keep any previous recovery target on failure.
+			if revoked && !u.revokedRunning {
+				u.revokedRunning = true
+				u.state, u.target = state, target
+			}
+			u.mu.Unlock()
+			return fmt.Errorf("update: save running-version revocation: %w", err)
+		}
+	}
+	u.revokedRunning = revoked
 	u.state, u.target = state, target
 	u.mu.Unlock()
 	u.opts.Logger.Info("agent update state", "update_state", state.String(), "target_version", target)
@@ -440,18 +473,10 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 		err = u.queueVerified(ctx, order, target, data)
 	}
 	if err != nil {
-		// Keep the last verified revocation after any download or
-		// verification failure.
-		failedState := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
-		u.mu.Lock()
-		if u.revokedRunning {
-			failedState = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
-		}
-		u.mu.Unlock()
-		if invalidated := u.setStateFor(order, failedState, target); invalidated != nil {
+		if invalidated := u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target); invalidated != nil {
 			return invalidated
 		}
-		u.opts.Logger.Error("agent update verification failed", "target_version", target, "update_state", failedState.String(), "error", err)
+		u.opts.Logger.Error("agent update preparation failed", "target_version", target, "error", err)
 		return err
 	}
 	// The control plane decides lower targets: a pinned version or a
