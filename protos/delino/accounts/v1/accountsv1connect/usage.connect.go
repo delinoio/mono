@@ -85,11 +85,11 @@ type UsageServiceClient interface {
 	// stored as unattributed usage (kept 7 years, nothing deducted) and
 	// returns unattributed set to true. Usage is never dropped.
 	ReportUsage(context.Context, *connect.Request[v1.ReportUsageRequest]) (*connect.Response[v1.ReportUsageResponse], error)
-	// List the current billing status of organizations whose status changed
-	// after a cursor, for polling. Statuses are ordered by sequence, with at
-	// most one entry per organization (its latest status). after_sequence 0
-	// returns every linked organization of the service. Only linked
-	// organizations appear; an unlink adds no entry.
+	// Poll for a page of current billing statuses with a sequence greater than
+	// after_sequence. Each page lists statuses in ascending sequence order,
+	// with at most one current status per linked organization. An unlink adds
+	// no entry. Set after_sequence to 0 to start a paginated traversal of the
+	// service's current links.
 	ListBillingStatusChanges(context.Context, *connect.Request[v1.ListBillingStatusChangesRequest]) (*connect.Response[v1.ListBillingStatusChangesResponse], error)
 	// Link an organization of the service to a billing account on behalf of a
 	// user. The user must be the owner or an admin of the billing account
@@ -226,11 +226,11 @@ type UsageServiceHandler interface {
 	// stored as unattributed usage (kept 7 years, nothing deducted) and
 	// returns unattributed set to true. Usage is never dropped.
 	ReportUsage(context.Context, *connect.Request[v1.ReportUsageRequest]) (*connect.Response[v1.ReportUsageResponse], error)
-	// List the current billing status of organizations whose status changed
-	// after a cursor, for polling. Statuses are ordered by sequence, with at
-	// most one entry per organization (its latest status). after_sequence 0
-	// returns every linked organization of the service. Only linked
-	// organizations appear; an unlink adds no entry.
+	// Poll for a page of current billing statuses with a sequence greater than
+	// after_sequence. Each page lists statuses in ascending sequence order,
+	// with at most one current status per linked organization. An unlink adds
+	// no entry. Set after_sequence to 0 to start a paginated traversal of the
+	// service's current links.
 	ListBillingStatusChanges(context.Context, *connect.Request[v1.ListBillingStatusChangesRequest]) (*connect.Response[v1.ListBillingStatusChangesResponse], error)
 	// Link an organization of the service to a billing account on behalf of a
 	// user. The user must be the owner or an admin of the billing account
