@@ -28,7 +28,7 @@ func TestCreditExpiryNotificationRetriesOnlyBeforeExpiry(t *testing.T) {
 			f := newFixture(t)
 			acct := f.account()
 			expiry := f.clock.Now().Add(24 * time.Hour)
-			id := f.queueNotice(acct, "credit_expiry/retry")
+			id, _ := f.queueNotice(acct)
 			f.s.email = &hookSender{next: f.email, before: func(_ context.Context, msg email.Message) error {
 				if strings.HasPrefix(msg.To, "admin-") {
 					return errors.New("send failed")
@@ -75,7 +75,7 @@ func TestCreditExpiryNotificationRetiresDuringRecipientLookup(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
 	expiry := f.clock.Now().Add(24 * time.Hour)
-	id := f.queueNotice(acct, "credit_expiry/lookup")
+	id, _ := f.queueNotice(acct)
 	lookups := 0
 	f.s.directory = notificationDirectoryFunc(func(ctx context.Context, userID string) (directory.User, error) {
 		lookups++
@@ -97,7 +97,7 @@ func TestCreditExpiryNotificationRetiresDuringRecipientLookup(t *testing.T) {
 func TestCreditExpiryNotificationRetiresWithInvalidExpiry(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
-	id := f.queueNotice(acct, "credit_expiry/invalid")
+	id, _ := f.queueNotice(acct)
 	if _, err := f.db.Pool.Exec(ctx(), `UPDATE billing_notifications SET details = '{"expire_time":"invalid"}'
 		WHERE notification_id = $1`, id); err != nil {
 		t.Fatal(err)
