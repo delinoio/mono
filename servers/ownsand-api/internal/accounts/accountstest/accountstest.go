@@ -73,6 +73,18 @@ type usageKey struct {
 	month time.Time // first instant of the UTC month of the window start
 }
 
+type usageReportKey struct {
+	service     accountsv1.ServiceId
+	org         string
+	meter       accountsv1.Meter
+	windowStart time.Time
+}
+
+type usageAttribution struct {
+	billingAccountID string
+	unattributed     bool
+}
+
 // utcMonth returns the first instant of the UTC calendar month of t.
 func utcMonth(t time.Time) time.Time {
 	t = t.UTC()
@@ -95,7 +107,7 @@ type Server struct {
 	// Current links are also in the history. Unlink closes the interval in place.
 	linkHistory map[string][]*link
 	usage       map[usageKey][2]int64
-	reported    map[string]bool
+	reported    map[usageReportKey]usageAttribution
 	failures    map[string]error
 	// replyFailures fail a call after it took effect: a lost response.
 	replyFailures map[string]error
@@ -125,7 +137,7 @@ func New(t testing.TB, now func() time.Time) *Server {
 	}
 	f := &Server{now: now, accounts: map[string]*account{}, links: map[string]*link{}, usage: map[usageKey][2]int64{},
 		linkHistory: map[string][]*link{},
-		reported:    map[string]bool{}, failures: map[string]error{}, replyFailures: map[string]error{}, gates: map[string]*Gate{}, calls: map[string]int{}}
+		reported:    map[usageReportKey]usageAttribution{}, failures: map[string]error{}, replyFailures: map[string]error{}, gates: map[string]*Gate{}, calls: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /oidc/token", f.token)
 	path, h := accountsv1connect.NewUsageServiceHandler(handler{f}, connect.WithInterceptors(authCheck{}))
@@ -203,7 +215,10 @@ func (f *Server) AddAccount(id, name string, members map[string]accountsv1.Billi
 func (f *Server) SetAccountStatus(id string, status accountsv1.BillingStatus, blockedSince time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	a := f.accounts[id]
+	f.setAccountStatusLocked(f.accounts[id], status, blockedSince)
+}
+
+func (f *Server) setAccountStatusLocked(a *account, status accountsv1.BillingStatus, blockedSince time.Time) {
 	a.status, a.blockedSince = status, blockedSince
 	a.reason = accountsv1.BillingStatusReason_BILLING_STATUS_REASON_NONE
 	if status != accountsv1.BillingStatus_BILLING_STATUS_ALLOWED {
@@ -211,7 +226,7 @@ func (f *Server) SetAccountStatus(id string, status accountsv1.BillingStatus, bl
 	}
 	orgs := make([]string, 0, len(f.links))
 	for org, l := range f.links {
-		if l.account == id {
+		if l.account == a.id {
 			orgs = append(orgs, org)
 		}
 	}
@@ -357,22 +372,29 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 	for _, r := range req.Msg.GetReports() {
 		org := r.GetOrganizationId()
 		windowStart := r.GetWindowStart().AsTime()
-		key := org + "/" + r.GetMeter().String() + "/" + windowStart.String()
-		res := &accountsv1.UsageReportResult{Service: r.GetService(), OrganizationId: org, Meter: r.GetMeter(), WindowStart: r.GetWindowStart(),
-			Duplicate: f.reported[key]}
-		if !f.reported[key] {
-			f.reported[key] = true
-			k := usageKey{org: org, meter: r.GetMeter(), month: utcMonth(windowStart)}
+		key := usageReportKey{service: r.GetService(), org: org, meter: r.GetMeter(), windowStart: windowStart}
+		attribution, duplicate := f.reported[key]
+		if !duplicate {
+			k := usageKey{org: org, meter: key.meter, month: utcMonth(windowStart)}
 			u := f.usage[k]
 			f.usage[k] = [2]int64{u[0] + r.GetQuantity(), u[1] + r.GetAmountUsdMicros()}
 			if l := f.usageLinkLocked(org, windowStart); l != nil {
-				res.BillingAccountId = l.account
-				f.accounts[l.account].balance -= r.GetAmountUsdMicros()
+				attribution.billingAccountID = l.account
+				a := f.accounts[l.account]
+				previousBalance := a.balance
+				a.balance -= r.GetAmountUsdMicros()
+				if a.status == accountsv1.BillingStatus_BILLING_STATUS_ALLOWED && previousBalance > 0 && a.balance <= 0 {
+					f.setAccountStatusLocked(a, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, f.now().UTC())
+				}
 			} else {
-				res.Unattributed = true
+				attribution.unattributed = true
 			}
+			f.reported[key] = attribution
 		}
-		resp.Results = append(resp.Results, res)
+		resp.Results = append(resp.Results, &accountsv1.UsageReportResult{
+			Service: key.service, OrganizationId: org, Meter: key.meter, WindowStart: r.GetWindowStart(),
+			Duplicate: duplicate, BillingAccountId: attribution.billingAccountID, Unattributed: attribution.unattributed,
+		})
 		named[org] = true
 	}
 	orgs := make([]string, 0, len(named))

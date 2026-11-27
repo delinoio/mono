@@ -352,9 +352,10 @@ func (h BillingHandler) LinkBillingAccount(ctx context.Context, req *connect.Req
 		return nil, err
 	}
 	var st billing.Status
-	var change billing.Change
+	var change, unlinkChange billing.Change
 	var accountName string
 	var attempt *linkAttempt
+	var unlinkFailure error
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		attempt = nil
 		p, err := h.authorizeBillingOwnerLocked(ctx, tx, orgID)
@@ -373,13 +374,18 @@ func (h BillingHandler) LinkBillingAccount(ctx context.Context, req *connect.Req
 		if err := tx.QueryRow(ctx, "SELECT name FROM organizations WHERE organization_id = $1", orgID).Scan(&name); err != nil {
 			return err
 		}
-		cur, ok, err := billing.LoadStatus(ctx, tx, orgID, true)
-		if err != nil {
-			return err
-		}
-		if !ok {
+		cur, resolved, err := h.Billing.ResolveOwnerUnlinkTx(ctx, tx, orgID, "")
+		if errors.Is(err, pgx.ErrNoRows) {
 			return errNotFound("organization")
 		}
+		if errors.Is(err, billing.ErrUnlinkFailed) {
+			unlinkFailure = pendingUnlinkError(err)
+			return nil // Commit the retry schedule before returning the error.
+		}
+		if err != nil {
+			return pendingUnlinkError(err)
+		}
+		unlinkChange = resolved
 		if cur.Linked() && cur.BillingAccountID != accountID {
 			return errAlreadyExists("the organization is linked to another billing account; unlink it first")
 		}
@@ -406,6 +412,10 @@ func (h BillingHandler) LinkBillingAccount(ctx context.Context, req *connect.Req
 		attempt.deadline, err = billing.BeginLinkAttemptTx(ctx, tx, orgID, attempt.id, accountID, now)
 		return err
 	})
+	if err == nil {
+		err = unlinkFailure
+		h.Billing.Committed(ctx, unlinkChange)
+	}
 	if err == nil && attempt != nil {
 		st, change, accountName, err = h.finishLinkAttempt(ctx, orgID, attempt)
 	}
@@ -554,6 +564,7 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 	}
 	var st billing.Status
 	var change billing.Change
+	var intentID string
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if _, err := h.authorizeBillingOwnerLocked(ctx, tx, orgID); err != nil {
 			return err
@@ -588,6 +599,12 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 		if err != nil {
 			return err
 		}
+		intentID, err = h.Billing.PrepareOwnerUnlinkTx(ctx, tx, orgID, cur.BillingAccountID, newID())
+		if err != nil || intentID != "" {
+			return err
+		}
+		// The compatibility release still serves old-style unlinks until
+		// every instance can finish a durable owner unlink.
 		if _, err := client.UnlinkOrganization(ctx, connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{Service: billing.ServiceID, OrganizationId: orgID})); err != nil {
 			return h.accountsError(ctx, "UnlinkOrganization", err)
 		}
@@ -599,11 +616,43 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 		st, _, change, err = billing.UnlinkTx(ctx, tx, orgID, billing.SourceUnlink, h.now())
 		return err
 	})
+	if err == nil && intentID != "" {
+		st, change, err = h.finishOwnerUnlink(ctx, orgID, intentID)
+	}
 	if err != nil {
 		return nil, h.internal(ctx, "unlink billing account", err)
 	}
 	h.Billing.Committed(ctx, change)
 	return connect.NewResponse(&ownsandv1.UnlinkBillingAccountResponse{Billing: st.Proto(h.now())}), nil
+}
+
+// finishOwnerUnlink takes the organization lock again after the intent is
+// durable. A worker or a concurrent owner operation may already have
+// finished the intent. Resolve only the operation this request prepared.
+func (h BillingHandler) finishOwnerUnlink(ctx context.Context, orgID, intentID string) (billing.Status, billing.Change, error) {
+	var st billing.Status
+	var change billing.Change
+	var unlinkFailure error
+	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if _, err := h.authorizeBillingOwnerLocked(ctx, tx, orgID); err != nil {
+			return err
+		}
+		var err error
+		st, change, err = h.Billing.ResolveOwnerUnlinkTx(ctx, tx, orgID, intentID)
+		switch {
+		case errors.Is(err, billing.ErrOwnerUnlinkSuperseded):
+			return connect.NewError(connect.CodeAborted, errors.New("the billing link changed during the unlink; review the current account"))
+		case errors.Is(err, billing.ErrUnlinkFailed):
+			unlinkFailure = pendingUnlinkError(err)
+			return nil // Commit the retry schedule before returning the error.
+		default:
+			return pendingUnlinkError(err)
+		}
+	})
+	if err == nil {
+		err = unlinkFailure
+	}
+	return st, change, err
 }
 
 // removeBillingLinkTx removes the billing link of the organization in the

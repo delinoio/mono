@@ -112,3 +112,33 @@ func TestDeferredRevocationTerminalCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestPeerSessionPeriodicSweep(t *testing.T) {
+	now := time.Now()
+	p := revocationTestPlane(func() time.Time { return now })
+	conn := p.S.Hub.Register(t.Context(), "device", "org")
+	defer p.S.Hub.Unregister(conn)
+	p.sessions["due"] = &session{deviceID: conn.DeviceID, gen: conn.Generation, retainUntil: now}
+	p.sessions["later"] = &session{deviceID: conn.DeviceID, gen: conn.Generation, retainUntil: now.Add(time.Second)}
+	p.sessions["pending"] = &session{deviceID: conn.DeviceID, gen: conn.Generation, expireAt: now.Add(-time.Second)}
+
+	p.SweepExpired(t.Context())
+	if p.sessions["due"] != nil || p.sessions["later"] == nil || p.sessions["pending"] == nil {
+		t.Fatalf("the first sweep must remove only the due session: %v", p.sessions)
+	}
+
+	now = now.Add(time.Second)
+	p.SweepExpired(t.Context())
+	p.SweepExpired(t.Context())
+	if len(p.sessions) != 1 || p.sessions["pending"] == nil {
+		t.Fatalf("the later sweeps must keep only the pending offer: %v", p.sessions)
+	}
+	if len(conn.Outbound()) != 0 || p.PendingRevocations() != 0 {
+		t.Fatal("expiry cleanup must not send revocations")
+	}
+
+	p.S.Hub.Unregister(conn)
+	if len(p.sessions) != 0 {
+		t.Fatal("channel teardown must remove the pending offer")
+	}
+}

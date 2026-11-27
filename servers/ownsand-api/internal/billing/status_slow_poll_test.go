@@ -47,7 +47,7 @@ func TestRunSlowPollDoesNotDelayMaintenance(t *testing.T) {
 	}{{held: true, meter: f.registry}, {held: false, meter: followerMeter}} {
 		worker := billing.NewStatuses(billing.StatusOptions{
 			DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(), Metrics: instance.meter, Timing: &timing,
-			Held: func() bool { return instance.held },
+			Ownership: func() (uint64, bool) { return 0, instance.held },
 		})
 		workers.Go(func() { worker.Run(ctx) })
 	}
@@ -100,7 +100,7 @@ func TestRunSlowPollIsSingleFlight(t *testing.T) {
 			held.Store(true)
 			timing := billing.DefaultStatusTiming()
 			timing.Tick, timing.Poll = tick, tc.poll
-			statuses, stop := f.runStatuses(timing, f.fake.Client(), held.Load)
+			statuses, stop, _ := f.runStatuses(timing, f.fake.Client(), func() (uint64, bool) { return 0, held.Load() })
 			defer stop()
 			defer gate.Release()
 			eventually(t, "the first poll at the Accounts endpoint", func() bool { return len(gate.Entered) == 1 })

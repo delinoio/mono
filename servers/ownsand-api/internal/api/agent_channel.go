@@ -36,11 +36,12 @@ const (
 	cmdUpdateAgent
 	cmdDeleteSnapshot
 	cmdWithdrawUpdate
+	cmdFenceResume
 )
 
 func (k commandKind) String() string {
 	return [...]string{"", "create_sandbox", "delete_sandbox", "pause_sandbox", "resume_sandbox", "create_snapshot",
-		"export_snapshot", "import_snapshot", "clean_up", "update_agent", "delete_snapshot", "withdraw_agent_update"}[k]
+		"export_snapshot", "import_snapshot", "clean_up", "update_agent", "delete_snapshot", "withdraw_agent_update", "fence_resume"}[k]
 }
 
 // commandInfo is what the server remembers about a sent command, so that it
@@ -111,14 +112,17 @@ func abortStalledWrite(ctx context.Context) error {
 	return rc.SetWriteDeadline(time.Unix(1, 0))
 }
 
-// sendCommand sends cmd on conn with a new command ID and remembers it.
+// sendCommand sends cmd on conn and remembers its command ID. A repeat
+// delete on that channel returns the outstanding delete's command ID.
 func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandInfo, cmd *ownsandv1.AgentCommand) (string, error) {
 	if cmd.CommandId == "" {
 		cmd.CommandId = newID()
 	}
 	info.deviceID = conn.DeviceID
 	info.generation = conn.Generation
-	s.commands.add(cmd.CommandId, info, conn, s.commandRetentionNow())
+	if existingID := s.commands.add(cmd.CommandId, info, conn, s.commandRetentionNow()); existingID != "" {
+		return existingID, nil
+	}
 	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}); err != nil {
 		s.commands.remove(cmd.CommandId)
 		return "", err
@@ -509,6 +513,7 @@ func (s *Service) handleCapabilityReport(ctx context.Context, conn *hub.Conn, r 
 		conn.DeviceID, caps, int16(r.GetHostOs()), int16(r.GetArch()), r.GetAgentVersion()); err != nil {
 		return err
 	}
+	conn.SetValue(resumeFenceSupportKey{}, r.GetResumeFenceSupported())
 	return s.evaluateUpdate(ctx, conn)
 }
 
@@ -600,13 +605,29 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
 	info, outcome := s.commands.take(res.GetCommandId(), conn.DeviceID, s.commandRetentionNow(), s.commandGrace())
 	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()), slog.String("channel_id", conn.ID))
-	switch outcome {
-	case takeUnknown:
-		log.InfoContext(ctx, "agent_command_result_unknown")
-		return
-	case takeWrongDevice:
+	if outcome == takeWrongDevice {
 		// The record stays for the device that the command was sent to.
 		log.WarnContext(ctx, "agent_command_result_wrong_device")
+		return
+	}
+	var handled bool
+	var err error
+	switch {
+	case res.GetFenceResume() != nil && res.GetError() == nil && (outcome == takeUnknown || info.kind == cmdFenceResume):
+		fence := res.GetFenceResume()
+		handled, err = s.settleBillingResume(ctx, conn, fence.GetResumeCommandId(), fence.GetSandbox())
+	case outcome == takeUnknown || info.kind == cmdResumeSandbox:
+		handled, err = s.settleBillingResume(ctx, conn, res.GetCommandId(), res.GetSandbox().GetSandbox())
+	}
+	if outcome == takeUnknown {
+		switch {
+		case err != nil:
+			log.WarnContext(ctx, "billing_resume_result_apply_failed", slog.Any("error", err))
+		case handled:
+			log.InfoContext(ctx, "billing_resume_result_received")
+		default:
+			log.InfoContext(ctx, "agent_command_result_unknown")
+		}
 		return
 	}
 	code := "ok"
@@ -615,7 +636,6 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	}
 	log.InfoContext(ctx, "agent_command_result", slog.String("command", info.kind.String()), slog.String("result", code),
 		slog.String("sandbox_id", info.sandboxID), slog.String("snapshot_id", info.snapshotID))
-	var err error
 	switch info.kind {
 	case cmdCreateSandbox:
 		if res.GetError().GetCode() == ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
@@ -642,7 +662,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 			err = s.applyResultEntry(ctx, conn, e)
 		}
 	case cmdDeleteSandbox, cmdPauseSandbox, cmdResumeSandbox:
-		if e := res.GetSandbox().GetSandbox(); res.GetError() == nil && e != nil {
+		if e := res.GetSandbox().GetSandbox(); err == nil && !handled && res.GetError() == nil && e != nil {
 			err = s.applyResultEntry(ctx, conn, e)
 		}
 	case cmdCreateSnapshot:

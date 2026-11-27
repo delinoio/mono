@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -497,36 +498,210 @@ func newLimitedNetwork(t *testing.T, limits flowLimits, logger *slog.Logger,
 	return n, newGuest(t, link, mac, guestSide)
 }
 
-// silentTCPServer accepts connections and never writes. Every accepted
-// connection is sent on the returned channel.
+// silentTCPServer accepts connections and never writes. The receiver owns
+// each connection it receives. Cleanup closes connections still in the fixture.
 func silentTCPServer(t *testing.T) (*net.TCPListener, <-chan net.Conn) {
 	t.Helper()
 	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	accepted := make(chan net.Conn, 16)
-	go func() {
+	accepted, cleanup := serveSilentTCP(ln, 16)
+	t.Cleanup(cleanup)
+	return ln, accepted
+}
+
+func serveSilentTCP(ln net.Listener, capacity int) (<-chan net.Conn, func()) {
+	accepted := make(chan net.Conn, capacity)
+	stop := make(chan struct{})
+	var acceptWorker sync.WaitGroup
+	acceptWorker.Go(func() {
+		defer close(accepted)
 		for {
-			c, err := ln.AcceptTCP()
+			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			accepted <- c
-		}
-	}()
-	t.Cleanup(func() {
-		ln.Close()
-		for {
 			select {
-			case c := <-accepted:
+			case accepted <- c:
+			case <-stop:
 				c.Close()
-			default:
 				return
 			}
 		}
 	})
-	return ln, accepted
+	return accepted, func() {
+		close(stop)
+		ln.Close()
+		acceptWorker.Wait()
+		for c := range accepted {
+			c.Close()
+		}
+	}
+}
+
+type gatedTCPListener struct {
+	net.Listener
+	accept func() (net.Conn, error)
+	closed chan struct{}
+}
+
+func (l *gatedTCPListener) Accept() (net.Conn, error) { return l.accept() }
+
+func (l *gatedTCPListener) Close() error {
+	defer close(l.closed)
+	return l.Listener.Close()
+}
+
+func TestSilentTCPServerCleanupClosesPendingConnections(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		queued int
+	}{
+		{name: "late_accept", queued: 0},
+		{name: "full_channel", queued: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+
+			// Establish real connections before entering the synctest bubble.
+			var clients, servers []net.Conn
+			for range tc.queued + 1 {
+				client, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				server, err := ln.Accept()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer server.Close()
+				clients = append(clients, client)
+				servers = append(servers, server)
+			}
+
+			synctest.Test(t, func(t *testing.T) {
+				pending := make(chan struct{})
+				release := make(chan struct{})
+				l := &gatedTCPListener{Listener: ln, closed: make(chan struct{})}
+				next := 0
+				l.accept = func() (net.Conn, error) {
+					if next == len(servers) {
+						<-l.closed
+						return nil, net.ErrClosed
+					}
+					if next == tc.queued {
+						close(pending)
+						<-release
+					}
+					c := servers[next]
+					next++
+					return c, nil
+				}
+
+				accepted, cleanup := serveSilentTCP(l, 1)
+				<-pending
+				if tc.queued > 0 {
+					// Let the worker attempt to publish into the full channel.
+					close(release)
+				}
+				synctest.Wait()
+				if got := len(accepted); got != tc.queued {
+					t.Errorf("queued sockets = %d, want %d", got, tc.queued)
+				}
+
+				cleaned := make(chan struct{})
+				go func() {
+					cleanup()
+					close(cleaned)
+				}()
+				if tc.queued == 0 {
+					synctest.Wait()
+					select {
+					case <-l.closed:
+					default:
+						t.Error("cleanup did not close the listener")
+					}
+					select {
+					case <-cleaned:
+						t.Error("cleanup returned while Accept still held a socket")
+					default:
+					}
+					close(release)
+				}
+				synctest.Wait()
+				select {
+				case <-cleaned:
+				default:
+					t.Fatal("cleanup did not finish without a receiver")
+				}
+				select {
+				case _, ok := <-accepted:
+					if ok {
+						t.Error("a socket remained queued after cleanup")
+					}
+				default:
+					t.Error("the accept worker did not close the channel")
+				}
+			})
+
+			for i, client := range clients {
+				if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				var b [1]byte
+				if _, err := client.Read(b[:]); err != io.EOF {
+					t.Errorf("client %d read after cleanup = %v, want EOF", i, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSilentTCPServerCleanupPreservesReceivedConnection(t *testing.T) {
+	var client, server net.Conn
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if !t.Run("receive", func(fixture *testing.T) {
+		ln, accepted := silentTCPServer(fixture)
+		var err error
+		client, err = (&net.Dialer{}).DialContext(ctx, "tcp", ln.Addr().String())
+		if err != nil {
+			fixture.Fatal(err)
+		}
+		t.Cleanup(func() { client.Close() })
+		select {
+		case server = <-accepted:
+			if server == nil {
+				fixture.Fatal("accept worker exited before sending the connection")
+			}
+		case <-ctx.Done():
+			fixture.Fatalf("receive connection: %v", ctx.Err())
+		}
+	}) {
+		return
+	}
+	defer server.Close()
+
+	deadline, _ := ctx.Deadline()
+	if err := client.SetWriteDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := io.ReadFull(server, b[:]); err != nil || b[0] != 'x' {
+		t.Fatalf("read after cleanup = %q, %v, want x", b[:], err)
+	}
 }
 
 // udpEchoSink echoes every datagram to its sender.

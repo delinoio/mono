@@ -29,10 +29,19 @@ case "$arch" in
     exit 2
     ;;
 esac
-if [ -d "$out" ]; then
-  echo "kernel output path is a directory: $out" >&2
-  exit 1
-fi
+
+validate_destination() {
+  if [ -d "$1" ]; then
+    echo "kernel output path is a directory: $1" >&2
+    return 1
+  fi
+  if [ -e "$1" ] && [ ! -f "$1" ] && [ ! -L "$1" ]; then
+    echo "kernel output path is not a regular file or symbolic link: $1" >&2
+    return 1
+  fi
+}
+validate_destination "$out"
+validate_destination "$out.config"
 
 version="6.18.64"
 # From https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc.
@@ -40,7 +49,7 @@ sha256="020d45510c539972e6f14c5c71566878d3b7ef56fb082b3e09134f2ebaade562"
 image="debian:trixie-20261104"
 
 here="$(cd "$(dirname "$0")" && pwd)"
-out_dir="$(cd "$(dirname "$out")" && pwd)"
+out_dir="$(cd "$(dirname "$out")" && pwd -P)"
 out_name="$(basename "$out")"
 cache="${OWNSAND_KERNEL_CACHE:-$HOME/.cache/ownsand-kernel}"
 mkdir -p "$cache"
@@ -52,9 +61,52 @@ mkdir -p "$cache"
 # failure here stops the script (set -e) before docker runs.
 cache="$(cd "$cache" && pwd -P)"
 
+# Keep the stage on the destination filesystem so each final move is a rename.
+stage="$(mktemp -d "$out_dir/.ownsand-kernel-stage.XXXXXX")"
+outputs=("$out_name" "$out_name.config")
+publish_lock="$out_dir/.ownsand-kernel-publish.lock"
+locked=false
+publishing=false
+
+cleanup() {
+  local status=$? name keep_stage=false
+  trap '' HUP INT TERM
+  if "$publishing"; then
+    for name in "${outputs[@]}"; do
+      # The staged file is absent only after its final rename succeeds.
+      if [ -f "$stage/out/$name" ]; then
+        continue
+      fi
+      if [ -e "$stage/previous/$name" ] || [ -L "$stage/previous/$name" ]; then
+        if mv -f -- "$stage/previous/$name" "$out_dir/"; then
+          continue
+        fi
+      elif rm -f -- "$out_dir/$name"; then
+        continue
+      fi
+      echo "could not restore $out_dir/$name" >&2
+      keep_stage=true
+    done
+  fi
+  if "$keep_stage"; then
+    echo "kernel rollback incomplete; recovery files are in $stage" >&2
+  elif ! rm -rf -- "$stage"; then
+    echo "could not remove kernel staging directory: $stage" >&2
+  fi
+  if "$locked" && ! rmdir -- "$publish_lock"; then
+    echo "could not remove kernel publication lock: $publish_lock" >&2
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -- "$stage/out" "$stage/previous"
+
 docker run --rm \
   -v "$here:/src:ro" \
-  -v "$out_dir:/out" \
+  -v "$stage/out:/out" \
   -v "$cache:/cache" \
   -e "VERSION=$version" \
   -e "SHA256=$sha256" \
@@ -112,6 +164,13 @@ docker run --rm \
   exit "$status"
 }
 
+for name in "${outputs[@]}"; do
+  if [ ! -f "$stage/out/$name" ] || [ -L "$stage/out/$name" ]; then
+    echo "kernel build did not produce a regular file for $out_dir/$name" >&2
+    exit 1
+  fi
+done
+
 if command -v shasum >/dev/null 2>&1; then
   checksum_tool=(shasum -a 256)
 elif command -v sha256sum >/dev/null 2>&1; then
@@ -122,9 +181,34 @@ else
 fi
 
 # Hash stdin so checksum output stays the same even for escaped filenames.
-if ! checksum="$("${checksum_tool[@]}" < "$out")" ||
+if ! checksum="$("${checksum_tool[@]}" < "$stage/out/$out_name")" ||
   ! [[ "${checksum%% *}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "could not compute SHA-256 for $out with ${checksum_tool[0]}" >&2
   exit 1
 fi
+
+# A directory lock works on Linux and macOS without requiring a host lock tool.
+if ! mkdir -- "$publish_lock"; then
+  echo "could not acquire kernel publication lock: $publish_lock" >&2
+  exit 1
+fi
+locked=true
+
+for name in "${outputs[@]}"; do
+  dest="$out_dir/$name"
+  validate_destination "$dest"
+  if [ -L "$dest" ] || [ -f "$dest" ]; then
+    cp -pP -- "$dest" "$stage/previous/$name"
+  fi
+done
+
+publishing=true
+for name in "${outputs[@]}"; do
+  # Give mv the parent directory so a directory at the final path fails.
+  if ! mv -f -- "$stage/out/$name" "$out_dir/"; then
+    echo "could not publish kernel output: $out_dir/$name" >&2
+    exit 1
+  fi
+done
+publishing=false
 echo "wrote $out (${checksum%% *})"
