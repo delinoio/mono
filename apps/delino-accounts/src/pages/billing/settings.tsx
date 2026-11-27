@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  useMutation,
+  useQuery,
+  useTransport,
+} from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { Switch } from "delino-ui/switch";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
-import { type FormEvent, type ReactNode, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { invalidateServices } from "../../api.ts";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
@@ -15,6 +26,7 @@ import {
   RefetchNotice,
   Loading,
 } from "../../components/ui.tsx";
+import { useCurrentUtcMonth } from "../../current-utc-month.ts";
 import {
   type AutoTopUpErrors,
   type AutoTopUpInput,
@@ -161,19 +173,38 @@ function NameSettings() {
 
 function AutoTopUpSection() {
   const { billingAccountId } = useBillingAccount();
-  const settings = useQuery(CreditService.method.getAutoTopUpSettings, {
-    billingAccountId,
-  });
+  const queryClient = useQueryClient();
+  const transport = useTransport();
+  const schema = CreditService.method.getAutoTopUpSettings;
+  const settings = useQuery(schema, { billingAccountId });
+  const { refetch } = settings;
+  const { year, month } = useCurrentUtcMonth();
+  const currentMonth = year * 12 + month;
+  const previousMonth = useRef(currentMonth);
+
+  useEffect(() => {
+    if (previousMonth.current === currentMonth) return;
+    previousMonth.current = currentMonth;
+    const queryKey = createConnectQueryKey({
+      schema,
+      transport,
+      input: { billingAccountId },
+      cardinality: "finite",
+    });
+    // Refetch replaces a pending refresh but would reuse a pending first read.
+    if (queryClient.getQueryData(queryKey) === undefined) {
+      void queryClient.cancelQueries({ queryKey, exact: true });
+    }
+    void refetch();
+  }, [billingAccountId, currentMonth, queryClient, refetch, schema, transport]);
+
   return settings.isPending ? (
     <section className="section" aria-label="Automatic top-up">
       <Loading label="Loading automatic top-up" />
     </section>
   ) : settings.isLoadingError ? (
     <section className="section" aria-label="Automatic top-up">
-      <ErrorNotice
-        error={settings.error}
-        onRetry={() => void settings.refetch()}
-      />
+      <ErrorNotice error={settings.error} onRetry={() => void refetch()} />
     </section>
   ) : (
     // The notice and the form are siblings in a fragment in every loaded
@@ -182,7 +213,7 @@ function AutoTopUpSection() {
     <>
       <RefetchNotice
         error={settings.isRefetchError ? settings.error : undefined}
-        onRetry={() => void settings.refetch()}
+        onRetry={() => void refetch()}
       />
       <AutoTopUpForm settings={settings.data.settings} />
     </>

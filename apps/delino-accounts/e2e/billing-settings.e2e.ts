@@ -28,6 +28,54 @@ describe("automatic top-up settings", () => {
     ).toHaveText("1");
     await expect(amount).toHaveValue("75");
   });
+
+  test("refreshes the cap usage at UTC rollover while Settings stays open", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    // Control the wall clock while leaving the app's month timer in Chromium.
+    await browser.addInitScript(() => {
+      const rollover = Date.parse("2027-01-01T00:00:00Z");
+      let now = rollover - 1_000;
+      window.Date = new Proxy(Date, {
+        construct(target, args) {
+          return Reflect.construct(target, args.length === 0 ? [now] : args);
+        },
+        get(target, property, receiver) {
+          return property === "now"
+            ? () => now
+            : Reflect.get(target, property, receiver);
+        },
+      });
+      window.addEventListener("billing-fixture:cross-utc-boundary", () => {
+        now = rollover;
+      });
+    });
+    await app.open("/billing-settings");
+    await screen.getByRole("tab", "Settings").click();
+    const capUsage = browser.locator('dt:text-is("Monthly cap usage") + dd');
+    const amount = screen.getByRole("textbox", "Top-up amount (USD)");
+    await expect(capUsage).toHaveText("$25.00");
+    await amount.fill("75");
+    await app.screenshot("cap-usage-before-rollover");
+
+    await browser.evaluate(() => {
+      window.capUsageFixture.setUsage("0");
+      window.dispatchEvent(new Event("billing-fixture:cross-utc-boundary"));
+      return null;
+    });
+
+    await expect(capUsage).toHaveText("$0.00");
+    await expect(amount).toHaveValue("75");
+    expect(
+      await browser.evaluate(() => window.capUsageFixture.readCount()),
+    ).toBe(2);
+    expect(
+      await browser.evaluate(() => window.capUsageFixture.saveCount()),
+    ).toBe(0);
+    await app.screenshot("cap-usage-after-rollover");
+  });
 });
 
 describe("low-balance alert settings", () => {
