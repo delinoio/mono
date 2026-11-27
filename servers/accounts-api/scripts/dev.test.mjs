@@ -591,6 +591,35 @@ test(
   },
 );
 
+// The extensionless build output can run under either Node.js package type.
+function executionMarkerProgram(marker) {
+  return `#!${process.execPath}
+import("node:fs").then(({ writeFileSync }) => {
+  writeFileSync(${JSON.stringify(marker)}, "");
+});
+`;
+}
+
+for (const type of ["module", "commonjs"]) {
+  test(
+    `the fake server writes its execution marker under ${type} scope`,
+    { skip, timeout: Timeout },
+    (t) => {
+      const dir = mkdtempSync(join(tmpdir(), "accounts-api-execution-"));
+      t.after(() => rmSync(dir, { recursive: true, force: true }));
+      const executable = join(dir, "accounts-api");
+      const marker = join(dir, "executed");
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ type }));
+      writeFileSync(executable, executionMarkerProgram(marker), {
+        mode: 0o755,
+      });
+
+      execFileSync(executable);
+      assert.ok(existsSync(marker), "the fake server did not write its marker");
+    },
+  );
+}
+
 // A fake `go` for the tests that signal the launcher during the build. It
 // installs its signal trap before it publishes the ready marker, so a test that
 // waits for the marker never signals a build that cannot handle the signal yet.
@@ -610,9 +639,7 @@ function signalDuringBuildFixture(t, signal) {
     buildOk: join(markerDir, "build-ok"),
     executed: join(markerDir, "executed"),
   };
-  const program = `#!${process.execPath}
-require("node:fs").writeFileSync(${JSON.stringify(markers.executed)}, "");
-`;
+  const program = executionMarkerProgram(markers.executed);
   const script = [
     'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done',
     "sleep 60 &",
