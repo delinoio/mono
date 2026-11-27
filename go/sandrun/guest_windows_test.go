@@ -288,7 +288,7 @@ func TestWindowsGuestAliasPruneIdentity(t *testing.T) {
 }
 
 func TestWindowsGuestCleanup(t *testing.T) {
-	for _, name := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes, guestEnvLinks, guestEnvLock, guestEnvDLArchive} {
+	for _, name := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes, guestEnvLinks, guestEnvLock, guestEnvPendingUpdates, guestEnvDLArchive} {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -311,7 +311,7 @@ func TestWindowsGuestCleanup(t *testing.T) {
 		}
 	}
 
-	for _, blocked := range []string{guestEnvArchive, guestEnvAliasPrunes, guestEnvLock, guestEnvDLArchive} {
+	for _, blocked := range []string{guestEnvArchive, guestEnvAliasPrunes, guestEnvLock, guestEnvPendingUpdates, guestEnvDLArchive} {
 		t.Run(blocked, func(t *testing.T) {
 			root := t.TempDir()
 			op := opCleanup
@@ -320,7 +320,7 @@ func TestWindowsGuestCleanup(t *testing.T) {
 				op = opRemoveArchive
 				env[guestEnvDLArchive] = filepath.Join(root, "download [archive].tar")
 			} else {
-				for _, key := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes, guestEnvLinks} {
+				for _, key := range []string{guestEnvArchive, guestEnvDeletes, guestEnvReplaceFiles, guestEnvPrunes, guestEnvAliasPrunes, guestEnvLinks, guestEnvPendingUpdates} {
 					env[key] = filepath.Join(root, key)
 				}
 				env[guestEnvLock] = filepath.Join(root, "lock")
@@ -343,7 +343,11 @@ func TestWindowsGuestCleanup(t *testing.T) {
 				}
 			}
 			held := holdWithoutDeleteSharing(t, heldPath)
-			run(t, op, env, 1)
+			wantCode := 1
+			if blocked == guestEnvPendingUpdates {
+				wantCode = exitPendingCleanupFailed
+			}
+			run(t, op, env, wantCode)
 			if _, err := os.Stat(heldPath); err != nil {
 				t.Fatalf("held path should remain: %v", err)
 			}

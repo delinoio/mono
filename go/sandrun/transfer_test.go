@@ -5,6 +5,8 @@ package sandrun
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -529,6 +531,41 @@ func TestSyncRejectsInvalidWriteAcknowledgement(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSyncRetainsPendingUpdatesWhenManifestAcknowledgementIsInvalid(t *testing.T) {
+	needPOSIX(t)
+	upstream, srv, org := newTestClient(t, "")
+	ds := newSession(t, upstream, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	ws := ds.GetWorkspacePath()
+	dir := newRepo(t, map[string]string{"a.txt": "alpha"}, nil, "")
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := upstream.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("bravo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := transferTestClient(t, srv.URL, transferHandlers{write: func(ctx context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+		reply, err := upstream.DevSessions().WriteDevSessionFile(ctx, connect.NewRequest(req.Msg))
+		if err == nil && req.Msg.GetPath() == ws+manifestSuffix {
+			reply.Msg.Finished = false
+		}
+		return reply, err
+	}})
+	if res, err := c.Sync(t.Context(), params); res != nil || connect.CodeOf(err) != connect.CodeDataLoss {
+		t.Fatalf("sync with invalid manifest acknowledgement = %+v, %v", res, err)
+	}
+	checkPendingUpdates(t, ws, "a.txt")
+	sum := sha256.Sum256([]byte("bravo"))
+	if got := guestManifest(t, ds).Files["a.txt"].SHA256; got != hex.EncodeToString(sum[:]) {
+		t.Fatalf("manifest was not published before the invalid acknowledgement: digest %q", got)
+	}
+	res, err := upstream.Sync(t.Context(), params)
+	if err != nil || res.Uploaded != 1 || readGuest(t, ds, "a.txt") != "bravo" {
+		t.Fatalf("retry after invalid manifest acknowledgement = %+v, %v", res, err)
+	}
+	checkPendingUpdates(t, ws)
 }
 
 func TestDownloadReadDeadlineKeepsDestination(t *testing.T) {
