@@ -4,14 +4,17 @@ package fcrt
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -140,7 +143,12 @@ func startFakeVM(t *testing.T, r *Runtime, id string, rec *recorder) *vm {
 	protocols.SetUnencryptedHTTP2(true)
 	guest := &http.Server{Handler: mux, Protocols: &protocols}
 	go guest.Serve(vsockListener{gl})
-	t.Cleanup(func() { guest.Close() })
+	t.Cleanup(func() {
+		guest.Close()
+		// Close the listener even if Serve has yet to register it. The
+		// socket must be unlinked before the directory descriptor is reused.
+		gl.Close()
+	})
 
 	al, err := net.Listen("unix", v.path(apiSocket))
 	if err != nil {
@@ -158,7 +166,10 @@ func startFakeVM(t *testing.T, r *Runtime, id string, rec *recorder) *vm {
 		w.WriteHeader(http.StatusNoContent)
 	})}
 	go api.Serve(al)
-	t.Cleanup(func() { api.Close() })
+	t.Cleanup(func() {
+		api.Close()
+		al.Close()
+	})
 	v.api = newAPIClient(v.path(apiSocket))
 
 	r.mu.Lock()
@@ -216,6 +227,116 @@ func TestSnapshotOfRunningVMFlushesOnce(t *testing.T) {
 	want := []string{"exec sync", `api PATCH /vm {"state":"Paused"}`, `api PATCH /vm {"state":"Resumed"}`}
 	if got := rec.list(); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("snapshot events %q, want %q", got, want)
+	}
+}
+
+type pauseRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f pauseRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestSnapshotCanceledBeforePauseSendsNoPatch(t *testing.T) {
+	r, _ := newCapturingRuntime(t)
+	v := startFakeVM(t, r, "s1", &recorder{})
+	v.api.hc.Transport = pauseRoundTripper(func(req *http.Request) (*http.Response, error) {
+		t.Errorf("API request after cancellation: %s %s", req.Method, req.URL.Path)
+		return nil, req.Context().Err()
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := r.Snapshot(ctx, v, filepath.Join(t.TempDir(), "snap")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot error %v, want context.Canceled", err)
+	}
+}
+
+func TestSnapshotCanceledWhileAwaitingPauseReply(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		rejectResume bool
+		sourceState  ownsandv1.SandboxState
+	}{
+		{"resume succeeds", false, ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED},
+		{"resume rejected", true, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newFlushCheckedRuntime(t)
+			rec := &recorder{rejectResume: tc.rejectResume}
+			v := startFakeVM(t, r, "s1", rec)
+			v.network = ownsandv1.NetworkMode_NETWORK_MODE_NONE
+			snapDir := filepath.Join(t.TempDir(), "snap")
+			applied := make(chan context.Context, 1)
+			release := make(chan struct{})
+			finish := sync.OnceFunc(func() { close(release) })
+			defer finish()
+			transport := v.api.hc.Transport
+			firstPatch := true
+			apiPaused := false
+			v.api.hc.Transport = pauseRoundTripper(func(req *http.Request) (*http.Response, error) {
+				resp, err := transport.RoundTrip(req)
+				if err != nil || req.Method != http.MethodPatch || resp.StatusCode != http.StatusNoContent {
+					return resp, err
+				}
+				if firstPatch {
+					firstPatch = false
+					apiPaused = true
+					applied <- req.Context()
+					<-release
+					if err := req.Context().Err(); err != nil {
+						resp.Body.Close()
+						return nil, err
+					}
+				} else {
+					apiPaused = false
+				}
+				return resp, err
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			type result struct {
+				state ownsandv1.SandboxState
+				err   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				info, err := r.Snapshot(ctx, v, snapDir)
+				done <- result{info.SourceState, err}
+			}()
+			select {
+			case reqCtx := <-applied:
+				cancel()
+				if err := reqCtx.Err(); err != nil {
+					t.Errorf("pause request ended before its reply: %v", err)
+				}
+			case got := <-done:
+				t.Fatalf("snapshot returned before the pause reply: state %v, error %v", got.state, got.err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Firecracker fixture did not acknowledge the pause")
+			}
+			finish()
+			select {
+			case got := <-done:
+				if !errors.Is(got.err, context.Canceled) || got.state != tc.sourceState {
+					t.Fatalf("snapshot returned state %v and error %v, want state %v and context.Canceled", got.state, got.err, tc.sourceState)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("snapshot did not return after the pause reply")
+			}
+			want := []string{"exec sync", `api PATCH /vm {"state":"Paused"}`, `api PATCH /vm {"state":"Resumed"}`}
+			if got := rec.list(); !slices.Equal(got, want) {
+				t.Fatalf("snapshot events %q, want %q", got, want)
+			}
+			v.mu.Lock()
+			paused := v.paused
+			v.mu.Unlock()
+			if paused != tc.rejectResume {
+				t.Fatalf("runtime paused = %v, want %v", paused, tc.rejectResume)
+			}
+			if apiPaused != tc.rejectResume {
+				t.Fatalf("fake Firecracker paused = %v, want %v", apiPaused, tc.rejectResume)
+			}
+		})
 	}
 }
 
