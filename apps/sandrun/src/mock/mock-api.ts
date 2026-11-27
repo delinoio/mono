@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import {
+  create,
+  type DescEnum,
+  type MessageInitShape,
+} from "@bufbuild/protobuf";
 import {
   type Duration,
   DurationSchema,
@@ -45,11 +49,14 @@ import {
   Priority,
   RequestEndReason,
   RequestState,
+  RequestStateSchema,
   Role,
   RunnerEndReason,
   ResourcesSchema,
   RunnerState,
+  RunnerStateSchema,
   WorkloadKind,
+  WorkloadKindSchema,
 } from "@delino/sandrun-protos/v1/common_pb";
 import {
   type DevSession,
@@ -99,6 +106,12 @@ import {
   TERMINAL_RUNNER_STATES,
   timestampMs,
 } from "../format.ts";
+import {
+  MAX_DISK_GIB,
+  MAX_MEMORY_MIB,
+  MAX_TTL_MS,
+  MAX_VCPU_COUNT,
+} from "../forms.ts";
 import {
   AGENT_INTEGRATION_NAME_LIMIT,
   API_KEY_NAME_LIMIT,
@@ -160,6 +173,13 @@ export const MOCK_IDS = {
 const OTHER_ADMIN = "mock-user-ada";
 const OTHER_MEMBER = "mock-user-lin";
 const LATER_MEMBER = "mock-user-nora";
+
+const IDLE_GITHUB_RUNNER_STATES = new Set([
+  RunnerState.CREATING,
+  RunnerState.PREPARING,
+  RunnerState.WARM,
+  RunnerState.WAITING_FOR_WORK,
+]);
 
 const now = () => Date.now();
 const ts = (offsetSeconds = 0): Timestamp =>
@@ -804,6 +824,21 @@ function page<T>(
   return { items: slice, nextPageToken: next };
 }
 
+function validateListFilter(
+  field: string,
+  schema: DescEnum,
+  values: readonly number[],
+): void {
+  for (const value of values) {
+    if (schema.value[value] === undefined) {
+      throw new ConnectError(
+        `invalid ${field}: must be a defined ${schema.name} value`,
+        Code.InvalidArgument,
+      );
+    }
+  }
+}
+
 function hasPath(mask: FieldMask | undefined, path: string): boolean {
   return mask?.paths.includes(path) ?? false;
 }
@@ -1283,6 +1318,19 @@ export function createMockTransport(
             k.revokedAt = ts();
           }
         }
+        for (const r of org.requests) {
+          if (
+            r.kind === WorkloadKind.DEV_SESSION &&
+            r.state === RequestState.QUEUED &&
+            r.ownerUserId === m.userId
+          )
+            endRequest(
+              org,
+              r,
+              RequestState.CANCELED,
+              RequestEndReason.MEMBER_REMOVED,
+            );
+        }
         audit(
           org,
           AuditAction.MEMBER_REMOVED,
@@ -1536,6 +1584,16 @@ export function createMockTransport(
               RequestEndReason.INTEGRATION_REMOVED,
             );
         }
+        for (const r of org.runners) {
+          if (
+            r.kind === WorkloadKind.GITHUB_JOB &&
+            r.githubInstallationId === i.githubInstallationId &&
+            r.requestId === "" &&
+            IDLE_GITHUB_RUNNER_STATES.has(r.state)
+          ) {
+            endRunner(org, r, RunnerEndReason.CLEAN_UP);
+          }
+        }
         audit(
           org,
           AuditAction.GITHUB_INSTALLATION_UNLINKED,
@@ -1714,6 +1772,9 @@ export function createMockTransport(
       },
       listRunnerProfiles(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("workload_kind", WorkloadKindSchema, [
+          req.workloadKind,
+        ]);
         const items = org.profiles.filter(
           (p) =>
             req.workloadKind === WorkloadKind.UNSPECIFIED ||
@@ -1867,6 +1928,8 @@ export function createMockTransport(
     router.service(WorkService, {
       listRequests(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("kind", WorkloadKindSchema, [req.kind]);
+        validateListFilter("states", RequestStateSchema, req.states);
         const active = org.requests
           .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
           .sort(compareQueueOrder);
@@ -1923,6 +1986,7 @@ export function createMockTransport(
       },
       listRunners(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("states", RunnerStateSchema, req.states);
         const items = org.runners.filter(
           (r) =>
             (req.includeEnded || !TERMINAL_RUNNER_STATES.has(r.state)) &&
@@ -2141,6 +2205,7 @@ export function createMockTransport(
       },
       listDevSessions(req) {
         const { org } = membership(req.organizationId);
+        validateListFilter("states", RequestStateSchema, req.states);
         const items = org.devSessions.filter(
           (s) =>
             (req.includeEnded || !TERMINAL_REQUEST_STATES.has(s.state)) &&
@@ -2242,9 +2307,9 @@ const VENDOR_CREDENTIAL_CASE: Record<AgentVendor, string | undefined> = {
 
 /** The runner profile rules of the control plane contract. */
 function validateProfile(p: RunnerProfile): void {
-  const fail = (message: string) => {
+  function fail(message: string): never {
     throw new ConnectError(message, Code.InvalidArgument);
-  };
+  }
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name) || p.name.length > 40)
     fail("name must be lowercase kebab-case with 1 to 40 characters");
   if (p.workloadKind === WorkloadKind.UNSPECIFIED)
@@ -2272,12 +2337,25 @@ function validateProfile(p: RunnerProfile): void {
     r.diskGib <= 0n
   )
     fail("resources must be greater than zero");
-  const seconds = (d: Duration | undefined) =>
-    d === undefined ? 0 : Number(d.seconds);
-  if (seconds(p.idleTtl) <= 0) fail("idle_ttl must be greater than zero");
-  if (seconds(p.maxTtl) <= 0 || seconds(p.maxTtl) > 7 * 86400)
+  if (r.vcpuCount > MAX_VCPU_COUNT)
+    fail(`invalid resources.vcpu_count: must be at most ${MAX_VCPU_COUNT}`);
+  if (r.memoryMib > BigInt(MAX_MEMORY_MIB))
+    fail(`invalid resources.memory_mib: must be at most ${MAX_MEMORY_MIB}`);
+  if (r.diskGib > BigInt(MAX_DISK_GIB))
+    fail(`invalid resources.disk_gib: must be at most ${MAX_DISK_GIB}`);
+
+  const nanoseconds = (duration: Duration | undefined) =>
+    (duration?.seconds ?? 0n) * 1_000_000_000n + BigInt(duration?.nanos ?? 0);
+  const idleTtl = nanoseconds(p.idleTtl);
+  const maxTtl = nanoseconds(p.maxTtl);
+  if (idleTtl <= 0n) fail("idle_ttl must be greater than zero");
+  if (maxTtl <= 0n || maxTtl > BigInt(MAX_TTL_MS) * 1_000_000n)
     fail("max_ttl must be at most 7 days");
-  if (seconds(p.maxQueueWait) <= 0 || seconds(p.maxQueueWait) > 86400)
+  if (idleTtl > maxTtl)
+    fail("invalid ttl: invalid idle_ttl: must not be greater than max_ttl");
+
+  const maxQueueWaitSeconds = p.maxQueueWait?.seconds ?? 0n;
+  if (maxQueueWaitSeconds <= 0n || maxQueueWaitSeconds > 86_400n)
     fail("max_queue_wait must be at most 24 hours");
   if (p.warmCount < 0 || p.warmCount > 10) fail("warm_count must be 0 to 10");
 }

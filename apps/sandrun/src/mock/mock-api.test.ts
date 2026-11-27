@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-import { timestampFromMs, timestampMs } from "@bufbuild/protobuf/wkt";
+import { create } from "@bufbuild/protobuf";
+import {
+  durationFromMs,
+  DurationSchema,
+  timestampFromMs,
+  timestampMs,
+} from "@bufbuild/protobuf/wkt";
 import { Code, createClient } from "@connectrpc/connect";
 import {
   AgentCredential,
@@ -16,22 +22,430 @@ import {
   ApiKeyState,
   RequestEndReason,
   RequestState,
+  ResourcesSchema,
+  Role,
   RunnerEndReason,
   RunnerState,
   WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
 import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
+import { MemberService } from "@delino/sandrun-protos/v1/member_pb";
+import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
 import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
-import { type Request, WorkService } from "@delino/sandrun-protos/v1/work_pb";
+import {
+  type Request,
+  type WatchQueueResponse,
+  WorkService,
+} from "@delino/sandrun-protos/v1/work_pb";
 import { expect, rs, test } from "@rstest/core";
 import { createMockTransport, MOCK_IDS, MOCK_USER } from "./mock-api.ts";
+
+test("ends the departing member's queued dev session and publishes one update", async () => {
+  const transport = createMockTransport();
+  const organizationId = MOCK_IDS.acme;
+  const members = createClient(MemberService, transport);
+  const organizations = createClient(OrganizationService, transport);
+  const sessions = createClient(DevSessionService, transport);
+  const work = createClient(WorkService, transport);
+  const getSession = (devSessionId: string) =>
+    sessions.getDevSession({ organizationId, devSessionId });
+  const getRequest = (requestId: string) =>
+    work.getRequest({ organizationId, requestId });
+
+  const { invitationSecret } = await members.createInvitation({
+    organizationId,
+    role: Role.ADMIN,
+  });
+  await organizations.transferOwnership({
+    organizationId,
+    userId: "mock-user-ada",
+  });
+  const queuedJob = await getRequest(MOCK_IDS.queuedJob);
+  expect(queuedJob.request?.state).toBe(RequestState.QUEUED);
+  const endedSession = await getSession(MOCK_IDS.devSessionOther);
+  expect(endedSession.devSession?.state).toBe(RequestState.ENDED);
+
+  const watch = new AbortController();
+  const stream = work
+    .watchQueue({ organizationId }, { signal: watch.signal })
+    [Symbol.asyncIterator]();
+  try {
+    const initialRequestIds: string[] = [];
+    for (;;) {
+      const { value, done } = await stream.next();
+      if (done) throw new Error("Expected a complete snapshot");
+      if (value.event.case === "snapshotComplete") break;
+      if (value.event.case === "request")
+        initialRequestIds.push(value.event.value.requestId);
+    }
+    expect(initialRequestIds).toContain(MOCK_IDS.queuedDev);
+
+    await members.removeMember({ organizationId, userId: MOCK_USER });
+    await expect(getSession(MOCK_IDS.queuedDev)).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    await expect(getRequest(MOCK_IDS.queuedDev)).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
+    const { member } = await members.acceptInvitation({ invitationSecret });
+    expect(member).toMatchObject({ userId: MOCK_USER, role: Role.ADMIN });
+
+    const terminal = {
+      state: RequestState.CANCELED,
+      endReason: RequestEndReason.MEMBER_REMOVED,
+    };
+    const { devSession } = await getSession(MOCK_IDS.queuedDev);
+    const { request } = await getRequest(MOCK_IDS.queuedDev);
+    expect(devSession).toMatchObject(terminal);
+    expect(request).toMatchObject(terminal);
+    expect(request?.endedAt).toBeDefined();
+    expect(devSession?.endedAt).toEqual(request?.endedAt);
+    expect(await getRequest(MOCK_IDS.queuedJob)).toEqual(queuedJob);
+    expect(await getSession(MOCK_IDS.devSessionOther)).toEqual(endedSession);
+
+    // Publish another update to check that removal emitted exactly one.
+    const { request: canceledAgent } = await work.cancelRequest({
+      organizationId,
+      requestId: MOCK_IDS.queuedAgent,
+    });
+    for (const update of [request, canceledAgent]) {
+      await expect(stream.next()).resolves.toMatchObject({
+        done: false,
+        value: { event: { case: "request", value: update } },
+      });
+    }
+  } finally {
+    watch.abort();
+    await stream.return?.();
+  }
+
+  const rejoinedRequestIds: string[] = [];
+  for await (const { event } of work.watchQueue({ organizationId })) {
+    if (event.case === "snapshotComplete") break;
+    if (event.case === "request")
+      rejoinedRequestIds.push(event.value.requestId);
+  }
+  expect(rejoinedRequestIds).toContain(MOCK_IDS.queuedJob);
+  expect(rejoinedRequestIds).not.toContain(MOCK_IDS.queuedDev);
+});
 
 const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
 };
+
+test("rejects undefined kind filters on runner profiles and requests", async () => {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const work = createClient(WorkService, transport);
+  const organizationId = MOCK_IDS.acme;
+  const unknownKind = 99 as WorkloadKind;
+
+  await expect(
+    profiles.listRunnerProfiles({ organizationId, workloadKind: unknownKind }),
+  ).rejects.toMatchObject({
+    code: Code.InvalidArgument,
+    rawMessage: "invalid workload_kind: must be a defined WorkloadKind value",
+  });
+  await expect(
+    work.listRequests({ organizationId, kind: unknownKind }),
+  ).rejects.toMatchObject({
+    code: Code.InvalidArgument,
+    rawMessage: "invalid kind: must be a defined WorkloadKind value",
+  });
+});
+
+test.each([
+  { includeEnded: false, mixed: false },
+  { includeEnded: false, mixed: true },
+  { includeEnded: true, mixed: false },
+  { includeEnded: true, mixed: true },
+])(
+  "rejects undefined state filters (includeEnded=$includeEnded, mixed=$mixed)",
+  async ({ includeEnded, mixed }) => {
+    const transport = createMockTransport();
+    const work = createClient(WorkService, transport);
+    const sessions = createClient(DevSessionService, transport);
+    const request = { organizationId: MOCK_IDS.acme, includeEnded };
+    const requestStates = mixed ? [RequestState.QUEUED] : [];
+    requestStates.push(99 as RequestState);
+    const runnerStates = mixed ? [RunnerState.BUSY] : [];
+    runnerStates.push(99 as RunnerState);
+    const invalidRequestState = {
+      code: Code.InvalidArgument,
+      rawMessage: "invalid states: must be a defined RequestState value",
+    };
+
+    await expect(
+      work.listRequests({ ...request, states: requestStates }),
+    ).rejects.toMatchObject(invalidRequestState);
+    await expect(
+      work.listRunners({ ...request, states: runnerStates }),
+    ).rejects.toMatchObject({
+      code: Code.InvalidArgument,
+      rawMessage: "invalid states: must be a defined RunnerState value",
+    });
+    await expect(
+      sessions.listDevSessions({ ...request, states: requestStates }),
+    ).rejects.toMatchObject(invalidRequestState);
+  },
+);
+
+test("keeps defined filters, zero values and omitted filters working", async () => {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const work = createClient(WorkService, transport);
+  const sessions = createClient(DevSessionService, transport);
+  const request = { organizationId: MOCK_IDS.acme };
+
+  const allProfiles = await profiles.listRunnerProfiles(request);
+  expect(allProfiles.profiles.map((profile) => profile.workloadKind)).toEqual([
+    WorkloadKind.GITHUB_JOB,
+    WorkloadKind.AGENT_SESSION,
+    WorkloadKind.DEV_SESSION,
+  ]);
+  expect(
+    await profiles.listRunnerProfiles({
+      ...request,
+      workloadKind: WorkloadKind.UNSPECIFIED,
+    }),
+  ).toEqual(allProfiles);
+  const githubProfiles = await profiles.listRunnerProfiles({
+    ...request,
+    workloadKind: WorkloadKind.GITHUB_JOB,
+  });
+  expect(
+    githubProfiles.profiles.map((profile) => profile.runnerProfileId),
+  ).toEqual([MOCK_IDS.linuxProfile]);
+
+  const githubRequests = await work.listRequests({
+    ...request,
+    kind: WorkloadKind.GITHUB_JOB,
+    states: [RequestState.QUEUED],
+  });
+  expect(githubRequests.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.queuedJob,
+  ]);
+  expect(
+    await work.listRequests({ ...request, kind: WorkloadKind.UNSPECIFIED }),
+  ).toEqual(await work.listRequests(request));
+  const busyRunners = await work.listRunners({
+    ...request,
+    states: [RunnerState.BUSY],
+  });
+  expect(busyRunners.runners.map((runner) => runner.runnerId)).toEqual([
+    MOCK_IDS.busyRunner,
+  ]);
+  const queuedSessions = await sessions.listDevSessions({
+    ...request,
+    states: [RequestState.QUEUED],
+  });
+  expect(
+    queuedSessions.devSessions.map((session) => session.devSessionId),
+  ).toEqual([MOCK_IDS.queuedDev]);
+  expect(
+    await work.listRequests({ ...request, states: [RequestState.UNSPECIFIED] }),
+  ).toMatchObject({ requests: [] });
+  expect(
+    await work.listRunners({ ...request, states: [RunnerState.UNSPECIFIED] }),
+  ).toMatchObject({ runners: [] });
+  expect(
+    await sessions.listDevSessions({
+      ...request,
+      states: [RequestState.UNSPECIFIED],
+    }),
+  ).toMatchObject({ devSessions: [] });
+});
+
+test("paginates filtered requests in queue order before ended requests", async () => {
+  const work = createClient(WorkService, createMockTransport());
+  const request = {
+    organizationId: MOCK_IDS.acme,
+    kind: WorkloadKind.GITHUB_JOB,
+    includeEnded: true,
+    pageSize: 2,
+  };
+  const first = await work.listRequests(request);
+  expect(first.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.runningJob,
+    MOCK_IDS.queuedJob,
+  ]);
+  expect(first.nextPageToken).not.toBe("");
+
+  const last = await work.listRequests({
+    ...request,
+    pageToken: first.nextPageToken,
+  });
+  expect(last.requests.map((row) => row.requestId)).toEqual([
+    MOCK_IDS.endedJob,
+  ]);
+  expect(last.nextPageToken).toBe("");
+});
+
+async function runnerProfileFixture() {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const audit = createClient(AuditService, transport);
+  const organizationId = MOCK_IDS.acme;
+  const seededRequest = {
+    organizationId,
+    runnerProfileId: MOCK_IDS.linuxProfile,
+  };
+  const { profile: seeded } = await profiles.getRunnerProfile(seededRequest);
+  if (!seeded?.resources)
+    throw new Error("Expected a seeded profile with resources");
+  const state = async () => ({
+    profiles: await profiles.listRunnerProfiles({
+      organizationId,
+      pageSize: 200,
+    }),
+    audit: await audit.listAuditEvents({ organizationId, pageSize: 200 }),
+  });
+  return {
+    profiles,
+    organizationId,
+    seededRequest,
+    seeded,
+    resources: seeded.resources,
+    state,
+  };
+}
+
+test.each([
+  [{ vcpuCount: 1025 }, "vcpu_count", 1024],
+  [{ memoryMib: 16_777_217n }, "memory_mib", 16_777_216],
+  [{ diskGib: 1_048_577n }, "disk_gib", 1_048_576],
+] as const)(
+  "rejects over-limit resources %s on runner profile create and update",
+  async (overLimit, field, limit) => {
+    const {
+      profiles,
+      organizationId,
+      seededRequest,
+      seeded,
+      resources,
+      state,
+    } = await runnerProfileFixture();
+    const invalidResources = { ...resources, ...overLimit };
+    const error = {
+      code: Code.InvalidArgument,
+      rawMessage: `invalid resources.${field}: must be at most ${limit}`,
+    };
+    const before = await state();
+
+    await expect(
+      profiles.createRunnerProfile({
+        organizationId,
+        profile: {
+          ...seeded,
+          name: "over-resource-limit",
+          resources: invalidResources,
+        },
+      }),
+    ).rejects.toMatchObject(error);
+    expect(await state()).toEqual(before);
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...seededRequest,
+        profile: { resources: invalidResources },
+        updateMask: { paths: ["resources"] },
+      }),
+    ).rejects.toMatchObject(error);
+    expect(await state()).toEqual(before);
+  },
+);
+
+const invalidIdleTtl = {
+  code: Code.InvalidArgument,
+  rawMessage: "invalid ttl: invalid idle_ttl: must not be greater than max_ttl",
+};
+
+test.each([1, 1_000_000])(
+  "rejects a runner profile with idle TTL %i nanoseconds above maximum TTL",
+  async (nanos) => {
+    const { profiles, organizationId, seeded, state } =
+      await runnerProfileFixture();
+    const before = await state();
+
+    await expect(
+      profiles.createRunnerProfile({
+        organizationId,
+        profile: {
+          ...seeded,
+          name: "over-idle-ttl-limit",
+          idleTtl: create(DurationSchema, { seconds: 60n, nanos }),
+          maxTtl: durationFromMs(60_000),
+        },
+      }),
+    ).rejects.toMatchObject(invalidIdleTtl);
+    expect(await state()).toEqual(before);
+  },
+);
+
+test.each([
+  ["idle_ttl", { idleTtl: durationFromMs(60_001) }],
+  ["max_ttl", { maxTtl: durationFromMs(59_999) }],
+] as const)(
+  "validates a runner profile's resulting TTLs when updating only %s",
+  async (path, profile) => {
+    const { profiles, seededRequest, state } = await runnerProfileFixture();
+    const ttl = durationFromMs(60_000);
+    await profiles.updateRunnerProfile({
+      ...seededRequest,
+      profile: { idleTtl: ttl, maxTtl: ttl },
+      updateMask: { paths: ["idle_ttl", "max_ttl"] },
+    });
+    const before = await state();
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...seededRequest,
+        profile,
+        updateMask: { paths: [path] },
+      }),
+    ).rejects.toMatchObject(invalidIdleTtl);
+    expect(await state()).toEqual(before);
+  },
+);
+
+test("creates and updates runner profiles at the resource limits with equal positive TTLs", async () => {
+  const { profiles, organizationId, seededRequest, seeded } =
+    await runnerProfileFixture();
+  const ttl = durationFromMs(1);
+  const limits = {
+    resources: create(ResourcesSchema, {
+      vcpuCount: 1024,
+      memoryMib: 16_777_216n,
+      diskGib: 1_048_576n,
+    }),
+    idleTtl: ttl,
+    maxTtl: ttl,
+  };
+  const { profile: created } = await profiles.createRunnerProfile({
+    organizationId,
+    profile: { ...seeded, ...limits, name: "resource-limits" },
+  });
+  if (!created) throw new Error("Expected the created profile");
+  await profiles.updateRunnerProfile({
+    ...seededRequest,
+    profile: limits,
+    updateMask: { paths: ["resources", "idle_ttl", "max_ttl"] },
+  });
+
+  for (const runnerProfileId of [
+    created.runnerProfileId,
+    seededRequest.runnerProfileId,
+  ]) {
+    const { profile } = await profiles.getRunnerProfile({
+      organizationId,
+      runnerProfileId,
+    });
+    expect(profile).toMatchObject(limits);
+  }
+});
 
 test("listing personal API keys reports expiry at the current time", async () => {
   const issuedAt = Date.UTC(2026, 0, 1);
@@ -583,6 +997,144 @@ test.each([0, 1])(
     }
   },
 );
+
+test("unlinking GitHub ends the installation's warm runner and keeps its history", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const work = createClient(WorkService, transport);
+  const audit = createClient(AuditService, transport);
+  const org = { organizationId: MOCK_IDS.acme };
+  const history = { ...org, includeEnded: true };
+  const before = structuredClone((await work.listRunners(history)).runners);
+
+  expect((await work.listRunners(org)).runners).toContainEqual(
+    expect.objectContaining({
+      runnerId: MOCK_IDS.warmRunner,
+      state: RunnerState.WARM,
+    }),
+  );
+  await github.unlinkGitHubInstallation({
+    ...org,
+    installationId: MOCK_IDS.installation,
+  });
+
+  const preserved = before.filter((r) => r.runnerId !== MOCK_IDS.warmRunner);
+  expect((await work.listRunners(org)).runners).toEqual(
+    preserved.filter((r) => r.runnerId === MOCK_IDS.busyRunner),
+  );
+  const { runners } = await work.listRunners(history);
+  expect(runners.filter((r) => r.runnerId !== MOCK_IDS.warmRunner)).toEqual(
+    preserved,
+  );
+  expect(runners.find((r) => r.runnerId === MOCK_IDS.warmRunner)).toMatchObject(
+    {
+      state: RunnerState.DELETED,
+      endReason: RunnerEndReason.CLEAN_UP,
+      endedAt: expect.any(Object),
+    },
+  );
+  expect(
+    (await github.listGitHubInstallations(org)).installations,
+  ).not.toContainEqual(
+    expect.objectContaining({ installationId: MOCK_IDS.installation }),
+  );
+  expect(
+    (await work.getRequest({ ...org, requestId: MOCK_IDS.queuedJob })).request,
+  ).toMatchObject({
+    state: RequestState.CANCELED,
+    endReason: RequestEndReason.INTEGRATION_REMOVED,
+  });
+  expect((await audit.listAuditEvents(org)).events).toContainEqual(
+    expect.objectContaining({
+      action: AuditAction.GITHUB_INSTALLATION_UNLINKED,
+      targetKind: AuditTargetKind.GITHUB_INSTALLATION,
+      targetId: MOCK_IDS.installation,
+    }),
+  );
+});
+
+test("unlinking a second GitHub installation leaves the original warm runner active", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const work = createClient(WorkService, transport);
+  const org = { organizationId: MOCK_IDS.acme };
+  const { installation } = await github.linkGitHubInstallation({
+    ...org,
+    githubInstallationId: 51_000_099n,
+    code: "fixture-code",
+    state: "mock-state",
+  });
+  if (!installation) throw new Error("Expected the second installation");
+
+  await github.unlinkGitHubInstallation({
+    ...org,
+    installationId: installation.installationId,
+  });
+
+  expect((await work.listRunners(org)).runners).toContainEqual(
+    expect.objectContaining({
+      runnerId: MOCK_IDS.warmRunner,
+      state: RunnerState.WARM,
+    }),
+  );
+});
+
+async function readSnapshotRunnerIds(
+  stream: AsyncIterator<WatchQueueResponse, unknown>,
+) {
+  const ids = new Set<string>();
+  for (;;) {
+    const { done, value: message } = await stream.next();
+    if (done) throw new Error("Expected a complete queue snapshot");
+    if (message.event.case === "snapshotComplete") return ids;
+    if (message.event.case === "runner") ids.add(message.event.value.runnerId);
+  }
+}
+
+test("GitHub unlink sends a terminal runner event and omits the runner from fresh queue snapshots", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const work = createClient(WorkService, transport);
+  const org = { organizationId: MOCK_IDS.acme };
+  const stream: AsyncIterator<WatchQueueResponse, unknown> = work
+    .watchQueue(org, { timeoutMs: 2000 })
+    [Symbol.asyncIterator]();
+  try {
+    expect(await readSnapshotRunnerIds(stream)).toContain(MOCK_IDS.warmRunner);
+    await github.unlinkGitHubInstallation({
+      ...org,
+      installationId: MOCK_IDS.installation,
+    });
+    for (;;) {
+      const { done, value: message } = await stream.next();
+      if (done) throw new Error("Expected a runner event after GitHub unlink");
+      if (
+        message.event.case === "runner" &&
+        message.event.value.runnerId === MOCK_IDS.warmRunner
+      ) {
+        expect(message.event.value).toMatchObject({
+          state: RunnerState.DELETED,
+          endReason: RunnerEndReason.CLEAN_UP,
+          endedAt: expect.any(Object),
+        });
+        break;
+      }
+    }
+  } finally {
+    await stream.return?.();
+  }
+
+  const fresh = work
+    .watchQueue(org, { timeoutMs: 2000 })
+    [Symbol.asyncIterator]();
+  try {
+    expect(await readSnapshotRunnerIds(fresh)).toEqual(
+      new Set([MOCK_IDS.busyRunner]),
+    );
+  } finally {
+    await fresh.return?.();
+  }
+});
 
 test("an agent integration name conflict preserves the integration list and audit history", async () => {
   const transport = createMockTransport();

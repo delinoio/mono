@@ -38,6 +38,46 @@ describe("sign-in", () => {
     });
   }
 
+  test("clears a replacement invitation fragment while signed out", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const path = "/invitations/accept?source=fixture";
+    const notice = screen.getByText(
+      "Sign in, then open the invitation link again.",
+    );
+    await app.open(path);
+    await expect(notice).toBeVisible();
+
+    const historyLength = await browser.evaluate(async () => {
+      const length = window.history.length;
+      const changed = new Promise<void>((resolve) => {
+        window.addEventListener("hashchange", () => resolve(), { once: true });
+      });
+      window.location.replace("#secret=sri_replacement_fixture");
+      await changed;
+      return length;
+    });
+
+    await expect(browser).toHaveURL(path);
+    await expect(notice).toBeVisible();
+    expect(
+      await browser.evaluate(() => ({
+        historyLength: window.history.length,
+        historyState: window.history.state,
+        localStorageLength: window.localStorage.length,
+        sessionStorageLength: window.sessionStorage.length,
+      })),
+    ).toEqual({
+      historyLength,
+      historyState: null,
+      localStorageLength: 0,
+      sessionStorageLength: 0,
+    });
+    await app.screenshot("signed-out-invitation-fragment-cleared");
+  });
+
   test("returns to sign-in from a direct mock callback visit", async ({
     app,
     browser,
@@ -554,6 +594,48 @@ describe("overview", () => {
   });
 });
 
+describe("setup with an invalid OwnSand link", () => {
+  const organizationPath = `/orgs/${NORTHWIND}`;
+  const integrationsPath = `${organizationPath}/integrations`;
+
+  test("keeps OwnSand incomplete on Overview", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(organizationPath);
+
+    const checklist = screen.getByRole("region", "Set up SandRun");
+    const ownSandStep = checklist.getByRole("listitem").filter({
+      hasText: "Link OwnSand",
+    });
+    await expect(ownSandStep).toHaveAttribute("data-done", "false");
+    await expect(
+      ownSandStep.getByRole("link", "Replace OwnSand API key"),
+    ).toHaveAttribute("href", integrationsPath);
+    await app.screenshot("invalid-ownsand-overview");
+  });
+
+  test("opens the organization's Integrations from empty Runners", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`${organizationPath}/runners`);
+
+    await expect(screen.getByText("No runners match")).toBeVisible();
+    const action = screen.getByRole("link", "Replace OwnSand API key");
+    await expect(action).toBeVisible();
+    await app.screenshot("invalid-ownsand-runners");
+    await action.tap();
+
+    await expect(browser).toHaveURL(integrationsPath);
+    await expect(
+      screen.getByRole("heading", "Integrations", { level: 1 }),
+    ).toBeVisible();
+  });
+});
+
 describe("audit", () => {
   test("shows the newest event first", async ({ app, browser, screen }) => {
     await app.open("/");
@@ -701,6 +783,28 @@ describe("keyboard scrolling in tables", () => {
 });
 
 describe("requests", () => {
+  test("shows only requests that match the selected kind and state", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/requests`);
+
+    const requests = screen.getByRole("table", "Requests");
+    await expect(requests).toContainText("sess_codex_4711");
+    await expect(requests).toContainText("build (ubuntu)");
+
+    await screen.getByRole("combobox", "Kind").tap();
+    await screen.getByRole("option", "GitHub job").tap();
+    await screen.getByRole("combobox", "State").tap();
+    await screen.getByRole("option", "Queued").tap();
+
+    await expect(requests).toContainText("test (ubuntu)");
+    await expect(requests).not.toContainText("sess_codex_4711");
+    await expect(requests).not.toContainText("build (ubuntu)");
+  });
+
   test("shows active requests in queue order before ended requests", async ({
     app,
     browser,
@@ -962,9 +1066,24 @@ describe("integrations", () => {
     const setupHistoryLength = await browser.evaluate(
       () => window.history.length,
     );
-    await screen.getByRole("combobox", "SandRun organization").tap();
+    const picker = screen.getByRole("combobox", "SandRun organization");
+    const submit = screen.getByRole("button", "Link installation");
+    await expect(submit).toBeDisabled();
+    await browser.evaluate(() => {
+      const form = document.querySelector("main form");
+      if (!(form instanceof HTMLFormElement)) {
+        throw new Error("Expected the GitHub setup form");
+      }
+      form.requestSubmit();
+      return null;
+    });
+    await expect(picker).toBeVisible();
+    await expect(browser).toHaveURL("/github/setup");
+
+    await picker.tap();
     await screen.getByRole("option", "Globex (admin)").tap();
-    await screen.getByRole("button", "Link installation").tap();
+    await expect(submit).toBeEnabled();
+    await submit.tap();
 
     await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
     expect(await browser.evaluate(() => window.history.length)).toBe(
@@ -1267,6 +1386,21 @@ describe("runner profiles", () => {
       profiles.getByRole("listitem").filter({ hasText: "fixture-linux-197 ·" }),
     ).toBeVisible();
 
+    for (const page of ["Requests", "Runners"]) {
+      await screen.getByRole("link", page).tap();
+      const table = screen.getByRole("table", page);
+      await expect(table).toContainText("0193b000…00b1");
+      await expect(table).not.toContainText("linux-build-renamed");
+      const filter = screen.getByRole("combobox", "Runner profile");
+      await expect(filter).toContainText("All profiles");
+      await filter.tap();
+      await expect(
+        screen.getByRole("option", "linux-build-renamed"),
+      ).toBeHidden();
+      await browser.keyboard.press("Escape");
+    }
+    await screen.getByRole("link", "Runner profiles").tap();
+
     await screen.getByRole("button", "Create runner profile").tap();
     const create = screen.getByRole("dialog", "Create a runner profile");
     await create.getByLabel("Name").tap();
@@ -1275,6 +1409,24 @@ describe("runner profiles", () => {
     await expect(
       profiles.getByRole("listitem").filter({ hasText: "new-linux ·" }),
     ).toBeVisible();
+  });
+
+  test("closes the runner profile editor after an unchanged save", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+
+    const profile = screen
+      .getByRole("listitem")
+      .filter({ hasText: "linux-build ·" });
+    await profile.getByRole("button", "Edit").tap();
+    const dialog = screen.getByRole("dialog", "Edit linux-build");
+    await dialog.getByRole("button", "Save changes").tap();
+    await expect(dialog).toBeHidden();
+    await expect(profile).toBeVisible();
   });
 
   test("lets the user retry an edit when a runner profile name already exists", async ({
@@ -1417,6 +1569,14 @@ describe("runner profiles", () => {
       await dialog.getByLabel(label).tap();
       await browser.keyboard.press("ControlOrMeta+A");
       await browser.keyboard.type(valid);
+    }
+    for (const [label, equalTtl] of [
+      ["Idle TTL (minutes)", "60"],
+      ["Maximum TTL (hours)", "1"],
+    ] as const) {
+      await dialog.getByLabel(label).tap();
+      await browser.keyboard.press("ControlOrMeta+A");
+      await browser.keyboard.type(equalTtl);
     }
     await dialog.getByRole("button", "Create profile").tap();
 
@@ -1714,6 +1874,78 @@ describe("invitations", () => {
     await expect(screen.getByRole("link", "Contoso Member")).toBeVisible();
   });
 
+  test("shows the canceled dev session after leaving and rejoining an organization", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+    const queue = screen.getByRole("table", "Waiting requests");
+    await expect(queue).toContainText("Dev session");
+    await screen.getByRole("link", "Members").tap();
+
+    await screen.getByRole("button", "Invite someone").tap();
+    await screen.getByRole("button", "Create link").tap();
+    const invitation = screen.getByRole("dialog", "Your invitation link");
+    await expect(invitation).toBeVisible();
+    const link = await browser.evaluate(
+      () =>
+        document.querySelector('code[aria-label="Invitation link"]')
+          ?.textContent ?? "",
+    );
+    expect(link).toContain("/invitations/accept#secret=");
+    await invitation.getByRole("button", "Done").tap();
+
+    await screen.getByRole("link", "Settings").tap();
+    await screen.getByRole("combobox", "New owner").tap();
+    await screen.getByRole("option", "Ada Park").tap();
+    await screen.getByRole("button", "Transfer", { exact: true }).tap();
+    await screen
+      .getByRole("alertdialog", "Make Ada Park the owner?")
+      .getByRole("button", "Transfer ownership")
+      .tap();
+    await expect(
+      screen.getByRole("heading", "Transfer ownership"),
+    ).toBeHidden();
+
+    await screen.getByRole("link", "Members").tap();
+    await screen.getByRole("button", "Leave organization").tap();
+    await screen
+      .getByRole("alertdialog", "Leave this organization?")
+      .getByRole("button", "Leave organization")
+      .tap();
+    await expect(browser).toHaveURL("/");
+    await expect(
+      screen.getByRole("link", "Northwind Labs Member"),
+    ).toBeVisible();
+    await expect(screen.getByRole("link", /Acme Robotics/)).toBeHidden();
+
+    await screen.getByLabel("Invitation link or secret").tap();
+    await browser.keyboard.type(link);
+    await screen.getByRole("button", "Continue").tap();
+    await screen.getByRole("button", "Join organization").tap();
+    await expect(browser).toHaveURL(`/orgs/${ACME}`);
+    await expect(queue).toContainText("GitHub job");
+    await expect(queue).not.toContainText("Dev session");
+    await app.screenshot("queue-after-membership-rejoin");
+
+    await screen.getByRole("link", "Dev sessions").tap();
+    await screen.getByRole("checkbox", "Show ended dev sessions").tap();
+    const sessions = screen.getByRole("table", "Dev sessions");
+    const canceled = sessions
+      .getByRole("row")
+      .filter({ hasText: "msvc build" });
+    await expect(canceled).toContainText("Canceled");
+    await expect(canceled).toContainText("Member removed");
+    const ended = sessions
+      .getByRole("row")
+      .filter({ hasText: "compiler check" });
+    await expect(ended).toContainText("Session TTL ended");
+    await app.screenshot("dev-sessions-after-membership-rejoin");
+  });
+
   test("creates and revokes an invitation as an admin and hides the controls from members", async ({
     app,
     screen,
@@ -1811,11 +2043,41 @@ describe("invitations", () => {
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
     await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
-    await screen.getByLabel("Invitation link or secret").tap();
-    await browser.keyboard.type(INVITATION_SECRET);
-    await screen.getByRole("button", "Continue").tap();
+    const input = screen.getByLabel("Invitation link or secret");
+    const toggle = screen.getByRole("button", "Show invitation");
+    const maskedInput = browser.locator('main form input[type="password"]');
+    const revealedInput = browser.locator('main form input[type="text"]');
+    await expect(maskedInput).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-pressed", "false");
 
+    await input.tap();
+    await browser.keyboard.type("not a valid secret");
+    await toggle.tap();
+    await expect(revealedInput).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-pressed", "true");
+    await toggle.tap();
+    await expect(maskedInput).toBeVisible();
+
+    await toggle.tap();
+    await input.tap();
+    await browser.keyboard.press("Enter");
+    const error = screen.getByText(
+      "Paste the whole invitation link or the secret.",
+    );
+    await expect(error).toBeVisible();
+    await expect(maskedInput).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+    await input.tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.press("Backspace");
+    await expect(error).toBeHidden();
+    await browser.keyboard.type(
+      `https://sandrun.delino.io/invitations/accept#secret=${INVITATION_SECRET}`,
+    );
+    await browser.keyboard.press("Enter");
     await expect(browser).toHaveURL("/invitations/accept");
+    await expect(maskedInput).toBeVisible();
     await screen.getByRole("button", "Join organization").tap();
 
     await expect(browser).toHaveURL(`/orgs/${CONTOSO}`);
