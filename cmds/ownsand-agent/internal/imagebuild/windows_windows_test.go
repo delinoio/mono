@@ -17,31 +17,57 @@ import (
 
 func TestSelectEdition(t *testing.T) {
 	list := []wimImage{
+		{4, "Windows Server 2025 Datacenter Evaluation (Desktop Experience)"},
 		{1, "Windows Server 2025 Standard Evaluation"},
 		{2, "Windows Server 2025 Standard Evaluation (Desktop Experience)"},
-		{4, "Windows Server 2025 Datacenter Evaluation (Desktop Experience)"},
 	}
 	for _, tc := range []struct {
+		name    string
 		edition string
 		want    int
 		ok      bool
 	}{
-		{"", 1, true},
-		{"2", 2, true},
-		{" 4 ", 4, true},
-		{"3", 0, false},
-		{"Windows Server 2025 Datacenter Evaluation (Desktop Experience)", 4, true},
-		{"windows server 2025 standard evaluation", 1, true},
-		{"Windows 11 Pro", 0, false},
+		{"default index", "", 1, true},
+		{"numeric index", "2", 2, true},
+		{"trimmed numeric index", " 4 ", 4, true},
+		{"missing index", "3", 0, false},
+		{"exact name", "Windows Server 2025 Datacenter Evaluation (Desktop Experience)", 4, true},
+		{"unique folded name", "windows server 2025 standard evaluation", 1, true},
+		{"missing name", "Windows 11 Pro", 0, false},
 	} {
-		got, err := selectEdition(list, tc.edition)
-		if (err == nil) != tc.ok || (tc.ok && got.Index != tc.want) {
-			t.Errorf("selectEdition(%q) = %+v, %v", tc.edition, got, err)
-		}
-		if err != nil && !strings.Contains(err.Error(), "4: Windows Server 2025 Datacenter") {
-			t.Errorf("error %q does not list the editions", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := selectEdition(list, tc.edition)
+			if (err == nil) != tc.ok || (tc.ok && got.Index != tc.want) {
+				t.Errorf("selectEdition(%q) = %+v, %v", tc.edition, got, err)
+			}
+			if err != nil && !strings.Contains(err.Error(), "4: Windows Server 2025 Datacenter") {
+				t.Errorf("error %q does not list the editions", err)
+			}
+		})
 	}
+
+	caseVariants := []wimImage{
+		{4, "WINDOWS 11 PRO"},
+		{1, "Windows 11 Pro"},
+	}
+	t.Run("exact mixed-case name", func(t *testing.T) {
+		got, err := selectEdition(caseVariants, "Windows 11 Pro")
+		if err != nil || got.Index != 1 {
+			t.Errorf("selectEdition(%q) = %+v, %v; want index 1", "Windows 11 Pro", got, err)
+		}
+	})
+	t.Run("exact uppercase name", func(t *testing.T) {
+		got, err := selectEdition(caseVariants, "WINDOWS 11 PRO")
+		if err != nil || got.Index != 4 {
+			t.Errorf("selectEdition(%q) = %+v, %v; want index 4", "WINDOWS 11 PRO", got, err)
+		}
+	})
+	t.Run("ambiguous folded name", func(t *testing.T) {
+		got, err := selectEdition(caseVariants, "windows 11 pro")
+		if err == nil {
+			t.Errorf("selectEdition(%q) = %+v, nil; want an error", "windows 11 pro", got)
+		}
+	})
 }
 
 func TestParseImageList(t *testing.T) {
