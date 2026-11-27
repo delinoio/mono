@@ -566,14 +566,20 @@ func TestWorkService(t *testing.T) {
 	owner := w.env.User(w.org.Owner)
 
 	// Watch: the snapshot has every open request and runner.
-	wctx, cancel := context.WithCancel(ctx)
+	wctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	watch, err := w.env.User(w.org.Member).Work.WatchQueue(wctx, connect.NewRequest(&sandrunv1.WatchQueueRequest{OrganizationId: w.org.ID}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	snapshot := map[string]bool{}
-	for watch.Receive() {
+	for {
+		if !watch.Receive() {
+			if err := watch.Err(); err != nil {
+				t.Fatalf("watch ended before snapshot_complete: %v", err)
+			}
+			t.Fatal("watch ended before snapshot_complete")
+		}
 		m := watch.Msg()
 		if m.GetSnapshotComplete() != nil {
 			break
