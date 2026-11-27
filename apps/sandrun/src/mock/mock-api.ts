@@ -100,6 +100,12 @@ import {
   timestampMs,
 } from "../format.ts";
 import {
+  MAX_DISK_GIB,
+  MAX_MEMORY_MIB,
+  MAX_TTL_MS,
+  MAX_VCPU_COUNT,
+} from "../forms.ts";
+import {
   AGENT_INTEGRATION_NAME_LIMIT,
   API_KEY_NAME_LIMIT,
   isNameLengthValid,
@@ -2255,9 +2261,9 @@ const VENDOR_CREDENTIAL_CASE: Record<AgentVendor, string | undefined> = {
 
 /** The runner profile rules of the control plane contract. */
 function validateProfile(p: RunnerProfile): void {
-  const fail = (message: string) => {
+  function fail(message: string): never {
     throw new ConnectError(message, Code.InvalidArgument);
-  };
+  }
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name) || p.name.length > 40)
     fail("name must be lowercase kebab-case with 1 to 40 characters");
   if (p.workloadKind === WorkloadKind.UNSPECIFIED)
@@ -2285,12 +2291,25 @@ function validateProfile(p: RunnerProfile): void {
     r.diskGib <= 0n
   )
     fail("resources must be greater than zero");
-  const seconds = (d: Duration | undefined) =>
-    d === undefined ? 0 : Number(d.seconds);
-  if (seconds(p.idleTtl) <= 0) fail("idle_ttl must be greater than zero");
-  if (seconds(p.maxTtl) <= 0 || seconds(p.maxTtl) > 7 * 86400)
+  if (r.vcpuCount > MAX_VCPU_COUNT)
+    fail(`invalid resources.vcpu_count: must be at most ${MAX_VCPU_COUNT}`);
+  if (r.memoryMib > BigInt(MAX_MEMORY_MIB))
+    fail(`invalid resources.memory_mib: must be at most ${MAX_MEMORY_MIB}`);
+  if (r.diskGib > BigInt(MAX_DISK_GIB))
+    fail(`invalid resources.disk_gib: must be at most ${MAX_DISK_GIB}`);
+
+  const nanoseconds = (duration: Duration | undefined) =>
+    (duration?.seconds ?? 0n) * 1_000_000_000n + BigInt(duration?.nanos ?? 0);
+  const idleTtl = nanoseconds(p.idleTtl);
+  const maxTtl = nanoseconds(p.maxTtl);
+  if (idleTtl <= 0n) fail("idle_ttl must be greater than zero");
+  if (maxTtl <= 0n || maxTtl > BigInt(MAX_TTL_MS) * 1_000_000n)
     fail("max_ttl must be at most 7 days");
-  if (seconds(p.maxQueueWait) <= 0 || seconds(p.maxQueueWait) > 86400)
+  if (idleTtl > maxTtl)
+    fail("invalid ttl: invalid idle_ttl: must not be greater than max_ttl");
+
+  const maxQueueWaitSeconds = p.maxQueueWait?.seconds ?? 0n;
+  if (maxQueueWaitSeconds <= 0n || maxQueueWaitSeconds > 86_400n)
     fail("max_queue_wait must be at most 24 hours");
   if (p.warmCount < 0 || p.warmCount > 10) fail("warm_count must be 0 to 10");
 }

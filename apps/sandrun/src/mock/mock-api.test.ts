@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-import { timestampFromMs, timestampMs } from "@bufbuild/protobuf/wkt";
+import { create } from "@bufbuild/protobuf";
+import {
+  durationFromMs,
+  DurationSchema,
+  timestampFromMs,
+  timestampMs,
+} from "@bufbuild/protobuf/wkt";
 import { Code, createClient } from "@connectrpc/connect";
 import {
   AgentCredential,
@@ -16,6 +22,7 @@ import {
   ApiKeyState,
   RequestEndReason,
   RequestState,
+  ResourcesSchema,
   Role,
   RunnerEndReason,
   RunnerState,
@@ -124,6 +131,169 @@ const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
 };
+
+async function runnerProfileFixture() {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const audit = createClient(AuditService, transport);
+  const organizationId = MOCK_IDS.acme;
+  const seededRequest = {
+    organizationId,
+    runnerProfileId: MOCK_IDS.linuxProfile,
+  };
+  const { profile: seeded } = await profiles.getRunnerProfile(seededRequest);
+  if (!seeded?.resources)
+    throw new Error("Expected a seeded profile with resources");
+  const state = async () => ({
+    profiles: await profiles.listRunnerProfiles({
+      organizationId,
+      pageSize: 200,
+    }),
+    audit: await audit.listAuditEvents({ organizationId, pageSize: 200 }),
+  });
+  return {
+    profiles,
+    organizationId,
+    seededRequest,
+    seeded,
+    resources: seeded.resources,
+    state,
+  };
+}
+
+test.each([
+  [{ vcpuCount: 1025 }, "vcpu_count", 1024],
+  [{ memoryMib: 16_777_217n }, "memory_mib", 16_777_216],
+  [{ diskGib: 1_048_577n }, "disk_gib", 1_048_576],
+] as const)(
+  "rejects over-limit resources %s on runner profile create and update",
+  async (overLimit, field, limit) => {
+    const {
+      profiles,
+      organizationId,
+      seededRequest,
+      seeded,
+      resources,
+      state,
+    } = await runnerProfileFixture();
+    const invalidResources = { ...resources, ...overLimit };
+    const error = {
+      code: Code.InvalidArgument,
+      rawMessage: `invalid resources.${field}: must be at most ${limit}`,
+    };
+    const before = await state();
+
+    await expect(
+      profiles.createRunnerProfile({
+        organizationId,
+        profile: {
+          ...seeded,
+          name: "over-resource-limit",
+          resources: invalidResources,
+        },
+      }),
+    ).rejects.toMatchObject(error);
+    expect(await state()).toEqual(before);
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...seededRequest,
+        profile: { resources: invalidResources },
+        updateMask: { paths: ["resources"] },
+      }),
+    ).rejects.toMatchObject(error);
+    expect(await state()).toEqual(before);
+  },
+);
+
+const invalidIdleTtl = {
+  code: Code.InvalidArgument,
+  rawMessage: "invalid ttl: invalid idle_ttl: must not be greater than max_ttl",
+};
+
+test.each([1, 1_000_000])(
+  "rejects a runner profile with idle TTL %i nanoseconds above maximum TTL",
+  async (nanos) => {
+    const { profiles, organizationId, seeded, state } =
+      await runnerProfileFixture();
+    const before = await state();
+
+    await expect(
+      profiles.createRunnerProfile({
+        organizationId,
+        profile: {
+          ...seeded,
+          name: "over-idle-ttl-limit",
+          idleTtl: create(DurationSchema, { seconds: 60n, nanos }),
+          maxTtl: durationFromMs(60_000),
+        },
+      }),
+    ).rejects.toMatchObject(invalidIdleTtl);
+    expect(await state()).toEqual(before);
+  },
+);
+
+test.each([
+  ["idle_ttl", { idleTtl: durationFromMs(60_001) }],
+  ["max_ttl", { maxTtl: durationFromMs(59_999) }],
+] as const)(
+  "validates a runner profile's resulting TTLs when updating only %s",
+  async (path, profile) => {
+    const { profiles, seededRequest, state } = await runnerProfileFixture();
+    const ttl = durationFromMs(60_000);
+    await profiles.updateRunnerProfile({
+      ...seededRequest,
+      profile: { idleTtl: ttl, maxTtl: ttl },
+      updateMask: { paths: ["idle_ttl", "max_ttl"] },
+    });
+    const before = await state();
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...seededRequest,
+        profile,
+        updateMask: { paths: [path] },
+      }),
+    ).rejects.toMatchObject(invalidIdleTtl);
+    expect(await state()).toEqual(before);
+  },
+);
+
+test("creates and updates runner profiles at the resource limits with equal positive TTLs", async () => {
+  const { profiles, organizationId, seededRequest, seeded } =
+    await runnerProfileFixture();
+  const ttl = durationFromMs(1);
+  const limits = {
+    resources: create(ResourcesSchema, {
+      vcpuCount: 1024,
+      memoryMib: 16_777_216n,
+      diskGib: 1_048_576n,
+    }),
+    idleTtl: ttl,
+    maxTtl: ttl,
+  };
+  const { profile: created } = await profiles.createRunnerProfile({
+    organizationId,
+    profile: { ...seeded, ...limits, name: "resource-limits" },
+  });
+  if (!created) throw new Error("Expected the created profile");
+  await profiles.updateRunnerProfile({
+    ...seededRequest,
+    profile: limits,
+    updateMask: { paths: ["resources", "idle_ttl", "max_ttl"] },
+  });
+
+  for (const runnerProfileId of [
+    created.runnerProfileId,
+    seededRequest.runnerProfileId,
+  ]) {
+    const { profile } = await profiles.getRunnerProfile({
+      organizationId,
+      runnerProfileId,
+    });
+    expect(profile).toMatchObject(limits);
+  }
+});
 
 test("listing personal API keys reports expiry at the current time", async () => {
   const issuedAt = Date.UTC(2026, 0, 1);
