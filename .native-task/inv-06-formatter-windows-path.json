@@ -1,0 +1,47 @@
+{
+  "gid": "inv-06-formatter-windows-path",
+  "commit": "cc066e85563b5ab7700465ccdfaacbfe99656570",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "cc066e85563b5ab7700465ccdfaacbfe99656570",
+    "setup": "From the root of the Windows checkout of the worker revision, run the commands in order in the same PowerShell 7 session. Use a short checkout path. Copy the probe to files.copyTo after creating its parent directory. Use an installed Node 24 and Git for Windows 2.32 or newer. Record the actual checkout SHA and retain all three logs.",
+    "commands": [
+      "git rev-parse HEAD; if ((git rev-parse HEAD) -ne 'cc066e85563b5ab7700465ccdfaacbfe99656570') { throw 'Unexpected worker revision' }",
+      "New-Item -ItemType Directory -Force .t3-tmp/formatter-path-validation | Out-Null",
+      "$ValidationDir = (Resolve-Path .t3-tmp/formatter-path-validation).Path",
+      "$Probe = (Resolve-Path (Join-Path $ValidationDir 'formatter-path-probe.mjs')).Path",
+      "$Node = (Get-Command node.exe -CommandType Application | Select-Object -First 1).Source",
+      "$Git = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source",
+      "& $Node --version; & $Git --version; pnpm --version",
+      "$env:TEMP = $ValidationDir; $env:TMP = $ValidationDir",
+      "pnpm install --frozen-lockfile --ignore-scripts; if ($LASTEXITCODE -ne 0) { throw 'Worker dependency install failed' }",
+      "git -c core.longpaths=true worktree add --detach .t3-tmp/formatter-path-base 8c90863a7ecce91e40fb0ac20ce57e67d5200bda; if ($LASTEXITCODE -ne 0) { throw 'Baseline checkout failed' }",
+      "Push-Location .t3-tmp/formatter-path-base; try { pnpm install --frozen-lockfile --ignore-scripts; if ($LASTEXITCODE -ne 0) { throw 'Baseline dependency install failed' }; & $Node $Probe baseline $Git 2>&1 | Tee-Object -FilePath (Join-Path $ValidationDir 'baseline.log'); if ($LASTEXITCODE -ne 0) { throw 'Baseline reproduction failed' } } finally { Pop-Location }",
+      "& $Node $Probe focused $Git 2>&1 | Tee-Object -FilePath (Join-Path $ValidationDir 'focused.log'); if ($LASTEXITCODE -ne 0) { throw 'Focused Windows check failed' }",
+      "& $Node $Probe full $Git 2>&1 | Tee-Object -FilePath (Join-Path $ValidationDir 'full.log'); if ($LASTEXITCODE -ne 0) { throw 'Full Windows formatter suite failed' }"
+    ],
+    "expectedResults": [
+      "Each probe logs PROBE preflight with the absolute Node executable, one Path key and a supported Git version.",
+      "On the baseline, the test process can run git --version. The first fixture git init --quiet fails with spawnSync git ENOENT. The probe exits 0 after confirming that specific failure.",
+      "On the worker revision, the focused check passes all five cases, including the duplicate-key assertions and the real Lefthook commit. The full formatter fixture suite passes with its built-in Windows skips."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-06-formatter-windows-path/worker/.t3-tmp/validation/formatter-path-probe.mjs",
+      "copyTo": ".t3-tmp/formatter-path-validation/formatter-path-probe.mjs",
+      "regressionTest": "scripts/ci/format-changed.test.mjs",
+      "outputLogs": [
+        ".t3-tmp/formatter-path-validation/baseline.log",
+        ".t3-tmp/formatter-path-validation/focused.log",
+        ".t3-tmp/formatter-path-validation/full.log"
+      ]
+    },
+    "crossBuild": {
+      "status": "not-applicable",
+      "reason": "The change is a JavaScript fixture executed by Node. There is no compiled Windows project code. Linux syntax validation and the Windows environment branch assertions passed.",
+      "command": "node --check scripts/ci/format-changed.test.mjs"
+    }
+  }
+}
