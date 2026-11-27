@@ -1168,16 +1168,10 @@ func TestRelayCancelsPendingCredentialOnChannelLoss(t *testing.T) {
 func TestRelayDropsCredentialOfClosedChannel(t *testing.T) {
 	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
 	var calls atomic.Int32
-	entered := make(chan struct{}, 1)
-	gate := make(chan struct{})
-	hook := func(context.Context) error {
-		// The old response completes during the teardown and ignores the
-		// cancellation of its request.
-		if calls.Add(1) == 1 {
-			entered <- struct{}{}
-			<-gate
-		}
-		return nil
+	waitForRelease, entered, release := newRelayCredentialGate(t)
+	hook := func(ctx context.Context) error {
+		calls.Add(1)
+		return waitForRelease(ctx)
 	}
 	e.beforeAuth.Store(&hook)
 	e.execGrant(e.execReq("/bin/true"))
@@ -1188,7 +1182,7 @@ func TestRelayDropsCredentialOfClosedChannel(t *testing.T) {
 	}
 	e.ch.Close()
 	e.dp.ChannelLost(e.ch)
-	close(gate)
+	release()
 	e.noConn(500 * time.Millisecond)
 	// A new channel without a grant gets no relay dial either.
 	e.ch = newChannel(2)
@@ -1486,20 +1480,69 @@ func (e *relayEnv) relayRunning() bool {
 	return e.dp.relay.running
 }
 
-// gatedGrant installs one exec grant and returns once the loop waits in
-// the credential request. The returned function releases the request.
-func (e *relayEnv) gatedGrant(t *testing.T) (*ownsandv1.RelayGrant, func()) {
-	t.Helper()
-	var calls atomic.Int32
-	entered := make(chan struct{}, 1)
+// newRelayCredentialGate holds the first credential callback until release.
+// The callback ignores cancellation so tests can model a late response.
+func newRelayCredentialGate(t *testing.T) (func(context.Context) error, <-chan struct{}, func()) {
+	var started atomic.Bool
+	entered := make(chan struct{})
 	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+
 	hook := func(context.Context) error {
-		if calls.Add(1) == 1 {
-			entered <- struct{}{}
+		if !started.Swap(true) {
+			close(entered)
 			<-gate
 		}
 		return nil
 	}
+	return hook, entered, release
+}
+
+func TestRelayCredentialGate(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		explicitRelease bool
+	}{
+		{name: "cleanup releases callback"},
+		{name: "cleanup after explicit release", explicitRelease: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			returned := make(chan struct{})
+			waitForReturn := func(t *testing.T) {
+				t.Helper()
+				select {
+				case <-returned:
+				case <-time.After(5 * time.Second):
+					t.Fatal("credential callback did not return after release")
+				}
+			}
+			t.Run("credential request", func(t *testing.T) {
+				hook, entered, release := newRelayCredentialGate(t)
+				go func() {
+					defer close(returned)
+					_ = hook(context.Background())
+				}()
+				select {
+				case <-entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("credential callback did not enter its gate")
+				}
+				if tc.explicitRelease {
+					release()
+					waitForReturn(t)
+				}
+			})
+			waitForReturn(t)
+		})
+	}
+}
+
+// gatedGrant installs one exec grant and returns once the loop waits in
+// the credential request. The returned function releases the request.
+func (e *relayEnv) gatedGrant(t *testing.T) (*ownsandv1.RelayGrant, func()) {
+	t.Helper()
+	hook, entered, release := newRelayCredentialGate(t)
 	e.beforeAuth.Store(&hook)
 	g := e.execGrant(e.execReq("/bin/true"))
 	select {
@@ -1507,7 +1550,7 @@ func (e *relayEnv) gatedGrant(t *testing.T) (*ownsandv1.RelayGrant, func()) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("relay loop did not request a credential")
 	}
-	return g, func() { close(gate) }
+	return g, release
 }
 
 func (e *relayEnv) revokeGrant(g *ownsandv1.RelayGrant) {
