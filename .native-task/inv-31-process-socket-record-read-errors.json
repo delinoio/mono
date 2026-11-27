@@ -1,0 +1,56 @@
+{
+  "gid": "inv-31-process-socket-record-read-errors",
+  "commit": "47addef2e009367f852f9159adc2f3be93f239e4",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "47addef2e009367f852f9159adc2f3be93f239e4",
+    "setup": "Use the specified source revision in an unprivileged Bash shell at the repository root. Copy files.copyFrom to files.copyTo before running the command list. Use a short checkout path so its .t3-tmp fits the macOS Unix socket path limit. The process runtime requires Go and no virtualization entitlement, administrator access, CMake, or guest image.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(uname -s)\" = Darwin",
+      "test \"$(uname -m)\" = arm64",
+      "test \"$(id -u)\" -ne 0",
+      "test \"$(git rev-parse HEAD)\" = 47addef2e009367f852f9159adc2f3be93f239e4",
+      "mkdir -p .t3-tmp/native-socket-record",
+      "export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp\" COPYFILE_DISABLE=1 CGO_ENABLED=0",
+      "test \"$(printf %s \"$TMPDIR\" | wc -c | tr -d '[:space:]')\" -le 80",
+      "test \"$(shasum -a 256 .t3-tmp/native-socket-record/restart_socket_record_probe_test.go | cut -d ' ' -f 1)\" = 33cade14dfab683fff6451f30ebf871dd612480b3d5417d54d7171e9459fb1a0",
+      "printf '%s\\n' '{\"Replace\":{\"cmds/ownsand-agent/restart_socket_record_probe_test.go\":\".t3-tmp/native-socket-record/restart_socket_record_probe_test.go\"}}' > \".t3-tmp/native-socket-record/overlay.json\"",
+      "go test -mod=readonly -count=1 -timeout=120s -run 'Test.*(DeleteUntracked|Socket.*Directory|RestartRemovesProcessRuntimeFiles)' -v ./cmds/ownsand-agent/internal/vmruntime/processrt ./cmds/ownsand-agent/internal/sandboxes 2>&1 | tee .t3-tmp/native-socket-record/targeted.log",
+      "go test -mod=readonly -count=1 -timeout=120s -overlay \".t3-tmp/native-socket-record/overlay.json\" -run '^TestProbeProcessRuntimeRestartWithUnreadableSocketRecord$' -v ./cmds/ownsand-agent 2>&1 | tee .t3-tmp/native-socket-record/runtime.log"
+    ],
+    "expectedResults": [
+      "Both Go commands exit zero and execute all named permission and restart cases.",
+      "The probe verifies that the macOS guest helper opened a real filesystem socket outside the sandbox.",
+      "The first restart preserves all cleanup paths and an unchanged RUNNING disk record. Its loopback state report has no end reason.",
+      "The next restart removes the external socket and sandbox directories, then reports and persists FAILED/LOST_ON_DEVICE."
+    ],
+    "files": {
+      "copyFrom": "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-process-socket-record-read-errors/worker/.t3-tmp/restart_socket_record_probe_test.go",
+      "copyTo": ".t3-tmp/native-socket-record/restart_socket_record_probe_test.go",
+      "sha256": "33cade14dfab683fff6451f30ebf871dd612480b3d5417d54d7171e9459fb1a0",
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/processrt/processrt_test.go",
+        "cmds/ownsand-agent/internal/sandboxes/manager_processrt_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/native-socket-record/targeted.log",
+        ".t3-tmp/native-socket-record/runtime.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-process-socket-record-read-errors/worker/.t3-tmp/processrt.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-process-socket-record-read-errors/worker/.t3-tmp/sandboxes.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-process-socket-record-read-errors/worker/.t3-tmp/ownsand-agent.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-process-socket-record-read-errors/worker/.t3-tmp/restart-socket-probe-darwin-arm64.test",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-process-socket-record-read-errors/worker/.t3-tmp/darwin-arm64/ownsand-agent",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-31-process-socket-record-read-errors/worker/.t3-tmp/darwin-arm64/ownsand-guest"
+      ]
+    },
+    "unperformedOutsideScope": [
+      "Virtualization.framework guest boot and release signing are outside the process-runtime scenario. The macOS host has no guest image."
+    ]
+  }
+}
