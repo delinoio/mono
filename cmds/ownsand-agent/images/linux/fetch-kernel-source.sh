@@ -42,9 +42,12 @@ cache="$4"
 archive="$cache/linux-$version.tar.xz"
 
 # Prints nothing; the exit status says whether the file has the pinned checksum.
-verify() {
-  echo "$sha256  $1" | sha256sum -c --quiet - >/dev/null 2>&1
-}
+verify() (
+  # Hash standard input so a newline in the path cannot affect verification.
+  checksum="$(sha256sum < "$1")" || return 1
+  shopt -s nocasematch
+  [[ "${checksum%% *}" == "$sha256" ]]
+) 2>/dev/null
 
 if [ -d "$archive" ]; then
   echo "the kernel source path $archive is a directory; remove it and run the build again" >&2
