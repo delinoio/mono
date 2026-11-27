@@ -47,6 +47,7 @@ func billingEnvWith(t *testing.T, extra ...testenv.Option) (*testenv.Env, *accou
 	var env *testenv.Env
 	fake := accountstest.New(t, func() time.Time { return env.Clock.Now() })
 	opts := append([]testenv.Option{testenv.WithAccounts(fake), func(o *app.Options) {
+		o.WriteOwnerUnlinks = true
 		o.BillingStatusTiming = &billing.StatusTiming{Poll: time.Hour, Tick: time.Hour, UnlinkBackoffMin: time.Second, UnlinkBackoffMax: 5 * time.Minute}
 		o.BillingEnforceInterval = time.Hour
 		// No usage report in the background: its statuses would refresh the
@@ -426,8 +427,14 @@ func TestBillingPhasesOfLinkedOrganization(t *testing.T) {
 	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 	enforceBilling(t, env)
 	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
-	if !strings.Contains(env.Logs.String(), `"msg":"billing_sandbox_paused"`) {
+	const pauseEvent = `"msg":"billing_sandbox_paused"`
+	if countLogs(env, pauseEvent) == 0 {
 		t.Fatal("billing_sandbox_paused not logged")
+	}
+	for line := range strings.SplitSeq(env.Logs.String(), "\n") {
+		if strings.Contains(line, pauseEvent) && !strings.Contains(line, `"state":"SANDBOX_STATE_PAUSED"`) {
+			t.Errorf("billing pause event must show PAUSED: %s", line)
+		}
 	}
 
 	// Recovery: only the sandbox that billing paused resumes.

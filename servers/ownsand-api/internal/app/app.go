@@ -88,6 +88,8 @@ type Options struct {
 	// reporter and the status poll stay idle, and the billing RPCs that need
 	// delino-accounts fail with unavailable.
 	UsageClient accountsv1connect.UsageServiceClient
+	// WriteOwnerUnlinks enables durable intent creation after reader rollout.
+	WriteOwnerUnlinks bool
 	// BillingTiming overrides the metering intervals (tests).
 	BillingTiming *billing.Timing
 	// BillingStatusTiming overrides the billing status worker intervals
@@ -170,8 +172,8 @@ func New(opts Options) (*App, error) {
 		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost}
 	svc.Lease = l
 	statuses := billing.NewStatuses(billing.StatusOptions{
-		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
-		Metrics: opts.Metrics, Timing: opts.BillingStatusTiming,
+		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Ownership: l.Ownership, WhileHeld: l.WhileHeld, Client: opts.UsageClient,
+		Metrics: opts.Metrics, Timing: opts.BillingStatusTiming, WriteOwnerUnlinks: opts.WriteOwnerUnlinks,
 	})
 	svc.Billing = statuses
 	enforcer := api.NewBillingEnforcer(svc, opts.BillingEnforceInterval)

@@ -223,9 +223,10 @@ func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityRepor
 	caps.MacOSHardwareModels = a.macOSHardwareModels(caps.MacOSHardwareModels)
 	free, _ := a.opts.FreeDisk()
 	report := &ownsandv1.CapabilityReport{
-		HostOs:       sysinfo.HostOS(),
-		Arch:         sysinfo.Arch(),
-		AgentVersion: version.Version,
+		HostOs:               sysinfo.HostOS(),
+		Arch:                 sysinfo.Arch(),
+		AgentVersion:         version.Version,
+		ResumeFenceSupported: true,
 		Capabilities: &ownsandv1.DeviceCapabilities{
 			LogicalCpuCount:      sysinfo.LogicalCPUs(),
 			MemoryMib:            sysinfo.MemoryMiB(),

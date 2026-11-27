@@ -285,6 +285,7 @@ func TestStaleExportResultCannotChangeRetry(t *testing.T) {
 	}
 
 	// The first attempt's result arrives late, with its own parts.
+	inserts := countManifestInserts(t, env)
 	sendExportResult(agent, first, partsFor(firstGrant))
 	testenv.Eventually(t, "stale result logged", func() bool { return strings.Contains(env.Logs.String(), `"msg":"export_result_stale"`) })
 	if got := snapshotExportState(t, c, org.ID, snapID); got != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING {
@@ -292,6 +293,9 @@ func TestStaleExportResultCannotChangeRetry(t *testing.T) {
 	}
 	if got := manifestHashes(t, env, snapID); len(got) != 0 {
 		t.Fatalf("the stale result stored %d parts", len(got))
+	}
+	if n := inserts(); n != 0 {
+		t.Fatalf("the stale result ran %d manifest insert statements", n)
 	}
 	// The stale attempt can no longer get URLs on the new channel to write
 	// to its own prefix: URLs always address the current attempt.
