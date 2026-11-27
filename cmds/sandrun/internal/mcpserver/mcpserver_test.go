@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -498,6 +499,157 @@ func TestExecWithinAndBeyondWait(t *testing.T) {
 	// A timeout stops the command.
 	if _, isErr := h.call("exec", map[string]any{"session_id": id, "command": []string{"sleep", "10"}, "timeout_seconds": 1}, &r); isErr || !r.TimedOut {
 		t.Fatalf("timeout exec = %+v", r)
+	}
+}
+
+func TestRunWithWaitReturnsBeforeSDKCleanup(t *testing.T) {
+	const (
+		execID = "test-exec"
+		wait   = 20 * time.Millisecond
+	)
+	tests := []struct {
+		name         string
+		stdoutOffset int64
+		stderrOffset int64
+		events       []sandrun.ExecEvent
+		want         execResult
+	}{
+		{name: "unconfirmed"},
+		{
+			name: "started",
+			events: []sandrun.ExecEvent{
+				{Kind: sandrun.ExecEventStarted, ExecID: execID},
+				{Kind: sandrun.ExecEventStderr, ExecID: execID, Data: []byte("log")},
+			},
+			want: execResult{
+				ExecID: execID, Running: true, NextStderrOffset: 3, Stderr: Output{Text: "log", To: 3},
+			},
+		},
+		{
+			name:         "attach output",
+			stdoutOffset: 12,
+			stderrOffset: 34,
+			events:       []sandrun.ExecEvent{{Kind: sandrun.ExecEventStdout, ExecID: execID, Offset: 12, Data: []byte("hi")}},
+			want: execResult{
+				ExecID: execID, Running: true, NextStdoutOffset: 14, NextStderrOffset: 34,
+				Stdout: Output{Text: "hi", From: 12, To: 14}, Stderr: Output{From: 34, To: 34},
+			},
+		},
+		{
+			name:         "attach missing range",
+			stdoutOffset: 12,
+			stderrOffset: 34,
+			events: []sandrun.ExecEvent{{
+				Kind: sandrun.ExecEventOutputTruncated, ExecID: execID,
+				MissingStdout: sandrun.ByteRange{From: 12, To: 16},
+			}},
+			want: execResult{
+				ExecID: execID, Running: true, NextStdoutOffset: 16, NextStderrOffset: 34,
+				Stdout: Output{From: 12, To: 16}, Stderr: Output{From: 34, To: 34},
+				OutputTruncated: []Truncated{{MissingStdout: &sandrun.ByteRange{From: 12, To: 16}}},
+			},
+		},
+	}
+	for _, tc := range tests {
+		run := func(t *testing.T) {
+			s := New(Config{maxWait: wait})
+			defer s.Close()
+			col := newCollector(tc.stdoutOffset, tc.stderrOffset)
+			if len(tc.want.OutputTruncated) > 0 {
+				// Leave room for the collector to append in place after the response.
+				col.truncated = make([]Truncated, 0, 2)
+			}
+			canceled, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			releaseSDK := sync.OnceFunc(func() { close(release) })
+			defer func() {
+				releaseSDK()
+				<-finished
+			}()
+			returned := make(chan execOutcome, 1)
+			go func() {
+				res, err := s.runWithWait(context.Background(), wait, col, func(ctx context.Context) (*sandrun.ExecResult, error) {
+					defer close(finished)
+					for _, ev := range tc.events {
+						_ = col.on(ev)
+					}
+					<-ctx.Done()
+					close(canceled)
+					<-release
+					_ = col.on(sandrun.ExecEvent{
+						Kind: sandrun.ExecEventOutputTruncated, ExecID: execID,
+						MissingStderr: sandrun.ByteRange{From: 37, To: 40},
+					})
+					return nil, ctx.Err()
+				})
+				returned <- execOutcome{res, err}
+			}()
+			<-canceled
+			var o execOutcome
+			select {
+			case o = <-returned:
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("tool still waiting while SDK cleanup is blocked")
+			}
+			if len(tc.events) == 0 {
+				if o.res != nil || !errors.Is(o.err, errExecUnconfirmed) {
+					t.Fatalf("unconfirmed call returned %+v, %v", o.res, o.err)
+				}
+				return
+			}
+			if o.res != nil || o.err != nil {
+				t.Fatalf("confirmed call returned %+v, %v", o.res, o.err)
+			}
+			got := col.result(execID, o.res)
+			releaseSDK()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("result = %+v, want %+v", got, tc.want)
+			}
+			<-finished
+			if len(got.OutputTruncated) > 0 && &got.OutputTruncated[0] == &col.truncated[0] {
+				t.Error("response shares its truncation slice with the collector")
+			}
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, run)
+		})
+	}
+}
+
+func TestRunWithWaitStopsOnCallerCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wait time.Duration
+	}{
+		{name: "during wait", wait: MaxWait},
+		{name: "during grace", wait: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{})
+			t.Cleanup(s.Close)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			started, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
+			returned := make(chan error, 1)
+			go func() {
+				_, err := s.runWithWait(ctx, tc.wait, newCollector(0, 0), func(ctx context.Context) (*sandrun.ExecResult, error) {
+					close(started)
+					<-release
+					return nil, ctx.Err()
+				})
+				returned <- err
+			}()
+			<-started
+			cancel()
+			select {
+			case err := <-returned:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("canceled caller received %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("tool still waiting after caller cancellation")
+			}
+		})
 	}
 }
 
