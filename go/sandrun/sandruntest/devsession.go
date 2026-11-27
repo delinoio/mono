@@ -692,6 +692,14 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
 	cmd := newExecCommand(ctx, req.GetCommand(), req.GetEnv())
+	var timedOut bool
+	cancelCommand := cmd.Cancel
+	cmd.Cancel = func() error {
+		deadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		err := cancelCommand()
+		timedOut = deadline && err == nil
+		return err
+	}
 	cmd.Dir = dir
 	cmd.Stdout = writerFunc(func(b []byte) (int, error) { p.append(0, b); return len(b), nil })
 	cmd.Stderr = writerFunc(func(b []byte) (int, error) { p.append(1, b); return len(b), nil })
@@ -709,8 +717,8 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 	go func() {
 		defer done()
 		defer cancel()
+		// Wait joins the cancellation callback before it drains the output.
 		_ = cmd.Wait()
-		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 		ex := &sandrunv1.DevSessionExecExited{TimedOut: timedOut, EndTime: timestamppb.Now()}
 		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 			ex.Status = &sandrunv1.DevSessionExecExited_Signal{Signal: int32(ws.Signal())}
