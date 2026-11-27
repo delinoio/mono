@@ -88,32 +88,45 @@ func TestEnrollTimesOut(t *testing.T) {
 // context ends the call long before the enrollment deadline, with the
 // caller's error and not the timeout error, and keeps the pending key.
 func TestEnrollCallerCancellationEndsRequest(t *testing.T) {
-	cp, st, client := stalledEnrollSetup(t, time.Hour)
+	const waitLimit = 10 * time.Second
+	cp, st, client := newEnrollFixture(t)
+	client.AuthTimeout = time.Hour
+	hold := cp.HoldNextEnroll()
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		// Cancel once the fake has the request.
-		for len(cp.EnrollPublicKeys()) == 0 {
-			time.Sleep(5 * time.Millisecond)
-		}
-		cancel()
-	}()
-	began := time.Now()
-	_, err := Enroll(ctx, st, client, testcp.Token, "host", quietLogger())
+	wait := time.NewTimer(waitLimit)
+	defer wait.Stop()
+	result := enrollAsync(t, ctx, st, client)
+	select {
+	case <-hold.Arrived():
+	case r := <-result:
+		t.Fatalf("enrollment returned before reaching the control plane: error = %v", r.err)
+	case <-wait.C:
+		t.Fatal("timed out waiting for enrollment to reach the control plane")
+	}
+
+	cancel()
+	var err error
+	select {
+	case r := <-result:
+		err = r.err
+	case <-wait.C:
+		t.Fatal("timed out waiting for enrollment to return after caller cancellation")
+	}
 	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrEnrollTimeout) {
 		t.Fatalf("enroll error = %v, want a cancellation", err)
 	}
-	if took := time.Since(began); took > 10*time.Second {
-		t.Fatalf("enroll took %s after cancellation", took)
-	}
 	pubKey := requirePendingKey(t, st)
 
-	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); err != nil {
+	retryCtx, cancelRetry := context.WithTimeout(t.Context(), waitLimit)
+	defer cancelRetry()
+	if _, err := Enroll(retryCtx, st, client, testcp.Token, "host", quietLogger()); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	keys := cp.EnrollPublicKeys()
-	if len(keys) != 2 || !bytes.Equal(keys[1], pubKey) {
-		t.Fatalf("retry public keys: %x, want %x", keys, pubKey)
+	if len(keys) != 2 || !bytes.Equal(keys[0], pubKey) || !bytes.Equal(keys[1], pubKey) {
+		t.Fatalf("public keys sent: %x, want twice %x", keys, pubKey)
 	}
 }
 

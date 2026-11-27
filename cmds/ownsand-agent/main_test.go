@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
 )
 
 func TestCLIEnrollStatusReset(t *testing.T) {
@@ -150,6 +152,69 @@ func TestCLIEnrollRejectsHostlessFlagBeforeCreatingIdentity(t *testing.T) {
 	if got := len(cp.EnrollPublicKeys()); got != 0 {
 		t.Fatalf("control plane got %d enrollment requests; want zero", got)
 	}
+}
+
+func TestCLIOutputWrite(t *testing.T) {
+	clearAgentEnv(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := serviceDefinition(exe, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeErr := errors.New("stdout is full")
+	for _, command := range []struct {
+		name      string
+		args      []string
+		want      string
+		operation string
+	}{
+		{"version", []string{"version"}, version.Version + "\n", "write version"},
+		{"service print", []string{"service", "print"}, definition, "write service definition"},
+	} {
+		t.Run(command.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(command.args, nil, &stdout, &stderr); code != exitOK {
+				t.Fatalf("exit code = %d, stderr = %q; want %d", code, stderr.String(), exitOK)
+			}
+			if got := stdout.String(); got != command.want {
+				t.Errorf("stdout = %q; want %q", got, command.want)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("stderr = %q; want empty", stderr.String())
+			}
+
+			for _, accepted := range []int{0, 2} {
+				t.Run("accepted-"+strconv.Itoa(accepted), func(t *testing.T) {
+					stdout := &cliOutputErrorWriter{accept: accepted, err: writeErr}
+					var stderr bytes.Buffer
+					if code := run(command.args, nil, stdout, &stderr); code != exitError {
+						t.Errorf("exit code = %d; want %d", code, exitError)
+					}
+					if got, want := stdout.output.String(), command.want[:accepted]; got != want {
+						t.Errorf("stdout = %q; want accepted prefix %q", got, want)
+					}
+					if got, want := stderr.String(), "ownsand-agent: "+command.operation+": "+writeErr.Error()+"\n"; got != want {
+						t.Errorf("stderr = %q; want %q", got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+type cliOutputErrorWriter struct {
+	output bytes.Buffer
+	accept int
+	err    error
+}
+
+func (w *cliOutputErrorWriter) Write(p []byte) (int, error) {
+	n, _ := w.output.Write(p[:min(w.accept, len(p))])
+	return n, w.err
 }
 
 func TestCLIMisc(t *testing.T) {
@@ -388,16 +453,57 @@ func TestStatusAbsentStatusFile(t *testing.T) {
 	}
 }
 
-// A valid status.json keeps the existing report and exit 0.
 func TestStatusValidStatusFile(t *testing.T) {
-	st := statusFixture(t)
-	if err := st.SaveStatus(&agent.Status{Connected: true, AgentVersion: "1.2.3", Runtime: "process"}); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name             string
+		snapshot         agent.Status
+		wantCapabilities string
+	}{
+		{
+			name: "with capability report",
+			snapshot: agent.Status{
+				GuestOSes:      []string{"GUEST_OS_LINUX", "GUEST_OS_MACOS"},
+				BaseImages:     []string{"BASE_IMAGE_LINUX"},
+				CapabilitiesAt: time.Date(2026, 11, 22, 14, 25, 28, 0, time.Local),
+				Checks: []agent.StatusCheck{
+					{ID: "virtualization-entitlement", Passed: true, Detail: "the agent executable has the entitlement"},
+					{ID: "macos-base-image", Detail: "the macOS base image is not built"},
+					{ID: "outbound-network", Passed: true},
+				},
+			},
+			wantCapabilities: " guest OSes GUEST_OS_LINUX, GUEST_OS_MACOS; base images BASE_IMAGE_LINUX (report of 2026-11-22 14:25:28)\n" +
+				"  virtualization-entitlement: passed (the agent executable has the entitlement)\n" +
+				"  macos-base-image: failed (the macOS base image is not built)\n" +
+				"  outbound-network: passed",
+		},
+		{
+			name:             "without capability report",
+			wantCapabilities: " unknown (no capability report yet)",
+		},
 	}
-	var out, errb bytes.Buffer
-	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
-	if code != exitOK || !strings.Contains(out.String(), "Connection: connected") || !strings.Contains(out.String(), "Agent: 1.2.3, runtime process") || strings.Contains(out.String(), "has not run") || errb.Len() != 0 {
-		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := statusFixture(t)
+			snapshot := tt.snapshot
+			snapshot.Connected = true
+			snapshot.AgentVersion = "1.2.3"
+			snapshot.Runtime = "process"
+			if err := st.SaveStatus(&snapshot); err != nil {
+				t.Fatal(err)
+			}
+
+			var out, errb bytes.Buffer
+			code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+			stdout := out.String()
+			if code != exitOK || !strings.Contains(stdout, "Connection: connected") || !strings.Contains(stdout, "Agent: 1.2.3, runtime process") || strings.Contains(stdout, "has not run") || errb.Len() != 0 {
+				t.Fatalf("status: %d %q / %q", code, stdout, errb.String())
+			}
+			_, rest, foundStart := strings.Cut(stdout, "\nCapabilities:")
+			capabilities, _, foundEnd := strings.Cut(rest, "\nSandboxes:")
+			if !foundStart || !foundEnd || capabilities != tt.wantCapabilities {
+				t.Fatalf("stdout = %q; want capability section %q", stdout, "Capabilities:"+tt.wantCapabilities)
+			}
+		})
 	}
 }
 
@@ -450,11 +556,15 @@ func TestStatusControlPlaneURL(t *testing.T) {
 	}
 }
 
-// A status.json that cannot be decoded or read is an error: a diagnostic on
-// standard error, exit 1 and never the first-run line. The other sections
-// still print.
+// An invalid status record or a read error produces a diagnostic and exit 1.
+// Both inventory counts still print.
 func TestStatusUnreadableStatusFile(t *testing.T) {
 	tests := map[string]func(t *testing.T, path string){
+		"null": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("null"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
 		"malformed": func(t *testing.T, path string) {
 			if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 				t.Fatal(err)
@@ -483,8 +593,8 @@ func TestStatusUnreadableStatusFile(t *testing.T) {
 			if !strings.Contains(errb.String(), "ownsand-agent: read status.json:") {
 				t.Fatalf("stderr = %q, want a read status.json diagnostic", errb.String())
 			}
-			if strings.Contains(out.String(), "has not run") || strings.Contains(out.String(), "Connection:") {
-				t.Fatalf("stdout = %q, must not report a connection state", out.String())
+			if strings.Contains(out.String(), "Connection:") || strings.Contains(out.String(), "Capabilities:") {
+				t.Fatalf("stdout = %q, must not report connection state or capabilities", out.String())
 			}
 			if !strings.Contains(out.String(), "Sandboxes: 0 records") || !strings.Contains(out.String(), "Snapshots: 0") {
 				t.Fatalf("stdout = %q, want the other sections", out.String())

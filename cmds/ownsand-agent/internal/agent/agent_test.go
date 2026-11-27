@@ -325,11 +325,19 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		<-release
 	}
 	written := make(chan struct{})
+	var finishWriterOnce sync.Once
+	finishWriter := func() {
+		finishWriterOnce.Do(func() {
+			close(release)
+			waitClosed(t, written, "the status write to finish")
+		})
+	}
+	t.Cleanup(finishWriter)
 	go func() {
 		defer close(written)
 		a.writeStatus()
 	}()
-	<-entered
+	waitClosed(t, entered, "the status write to enter the hook")
 
 	removed := make(chan error, 1)
 	go func() { removed <- a.removeDevice(context.Background()) }()
@@ -338,7 +346,7 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 		t.Fatalf("removal finished while a status write was in flight: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(release)
+	finishWriter()
 	select {
 	case err := <-removed:
 		if !errors.Is(err, ErrRemoved) {
@@ -347,7 +355,6 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("removal did not finish")
 	}
-	<-written
 	requireEmptyStateDir(t, st)
 
 	// The writer stays fenced: later writes do nothing.

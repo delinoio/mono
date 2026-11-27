@@ -163,7 +163,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	c := colors{on: !*noColor && os.Getenv("NO_COLOR") == ""}
 	switch cmd {
 	case "version":
-		fmt.Fprintln(stdout, version.Version)
+		if _, err := fmt.Fprintln(stdout, version.Version); err != nil {
+			fmt.Fprintln(stderr, "ownsand-agent: write version:", err)
+			return exitError
+		}
 		return exitOK
 	case "enroll":
 		return enroll(cfg, *apiURL, *tokenFile, *name, stdin, stdout, stderr, c)
@@ -370,8 +373,11 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 	}
 	fmt.Fprintf(stdout, "%s %s (device %s, organization %s)\n", c.bold("Enrollment:"), c.ok("enrolled"), id.DeviceID, id.OrganizationID)
 	a, agentErr := st.LoadAgent()
-	var s agent.Status
+	var s *agent.Status
 	statusErr := st.LoadStatus(&s)
+	if statusErr == nil && s == nil {
+		statusErr = errors.New("expected a status object, got null")
+	}
 	if statusErr == nil && s.APIURL != "" {
 		fmt.Fprintf(stdout, "%s %s\n", c.bold("Control plane:"), s.APIURL)
 	} else if agentErr == nil {
@@ -398,7 +404,7 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		fmt.Fprintf(stdout, "%s %s (status of %s)\n", c.bold("Connection:"), conn, s.UpdatedAt.Format("2006-01-02 15:04:05"))
 		fmt.Fprintf(stdout, "%s %s, runtime %s\n", c.bold("Agent:"), s.AgentVersion, s.Runtime)
 		fmt.Fprintf(stdout, "%s %s %s\n", c.bold("Update:"), s.UpdateState, s.UpdateTarget)
-		printCapabilities(stdout, s, c)
+		printCapabilities(stdout, *s, c)
 	}
 	// A failed inventory read is an error, never a smaller count: the partial
 	// result is discarded, the line shows the count as unavailable, the
@@ -500,6 +506,9 @@ func servicePrint(stateDir string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ownsand-agent: render service definition:", err)
 		return exitError
 	}
-	fmt.Fprint(stdout, def)
+	if _, err := fmt.Fprint(stdout, def); err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: write service definition:", err)
+		return exitError
+	}
 	return exitOK
 }

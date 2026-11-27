@@ -379,15 +379,16 @@ func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 	id := resp.Msg.GetProfile().GetRunnerProfileId()
 	// The held update stands in for another admin's warm_count update that
 	// commits after this name update read the profile.
-	commit := holdTx(t, w.env, "UPDATE runner_profiles SET warm_count = 3 WHERE runner_profile_id = $1", id)
+	holder := holdTx(t, w.env, "UPDATE runner_profiles SET warm_count = 3 WHERE runner_profile_id = $1", id)
 	errc := make(chan error, 1)
 	go func() {
 		_, err := admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&sandrunv1.UpdateRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: id,
 			Profile: &sandrunv1.RunnerProfile{Name: "renamed"}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"name"}}}))
 		errc <- err
 	}()
-	waitForLockWaiter(t, w.env)
-	commit()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR UPDATE"})
+	holder.commit()
 	if err := <-errc; err != nil {
 		t.Fatalf("name update: %v", err)
 	}
@@ -429,7 +430,7 @@ func TestRunnerProfileResourceUpdates(t *testing.T) {
 	}
 
 	// Commit the memory change after the vCPU update tries to lock the row.
-	commit := holdTx(t, w.env, "UPDATE runner_profiles SET memory_mib = 16384 WHERE runner_profile_id = $1", id)
+	holder := holdTx(t, w.env, "UPDATE runner_profiles SET memory_mib = 16384 WHERE runner_profile_id = $1", id)
 	type result struct {
 		resp *connect.Response[sandrunv1.UpdateRunnerProfileResponse]
 		err  error
@@ -439,8 +440,9 @@ func TestRunnerProfileResourceUpdates(t *testing.T) {
 		resp, err := update(&sandrunv1.Resources{VcpuCount: 8}, "resources.vcpu_count")
 		done <- result{resp: resp, err: err}
 	}()
-	waitForLockWaiter(t, w.env)
-	commit()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR UPDATE"})
+	holder.commit()
 	concurrent := <-done
 	if concurrent.err != nil {
 		t.Fatal(concurrent.err)
@@ -581,7 +583,7 @@ func TestCreateRunnerProfileIntegrationDeletedDuringInsert(t *testing.T) {
 
 	// The vendor lookup sees the integration until the deletion commits.
 	// The insert's foreign-key check waits for that transaction to finish.
-	commit := holdTx(t, w.env, "DELETE FROM agent_integrations WHERE agent_integration_id = $1", input.AgentIntegrationId)
+	holder := holdTx(t, w.env, "DELETE FROM agent_integrations WHERE agent_integration_id = $1", input.AgentIntegrationId)
 	result := make(chan error, 1)
 	go func() {
 		_, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&sandrunv1.CreateRunnerProfileRequest{
@@ -589,8 +591,9 @@ func TestCreateRunnerProfileIntegrationDeletedDuringInsert(t *testing.T) {
 		}))
 		result <- err
 	}()
-	waitForLockWaiter(t, w.env)
-	commit()
+	waitForLockWaiter(t, w.env, lockWait{blockerPID: holder.pid,
+		query: "INSERT INTO runner_profiles (runner_profile_id, organization_id, name, workload_kind, agent_integration_id"})
+	holder.commit()
 
 	select {
 	case err := <-result:
