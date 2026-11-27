@@ -93,14 +93,14 @@ func fileExists(p string) bool {
 }
 
 // hyperVCheck reports whether the HCS is reachable from this process.
-func hyperVCheck() (bool, string) {
-	if err := hcsLoad(); err != nil {
+func hyperVCheck(isElevated func() bool) (bool, string) {
+	if err := hcsLoadFunc(); err != nil {
 		return false, fmt.Sprintf("the Host Compute Service API (computecore.dll) is not available; enable Hyper-V: %v", err)
 	}
-	if !windows.GetCurrentProcessToken().IsElevated() {
+	if !isElevated() {
 		return false, "the agent process is not elevated; the Host Compute Service needs an Administrator or SYSTEM"
 	}
-	systems, err := enumerateSystems(Owner)
+	systems, err := enumerateSystemsFunc(Owner)
 	if err != nil {
 		return false, fmt.Sprintf("the Host Compute Service is not reachable: %v", err)
 	}
@@ -113,7 +113,7 @@ func (r *Runtime) Capabilities(context.Context) vmruntime.Capabilities {
 	check := func(id string, passed bool, detail string) {
 		caps.Checks = append(caps.Checks, &ownsandv1.HypervisorCheck{CheckId: id, Passed: passed, Detail: detail})
 	}
-	hv, detail := hyperVCheck()
+	hv, detail := hyperVCheck(windows.GetCurrentProcessToken().IsElevated)
 	check(checkHyperV, hv, detail)
 	image := fileExists(r.opts.Kernel) && fileExists(r.opts.Rootfs)
 	if image {
@@ -891,10 +891,8 @@ func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	return nil
 }
 
-// hcsLoadFunc and enumerateSystemsFunc are the HCS calls that Running makes.
-// They are variables only so that tests can inject a load failure and an
-// enumeration result without a Hyper-V host; remove them when the HCS calls
-// sit behind an interface.
+// Inventory tests replace these HCS calls to exercise Running and the
+// Hyper-V check without a Hyper-V host.
 var (
 	hcsLoadFunc          = hcsLoad
 	enumerateSystemsFunc = enumerateSystems
