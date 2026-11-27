@@ -393,16 +393,18 @@ export type ListBillingStatusChangesRequest = Message<"delino.accounts.v1.ListBi
   service: ServiceId;
 
   /**
-   * Return statuses with a sequence greater than this value. 0 returns
-   * every linked organization. Negative values fail with
-   * `invalid_argument`.
+   * Return statuses with a sequence greater than this value. Set this field
+   * to 0 for the first page of a traversal of current links. Negative values
+   * fail with `invalid_argument`.
    *
    * @generated from field: int64 after_sequence = 2;
    */
   afterSequence: bigint;
 
   /**
-   * Default 50, maximum 200.
+   * The effective page size is 50 when this field is omitted or 0, the
+   * requested size for values from 1 through 200, and 200 for larger values.
+   * Negative values fail with `invalid_argument`.
    *
    * @generated from field: int32 page_size = 3;
    */
@@ -426,9 +428,10 @@ export type ListBillingStatusChangesResponse = Message<"delino.accounts.v1.ListB
   statuses: OrganizationBillingStatus[];
 
   /**
-   * Cursor for the next call: the highest sequence in statuses, or
-   * after_sequence when statuses is empty. Fewer than page_size statuses
-   * mean that the caller is up to date.
+   * The highest sequence in statuses. On an empty page, this field equals
+   * the input after_sequence. Stop when the page contains fewer statuses
+   * than the effective page size. After a full page, set after_sequence to
+   * this value in the next request.
    *
    * @generated from field: int64 next_sequence = 2;
    */
@@ -996,11 +999,11 @@ export const UsageService: GenService<{
     output: typeof ReportUsageResponseSchema;
   },
   /**
-   * List the current billing status of organizations whose status changed
-   * after a cursor, for polling. Statuses are ordered by sequence, with at
-   * most one entry per organization (its latest status). after_sequence 0
-   * returns every linked organization of the service. Only linked
-   * organizations appear; an unlink adds no entry.
+   * Poll for a page of current billing statuses with a sequence greater than
+   * after_sequence. Each page lists statuses in ascending sequence order,
+   * with at most one current status per linked organization. An unlink adds
+   * no entry. Set after_sequence to 0 to start a paginated traversal of the
+   * service's current links.
    *
    * @generated from rpc delino.accounts.v1.UsageService.ListBillingStatusChanges
    */

@@ -469,6 +469,43 @@ describe("billing accounts", () => {
     await refocus();
     expect(nameField().value).toBe("Beta");
   });
+
+  test("waits for the post-save read even if a pre-save read returns first", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const preSaveRead = deferNextCall(api, "GetBillingAccount");
+    await refocus();
+    expect(calls(api, "GetBillingAccount")).toHaveLength(2);
+
+    const postSaveRead = deferNextCall(api, "GetBillingAccount");
+    try {
+      await type(nameField(), "  Alpha  ");
+      await click(saveNameButton());
+      await waitFor(() =>
+        expect(calls(api, "GetBillingAccount")).toHaveLength(3),
+      );
+      renameElsewhere(api, "Beta");
+      preSaveRead.release();
+      await settle();
+      expect(nameField().value).toBe("Alpha");
+      expect(saveNameButton().disabled).toBe(true);
+      expect(
+        screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
+      ).toBeTruthy();
+
+      postSaveRead.release();
+      await screen.findByRole("heading", { name: "Beta", level: 1 });
+      expect(nameField().value).toBe("Beta");
+
+      renameElsewhere(api, "Gamma");
+      await refocus();
+      await screen.findByRole("heading", { name: "Gamma", level: 1 });
+      expect(nameField().value).toBe("Gamma");
+    } finally {
+      preSaveRead.release();
+      postSaveRead.release();
+    }
+  });
 });
 
 async function balanceText() {

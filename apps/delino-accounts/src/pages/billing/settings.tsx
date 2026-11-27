@@ -118,22 +118,24 @@ function SettingsForm({
 }
 
 function NameSettings() {
-  const { billingAccountId, name, role } = useBillingAccount();
+  const { billingAccountId, name, role, queryKey, readVersion } =
+    useBillingAccount();
   const queryClient = useQueryClient();
   const update = useMutation(BillingAccountService.method.updateBillingAccount);
   const [draft, setDraft] = useState<{ value: string }>();
-  const [savedName, setSavedName] = useState<string>();
+  const [savedName, setSavedName] = useState<{
+    value: string;
+    readVersion: number;
+  }>();
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const editable = can(role, Permission.ManageMembers);
-  const awaitingSavedName = savedName !== undefined && savedName !== name;
-  if (savedName === name) setSavedName(undefined);
-  // While saving or waiting for the saved name to arrive, the fetched name
-  // can be stale. A draft that matches it may still be an unsaved edit.
-  if (!saving && !awaitingSavedName && draft?.value === name) {
-    setDraft(undefined);
+  const awaitingRead =
+    savedName !== undefined && readVersion <= savedName.readVersion;
+  if (savedName !== undefined && !awaitingRead) {
+    setSavedName(undefined);
   }
-  const value = draft?.value ?? savedName ?? name;
+  const value = draft?.value ?? (awaitingRead ? savedName.value : name);
   return (
     <SettingsForm
       title="Name"
@@ -149,7 +151,14 @@ function NameSettings() {
         setSaving(true);
         try {
           await update.mutateAsync({ billingAccountId, name: checked.value });
-          setSavedName(checked.value);
+          // Snapshot the cache after the mutation, before invalidation replaces
+          // any in-flight read. A failed read does not advance the count.
+          setSavedName({
+            value: checked.value,
+            readVersion:
+              queryClient.getQueryState(queryKey)?.dataUpdateCount ??
+              readVersion,
+          });
           // Each edit creates a new draft, even if the user types the same text.
           setDraft((latest) => (latest === draft ? undefined : latest));
           await invalidateServices(queryClient, BillingAccountService);
@@ -162,7 +171,14 @@ function NameSettings() {
       <TextField
         label="Billing account name"
         value={value}
-        onChange={(event) => setDraft({ value: event.target.value })}
+        onChange={(event) => {
+          const value = event.target.value;
+          // During a save or its refresh, matching the fetched name can
+          // still be a new edit because the fetched name may be stale.
+          setDraft(
+            !saving && !awaitingRead && value === name ? undefined : { value },
+          );
+        }}
         error={error}
         disabled={!editable}
         autoComplete="off"

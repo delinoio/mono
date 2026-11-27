@@ -281,13 +281,43 @@ type Transaction struct {
 	CustomData     map[string]any    `json:"custom_data"`
 	CurrencyCode   string            `json:"currency_code"`
 	Items          []TransactionItem `json:"items"`
-	Details        struct {
+	// Keep optional payment data separate so malformed attempts do not
+	// invalidate the rest of a transaction.
+	Payments json.RawMessage `json:"payments"`
+	Details  struct {
 		Totals Totals `json:"totals"`
 	} `json:"details"`
 	BillingPeriod *Period    `json:"billing_period"`
 	BilledAt      *time.Time `json:"billed_at"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+type paymentStatus string
+
+const paymentCaptured paymentStatus = "captured"
+
+// SingleCaptureTime returns the capture time when exactly one payment
+// attempt was captured and its timestamp is usable. Otherwise it returns
+// the zero time.
+func (txn Transaction) SingleCaptureTime() time.Time {
+	var attempts []struct {
+		Status     paymentStatus   `json:"status"`
+		CapturedAt json.RawMessage `json:"captured_at"`
+	}
+	if json.Unmarshal(txn.Payments, &attempts) != nil {
+		return time.Time{}
+	}
+	var capturedAt time.Time
+	for _, attempt := range attempts {
+		if attempt.Status != paymentCaptured {
+			continue
+		}
+		if !capturedAt.IsZero() || json.Unmarshal(attempt.CapturedAt, &capturedAt) != nil || capturedAt.IsZero() {
+			return time.Time{}
+		}
+	}
+	return capturedAt
 }
 
 // TransactionItem is one item of a transaction.

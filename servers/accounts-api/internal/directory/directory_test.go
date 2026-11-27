@@ -119,6 +119,77 @@ func TestLogtoUser(t *testing.T) {
 	}
 }
 
+func TestLogtoUserRetryDoesNotJoinCompletedRefresh(t *testing.T) {
+	logStarted := make(chan struct{})
+	releaseLog := make(chan struct{})
+	t.Cleanup(func() { close(releaseLog) })
+	logger := slog.New(&pausedTokenLoadedHandler{
+		Handler: slog.NewJSONHandler(io.Discard, nil),
+		started: logStarted,
+		release: releaseLog,
+	})
+
+	trace := &logtoRequestTrace{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oidc/token":
+			trace.mu.Lock()
+			trace.tokens++
+			n := trace.tokens
+			trace.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(tokenFixture(n))
+		case "/api/users/rejected":
+			auth := r.Header.Get("Authorization")
+			trace.mu.Lock()
+			trace.profiles = append(trace.profiles, auth)
+			trace.mu.Unlock()
+			if auth != "Bearer tok2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			fallthrough
+		case "/api/users/u1":
+			_, _ = io.WriteString(w, `{"name":"Ann"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	l := directory.NewLogto(directory.LogtoConfig{Endpoint: srv.URL, Logger: logger})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	leader := startUser(ctx, l)
+	select {
+	case <-logStarted:
+	case <-ctx.Done():
+		t.Fatal("first token refresh did not reach the success log")
+	}
+
+	if user, err := l.User(ctx, "rejected"); err != nil || user.Name != "Ann" {
+		t.Fatalf("User(rejected) = %+v, %v, want the profile while the first log call is paused", user, err)
+	}
+	trace.check(t, 2, "Bearer tok1", "Bearer tok2")
+	if result := receive(t, leader, "leader lookup"); result.err != nil || result.user.Name != "Ann" {
+		t.Fatalf("leader lookup = %+v, %v, want the profile", result.user, result.err)
+	}
+}
+
+type pausedTokenLoadedHandler struct {
+	slog.Handler
+	paused  atomic.Bool
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (h *pausedTokenLoadedHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message == "logto_management_token_loaded" && h.paused.CompareAndSwap(false, true) {
+		close(h.started)
+		<-h.release
+	}
+	return h.Handler.Handle(ctx, record)
+}
+
 func TestLogtoUserEvictsTokenRejectedOnRetry(t *testing.T) {
 	l, trace := newLogtoRejectionClient(t, func(r *http.Request) bool {
 		return r.Header.Get("Authorization") == "Bearer tok3"
@@ -182,6 +253,10 @@ type logtoRequestTrace struct {
 	profiles []string
 }
 
+func tokenFixture(n int) map[string]any {
+	return map[string]any{"access_token": fmt.Sprintf("tok%d", n), "expires_in": 3600}
+}
+
 func (trace *logtoRequestTrace) check(t *testing.T, tokens int, profiles ...string) {
 	t.Helper()
 	trace.mu.Lock()
@@ -201,7 +276,7 @@ func newLogtoRejectionClient(t *testing.T, acceptProfile func(*http.Request) boo
 			trace.tokens++
 			n := trace.tokens
 			trace.mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": fmt.Sprintf("tok%d", n), "expires_in": 3600})
+			_ = json.NewEncoder(w).Encode(tokenFixture(n))
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/users/"):
 			trace.mu.Lock()
 			trace.profiles = append(trace.profiles, strings.TrimPrefix(r.URL.Path, "/api/users/")+" "+r.Header.Get("Authorization"))

@@ -6,6 +6,8 @@
 # also stages `THIRD-PARTY-LICENSES.txt` (scripts/ci/server-notices.sh), the
 # license files of the third-party Go modules that the binary links.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+# The Droplet deployer reads this capability before scheduling any worker.
+LABEL io.delino.accounts.cap-accounting="claim-time"
 COPY dist/accounts-api /usr/local/bin/accounts-api
 # FSL-1.1-ALv2 terms and copyright notice (servers/LICENSE).
 COPY LICENSE /usr/share/licenses/accounts-api/LICENSE
