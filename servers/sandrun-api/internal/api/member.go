@@ -66,6 +66,20 @@ func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Reques
 		if err := LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
+		// FOR SHARE makes creation wait for removal or a role change.
+		// If creation locks the membership first, the membership change
+		// waits and revokes this invitation after it commits.
+		var lockedRole int16
+		err = tx.QueryRow(ctx, "SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR SHARE", c.OrganizationID, c.UserID).Scan(&lockedRole)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound("organization")
+		}
+		if err != nil {
+			return err
+		}
+		if !authz.RoleAllowed(sandrunv1.Role(lockedRole), authz.ActionManageMembers) {
+			return ErrPermission("the caller's role does not allow this action")
+		}
 		secret, err := auth.NewSecret(auth.SecretInvitation)
 		if err != nil {
 			return err
@@ -346,10 +360,51 @@ func loadMembershipForUpdate(ctx context.Context, q db.Querier, orgID, userID st
 	return id, sandrunv1.Role(role), err
 }
 
+// The caller holds the creator's membership lock. Revoke before writing the
+// membership row so this transaction can wait for an in-flight acceptance
+// without blocking that acceptance's membership insert.
+func (h MemberHandler) revokeInvitationsByCreatorTx(ctx context.Context, tx pgx.Tx, orgID, userID string, actor auth.Principal) (int, error) {
+	rows, err := tx.Query(ctx, `UPDATE invitations SET revoke_time = $3
+		WHERE organization_id = $1 AND created_by_user_id = $2
+			AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $3
+		RETURNING invitation_id::text`, orgID, userID, h.NowUTC())
+	if err != nil {
+		return 0, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if err := h.WriteAudit(ctx, tx, AuditEvent{
+			OrganizationID: orgID, Action: sandrunv1.AuditAction_AUDIT_ACTION_INVITATION_REVOKED, Actor: actor,
+			TargetKind: sandrunv1.AuditTargetKind_AUDIT_TARGET_KIND_INVITATION, TargetID: id,
+		}); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
+type invitationRevocationReason string
+
+const (
+	invitationsMembershipEnded          invitationRevocationReason = "membership_ended"
+	invitationsRoleLostMemberManagement invitationRevocationReason = "role_lost_member_management"
+)
+
+func (h MemberHandler) logInvitationRevocations(ctx context.Context, orgID, userID string, count int, reason invitationRevocationReason) {
+	if count > 0 {
+		h.Logger.InfoContext(ctx, "invitations_revoked_by_membership_change",
+			slog.String("organization_id", orgID), slog.String("user_id", userID), slog.Int("count", count), slog.String("reason", string(reason)))
+	}
+}
+
 func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Request[sandrunv1.UpdateMemberRoleRequest]) (*connect.Response[sandrunv1.UpdateMemberRoleResponse], error) {
 	target := req.Msg.GetUserId()
 	role := req.Msg.GetRole()
 	var resp *sandrunv1.UpdateMemberRoleResponse
+	var revokedInvitations int
 	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		c, err := h.Authorize(ctx, tx, req.Msg.GetOrganizationId(), authz.ActionManageMembers)
 		if err != nil {
@@ -380,6 +435,12 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 		if target == c.UserID && !authz.RoleAllowed(current, authz.ActionManageMembers) {
 			return ErrPermission("the caller's role does not allow this action")
 		}
+		if authz.RoleAllowed(current, authz.ActionManageMembers) && !authz.RoleAllowed(role, authz.ActionManageMembers) {
+			revokedInvitations, err = h.revokeInvitationsByCreatorTx(ctx, tx, c.OrganizationID, target, c.Principal)
+			if err != nil {
+				return err
+			}
+		}
 		var joined time.Time
 		if err := tx.QueryRow(ctx, "UPDATE memberships SET role = $3 WHERE organization_id = $1 AND user_id = $2 RETURNING join_time", c.OrganizationID, target, int16(role)).Scan(&joined); err != nil {
 			return err
@@ -398,19 +459,21 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 	if err != nil {
 		return nil, h.Internal(ctx, "update member role", err)
 	}
+	h.logInvitationRevocations(ctx, resp.Member.GetOrganizationId(), target, revokedInvitations, invitationsRoleLostMemberManagement)
 	return connect.NewResponse(resp), nil
 }
 
 const removeMemberAttempts = 3
 
 // RemoveMember ends a membership: removal by an owner or admin, or leaving.
-// In one transaction it deletes the membership, revokes every personal API
-// key of the user in the organization, runs the InTx membership end hooks
-// and records the audit events; after the commit it runs the AfterCommit
-// hooks to start sandbox cleanup.
+// In one transaction it revokes the user's pending invitations and personal
+// API keys in the organization, deletes the membership, runs the InTx
+// membership end hooks and records the audit events. After the commit it
+// runs the AfterCommit hooks to start sandbox cleanup.
 func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[sandrunv1.RemoveMemberRequest]) (*connect.Response[sandrunv1.RemoveMemberResponse], error) {
 	target := req.Msg.GetUserId()
 	var end MembershipEnd
+	var revokedInvitations int
 	remove := func(tx pgx.Tx) error {
 		p, err := principal(ctx)
 		if err != nil {
@@ -441,6 +504,10 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[sa
 		if role == sandrunv1.Role_ROLE_OWNER {
 			return ErrPermission("the owner cannot be removed")
 		}
+		revokedInvitations, err = h.revokeInvitationsByCreatorTx(ctx, tx, c.OrganizationID, target, c.Principal)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, "DELETE FROM memberships WHERE membership_id = $1", membershipID); err != nil {
 			return err
 		}
@@ -468,6 +535,7 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[sa
 		if err != nil {
 			return nil, h.Internal(ctx, "remove member", err)
 		}
+		h.logInvitationRevocations(ctx, end.OrganizationID, target, revokedInvitations, invitationsMembershipEnded)
 		h.membershipEndAfterCommit(ctx, end)
 		return connect.NewResponse(&sandrunv1.RemoveMemberResponse{}), nil
 	}
