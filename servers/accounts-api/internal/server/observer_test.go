@@ -1809,15 +1809,11 @@ func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
 	}
 }
 
-// readUntilServerClose reads from conn until the server closes the connection
-// and fails the test on any other end of the stream. io.ReadAll returns a nil
-// error only for io.EOF, so a non-nil error is the connection deadline that the
-// tests set, which means that the server held the connection open, or a reset.
-// Ignoring it would let a server that never closes pass as a server that
-// closes, so the failure carries the bytes that arrived before it.
-func readUntilServerClose(t *testing.T, conn net.Conn) []byte {
+// readUntilServerClose requires the reader to reach EOF. If the read fails,
+// for example on a client deadline or a reset, it reports the bytes received.
+func readUntilServerClose(t *testing.T, reader io.Reader) []byte {
 	t.Helper()
-	response, err := io.ReadAll(conn)
+	response, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatalf("read until the server closed the connection: %v after %q", err, response)
 	}
@@ -1965,9 +1961,7 @@ func TestStallWithFewerThanFourHeadBytesIsNotAHeaderReadTimeout(t *testing.T) {
 					t.Fatalf("write: %v", err)
 				}
 			}
-			// net/http closes the connection without a response when the timer
-			// expires, which the client sees as the end of the stream.
-			rest, _ := io.ReadAll(reader)
+			rest := readUntilServerClose(t, reader)
 			if tc.wantStatus == 0 && len(rest) != 0 {
 				t.Fatalf("unexpected bytes after the stall: %q", rest)
 			}
@@ -2197,7 +2191,7 @@ func TestDrainedRequestBodyDoesNotMoveRejectionStart(t *testing.T) {
 		// The tail ends at a line boundary, so net/http closes the connection
 		// without a response when the header timeout expires.
 		write(t, conn, "GET /next HTTP/1.1\r\nHost: t\r\n")
-		_, _ = io.ReadAll(conn)
+		readUntilServerClose(t, conn)
 		records := waitForRejection(t, logs)
 		if len(records) != 1 || records[0].Status != 0 || records[0].Reason != string(RejectionHeaderReadTimeout) {
 			t.Fatalf("rejected records = %+v, want one header_read_timeout: %s", records, logs.String())
@@ -2301,7 +2295,7 @@ func TestKeepAliveHeadBeyondTheFirstHeadLimit(t *testing.T) {
 		if _, err := io.WriteString(conn, "GET /stall HTTP/1.1\r\nHost: t\r\n"); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		_, _ = io.ReadAll(reader)
+		readUntilServerClose(t, reader)
 		waitFor(logs, "http_request_rejected", 1)
 		records := rejectedRecords(t, logs)
 		if len(records) != 1 || records[0].Reason != string(RejectionHeaderReadTimeout) || records[0].Status != 0 {
