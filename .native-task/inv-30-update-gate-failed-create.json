@@ -1,0 +1,72 @@
+{
+  "gid": "inv-30-update-gate-failed-create",
+  "commit": "a5742e688e0e4273d070dd5d582c4fc8c4b46dd4",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "Windows",
+    "host": "delino-win-1",
+    "environmentId": "06781016-0365-4c4d-92ee-1fc749915bbc",
+    "sha": "a5742e688e0e4273d070dd5d582c4fc8c4b46dd4",
+    "setup": "Run in PowerShell at the specified commit in a short local non-production checkout. Use the non-elevated account. The targeted tests use temporary directories, loopback HTTP, and fake HCS operations. The HCS fixture requires computecore.dll and its callback export. Treat a skipped test as incomplete coverage.",
+    "commands": [
+      "if ((git rev-parse HEAD).Trim() -ne 'a5742e688e0e4273d070dd5d582c4fc8c4b46dd4') { throw 'Unexpected validation revision' }",
+      "go version; if ($LASTEXITCODE -ne 0) { throw 'Go is unavailable' }",
+      "New-Item -ItemType Directory -Force -Path '.t3-tmp/update-gate-native' | Out-Null",
+      "$env:TEMP = (Resolve-Path '.t3-tmp/update-gate-native').Path; $env:TMP = $env:TEMP; $env:GOTMPDIR = $env:TEMP",
+      "go test -mod=readonly -v -count=1 -timeout=2m ./cmds/ownsand-agent/internal/sandboxes -run '^(TestBusyUntilAllFailedCreateCleanupCompletes|TestFailedCreateRetriesStopUntilItSucceeds|TestBusyWhileVMStopIsPendingOrFailed)$' 2>&1 | Tee-Object -FilePath '.t3-tmp/update-gate-native/sandboxes.log'; if ($LASTEXITCODE -ne 0) { throw 'sandboxes tests failed' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/sandboxes.log' -Pattern '^--- PASS: TestBusyUntilAllFailedCreateCleanupCompletes ')) { throw 'TestBusyUntilAllFailedCreateCleanupCompletes did not pass' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/sandboxes.log' -Pattern '^--- PASS: TestFailedCreateRetriesStopUntilItSucceeds ')) { throw 'TestFailedCreateRetriesStopUntilItSucceeds did not pass' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/sandboxes.log' -Pattern '^--- PASS: TestBusyWhileVMStopIsPendingOrFailed ')) { throw 'TestBusyWhileVMStopIsPendingOrFailed did not pass' }",
+      "go test -mod=readonly -v -count=1 -timeout=2m ./cmds/ownsand-agent/internal/update -run '^(TestUpdateInstallsWhenIdle|TestRevokedRunningVersion|TestTransferReservationExcludesInstallation)$' 2>&1 | Tee-Object -FilePath '.t3-tmp/update-gate-native/update.log'; if ($LASTEXITCODE -ne 0) { throw 'update tests failed' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/update.log' -Pattern '^--- PASS: TestUpdateInstallsWhenIdle ')) { throw 'TestUpdateInstallsWhenIdle did not pass' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/update.log' -Pattern '^--- PASS: TestRevokedRunningVersion ')) { throw 'TestRevokedRunningVersion did not pass' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/update.log' -Pattern '^--- PASS: TestTransferReservationExcludesInstallation ')) { throw 'TestTransferReservationExcludesInstallation did not pass' }",
+      "go test -mod=readonly -v -count=1 -timeout=2m ./cmds/ownsand-agent/internal/vmruntime/hcsrt -run '^(TestFailedCreateReleasesWatcherAndKeepsUnconfirmedVM|TestDeleteKeepsTrackedVMWhenExitUnconfirmed|TestDeleteRemovesTrackedVMWhenExitConfirmed)$' 2>&1 | Tee-Object -FilePath '.t3-tmp/update-gate-native/hcs.log'; if ($LASTEXITCODE -ne 0) { throw 'hcs tests failed' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/hcs.log' -Pattern '^--- PASS: TestFailedCreateReleasesWatcherAndKeepsUnconfirmedVM ')) { throw 'TestFailedCreateReleasesWatcherAndKeepsUnconfirmedVM did not pass' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/hcs.log' -Pattern '^--- PASS: TestDeleteKeepsTrackedVMWhenExitUnconfirmed ')) { throw 'TestDeleteKeepsTrackedVMWhenExitUnconfirmed did not pass' }",
+      "if (-not (Select-String -Quiet -Path '.t3-tmp/update-gate-native/hcs.log' -Pattern '^--- PASS: TestDeleteRemovesTrackedVMWhenExitConfirmed ')) { throw 'TestDeleteRemovesTrackedVMWhenExitConfirmed did not pass' }"
+    ],
+    "expectedResults": [
+      "The manager stays busy after acknowledging both failed creates and after only one pending cleanup succeeds. The last successful Delete makes the manager idle, including an idempotent confirmation for the sandbox whose runtime already cleaned up.",
+      "The updater defers the ordinary and revoked updates until admission permits installation. It keeps the create and transfer interlocks, and calls the installer once when idle.",
+      "The HCS fixtures retain a registered VM and its files while no exit is confirmed. Once Delete confirms exit, the fixture clears the registration and files.",
+      "The command exits zero for each suite, and each named test emits PASS."
+    ],
+    "files": {
+      "copyFrom": [],
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/sandboxes/manager_test.go",
+        "cmds/ownsand-agent/internal/update/update_test.go",
+        "cmds/ownsand-agent/internal/vmruntime/hcsrt/runtime_windows_test.go"
+      ],
+      "outputLogs": [
+        ".t3-tmp/update-gate-native/sandboxes.log",
+        ".t3-tmp/update-gate-native/update.log",
+        ".t3-tmp/update-gate-native/hcs.log"
+      ],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/ownsand-agent-windows-amd64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/ownsand-agent-windows-arm64.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/windows-arm64-tests/hcsrt.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/windows-arm64-tests/sandboxes.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/windows-arm64-tests/update.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/windows-tests/hcsrt.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/windows-tests/sandboxes.test.exe",
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-30-update-gate-failed-create/worker/.t3-tmp/update-gate/windows-tests/update.test.exe"
+      ]
+    },
+    "requiresElevation": {
+      "status": "pending",
+      "reason": "An actual Hyper-V VM and Windows service installation/restart need an elevated disposable host. The assigned validation account has no elevation.",
+      "prerequisites": [
+        "Disposable enrolled agent and VM on a non-production Hyper-V host.",
+        "Local control plane, staged test-signed update artifact and a lab fixture that can safely delay and fail readiness and stop confirmation."
+      ],
+      "expectedResults": [
+        "With no other sandbox work, a failed create remains visible as FAILED/CREATE_FAILED. Acknowledge the terminal result while a controlled Delete attempt remains open.",
+        "Keep the ordinary or revoked update pending through the failed Delete and verify that no installer call or service restart occurs.",
+        "Allow the next Delete to confirm VM exit. Observe one ordinary install check consume the staged artifact and one restart."
+      ]
+    }
+  }
+}
