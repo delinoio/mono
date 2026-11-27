@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -684,30 +685,47 @@ func TestInvitationDeliveryAfterCommit(t *testing.T) {
 
 	// At the time of the send, the invitation is committed and visible from
 	// another connection, and its creation is audited already.
-	var seenAtSend []string
-	var createdAtSend int
+	type sendResult struct {
+		called        bool
+		invitations   []string
+		creationCount int
+	}
+	var hookMu sync.Mutex
+	var hookResult sendResult
 	env.Email.SetOnSend(func(email.Message) {
-		seenAtSend = invitationRows(t, env, accountID)
-		createdAtSend = auditRowCount(t, env, accountID, api.AuditInvitationCreated)
+		invitations := invitationRows(t, env, accountID)
+		creationCount := auditRowCount(t, env, accountID, api.AuditInvitationCreated)
+		hookMu.Lock()
+		hookResult = sendResult{called: true, invitations: invitations, creationCount: creationCount}
+		hookMu.Unlock()
 	})
+	snapshot := func() sendResult {
+		hookMu.Lock()
+		defer hookMu.Unlock()
+		return hookResult
+	}
 	env.Email.SetErr(errors.New("resend down"))
 	_, err := owner.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
 		BillingAccountId: accountID, Email: "guest@example.com", Role: roleViewer,
 	}))
 	wantCode(t, err, connect.CodeUnavailable)
-	if len(seenAtSend) != 0 {
-		t.Fatalf("the sender ran although the send was set to fail: %v", seenAtSend)
+	if snapshot().called {
+		t.Fatal("the send hook ran during the forced send failure")
 	}
 	env.Email.SetErr(nil)
 
 	// Transient failure, then recovery: the address can be invited again.
 	invite(t, owner, accountID, "guest@example.com", roleViewer)
-	if got := strings.Join(seenAtSend, ","); got != "guest@example.com=revoked,guest@example.com=pending" {
-		t.Errorf("invitations visible at the send = %v, want the revoked one and the committed pending one", seenAtSend)
+	result := snapshot()
+	if !result.called {
+		t.Fatal("the send hook did not run during the retry")
+	}
+	if got := strings.Join(result.invitations, ","); got != "guest@example.com=revoked,guest@example.com=pending" {
+		t.Errorf("invitations visible at the send = %v, want the revoked one and the committed pending one", result.invitations)
 	}
 	// The revoked invitation and the pending one each have a creation event.
-	if createdAtSend != 2 {
-		t.Errorf("%d invitation_created rows at the send, want 2", createdAtSend)
+	if result.creationCount != 2 {
+		t.Errorf("%d invitation_created rows at the send, want 2", result.creationCount)
 	}
 	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 2 {
 		t.Errorf("%d invitation_created rows after the send, want 2", n)
