@@ -288,6 +288,10 @@ func (a *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc
 type Authenticator struct {
 	Service *Service
 	Logto   TokenValidator
+
+	prefixWarningsMu sync.Mutex
+	prefixWarnings   map[string]time.Time
+	nextWarningSweep time.Time
 }
 
 // TokenValidator validates a Logto access token and returns the user ID.
@@ -319,17 +323,26 @@ func (a *Authenticator) Authenticate(ctx context.Context, header, client string)
 
 func (a *Authenticator) apiKey(ctx context.Context, token, client string) (auth.Principal, error) {
 	s := a.Service
-	prefix := auth.DisplayPrefix(token)
-	if ok, retry := s.Limits.PerPrefix.Peek("apikey:" + prefix); !ok {
-		return auth.Principal{}, errRateLimited(retry)
-	}
 	if client != "" {
 		if ok, retry := s.Limits.PerClient.Peek(client); !ok {
 			return auth.Principal{}, errRateLimited(retry)
 		}
 	}
 	fail := func() (auth.Principal, error) {
-		s.Limits.PerPrefix.Allow("apikey:"+prefix, 1)
+		prefix := auth.DisplayPrefix(token)
+		if ok, retry := s.Limits.PerPrefix.Allow("apikey:"+prefix, 1); !ok {
+			// Retain only the display prefix bytes in the warning state and log.
+			prefix = strings.Clone(prefix)
+			if a.allowPrefixWarning(prefix) {
+				// A short malformed value can be its own display prefix.
+				if prefix == token {
+					prefix = "[redacted]"
+				}
+				s.Logger.WarnContext(ctx, "api_key_prefix_rate_limited",
+					slog.String("key_prefix", prefix), slog.String("client_address", client))
+			}
+			return auth.Principal{}, errRateLimited(retry)
+		}
 		if client != "" {
 			s.Limits.PerClient.Allow(client, 1)
 		}
@@ -351,6 +364,34 @@ func (a *Authenticator) apiKey(ctx context.Context, token, client string) (auth.
 		return auth.Principal{}, s.internal(ctx, "load api key", err)
 	}
 	return auth.Principal{Kind: ownsandv1.PrincipalKind_PRINCIPAL_KIND_API_KEY, ID: id, OrganizationID: orgID}, nil
+}
+
+func (a *Authenticator) allowPrefixWarning(prefix string) bool {
+	const (
+		interval    = 10 * time.Second
+		maxWarnings = 4096
+	)
+	a.prefixWarningsMu.Lock()
+	defer a.prefixWarningsMu.Unlock()
+
+	now := a.Service.Now()
+	if !now.Before(a.nextWarningSweep) {
+		for key, until := range a.prefixWarnings {
+			if !now.Before(until) {
+				delete(a.prefixWarnings, key)
+			}
+		}
+		a.nextWarningSweep = now.Add(interval)
+	}
+	// Keep active entries when the map is full so their prefixes stay quiet.
+	if now.Before(a.prefixWarnings[prefix]) || len(a.prefixWarnings) >= maxWarnings {
+		return false
+	}
+	if a.prefixWarnings == nil {
+		a.prefixWarnings = make(map[string]time.Time)
+	}
+	a.prefixWarnings[prefix] = now.Add(interval)
+	return true
 }
 
 func (a *Authenticator) deviceSession(ctx context.Context, token string) (auth.Principal, error) {
