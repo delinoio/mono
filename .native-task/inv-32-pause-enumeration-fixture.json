@@ -1,0 +1,43 @@
+{
+  "gid": "inv-32-pause-enumeration-fixture",
+  "commit": "1d143471fc80a9fae52464fce511554f2f61de6e",
+  "nativeValidation": {
+    "status": "pending",
+    "platform": "macOS arm64",
+    "host": "m3-16",
+    "environmentId": "ab8dbefb-9bf5-45e1-bc17-c4b00208c3b5",
+    "sha": "1d143471fc80a9fae52464fce511554f2f61de6e",
+    "setup": "Run in one Bash shell at the stated commit in a checkout short enough for the runtime's Unix socket. The focused fixture builds the real guest helper and starts local disposable processes.",
+    "commands": [
+      "set -euo pipefail",
+      "test \"$(uname -s)\" = Darwin",
+      "test \"$(uname -m)\" = arm64",
+      "test \"$(git rev-parse HEAD)\" = 1d143471fc80a9fae52464fce511554f2f61de6e",
+      "test -z \"$(git status --porcelain)\"",
+      "mkdir -p \".t3-tmp/native-pause-enumeration\"",
+      "export TMPDIR=\"$(git rev-parse --show-toplevel)/.t3-tmp\" COPYFILE_DISABLE=1 CGO_ENABLED=0",
+      "test \"$(printf %s \"$TMPDIR\" | wc -c | tr -d '[:space:]')\" -le 80",
+      "go test -count=1 -timeout=90s -v -run '^TestPauseFailureContinuesHelper$' ./cmds/ownsand-agent/internal/vmruntime/processrt 2>&1 | tee \".t3-tmp/native-pause-enumeration/processrt.log\"",
+      "grep -F -- \"--- PASS: TestPauseFailureContinuesHelper\" \".t3-tmp/native-pause-enumeration/processrt.log\""
+    ],
+    "expectedResults": [
+      "The focused test runs and passes on Darwin arm64.",
+      "Pause observes the stopped helper through the native ps probe. Worker enumeration then returns an error that wraps context.Canceled.",
+      "After rollback, the helper, shell and sleeper run. A fresh Pause stops all three and Resume continues all three."
+    ],
+    "files": {
+      "copyFrom": null,
+      "regressionTests": [
+        "cmds/ownsand-agent/internal/vmruntime/processrt/processrt_test.go"
+      ],
+      "outputLogs": [".t3-tmp/native-pause-enumeration/processrt.log"],
+      "crossBuildArtifacts": [
+        "/home/kdy1/.t3/worktrees/mono/kdy1-32e4449b-06433aa1260e4aac/.t3-tmp/wt/stk-inv-32-pause-enumeration-fixture/worker/.t3-tmp/pause-enumeration/processrt-darwin-arm64.test"
+      ]
+    },
+    "unperformedOrUnavailable": [
+      "Native execution is pending on m3-16.",
+      "The Linux cross-build uses CGO_ENABLED=0. This fixture requires no cgo, Virtualization.framework, signing, administrator password, CMake, IPSW, or macOS guest image."
+    ]
+  }
+}
