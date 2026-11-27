@@ -95,8 +95,8 @@ func TestStatusStateMachine(t *testing.T) {
 	f.credit(acct, 1000)
 	org := f.link(acct, "Acme <Sandbox>")
 	allowed := f.wantStatus(org, StatusAllowed, ReasonNone)
-	if allowed.Sequence <= 0 {
-		t.Fatalf("sequence %d", allowed.Sequence)
+	if allowed.Sequence <= 0 || allowed.LastAllowedSequence != 0 {
+		t.Fatalf("initial status = %+v", allowed)
 	}
 
 	// Usage that takes the balance to zero blocks the organization at once.
@@ -154,6 +154,9 @@ func TestStatusStateMachine(t *testing.T) {
 	if resumed.Sequence <= suspended.Sequence {
 		t.Fatalf("resumed sequence %d", resumed.Sequence)
 	}
+	if resumed.LastAllowedSequence != resumed.Sequence {
+		t.Fatalf("recovery sequence = %d, want %d", resumed.LastAllowedSequence, resumed.Sequence)
+	}
 	var since *time.Time
 	if err := f.db.Pool.QueryRow(ctx(), `SELECT nonpayment_since FROM billing_accounts WHERE billing_account_id = $1`, acct).Scan(&since); err != nil || since != nil {
 		t.Fatalf("nonpayment_since = %v, %v", since, err)
@@ -181,7 +184,7 @@ func TestStatusSubscriptionAndReasons(t *testing.T) {
 	f.webhook(paddle.EventTransactionCompleted, paddletest.Transaction(paddletest.TransactionData{
 		ID: txnID, SubscriptionID: subID, Origin: paddle.OriginWeb, PriceID: priceID, SubtotalCents: 1000,
 	}))
-	f.wantStatus(org, StatusAllowed, ReasonNone)
+	recovered := f.wantStatus(org, StatusAllowed, ReasonNone)
 
 	// A canceled subscription blocks it; with a balance of zero as well the
 	// reason stays NO_ACTIVE_SUBSCRIPTION.
@@ -191,6 +194,15 @@ func TestStatusSubscriptionAndReasons(t *testing.T) {
 	st = f.wantStatus(org, StatusBlocked, ReasonNoActiveSubscription)
 	if !st.BlockedSince.Equal(canceledAt) {
 		t.Fatalf("blocked_since %v, want %v", st.BlockedSince, canceledAt)
+	}
+	// The current-status feed replaces the recovery with the later block,
+	// but still carries the recovery sequence on the wire.
+	page, err := f.s.ListStatusChanges(ctx(), "ownsand", recovered.Sequence-1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].Sequence != st.Sequence || page[0].Proto().GetLastAllowedSequence() != recovered.Sequence {
+		t.Fatalf("status page after missed recovery = %+v, want block %d with recovery %d", page, st.Sequence, recovered.Sequence)
 	}
 	f.clock.Advance(time.Hour)
 	f.deduct(acct, 30*usd)
@@ -211,6 +223,9 @@ func TestStatusSubscriptionAndReasons(t *testing.T) {
 	// Each status has its own sequence.
 	if st2.Sequence <= after.Sequence {
 		t.Fatalf("sequences %d, %d", after.Sequence, st2.Sequence)
+	}
+	if st2.LastAllowedSequence != 0 {
+		t.Fatalf("new link inherited recovery sequence %d", st2.LastAllowedSequence)
 	}
 
 	// An active subscription with a debt keeps the block, now with
