@@ -98,7 +98,7 @@ describe("fakeWebRtc held methods", () => {
     "createOffer",
     "setLocalDescription",
     "setRemoteDescription",
-  ] as const)("%s stays pending until it is released", async (method) => {
+  ] as const)("%s counts only calls waiting for release", async (method) => {
     const { clock, rtc, connection } = connect({
       hold: [method],
       openDelayMs: 0,
@@ -110,15 +110,61 @@ describe("fakeWebRtc held methods", () => {
       setRemoteDescription: () =>
         connection.setRemoteDescription({ type: "answer" }),
     };
-    let done = false;
-    const pending = calls[method]().then(() => {
-      done = true;
-    });
+    let completed = 0;
+    const invoke = async () => {
+      await calls[method]();
+      completed++;
+    };
+    const pending = [invoke(), invoke()];
     await clock.settle();
-    expect(done).toBe(false);
-    expect(rtc.held(method)).toBe(1);
+    expect(completed).toBe(0);
+    expect(rtc.held(method)).toBe(2);
+
     rtc.release(method);
-    await pending;
-    expect(done).toBe(true);
+    expect(rtc.held(method)).toBe(0);
+    await Promise.all(pending);
+    expect(completed).toBe(2);
+
+    const later = invoke();
+    expect(rtc.held(method)).toBe(0);
+    await later;
+    expect(rtc.held(method)).toBe(0);
+
+    rtc.release(method);
+    const afterRepeatedRelease = invoke();
+    expect(rtc.held(method)).toBe(0);
+    await afterRepeatedRelease;
+    expect(rtc.held(method)).toBe(0);
+    expect(completed).toBe(4);
+  });
+
+  test("releases each configured method independently before or during calls", async () => {
+    const { clock, rtc, connection, channel } = connect({
+      hold: ["createOffer", "setLocalDescription"],
+      openDelayMs: 0,
+    });
+    rtc.release("createOffer");
+    const offer = connection.createOffer();
+    expect(rtc.held("createOffer")).toBe(0);
+    const description = await offer;
+    expect(description).toEqual({ type: "offer", sdp: "v=0 fake-offer" });
+    expect(rtc.held("createOffer")).toBe(0);
+
+    const local = connection.setLocalDescription(description);
+    await clock.settle();
+    expect(rtc.held("setLocalDescription")).toBe(1);
+    expect(connection.localDescription).toBeNull();
+
+    const remote = connection.setRemoteDescription({ type: "answer" });
+    expect(rtc.held("setRemoteDescription")).toBe(0);
+    await remote;
+    expect(rtc.held("setRemoteDescription")).toBe(0);
+    expect(channel.readyState).toBe("open");
+    expect(rtc.held("setLocalDescription")).toBe(1);
+
+    rtc.release("setLocalDescription");
+    await local;
+    expect(rtc.held("setLocalDescription")).toBe(0);
+    expect(connection.localDescription).toEqual(description);
   });
 });
