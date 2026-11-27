@@ -37,15 +37,14 @@ func raceFreeOneToken(t *testing.T, c *Conn) {
 	}
 }
 
-// raceWaitBlocked gives a goroutine time to reach its wait for a token. The
-// frame under test cannot be observed before it is queued, so the test
-// asserts that the call has not returned.
-func raceWaitBlocked(t *testing.T, done <-chan struct{}) {
+// raceWaitForToken waits for enqueueFrame to evaluate the caller's Done
+// channel in the token select, after its first check for stream closure.
+func raceWaitForToken(t *testing.T, reached <-chan struct{}) {
 	t.Helper()
 	select {
-	case <-done:
-		t.Fatal("the call returned although the outbound queue was full")
-	case <-time.After(50 * time.Millisecond):
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueueFrame did not reach the outbound token wait")
 	}
 }
 
@@ -93,13 +92,12 @@ func TestLateSendAfterCloseIsRejected(t *testing.T) {
 	filler := fillOutbound(c)
 
 	var written atomic.Int64
+	probe := &doneProbeContext{Context: t.Context(), reached: make(chan struct{})}
 	errCh := make(chan error, 1)
-	done := make(chan struct{})
 	go func() {
-		errCh <- s.SendMetered(context.Background(), raceKeepalive(), func(int64) { written.Add(1) })
-		close(done)
+		errCh <- s.SendMetered(probe, raceKeepalive(), func(int64) { written.Add(1) })
 	}()
-	raceWaitBlocked(t, done)
+	raceWaitForToken(t, probe.reached)
 
 	closeReturnsPromptly(t, s, true)
 	raceFreeOneToken(t, c)
@@ -178,12 +176,13 @@ func TestLateWindowUpdateAfterCloseIsRejected(t *testing.T) {
 	}
 	filler := fillOutbound(c)
 
+	probe := &doneProbeContext{Context: t.Context(), reached: make(chan struct{})}
 	done := make(chan struct{})
 	go func() {
-		s.Consumed(context.Background(), fc)
+		s.Consumed(probe, fc)
 		close(done)
 	}()
-	raceWaitBlocked(t, done)
+	raceWaitForToken(t, probe.reached)
 
 	closeReturnsPromptly(t, s, true)
 	raceFreeOneToken(t, c)

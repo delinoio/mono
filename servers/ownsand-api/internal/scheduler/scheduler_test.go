@@ -70,6 +70,65 @@ func TestPlaceSelectsLowestShareThenID(t *testing.T) {
 	}
 }
 
+func TestPlaceComparesSharesExactly(t *testing.T) {
+	tests := []struct {
+		name                       string
+		aVCPU, zVCPU               int32
+		aMemory, zMemory           int64
+		aMemoryLimit, zMemoryLimit int64
+		want                       string
+	}{
+		{
+			name:         "shares that round to the same float",
+			aVCPU:        1,
+			zVCPU:        1,
+			aMemory:      100_000_000,
+			zMemory:      99_999_999,
+			aMemoryLimit: 200_000_001,
+			zMemoryLimit: 199_999_999,
+			want:         "z-device",
+		},
+		{
+			name:         "cross-products wider than 64 bits",
+			aVCPU:        1,
+			zVCPU:        1,
+			aMemory:      (1 << 62) - 1,
+			zMemory:      (1 << 62) - 2,
+			aMemoryLimit: math.MaxInt64,
+			zMemoryLimit: math.MaxInt64,
+			want:         "z-device",
+		},
+		{
+			name:         "equal shares from different resources",
+			aVCPU:        1,
+			zMemory:      1024,
+			aMemoryLimit: 4096,
+			zMemoryLimit: 4096,
+			want:         "a-device",
+		},
+	}
+	req := linuxRequest()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a, z := linuxDevice("a-device"), linuxDevice("z-device")
+			a.Limits.MemoryMib, z.Limits.MemoryMib = tc.aMemoryLimit, tc.zMemoryLimit
+			a.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: tc.aVCPU, MemoryMib: tc.aMemory, DiskGib: 1}
+			z.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: tc.zVCPU, MemoryMib: tc.zMemory, DiskGib: 1}
+			for _, device := range []Device{a, z} {
+				if outcome, reason := Evaluate(req, device, now); outcome != Eligible {
+					t.Fatalf("Evaluate(%q) = %v, %q, want eligible", device.ID, outcome, reason)
+				}
+			}
+			for _, devices := range [][]Device{{a, z}, {z, a}} {
+				decision, err := Place(req, devices, now)
+				if err != nil || decision.DeviceID != tc.want {
+					t.Errorf("Place with %q first chose %+v, %v, want %q", devices[0].ID, decision, err, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestErrorCodeRule(t *testing.T) {
 	offline := linuxDevice("d1")
 	offline.Online = false

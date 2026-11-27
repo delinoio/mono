@@ -8,3 +8,5 @@ package store
 // directory fsync. Add macOS directory flushing when its durability behavior
 // has been validated.
 func (s *Store) SyncPendingIdentityDirectories() error { return nil }
+
+func (s *Store) syncSandboxCleanupDirectory() error { return nil }

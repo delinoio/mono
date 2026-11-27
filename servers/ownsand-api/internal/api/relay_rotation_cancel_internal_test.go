@@ -218,11 +218,10 @@ func stdout(data string) *ownsandv1.ExecEvent {
 }
 
 // TestRotationAfterRequestCancelReturnsContextError checks that a rotation
-// that finds the request context ended does not return OK. The agent frame
-// behind the accepted event is already queued, and Next returns a queued
-// frame before it looks at the context. The handler must return the
-// cancellation after the receive, before it rotates. The handler logs the
-// cancellation and sends the agent a stream close frame.
+// that finds the request context ended does not return OK. The caller
+// cancels during the accepted event while another agent frame is already
+// queued. The call is logged as canceled, the queued frame stays unsent, and
+// the agent receives a stream close frame.
 func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
 	h := newRotationHarness(t, pastRotation)
 	h.feed(&ownsandv1.RequestAccepted{})
@@ -248,8 +247,9 @@ func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
 }
 
 // expiringContext reports context.DeadlineExceeded from Err once expire ran.
-// The accepted event callback controls when the deadline is reached. The
-// fixture keeps Done open to exercise the check of Err after a receive.
+// A real deadline would also end the request upload and the first Next before
+// the handler sends the accepted event. Done stays open here to simulate a
+// deadline first observed through Err while the handler is sending.
 type expiringContext struct {
 	context.Context
 	expired atomic.Bool
@@ -286,10 +286,8 @@ func TestRotationAfterRequestDeadlineReturnsDeadlineExceeded(t *testing.T) {
 	h.waitClose()
 }
 
-// TestRotationWithEmptyQueueAfterRequestCancel covers the other way into the
-// rotation branch: no frame is queued, and the handler's wake timer ticks. The
-// select in Next chooses between the ended context and the tick at random, so
-// the test passes only when both outcomes end the call with the context error.
+// TestRotationWithEmptyQueueAfterRequestCancel checks cancellation at
+// rotation with no queued frame after the accepted event.
 func TestRotationWithEmptyQueueAfterRequestCancel(t *testing.T) {
 	timing := pastRotation
 	timing.Keepalive = 4 * time.Millisecond // the handler wakes every millisecond
@@ -332,6 +330,22 @@ func TestRotationWithLiveContextReturnsOK(t *testing.T) {
 	h.waitClose()
 }
 
+// queuedReplyContext exposes the error after the response check for the
+// accepted event. This lets the test reach Next with the terminal reply queued.
+type queuedReplyContext struct {
+	context.Context
+	err    error
+	queued atomic.Bool
+	checks atomic.Uint32
+}
+
+func (c *queuedReplyContext) Err() error {
+	if c.queued.Load() && c.checks.Add(1) > 1 {
+		return c.err
+	}
+	return c.Context.Err()
+}
+
 func TestRotationInFutureWithQueuedTerminalReply(t *testing.T) {
 	timing := pastRotation
 	timing.Rotation = 2 * time.Hour // the harness sets Started one hour in the past
@@ -362,20 +376,13 @@ func TestRotationInFutureWithQueuedTerminalReply(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRotationHarness(t, timing)
 			h.feed(&ownsandv1.RequestAccepted{})
-			parent, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			ctx := &expiringContext{Context: parent}
+			ctx := &queuedReplyContext{Context: context.Background(), err: tc.wantErr}
 			exited := &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{
 				Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0},
 			}}}
 			err := h.serve(ctx, func() {
 				h.feed(exited)
-				switch tc.wantErr {
-				case context.Canceled:
-					cancel()
-				case context.DeadlineExceeded:
-					ctx.expire()
-				}
+				ctx.queued.Store(tc.wantErr != nil)
 			})
 			if !errors.Is(err, tc.wantErr) {
 				t.Errorf("serveStream = %v, want %v", err, tc.wantErr)

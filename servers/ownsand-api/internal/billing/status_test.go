@@ -19,6 +19,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 )
 
 const (
@@ -474,7 +475,7 @@ func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
 	var mu sync.Mutex
 	isHeld := false
 	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(), Timing: &timing,
-		Held: func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }})
+		Ownership: func() (uint64, bool) { mu.Lock(); defer mu.Unlock(); return 0, isHeld }})
 	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -559,12 +560,12 @@ func (p *pollRecorder) startTimes() []time.Time {
 
 // runStatuses runs the status worker of a lease holder with the timing and
 // the client until the returned stop function is called.
-func (f *statusFixture) runStatuses(timing billing.StatusTiming, client accountsv1connect.UsageServiceClient, held func() bool) (*billing.Statuses, func()) {
-	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client, Timing: &timing, Held: held})
+func (f *statusFixture) runStatuses(timing billing.StatusTiming, client accountsv1connect.UsageServiceClient, ownership func() (uint64, bool)) (*billing.Statuses, func(), <-chan error) {
+	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client, Timing: &timing, Ownership: ownership})
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	done := make(chan error)
 	go func() { statuses.Run(ctx); close(done) }()
-	return statuses, func() { cancel(); <-done }
+	return statuses, func() { cancel(); <-done }, done
 }
 
 // TestRunPollCadence checks that consecutive polls start one Poll interval
@@ -589,7 +590,7 @@ func TestRunPollCadence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
 			rec := &pollRecorder{UsageServiceClient: f.fake.Client(), delay: tc.delay}
-			_, stop := f.runStatuses(billing.StatusTiming{Poll: poll, Tick: tick, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, rec, nil)
+			_, stop, _ := f.runStatuses(billing.StatusTiming{Poll: poll, Tick: tick, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, rec, nil)
 			defer stop()
 			eventually(t, "ten polls", func() bool { return len(rec.startTimes()) >= 10 })
 			starts := rec.startTimes()
@@ -614,13 +615,13 @@ func TestRunPollTriggers(t *testing.T) {
 	f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
 	var mu sync.Mutex
 	isHeld := false
-	held := func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }
+	ownership := func() (uint64, bool) { mu.Lock(); defer mu.Unlock(); return 0, isHeld }
 	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
 	polls := func() int { return f.fake.Calls(accountstest.MethodListBillingStatusChanges) }
 
 	// The poll interval is far longer than the test: only the first step and
 	// a kick poll.
-	statuses, stop := f.runStatuses(billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), held)
+	statuses, stop, _ := f.runStatuses(billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), ownership)
 	defer stop()
 	time.Sleep(200 * time.Millisecond)
 	if n := polls(); n != 0 {
@@ -640,12 +641,80 @@ func TestRunPollTriggers(t *testing.T) {
 	}
 }
 
+func TestRunPollOnLeaseReacquisition(t *testing.T) {
+	for _, observeLoss := range []bool{true, false} {
+		name := "loss between steps"
+		if observeLoss {
+			name = "loss observed on a step"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newStatusFixture(t, time.Now())
+			timing := billing.DefaultStatusTiming()
+			timing.Poll = time.Hour
+			timing.Tick = 10 * time.Millisecond
+
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			type ownership struct {
+				epoch uint64
+				held  bool
+			}
+			samples := make(chan struct{})
+			states := make(chan ownership)
+			statuses := billing.NewStatuses(billing.StatusOptions{
+				DB: f.db, Logger: f.logger, Client: f.fake.Client(), Timing: &timing,
+				// Only the poll loop takes a step on the fixture's channel.
+				WhileHeld: func(func(*lease.Period)) bool { return false },
+				Ownership: func() (uint64, bool) {
+					select {
+					case samples <- struct{}{}:
+					case <-ctx.Done():
+						return 0, false
+					}
+					select {
+					case state := <-states:
+						return state.epoch, state.held
+					case <-ctx.Done():
+						return 0, false
+					}
+				},
+			})
+			go func() { defer close(done); statuses.Run(ctx) }()
+			defer func() { cancel(); <-done }()
+
+			// The next sample proves that the worker finished the previous step.
+			step := func(state ownership, previousPolls int) {
+				t.Helper()
+				select {
+				case <-samples:
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for the next ownership sample")
+				}
+				if got := f.fake.Calls(accountstest.MethodListBillingStatusChanges); got != previousPolls {
+					t.Fatalf("before sample %+v: got %d polls, want %d", state, got, previousPolls)
+				}
+				states <- state
+			}
+			first := ownership{epoch: 1, held: true}
+			next := ownership{epoch: 3, held: true}
+			step(first, 0)
+			step(first, 1) // Renewal keeps this epoch and the existing cadence.
+			if observeLoss {
+				step(ownership{epoch: 2}, 1)
+			}
+			step(next, 1)
+			step(next, 2)
+			step(next, 2)
+		})
+	}
+}
+
 // TestRunFailedPollRetriesAtNextInterval checks that a failed poll is retried
 // at the next poll interval, not at every tick.
 func TestRunFailedPollRetriesAtNextInterval(t *testing.T) {
 	f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
 	f.fake.Fail(accountstest.MethodListBillingStatusChanges, connect.NewError(connect.CodeUnavailable, errors.New("down")))
-	_, stop := f.runStatuses(billing.StatusTiming{Poll: 300 * time.Millisecond, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), nil)
+	_, stop, _ := f.runStatuses(billing.StatusTiming{Poll: 300 * time.Millisecond, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), nil)
 	defer stop()
 	time.Sleep(time.Second)
 	// One poll at the first step and one every 300 ms: 4 within a second. A
@@ -768,12 +837,11 @@ func (f *statusFixture) waitForLockWaiter(t *testing.T) {
 	t.Fatal("no session waits for the organization lock")
 }
 
-// goErr runs fn in a goroutine and returns a function that waits for its
-// error.
-func goErr(fn func() error) (wait func() error) {
+// goErr runs fn in a goroutine and returns its result channel.
+func goErr(fn func() error) <-chan error {
 	done := make(chan error, 1)
 	go func() { done <- fn() }()
-	return func() error { return <-done }
+	return done
 }
 
 // TestPendingUnlinkLockWait checks a retry that selected a due pending unlink
@@ -790,14 +858,14 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 		f.link(t, org1, accountA)
 		f.addPendingUnlink(t, org1)
 		tx, finish := f.lockOrganization(t, org1)
-		wait := goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
+		done := goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
 		f.waitForLockWaiter(t)
 		moved := t0.Add(time.Minute)
 		if _, err := tx.Exec(ctx, "UPDATE billing_pending_unlinks SET attempts = 1, next_attempt_time = $2 WHERE organization_id = $1", org1, moved); err != nil {
 			t.Fatal(err)
 		}
 		finish()
-		if err := wait(); err != nil {
+		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
 		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 0 {
@@ -817,13 +885,13 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 		f.link(t, org1, accountA)
 		f.addPendingUnlink(t, org1)
 		tx, finish := f.lockOrganization(t, org1)
-		wait := goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
+		done := goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
 		f.waitForLockWaiter(t)
 		if _, err := tx.Exec(ctx, "DELETE FROM billing_pending_unlinks WHERE organization_id = $1", org1); err != nil {
 			t.Fatal(err)
 		}
 		finish()
-		if err := wait(); err != nil {
+		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
 		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 0 {
@@ -846,14 +914,14 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 		_, finish := f.lockOrganization(t, org1)
 		// The worker starts before the deadline and reads the clock again
 		// after the lock, when the deadline has passed.
-		wait := goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
+		done := goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
 		f.waitForLockWaiter(t)
 		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 0 {
 			t.Fatalf("UnlinkOrganization calls before the lock = %d, want 0", got)
 		}
 		f.clock.Set(due)
 		finish()
-		if err := wait(); err != nil {
+		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
 		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 1 {
@@ -869,14 +937,16 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 
 	// The immediate attempt after a commit holds the lock during its call. A
 	// worker that selected the same row waits for it.
-	immediate := func(t *testing.T, f *statusFixture) (workerErr func() error, gate *accountstest.Gate, attemptErr func() error) {
+	immediate := func(t *testing.T, f *statusFixture) (*accountstest.Gate, <-chan error, <-chan error) {
 		t.Helper()
-		gate = f.fake.Hold(accountstest.MethodUnlinkOrganization)
-		attemptErr = goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
-		<-gate.Entered
-		workerErr = goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
+		gate := f.fake.Hold(accountstest.MethodUnlinkOrganization)
+		t.Cleanup(gate.Release)
+		ctx := t.Context()
+		attemptDone := goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
+		gate.WaitForEntry(t, attemptDone)
+		workerDone := goErr(func() error { return f.statuses.RetryPendingUnlinks(ctx) })
 		f.waitForLockWaiter(t)
-		return workerErr, gate, attemptErr
+		return gate, attemptDone, workerDone
 	}
 
 	t.Run("immediate attempt failed", func(t *testing.T) {
@@ -885,12 +955,12 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 		f.link(t, org1, accountA)
 		f.addPendingUnlink(t, org1)
 		f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
-		workerErr, gate, attemptErr := immediate(t, f)
+		gate, attemptDone, workerDone := immediate(t, f)
 		gate.Release()
-		if err := attemptErr(); err != nil {
+		if err := gate.WaitForResult(t, attemptDone); err != nil {
 			t.Fatal(err)
 		}
-		if err := workerErr(); err != nil {
+		if err := gate.WaitForResult(t, workerDone); err != nil {
 			t.Fatal(err)
 		}
 		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 1 {
@@ -919,12 +989,12 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 		f.addOrg(t, org1)
 		f.link(t, org1, accountA)
 		f.addPendingUnlink(t, org1)
-		workerErr, gate, attemptErr := immediate(t, f)
+		gate, attemptDone, workerDone := immediate(t, f)
 		gate.Release()
-		if err := attemptErr(); err != nil {
+		if err := gate.WaitForResult(t, attemptDone); err != nil {
 			t.Fatal(err)
 		}
-		if err := workerErr(); err != nil {
+		if err := gate.WaitForResult(t, workerDone); err != nil {
 			t.Fatal(err)
 		}
 		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 1 {

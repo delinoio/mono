@@ -428,6 +428,8 @@ func killProcess(t *testing.T, p *proc) {
 func launchProcess(logs *logSink, name string, env []string, bin string, args ...string) (*proc, error) {
 	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(), env...)
+	// Descendants can keep the output pipes open after the direct child exits.
+	cmd.WaitDelay = 2 * time.Second
 	stdout, stdoutDone := logs.writer(name)
 	stderr, stderrDone := logs.writer(name)
 	cmd.Stdout = stdout
