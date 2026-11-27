@@ -67,13 +67,14 @@ func createLocalOffer(peer offerPeer, gatherTimeout time.Duration) (string, erro
 type fakeOfferPeer struct {
 	createErr, setErr error
 	gathered          chan struct{}
-	sdp               string
+	offerSDP          string
+	gatheredSDP       string
 	calls             []string
 }
 
 func (f *fakeOfferPeer) CreateOffer(*webrtc.OfferOptions) (webrtc.SessionDescription, error) {
 	f.calls = append(f.calls, "CreateOffer")
-	return webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: f.sdp}, f.createErr
+	return webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: f.offerSDP}, f.createErr
 }
 
 func (f *fakeOfferPeer) SetLocalDescription(webrtc.SessionDescription) error {
@@ -87,7 +88,7 @@ func (f *fakeOfferPeer) GatheringComplete() <-chan struct{} {
 }
 
 func (f *fakeOfferPeer) LocalDescription() *webrtc.SessionDescription {
-	return &webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: f.sdp}
+	return &webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: f.gatheredSDP}
 }
 
 // An operation error is reported as that error, not as a gathering timeout:
@@ -127,7 +128,7 @@ func TestCreateLocalOfferOperationErrors(t *testing.T) {
 
 // Gathering that never completes ends with errGatheringTimeout.
 func TestCreateLocalOfferGatheringTimeout(t *testing.T) {
-	peer := &fakeOfferPeer{gathered: make(chan struct{}), sdp: "v=0"}
+	peer := &fakeOfferPeer{gathered: make(chan struct{}), offerSDP: "v=0"}
 	sdp, err := createLocalOffer(peer, time.Millisecond)
 	if !errors.Is(err, errGatheringTimeout) {
 		t.Fatalf("error %v, want a gathering timeout", err)
@@ -139,12 +140,14 @@ func TestCreateLocalOfferGatheringTimeout(t *testing.T) {
 
 // Completed gathering returns the local SDP.
 func TestCreateLocalOfferSuccess(t *testing.T) {
+	const offerSDP = "v=0\r\n"
+	const gatheredSDP = offerSDP + "a=candidate:1 1 UDP 2130706431 192.0.2.1 5000 typ host\r\n"
 	gathered := make(chan struct{})
 	close(gathered)
-	peer := &fakeOfferPeer{gathered: gathered, sdp: "v=0 fixture"}
+	peer := &fakeOfferPeer{gathered: gathered, offerSDP: offerSDP, gatheredSDP: gatheredSDP}
 	sdp, err := createLocalOffer(peer, time.Minute)
-	if err != nil || sdp != "v=0 fixture" {
-		t.Fatalf("createLocalOffer = %q, %v", sdp, err)
+	if err != nil || sdp != gatheredSDP {
+		t.Fatalf("createLocalOffer = %q, %v, want %q, nil", sdp, err, gatheredSDP)
 	}
 	if got := strings.Join(peer.calls, ","); got != "CreateOffer,GatheringComplete,SetLocalDescription" {
 		t.Fatalf("calls %s", got)

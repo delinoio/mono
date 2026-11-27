@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
@@ -164,7 +163,7 @@ func New(ctx context.Context, opts Options) (*Agent, error) {
 		return nil, err
 	}
 	a.Sandboxes.SetCreateGate(updateGate{a.updater})
-	httpClient := &http.Client{Timeout: 30 * time.Minute}
+	httpClient := snapxfer.NewHTTPClient(30 * time.Minute)
 	a.transfer = &snapxfer.Transfer{HTTP: httpClient, URLs: a, Logger: opts.Logger, TempDir: opts.Store.Path(store.SnapshotsDir)}
 	if opts.NewDataPath != nil {
 		a.dataPath = opts.NewDataPath(a)

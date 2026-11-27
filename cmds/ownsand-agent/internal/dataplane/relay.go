@@ -110,13 +110,17 @@ type rstream struct {
 	cancel  context.CancelFunc
 	started bool
 	ended   bool
+	// terminalQueued seals admission while the dispatcher returns its outcome.
+	terminalQueued bool
 }
 
 type rconn struct {
-	gen    uint64
-	out    chan *ownsandv1.DataFrame
-	ctx    context.Context
-	cancel context.CancelFunc
+	gen uint64
+	out chan *ownsandv1.DataFrame
+	// outSpace is closed when the writer frees a slot. relay.mu guards it.
+	outSpace chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 	// flushDeadline bounds closeAfterFlush; zero uses Timing's default.
 	flushDeadline time.Duration
 	// lastRecv is the monotonic reading (see monotonicNow) of the last byte
@@ -133,7 +137,7 @@ type rconn struct {
 	// connection; only then does the loop dial again without back-off.
 	probeFailed atomic.Bool
 	// queueFullLogged limits the log of the queue-full fallback of a
-	// terminal frame to one entry per connection.
+	// relay termination frame to one entry per connection.
 	queueFullLogged atomic.Bool
 	streams         map[uint64]*rstream
 	highest         uint64
@@ -191,25 +195,6 @@ func (c *rconn) enqueue(f *ownsandv1.DataFrame) error {
 	}
 }
 
-// enqueueCtx queues a frame like enqueue and also stops waiting when ctx ends
-// (a stream context that a close frame canceled). It returns ctx.Err() then,
-// and queues no frame when ctx has already ended, so a frame of a closed
-// stream never follows the close. Connection-level and terminal frames keep
-// the connection-lifetime enqueue.
-func (c *rconn) enqueueCtx(ctx context.Context, f *ownsandv1.DataFrame) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case c.out <- f:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.ctx.Done():
-		return errors.New("dataplane: relay connection closed")
-	}
-}
-
 type relay struct {
 	d      *DataPlane
 	limits RelayLimits
@@ -224,6 +209,16 @@ type relay struct {
 	wake     chan struct{}
 	ctx      context.Context
 	cancel   context.CancelFunc
+}
+
+// outboundDequeued wakes stream senders to recheck admission and capacity.
+func (r *relay) outboundDequeued(c *rconn) {
+	r.mu.Lock()
+	if c.outSpace != nil {
+		close(c.outSpace)
+		c.outSpace = nil
+	}
+	r.mu.Unlock()
 }
 
 // countingBody reports every block of bytes that arrives on the relay
@@ -571,6 +566,7 @@ func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error)
 			case <-ctx.Done():
 				return
 			case f := <-c.out:
+				r.outboundDequeued(c)
 				if f == nil {
 					// The flush marker of closeAfterFlush: end the request
 					// side so the queued frames reach the control plane
@@ -749,6 +745,6 @@ func (r *relay) connClosed(c *rconn) {
 	}
 	r.mu.Unlock()
 	for _, st := range streams {
-		r.finishStream(st, nil)
+		r.finishStream(st, nil, nil)
 	}
 }
