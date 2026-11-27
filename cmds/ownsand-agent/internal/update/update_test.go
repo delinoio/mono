@@ -28,12 +28,13 @@ import (
 )
 
 type release struct {
-	pub      ed25519.PublicKey
-	priv     ed25519.PrivateKey
-	manifest []byte
-	sig      []byte
-	artifact []byte
-	srv      *httptest.Server
+	pub              ed25519.PublicKey
+	priv             ed25519.PrivateKey
+	manifest         []byte
+	sig              []byte
+	artifact         []byte
+	srv              *httptest.Server
+	artifactRequests atomic.Int32
 }
 
 func newRelease(t *testing.T, mutate func(*Manifest, *[]byte)) *release {
@@ -43,7 +44,7 @@ func newRelease(t *testing.T, mutate func(*Manifest, *[]byte)) *release {
 	r.srv = httptest.NewServer(mux)
 	t.Cleanup(r.srv.Close)
 	sum := sha256.Sum256(r.artifact)
-	m := Manifest{Schema: 1, Releases: []Release{{Version: "1.1.0", Default: true, Artifacts: []Artifact{{Platform: "linux-amd64", URL: r.srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}, RevokedVersions: []string{"0.9.0"}}
+	m := Manifest{Schema: 1, Sequence: 1, Releases: []Release{{Version: "1.1.0", Default: true, Artifacts: []Artifact{{Platform: "linux-amd64", URL: r.srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}, RevokedVersions: []string{"0.9.0"}}
 	artifact := r.artifact
 	if mutate != nil {
 		mutate(&m, &artifact)
@@ -54,7 +55,10 @@ func newRelease(t *testing.T, mutate func(*Manifest, *[]byte)) *release {
 	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte(base64.StdEncoding.EncodeToString(r.sig)))
 	})
-	mux.HandleFunc("/agent", func(w http.ResponseWriter, _ *http.Request) { w.Write(artifact) })
+	mux.HandleFunc("/agent", func(w http.ResponseWriter, _ *http.Request) {
+		r.artifactRequests.Add(1)
+		w.Write(artifact)
+	})
 	return r
 }
 
@@ -929,7 +933,7 @@ func TestArtifactFailureKeepsSignedRevocation(t *testing.T) {
 		t.Fatal("installer or restart ran after a failed artifact")
 	}
 	// A later command stages a verified artifact and installs once idle.
-	good := newRelease(t, nil)
+	good := newRelease(t, func(m *Manifest, _ *[]byte) { m.Sequence = 2 })
 	u.opts.HTTP, u.opts.ManifestURL, u.opts.Keys = good.srv.Client(), good.srv.URL+"/manifest.json", []ed25519.PublicKey{good.pub}
 	if err := update(u, "1.1.0", true); err != nil {
 		t.Fatal(err)

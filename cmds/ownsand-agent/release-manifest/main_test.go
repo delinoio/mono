@@ -7,11 +7,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -109,6 +111,23 @@ func (f *fixture) addRelease(t *testing.T, current, version, artifactDir, out st
 	return f.run(t, args...)
 }
 
+// writeSignedCurrent also prepares legacy manifests that an earlier release
+// tool could sign.
+func (f *fixture) writeSignedCurrent(t *testing.T, path string, raw []byte) {
+	t.Helper()
+	key, err := parsePrivateKey([]byte(f.pemText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(key, raw))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".sig", []byte(sig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManifestSchemaMatchesTheAgent(t *testing.T) {
 	if manifestSchema != update.ManifestSchema {
 		t.Fatalf("manifestSchema = %d, update.ManifestSchema = %d", manifestSchema, update.ManifestSchema)
@@ -149,6 +168,9 @@ func TestReleaseRoundTripVerifiesWithTheAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the agent rejects the manifest: %v", err)
 	}
+	if m.Sequence != 2 {
+		t.Fatalf("agent decoded sequence %d, want 2", m.Sequence)
+	}
 	if len(m.Releases) != 2 || m.Releases[0].Default || !m.Releases[1].Default {
 		t.Fatalf("releases %+v, want 0.1.0 then the default 0.2.0", m.Releases)
 	}
@@ -173,12 +195,7 @@ func TestAddReleaseKeepsRevokedVersionsAndIsIdempotent(t *testing.T) {
 	current := filepath.Join(f.dir, "current.json")
 	art := f.artifacts(t, "a", "x", PlatformLinuxAmd64)
 	seed := []byte(`{"schema":1,"releases":[{"version":"0.1.0","default":true,"artifacts":[{"platform":"linux-amd64","url":"https://example.test/a","sha256":"` + strings.Repeat("a", 64) + `"}]}],"revoked_versions":["0.0.9"]}`)
-	if err := os.WriteFile(current, seed, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.run(t, "sign", "--manifest", current, "--out", current+".sig"); err != nil {
-		t.Fatal(err)
-	}
+	f.writeSignedCurrent(t, current, seed)
 	next := filepath.Join(f.dir, "next.json")
 	if err := f.addRelease(t, current, "0.2.0", art, next, "linux-amd64"); err != nil {
 		t.Fatal(err)
@@ -206,10 +223,99 @@ func TestAddReleaseKeepsRevokedVersionsAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestAddReleaseSetsSequence(t *testing.T) {
+	f := newFixture(t)
+	const platform = "linux-amd64"
+	artifactDir := f.artifacts(t, "assets", "agent", PlatformLinuxAmd64)
+	legacy := filepath.Join(f.dir, "legacy.json")
+	f.writeSignedCurrent(t, legacy, []byte(`{"schema":1,"releases":[],"revoked_versions":[]}`))
+	first := filepath.Join(f.dir, "first.json")
+	second := filepath.Join(f.dir, "second.json")
+
+	for _, tc := range []struct {
+		name, current, out, version string
+		sequence                    uint64
+	}{
+		{"initial", "", first, "0.1.0", 1},
+		{"next", first, second, "0.2.0", 2},
+		{"rerun", second, filepath.Join(f.dir, "rerun.json"), "0.2.0", 2},
+		{"legacy migration", legacy, filepath.Join(f.dir, "migrated.json"), "0.1.0", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := f.addRelease(t, tc.current, tc.version, artifactDir, tc.out, platform); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(tc.out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := decodeManifest(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.Sequence != tc.sequence {
+				t.Fatalf("sequence = %d, want %d", m.Sequence, tc.sequence)
+			}
+			switch tc.name {
+			case "initial":
+				if err := f.run(t, "sign", "--manifest", tc.out, "--out", tc.out+".sig"); err != nil {
+					t.Fatal(err)
+				}
+			case "next":
+				// Exercise a current manifest with different formatting.
+				f.writeSignedCurrent(t, tc.out, append(raw, ' ', '\n'))
+			}
+		})
+	}
+	previous, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rerun, err := os.ReadFile(filepath.Join(f.dir, "rerun.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rerun, previous) {
+		t.Fatal("the rerun rewrote the signed manifest bytes")
+	}
+}
+
+func TestAddReleaseSequenceExhaustion(t *testing.T) {
+	f := newFixture(t)
+	current := filepath.Join(f.dir, "current.json")
+	out := filepath.Join(f.dir, "out.json")
+	art := f.artifacts(t, "assets", "agent", PlatformLinuxAmd64)
+	m := emptyManifest()
+	m.Sequence = math.MaxUint64
+	raw, err := m.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.writeSignedCurrent(t, current, raw)
+	if err := f.addRelease(t, current, "0.1.0", art, out, "linux-amd64"); !errors.Is(err, errManifestSequenceExhausted) {
+		t.Fatalf("add release at the maximum sequence: %v", err)
+	}
+	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed add-release left an output: %v", err)
+	}
+}
+
+func TestSignAndVerifyRequireSequence(t *testing.T) {
+	f := newFixture(t)
+	path := filepath.Join(f.dir, "manifest.json")
+	f.writeSignedCurrent(t, path, []byte(`{"schema":1,"releases":[],"revoked_versions":[]}`))
+	if err := f.run(t, "sign", "--manifest", path, "--out", path+".new.sig"); !errors.Is(err, errManifestNoSequence) {
+		t.Fatalf("sign unsequenced manifest: %v", err)
+	}
+	if err := f.run(t, "verify", "--manifest", path, "--signature", path+".sig"); !errors.Is(err, errManifestNoSequence) {
+		t.Fatalf("verify unsequenced manifest: %v", err)
+	}
+}
+
 func TestAddReleaseRejections(t *testing.T) {
 	f := newFixture(t)
 	current := filepath.Join(f.dir, "current.json")
-	seed := []byte(`{"schema":1,"releases":[{"version":"0.3.0","default":true,"artifacts":[{"platform":"linux-amd64","url":"https://example.test/a","sha256":"` + strings.Repeat("a", 64) + `"}]}],"revoked_versions":["0.4.0"]}`)
+	seed := []byte(`{"schema":1,"sequence":1,"releases":[{"version":"0.3.0","default":true,"artifacts":[{"platform":"linux-amd64","url":"https://example.test/a","sha256":"` + strings.Repeat("a", 64) + `"}]}],"revoked_versions":["0.4.0"]}`)
 	os.WriteFile(current, seed, 0o644)
 	if err := f.run(t, "sign", "--manifest", current, "--out", current+".sig"); err != nil {
 		t.Fatal(err)
@@ -296,7 +402,9 @@ func TestDecodeManifestRejectsUnknownFields(t *testing.T) {
 func TestSignRequiresABuiltinKey(t *testing.T) {
 	f := newFixture(t)
 	manifestPath := filepath.Join(f.dir, "m.json")
-	b, _ := emptyManifest().encode()
+	m := emptyManifest()
+	m.Sequence = 1
+	b, _ := m.encode()
 	os.WriteFile(manifestPath, b, 0o644)
 	other, _, _ := ed25519.GenerateKey(rand.Reader)
 	setBuiltinKeys(t, other)

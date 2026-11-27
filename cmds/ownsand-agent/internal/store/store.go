@@ -244,6 +244,13 @@ type PendingUpdate struct {
 	PreviousVersion string `json:"previous_version"`
 }
 
+// ManifestCheckpoint records the highest accepted release manifest sequence
+// and the lowercase hex SHA-256 of the exact signed bytes.
+type ManifestCheckpoint struct {
+	Sequence uint64 `json:"sequence"`
+	SHA256   string `json:"sha256"`
+}
+
 // AgentState is the agent record apart from the identity.
 type AgentState struct {
 	APIURL string `json:"api_url"`
@@ -251,9 +258,10 @@ type AgentState struct {
 	// reset state directory.
 	StateEpoch string `json:"state_epoch"`
 	// RevisionCounter is the last sandbox revision counter of the epoch.
-	RevisionCounter uint64         `json:"revision_counter"`
-	Removal         RemovalRecord  `json:"removal"`
-	PendingUpdate   *PendingUpdate `json:"pending_update,omitempty"`
+	RevisionCounter uint64              `json:"revision_counter"`
+	Removal         RemovalRecord       `json:"removal"`
+	PendingUpdate   *PendingUpdate      `json:"pending_update,omitempty"`
+	ReleaseManifest *ManifestCheckpoint `json:"release_manifest,omitempty"`
 	// Limits and STUN URLs of the last configuration message.
 	Limits   *Limits  `json:"limits,omitempty"`
 	STUNURLs []string `json:"stun_urls,omitempty"`

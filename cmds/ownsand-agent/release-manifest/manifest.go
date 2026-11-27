@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -36,6 +37,7 @@ const maxManifestBytes = 1 << 20
 // package update.
 type manifest struct {
 	Schema          int       `json:"schema"`
+	Sequence        uint64    `json:"sequence"`
 	Releases        []release `json:"releases"`
 	RevokedVersions []string  `json:"revoked_versions"`
 }
@@ -119,13 +121,15 @@ var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Errors of the manifest update.
 var (
-	errNewerRelease    = errors.New("the manifest already lists a newer release")
-	errChangedRelease  = errors.New("the manifest already lists this version with other artifacts")
-	errRevokedRelease  = errors.New("the manifest revokes this version")
-	errUnverified      = errors.New("the current manifest signature does not verify with a built-in release key")
-	errNoBuiltinKeys   = errors.New("the agent has no built-in release public key; add one to cmds/ownsand-agent/internal/releasekeys")
-	errKeyNotBuiltin   = errors.New("the signing key is not a built-in release key of the agent")
-	errManifestTooLong = fmt.Errorf("the manifest is larger than %d bytes, the most that the agent downloads", maxManifestBytes)
+	errNewerRelease              = errors.New("the manifest already lists a newer release")
+	errChangedRelease            = errors.New("the manifest already lists this version with other artifacts")
+	errRevokedRelease            = errors.New("the manifest revokes this version")
+	errUnverified                = errors.New("the current manifest signature does not verify with a built-in release key")
+	errNoBuiltinKeys             = errors.New("the agent has no built-in release public key; add one to cmds/ownsand-agent/internal/releasekeys")
+	errKeyNotBuiltin             = errors.New("the signing key is not a built-in release key of the agent")
+	errManifestNoSequence        = errors.New("the manifest has no positive sequence")
+	errManifestSequenceExhausted = errors.New("the manifest sequence has reached its maximum")
+	errManifestTooLong           = fmt.Errorf("the manifest is larger than %d bytes, the most that the agent downloads", maxManifestBytes)
 )
 
 // decodeManifest decodes and validates manifest bytes. Unknown fields fail,
@@ -144,6 +148,13 @@ func decodeManifest(b []byte) (*manifest, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+func (m *manifest) requireSequence() error {
+	if m.Sequence == 0 {
+		return errManifestNoSequence
+	}
+	return nil
 }
 
 func (m *manifest) validate() error {
@@ -296,7 +307,8 @@ func newRelease(in releaseInput) (release, error) {
 
 // addRelease adds r to m and makes it the only default release. It is
 // idempotent: when m already lists r with the same artifacts (a rerun of the
-// publish job), it only restores the default flags. It fails when m lists the
+// publish job), it only restores the default flags. It advances the sequence
+// when the manifest changes or has no sequence yet. It fails when m lists the
 // version with other artifacts, lists a newer version or revokes the
 // version, so a rerun of an old run never replaces a newer default.
 func addRelease(m *manifest, r release) error {
@@ -321,14 +333,28 @@ func addRelease(m *manifest, r release) error {
 			index = i
 		}
 	}
+	changed := index < 0 || m.Sequence == 0
 	if index < 0 {
 		m.Releases = append(m.Releases, r)
 		index = len(m.Releases) - 1
 	}
 	for i := range m.Releases {
-		m.Releases[i].Default = i == index
+		isDefault := i == index
+		if m.Releases[i].Default != isDefault {
+			changed = true
+			m.Releases[i].Default = isDefault
+		}
 	}
-	return m.validate()
+	if err := m.validate(); err != nil {
+		return err
+	}
+	if changed {
+		if m.Sequence == math.MaxUint64 {
+			return errManifestSequenceExhausted
+		}
+		m.Sequence++
+	}
+	return nil
 }
 
 func sameArtifacts(a, b []artifact) bool {
