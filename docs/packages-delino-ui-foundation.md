@@ -158,7 +158,7 @@ Root `pnpm test` and `pnpm typecheck` include the package. The package has no `b
 - `@ui-sdk/core` and `@ui-sdk/react` (Apache-2.0), pinned to the same exact version in `dependencies`. UI SDK is in public beta and its APIs can change before general availability, so upgrade both packages together, read their changelogs and run the unit tests.
 - `react` and `react-dom` 19 as peer dependencies.
 - `@rstest/core`, `happy-dom`, `@testing-library/react`, `@testing-library/dom`, `typescript` and the React type packages as development dependencies.
-- Consumers: the [OwnSand console](apps-ownsand-console-foundation.md#dependencies-and-integrations) (`apps/ownsand`) and [delino-accounts](apps-delino-accounts-foundation.md#dependencies-and-integrations) (`apps/delino-accounts`) declare `"delino-ui": "workspace:*"` in their dependencies. An app that starts using the package adds the same entry, records the use in its own contract and is added to this list.
+- Consumers: the [OwnSand console](apps-ownsand-console-foundation.md#dependencies-and-integrations) (`apps/ownsand`), [delino-accounts](apps-delino-accounts-foundation.md#dependencies-and-integrations) (`apps/delino-accounts`), and the [SandRun console](apps-sandrun-console-foundation.md#dependencies-and-integrations) (`apps/sandrun`) declare `"delino-ui": "workspace:*"` in their dependencies. An app that starts using the package adds the same entry, records the use in its own contract and is added to this list.
 
 ## Change Triggers
 
