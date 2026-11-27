@@ -309,7 +309,10 @@ func Resolve(dir string) (Metadata, error) {
 // under `<dir>.old`. Install first recovers the backup, so an exchange that an
 // earlier process left half done is repaired instead of deleted, and it
 // removes a leftover `<dir>.old` only when dir holds a complete image. When
-// the second rename fails, the old image moves back.
+// the second rename fails, the old image moves back. Canceling ctx before
+// the exchange leaves the current image (including any recovered backup) in
+// place. Once the exchange starts, Install follows the recovery rules above
+// even if ctx ends.
 func Install(ctx context.Context, dir string) error {
 	lock, err := waitLock(ctx, publicationLockPath(dir), exclusiveLock)
 	if err != nil {
@@ -328,6 +331,9 @@ func Install(ctx context.Context, dir string) error {
 	// whatever is left in old is stale and the only complete generation is
 	// not at risk.
 	if err := os.RemoveAll(old); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	moved := true
