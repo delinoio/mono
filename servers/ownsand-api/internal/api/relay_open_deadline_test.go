@@ -189,22 +189,52 @@ func TestRelayAdmissionDeviceConnectionWait(t *testing.T) {
 	})
 }
 
-// TestRelayAdmissionStreamOpenWait checks the wait to open a stream on an
-// agent relay connection whose outbound queue is full (nothing sends the
-// queued frames), both while the call waits for room in the queue and while
-// it waits for another open that holds the open order: a server-side deadline
-// ends the call with deadline_exceeded and a cancellation with canceled. A
-// connection that closed during the wait stays unavailable.
+type relayAdmissionWait string
+
+const (
+	relayAdmissionQueue relayAdmissionWait = "outbound queue"
+	relayAdmissionGate  relayAdmissionWait = "open gate"
+)
+
+// waitRelayAdmissionOpen observes the server goroutine of the one active
+// ReadFile RPC. A direct Open by the fixture's holder has no DataPlane.open
+// frame. The top frame identifies which select blocks the RPC.
+func waitRelayAdmissionOpen(want relayAdmissionWait, within time.Duration) bool {
+	const connFrame = "github.com/delinoio/mono/servers/ownsand-api/internal/relay.(*Conn)."
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		for _, trace := range strings.Split(goroutineStacks(), "\n\n") {
+			header, frames, _ := strings.Cut(trace, "\n")
+			if !strings.Contains(header, "[select") ||
+				!strings.Contains(frames, "(*DataPlane).open(") ||
+				!strings.Contains(frames, connFrame+"Open(") {
+				continue
+			}
+			if want == relayAdmissionGate && strings.HasPrefix(frames, connFrame+"Open(") ||
+				want == relayAdmissionQueue && strings.HasPrefix(frames, connFrame+"enqueueFrame(") {
+				return true
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// TestRelayAdmissionStreamOpenWait checks the Connect status of a ReadFile
+// waiting for queue capacity or for another open to release the gate.
 func TestRelayAdmissionStreamOpenWait(t *testing.T) {
+	const (
+		waitWithin     = 2 * time.Second
+		serverDeadline = 3 * time.Second
+	)
 	env := testenv.New(t, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
 			RequestDeadline: 5 * time.Second, GrantAck: time.Second, Signaling: 2 * time.Second}
 	})
 	org, _, sandboxID := runningSandbox(t, env)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	// A connection without a writer: its outbound queue (1024 ordinary
-	// frames) fills with stream open frames and no more room appears.
+	// The connection has no writer. Once full, the outbound queue stays full.
 	probe := authorizeReadFile(t, org, sandboxID)
 	g := env.App.Plane.Grants.Get(probe.id)
 	if g == nil {
@@ -225,8 +255,50 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 			t.Fatalf("fill the outbound queue, open %d: %v", i, err)
 		}
 	}
+	fillerCount := conn.StreamCount()
 
-	expect := func(t *testing.T, name string, activeStreams int) {
+	startCall := func(t *testing.T, timeout time.Duration) (context.CancelFunc, <-chan error) {
+		t.Helper()
+		grant := authorizeReadFile(t, org, sandboxID)
+		clientCtx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- callReadFile(clientCtx, t, env, org, grant, timeout)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(waitWithin):
+				t.Error("ReadFile did not exit after cleanup canceled its context")
+			}
+		})
+		return cancel, done
+	}
+	requireCode := func(t *testing.T, done <-chan error, want connect.Code) {
+		t.Helper()
+		select {
+		case err := <-done:
+			if testenv.Code(err) != want {
+				t.Fatalf("ReadFile returned %v, want %s", err, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("ReadFile did not return, want %s", want)
+		}
+	}
+	requireWait := func(t *testing.T, want relayAdmissionWait) {
+		t.Helper()
+		if !waitRelayAdmissionOpen(want, waitWithin) {
+			t.Fatalf("ReadFile did not reach the %s wait within %v", want, waitWithin)
+		}
+		if want == relayAdmissionGate {
+			if got := conn.StreamCount(); got != fillerCount+1 {
+				t.Fatalf("stream count while ReadFile waits at the open gate = %d, want %d with the holder active", got, fillerCount+1)
+			}
+		}
+	}
+	expect := func(t *testing.T, want relayAdmissionWait, activeStreams int) {
 		t.Helper()
 		checkStreams := func(t *testing.T) {
 			t.Helper()
@@ -234,75 +306,74 @@ func TestRelayAdmissionStreamOpenWait(t *testing.T) {
 				t.Fatalf("open streams after rejected admission = %d, want %d", got, activeStreams)
 			}
 		}
-		t.Run(name+"/deadline", func(t *testing.T) {
+		t.Run("deadline", func(t *testing.T) {
 			before := countRPCCode(env, readFileProcedure, connect.CodeDeadlineExceeded)
 			start := time.Now()
-			_, err := admissionCall(ctx, t, env, org, sandboxID, 200*time.Millisecond)
-			took := time.Since(start)
-			if testenv.Code(err) != connect.CodeDeadlineExceeded {
-				t.Fatalf("deadline during the stream open: %v after %v, want deadline_exceeded", err, took)
-			}
-			if took > 3*time.Second {
-				t.Fatalf("the call ended after %v, want about the 200 ms server deadline", took)
+			_, done := startCall(t, serverDeadline)
+			requireWait(t, want)
+			requireCode(t, done, connect.CodeDeadlineExceeded)
+			if took := time.Since(start); took > serverDeadline+waitWithin {
+				t.Fatalf("the call ended after %v, want about the %v server deadline", took, serverDeadline)
 			}
 			waitRPCCode(t, env, readFileProcedure, connect.CodeDeadlineExceeded, before)
 			checkStreams(t)
 		})
-		t.Run(name+"/cancel", func(t *testing.T) {
+		t.Run("cancel", func(t *testing.T) {
 			before := countRPCCode(env, readFileProcedure, connect.CodeCanceled)
-			grant := authorizeReadFile(t, org, sandboxID)
-			cctx, cancel := context.WithCancel(ctx)
-			go func() {
-				time.Sleep(150 * time.Millisecond)
-				cancel()
-			}()
-			err := callReadFile(cctx, t, env, org, grant, 0)
-			if testenv.Code(err) != connect.CodeCanceled {
-				t.Fatalf("cancellation during the stream open: %v, want canceled", err)
+			cancel, done := startCall(t, 0)
+			requireWait(t, want)
+			if want == relayAdmissionQueue {
+				// With no holder, a queue wait must fail the gate observation
+				// even though the RPC will return the same cancellation code.
+				const controlWithin = 100 * time.Millisecond
+				if waitRelayAdmissionOpen(relayAdmissionGate, controlWithin) {
+					t.Fatal("the queue wait satisfied the open gate observation without a holder")
+				}
+				t.Logf("the open gate observation rejected the queue wait after %v", controlWithin)
 			}
+			cancel()
+			requireCode(t, done, connect.CodeCanceled)
 			waitRPCCode(t, env, readFileProcedure, connect.CodeCanceled, before)
 			checkStreams(t)
 		})
 	}
-	// The call itself waits for room in the full queue.
-	fillerStreams := conn.StreamCount()
-	expect(t, "queue full", fillerStreams)
 
-	// Another open holds the open order while it waits for room, so the call
-	// waits for its turn.
-	holderCtx, stopHolder := context.WithCancel(ctx)
-	holderDone := make(chan error, 1)
-	go func() {
-		_, err := conn.Open(holderCtx, "holder", sandboxID)
-		holderDone <- err
-	}()
-	t.Cleanup(func() {
-		stopHolder()
-		select {
-		case <-holderDone:
-		case <-time.After(5 * time.Second):
-			t.Error("the open order holder did not return")
-		}
+	t.Run("queue full", func(t *testing.T) {
+		expect(t, relayAdmissionQueue, fillerCount)
 	})
-	waitUntil := time.Now().Add(5 * time.Second)
-	for conn.StreamCount() != fillerStreams+1 {
-		if time.Now().After(waitUntil) {
-			t.Fatal("the holder did not allocate its stream")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	expect(t, "open order held", fillerStreams+1)
+	t.Run("open order held", func(t *testing.T) {
+		holderCtx, stopHolder := context.WithCancel(t.Context())
+		holderDone := make(chan struct{})
+		t.Cleanup(func() {
+			stopHolder()
+			select {
+			case <-holderDone:
+			case <-time.After(waitWithin):
+				t.Error("the open gate holder did not exit after cleanup canceled its context")
+			}
+		})
+		go func() {
+			defer close(holderDone)
+			_, _ = conn.Open(holderCtx, "holder", sandboxID)
+		}()
 
-	// A connection that closes while the call waits stays unavailable, and
-	// the call does not report a context error.
-	closing := authorizeReadFile(t, org, sandboxID)
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		conn.Close(fmt.Errorf("the agent relay connection closed in the test"))
-	}()
-	start := time.Now()
-	err := callReadFile(ctx, t, env, org, closing, time.Minute)
-	if testenv.Code(err) != connect.CodeUnavailable {
-		t.Fatalf("connection closed during the stream open: %v after %v, want unavailable", err, time.Since(start))
-	}
+		// Open reserves its stream after acquiring the gate and before
+		// enqueueing. The full queue keeps the holder from releasing the gate.
+		deadline := time.Now().Add(waitWithin)
+		for conn.StreamCount() != fillerCount+1 {
+			if time.Now().After(deadline) {
+				t.Fatalf("stream count while starting the open gate holder = %d, want %d within %v", conn.StreamCount(), fillerCount+1, waitWithin)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		expect(t, relayAdmissionGate, fillerCount+1)
+		t.Run("close", func(t *testing.T) {
+			// The client has no deadline, and the server deadline is longer
+			// than the wait for the RPC to reach the gate and return.
+			_, done := startCall(t, time.Minute)
+			requireWait(t, relayAdmissionGate)
+			conn.Close(fmt.Errorf("the agent relay connection closed in the test"))
+			requireCode(t, done, connect.CodeUnavailable)
+		})
+	})
 }
