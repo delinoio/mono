@@ -103,6 +103,7 @@ type Server struct {
 // Gate holds the calls of one method before they take effect, until
 // Release. Tests use it to keep a call in flight while other operations run.
 type Gate struct {
+	method string
 	// Entered receives one value when a held call reaches the gate and can
 	// notify before release. Calls that observe release skip notification.
 	Entered chan struct{}
@@ -262,7 +263,7 @@ func (f *Server) FailReply(method string, err error) {
 // Hold makes every later call of method wait before it takes effect until
 // the returned gate is released.
 func (f *Server) Hold(method string) *Gate {
-	g := &Gate{Entered: make(chan struct{}, 16), release: make(chan struct{})}
+	g := &Gate{method: method, Entered: make(chan struct{}, 16), release: make(chan struct{})}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gates[method] = g
