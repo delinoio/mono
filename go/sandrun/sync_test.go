@@ -618,13 +618,19 @@ func TestSyncGitSymlinkPlaceholder(t *testing.T) {
 	}
 }
 
-func TestSyncRejectsGitSymlinkPlaceholderLineBreakOnWindows(t *testing.T) {
-	c, srv, org := newTestClient(t, "")
-	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
-	dir := newRepo(t, map[string]string{"link": "target\nsecond line"}, nil, "")
+func newGitSymlinkPlaceholder(t *testing.T, target string) string {
+	t.Helper()
+	dir := newRepo(t, map[string]string{"link": target}, nil, "")
 	oid := strings.TrimSpace(git(t, dir, "rev-parse", ":link"))
 	git(t, dir, "update-index", "--cacheinfo", "120000,"+oid+",link")
 	git(t, dir, "config", "core.symlinks", "false")
+	return dir
+}
+
+func TestSyncRejectsGitSymlinkPlaceholderLineBreakOnWindows(t *testing.T) {
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newGitSymlinkPlaceholder(t, "target\nsecond line")
 
 	_, err := c.Sync(t.Context(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
 	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "line break") {
@@ -632,6 +638,112 @@ func TestSyncRejectsGitSymlinkPlaceholderLineBreakOnWindows(t *testing.T) {
 	}
 	if srv.Calls(execProc) != 0 || srv.Calls(writeProc) != 0 {
 		t.Fatal("sync started a guest command or upload for the rejected link")
+	}
+}
+
+func TestSyncRejectsGitSymlinkPlaceholderInvalidUTF8OnWindows(t *testing.T) {
+	const target = "dest-\xff"
+	for _, tc := range []struct {
+		name          string
+		matchingEntry bool
+	}{
+		{name: "missing manifest"},
+		{name: "matching manifest", matchingEntry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+			dir := newGitSymlinkPlaceholder(t, target)
+			if tc.matchingEntry {
+				body, err := json.Marshal(manifest{
+					Version: manifestVersion, PathsValidated: true,
+					Files: map[string]manifestEntry{"link": localSymlink("link", target).entry},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(ds.GetWorkspacePath()+manifestSuffix, body, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res, err := c.Sync(t.Context(), SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+			if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition ||
+				!strings.Contains(err.Error(), `symbolic link "link"`) || !strings.Contains(err.Error(), "invalid UTF-8") ||
+				strings.Contains(err.Error(), "dest-") {
+				t.Errorf("sync = %+v, %v, want failed precondition naming the link without its target", res, err)
+			}
+			if execs, writes := srv.Calls(execProc), srv.Calls(writeProc); execs != 0 || writes != 0 {
+				t.Errorf("guest execs = %d, writes = %d, want zero for both", execs, writes)
+			}
+		})
+	}
+}
+
+func TestSyncGitSymlinkPlaceholderReplacementRuneOnWindows(t *testing.T) {
+	const target = "dest-\uFFFD"
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
+	dir := newGitSymlinkPlaceholder(t, target)
+	if runtime.GOOS != "windows" {
+		// The fake guest executes locally. On POSIX, emulate the Windows
+		// command outcomes so the test can inspect the staged link list.
+		bin := t.TempDir()
+		script := `#!/bin/sh
+set -eu
+if [ -n "${SANDRUN_SYNC_FORCE-}" ]; then
+    mkdir "$SANDRUN_SYNC_LOCK"
+elif [ -n "${SANDRUN_SYNC_LINK_LIST-}" ] && [ -n "${SANDRUN_SYNC_WORKSPACE-}" ]; then
+    test -s "$SANDRUN_SYNC_LINK_LIST"
+else
+    rm -f "$SANDRUN_SYNC_LINK_LIST"
+    rmdir "$SANDRUN_SYNC_LOCK"
+fi
+`
+		if err := os.WriteFile(filepath.Join(bin, "powershell.exe"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	} else if err := os.WriteFile(filepath.Join(ds.GetWorkspacePath(), target), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var applied atomic.Bool
+	srv.BeforeExec = func(req *sandrunv1.ExecDevSessionRequest) {
+		env := req.GetEnv()
+		if list := env[guestEnvLinks]; list != "" && env[guestEnvWorkspace] != "" {
+			applied.Store(true)
+			body, err := os.ReadFile(list)
+			if want := "link\t" + target + "\n"; err != nil || string(body) != want {
+				t.Errorf("staged link list = %x, %v, want %x", body, err, want)
+			}
+		}
+	}
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	if !applied.Load() {
+		t.Fatal("sync did not reach guest apply with the staged link list")
+	}
+}
+
+func TestSyncGitSymlinkPlaceholderPreservesInvalidUTF8OnPOSIX(t *testing.T) {
+	needPOSIX(t)
+	const target = "dest-\xff"
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+	dir := newGitSymlinkPlaceholder(t, target)
+	params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+	if _, err := c.Sync(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), "link")); err != nil || got != target {
+		t.Fatalf("guest link target = %x, %v, want %x", got, err, target)
+	}
+	sum := sha256.Sum256([]byte(target))
+	want := manifestEntry{Size: int64(len(target)), SHA256: hex.EncodeToString(sum[:]), Mode: modeSymlink}
+	if got := guestManifest(t, ds).Files["link"]; got != want {
+		t.Fatalf("guest manifest entry = %+v, want %+v", got, want)
 	}
 }
 

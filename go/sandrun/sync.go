@@ -92,6 +92,8 @@ type SyncResult struct {
 //     normalization and case mapping (macOS guests), and paths that are not
 //     valid on Windows (Windows guests) fail before the lock and any upload
 //     (*PathRuleError).
+//     Windows link targets with invalid UTF-8 or a line break fail at this
+//     stage, including links that match the guest manifest.
 //  6. The lock directory <workspace_path>.sandrun-sync.lock is created with one
 //     exec; an existing lock fails with ErrSyncLocked unless Force is set.
 //     Sync checks the manifest under the lock before returning an unchanged result.
@@ -191,11 +193,17 @@ func (c *Client) sync(ctx context.Context, p SyncParams, manifestLimit int64) (*
 		if len(bad) > 0 {
 			return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidWindowsName, Paths: bad})
 		}
-		// Windows reads one symbolic link per line. A line break in a
-		// target would make it interpret the remaining bytes as a new entry.
+		// Windows reads the link list as UTF-8 with one entry per line.
+		// Check every selected link, including entries the manifest already has.
 		for _, f := range local.files {
-			if f.entry.Mode == modeSymlink && strings.ContainsAny(f.target, "\r\n") {
+			if f.entry.Mode != modeSymlink {
+				continue
+			}
+			if strings.ContainsAny(f.target, "\r\n") {
 				return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sandrun: symbolic link %q has a target with a line break, which Windows sync cannot send", f.rel))
+			}
+			if !utf8.ValidString(f.target) {
+				return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sandrun: symbolic link %q has a target with invalid UTF-8, which Windows sync cannot send", f.rel))
 			}
 		}
 	}
