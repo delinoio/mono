@@ -140,7 +140,7 @@ export type SelectOptionProps = Omit<
 > & {
   /**
    * The visible name of the option. Strings, numbers, bigints and nested
-   * elements are allowed. An option whose children hold no text shows its value.
+   * elements are allowed. Without a label, blank child text falls back to the value.
    */
   children: React.ReactNode;
 };
@@ -208,21 +208,23 @@ export function SelectOption({
   children,
   className,
   label,
+  value,
   ...props
 }: SelectOptionProps) {
-  // The UI SDK keeps the trigger and the list text of an option from its
-  // `label` (a string) and falls back to the option value when it is absent.
-  // Interpolated children such as `{os} base image` reach this component as
-  // an array, so derive the text here; an explicit `label` wins and an option
-  // without text keeps showing its value.
-  const text = nodeText(children);
+  const childText = label == null ? nodeText(children) : undefined;
+  const fallback =
+    childText?.trim() === "" && typeof value === "string" ? value : undefined;
+  // The UI SDK gives string children priority over the item label.
+  // Pass the override as item text so the list and trigger agree.
+  const itemText = label || fallback;
   return (
     <SelectItem
       className={mergeClassName("dui-select-option", className)}
-      label={label ?? (text === "" ? undefined : text)}
+      label={label ?? fallback ?? (childText || undefined)}
+      value={value}
       {...props}
     >
-      <SelectItemText>{children}</SelectItemText>
+      <SelectItemText>{itemText ?? children}</SelectItemText>
       <SelectItemIndicator className="dui-select-option-indicator">
         <svg aria-hidden="true" viewBox="0 0 16 16" fill="none">
           <path

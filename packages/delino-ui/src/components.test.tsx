@@ -1307,6 +1307,56 @@ describe("Select", () => {
       expect(trigger.textContent).toBe("Twelve");
     });
 
+    test("uses a nonempty explicit label in the trigger and list", async () => {
+      const option = (
+        <SelectOption value="option-id" label="Twelve">
+          Dozen
+        </SelectOption>
+      );
+      const markup = document.createElement("div");
+      markup.innerHTML = renderToStaticMarkup(
+        <Select label="Quantity" defaultValue="option-id">
+          {option}
+        </Select>,
+      );
+      expect(markup.querySelector(".dui-select-value")?.textContent).toBe(
+        "Twelve",
+      );
+      const values: (string | null)[] = [];
+      render(
+        <Select label="Quantity" onValueChange={(value) => values.push(value)}>
+          {option}
+        </Select>,
+      );
+      const trigger = screen.getByRole("combobox", { name: "Quantity" });
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      const row = screen.getByRole("option", { name: "Twelve" });
+      expect(row.textContent).toBe("Twelve");
+      await act(async () => {
+        fireEvent.click(row);
+      });
+      expect(trigger.textContent).toBe("Twelve");
+      expect(values).toEqual(["option-id"]);
+    });
+
+    test("keeps the row's child text for an empty explicit label", async () => {
+      render(
+        <Select label="Quantity">
+          <SelectOption value="option-id" label="">
+            Dozen
+          </SelectOption>
+        </Select>,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("combobox", { name: "Quantity" }));
+      });
+      expect(screen.getByRole("option", { name: "Dozen" }).textContent).toBe(
+        "Dozen",
+      );
+    });
+
     test("reads the text of nested elements and numbers", () => {
       const slot = 2;
       render(
@@ -1331,18 +1381,60 @@ describe("Select", () => {
       ).toContain("Slot 2");
     });
 
-    test("keeps showing the value for an option without text", () => {
-      render(
-        <Select label="Empty" defaultValue="raw-value">
-          <SelectOption value="raw-value">
-            {null}
-            {false}
-          </SelectOption>
-        </Select>,
+    test.each([
+      { name: "an empty string", children: "" },
+      { name: "whitespace", children: "  " },
+      { name: "nested whitespace", children: <span>{"  "}</span> },
+      { name: "textless children", children: [null, false] },
+    ])("shows the option value for $name", async ({ children }) => {
+      const option = <SelectOption value="raw-value">{children}</SelectOption>;
+      const preselected = (
+        <Select label="Preselected" defaultValue="raw-value">
+          {option}
+        </Select>
       );
-      expect(
-        screen.getByRole("combobox", { name: "Empty" }).textContent,
-      ).toContain("raw-value");
+      const markup = document.createElement("div");
+      markup.innerHTML = renderToStaticMarkup(preselected);
+      expect(markup.querySelector(".dui-select-value")?.textContent).toBe(
+        "raw-value",
+      );
+
+      const values: (string | null)[] = [];
+      render(
+        <>
+          {preselected}
+          <Select label="Empty" onValueChange={(value) => values.push(value)}>
+            {option}
+          </Select>
+        </>,
+      );
+      const preselectedTrigger = screen.getByRole("combobox", {
+        name: "Preselected",
+      });
+      expect(preselectedTrigger.textContent).toBe("raw-value");
+      await act(async () => {
+        fireEvent.click(preselectedTrigger);
+      });
+      const preselectedRow = screen.getByRole("option", { name: "raw-value" });
+      expect(preselectedRow.textContent).toBe("raw-value");
+      expect(preselectedRow.getAttribute("aria-selected")).toBe("true");
+      await act(async () => {
+        fireEvent.keyDown(document.activeElement as Element, { key: "Escape" });
+      });
+      expect(preselectedTrigger.getAttribute("aria-expanded")).toBe("false");
+      expect(preselectedTrigger.textContent).toBe("raw-value");
+
+      const trigger = screen.getByRole("combobox", { name: "Empty" });
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      const row = screen.getByRole("option", { name: "raw-value" });
+      expect(row.textContent).toBe("raw-value");
+      await act(async () => {
+        fireEvent.click(row);
+      });
+      expect(trigger.textContent).toBe("raw-value");
+      expect(values).toEqual(["raw-value"]);
     });
   });
 
