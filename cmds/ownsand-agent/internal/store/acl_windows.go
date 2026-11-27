@@ -42,6 +42,10 @@ const (
 	inheritFlags = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
 	// aceInheritMask selects the inheritance bits of ACE_HEADER.AceFlags.
 	aceInheritMask = 0x0F
+
+	// SetSecurityInfo duplicates the handle with READ_CONTROL and WRITE_DAC
+	// when changing DACL inheritance.
+	stateDACLWriteAccess = windows.READ_CONTROL | windows.WRITE_DAC
 )
 
 // principals holds the SIDs that the restriction handles.
@@ -291,7 +295,7 @@ func protectRoot(dir string, h windows.Handle, p *principals) error {
 	if err != nil {
 		return fmt.Errorf("build the ACL of %s: %w", dir, err)
 	}
-	writable, info, err := openStateEntry(dir, windows.WRITE_DAC)
+	writable, info, err := openStateEntry(dir, stateDACLWriteAccess)
 	if err != nil {
 		return err
 	}
@@ -442,7 +446,7 @@ func resetChild(path string, p *principals, keepWorker bool) (bool, error) {
 	}
 	// Keep the checked entry open without delete sharing while opening it
 	// with write access. The second handle also opens the entry itself.
-	writable, current, err := openStateEntry(path, windows.WRITE_DAC)
+	writable, current, err := openStateEntry(path, stateDACLWriteAccess)
 	if err != nil {
 		return false, err
 	}
