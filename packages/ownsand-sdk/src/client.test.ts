@@ -4,7 +4,7 @@ import { getEventListeners } from "node:events";
 import { fileURLToPath } from "node:url";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { describe, expect, test } from "@rstest/core";
+import { describe, expect, rstest, test } from "@rstest/core";
 import { type CreateSandboxInput, OwnSandClient } from "./client.ts";
 import {
   ActivityRegistry,
@@ -102,8 +102,38 @@ describe("client construction", () => {
     expect(() => resolveApiOrigin("https://a.test/api")).toThrow(
       OwnSandConfigError,
     );
+    expect(() => resolveApiOrigin("https://a.test/tenant@name/..")).toThrow(
+      /^origin must not have a path, query or fragment$/,
+    );
     expect(() => resolveApiOrigin("https://u:p@a.test")).toThrow(
       OwnSandConfigError,
+    );
+  });
+
+  test.each([
+    "https://@api.example.test",
+    "https://:@api.example.test/",
+    "https:@api.example.test",
+  ])("rejects a written origin with empty userinfo (%s)", (origin) => {
+    const fetch = rstest.fn<typeof globalThis.fetch>();
+    const resolveOrigin = () => resolveApiOrigin(origin);
+    const createClient = () =>
+      new OwnSandClient({ origin, apiKey: API_KEY, env: {}, fetch });
+    const expectedMessage = /^origin must not contain credentials$/;
+    expect(resolveOrigin).toThrow(OwnSandConfigError);
+    expect(resolveOrigin).toThrow(expectedMessage);
+    expect(createClient).toThrow(OwnSandConfigError);
+    expect(createClient).toThrow(expectedMessage);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["https://api.example.test/", "https://api.example.test"],
+    ["http://[::1]:8080/", "http://[::1]:8080"],
+  ])("canonicalizes a valid explicit origin (%s)", (origin, expected) => {
+    expect(resolveApiOrigin(origin)).toBe(expected);
+    expect(new OwnSandClient({ origin, apiKey: API_KEY, env: {} }).origin).toBe(
+      expected,
     );
   });
 
