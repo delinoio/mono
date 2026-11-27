@@ -8,7 +8,13 @@ import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
-import { ErrorNotice, Loading, PageHeader } from "../components/ui.tsx";
+import {
+  ErrorNotice,
+  Loading,
+  PageHeader,
+  QueryBoundary,
+  showsFullError,
+} from "../components/ui.tsx";
 import type { GitHubCallback } from "../github-callback.ts";
 import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
@@ -25,18 +31,28 @@ export function GitHubSetupPage({
 }) {
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const orgs = useOrganizations(callback !== undefined);
-  const loadingOrgs = orgs.isPending || orgs.fetchStatus !== "idle";
+  const link = useMutation(GitHubService.method.linkGitHubInstallation, {
+    onSuccess: () => invalidateServices(queryClient, GitHubService),
+  });
+  const orgs = useOrganizations(callback !== undefined && link.isIdle);
   const adminOrgs =
-    orgs.isSuccess && !loadingOrgs
+    callback !== undefined && orgs.data !== undefined && !showsFullError(orgs)
       ? orgs.data.filter((o) =>
           can(o.callerRole, Permission.ManageIntegrations),
         )
       : [];
-  const link = useMutation(GitHubService.method.linkGitHubInstallation, {
-    onSuccess: () => invalidateServices(queryClient, GitHubService),
-  });
   const [selected, setSelected] = useState<string>();
+  const eligibleSelection = adminOrgs.find(
+    (org) => org.organizationId === selected,
+  )?.organizationId;
+  // Only a successful full list can show that a previous choice is obsolete.
+  if (
+    orgs.isSuccess &&
+    selected !== undefined &&
+    eligibleSelection === undefined
+  ) {
+    setSelected(undefined);
+  }
   // React strict mode runs effects twice; the code and state are single-use.
   const sent = useRef(false);
 
@@ -82,12 +98,6 @@ export function GitHubSetupPage({
         <Link to="/">Go to your organizations</Link>
       </div>
     );
-  } else if (loadingOrgs) {
-    body = <Loading label="Loading your organizations" />;
-  } else if (orgs.error) {
-    body = (
-      <ErrorNotice error={orgs.error} onRetry={() => void orgs.refetch()} />
-    );
   } else if (link.error) {
     body = (
       <>
@@ -99,44 +109,57 @@ export function GitHubSetupPage({
         <Link to="/">Go to your organizations</Link>
       </>
     );
-  } else if (adminOrgs.length === 0) {
-    body = (
-      <div className="notice notice-error" role="alert">
-        <p>
-          Only an owner or admin of a SandRun organization can link a GitHub
-          installation.
-        </p>
-        <Link to="/">Go to your organizations</Link>
-      </div>
-    );
-  } else if (onlyOrg !== undefined || link.isPending || sent.current) {
+  } else if (link.isPending || sent.current) {
     body = <Loading label="Linking the GitHub installation" />;
   } else {
     body = (
-      <form
-        className="form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (selected !== undefined) linkTo(selected);
+      <QueryBoundary query={orgs} loading="Loading your organizations">
+        {() => {
+          if (adminOrgs.length === 0) {
+            return (
+              <div className="notice notice-error" role="alert">
+                <p>
+                  Only an owner or admin of a SandRun organization can link a
+                  GitHub installation.
+                </p>
+                <Link to="/">Go to your organizations</Link>
+              </div>
+            );
+          }
+          if (onlyOrg !== undefined) {
+            return <Loading label="Linking the GitHub installation" />;
+          }
+          return (
+            <form
+              className="form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (eligibleSelection !== undefined) linkTo(eligibleSelection);
+              }}
+            >
+              <Select
+                label="SandRun organization"
+                value={eligibleSelection ?? null}
+                onValueChange={(value) => setSelected(value ?? undefined)}
+              >
+                {adminOrgs.map((o) => (
+                  <SelectOption key={o.organizationId} value={o.organizationId}>
+                    {`${o.name} (${o.callerRole === Role.OWNER ? "owner" : "admin"})`}
+                  </SelectOption>
+                ))}
+              </Select>
+              <div className="actions">
+                <Button
+                  type="submit"
+                  disabled={eligibleSelection === undefined}
+                >
+                  Link installation
+                </Button>
+              </div>
+            </form>
+          );
         }}
-      >
-        <Select
-          label="SandRun organization"
-          value={selected ?? null}
-          onValueChange={(v) => v && setSelected(v)}
-        >
-          {adminOrgs.map((o) => (
-            <SelectOption key={o.organizationId} value={o.organizationId}>
-              {`${o.name} (${o.callerRole === Role.OWNER ? "owner" : "admin"})`}
-            </SelectOption>
-          ))}
-        </Select>
-        <div className="actions">
-          <Button type="submit" disabled={selected === undefined}>
-            Link installation
-          </Button>
-        </div>
-      </form>
+      </QueryBoundary>
     );
   }
 

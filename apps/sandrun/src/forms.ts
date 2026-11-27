@@ -346,13 +346,9 @@ export function profileUpdateMask(
   ) {
     paths.push("source");
   }
-  if (
-    before.vcpuCount !== after.vcpuCount ||
-    before.memoryMib !== after.memoryMib ||
-    before.diskGib !== after.diskGib
-  ) {
-    paths.push("resources");
-  }
+  if (before.vcpuCount !== after.vcpuCount) paths.push("resources.vcpu_count");
+  if (before.memoryMib !== after.memoryMib) paths.push("resources.memory_mib");
+  if (before.diskGib !== after.diskGib) paths.push("resources.disk_gib");
   if (before.idleTtlMinutes !== after.idleTtlMinutes) paths.push("idle_ttl");
   if (before.maxTtlHours !== after.maxTtlHours) paths.push("max_ttl");
   if (before.priority !== after.priority) paths.push("priority");

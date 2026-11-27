@@ -2,6 +2,7 @@
 import { useMutation } from "@connectrpc/connect-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
+import { PasswordInput } from "delino-ui/password-input";
 import { TextField } from "delino-ui/text-field";
 import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
 import { useQueryClient } from "@tanstack/react-query";
@@ -84,8 +85,9 @@ export function OrganizationsPage() {
         <section className="section" aria-labelledby="join-title">
           <h2 id="join-title">Join with an invitation</h2>
           <form className="inline-form" onSubmit={join}>
-            <TextField
+            <PasswordInput
               label="Invitation link or secret"
+              toggleLabel="Show invitation"
               value={link}
               onValueChange={(value) => {
                 setLink(value);
