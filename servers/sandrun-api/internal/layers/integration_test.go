@@ -266,7 +266,9 @@ func TestAgentIntegrations(t *testing.T) {
 		t.Fatalf("resealed %d, %v", changed, err)
 	}
 	var left int
-	_ = w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM agent_integration_credentials WHERE key_id <> 'next'").Scan(&left)
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM agent_integration_credentials WHERE key_id <> 'next'").Scan(&left); err != nil {
+		t.Fatalf("count credentials with the old key: %v", err)
+	}
 	if left != 0 {
 		t.Fatalf("%d credentials keep the old key", left)
 	}
