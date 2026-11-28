@@ -255,6 +255,7 @@ func TestExportResultRetryStopsWhenSnapshotIsDeleted(t *testing.T) {
 	}
 	fault.off()
 	waitLog(t, env, `"msg":"export_result_apply_recovered"`)
+	checkTerminalExportLogs(t, env, snapID)
 	if got := manifestHashes(t, env, snapID); len(got) != 0 {
 		t.Fatalf("the deleted snapshot has %d parts", len(got))
 	}

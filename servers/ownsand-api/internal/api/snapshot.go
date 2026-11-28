@@ -246,13 +246,30 @@ func (s *Service) applySnapshotResultOnce(ctx context.Context, info commandInfo,
 	return missing, err
 }
 
+type snapshotExportOutcome struct {
+	snapshotID string
+	commandID  string
+	reason     string
+	parts      int
+}
+
+// log records the outcome after the transaction that applied it commits.
+func (o snapshotExportOutcome) log(ctx context.Context, logger *slog.Logger) {
+	if o.reason != "" {
+		logger.WarnContext(ctx, "export_failed", slog.String("snapshot_id", o.snapshotID), slog.String("command_id", o.commandID), slog.String("reason", o.reason))
+		return
+	}
+	logger.InfoContext(ctx, "export_completed", slog.String("snapshot_id", o.snapshotID), slog.String("command_id", o.commandID), slog.Int("parts", o.parts))
+}
+
 // applyExportResult applies the result of an export command. Only the result
 // of the attempt that the snapshot row names (its export command ID) in the
 // EXPORTING state changes the row: a result of an earlier attempt that
 // arrives late is ignored and leaves the state and the part manifest of the
 // current attempt as they are.
 func (s *Service) applyExportResult(ctx context.Context, info commandInfo, commandID string, res *ownsandv1.AgentCommandResult) error {
-	return s.DB.InTx(ctx, func(tx pgx.Tx) error {
+	var outcome *snapshotExportOutcome
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var export int16
 		var owner string
 		err := tx.QueryRow(ctx, "SELECT export_state, COALESCE(export_command_id::text, '') FROM snapshots WHERE snapshot_id = $1 FOR UPDATE", info.snapshotID).Scan(&export, &owner)
@@ -304,7 +321,8 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 			}
 		}
 		if reason != "" {
-			return s.failExportTx(ctx, tx, info.orgID, info.snapshotID, commandID, reason)
+			outcome, err = s.failExportTx(ctx, tx, info.orgID, info.snapshotID, commandID, reason)
+			return err
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM snapshot_parts WHERE snapshot_id = $1", info.snapshotID); err != nil {
 			return err
@@ -329,9 +347,16 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 			info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED), s.now().Add(s.exportVerifyDelay())); err != nil {
 			return err
 		}
-		s.Logger.InfoContext(ctx, "export_completed", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("parts", len(parts)))
+		outcome = &snapshotExportOutcome{snapshotID: info.snapshotID, commandID: commandID, parts: len(parts)}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if outcome != nil {
+		outcome.log(ctx, s.Logger)
+	}
+	return nil
 }
 
 // Retry of the application of an export result after a transient database
@@ -500,16 +525,15 @@ func (s *Service) releaseUnsentExport(ctx context.Context, orgID, snapshotID, co
 // computed after the last upload URL of the attempt was signed: the attempt
 // can sign no more URL once the row is not EXPORTING. The failed attempt's
 // objects never outlive the sweep, and a retry writes to the prefix of its
-// own attempt.
-func (s *Service) failExportTx(ctx context.Context, tx pgx.Tx, orgID, snapshotID, attemptID, reason string) error {
+// own attempt. The caller logs the returned outcome after commit.
+func (s *Service) failExportTx(ctx context.Context, tx pgx.Tx, orgID, snapshotID, attemptID, reason string) (*snapshotExportOutcome, error) {
 	if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)); err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.startCleanupJobTx(ctx, tx, orgID, attemptPrefix(orgID, snapshotID, attemptID)); err != nil {
-		return err
+		return nil, err
 	}
-	s.Logger.WarnContext(ctx, "export_failed", slog.String("snapshot_id", snapshotID), slog.String("command_id", attemptID), slog.String("reason", reason))
-	return nil
+	return &snapshotExportOutcome{snapshotID: snapshotID, commandID: attemptID, reason: reason}, nil
 }
 
 // attemptPrefix is the R2 key prefix of the objects of one export attempt.
@@ -760,6 +784,7 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 	}
 	var sn *snapshotRow
 	var conn *hub.Conn
+	var abandoned *snapshotExportOutcome
 	claimed := false
 	// Every attempt has its own command ID, which the row stores with the
 	// ID of the channel that receives the command.
@@ -785,7 +810,8 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 			if live == nil || live.ID == sn.exportChannelID {
 				return nil
 			}
-			if err := h.failExportTx(ctx, tx, orgID, sn.pb.GetSnapshotId(), sn.exportCommandID, "owner_channel_replaced"); err != nil {
+			abandoned, err = h.failExportTx(ctx, tx, orgID, sn.pb.GetSnapshotId(), sn.exportCommandID, "owner_channel_replaced")
+			if err != nil {
 				return err
 			}
 		}
@@ -812,6 +838,9 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 			h.failUnsentExport(ctx, conn, orgID, snapshotID, commandID, exportClaimCommitFailed, slog.Any("commit_error", err))
 		}
 		return nil, h.internal(ctx, "export snapshot", err)
+	}
+	if abandoned != nil {
+		abandoned.log(ctx, h.Logger)
 	}
 	if claimed {
 		h.Logger.InfoContext(ctx, "export_started", slog.String("snapshot_id", sn.pb.GetSnapshotId()), slog.String("command_id", commandID), slog.String("channel_id", conn.ID))

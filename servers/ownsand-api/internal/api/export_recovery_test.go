@@ -168,12 +168,7 @@ func TestInterruptedExportFailsOnReplacementChannelAndRetries(t *testing.T) {
 	if got := env.Objects.DeletedPrefixes(); len(got) != 1 || got[0] != abandoned {
 		t.Fatalf("first sweep = %v, want only %s", got, abandoned)
 	}
-	logs := env.Logs.String()
-	for _, want := range []string{`"msg":"export_failed"`, `"command_id":"` + first + `"`, `"reason":"owner_channel_replaced"`, `"snapshot_id":"` + snapID + `"`} {
-		if !strings.Contains(logs, want) {
-			t.Fatalf("logs lack %s", want)
-		}
-	}
+	waitExportFailureLog(t, env, snapID, first, "owner_channel_replaced")
 
 	// The explicit retry sends exactly one new command.
 	answerExports(agent)
@@ -424,12 +419,7 @@ func TestDuplicateExportPartNumbersFailTheExport(t *testing.T) {
 	}
 	sendExportResult(agent, first, []*ownsandv1.SnapshotPart{part(1), part(1), part(2)})
 	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
-	logs := env.Logs.String()
-	for _, want := range []string{`"msg":"export_failed"`, `"reason":"invalid_part"`, `"command_id":"` + first + `"`} {
-		if !strings.Contains(logs, want) {
-			t.Fatalf("logs lack %s", want)
-		}
-	}
+	waitExportFailureLog(t, env, snapID, first, "invalid_part")
 	if _, ok := cleanupJobs(t, env)[attemptPrefixOf(org.ID, snapID, first)]; !ok {
 		t.Fatalf("no clean-up job for the failed attempt: %v", cleanupJobs(t, env))
 	}
