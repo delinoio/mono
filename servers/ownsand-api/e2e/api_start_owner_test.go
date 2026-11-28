@@ -91,19 +91,20 @@ func TestStartAPIWaitIgnoresTheRecordOfAnotherAttempt(t *testing.T) {
 	srv := foreignHealthServer(t)
 	logs := &logSink{}
 	appendLines(logs, startedLine("api", ownerAddr))
-	exited := make(chan struct{})
+	checks := 0
 	owned := func() bool {
-		defer func() {
-			select {
-			case <-exited:
-			default:
-				close(exited)
-			}
-		}()
-		return logs.hasServerStarted("api-attempt2", ownerAddr)
+		checks++
+		matched := logs.hasServerStarted("api-attempt2", ownerAddr)
+		if checks == 1 {
+			appendLines(logs, startedLine("api-attempt2", ownerAddr))
+		}
+		return matched
 	}
-	if err := pollReadyWhile(srv.URL, 30*time.Second, exited, owned); !errors.Is(err, errProcessExited) {
-		t.Fatalf("pollReadyWhile = %v, want errProcessExited", err)
+	if err := pollReadyWhile(srv.URL, 30*time.Second, nil, owned); err != nil {
+		t.Fatalf("pollReadyWhile: %v", err)
+	}
+	if checks != 2 {
+		t.Fatalf("ownership checks = %d, want 2 (the first check had only the other attempt's record)", checks)
 	}
 }
 
