@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
@@ -409,13 +410,15 @@ func stableKey(key string) bool {
 }
 
 // httpURL checks that value is an absolute http or https URL with a host name
-// (a port alone such as https://:443 has none), without a query
-// or fragment and returns it without a trailing slash. A port, when present,
+// (a port alone such as https://:443 has none). The decoded host name must
+// contain no whitespace. The URL must have no query or fragment. The
+// returned value has no trailing slash. A port, when present,
 // must fit in 16 bits: url.Parse accepts any digit string, so a value such as
 // https://127.0.0.1:65536 would otherwise only fail on the first request.
 func httpURL(name, value string) (string, error) {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil ||
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" ||
+		strings.ContainsFunc(u.Hostname(), unicode.IsSpace) || u.User != nil ||
 		u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
 		return "", fmt.Errorf("%s must be an http or https URL", name)
 	}
