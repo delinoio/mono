@@ -593,6 +593,15 @@ export function createMockTransport(): Transport {
         );
       }
       if (method.name === "ListLinkableBillingAccounts") {
+        const holdKey = "ownsand-e2e-billing-list-initial";
+        if (sessionStorage.getItem(holdKey) === "hold") {
+          await new Promise<void>((resolve) => {
+            window.addEventListener(`${holdKey}-release`, () => resolve(), {
+              once: true,
+            });
+            sessionStorage.setItem(holdKey, "held");
+          });
+        }
         const code = sessionStorage.getItem("ownsand-e2e-billing-list-error");
         if (code !== null) {
           throw new ConnectError(
@@ -600,10 +609,13 @@ export function createMockTransport(): Transport {
             Number(code) as Code,
           );
         }
-        if (
+        const removeFirst =
           sessionStorage.getItem("ownsand-e2e-billing-list-remove-first") ===
-          "true"
-        ) {
+          "true";
+        const renamed = sessionStorage.getItem(
+          "ownsand-e2e-billing-list-rename-first",
+        );
+        if (removeFirst || renamed !== null) {
           const response = await base.unary(
             method,
             signal,
@@ -618,7 +630,13 @@ export function createMockTransport(): Transport {
             ...response,
             message: {
               ...response.message,
-              billingAccounts: billingAccounts.slice(1),
+              billingAccounts: removeFirst
+                ? billingAccounts.slice(1)
+                : billingAccounts.map((account, index) =>
+                    index === 0 && renamed !== null
+                      ? { ...account, name: renamed }
+                      : account,
+                  ),
             },
           };
         }

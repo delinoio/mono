@@ -288,6 +288,8 @@ function LinkBillingDialog({
   const [selected, setSelected] = useState<string | null>(null);
   const [selectionError, setSelectionError] = useState<string>();
   const listRef = useRef<HTMLDivElement>(null);
+  const didFocusFirst = useRef(false);
+  const focusedRadio = useRef<HTMLElement | null>(null);
   const fullError = showsFullError(accounts);
   const list =
     accounts.isPending || fullError
@@ -301,16 +303,35 @@ function LinkBillingDialog({
     setSelected(null);
   }
 
-  // The account choice is the only input, so it gets the focus. The list
-  // can arrive after the dialog opened, when the dialog's own initial focus
-  // has already run, so focus the checked or first option once it renders.
   useEffect(() => {
-    if (!open || list === undefined || list.length === 0) return;
-    const radio =
-      listRef.current?.querySelector<HTMLElement>(
-        '[role="radio"][aria-checked="true"]',
-      ) ?? listRef.current?.querySelector<HTMLElement>('[role="radio"]');
-    radio?.focus();
+    if (!open) didFocusFirst.current = false;
+    const options = listRef.current;
+    if (!open || !list?.length || options === null) {
+      focusedRadio.current = null;
+      return;
+    }
+
+    // The first response can arrive after the dialog has set its initial focus.
+    if (!didFocusFirst.current) {
+      const first = options.querySelector<HTMLElement>('[role="radio"]');
+      if (first) {
+        didFocusFirst.current = true;
+        first.focus();
+      }
+      return;
+    }
+
+    const previous = focusedRadio.current;
+    if (previous === null || previous.isConnected) return;
+    focusedRadio.current = null;
+    const { activeElement, body } = options.ownerDocument;
+    if (activeElement === body) {
+      const fallback =
+        options.querySelector<HTMLElement>(
+          '[role="radio"][aria-checked="true"]',
+        ) ?? options.querySelector<HTMLElement>('[role="radio"]');
+      fallback?.focus();
+    }
   }, [open, list]);
 
   const close = (next: boolean) => {
@@ -339,7 +360,31 @@ function LinkBillingDialog({
     );
   } else {
     content = (
-      <div ref={listRef}>
+      <div
+        ref={listRef}
+        onFocus={(event) => {
+          focusedRadio.current =
+            event.target.closest<HTMLElement>('[role="radio"]');
+        }}
+        onBlur={(event) => {
+          if (event.relatedTarget !== null) {
+            focusedRadio.current = null;
+            return;
+          }
+          const radio = focusedRadio.current;
+          if (radio === null) return;
+          // A blur without a new target can occur while React removes the option.
+          queueMicrotask(() => {
+            if (
+              focusedRadio.current === radio &&
+              radio.isConnected &&
+              radio.ownerDocument.activeElement !== radio
+            ) {
+              focusedRadio.current = null;
+            }
+          });
+        }}
+      >
         <RadioGroup
           label={t("billing.account")}
           value={selectedId ?? null}
