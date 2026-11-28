@@ -306,8 +306,17 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // timeout. beforeDrain runs first, so the background workers release the
 // instance lease and close agent connections before the drain.
 func serve(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration, beforeDrain func()) error {
+	public := &acceptErrorListener{Listener: listener}
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- srv.Serve(listener) }()
+	go func() {
+		err := srv.Serve(public)
+		// Shutdown can make Serve return ErrServerClosed before it classifies
+		// the listener's pending Accept error.
+		if err == http.ErrServerClosed {
+			err = public.terminalErr
+		}
+		serveDone <- err
+	}()
 	var serveErr error
 	select {
 	case serveErr = <-serveDone:
@@ -327,11 +336,26 @@ func serve(ctx context.Context, stop func(), srv *http.Server, listener net.List
 	if serveDone != nil {
 		serveErr = <-serveDone
 	}
-	if errors.Is(serveErr, http.ErrServerClosed) {
-		serveErr = nil
-	}
 	if drainErr == nil {
 		logger.Info("server_shutdown_completed")
 	}
 	return errors.Join(serveErr, drainErr)
+}
+
+type acceptErrorListener struct {
+	net.Listener
+	// Serve calls Accept serially and stops on the first permanent error.
+	// The serving goroutine reads terminalErr after Serve returns.
+	terminalErr error
+}
+
+func (l *acceptErrorListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		// Match net/http's retry rule for the error returned directly by Accept.
+		if temporary, ok := err.(net.Error); !ok || !temporary.Temporary() {
+			l.terminalErr = err
+		}
+	}
+	return conn, err
 }

@@ -3,7 +3,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,6 +54,43 @@ type closeErrorListener struct {
 func (l closeErrorListener) Close() error {
 	_ = l.Listener.Close()
 	return l.err
+}
+
+type shutdownTemporaryAcceptError struct{ error }
+
+func (shutdownTemporaryAcceptError) Timeout() bool   { return false }
+func (shutdownTemporaryAcceptError) Temporary() bool { return true }
+
+// acceptOnShutdownListener serves one connection, then holds the next Accept
+// result until Shutdown sets its flag and closes the listener.
+type acceptOnShutdownListener struct {
+	net.Listener
+	temporaryErr error
+	acceptErr    error
+	closeErr     error
+	accepted     bool
+	waiting      chan struct{}
+	closed       chan struct{}
+}
+
+func (l *acceptOnShutdownListener) Accept() (net.Conn, error) {
+	if l.temporaryErr != nil {
+		err := l.temporaryErr
+		l.temporaryErr = nil
+		return nil, err
+	}
+	if !l.accepted {
+		l.accepted = true
+		return l.Listener.Accept()
+	}
+	close(l.waiting)
+	<-l.closed
+	return nil, l.acceptErr
+}
+
+func (l *acceptOnShutdownListener) Close() error {
+	defer close(l.closed)
+	return errors.Join(l.Listener.Close(), l.closeErr)
 }
 
 func shutdownTestListener(t *testing.T) net.Listener {
@@ -227,6 +267,100 @@ func TestServeDrainsAfterPublicListenerFailure(t *testing.T) {
 			err := waitForShutdownTest(t, done)
 			if !errors.Is(err, listener.err) || (tc.cleanupErr != nil && !errors.Is(err, tc.cleanupErr)) {
 				t.Fatalf("serve = %v, want listener error %v and cleanup error %v", err, listener.err, tc.cleanupErr)
+			}
+		})
+	}
+}
+
+func TestServerShutdownRetainsPublicAcceptFailure(t *testing.T) {
+	acceptErr := errors.New("permanent public accept error")
+	closeErr := errors.New("public listener cleanup failed")
+	flushErr := errors.New("final usage flush failed")
+	closed := fmt.Errorf("public listener: %w", net.ErrClosed)
+	for _, tc := range []struct {
+		name         string
+		acceptErr    error
+		temporaryErr error
+		closeErr     error
+		flushErr     error
+		wantErrors   []error
+	}{
+		{name: "permanent failure", acceptErr: acceptErr, wantErrors: []error{acceptErr}},
+		{name: "cleanup and usage failure", acceptErr: acceptErr, closeErr: closeErr, flushErr: flushErr, wantErrors: []error{acceptErr, closeErr, flushErr}},
+		{name: "healthy cancellation", acceptErr: closed},
+		{name: "temporary failure before healthy cancellation", temporaryErr: shutdownTemporaryAcceptError{errors.New("retry public accept")}, acceptErr: closed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener := &acceptOnShutdownListener{
+				Listener: shutdownTestListener(t), temporaryErr: tc.temporaryErr, acceptErr: tc.acceptErr, closeErr: tc.closeErr,
+				waiting: make(chan struct{}), closed: make(chan struct{}),
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			requestStarted := make(chan struct{})
+			releaseRequest := make(chan struct{})
+			requestFinished := make(chan struct{})
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(requestStarted)
+				defer close(requestFinished)
+				select {
+				case <-releaseRequest:
+					_, _ = io.WriteString(w, "finished")
+				case <-r.Context().Done():
+				}
+			}), logger)
+			usage := &fakeUsage{flushErr: tc.flushErr, drain: func(context.Context) error {
+				select {
+				case <-requestFinished:
+				default:
+					t.Error("usage drain started while the public request was still open")
+				}
+				return nil
+			}}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- runServers(ctx, func() {}, srv, listener, logger, 3*time.Second, func() {}, usage, nil, nil)
+			}()
+			client := &http.Client{Transport: &http.Transport{}}
+			t.Cleanup(client.CloseIdleConnections)
+			resp := fetchForShutdownTest(t, client, listener, "/hold")
+			waitForShutdownTest(t, requestStarted)
+			waitForShutdownTest(t, listener.waiting)
+			cancel()
+			waitForShutdownTest(t, listener.closed)
+			requireShutdownPending(t, done)
+			close(releaseRequest)
+			requireShutdownResponse(t, resp, "finished")
+
+			err := waitForShutdownTest(t, done)
+			if !slices.Equal(usage.calls, []string{"drain", "flush"}) {
+				t.Errorf("usage calls = %v, want drain then flush", usage.calls)
+			}
+			if len(tc.wantErrors) == 0 {
+				if err != nil {
+					t.Fatalf("clean shutdown: %v", err)
+				}
+				return
+			}
+
+			var logs bytes.Buffer
+			logServerExited(slog.New(slog.NewJSONHandler(&logs, nil)), err)
+			var record struct {
+				Message string `json:"msg"`
+				Error   string `json:"error"`
+			}
+			if jsonErr := json.Unmarshal(logs.Bytes(), &record); jsonErr != nil || record.Message != "server_exited" {
+				t.Fatalf("server_exited record = %s, decode error = %v", logs.Bytes(), jsonErr)
+			}
+			for _, want := range tc.wantErrors {
+				if !errors.Is(err, want) {
+					t.Errorf("runServers = %v, want cause %v", err, want)
+				}
+				if strings.Count(record.Error, want.Error()) != 1 {
+					t.Errorf("server_exited error = %q, want cause %q exactly once", record.Error, want)
+				}
 			}
 		})
 	}
