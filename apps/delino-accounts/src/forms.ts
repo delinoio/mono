@@ -6,6 +6,7 @@ import {
   parseUsdCents,
   usd,
 } from "./money.ts";
+import { englishText, type Text } from "./text.ts";
 
 /** A field value that passed validation, or the message of the field error. */
 export type Checked<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -39,19 +40,24 @@ function trimGoSpace(input: string): string {
  * of Go's `strings.TrimSpace`, see `trimGoSpace`), and no control
  * characters.
  */
-export function checkAccountName(input: string): Checked<string> {
+export function checkAccountName(
+  input: string,
+  text: Text = englishText,
+): Checked<string> {
   const name = trimGoSpace(input);
   if (name === "") {
-    return { ok: false, error: "Enter a name." };
+    return { ok: false, error: text.t("validation.nameRequired") };
   }
   if ([...name].length > MAX_ACCOUNT_NAME_LENGTH) {
     return {
       ok: false,
-      error: `Use at most ${MAX_ACCOUNT_NAME_LENGTH} characters.`,
+      error: text.t("validation.nameTooLong", {
+        max: new Intl.NumberFormat(text.lang).format(MAX_ACCOUNT_NAME_LENGTH),
+      }),
     };
   }
   if (/\p{Cc}/u.test(name)) {
-    return { ok: false, error: "Remove control characters from the name." };
+    return { ok: false, error: text.t("validation.nameControlCharacters") };
   }
   return { ok: true, value: name };
 }
@@ -90,10 +96,13 @@ function isEmailDomain(domain: string): boolean {
 }
 
 /** Checks an invitation email address (`local@domain`, at most 254 bytes). */
-export function checkEmail(input: string): Checked<string> {
+export function checkEmail(
+  input: string,
+  text: Text = englishText,
+): Checked<string> {
   const email = trimGoSpace(input);
   if (email === "") {
-    return { ok: false, error: "Enter an email address." };
+    return { ok: false, error: text.t("validation.emailRequired") };
   }
   const [local = "", domain = "", extra] = email.split("@", 3);
   // Pasted angle quotes can wrap an address. Go treats these Unicode
@@ -108,7 +117,7 @@ export function checkEmail(input: string): Checked<string> {
   ) {
     return {
       ok: false,
-      error: "Enter an email address like name@example.com.",
+      error: text.t("validation.emailInvalid"),
     };
   }
   return { ok: true, value: email };
@@ -134,15 +143,18 @@ export const DEFAULT_ALERT_THRESHOLD_USD_MICROS = usd(10n);
 export function checkAmount(
   input: string,
   limits: { min?: bigint; max?: bigint } = {},
+  text: Text = englishText,
 ): Checked<bigint> {
   const parsed = parseUsdCents(input);
   if (!parsed.ok) {
-    return { ok: false, error: amountErrorMessage(parsed.error) };
+    return { ok: false, error: amountErrorMessage(parsed.error, text) };
   }
   if (limits.min !== undefined && parsed.micros < limits.min) {
     return {
       ok: false,
-      error: `Enter at least ${formatUsd(limits.min)}.`,
+      error: text.t("validation.amountMin", {
+        amount: formatUsd(limits.min, text.lang),
+      }),
     };
   }
   const max =
@@ -152,18 +164,24 @@ export function checkAmount(
   if (parsed.micros > max) {
     return {
       ok: false,
-      error: `Enter at most ${formatUsd(max)}.`,
+      error: text.t("validation.amountMax", {
+        amount: formatUsd(max, text.lang),
+      }),
     };
   }
   return { ok: true, value: parsed.micros };
 }
 
 /** Checks a manual top-up amount: $25 to $10,000 in whole cents. */
-export function checkTopUpAmount(input: string): Checked<bigint> {
-  return checkAmount(input, {
-    min: TOP_UP_MIN_USD_MICROS,
-    max: TOP_UP_MAX_USD_MICROS,
-  });
+export function checkTopUpAmount(
+  input: string,
+  text: Text = englishText,
+): Checked<bigint> {
+  return checkAmount(
+    input,
+    { min: TOP_UP_MIN_USD_MICROS, max: TOP_UP_MAX_USD_MICROS },
+    text,
+  );
 }
 
 export interface AutoTopUpInput {
@@ -193,18 +211,19 @@ export type AutoTopUpErrors = Partial<
  */
 export function checkAutoTopUp(
   input: AutoTopUpInput,
+  text: Text = englishText,
 ):
   | { ok: true; value: AutoTopUpValues }
   | { ok: false; errors: AutoTopUpErrors } {
   const errors: AutoTopUpErrors = {};
   const read = (
     key: keyof AutoTopUpErrors,
-    text: string,
+    value: string,
     min: bigint | undefined,
     max?: bigint,
   ): bigint => {
-    if (!input.enabled && text.trim() === "") return 0n;
-    const checked = checkAmount(text, { min, max });
+    if (!input.enabled && value.trim() === "") return 0n;
+    const checked = checkAmount(value, { min, max }, text);
     if (!checked.ok) {
       errors[key] = checked.error;
       return 0n;
@@ -229,7 +248,9 @@ export function checkAutoTopUp(
     errors.amount === undefined &&
     monthlyCap < amount
   ) {
-    errors.monthlyCap = `Enter at least the top-up amount (${formatUsd(amount)}).`;
+    errors.monthlyCap = text.t("validation.monthlyCapBelowAmount", {
+      amount: formatUsd(amount, text.lang),
+    });
   }
   if (Object.keys(errors).length > 0) {
     return { ok: false, errors };
@@ -246,6 +267,9 @@ export function checkAutoTopUp(
 }
 
 /** Checks a low-balance alert threshold: at least $0, whole cents. */
-export function checkAlertThreshold(input: string): Checked<bigint> {
-  return checkAmount(input, { min: 0n });
+export function checkAlertThreshold(
+  input: string,
+  text: Text = englishText,
+): Checked<bigint> {
+  return checkAmount(input, { min: 0n }, text);
 }

@@ -3,6 +3,7 @@
 package api_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
+	"github.com/delinoio/mono/servers/accounts-api/internal/api"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth/authtest"
 	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
@@ -837,6 +839,162 @@ func TestLinkOrganizationRoles(t *testing.T) {
 		if !strings.Contains(logs, `"kind":"`+kind+`"`) {
 			t.Errorf("no audit event %s", kind)
 		}
+	}
+}
+
+type organizationLinkLog struct {
+	Message          string `json:"msg"`
+	Level            string `json:"level"`
+	BillingAccountID string `json:"billing_account_id"`
+	Service          string `json:"service"`
+	OrganizationID   string `json:"organization_id"`
+	ActorUserID      string `json:"actor_user_id"`
+	ClientID         string `json:"client_id"`
+}
+
+func organizationLinkLogs(t *testing.T, logs string) []organizationLinkLog {
+	t.Helper()
+	var records []organizationLinkLog
+	for line := range strings.SplitSeq(logs, "\n") {
+		if line == "" {
+			continue
+		}
+		var record organizationLinkLog
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode log record: %v", err)
+		}
+		switch record.Message {
+		case "billing_organization_linked", "billing_organization_unlinked":
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
+func TestLinkOrganizationLogsCommittedChanges(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+	org := newOrg(t)
+	offset := len(env.Logs.String())
+
+	link(t, env, accountID, org, owner.ID, "Original")
+	wantLink := organizationLinkLog{
+		Message: "billing_organization_linked", Level: "INFO", BillingAccountID: accountID,
+		Service: "ownsand", OrganizationID: org, ActorUserID: owner.ID,
+	}
+	if got := organizationLinkLogs(t, env.Logs.String()[offset:]); len(got) != 1 || got[0] != wantLink {
+		t.Errorf("link logs = %+v, want one %+v", got, wantLink)
+	}
+
+	offset = len(env.Logs.String())
+	link(t, env, accountID, org, owner.ID, "Original")
+	link(t, env, accountID, org, owner.ID, "Renamed")
+	var name string
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT organization_name FROM organization_links
+		WHERE organization_id = $1 AND unlink_time IS NULL`, org).Scan(&name); err != nil || name != "Renamed" {
+		t.Fatalf("active organization name = %q, %v, want Renamed", name, err)
+	}
+	if got := organizationLinkLogs(t, env.Logs.String()[offset:]); len(got) != 0 {
+		t.Errorf("same-account relink logs = %+v, want none", got)
+	}
+
+	offset = len(env.Logs.String())
+	unlink(t, env, org)
+	wantUnlink := organizationLinkLog{
+		Message: "billing_organization_unlinked", Level: "INFO", BillingAccountID: accountID,
+		Service: "ownsand", OrganizationID: org, ClientID: testenv.UsageClientID,
+	}
+	if got := organizationLinkLogs(t, env.Logs.String()[offset:]); len(got) != 1 || got[0] != wantUnlink {
+		t.Errorf("unlink logs = %+v, want one %+v", got, wantUnlink)
+	}
+	var unlinked bool
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT unlink_time IS NOT NULL FROM organization_links
+		WHERE organization_id = $1`, org).Scan(&unlinked); err != nil || !unlinked {
+		t.Fatalf("stored link ended = %t, %v, want true", unlinked, err)
+	}
+
+	offset = len(env.Logs.String())
+	unlink(t, env, org)
+	if got := organizationLinkLogs(t, env.Logs.String()[offset:]); len(got) != 0 {
+		t.Errorf("repeated unlink logs = %+v, want none", got)
+	}
+}
+
+func TestLinkOrganizationDoesNotLogRolledBackChanges(t *testing.T) {
+	const auditTrigger = `CREATE TRIGGER fail_link_change BEFORE INSERT ON billing_audit_events
+		FOR EACH ROW WHEN (NEW.kind = '%s') EXECUTE FUNCTION fail_link_change()`
+	const commitTrigger = `CREATE CONSTRAINT TRIGGER fail_link_change AFTER INSERT ON billing_audit_events
+		DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.kind = '%s') EXECUTE FUNCTION fail_link_change()`
+
+	for _, tc := range []struct {
+		name    string
+		kind    api.AuditKind
+		trigger string
+	}{
+		{"link audit failure", api.AuditOrganizationLinked, fmt.Sprintf(auditTrigger, api.AuditOrganizationLinked)},
+		{"link status failure", api.AuditOrganizationLinked, `CREATE TRIGGER fail_link_change BEFORE UPDATE OF billing_status
+			ON organization_links FOR EACH ROW EXECUTE FUNCTION fail_link_change()`},
+		{"link commit failure", api.AuditOrganizationLinked, fmt.Sprintf(commitTrigger, api.AuditOrganizationLinked)},
+		{"unlink audit failure", api.AuditOrganizationUnlinked, fmt.Sprintf(auditTrigger, api.AuditOrganizationUnlinked)},
+		{"unlink commit failure", api.AuditOrganizationUnlinked, fmt.Sprintf(commitTrigger, api.AuditOrganizationUnlinked)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t)
+			owner := newPerson(env, "owner")
+			accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+			org := newOrg(t)
+			unlinking := tc.kind == api.AuditOrganizationUnlinked
+			wantRows := 0
+			if unlinking {
+				link(t, env, accountID, org, owner.ID, "Org")
+				wantRows = 1
+			}
+			for _, stmt := range []string{
+				`CREATE FUNCTION fail_link_change() RETURNS trigger LANGUAGE plpgsql AS $$
+					BEGIN RAISE EXCEPTION 'forced link transaction failure'; END $$`,
+				tc.trigger,
+			} {
+				if _, err := env.DB.Pool.Exec(ctx(), stmt); err != nil {
+					t.Fatalf("install failure trigger: %v", err)
+				}
+			}
+
+			offset := len(env.Logs.String())
+			var err error
+			if unlinking {
+				_, err = env.Service().UnlinkOrganization(ctx(), connect.NewRequest(&accountsv1.UnlinkOrganizationRequest{
+					Service: ownsand, OrganizationId: org,
+				}))
+			} else {
+				_, err = env.Service().LinkOrganization(ctx(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+					Service: ownsand, OrganizationId: org, BillingAccountId: accountID, UserId: owner.ID, OrganizationName: "Org",
+				}))
+			}
+			wantCode(t, err, connect.CodeInternal)
+			logs := env.Logs.String()[offset:]
+			if !strings.Contains(logs, "forced link transaction failure") {
+				t.Errorf("RPC did not log the forced database error")
+			}
+			if got := organizationLinkLogs(t, logs); len(got) != 0 {
+				t.Errorf("rolled-back change logs = %+v, want none", got)
+			}
+			if n := auditRecordCount(logs, tc.kind); n != 0 {
+				t.Errorf("audit logs = %d, want 0", n)
+			}
+			if n := auditRowCount(t, env, accountID, tc.kind); n != 0 {
+				t.Errorf("audit rows = %d, want 0", n)
+			}
+
+			var total, active int
+			if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*), count(*) FILTER (WHERE unlink_time IS NULL)
+				FROM organization_links WHERE organization_id = $1`, org).Scan(&total, &active); err != nil {
+				t.Fatalf("count organization links: %v", err)
+			}
+			if total != wantRows || active != wantRows {
+				t.Errorf("organization links = %d total, %d active, want %d of each", total, active, wantRows)
+			}
+		})
 	}
 }
 

@@ -1,0 +1,14 @@
+{
+  "sourceLang": "en",
+  "context": "Public marketing website of Delino, built with Rspress. Keep the product names Delino and Delino Docs unchanged.",
+  "locales": [
+    { "lang": "en", "label": "English" },
+    { "lang": "ko", "label": "한국어" },
+    { "lang": "ja", "label": "日本語" },
+    { "lang": "zh-Hans", "label": "简体中文" },
+    { "lang": "es", "label": "Español" },
+    { "lang": "fr", "label": "Français" },
+    { "lang": "de", "label": "Deutsch" },
+    { "lang": "pt-BR", "label": "Português (Brasil)" }
+  ]
+}

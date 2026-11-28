@@ -28,6 +28,8 @@ func TestNewReleaseRejectsMalformedURLPrefixes(t *testing.T) {
 		"https://example.test/re leases",
 		"https://example.test/%zz",
 		"https://example.test:port/releases",
+		"https://example.test:65536/releases",
+		"https://example.test:18446744073709551616/releases",
 		"https://example.test/releases?channel=stable",
 		"https://example.test/releases/?channel=stable",
 		"https://example.test/releases?",
@@ -58,7 +60,10 @@ func TestNewReleaseKeepsValidURLPrefixes(t *testing.T) {
 		"https://example.test/releases":                                             "https://example.test/releases/",
 		"https://example.test/releases/":                                            "https://example.test/releases/",
 		"https://example.test":                                                      "https://example.test/",
+		"https://example.test:/releases":                                            "https://example.test:/releases/",
+		"https://example.test:0/releases":                                           "https://example.test:0/releases/",
 		"https://example.test:8443/releases":                                        "https://example.test:8443/releases/",
+		"https://example.test:65535/releases":                                       "https://example.test:65535/releases/",
 		"https://github.com/delinoio/mono/releases/download/ownsand-agent%401.2.3":  "https://github.com/delinoio/mono/releases/download/ownsand-agent%401.2.3/",
 		"https://github.com/delinoio/mono/releases/download/ownsand-agent%401.2.3/": "https://github.com/delinoio/mono/releases/download/ownsand-agent%401.2.3/",
 	}
@@ -101,17 +106,22 @@ func TestDecodeManifestChecksArtifactURLs(t *testing.T) {
 		"https://example .test/a",
 		"https://example.test/%zz",
 		"https://example.test:port/a",
+		"https://example.test:65536/a?download=1",
+		"https://example.test:18446744073709551616/a?download=1",
 	}
 	for _, u := range bad {
-		if _, err := decodeManifest(manifestWith(u)); err == nil {
-			t.Errorf("decodeManifest accepted artifact URL %q", u)
+		if _, err := decodeManifest(manifestWith(u)); err == nil || !strings.Contains(err.Error(), "artifact URL") {
+			t.Errorf("decodeManifest for %q = %v, want an artifact URL error", u, err)
 		}
 	}
 	good := []string{
 		"https://example.test/a",
 		"https://example.test/ownsand-agent%401.2.3/ownsand-agent-linux-amd64",
 		"https://example.test/a?token=1&x=y",
+		"https://example.test:/a",
+		"https://example.test:0/a",
 		"https://example.test:8443/a?",
+		"https://example.test:65535/a?download=1",
 	}
 	for _, u := range good {
 		if _, err := decodeManifest(manifestWith(u)); err != nil {

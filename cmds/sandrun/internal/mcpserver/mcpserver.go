@@ -27,6 +27,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/delinoio/mono/cmds/sandrun/internal/syncpath"
 	"github.com/delinoio/mono/go/sandrun"
 	"github.com/delinoio/mono/go/uuidv7"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
@@ -980,7 +981,7 @@ func (s *Server) sync(ctx context.Context, _ *mcp.CallToolRequest, in syncArgs) 
 	if err != nil {
 		return nil, transferResult{}, err
 	}
-	dir := s.localPath(in.LocalPath)
+	dir := syncpath.FromWorkDir(s.cfg.WorkDir, in.LocalPath)
 	t, err := s.startTransfer("sync", func(tctx context.Context, t *transfer) {
 		res, err := c.Sync(tctx, sandrun.SyncParams{OrganizationID: s.cfg.OrganizationID, DevSessionID: in.SessionID, LocalDir: dir, Force: in.Force, Progress: t.onProgress})
 		t.mu.Lock()

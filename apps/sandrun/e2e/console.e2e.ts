@@ -366,6 +366,33 @@ function measureOrganizationHeading() {
 }
 
 describe("organization layout", () => {
+  test("keeps the translated top bar within the page width", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    // German has some of the longest top bar labels; a stored selection
+    // applies on the next load.
+    await browser.evaluate(() => {
+      localStorage.setItem("delino.language", "de");
+      return null;
+    });
+    await app.open(`/orgs/${ACME}/members`);
+    await expect(screen.getByRole("button", "Abmelden")).toBeVisible();
+
+    for (const width of [320, 760, 761, 800, 1024, 1280]) {
+      await browser.setViewport({ width, height: 844 });
+      const fits = await browser.evaluate(
+        () =>
+          document.documentElement.scrollWidth ===
+          document.documentElement.clientWidth,
+      );
+      expect(fits, `${width}px document fits`).toBe(true);
+    }
+  });
+
   test("wraps a long unbroken organization name inside the navigation", async ({
     app,
     browser,

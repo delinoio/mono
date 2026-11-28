@@ -268,6 +268,7 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 	now := h.timestamp()
 	var account billingAccount
 	var status billing.OrganizationStatus
+	var created bool
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err = loadAccess(ctx, tx, accountID, userID, lockAccount)
@@ -277,7 +278,8 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 		if err := require(account, PermissionManage); err != nil {
 			return err
 		}
-		if err := h.link(ctx, tx, audit, service, orgID, accountID, userID, name, now); err != nil {
+		created, err = h.link(ctx, tx, audit, service, orgID, accountID, userID, name, now)
+		if err != nil {
 			return err
 		}
 		// The status of a new link, or a suspension of an existing link
@@ -298,6 +300,11 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 	if err != nil {
 		return nil, h.internal(ctx, "link_organization", err)
 	}
+	if created {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, "billing_organization_linked",
+			slog.String("billing_account_id", accountID), slog.String("service", service),
+			slog.String("organization_id", orgID), slog.String("actor_user_id", userID))
+	}
 	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.LinkOrganizationResponse{Status: status.Proto(), BillingAccountName: account.Name}), nil
 }
@@ -305,38 +312,39 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 // link creates the link of the organization to the billing account, which
 // tx holds locked, or changes the name of an existing link to it. A link to
 // another billing account is already_exists. now is the time of a rename; a
-// new link takes its time after it holds the organization lock.
-func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, audit *auditLog, service, orgID, accountID, userID, name string, now time.Time) error {
+// new link takes its time after it holds the organization lock. The bool
+// reports whether link inserted a new row.
+func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, audit *auditLog, service, orgID, accountID, userID, name string, now time.Time) (bool, error) {
 	var linkID, linkedAccount, oldName string
 	err := tx.QueryRow(ctx, `SELECT organization_link_id::text, billing_account_id::text, organization_name
 		FROM organization_links WHERE service = $1 AND organization_id = $2 AND unlink_time IS NULL FOR UPDATE`,
 		service, orgID).Scan(&linkID, &linkedAccount, &oldName)
 	switch {
 	case err == nil && linkedAccount != accountID:
-		return alreadyExists("the organization is linked to another billing account")
+		return false, alreadyExists("the organization is linked to another billing account")
 	case err == nil:
 		if oldName == name {
-			return nil
+			return false, nil
 		}
 		if _, err := tx.Exec(ctx, `UPDATE organization_links SET organization_name = $2 WHERE organization_link_id = $1`,
 			linkID, name); err != nil {
-			return err
+			return false, err
 		}
-		return h.recordAudit(ctx, tx, audit, now, auditEvent{
+		return false, h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditOrganizationLinkRenamed, ActorUserID: userID,
 			Details: map[string]string{"service": service, "organization_id": orgID, "old_name": oldName, "new_name": name},
 		})
 	case !errors.Is(err, pgx.ErrNoRows):
-		return err
+		return false, err
 	}
 	if linkID, err = newID(); err != nil {
-		return err
+		return false, err
 	}
 	// The billing account lock is held; take the organization lock after it
 	// (see billing.LockOrganization) so an unattributed report of the
 	// organization either commits before this link is inserted or finds it.
 	if err := billing.LockOrganization(ctx, tx, service, orgID); err != nil {
-		return err
+		return false, err
 	}
 	// A new link takes effect when it holds both locks: read the clock
 	// again, because the caller read it before it waited for the billing
@@ -357,14 +365,11 @@ func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, audit *auditLog, ser
 			// A concurrent link of the organization to another billing
 			// account committed first; links to this billing account
 			// serialize on its lock.
-			return alreadyExists("the organization is linked to another billing account")
+			return false, alreadyExists("the organization is linked to another billing account")
 		}
-		return err
+		return false, err
 	}
-	h.logger.LogAttrs(ctx, slog.LevelInfo, "billing_organization_linked",
-		slog.String("billing_account_id", accountID), slog.String("service", service),
-		slog.String("organization_id", orgID), slog.String("actor_user_id", userID))
-	return h.recordAudit(ctx, tx, audit, now, auditEvent{
+	return true, h.recordAudit(ctx, tx, audit, now, auditEvent{
 		BillingAccountID: accountID, Kind: AuditOrganizationLinked, ActorUserID: userID,
 		Details: map[string]string{"service": service, "organization_id": orgID, "organization_name": name},
 	})
@@ -392,6 +397,7 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 	if !ok {
 		return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil
 	}
+	var removed bool
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		// The billing account lock comes first, as for every change of a
@@ -411,9 +417,7 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 		if err != nil || tag.RowsAffected() == 0 {
 			return err
 		}
-		h.logger.LogAttrs(ctx, slog.LevelInfo, "billing_organization_unlinked",
-			slog.String("billing_account_id", current.BillingAccountID), slog.String("service", service),
-			slog.String("organization_id", orgID), slog.String("client_id", clientID))
+		removed = true
 		// The calling service names no user; the actor is its
 		// machine-to-machine application.
 		return h.recordAudit(ctx, tx, audit, now, auditEvent{
@@ -423,6 +427,11 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 	})
 	if err != nil {
 		return nil, h.internal(ctx, "unlink_organization", err)
+	}
+	if removed {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, "billing_organization_unlinked",
+			slog.String("billing_account_id", current.BillingAccountID), slog.String("service", service),
+			slog.String("organization_id", orgID), slog.String("client_id", clientID))
 	}
 	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil

@@ -237,6 +237,10 @@ type TokenValidator interface {
 type Authenticator struct {
 	Service *Service
 	Logto   TokenValidator
+
+	prefixWarningsMu sync.Mutex
+	prefixWarnings   map[string]time.Time
+	nextWarningSweep time.Time
 }
 
 // Authenticate validates the Authorization header value.
@@ -259,24 +263,33 @@ func (a *Authenticator) Authenticate(ctx context.Context, header, client string)
 	return auth.Principal{Kind: auth.PrincipalUser, UserID: sub}, nil
 }
 
-// apiKey validates a personal API key. Only failures take rate limit tokens,
-// and a display prefix (or client address) without tokens is rejected before
-// validation.
+// apiKey checks the client address limit before validating a personal API key.
+// A failed validation charges the client bucket, then checks and charges the
+// display prefix bucket.
 func (a *Authenticator) apiKey(ctx context.Context, token, client string) (auth.Principal, error) {
 	s := a.Service
-	prefixKey := "apikey:" + auth.DisplayPrefix(auth.SecretAPIKey, token)
-	if ok, retry := s.Limits.PerPrefix.Peek(prefixKey); !ok {
-		return auth.Principal{}, ErrRateLimited(retry)
-	}
 	if client != "" {
 		if ok, retry := s.Limits.PerClient.Peek(client); !ok {
 			return auth.Principal{}, ErrRateLimited(retry)
 		}
 	}
 	fail := func() (auth.Principal, error) {
-		s.Limits.PerPrefix.Allow(prefixKey, 1)
 		if client != "" {
 			s.Limits.PerClient.Allow(client, 1)
+		}
+		prefix := auth.DisplayPrefix(auth.SecretAPIKey, token)
+		if ok, retry := s.Limits.PerPrefix.Allow("apikey:"+prefix, 1); !ok {
+			// Keep only the display prefix bytes in the warning state and log.
+			prefix = strings.Clone(prefix)
+			if a.allowPrefixWarning(prefix) {
+				// For short malformed inputs the prefix is the entire value.
+				if prefix == token {
+					prefix = "[redacted]"
+				}
+				s.Logger.WarnContext(ctx, "api_key_prefix_rate_limited",
+					slog.String("key_prefix", prefix), slog.String("rpc_id", RPCID(ctx)))
+			}
+			return auth.Principal{}, ErrRateLimited(retry)
 		}
 		return auth.Principal{}, ErrUnauthenticated("invalid personal API key")
 	}
@@ -299,6 +312,34 @@ func (a *Authenticator) apiKey(ctx context.Context, token, client string) (auth.
 		return fail()
 	}
 	return auth.Principal{Kind: auth.PrincipalAPIKey, UserID: userID, APIKeyID: keyID, OrganizationID: orgID}, nil
+}
+
+func (a *Authenticator) allowPrefixWarning(prefix string) bool {
+	const (
+		interval    = 10 * time.Second
+		maxWarnings = 4096
+	)
+	a.prefixWarningsMu.Lock()
+	defer a.prefixWarningsMu.Unlock()
+
+	now := a.Service.Now()
+	if !now.Before(a.nextWarningSweep) {
+		for key, until := range a.prefixWarnings {
+			if !now.Before(until) {
+				delete(a.prefixWarnings, key)
+			}
+		}
+		a.nextWarningSweep = now.Add(interval)
+	}
+	// Keep active entries when full so each prefix stays quiet for the full interval.
+	if now.Before(a.prefixWarnings[prefix]) || len(a.prefixWarnings) >= maxWarnings {
+		return false
+	}
+	if a.prefixWarnings == nil {
+		a.prefixWarnings = make(map[string]time.Time)
+	}
+	a.prefixWarnings[prefix] = now.Add(interval)
+	return true
 }
 
 // apiKeyUseCache remembers when this process last wrote the last use time of

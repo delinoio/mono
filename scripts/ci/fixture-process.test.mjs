@@ -1,11 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Tests that a failing test does not leave the fixture's blocked subprocesses
-// running. A nested `node --test` run starts a blocked command substitution
-// (the shape of the stubbed `curl` in the Droplet deployment fixtures) through
-// `spawnProcessGroup` and then fails before it releases the command. The
-// nested runner must report that failure and exit, and the blocked process
-// must be gone.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { once } from "node:events";
@@ -20,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { killProcessGroup, spawnProcessGroup } from "./fixture-process.mjs";
+import { spawnProcessGroup, startProcessGroup } from "./fixture-process.mjs";
 
 const skip =
   process.platform === "win32"
@@ -62,10 +55,10 @@ async function waitFor(condition, what) {
   assert.fail(`timed out waiting for ${what}`);
 }
 
-// The nested fixture: bash runs a command substitution that blocks until
-// `release` exists and records its own pid; the test fails before it writes
-// `release`.
-function fixtureSource(dir) {
+// Both commands leave a Bash descendant blocked with an open output pipe.
+// The second command exits before teardown runs.
+function fixtureSource(dir, commandExits) {
+  const blocker = `bash -c 'echo "$$" > "$DIR/blocked.pid.tmp"; mv "$DIR/blocked.pid.tmp" "$DIR/blocked.pid"; while [[ ! -e "$DIR/release" ]]; do sleep 0.05; done; printf 200'`;
   return `
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
@@ -74,36 +67,50 @@ import test from "node:test";
 import { spawnProcessGroup } from ${JSON.stringify(helperUrl)};
 
 const dir = ${JSON.stringify(dir)};
-const script = \`out=$(bash -c 'echo "$$" > "$DIR/blocked.pid.tmp"; mv "$DIR/blocked.pid.tmp" "$DIR/blocked.pid"; while [[ ! -e "$DIR/release" ]]; do sleep 0.05; done; printf 200')
-echo "$out"\`;
+const blocker = ${JSON.stringify(blocker)};
+const commandExits = ${JSON.stringify(commandExits)};
+const script = commandExits ? blocker + " & exit 3" : "out=$(" + blocker + '); echo "$out"';
 
 test("fails before it releases the blocked command", async (t) => {
-  spawnProcessGroup(t, "bash", ["-c", script], { env: { ...process.env, DIR: dir } });
-  for (let n = 0; n < 300 && !existsSync(join(dir, "blocked.pid")); n += 1) {
+  const { child } = spawnProcessGroup(t, "bash", ["-c", script], { env: { ...process.env, DIR: dir } });
+  for (let n = 0; n < 300; n += 1) {
+    if (existsSync(join(dir, "blocked.pid")) && (!commandExits || child.exitCode !== null)) break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.ok(readFileSync(join(dir, "blocked.pid"), "utf8").trim());
+  if (commandExits) {
+    assert.equal(child.exitCode, 3);
+    assert.equal(child.stdout.readableEnded, false);
+  }
   assert.fail("deliberate failure before release");
 });
 `;
 }
 
-test(
-  "a failing test stops the blocked fixture subprocess and the runner exits",
-  { skip },
-  async (t) => {
+for (const [name, commandExits] of [
+  ["a failing test stops a blocked command substitution", false],
+  [
+    "teardown stops a descendant that keeps stdout open after command exit",
+    true,
+  ],
+]) {
+  test(name, { skip }, async (t) => {
     const dir = mkdtempSync(join(tmpdir(), "fixture-process-"));
     const pidFile = join(dir, "blocked.pid");
-    t.after(() => {
-      // Only needed when the teardown under test did not work.
-      if (existsSync(pidFile)) {
-        const pid = Number(readFileSync(pidFile, "utf8"));
-        if (pid > 0 && alive(pid)) process.kill(pid, "SIGKILL");
+    t.after(async () => {
+      try {
+        // Release our own blocker if teardown failed.
+        writeFileSync(join(dir, "release"), "");
+        if (existsSync(pidFile)) {
+          const pid = Number(readFileSync(pidFile, "utf8"));
+          await waitFor(() => !alive(pid), "the released subprocess to exit");
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
-      rmSync(dir, { recursive: true, force: true });
     });
     const fixture = join(dir, "blocked-fixture.mjs");
-    writeFileSync(fixture, fixtureSource(dir));
+    writeFileSync(fixture, fixtureSource(dir, commandExits));
     // The nested runner must not inherit this runner's test context.
     const env = { ...process.env };
     delete env.NODE_TEST_CONTEXT;
@@ -123,19 +130,72 @@ test(
     const pid = Number(readFileSync(pidFile, "utf8"));
     assert.ok(pid > 0);
     await waitFor(() => !alive(pid), "the blocked subprocess to exit");
+  });
+}
+
+test(
+  "repeated teardown sends no signal to a simulated reused owner group",
+  { skip },
+  async (t) => {
+    const { child, done, reap } = spawnProcessGroup(t, "bash", [
+      "-c",
+      'printf "%s" "$PPID"; exit 3',
+    ]);
+    const result = await done;
+    assert.equal(result.status, 3);
+    const ownerPid = Number(result.stdout);
+    assert.ok(ownerPid > 0);
+    assert.ok(child.pid > 0);
+    assert.notEqual(child.pid, ownerPid);
+
+    // The first reap waits for the owner to exit. Model reuse of that ID
+    // entirely in the runner, without sending any signal to a real group.
+    await reap();
+    const calls = [];
+    const mock = t.mock.method(process, "kill", (pid, signal) => {
+      calls.push({ pid, signal, sentinel: pid === -ownerPid });
+      return true;
+    });
+    try {
+      await reap();
+      await reap();
+      assert.deepEqual(calls, []);
+    } finally {
+      mock.mock.restore();
+    }
   },
 );
 
 test(
-  "teardown treats a process group that already exited as normal",
-  { skip },
+  "an unexpected owner exit rejects the active command result and teardown",
+  { skip, timeout: 5_000 },
   async (t) => {
-    const { child, done } = spawnProcessGroup(t, "bash", ["-c", "exit 3"]);
-    const result = await done;
-    assert.equal(result.status, 3);
-    // The same call the teardown makes; it must not throw.
-    killProcessGroup(child);
-    killProcessGroup(child);
+    const { child, done, reap, signalGroup } = startProcessGroup(
+      process.execPath,
+      ["-e", 'process.stdout.write("ready"); process.stdin.resume()'],
+    );
+    t.after(() => reap().catch(() => {}));
+
+    await once(child.stdout, "data", { signal: t.signal });
+    signalGroup("SIGKILL");
+
+    await assert.rejects(done, /Fixture process owner disconnected/);
+    await assert.rejects(reap(), /Fixture process owner disconnected/);
+  },
+);
+
+test(
+  "reports a command spawn failure and still reaps its owner",
+  { skip },
+  async () => {
+    const { done, reap } = startProcessGroup("bash", ["-c", "exit 0"], {
+      cwd: new URL("./fixture-process.mjs", import.meta.url),
+    });
+    try {
+      await assert.rejects(done, { code: "ENOTDIR" });
+    } finally {
+      await assert.rejects(reap(), { code: "ENOTDIR" });
+    }
   },
 );
 

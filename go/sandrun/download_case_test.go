@@ -510,18 +510,102 @@ func TestDownloadDirectoryCaseCollision(t *testing.T) {
 	}
 }
 
-func TestDownloadArchiveRepeatedDirectoryName(t *testing.T) {
-	dir := t.TempDir()
-	extractor := archiveExtractor{fileLimit: 100, totalLimit: 1000, link: (*os.Root).Link}
-	_, err := extractor.extractArchive(t.Context(), tarOf(t,
-		&tar.Header{Typeflag: tar.TypeReg, Name: "./Reports/left.txt", Mode: 0o644, Size: 1},
-		&tar.Header{Typeflag: tar.TypeDir, Name: "Reports/", Mode: 0o755},
-		&tar.Header{Typeflag: tar.TypeReg, Name: "Reports/right.txt", Mode: 0o644, Size: 2},
-	), dir)
-	if err != nil {
-		t.Fatal(err)
+func TestDownloadDirectorySeparatorCollision(t *testing.T) {
+	const slashDir, backslashDir = "outer/inner", `outer\inner`
+	aliases := filepath.FromSlash(slashDir) == filepath.FromSlash(backslashDir)
+	t.Logf("the local path rules alias %+q and %+q: %t", slashDir, backslashDir, aliases)
+
+	left := &tar.Header{Name: "./" + slashDir + "/left.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1}
+	anchor := &tar.Header{Name: "anchor.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2}
+	linkTarget := &tar.Header{Name: backslashDir + "/target.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2}
+	for _, tc := range []struct {
+		name     string
+		explicit bool
+		right    *tar.Header
+		prefix   []*tar.Header
+		suffix   []*tar.Header
+	}{
+		{
+			name:     "explicit",
+			explicit: true,
+			right:    &tar.Header{Name: backslashDir + "/right.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2},
+		},
+		{
+			name:  "implicit-regular",
+			right: &tar.Header{Name: backslashDir + "/right.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2},
+		},
+		{
+			name:   "implicit-hard-link",
+			right:  &tar.Header{Name: backslashDir + "/right.txt", Typeflag: tar.TypeLink, Linkname: anchor.Name},
+			prefix: []*tar.Header{anchor},
+		},
+		{
+			name:   "implicit-symlink",
+			right:  &tar.Header{Name: backslashDir + "/right.txt", Typeflag: tar.TypeSymlink, Linkname: "target.txt"},
+			suffix: []*tar.Header{linkTarget},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, reversed := range []bool{false, true} {
+				first, second := slashDir, backslashDir
+				children := []*tar.Header{left, tc.right}
+				if reversed {
+					first, second = second, first
+					children[0], children[1] = children[1], children[0]
+				}
+				entries := slices.Clone(tc.prefix)
+				if tc.explicit {
+					entries = append(entries,
+						&tar.Header{Name: "./" + first + "/", Typeflag: tar.TypeDir, Mode: 0o755},
+						&tar.Header{Name: second + "/", Typeflag: tar.TypeDir, Mode: 0o755},
+					)
+				}
+				entries = append(entries, children...)
+				entries = append(entries, tc.suffix...)
+				for _, existing := range []bool{false, true} {
+					t.Run(fmt.Sprintf("reversed=%t/existing=%t", reversed, existing), func(t *testing.T) {
+						dest, result, err := downloadCaseArchive(t, t.TempDir(), existing, entries...)
+						if aliases {
+							checkArchiveCollision(t, dest, result, err, existing, first, second)
+							return
+						}
+						wantFiles := len(tc.prefix) + len(children) + len(tc.suffix)
+						if err != nil || result == nil || !result.Directory || result.Files != wantFiles || len(result.Warnings) != 0 {
+							t.Fatalf("separator-distinct directory download = %+v, %v", result, err)
+						}
+						checkDownloadedFiles(t, filepath.Join(dest, filepath.FromSlash(slashDir)), []string{"left.txt"}, []string{"x"})
+						rightDir := filepath.Join(dest, backslashDir)
+						if tc.right.Typeflag == tar.TypeSymlink {
+							got, err := os.Readlink(filepath.Join(rightDir, "right.txt"))
+							if err != nil || got != tc.right.Linkname {
+								t.Fatalf("symlink target = %q, %v, want %q", got, err, tc.right.Linkname)
+							}
+							checkDownloadedFiles(t, rightDir, []string{"right.txt", "target.txt"}, []string{"xx", "xx"})
+							return
+						}
+						checkDownloadedFiles(t, rightDir, []string{"right.txt"}, []string{"xx"})
+					})
+				}
+			}
+		})
 	}
-	checkDownloadedFiles(t, filepath.Join(dir, "Reports"), []string{"left.txt", "right.txt"}, []string{"x", "xx"})
+}
+
+func TestDownloadArchiveRepeatedDirectoryName(t *testing.T) {
+	for _, dir := range []string{"Reports/nested", `Reports\nested`} {
+		t.Run(dir, func(t *testing.T) {
+			dest, result, err := downloadCaseArchive(t, t.TempDir(), false,
+				&tar.Header{Typeflag: tar.TypeReg, Name: "./" + dir + "/left.txt", Mode: 0o644, Size: 1},
+				&tar.Header{Typeflag: tar.TypeDir, Name: dir + "/", Mode: 0o755},
+				&tar.Header{Typeflag: tar.TypeDir, Name: "./" + dir, Mode: 0o755},
+				&tar.Header{Typeflag: tar.TypeReg, Name: dir + "/right.txt", Mode: 0o644, Size: 2},
+			)
+			if err != nil || result == nil || !result.Directory || result.Files != 2 || result.Bytes != 3 {
+				t.Fatalf("repeated directory download = %+v, %v", result, err)
+			}
+			checkDownloadedFiles(t, filepath.Join(dest, filepath.FromSlash(dir)), []string{"left.txt", "right.txt"}, []string{"x", "xx"})
+		})
+	}
 }
 
 func checkDownloadCleanup(t *testing.T, parent string, fake *scriptedDownloadSession) {

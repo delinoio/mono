@@ -66,6 +66,7 @@ const e2eInputs = new Set([
 // planner runs without installing dependencies and cannot derive it itself.
 // `packages/ownsand-sdk/` is not an app dependency and stays out.
 export const e2eWorkspacePackages = [
+  "packages/delino-i18n/",
   "packages/delino-ui/",
   "packages/sandrun-sdk/",
   "protos/delino/accounts/",

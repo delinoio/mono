@@ -159,10 +159,15 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 		if !ok {
 			continue // the root entry "./"
 		}
+		archiveName := normalizedArchiveName(hdr.Name)
+		var archiveParent string
+		if slash := strings.LastIndexByte(archiveName, '/'); slash >= 0 {
+			archiveParent = archiveName[:slash]
+		}
 		mode := fs.FileMode(hdr.Mode).Perm()
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := directoryNames.mkdirAll(root, name, mode|0o700); err != nil {
+			if err := directoryNames.mkdirAll(root, name, archiveName, mode|0o700); err != nil {
 				return st, err
 			}
 		case tar.TypeReg:
@@ -176,7 +181,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 				if err != nil {
 					return err
 				}
-				if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
+				if err := directoryNames.mkdirAll(root, filepath.Dir(name), archiveParent, 0o755); err != nil {
 					return err
 				}
 				return writeEntry(root, name, mode, tr, hdr.Size)
@@ -197,7 +202,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			if err != nil {
 				return st, err
 			}
-			if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
+			if err := directoryNames.mkdirAll(root, filepath.Dir(name), archiveParent, 0o755); err != nil {
 				return st, err
 			}
 			if err := root.Remove(name); err == nil && previous >= 0 {
@@ -225,7 +230,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			if err != nil {
 				return st, err
 			}
-			if err := directoryNames.mkdirAll(root, filepath.Dir(name), 0o755); err != nil {
+			if err := directoryNames.mkdirAll(root, filepath.Dir(name), archiveParent, 0o755); err != nil {
 				return st, err
 			}
 			_ = root.Remove(name)
@@ -243,15 +248,52 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 	}
 }
 
-type archiveDirectoryNames map[string]fs.FileInfo
+type archiveDirectoryNames map[string]archiveDirectoryName
+
+type archiveDirectoryName struct {
+	info     fs.FileInfo
+	spelling string
+}
+
+func (entry archiveDirectoryName) displayName(local string) string {
+	if entry.spelling != "" {
+		return entry.spelling
+	}
+	return filepath.ToSlash(local)
+}
+
+// windowsArchiveDirectories indexes original directory spellings by their
+// local paths. A backslash can introduce a local directory without a
+// corresponding archive directory, so only index prefixes at slash boundaries.
+func windowsArchiveDirectories(archiveDir string) map[string]string {
+	if archiveDir == "" {
+		return nil
+	}
+	spellings := make(map[string]string)
+	local := filepath.FromSlash(archiveDir)
+	// Work toward the root so that when a navigation component cleans to
+	// the same path as an ancestor, the ancestor supplies the spelling.
+	for archiveDir != "" {
+		spellings[filepath.Clean(local)] = archiveDir
+		slash := strings.LastIndexByte(archiveDir, '/')
+		if slash < 0 {
+			break
+		}
+		archiveDir = archiveDir[:slash]
+		local = local[:slash]
+	}
+	return spellings
+}
 
 // mkdirAll checks each directory spelling against the staging filesystem.
 // Directory identity catches aliases even when their spellings do not fold
 // to the same case. A newly created directory cannot alias an existing one.
-func (names archiveDirectoryNames) mkdirAll(root *os.Root, dir string, mode fs.FileMode) error {
+func (names archiveDirectoryNames) mkdirAll(root *os.Root, dir, archiveDir string, mode fs.FileMode) error {
+	var spellings map[string]string
 	if runtime.GOOS == "windows" {
 		// os.Root cleans Windows paths before looking up their components.
 		dir = filepath.Clean(dir)
+		spellings = windowsArchiveDirectories(archiveDir)
 	}
 	var prefix string
 	for _, component := range splitPath(dir) {
@@ -268,6 +310,10 @@ func (names archiveDirectoryNames) mkdirAll(root *os.Root, dir string, mode fs.F
 			continue
 		}
 
+		spelling := prefix
+		if runtime.GOOS == "windows" {
+			spelling = spellings[prefix]
+		}
 		info, err := root.Lstat(prefix)
 		if errors.Is(err, fs.ErrNotExist) {
 			if err := root.MkdirAll(prefix, mode); err != nil {
@@ -277,39 +323,50 @@ func (names archiveDirectoryNames) mkdirAll(root *os.Root, dir string, mode fs.F
 			if err != nil {
 				return err
 			}
-			names[prefix] = info
+			names[prefix] = archiveDirectoryName{info: info, spelling: spelling}
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		if info.IsDir() && !os.SameFile(names[prefix], info) {
-			if err := names.claim(root, prefix, component, info); err != nil {
-				return err
+		if !info.IsDir() {
+			continue
+		}
+		entry := archiveDirectoryName{info: info, spelling: spelling}
+		if previous := names[prefix]; os.SameFile(previous.info, info) {
+			if previous.spelling != "" && spelling != "" && previous.spelling != spelling {
+				return &archiveNameCollision{earlier: previous.spelling, later: spelling}
 			}
+			if previous.spelling == "" && spelling != "" {
+				names[prefix] = entry
+			}
+			continue
+		}
+		if err := names.claim(root, prefix, component, entry); err != nil {
+			return err
 		}
 	}
 	// Let os.Root validate a final symbolic link or navigation component.
 	return root.MkdirAll(dir, mode)
 }
 
-func (names archiveDirectoryNames) claim(root *os.Root, name, component string, info fs.FileInfo) error {
-	for previous, identity := range names {
-		if !os.SameFile(identity, info) {
+func (names archiveDirectoryNames) claim(root *os.Root, name, component string, entry archiveDirectoryName) error {
+	for previous, claimed := range names {
+		if !os.SameFile(claimed.info, entry.info) {
 			continue
 		}
 		current, err := root.Lstat(previous)
-		if err != nil || !os.SameFile(current, info) {
+		if err != nil || !os.SameFile(current, entry.info) {
 			continue // A later entry can replace an empty directory or a symbolic link to its parent.
 		}
-		if filepath.Base(previous) != component {
-			return &archiveNameCollision{earlier: filepath.ToSlash(previous), later: filepath.ToSlash(name)}
-		}
 		// A symbolic link can lead to the same directory with the same
-		// final component. Keep the original claim in that case.
-		return nil
+		// final component. Keep both lookups for later spelling checks.
+		if filepath.Base(previous) != component ||
+			(claimed.spelling != "" && entry.spelling != "" && path.Base(claimed.spelling) != path.Base(entry.spelling)) {
+			return &archiveNameCollision{earlier: claimed.displayName(previous), later: entry.displayName(name)}
+		}
 	}
-	names[name] = info
+	names[name] = entry
 	return nil
 }
 

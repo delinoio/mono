@@ -16,6 +16,7 @@ import {
   showsFullError,
 } from "../components/ui.tsx";
 import type { GitHubCallback } from "../github-callback.ts";
+import { useI18n } from "../i18n.ts";
 import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
@@ -29,6 +30,7 @@ export function GitHubSetupPage({
 }: {
   callback: GitHubCallback | undefined;
 }) {
+  const { t } = useI18n();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const link = useMutation(GitHubService.method.linkGitHubInstallation, {
@@ -91,43 +93,37 @@ export function GitHubSetupPage({
   if (callback === undefined) {
     body = (
       <div className="notice notice-error" role="alert">
-        <p>
-          The address has no GitHub installation details. Start the installation
-          again from the integrations of your organization.
-        </p>
-        <Link to="/">Go to your organizations</Link>
+        <p>{t("githubSetup.missingDetails")}</p>
+        <Link to="/">{t("common.goToOrganizations")}</Link>
       </div>
     );
   } else if (link.error) {
     body = (
       <>
         <ErrorNotice error={link.error} />
-        <p className="muted">
-          The installation link is single-use. Start the installation again from
-          the integrations of your organization.
-        </p>
-        <Link to="/">Go to your organizations</Link>
+        <p className="muted">{t("githubSetup.singleUse")}</p>
+        <Link to="/">{t("common.goToOrganizations")}</Link>
       </>
     );
   } else if (link.isPending || sent.current) {
-    body = <Loading label="Linking the GitHub installation" />;
+    body = <Loading label={t("githubSetup.linking")} />;
   } else {
     body = (
-      <QueryBoundary query={orgs} loading="Loading your organizations">
+      <QueryBoundary
+        query={orgs}
+        loading={t("githubSetup.loadingOrganizations")}
+      >
         {() => {
           if (adminOrgs.length === 0) {
             return (
               <div className="notice notice-error" role="alert">
-                <p>
-                  Only an owner or admin of a SandRun organization can link a
-                  GitHub installation.
-                </p>
-                <Link to="/">Go to your organizations</Link>
+                <p>{t("githubSetup.notAdmin")}</p>
+                <Link to="/">{t("common.goToOrganizations")}</Link>
               </div>
             );
           }
           if (onlyOrg !== undefined) {
-            return <Loading label="Linking the GitHub installation" />;
+            return <Loading label={t("githubSetup.linking")} />;
           }
           return (
             <form
@@ -138,13 +134,18 @@ export function GitHubSetupPage({
               }}
             >
               <Select
-                label="SandRun organization"
+                label={t("githubSetup.organization")}
                 value={eligibleSelection ?? null}
                 onValueChange={(value) => setSelected(value ?? undefined)}
               >
                 {adminOrgs.map((o) => (
                   <SelectOption key={o.organizationId} value={o.organizationId}>
-                    {`${o.name} (${o.callerRole === Role.OWNER ? "owner" : "admin"})`}
+                    {t(
+                      o.callerRole === Role.OWNER
+                        ? "githubSetup.organizationOwner"
+                        : "githubSetup.organizationAdmin",
+                      { name: o.name },
+                    )}
                   </SelectOption>
                 ))}
               </Select>
@@ -153,7 +154,7 @@ export function GitHubSetupPage({
                   type="submit"
                   disabled={eligibleSelection === undefined}
                 >
-                  Link installation
+                  {t("githubSetup.link")}
                 </Button>
               </div>
             </form>
@@ -168,8 +169,8 @@ export function GitHubSetupPage({
       <TopBar />
       <main className="content content-narrow">
         <PageHeader
-          title="Connect GitHub"
-          description="Link the GitHub organization where you installed the SandRun GitHub App."
+          title={t("githubSetup.title")}
+          description={t("githubSetup.description")}
         />
         {body}
       </main>

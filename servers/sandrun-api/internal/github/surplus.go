@@ -104,7 +104,7 @@ func (l *Layer) removeSurplus(ctx context.Context, check surplusCheck) bool {
 	pool := inst.PoolKey()
 	// Retire unusable labels before counting the capacity that can still
 	// take queued jobs. Queued events can also retire renamed runners.
-	l.retireRenamed(ctx, orgID, profileID, pool)
+	renameCleanupComplete := l.retireRenamed(ctx, orgID, profileID, pool)
 	p, err := l.profiles.Get(ctx, l.svc.DB.Pool, orgID, profileID)
 	if connect.CodeOf(err) == connect.CodeNotFound {
 		return true
@@ -112,6 +112,10 @@ func (l *Layer) removeSurplus(ctx context.Context, check surplusCheck) bool {
 	if err != nil {
 		l.svc.Logger.WarnContext(ctx, "github_surplus_profile_read_failed",
 			slog.String("organization_id", orgID), slog.String("runner_profile_id", profileID), slog.Any("error", err))
+		return false
+	}
+	if !renameCleanupComplete {
+		// Counting a runner whose old-label removal failed can trim the current reserve.
 		return false
 	}
 	surplus, err := l.engine.PoolSurplus(ctx, orgID, profileID, pool, int(p.WarmCount))

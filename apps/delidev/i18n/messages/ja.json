@@ -1,0 +1,12 @@
+{
+  "app.language": "言語",
+  "appInfo.loading": "アプリ情報を読み込み中…",
+  "appInfo.browser": "ブラウザーで実行中です。ランタイムを確認するには、Tauriでアプリを起動してください。",
+  "appInfo.failed": "アプリ情報を読み込めませんでした: {message}",
+  "appInfo.version": "バージョン",
+  "appInfo.runtime": "WebViewランタイム",
+  "appInfo.platform": "プラットフォーム",
+  "appInfo.platformValue": "{platform} ({os})",
+  "runtime.cef": "Chromium Embedded Framework",
+  "runtime.wry": "システムのWebView"
+}

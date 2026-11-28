@@ -110,7 +110,7 @@ func TestSignalHelperProcess(t *testing.T) {
 	}
 	ctx, stop := shutdownContext()
 	fmt.Println("listening", listener.Addr().String())
-	err := runServers(ctx, stop, newServer(mux, logger), listener, logger, timeout, worker, serveMetrics)
+	err := runServers(ctx, stop, newServer(mux, logger), listener, logger, timeout, nil, worker, serveMetrics)
 	stop()
 	if err != nil {
 		logger.Error("server_exited", slog.Any("error", err))

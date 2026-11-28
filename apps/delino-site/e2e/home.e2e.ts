@@ -61,6 +61,11 @@ describe("home", () => {
     browser,
   }) => {
     await app.open("/");
+    // The development server renders the page in the browser after
+    // `app.open` returns, so wait for the cards before reading their titles.
+    await expect(
+      browser.locator(".rp-home-feature__title").first(),
+    ).toBeVisible();
 
     // Rspress keys the feature cards by title, so a repeated title makes React
     // report duplicate keys in the development console and can drop a card.
@@ -83,6 +88,138 @@ describe("home", () => {
       await agent.assert("the page lists three feature cards");
     },
   );
+});
+
+describe("languages", () => {
+  test("renders the Korean home page with a language menu", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    // Rspress 2.1.3 moves the language menu into the hamburger menu at 1280px
+    // and narrower, so use a wider viewport to reach the navbar menu.
+    await browser.setViewport({ width: 1440, height: 900 });
+    await app.open("/ko/");
+    // The hero image text is translated, so wait for the brand wordmark.
+    await expect(browser.locator(".rp-home-hero__title-brand")).toBeVisible();
+
+    const lang = await browser.evaluate(() => document.documentElement.lang);
+    expect(lang).toBe("ko");
+
+    // The menu shows the native label of the selected language and lists the
+    // other languages as links to the same page in that language.
+    const menu = browser.locator(
+      ".rp-nav__others > .rp-nav-menu__item > .rp-nav-menu__item__container",
+    );
+    await expect(menu).toHaveText("한국어");
+    await menu.hover();
+    await expect(screen.getByRole("link", "English")).toHaveAttribute(
+      "href",
+      "/",
+    );
+  });
+
+  test("keeps the selected language in links to the documentation site", async ({
+    app,
+    browser,
+  }) => {
+    await app.open("/ko/");
+
+    // The translated page keeps the English URL in its frontmatter; the theme
+    // `Link` adds the language prefix. The action label is translated, so the
+    // test selects the brand action by its Rspress class name.
+    await expect(
+      browser.locator(".rp-home-hero__action.rp-button--brand"),
+    ).toHaveAttribute("href", "https://docs.delino.io/ko/");
+  });
+});
+
+describe("compact navigation focus", () => {
+  function readTriggerOutline(selector: string) {
+    const trigger = document.querySelector<HTMLButtonElement>(selector);
+    if (!trigger) {
+      throw new Error(`Missing navigation button: ${selector}`);
+    }
+    const style = getComputedStyle(trigger);
+    return {
+      focused: document.activeElement === trigger,
+      hovered: trigger.matches(":hover"),
+      open: Boolean(
+        document.querySelector(
+          ".rp-nav-screen--open, .rp-nav-hamburger__md .rp-hover-group:not(.rp-hover-group--hidden)",
+        ),
+      ),
+      dark: document.documentElement.classList.contains("rp-dark"),
+      style: style.outlineStyle,
+      width: parseFloat(style.outlineWidth),
+      offset: parseFloat(style.outlineOffset),
+    };
+  }
+
+  for (const colorScheme of ["light", "dark"] as const) {
+    for (const { width, variant, tabCount } of [
+      { width: 768, variant: "sm", tabCount: 2 },
+      { width: 769, variant: "md", tabCount: 4 },
+    ]) {
+      test(`shows a keyboard focus outline at ${width}px in ${colorScheme} mode`, async ({
+        app,
+        browser,
+        screen,
+      }) => {
+        await browser.setViewport({ width, height: 800 });
+        await browser.emulateMedia({ colorScheme });
+        await app.open("/");
+        await browser.mouse.move(10, 200);
+
+        const trigger = screen.getByRole("button", "mobile hamburger");
+        await expect(trigger).toBeVisible();
+        for (let step = 0; step < tabCount; step++) {
+          await browser.keyboard.press("Tab");
+        }
+        await expect(trigger).toBeFocused();
+
+        const selector = `.rp-nav-hamburger__${variant}`;
+        const focused = await browser.evaluate(readTriggerOutline, selector);
+        expect(focused.focused).toBe(true);
+        expect(focused.hovered).toBe(false);
+        expect(focused.open).toBe(false);
+        expect(focused.dark).toBe(colorScheme === "dark");
+        expect(focused.style).toBe("solid");
+        expect(focused.width).toBeGreaterThanOrEqual(2);
+        expect(focused.offset).toBeGreaterThan(0);
+
+        await browser.keyboard.press("Tab");
+        await expect(screen.getByRole("link", "Read the docs")).toBeFocused();
+        const blurred = await browser.evaluate(readTriggerOutline, selector);
+        expect(blurred.style).toBe("none");
+      });
+    }
+  }
+
+  test("skips both hidden navigation buttons at 1281px", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await browser.setViewport({ width: 1281, height: 800 });
+    await app.open("/");
+
+    const buttons = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(".rp-nav-hamburger"),
+        (button) => getComputedStyle(button).display,
+      ),
+    );
+    expect(buttons).toEqual(["none", "none"]);
+
+    const header = screen.getByRole("banner");
+    for (const name of ["Delino", /^Docs\b/, /^GitHub\b/]) {
+      await browser.keyboard.press("Tab");
+      await expect(header.getByRole("link", name)).toBeFocused();
+    }
+    await browser.keyboard.press("Tab");
+    await expect(screen.getByRole("link", "Read the docs")).toBeFocused();
+  });
 });
 
 describe("brand colors", () => {

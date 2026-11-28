@@ -98,23 +98,37 @@ func TestSecondInterruptEndsACommandThatIgnoresTheFirst(t *testing.T) {
 
 	// Wait until the command reads the FIFO, which is after main installed
 	// the interrupt handler.
-	deadline := time.Now().Add(phaseTimeout)
+	deadline := time.NewTimer(phaseTimeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	var lastProbeErr error
 	for {
 		held, err := holdsFile(cmd.Process.Pid, fifo)
-		if err != nil {
-			t.Fatalf("inspect the command before FIFO readiness: %v", err)
-		}
 		if held {
 			break
 		}
+		if err != nil {
+			// Wait can reap the child before it closes ended.
+			lastProbeErr = err
+		}
+		select {
+		case <-ended:
+		case <-deadline.C:
+		case <-poll.C:
+			continue
+		}
+		// Prefer the wait status if the child finished by the time we
+		// handle the readiness deadline.
 		select {
 		case <-ended:
 			t.Fatalf("the command ended before it opened the FIFO: %v", waitErr)
-		case <-time.After(10 * time.Millisecond):
+		default:
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the command did not open the FIFO")
+		if lastProbeErr != nil {
+			t.Fatalf("the command did not open the FIFO: last descriptor probe failed: %v", lastProbeErr)
 		}
+		t.Fatal("the command did not open the FIFO")
 	}
 
 	if err := ackReader.SetReadDeadline(time.Now().Add(phaseTimeout)); err != nil {

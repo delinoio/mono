@@ -3,12 +3,15 @@ import type { QueryKey } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { createContext, type ReactNode, useContext } from "react";
 import { useAuth } from "../auth.tsx";
+import { useI18n } from "../i18n.ts";
 import type { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import { LanguageSelect } from "./language-select.tsx";
 
-/** The top bar: product name, billing link and sign-out. */
+/** The top bar: product name, billing link, language menu and sign-out. */
 export function TopBar() {
   const auth = useAuth();
+  const { t } = useI18n();
   const { route } = useRouter();
   const inBilling =
     route.id === RouteId.Billing || route.id === RouteId.BillingAccount;
@@ -17,21 +20,22 @@ export function TopBar() {
       <Link to={routePath({ id: RouteId.Home })} className="brand">
         Delino Accounts
       </Link>
-      <nav className="topbar-links" aria-label="Main">
+      <nav className="topbar-links" aria-label={t("nav.main")}>
         <Link
           to={routePath({ id: RouteId.Billing })}
           aria-current={route.id === RouteId.Billing ? "page" : undefined}
           className={inBilling ? "topbar-link-active" : undefined}
         >
-          Billing
+          {t("nav.billing")}
         </Link>
+        <LanguageSelect />
         {auth.isAuthenticated ? (
           <Button
             variant={ButtonVariant.Secondary}
             size={ButtonSize.Small}
             onClick={() => auth.signOut()}
           >
-            Sign out
+            {t("nav.signOut")}
           </Button>
         ) : null}
       </nav>

@@ -16,10 +16,9 @@ import {
   AuthContextProvider,
   LogtoAuthProvider,
   MockAuthProvider,
-  SIGN_IN_NOT_CONFIGURED,
   useAuth,
 } from "./auth.tsx";
-import { OrgShell, TopBar } from "./components/shell.tsx";
+import { OrgShell, SignedOutTopBar, TopBar } from "./components/shell.tsx";
 import { PageHeader, SignInAction } from "./components/ui.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import {
@@ -27,6 +26,7 @@ import {
   parseGitHubCallback,
   stripCallbackFromAddress,
 } from "./github-callback.ts";
+import { type MessageKey, useI18n } from "./i18n.ts";
 import { takeSecretFromAddress } from "./invitation.ts";
 import { ApiKeysPage } from "./pages/api-keys.tsx";
 import { AuditPage } from "./pages/audit.tsx";
@@ -139,6 +139,7 @@ function ApiProviders({
 
 function Routes({ config }: { config: ConsoleConfig }) {
   const auth = useAuth();
+  const { t } = useI18n();
   const { route } = useRouter();
   const configured =
     config.authMode === AuthMode.Mock || config.logto !== undefined;
@@ -166,8 +167,8 @@ function Routes({ config }: { config: ConsoleConfig }) {
         <>
           <TopBar />
           <main className="content content-narrow">
-            <PageHeader title="Page not found" />
-            <Link to="/">Go to your organizations</Link>
+            <PageHeader title={t("notFound.title")} />
+            <Link to="/">{t("common.goToOrganizations")}</Link>
           </main>
         </>
       );
@@ -234,8 +235,8 @@ function EntryRoute({
         configured={configured}
         notice={
           id === RouteId.Invitation
-            ? "Sign in, then open the invitation link again."
-            : "Sign in, then start the GitHub installation again from the integrations of your organization."
+            ? "signIn.invitationNotice"
+            : "signIn.gitHubSetupNotice"
         }
       />
     );
@@ -277,21 +278,22 @@ function SignIn({
   notice,
 }: {
   configured: boolean;
-  notice?: string;
+  notice?: MessageKey;
 }) {
+  const { t } = useI18n();
   return (
-    <main className="sign-in">
-      <h1>SandRun</h1>
-      <p className="muted">
-        Run GitHub Actions jobs, coding-agent sessions and dev sessions on the
-        devices your team already owns.
-      </p>
-      {notice !== undefined && configured ? <p>{notice}</p> : null}
-      {configured ? (
-        <SignInAction />
-      ) : (
-        <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
-      )}
-    </main>
+    <>
+      <SignedOutTopBar />
+      <main className="sign-in">
+        <h1>SandRun</h1>
+        <p className="muted">{t("signIn.tagline")}</p>
+        {notice !== undefined && configured ? <p>{t(notice)}</p> : null}
+        {configured ? (
+          <SignInAction />
+        ) : (
+          <p role="alert">{t("signIn.notConfigured")}</p>
+        )}
+      </main>
+    </>
   );
 }

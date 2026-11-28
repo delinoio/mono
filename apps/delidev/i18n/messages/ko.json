@@ -1,0 +1,12 @@
+{
+  "app.language": "언어",
+  "appInfo.loading": "앱 정보 불러오는 중…",
+  "appInfo.browser": "브라우저에서 실행 중입니다. 런타임을 확인하려면 Tauri로 앱을 실행하세요.",
+  "appInfo.failed": "앱 정보를 불러올 수 없습니다: {message}",
+  "appInfo.version": "버전",
+  "appInfo.runtime": "웹뷰 런타임",
+  "appInfo.platform": "플랫폼",
+  "appInfo.platformValue": "{platform} ({os})",
+  "runtime.cef": "Chromium Embedded Framework",
+  "runtime.wry": "시스템 웹뷰"
+}

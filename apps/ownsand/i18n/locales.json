@@ -1,0 +1,38 @@
+{
+  "sourceLang": "en",
+  "context": "User interface text of the OwnSand web console. OwnSand turns devices that a team already owns into a private sandbox cloud: organizations register devices and create isolated sandboxes, snapshots and API keys on them. Keep product names (OwnSand, Delino) and technical terms such as sandbox, snapshot, vCPU and API key in their conventional form for the target language.",
+  "locales": [
+    {
+      "lang": "en",
+      "label": "English"
+    },
+    {
+      "lang": "ko",
+      "label": "한국어"
+    },
+    {
+      "lang": "ja",
+      "label": "日本語"
+    },
+    {
+      "lang": "zh-Hans",
+      "label": "简体中文"
+    },
+    {
+      "lang": "es",
+      "label": "Español"
+    },
+    {
+      "lang": "fr",
+      "label": "Français"
+    },
+    {
+      "lang": "de",
+      "label": "Deutsch"
+    },
+    {
+      "lang": "pt-BR",
+      "label": "Português (Brasil)"
+    }
+  ]
+}

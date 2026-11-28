@@ -23,6 +23,58 @@ import (
 // does not implement net.Error with Temporary, so net/http does not retry it.
 var errMetricsAccept = errors.New("metrics accept failed permanently")
 
+func TestRunServersSkipsPreCanceledStartup(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		withMetrics bool
+	}{
+		{name: "with metrics", withMetrics: true},
+		{name: "without metrics"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			logs := &syncBuffer{}
+			logger := slog.New(slog.NewJSONHandler(logs, nil))
+			listener := newTestListener(t)
+			srv := newServer(http.NewServeMux(), logger)
+
+			stopCalls := 0
+			stop := func() { stopCalls++ }
+			onStart := func() { logger.Info("server_started") }
+			var workerCalls, metricsCalls atomic.Int32
+			worker := func(context.Context) {
+				workerCalls.Add(1)
+				logger.Info("billing_worker_started")
+			}
+			var serveMetrics func(context.Context) error
+			if tt.withMetrics {
+				serveMetrics = func(context.Context) error {
+					metricsCalls.Add(1)
+					logger.Info("metrics_listener_started")
+					return nil
+				}
+			}
+
+			if err := runServers(ctx, stop, srv, listener, logger, time.Second, onStart, worker, serveMetrics); err != nil {
+				t.Fatalf("runServers error = %v, want nil", err)
+			}
+			if stopCalls != 1 || workerCalls.Load() != 0 || metricsCalls.Load() != 0 {
+				t.Errorf("calls to stop, worker and metrics = %d, %d, %d, want 1, 0, 0",
+					stopCalls, workerCalls.Load(), metricsCalls.Load())
+			}
+			conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+			if err == nil {
+				_ = conn.Close()
+				t.Error("public listener accepted a connection after canceled startup")
+			}
+			if output := logs.String(); output != "" {
+				t.Errorf("logs after canceled startup = %q, want no logs", output)
+			}
+		})
+	}
+}
+
 func TestRunServersClosesActivePublicConnectionAtDrainDeadline(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -65,7 +117,7 @@ func TestRunServersClosesActivePublicConnectionAtDrainDeadline(t *testing.T) {
 			}
 			const drainTimeout = 200 * time.Millisecond
 			result := runAsync(func() error {
-				return runServers(ctx, noStop, srv, listener, logger, drainTimeout, worker, nil)
+				return runServers(ctx, noStop, srv, listener, logger, drainTimeout, nil, worker, nil)
 			})
 
 			conn, err := net.DialTimeout("tcp", publicListener.Addr().String(), handlerStartTimeout)
@@ -168,7 +220,7 @@ func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) 
 	}
 	srv := newServer(http.NewServeMux(), logger)
 	go func() {
-		rig.result <- runServers(ctx, noStop, srv, listener, logger, 5*time.Second, worker, serveMetrics)
+		rig.result <- runServers(ctx, noStop, srv, listener, logger, 5*time.Second, nil, worker, serveMetrics)
 	}()
 	select {
 	case <-rig.workerStarted:

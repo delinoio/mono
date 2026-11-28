@@ -26,7 +26,7 @@ Every path below exists. A new path starts as `planned` and changes to an actual
 
 - `servers/sandrun-api/`: Go control plane on the shared DigitalOcean Droplet, served at `https://sandrun.api.delino.io`. It owns the queue, the dispatcher, the GitHub App integration, the agent vendor adapters and the Claude Code orchestrator processes.
 - `apps/sandrun/`: Rsbuild React web console (workspace package `sandrun-console`) served at `https://sandrun.delino.io`.
-- `cmds/sandrun/`: Go command-line interface. The same binary serves the `sandrun mcp` MCP server for coding agents.
+- `cmds/sandrun/`: Go command-line interface. The same binary serves the `sandrun mcp` MCP server for coding agents. Both use `cmds/sandrun/internal/syncpath` for local sync sources.
 - `protos/delino/sandrun/`: the workspace package `@delino/sandrun-protos` with the Connect RPC schemas in `v1/`, the committed Go bindings and the committed TypeScript bindings.
 - `packages/sandrun-sdk/`: TypeScript SDK (workspace package `sandrun-sdk`).
 - `go/sandrun/`: Go SDK, with the test fake `go/sandrun/sandruntest`. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).

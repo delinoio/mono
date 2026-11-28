@@ -250,7 +250,9 @@ func (e *Env) FailProgramExitCommits() func() {
 	}
 	return func() {
 		e.T.Helper()
-		if _, err := e.DB.Pool.Exec(ctx, "DROP TRIGGER fail_program_exit ON runners"); err != nil {
+		if _, err := e.DB.Pool.Exec(ctx, `
+			DROP TRIGGER fail_program_exit ON runners;
+			DROP FUNCTION fail_program_exit();`); err != nil {
 			e.T.Fatal(err)
 		}
 	}

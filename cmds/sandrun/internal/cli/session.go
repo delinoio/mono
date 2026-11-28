@@ -15,6 +15,7 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/delinoio/mono/cmds/sandrun/internal/syncpath"
 	"github.com/delinoio/mono/go/sandrun"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 )
@@ -564,7 +565,7 @@ func (a *app) sessionSync(ctx context.Context, name string, args []string) error
 	if len(rest) < 1 || len(rest) > 2 {
 		return usageErr("usage: sandrun session sync [flags] <session-id> [<local-dir>]")
 	}
-	dir := "."
+	var dir string
 	if len(rest) == 2 {
 		dir = rest[1]
 	}
@@ -573,7 +574,7 @@ func (a *app) sessionSync(ctx context.Context, name string, args []string) error
 		if err != nil {
 			return err
 		}
-		dir = filepath.Join(wd, dir)
+		dir = syncpath.FromWorkDir(wd, dir)
 	}
 	org, c, err := a.orgSetup()
 	if err != nil {

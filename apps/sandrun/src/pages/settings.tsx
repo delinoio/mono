@@ -25,6 +25,7 @@ import {
   showsFullError,
 } from "../components/ui.tsx";
 import { devSessionLimitError } from "../forms.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { displayName, useMembers } from "../members.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
@@ -34,10 +35,11 @@ import { useRouter } from "../router.tsx";
  * transfer and organization deletion (`owner`).
  */
 export function SettingsPage() {
+  const { t } = useI18n();
   const { role } = useOrg();
   return (
     <>
-      <PageHeader title="Settings" />
+      <PageHeader title={t("settings.title")} />
       <DevSessionLimit />
       {can(role, Permission.TransferOwnership) ? <OwnerActions /> : null}
     </>
@@ -45,6 +47,7 @@ export function SettingsPage() {
 }
 
 function DevSessionLimit() {
+  const { t } = useI18n();
   const { organizationId, organization } = useOrg();
   const queryClient = useQueryClient();
   const transport = useTransport();
@@ -52,7 +55,7 @@ function DevSessionLimit() {
   const [draft, setDraft] = useState<{ value: number | null }>();
   const value = draft ? draft.value : stored;
   const hasChanges = draft !== undefined && draft.value !== stored;
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<MessageKey>();
   const update = useMutation(
     OrganizationService.method.updateOrganizationSettings,
     {
@@ -102,8 +105,8 @@ function DevSessionLimit() {
       setDraft((current) => (current === draft ? undefined : current));
       toast.success(
         value === null
-          ? "Dev sessions have no per-user limit."
-          : "The dev session limit is saved.",
+          ? t("settings.devSessionLimit.removed")
+          : t("settings.devSessionLimit.saved"),
       );
     } catch {
       // The notice below shows the error.
@@ -111,26 +114,24 @@ function DevSessionLimit() {
   };
   return (
     <section className="section" aria-labelledby="limit-title">
-      <h2 id="limit-title">Dev sessions per user</h2>
-      <p className="muted">
-        The most dev sessions that one user can have queued, starting or running
-        at the same time. Leave it empty for no limit. Lowering it ends no
-        existing dev session.
-      </p>
+      <h2 id="limit-title">{t("settings.devSessionLimit.title")}</h2>
+      <p className="muted">{t("settings.devSessionLimit.description")}</p>
       <form className="inline-form" onSubmit={submit} noValidate>
         <NumberInput
-          label="Limit per user"
+          label={t("settings.devSessionLimit.label")}
+          decrementLabel={t("common.decrease")}
+          incrementLabel={t("common.increase")}
           value={value}
           onValueChange={(v) => {
             setDraft({ value: v });
             setError(undefined);
           }}
           min={1}
-          error={error}
+          error={error && t(error)}
           autoFocus
         />
         <Button type="submit" disabled={!hasChanges || update.isPending}>
-          Save limit
+          {t("settings.devSessionLimit.save")}
         </Button>
       </form>
       {update.error ? <ErrorNotice error={update.error} /> : null}
@@ -139,6 +140,7 @@ function DevSessionLimit() {
 }
 
 function OwnerActions() {
+  const { t } = useI18n();
   const { organizationId, name } = useOrg();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
@@ -165,16 +167,14 @@ function OwnerActions() {
   return (
     <>
       <section className="section" aria-labelledby="transfer-title">
-        <h2 id="transfer-title">Transfer ownership</h2>
-        <p className="muted">
-          The new owner gets every permission. You become an admin.
-        </p>
+        <h2 id="transfer-title">{t("settings.transfer.title")}</h2>
+        <p className="muted">{t("settings.transfer.description")}</p>
         <MemberListStatus roster={roster} />
         <div className="inline-form">
           <Select
             disabled={!hasRoster}
-            label="New owner"
-            placeholder="Choose a member"
+            label={t("settings.transfer.newOwner")}
+            placeholder={t("settings.transfer.placeholder")}
             value={candidate?.userId ?? null}
             onValueChange={setTarget}
           >
@@ -189,24 +189,18 @@ function OwnerActions() {
             disabled={candidate === undefined}
             onClick={() => setTransferTarget(candidate?.userId ?? null)}
           >
-            Transfer
+            {t("settings.transfer.action")}
           </Button>
         </div>
       </section>
       <section className="section danger-zone" aria-labelledby="delete-title">
-        <h2 id="delete-title">Delete organization</h2>
-        <p className="muted">
-          Cancels every queued request, deletes every runner and removes the
-          OwnSand link, the GitHub installations, the agent integrations and
-          every member. The SandRun GitHub App stays installed in GitHub:
-          uninstall it in the settings of each GitHub organization, because
-          SandRun cannot uninstall it.
-        </p>
+        <h2 id="delete-title">{t("settings.delete.title")}</h2>
+        <p className="muted">{t("settings.delete.description")}</p>
         <Button
           variant={ButtonVariant.Danger}
           onClick={() => setConfirmDelete(true)}
         >
-          Delete organization
+          {t("settings.delete.title")}
         </Button>
       </section>
       <ConfirmDialog
@@ -214,9 +208,11 @@ function OwnerActions() {
         onOpenChange={(open) => {
           if (!open) setTransferTarget(null);
         }}
-        title={`Make ${candidate ? displayName(candidate) : ""} the owner?`}
-        description="You become an admin. Only the new owner can give ownership back."
-        confirmLabel="Transfer ownership"
+        title={t("settings.transferDialog.title", {
+          name: candidate ? displayName(candidate) : "",
+        })}
+        description={t("settings.transferDialog.description")}
+        confirmLabel={t("settings.transfer.title")}
         onConfirm={async () => {
           if (transferCandidate === undefined) return;
           await transfer.mutateAsync({
@@ -228,9 +224,9 @@ function OwnerActions() {
       <ConfirmDialog
         open={confirmDelete}
         onOpenChange={setConfirmDelete}
-        title={`Delete ${name}?`}
-        description="Every runner is deleted and every queued request is canceled. Uninstall the SandRun GitHub App in GitHub yourself, because SandRun cannot uninstall it. This cannot be undone."
-        confirmLabel="Delete organization"
+        title={t("settings.deleteDialog.title", { name })}
+        description={t("settings.deleteDialog.description")}
+        confirmLabel={t("settings.delete.title")}
         onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId });
           // Refreshing the old route can unmount the confirmation.

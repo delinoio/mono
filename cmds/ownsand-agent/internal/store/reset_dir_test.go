@@ -52,7 +52,7 @@ func TestResetDirKeepsHeldLockAndStateUntilRetry(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	if err := resetDir(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) {
+	if err := ResetDirContext(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) {
 		t.Fatalf("reset while enrollment holds the lock: %v, want ErrEnrollmentBusy", err)
 	}
 	for _, name := range []string{IdentityFile, AgentFile} {
@@ -89,7 +89,7 @@ func TestResetDirKeepsStateAfterDeadline(t *testing.T) {
 	}
 	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
 	defer cancel()
-	if err := resetDir(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
+	if err := ResetDirContext(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expired reset = %v, want ErrEnrollmentBusy and DeadlineExceeded", err)
 	}
 	for _, name := range []string{IdentityFile, AgentFile} {
@@ -101,7 +101,7 @@ func TestResetDirKeepsStateAfterDeadline(t *testing.T) {
 	if err != nil || !os.SameFile(before, after) {
 		t.Fatalf("expired reset changed the enrollment lock: %v", err)
 	}
-	if err := resetDir(t.Context(), dir); err != nil {
+	if err := ResetDirContext(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{IdentityFile, AgentFile} {

@@ -505,6 +505,11 @@ describe("organizations", () => {
     );
     const toggle = screen.getByRole("button", { name: "Show invitation" });
     const error = "Paste the whole invitation link or the secret.";
+    // The field shows the error and the UI SDK announcer repeats it 100ms
+    // later in a hidden live region that keeps the text after the field
+    // clears it. Check only the field, so the result does not depend on how
+    // long the test takes to type.
+    const visibleText = { ignore: "script, style, [data-ui-sdk-announcer]" };
 
     expect(input.type).toBe("password");
     expect(input.getAttribute("autocomplete")).toBe("off");
@@ -525,11 +530,11 @@ describe("organizations", () => {
 
     await click(toggle);
     await click(screen.getByRole("button", { name: "Continue" }));
-    expect(screen.getByText(error)).toBeTruthy();
+    expect(screen.getByText(error, visibleText)).toBeTruthy();
     expect(input.type).toBe("password");
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
     await type(input, "editing the invitation");
-    expect(screen.queryByText(error)).toBeNull();
+    expect(screen.queryByText(error, visibleText)).toBeNull();
   });
 
   test.each([
@@ -3747,7 +3752,7 @@ describe("setup guidance", () => {
       });
       return within(checklist).getByRole("link", { name: "Link OwnSand" });
     }
-    await screen.findByText(/Next step: link ownsand/);
+    await screen.findByText(/Next step: link OwnSand\./);
     return screen.getByRole("link", { name: "Link OwnSand" });
   }
 

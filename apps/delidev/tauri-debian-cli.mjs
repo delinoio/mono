@@ -25,11 +25,38 @@ const bundler = {
   sha256: "3584509319122de69155798e3bf6ab931e1bb9165d80e7536cb53ab6ce7bb6f6",
 };
 
-// Debian portion of Tauri commit 6620118f0fe85472abfdccea8d99fd0ec9447c3f.
+// Linux portion of Tauri commit 6620118f0fe85472abfdccea8d99fd0ec9447c3f.
 // CEF 154 no longer ships standalone ANGLE libraries. Remove this backport
 // when the published CLI pin includes the fix.
+const angleCopyLists = [
+  "src/bundle/linux/debian.rs",
+  "src/bundle/linux/rpm.rs",
+  "src/bundle/linux/appimage/sharun_cef.rs",
+];
 const angleFiles =
   '      // ANGLE support\n      "libEGL.so",\n      "libGLESv2.so",\n';
+
+// The pinned CLI groups CEF with custom runtimes, but CEF uses GTK 4.
+// Remove this patch when the published CLI pin declares GTK 4 for CEF.
+const cefDependencyPatch = {
+  path: "src/runtime/mod.rs",
+  before: `      // CEF is shipped with the app
+      Self::Cef | Self::Other => &[GTK],`,
+  after: `      Self::Cef => &[LinuxDependency {
+        deb_package: "libgtk-4-1",
+        library: "libgtk-4.so.1",
+      }],
+      Self::Other => &[GTK],`,
+};
+
+export function patchCefLinuxDependencies(source) {
+  const { before, after } = cefDependencyPatch;
+  const index = source.indexOf(before);
+  if (index === -1 || index !== source.lastIndexOf(before)) {
+    throw new Error("Could not locate the pinned CEF Linux dependency mapping");
+  }
+  return source.replace(before, after);
+}
 
 async function unpackCrate(workDir, { name, version, sha256 }) {
   const packageName = `${name}-${version}`;
@@ -51,12 +78,14 @@ async function unpackCrate(workDir, { name, version, sha256 }) {
   return join(workDir, packageName);
 }
 
-export async function debianCli() {
+export async function linuxCefCli() {
   const manifest = JSON.parse(
     readFileSync(new URL("./package.json", import.meta.url)),
   );
   if (manifest.devDependencies["@tauri-apps/cli"] !== cli.version) {
-    throw new Error("Review the Debian backport for the new Tauri CLI version");
+    throw new Error(
+      "Review the Linux CEF backport for the new Tauri CLI version",
+    );
   }
   const rustc = execFileSync("rustc", ["-vV"], { encoding: "utf8" });
   const host = /^host: (.+)$/m.exec(rustc)?.[1];
@@ -70,7 +99,7 @@ export async function debianCli() {
   const cacheVersion = createHash("sha256")
     .update(cli.sha256)
     .update(bundler.sha256)
-    .update(angleFiles)
+    .update(JSON.stringify([angleCopyLists, angleFiles, cefDependencyPatch]))
     .digest("hex");
   const cacheDir = join(
     cache,
@@ -86,16 +115,25 @@ export async function debianCli() {
   const workDir = mkdtempSync(join(cacheDir, "build-"));
   try {
     console.error(
-      `Building Tauri CLI ${cli.version} with the Debian CEF backport`,
+      `Building Tauri CLI ${cli.version} with the Linux CEF backport`,
     );
     const cliDir = await unpackCrate(workDir, cli);
     const bundlerDir = await unpackCrate(workDir, bundler);
-    const debianSource = join(bundlerDir, "src/bundle/linux/debian.rs");
-    const source = readFileSync(debianSource, "utf8");
-    if (!source.includes(angleFiles)) {
-      throw new Error("Could not locate the pinned Debian ANGLE copy list");
+    const runtimePath = join(cliDir, cefDependencyPatch.path);
+    writeFileSync(
+      runtimePath,
+      patchCefLinuxDependencies(readFileSync(runtimePath, "utf8")),
+    );
+    for (const copyList of angleCopyLists) {
+      const sourcePath = join(bundlerDir, copyList);
+      const source = readFileSync(sourcePath, "utf8");
+      if (!source.includes(angleFiles)) {
+        throw new Error(
+          `Could not locate the pinned ANGLE copy list in ${copyList}`,
+        );
+      }
+      writeFileSync(sourcePath, source.replace(angleFiles, ""));
     }
-    writeFileSync(debianSource, source.replace(angleFiles, ""));
 
     // Keep the published lockfile and dependency graph. An empty workspace
     // isolates the extracted CLI when the cache is inside a Cargo workspace.

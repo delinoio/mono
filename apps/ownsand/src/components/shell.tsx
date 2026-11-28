@@ -8,10 +8,13 @@ import { createContext, type ReactNode, useContext } from "react";
 import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
 import { labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import { enumText, type MessageKey } from "../text.ts";
 import { BillingBanner } from "./billing.tsx";
+import { LanguageSelect } from "./language-select.tsx";
 import {
   ErrorNotice,
   isTerminalError,
@@ -38,42 +41,42 @@ export function useOrg(): OrgContextValue {
 
 const SECTIONS: {
   id: RouteId;
-  title: string;
+  title: MessageKey;
   permission: Permission;
 }[] = [
   {
     id: RouteId.Sandboxes,
-    title: "Sandboxes",
+    title: "nav.sandboxes",
     permission: Permission.UseSandboxes,
   },
   {
     id: RouteId.Snapshots,
-    title: "Snapshots",
+    title: "nav.snapshots",
     permission: Permission.UseSandboxes,
   },
   {
     id: RouteId.Devices,
-    title: "Devices",
+    title: "nav.devices",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.Members,
-    title: "Members",
+    title: "nav.members",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.EnrollmentTokens,
-    title: "Enrollment tokens",
+    title: "nav.enrollmentTokens",
     permission: Permission.ManageEnrollmentTokens,
   },
   {
     id: RouteId.ApiKeys,
-    title: "API keys",
+    title: "nav.apiKeys",
     permission: Permission.ManageApiKeys,
   },
   {
     id: RouteId.Settings,
-    title: "Settings",
+    title: "nav.settings",
     permission: Permission.ReadOrganization,
   },
 ];
@@ -99,9 +102,27 @@ export function canOpenSection(role: Role | undefined, id: RouteId): boolean {
  */
 const RETRY_ORGANIZATIONS = "retry-organizations";
 
-/** The top bar: product name, organization switcher and account links. */
+/**
+ * The top bar of the signed-out pages and the invitation flow: the product
+ * name and the language menu. `brand` false leaves out the product name, for
+ * a page whose heading already shows it.
+ */
+export function PublicTopBar({ brand = true }: { brand?: boolean }) {
+  return (
+    <header className="topbar">
+      {brand ? <span className="brand">OwnSand</span> : null}
+      <LanguageSelect className="topbar-language" />
+    </header>
+  );
+}
+
+/**
+ * The top bar: product name, organization switcher, language menu and
+ * account links.
+ */
 export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
+  const { t } = useI18n();
   const { route, navigate } = useRouter();
   const orgs = useOrganizations();
   const normalizedOrganizationId = organizationId?.toLowerCase();
@@ -131,8 +152,8 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
       orgs.terminalLoadMoreError === null ? (
         <div className="org-switcher">
           <Select
-            label="Organization"
-            placeholder="Choose an organization"
+            label={t("topBar.organization")}
+            placeholder={t("topBar.chooseOrganization")}
             value={
               selectedOrganization?.organizationId ??
               // A later page can still contain the route organization.
@@ -158,26 +179,27 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
             ))}
             {orgs.loadMoreError ? (
               <SelectOption value={RETRY_ORGANIZATIONS}>
-                Some organizations did not load. Try again
+                {t("topBar.organizationsFailed")}
               </SelectOption>
             ) : orgs.isIncomplete ? (
               <SelectOption value={RETRY_ORGANIZATIONS} disabled>
-                Loading more organizations
+                {t("topBar.organizationsLoading")}
               </SelectOption>
             ) : null}
           </Select>
         </div>
       ) : null}
-      <nav className="topbar-links" aria-label="Account">
+      <LanguageSelect className="topbar-language" />
+      <nav className="topbar-links" aria-label={t("topBar.account")}>
         <a href={ACCOUNTS_URL} target="_blank" rel="noreferrer">
-          Account settings
+          {t("topBar.accountSettings")}
         </a>
         <Button
           variant={ButtonVariant.Secondary}
           size={ButtonSize.Small}
           onClick={() => auth.signOut()}
         >
-          Sign out
+          {t("topBar.signOut")}
         </Button>
       </nav>
     </header>
@@ -193,12 +215,14 @@ export function OrgShell({
   children: ReactNode;
 }) {
   const { route } = useRouter();
+  const i18n = useI18n();
+  const { t } = i18n;
   const org = useQuery(OrganizationService.method.getOrganization, {
     organizationId,
   });
   let body: ReactNode;
   if (org.isPending) {
-    body = <Loading label="Loading the organization" />;
+    body = <Loading label={t("orgShell.loading")} />;
   } else if (org.data === undefined || showsFullError(org)) {
     // No loaded organization, or an error that a retry cannot fix
     // (`not_found`, `permission_denied`, `unauthenticated`): replace the
@@ -206,7 +230,7 @@ export function OrgShell({
     // open dialogs and typed values survive; the notice below reports it.
     body = (
       <ErrorNotice error={org.error} onRetry={() => void org.refetch()}>
-        <Link to="/">Go to your organizations</Link>
+        <Link to="/">{t("common.goToOrganizations")}</Link>
       </ErrorNotice>
     );
   } else {
@@ -223,10 +247,12 @@ export function OrgShell({
         value={{ organizationId, name: organization.name, role }}
       >
         <div className="org-layout">
-          <nav className="sidenav" aria-label="Organization">
+          <nav className="sidenav" aria-label={t("orgShell.navigation")}>
             <p className="sidenav-org">
               {organization.name}
-              <span className="muted"> · {labels.role[role]}</span>
+              <span className="muted">
+                {` · ${enumText(i18n, labels.role, role)}`}
+              </span>
             </p>
             <ul>
               {visibleSections(role).map((s) => (
@@ -237,7 +263,7 @@ export function OrgShell({
                     >[0])}
                     aria-current={current === s.id ? "page" : undefined}
                   >
-                    {s.title}
+                    {t(s.title)}
                   </Link>
                 </li>
               ))}
@@ -250,14 +276,14 @@ export function OrgShell({
               children
             ) : (
               <div className="notice notice-error" role="alert">
-                <p>You do not have permission to open this page.</p>
+                <p>{t("orgShell.noPermission")}</p>
                 <Link
                   to={routePath({
                     id: RouteId.Sandboxes,
                     organizationId,
                   })}
                 >
-                  Go to sandboxes
+                  {t("orgShell.goToSandboxes")}
                 </Link>
               </div>
             )}

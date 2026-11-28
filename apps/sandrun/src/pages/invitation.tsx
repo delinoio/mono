@@ -13,6 +13,7 @@ import {
   secretFromInput,
   takeSecretFromAddress,
 } from "../invitation.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { refreshOrganizations } from "../organizations.ts";
 import { Link, orgPath, parseRoute, RouteId, useRouter } from "../router.tsx";
 
@@ -25,10 +26,11 @@ export function InvitationPage({
 }: {
   initialSecret: string | undefined;
 }) {
+  const { t } = useI18n();
   const { isCurrentVisit, navigate } = useRouter();
   const queryClient = useQueryClient();
   const [value, setValue] = useState(initialSecret ?? "");
-  const [inputError, setInputError] = useState<string>();
+  const [inputError, setInputError] = useState<MessageKey>();
   const [showRecovery, setShowRecovery] = useState(false);
   const currentAttempt = useRef(0);
   const accept = useMutation(MemberService.method.acceptInvitation, {
@@ -73,7 +75,7 @@ export function InvitationPage({
     event.preventDefault();
     const secret = secretFromInput(value);
     if (secret === undefined) {
-      setInputError("Paste the invitation link or the secret.");
+      setInputError("invitation.inputRequired");
       return;
     }
     const attempt = ++currentAttempt.current;
@@ -106,23 +108,19 @@ export function InvitationPage({
       <TopBar />
       <main className="content content-narrow">
         <PageHeader
-          title="Accept an invitation"
-          description={
-            showRecovery
-              ? undefined
-              : "Join a SandRun organization with the one-time invitation that an admin sent you. An invitation works for 7 days."
-          }
+          title={t("invitation.title")}
+          description={showRecovery ? undefined : t("invitation.description")}
         />
         {showRecovery ? (
           <div className="notice">
-            <p role="alert">You may have joined the organization.</p>
-            <Link to="/">Go to your organizations</Link>
+            <p role="alert">{t("invitation.mayHaveJoined")}</p>
+            <Link to="/">{t("common.goToOrganizations")}</Link>
           </div>
         ) : (
           <form className="form" onSubmit={submit} noValidate>
             <PasswordInput
-              label="Invitation link or secret"
-              toggleLabel="Show invitation"
+              label={t("invitation.inputLabel")}
+              toggleLabel={t("invitation.showInput")}
               value={value}
               onValueChange={(v: string) => {
                 currentAttempt.current += 1;
@@ -130,14 +128,14 @@ export function InvitationPage({
                 setInputError(undefined);
                 resetAccept();
               }}
-              error={inputError}
+              error={inputError && t(inputError)}
               autoFocus
               autoComplete="off"
             />
             {accept.error ? <ErrorNotice error={accept.error} /> : null}
             <div className="actions">
               <Button type="submit" disabled={accept.isPending}>
-                Join organization
+                {t("invitation.join")}
               </Button>
             </div>
           </form>

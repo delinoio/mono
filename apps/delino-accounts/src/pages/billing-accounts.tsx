@@ -21,6 +21,7 @@ import {
 import { checkAccountName } from "../forms.ts";
 import { useAllPages } from "../paging.ts";
 import { labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -36,30 +37,30 @@ export function BillingAccountsPage() {
     (account) => account.billingAccountId,
   );
   const [creating, setCreating] = useState(false);
+  const { t } = useI18n();
   return (
     <Page narrow>
       <PageHeader
-        title="Billing accounts"
-        description="A billing account holds prepaid credit and pays for the organizations that are linked to it."
+        title={t("billingAccounts.title")}
+        description={t("billingAccounts.description")}
         action={
           <Button onClick={() => setCreating(true)}>
-            Create billing account
+            {t("billingAccounts.create")}
           </Button>
         }
       />
       <RefetchNotice error={accounts.refreshError} onRetry={accounts.refetch} />
       {accounts.isPending ? (
-        <Loading label="Loading billing accounts" />
+        <Loading label={t("billingAccounts.loading")} />
       ) : accounts.error ? (
         <ErrorNotice error={accounts.error} onRetry={accounts.refetch} />
       ) : accounts.items.length === 0 ? (
-        <Empty title="No billing accounts yet">
-          Create one to pay for Delino services, or accept an invitation from a
-          billing account owner.
+        <Empty title={t("billingAccounts.empty.title")}>
+          {t("billingAccounts.empty.description")}
         </Empty>
       ) : (
         <>
-          <ul className="list" aria-label="Billing accounts">
+          <ul className="list" aria-label={t("billingAccounts.title")}>
             {accounts.items.map((account) => (
               <li key={account.billingAccountId} className="list-row">
                 <Link
@@ -70,7 +71,7 @@ export function BillingAccountsPage() {
                   className="list-link"
                 >
                   <span className="list-title">{account.name}</span>
-                  <Badge>{labels.role[account.callerRole]}</Badge>
+                  <Badge>{t(labels.role[account.callerRole])}</Badge>
                 </Link>
               </li>
             ))}
@@ -91,6 +92,8 @@ function CreateBillingAccountDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const { navigate } = useRouter();
+  const i18n = useI18n();
+  const { t } = i18n;
   const queryClient = useQueryClient();
   const create = useMutation(BillingAccountService.method.createBillingAccount);
   const [name, setName] = useState("");
@@ -106,11 +109,11 @@ function CreateBillingAccountDialog({
     <FormDialog
       open={open}
       onOpenChange={reset}
-      title="Create a billing account"
-      description="You become its owner. To use it, start the $10/month subscription."
-      submitLabel="Create"
+      title={t("createAccount.title")}
+      description={t("createAccount.description")}
+      submitLabel={t("createAccount.submit")}
       onSubmit={async () => {
-        const checked = checkAccountName(name);
+        const checked = checkAccountName(name, i18n);
         if (!checked.ok) {
           setError(checked.error);
           return formInvalid();
@@ -138,13 +141,13 @@ function CreateBillingAccountDialog({
       }}
     >
       <TextField
-        label="Name"
+        label={t("createAccount.name")}
         value={name}
         onChange={(event) => setName(event.target.value)}
         error={error}
         autoFocus
         autoComplete="off"
-        placeholder="For example, Acme Robotics"
+        placeholder={t("createAccount.namePlaceholder")}
       />
     </FormDialog>
   );

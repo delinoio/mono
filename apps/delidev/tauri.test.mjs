@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { patchCefLinuxDependencies } from "./tauri-debian-cli.mjs";
 
 function fixture(t, platform = process.platform) {
   const workspace = mkdtempSync(join(tmpdir(), "delidev-tauri-test-"));
@@ -93,7 +94,7 @@ console.log(JSON.stringify({ cli: "stock", args }));
   );
   writeFileSync(
     join(root, "tauri-debian-cli.mjs"),
-    'import { fileURLToPath } from "node:url"; export const debianCli = () => fileURLToPath(new URL("./cargo-tauri", import.meta.url));',
+    'import { fileURLToPath } from "node:url"; export const linuxCefCli = () => fileURLToPath(new URL("./cargo-tauri", import.meta.url));',
   );
   writeFileSync(
     join(root, "cargo-tauri"),
@@ -132,30 +133,142 @@ console.log(JSON.stringify({ cli: "stock", args }));
 }
 
 const linuxOnly = { skip: process.platform !== "linux" };
+const unixOnly = { skip: !["darwin", "linux"].includes(process.platform) };
+const embedCef = '{"bundle":{"cef":{"embed":true}}}';
+
+test("changes only the CEF arm of the pinned Linux dependency mapping", () => {
+  const pinned = `    match self {
+      Self::Wry => &[WEBKIT2GTK, GTK],
+      // CEF is shipped with the app
+      Self::Cef | Self::Other => &[GTK],
+    }`;
+  assert.equal(
+    patchCefLinuxDependencies(pinned),
+    `    match self {
+      Self::Wry => &[WEBKIT2GTK, GTK],
+      Self::Cef => &[LinuxDependency {
+        deb_package: "libgtk-4-1",
+        library: "libgtk-4.so.1",
+      }],
+      Self::Other => &[GTK],
+    }`,
+  );
+  for (const source of ["", pinned + pinned]) {
+    assert.throws(
+      () => patchCefLinuxDependencies(source),
+      /Could not locate the pinned CEF Linux dependency mapping/,
+    );
+  }
+});
 
 test(
-  "uses the stock CLI for shared CEF and selections without Debian",
+  "uses the stock CLI for requests outside the Linux backport",
   linuxOnly,
   (t) => {
     const { run } = fixture(t);
-    const embed = '{"bundle":{"cef":{"embed":true}}}';
-    const rpm = '{"bundle":{"targets":["rpm"]}}';
     for (const args of [
-      ["bundle", "--bundles", "deb"],
-      ["bundle", "--config", embed, "--config", rpm],
-      ["bundle", "--config", embed, "--bundles", "rpm"],
-      ["bundle", "--config", embed, "--bundles"],
-      ["build", "--config", embed, "--no-bundle"],
+      ["bundle", "--bundles", "appimage"],
+      ["bundle", "--config", embedCef, "--bundles", "dmg"],
+      ["bundle", "--config", embedCef, "--bundles"],
+      ["build", "--config", embedCef, "--no-bundle"],
+      ["build", "--help", "--bundles", "rpm"],
       ["build", "--config", '{"bundle":{"active":false,"cef":null}}'],
-      ["build", "--target", "aarch64-linux-android", "--bundles", "deb"],
+      ["build", "--target", "aarch64-linux-android", "--bundles", "rpm"],
+      ["bundle", "--target", "x86_64-pc-windows-msvc", "--bundles", "appimage"],
     ]) {
       assert.deepEqual(run(...args), { cli: "stock", args });
     }
   },
 );
 
-const unixOnly = { skip: !["darwin", "linux"].includes(process.platform) };
-const embedCef = '{"bundle":{"cef":{"embed":true}}}';
+test(
+  "uses the backport without staging notices for shared CEF Debian and RPM",
+  linuxOnly,
+  (t) => {
+    const { run, staging } = fixture(t);
+    for (const command of ["build", "bundle"]) {
+      for (const selection of [
+        [], // Selects Debian from the Linux config.
+        ["--bundles", "deb"],
+        ["--bundles", "rpm,appimage"],
+        ["--config", '{"bundle":{"targets":["rpm"]}}'],
+        [
+          "--config",
+          embedCef,
+          "--config",
+          '{"bundle":{"cef":{"embed":false}}}',
+        ],
+      ]) {
+        const args = [command, ...selection];
+        assert.deepEqual(run(...args), { cli: "patched", args });
+        assert.deepEqual(readdirSync(staging), []);
+      }
+    }
+  },
+);
+
+test(
+  "maps staged notices only into the selected embedded Linux bundles",
+  linuxOnly,
+  (t) => {
+    const { run, staging } = fixture(t);
+    const docDir = "usr/share/doc/delidev/cef";
+    for (const command of ["build", "bundle"]) {
+      for (const [selection, formats] of [
+        [["--bundles", "rpm"], ["rpm"]],
+        [["--bundles=appimage"], ["appimage"]],
+        [["-brpm,appimage"], ["rpm", "appimage"]],
+        [
+          ["--bundles", "rpm", "appimage"],
+          ["rpm", "appimage"],
+        ],
+        [["--config", '{"bundle":{"targets":"rpm"}}'], ["rpm"]],
+        [["--config", '{"bundle":{"targets":["appimage"]}}'], ["appimage"]],
+        [
+          ["--config", '{"bundle":{"targets":null}}'],
+          ["deb", "rpm", "appimage"],
+        ],
+      ]) {
+        const args = [command, "--config", embedCef, ...selection];
+        const result = run(...args);
+        assert.equal(result.cli, "patched");
+        const patch = JSON.parse(
+          result.args[result.args.lastIndexOf("--config") + 1],
+        );
+        assert.match(
+          patch.build?.beforeBundleCommand ?? "",
+          /cef-notices\.mjs/,
+        );
+        const linux = patch.bundle.linux;
+        assert.deepEqual(
+          Object.keys(linux),
+          formats.filter((format) => format !== "deb"),
+        );
+        if (formats.includes("deb")) {
+          const deb = JSON.parse(result.args[2]).bundle.linux.deb;
+          assert.deepEqual(deb.files, {
+            [`/${docDir}/LICENSE.txt`]: Object.values(linux.rpm.files)[0],
+            [`/${docDir}/CREDITS.html`]: Object.values(linux.rpm.files)[1],
+          });
+        } else {
+          assert.deepEqual(result.args.slice(0, 3), args.slice(0, 3));
+        }
+        const sources = [];
+        for (const format of Object.keys(linux)) {
+          const dir = format === "rpm" ? `/${docDir}` : docDir;
+          const { files } = linux[format];
+          assert.deepEqual(Object.keys(files), [
+            `${dir}/LICENSE.txt`,
+            `${dir}/CREDITS.html`,
+          ]);
+          sources.push(Object.values(files));
+        }
+        for (const paths of sources) assert.deepEqual(paths, sources[0]);
+        assert.deepEqual(readdirSync(staging), []);
+      }
+    }
+  },
+);
 
 test(
   "selects notice staging for embedded macOS apps and DMGs",
@@ -356,7 +469,7 @@ test(
         "--config",
         rpm,
         "--config",
-        '{"bundle":{"targets":["deb","rpm"]}}',
+        '{"bundle":{"targets":["deb","rpm","appimage"]}}',
       ],
       ["bundle", "--config", embed, "--config", rpm, "-bdeb"],
       [

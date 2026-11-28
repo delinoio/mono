@@ -32,7 +32,7 @@
 - When introducing a workaround, leave sufficient comments that explain why it exists, its scope, and the conditions for removing it.
 - Prefer enum types over strings whenever possible.
 - If you modified Rust code, run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --workspace --locked` from the root directory before finishing your task; CI runs these commands. The root `Cargo.toml` defines the Rust workspace; add every new crate as an explicit member in the same change, as described in `crates/AGENTS.md`.
-- If you modified frontend code, run `pnpm test` from the root directory before finishing your task. In `apps/` and `packages/`, `apps/delino-accounts`, `apps/ownsand`, `apps/sandrun`, `apps/sandcrew`, `packages/delino-ui`, `packages/ownsand-sdk` and `packages/sandrun-sdk` define TypeScript tests. Check `apps/delino-docs`, `apps/delino-site` and `apps/delidev` with their `typecheck` and `build` scripts. CI runs `build`, `lint`, `typecheck` and `test` for every affected workspace package, so also run `pnpm exec turbo run build lint typecheck --filter=<package>` for each changed workspace package, including `protos/delino/*` binding packages, and then remove the generated `dist` directories.
+- If you modified frontend code, run `pnpm test` from the root directory before finishing your task. In `apps/` and `packages/`, `apps/delino-accounts`, `apps/ownsand`, `apps/sandrun`, `apps/sandcrew`, `packages/delino-i18n`, `packages/delino-ui`, `packages/ownsand-sdk` and `packages/sandrun-sdk` define TypeScript tests. Check `apps/delino-docs`, `apps/delino-site` and `apps/delidev` with their `typecheck`, `build` and `test` scripts; every app `test` script runs the offline translation check. CI runs `build`, `lint`, `typecheck` and `test` for every affected workspace package, so also run `pnpm exec turbo run build lint typecheck --filter=<package>` for each changed workspace package, including `protos/delino/*` binding packages, and then remove the generated `dist` directories.
 - Select a workspace package in a Turbo `--filter` by its directory (for example `--filter=./apps/ownsand`) or by the `name` in its `package.json` (`ownsand-console`). Directory and package names differ for `apps/ownsand` (`ownsand-console`), `apps/sandrun` (`sandrun-console`), `apps/sandcrew` (`sandcrew-console`) and the `@delino/<name>-protos` packages.
 - If you modified `scripts/ci/` or `scripts/dev/`, run `pnpm test:tooling` from the root directory before finishing your task.
 - Commit your work as frequent as possible using git. Do NOT use `--no-verify` flag.
@@ -86,6 +86,7 @@
 - `docs/repository-auth-contract.md`: Shared Logto authentication and user identity.
 - `docs/repository-billing-contract.md`: Billing currency and monetary precision.
 - `docs/repository-e2e-contract.md`: Browser end-to-end tests for web apps.
+- `docs/repository-localization-contract.md`: App languages, language selection and the translation workflow.
 - `docs/project-template.md`: Project index template.
 - `docs/domain-template.md`: Domain contract template.
 
@@ -133,13 +134,14 @@
 ## Issue Tracker Contract
 
 - Use the Linear team `DELI` (Mono) at https://linear.app/delinoio/team/DELI/ as the primary issue tracker for all development work, including bugs, features, tasks, chores, investigations and review, QA or analysis follow-ups.
+- When an automated process creates an issue, create it in the Linear team `AI` at https://linear.app/delinoio/team/AI/, not in `DELI`. Automated processes include scheduled tasks, automations, CI jobs, bots and agent workflows that create issues without a human directing each issue.
 - Use GitHub Issues in this repository for customer support only. Do not create GitHub issues for development work.
-- In pull request descriptions, add a standalone `Closes DELI-<number>` line for each fully resolved Linear issue and a standalone `Refs DELI-<number>` line for each partially addressed or related Linear issue. Do not use both for the same issue.
+- In pull request descriptions, add a standalone `Closes <identifier>` line (for example `Closes DELI-<number>` or `Closes AI-<number>`) for each fully resolved Linear issue and a standalone `Refs <identifier>` line for each partially addressed or related Linear issue. Do not use both for the same issue.
 - Follow `docs/repository-issue-tracker-contract.md`.
 
 ## Linear Issue Style Contract
 
-- Apply this contract to all open/new Linear issues in the `DELI` team.
+- Apply this contract to all open/new Linear issues in the `DELI` and `AI` teams.
 - Use issue titles in the format `<domain>: <description>`.
 - `<domain>` must use stable lowercase identifiers from project/domain contracts (for example: `tooling`, `docs`).
 - `<description>` should be concise, specific, and start with a lowercase verb phrase when possible.

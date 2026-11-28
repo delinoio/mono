@@ -28,6 +28,7 @@ import {
 } from "react";
 import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import type { AllPages } from "../paging.ts";
 
 export function PageHeader({
@@ -51,9 +52,14 @@ export function PageHeader({
 }
 
 /** A loading placeholder for a list. */
-export function Loading({ label = "Loading" }: { label?: string }) {
+export function Loading({ label }: { label?: string }) {
+  const { t } = useI18n();
   return (
-    <div className="loading" role="status" aria-label={label}>
+    <div
+      className="loading"
+      role="status"
+      aria-label={label ?? t("common.loading")}
+    >
       <Skeleton height="56px" />
       <Skeleton height="56px" />
       <Skeleton height="56px" />
@@ -80,16 +86,17 @@ export function ErrorNotice({
   onRetry?: () => void;
   onSignIn?: () => Promise<void> | void;
 }) {
+  const i18n = useI18n();
   const unauthenticated =
     error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
-      <p>{errorMessage(error)}</p>
+      <p>{errorMessage(error, i18n)}</p>
       {unauthenticated ? (
         <SignInAgainButton onSignIn={onSignIn} />
       ) : onRetry ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
-          Try again
+          {i18n.t("common.tryAgain")}
         </Button>
       ) : null}
     </div>
@@ -173,6 +180,7 @@ export function InfiniteListNotice({ list }: { list: InfiniteListState }) {
  * stay visible above it.
  */
 export function MorePages({ pages }: { pages: AllPages<unknown> }) {
+  const i18n = useI18n();
   if (pages.continuationError !== undefined) {
     // An ended session cannot recover through a retry, so offer the sign-in
     // action instead, like `ErrorNotice`. The loaded rows stay either way.
@@ -181,7 +189,11 @@ export function MorePages({ pages }: { pages: AllPages<unknown> }) {
       pages.continuationError.code === Code.Unauthenticated;
     return (
       <div className="notice notice-error" role="alert">
-        <p>Some items did not load. {errorMessage(pages.continuationError)}</p>
+        <p>
+          {i18n.t("common.someItemsDidNotLoad", {
+            message: errorMessage(pages.continuationError, i18n),
+          })}
+        </p>
         {unauthenticated ? (
           <SignInAgainButton onSignIn={undefined} />
         ) : (
@@ -189,7 +201,7 @@ export function MorePages({ pages }: { pages: AllPages<unknown> }) {
             variant={ButtonVariant.Secondary}
             onClick={pages.retryContinuation}
           >
-            Try again
+            {i18n.t("common.tryAgain")}
           </Button>
         )}
       </div>
@@ -197,7 +209,7 @@ export function MorePages({ pages }: { pages: AllPages<unknown> }) {
   }
   return pages.isLoadingMore ? (
     <p className="muted" role="status">
-      Loading more
+      {i18n.t("common.loadingMore")}
     </p>
   ) : null;
 }
@@ -212,13 +224,14 @@ function SignInAgainButton({
   onSignIn: (() => Promise<void> | void) | undefined;
 }) {
   const auth = useAuth();
+  const { t } = useI18n();
   return (
     <>
       <Button
         variant={ButtonVariant.Secondary}
         onClick={() => void (onSignIn ? onSignIn() : auth.signIn())}
       >
-        Sign in with Delino
+        {t("auth.signInWithDelino")}
       </Button>
       <SignInFailureNotice />
     </>
@@ -233,11 +246,8 @@ function SignInAgainButton({
  */
 export function SignInFailureNotice() {
   const auth = useAuth();
-  return auth.signInFailed ? (
-    <p role="alert">
-      Sign-in did not start. Check your connection and try again.
-    </p>
-  ) : null;
+  const { t } = useI18n();
+  return auth.signInFailed ? <p role="alert">{t("auth.didNotStart")}</p> : null;
 }
 
 export function Empty({
@@ -332,6 +342,7 @@ export function ConfirmDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const { error, pending, clearError, submit } = useDialogSubmission(open);
+  const { t } = useI18n();
   return (
     <AlertDialog
       open={open}
@@ -345,7 +356,7 @@ export function ConfirmDialog({
         <AlertDialogDescription>{description}</AlertDialogDescription>
         {error !== undefined ? <ErrorNotice error={error} /> : null}
         <AlertDialogActions>
-          <AlertDialogClose>Cancel</AlertDialogClose>
+          <AlertDialogClose>{t("common.cancel")}</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
             disabled={pending}
@@ -409,6 +420,7 @@ export function FormDialog({
   children: ReactNode;
 }) {
   const { error, pending, clearError, submit } = useDialogSubmission(open);
+  const { t } = useI18n();
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
     return submit(onSubmit, (submission) => {
@@ -434,7 +446,7 @@ export function FormDialog({
           {children}
           {error !== undefined ? <ErrorNotice error={error} /> : null}
           <DialogActions>
-            <DialogClose>Cancel</DialogClose>
+            <DialogClose>{t("common.cancel")}</DialogClose>
             <Button type="submit" disabled={pending}>
               {submitLabel}
             </Button>

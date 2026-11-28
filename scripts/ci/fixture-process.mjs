@@ -1,61 +1,194 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Starts a fixture subprocess in its own process group and stops the whole
-// group when the test ends. POSIX only: the callers skip on Windows.
-import { spawn } from "node:child_process";
+// POSIX fixture commands run in a group owned by a dedicated Node process.
+import { fork, spawn } from "node:child_process";
+import { closeSync } from "node:fs";
+import { finished } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 
-// Sends SIGKILL to the process group of `child`. A group that already exited
-// is normal teardown (ESRCH); any other error is a real failure.
-export function killProcessGroup(child) {
-  // No pid means the spawn failed and no process exists.
-  if (child.pid === undefined) return;
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch (error) {
-    if (error?.code !== "ESRCH") throw error;
-  }
+function ownProcessGroup() {
+  let command;
+  const report = (message) => {
+    if (process.connected) process.send(message, () => {});
+  };
+  const stop = () => process.kill(0, "SIGKILL");
+
+  // A terminal-style signal must reach the command and its descendants while
+  // the owner stays in the group to handle teardown.
+  for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"])
+    process.on(signal, () => {});
+
+  process.once("disconnect", stop);
+  process.on("message", (message) => {
+    switch (message.type) {
+      case "start": {
+        const reportError = (error) =>
+          report({
+            type: "commandError",
+            message: error.message,
+            details: { ...error },
+          });
+        try {
+          command = spawn(message.command, message.args, {
+            ...message.options,
+            stdio: "inherit",
+          });
+          command.once("spawn", () =>
+            report({ type: "started", pid: command.pid }),
+          );
+          command.once("error", reportError);
+          command.once("exit", (status, signal) =>
+            report({ type: "commandExit", status, signal }),
+          );
+        } catch (error) {
+          reportError(error);
+        } finally {
+          // Only the command and its descendants should hold the fixture
+          // pipes open. They inherited the descriptors before we close ours.
+          for (const fd of [0, 1, 2]) closeSync(fd);
+        }
+        break;
+      }
+      case "signalCommand":
+        command?.kill(message.signal);
+        break;
+      case "signalGroup":
+        process.kill(0, message.signal);
+        break;
+      case "stop":
+        // Report the stop before SIGKILL removes the owner too.
+        process.send({ type: "stopping" }, stop);
+        break;
+    }
+  });
 }
 
-// Spawns `command` with piped stdio in a new process group (detached) and
-// returns the child plus `done`, which resolves with the exit status and the
-// captured output once the child exited and its streams closed. `t.after`
-// kills the group and waits for `done`.
-//
-// Killing only the child is not enough: a command substitution or pipeline
-// that the child started (for example a stubbed `curl` that blocks until a
-// file appears) keeps the stdout and stderr pipes open after the child died.
-// `close` never fires then and `node --test` cannot exit after a failing
-// test. Killing the group closes the pipes. The group id equals the child pid
-// only because `detached: true` makes the child a group leader.
-export function spawnProcessGroup(t, command, args, options = {}) {
-  const child = spawn(command, args, {
-    ...options,
-    stdio: ["pipe", "pipe", "pipe"],
+async function capture(stream) {
+  const decoder = new StringDecoder("utf8");
+  let output = "";
+  stream.on("data", (chunk) => (output += decoder.write(chunk)));
+  await finished(stream, { cleanup: true });
+  return output + decoder.end();
+}
+
+// The command PID and direct signal target belong to the command. Group
+// signals go through the owner, including after the command has exited.
+export function startProcessGroup(command, args, { cwd, env } = {}) {
+  const owner = fork(fileURLToPath(import.meta.url), [], {
     detached: true,
+    execArgv: [],
+    stdio: ["pipe", "pipe", "pipe", "ipc"],
   });
-  const stdoutDecoder = new StringDecoder("utf8");
-  const stderrDecoder = new StringDecoder("utf8");
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => (stdout += stdoutDecoder.write(chunk)));
-  child.stderr.on("data", (chunk) => (stderr += stderrDecoder.write(chunk)));
-  const done = new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", (status) =>
-      resolve({
-        status,
-        stdout: stdout + stdoutDecoder.end(),
-        stderr: stderr + stderrDecoder.end(),
-      }),
-    );
-  });
-  // An unawaited `done` must not turn a spawn error into an unhandled
-  // rejection after the test has already failed.
+  const send = (message) => {
+    if (owner.connected) owner.send(message, () => {});
+  };
+  const child = {
+    pid: undefined,
+    exitCode: null,
+    signalCode: null,
+    stdin: owner.stdin,
+    stdout: owner.stdout,
+    stderr: owner.stderr,
+    kill: (signal = "SIGTERM") => send({ type: "signalCommand", signal }),
+  };
+  const commandExit = Promise.withResolvers();
+  const ownerClose = Promise.withResolvers();
+  const ownerFailure = Promise.withResolvers();
+  let stopping = false;
+  let ownerError;
+
+  function recordExit(status, signal) {
+    child.exitCode = status;
+    child.signalCode = signal;
+    commandExit.resolve(status);
+  }
+
+  function loseOwner(error) {
+    if (ownerError) return;
+    ownerError = error;
+    ownerFailure.reject(error);
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
+
+  const commandDone = Promise.all([
+    commandExit.promise,
+    capture(child.stdout),
+    capture(child.stderr),
+  ]).then(([status, stdout, stderr]) => ({ status, stdout, stderr }));
+  const done = Promise.race([commandDone, ownerFailure.promise]);
+  // A caller can fail before it reaches its await of done.
   done.catch(() => {});
-  t.after(async () => {
-    killProcessGroup(child);
-    await done;
+  child.stdin.on("error", (error) => {
+    if (error.code !== "EPIPE" && error.code !== "ECONNRESET")
+      commandExit.reject(error);
   });
-  return { child, done };
+
+  let commandExited = false;
+  owner.on("message", (message) => {
+    switch (message.type) {
+      case "started":
+        child.pid = message.pid;
+        break;
+      case "commandError":
+        commandExit.reject(
+          Object.assign(new Error(message.message), message.details),
+        );
+        break;
+      case "commandExit":
+        commandExited = true;
+        recordExit(message.status, message.signal);
+        break;
+      case "stopping":
+        stopping = true;
+        break;
+    }
+  });
+  owner.once("error", loseOwner);
+  owner.once("disconnect", () => {
+    // The owner can disappear while a descendant still holds a pipe.
+    if (!stopping) loseOwner(new Error("Fixture process owner disconnected"));
+  });
+  owner.once("close", (status, signal) => {
+    if (stopping && signal === "SIGKILL") {
+      if (!commandExited) recordExit(null, signal);
+    } else if (!ownerError) {
+      loseOwner(
+        new Error(`Fixture process owner exited with ${signal ?? status}`),
+      );
+    }
+    ownerClose.resolve();
+  });
+
+  send({
+    type: "start",
+    command,
+    args,
+    options: { cwd: cwd instanceof URL ? fileURLToPath(cwd) : cwd, env },
+  });
+
+  let reaping;
+  const reap = () =>
+    (reaping ??= (async () => {
+      send({ type: "stop" });
+      await ownerClose.promise;
+      if (ownerError) throw ownerError;
+      return done;
+    })());
+  return {
+    child,
+    done,
+    reap,
+    signalGroup: (signal) => send({ type: "signalGroup", signal }),
+  };
 }
+
+export function spawnProcessGroup(t, command, args, options) {
+  const run = startProcessGroup(command, args, options);
+  t.after(run.reap);
+  return run;
+}
+
+if (import.meta.main && process.send) ownProcessGroup();

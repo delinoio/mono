@@ -1,0 +1,34 @@
+{
+  "name": "delino-i18n",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "delino-i18n": "./cli/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/runtime.ts",
+    "./react": "./src/react.tsx"
+  },
+  "scripts": {
+    "test": "rstest run && node --test cli/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jose": "6.2.12",
+    "js-yaml": "4.3.2"
+  },
+  "peerDependencies": {
+    "react": "^19.3.0"
+  },
+  "devDependencies": {
+    "@rstest/core": "0.12.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "happy-dom": "21.0.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3"
+  }
+}

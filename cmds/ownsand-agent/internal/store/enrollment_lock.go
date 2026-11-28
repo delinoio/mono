@@ -33,6 +33,15 @@ const (
 	enrollmentShared
 )
 
+type enrollmentLockBusyObserverKey struct{}
+
+// WithEnrollmentLockBusyObserver attaches a test observer to a lock acquisition.
+// The observer runs once when the acquisition first finds the file lock busy.
+// It runs inline and must return promptly.
+func WithEnrollmentLockBusyObserver(ctx context.Context, observe func()) context.Context {
+	return context.WithValue(ctx, enrollmentLockBusyObserverKey{}, observe)
+}
+
 // LockEnrollment takes the exclusive enrollment lock of the state directory
 // and returns the function that releases it. The lock is an advisory file
 // lock (flock, or LockFileEx on Windows), so it excludes other Store values
@@ -94,6 +103,7 @@ func acquireEnrollmentLock(ctx context.Context, dir string, mode enrollmentLockA
 }
 
 func waitEnrollmentLock(ctx context.Context, f *os.File, mode enrollmentLockAccess, tryLock func(*os.File, enrollmentLockAccess) (bool, error)) error {
+	observeBusy, _ := ctx.Value(enrollmentLockBusyObserverKey{}).(func())
 	for {
 		if err := enrollmentWaitError(ctx); err != nil {
 			return err
@@ -108,6 +118,10 @@ func waitEnrollmentLock(ctx context.Context, f *os.File, mode enrollmentLockAcce
 				return err
 			}
 			return nil
+		}
+		if observeBusy != nil {
+			observeBusy()
+			observeBusy = nil
 		}
 		if mode == enrollmentShared {
 			return ErrEnrollmentBusy
