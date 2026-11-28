@@ -11,7 +11,9 @@ import (
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -89,13 +91,9 @@ func exportFailTiming(budget, backoff time.Duration) testenv.Option {
 	}
 }
 
-// failedExportSend sets up a device with a ready snapshot, saturates the
-// agent channel and calls ExportSnapshot; it cancels the request once the
-// EXPORTING claim is committed, so the command send fails before enqueue
-// while the channel is still open. It returns after the RPC failed; the
-// failure compensation of the handler may still run (it does not depend on
-// the request context).
-func failedExportSend(t *testing.T, env *testenv.Env) (org *testenv.Org, snapID string, agent *testenv.FakeAgent, conn *hub.Conn) {
+// prepareSaturatedExport creates a ready snapshot and saturates its agent
+// channel so the export command cannot enqueue.
+func prepareSaturatedExport(t *testing.T, env *testenv.Env) (org *testenv.Org, snapID string, agent *testenv.FakeAgent, conn *hub.Conn) {
 	t.Helper()
 	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	ctx := context.Background()
@@ -115,7 +113,6 @@ func failedExportSend(t *testing.T, env *testenv.Env) (org *testenv.Org, snapID 
 	}
 
 	saturate(t, env, agent)
-	exportFailsAfterClaim(t, c, org.ID, snapID)
 	return org, snapID, agent, live
 }
 
@@ -146,8 +143,9 @@ func TestExportFailUpdateRetriesTransientError(t *testing.T) {
 	env := testenv.New(t, exportFailTiming(10*time.Second, 20*time.Millisecond))
 	fault := newExportFailFault(t, env)
 	fault.on("40001", 2) // serialization_failure for the first two calls
-	org, snapID, agent, conn := failedExportSend(t, env)
+	org, snapID, agent, conn := prepareSaturatedExport(t, env)
 	c := org.OwnerClient
+	exportFailsAfterClaim(t, c, org.ID, snapID)
 
 	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
 	waitLog(t, env, `"reason":"send_failed"`)
@@ -199,8 +197,20 @@ func TestExportFailUpdateUnresolvedClosesChannel(t *testing.T) {
 			env := testenv.New(t, exportFailTiming(tc.budget, 20*time.Millisecond))
 			fault := newExportFailFault(t, env)
 			fault.on(tc.code, 1<<30)
-			org, snapID, agent, conn := failedExportSend(t, env)
+			org, snapID, agent, conn := prepareSaturatedExport(t, env)
 			c := org.OwnerClient
+
+			// The HTTP client can return cancellation while compensation is
+			// still running. Call the handler to observe its final status.
+			handler := api.SnapshotHandler{Service: env.App.Service}
+			err := exportErrorAfterClaim(t, c, org.ID, snapID, func(ctx context.Context) error {
+				ctx = auth.WithPrincipal(ctx, auth.Principal{Kind: ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER, ID: org.Owner})
+				_, err := handler.ExportSnapshot(ctx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID}))
+				return err
+			})
+			if got := connect.CodeOf(err); got != connect.CodeUnavailable {
+				t.Fatalf("ExportSnapshot returned code %v, want %v: %v", got, connect.CodeUnavailable, err)
+			}
 
 			waitConnClosed(t, conn)
 			waitLog(t, env, `"msg":"export_fail_transition_failed"`)
