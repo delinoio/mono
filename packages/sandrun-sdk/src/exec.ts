@@ -287,22 +287,17 @@ export async function* execDevSession(
         if (abortedBy(signal)) {
           return;
         }
-        if (
-          message.event === undefined ||
-          message.event.event.case === "keepalive"
-        ) {
+        const event = message.event?.event;
+        if (event?.case === undefined || event.case === "keepalive") {
           continue;
         }
-        const event = message.event.event;
         anyEvent = true;
         const wasStarted: boolean = started;
         const previousStdoutOffset = stdoutOffset;
         const previousStderrOffset = stderrOffset;
         yield* handle(event);
-        // Keep the existing retry behavior for unknown events and terminal cleanup errors.
         progressed ||=
           terminalDelivered ||
-          event.case === undefined ||
           started !== wasStarted ||
           stdoutOffset !== previousStdoutOffset ||
           stderrOffset !== previousStderrOffset;
