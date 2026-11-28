@@ -36,6 +36,7 @@ import {
 } from "../format.ts";
 import { useI18n } from "../i18n.ts";
 import { can, Permission } from "../roles.ts";
+import { useQueueWaitClock } from "../use-queue-wait-clock.ts";
 
 const ALL = "all";
 
@@ -109,7 +110,7 @@ export function RequestsPage() {
     onSuccess: () => invalidateServices(queryClient, WorkService),
   });
   const admin = can(role, Permission.CancelRequests);
-  const now = Date.now();
+  const now = useQueueWaitClock();
 
   return (
     <>

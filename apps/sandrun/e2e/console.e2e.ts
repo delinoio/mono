@@ -1020,6 +1020,16 @@ describe("requests", () => {
       .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
     await expect(queuedJob.getByRole("button", "Cancel")).toBeVisible();
     await expect(endedRequest).toBeVisible();
+    const runningJob = table.getByRole("row").filter({
+      hasText: "acme-robotics/firmware · build (ubuntu)",
+    });
+    const endedJob = table.getByRole("row").filter({ has: endedRequest });
+    await expect(
+      runningJob.getByRole("cell", "1 min", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      endedJob.getByRole("cell", "3 min", { exact: true }),
+    ).toBeVisible();
     const sources = await browser.evaluate(() =>
       Array.from(
         document.querySelectorAll(
