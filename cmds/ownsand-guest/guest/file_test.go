@@ -414,14 +414,21 @@ func TestReadRetention(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
 	path := filepath.Join(t.TempDir(), "f")
-	os.WriteFile(path, []byte("x"), 0o644)
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	req := readReq(t, path)
-	h.readAll(req)
+	if data, size, errd := h.readAll(req); errd != nil || string(data) != "x" || size != 1 {
+		t.Fatalf("initial read: data %q, size %d, error %v", data, size, errd)
+	}
 	h.waitReadCallsEnded(req.GetReadId())
+	if err := os.WriteFile(path, []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	h.clock.Advance(14 * time.Minute)
 	h.srv.Sweep()
-	if data, _, errd := h.readAll(req); errd != nil || string(data) != "x" {
-		t.Fatalf("read within 15 minutes: %v", errd)
+	if data, size, errd := h.readAll(req); errd != nil || string(data) != "x" || size != 1 {
+		t.Fatalf("read within 15 minutes: data %q, size %d, error %v", data, size, errd)
 	}
 	h.waitReadCallsEnded(req.GetReadId())
 	h.clock.Advance(15 * time.Minute)
@@ -429,9 +436,8 @@ func TestReadRetention(t *testing.T) {
 	if _, _, errd := h.readAll(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
 		t.Fatalf("read after expiry: %v", errd)
 	}
-	entries, _ := os.ReadDir(h.srv.reads.dir)
-	if len(entries) != 0 {
-		t.Fatalf("snapshot files left: %d", len(entries))
+	if names := snapshotFiles(t, h.srv.reads); len(names) != 0 {
+		t.Fatalf("snapshot files left: %v", names)
 	}
 }
 
