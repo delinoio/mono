@@ -3355,6 +3355,7 @@ function nonUtf8CheckoutFixture(
   f.git("add", "--", "staged.ts");
   const directory = realpathSync(f.parent);
   const raw = latin1Name("");
+  const rawCwd = entryPath(directory, raw);
   if (tryRawEntry(directory, raw, (path) => rename(f.cwd, path)) === null)
     return null;
   const checkoutArgs = (command, args) => [
@@ -3369,10 +3370,7 @@ function nonUtf8CheckoutFixture(
     checkoutArgs("git", ["rev-parse", "--show-toplevel"]),
     { cwd: f.parent, env: f.env },
   );
-  const expected = Buffer.concat([
-    entryPath(directory, raw),
-    Buffer.from("\n"),
-  ]);
+  const expected = Buffer.concat([rawCwd, Buffer.from("\n")]);
   if (!reported.equals(expected)) return null;
   const inCheckout = (command, args, extraEnv = {}) =>
     spawnSync("/bin/sh", checkoutArgs(command, args), {
@@ -3380,7 +3378,7 @@ function nonUtf8CheckoutFixture(
       env: { ...f.env, ...extraEnv },
       encoding: "utf8",
     });
-  return { ...f, inCheckout };
+  return { ...f, rawCwd, inCheckout };
 }
 
 test("every CLI mode reports a non-UTF-8 checkout path accurately", (t) => {
@@ -3415,11 +3413,66 @@ test("every CLI mode reports a non-UTF-8 checkout path accurately", (t) => {
   );
 });
 
+test("the CLI rejects a non-UTF-8 checkout path even when its decoded sibling exists", (t) => {
+  const f = nonUtf8CheckoutFixture(t);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  // The symlink lets Node enter the exact directory through a valid cwd string.
+  const rawCwdAlias = join(f.parent, "raw-checkout");
+  symlinkSync(f.rawCwd, rawCwdAlias, "dir");
+  const sibling = join(f.parent, "caf\ufffd");
+  execFileSync("git", ["clone", "--quiet", ".", sibling], {
+    cwd: rawCwdAlias,
+    env: f.env,
+  });
+  symlinkSync(join(root, "node_modules"), join(sibling, "node_modules"), "dir");
+  const siblingFile = join(sibling, "other.ts");
+  writeFileSync(siblingFile, "const   other = 2;\n");
+  execFileSync("git", ["add", "--", "other.ts"], { cwd: sibling, env: f.env });
+
+  const files = [
+    Buffer.concat([f.rawCwd, Buffer.from("/staged.ts")]),
+    Buffer.concat([f.rawCwd, Buffer.from("/.git/index")]),
+    siblingFile,
+    join(sibling, ".git/index"),
+  ];
+  const snapshot = () => files.map((path) => readFileSync(path));
+  const before = snapshot();
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = (cwd, args) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+  for (const args of [
+    ["--staged"],
+    ["--staged", "--write"],
+    ["--all"],
+    ["--all", "--write"],
+  ]) {
+    const result = run(rawCwdAlias, args);
+    const label = `${args.join(" ")}\n${result.stdout}${result.stderr}`;
+    assert.equal(result.status, 2, label);
+    assert.equal(result.stdout, "", label);
+    const record = JSON.parse(result.stderr);
+    assert.equal(record.event, "ci_format_error", label);
+    assert.match(record.message, /caf\\xe9/u, label);
+    assert.match(record.message, /Move or rename the checkout/u, label);
+    assert.deepEqual(snapshot(), before, label);
+  }
+
+  const result = run(sibling, ["--staged"]);
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /"candidates":1/u);
+  assert.match(result.stderr, /other\.ts/u);
+  assert.deepEqual(snapshot(), before);
+});
+
 test("a non-UTF-8 checkout path raises NonUtf8RootError from the selectors", (t) => {
   const f = nonUtf8CheckoutFixture(t);
   if (f === null) return t.skip(unsupportedFileSystem);
   // The selector module runs in the checkout so its `process.cwd()` is the
-  // lossy form of the raw path, as it is for the CLI.
+  // lossy form of the raw path. Test the explicit start path API.
   const probe = `
     import { allFormatFiles } from ${JSON.stringify(
       new URL("./format-changed.mjs", import.meta.url).href,
