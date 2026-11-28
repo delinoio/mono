@@ -5,14 +5,10 @@
 # `quality` job, so that a change that would stop every deployment fails in
 # its own pull request:
 # - `deploy-plan.mjs --check` applies the deploy planner's rules that need no
-#   release: changeset file names and the `deploy` manifest fields;
-# - `changeset version` rejects a changeset for an unknown package or one that
-#   mixes the ignored `delidev` with other packages. It rewrites files, so run
-#   this only in a throwaway checkout.
-#
-# Without a pending changeset there is nothing to validate; `changeset
-# version` would exit 1 ("No unreleased changesets found"), and most pull
-# requests need no changeset.
+#   release: changeset file names and the `deploy` manifest fields.
+# - With pending changesets, the deploy planner checks the proposed releases
+#   before `changeset version` exercises versioning. Versioning rewrites files,
+#   so run this only in a throwaway checkout.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -41,4 +37,18 @@ if (( ${#pending[@]} == 0 )); then
 fi
 
 echo "Validating ${#pending[@]} pending changeset(s): ${pending[*]}"
+
+# Changesets CLI 3.0.3 resolves its configured base branch even when reading
+# all pending changesets. A detached CI checkout may have only origin/main.
+# Create the missing local branch at HEAD. Passing --since would limit the
+# plan to changed files and miss changesets already committed on the base.
+base_branch="$(node --print 'require("./.changeset/config.json").baseBranch ?? "main"')"
+if ! git show-ref --verify --quiet "refs/heads/$base_branch"; then
+  git branch -- "$base_branch" HEAD
+fi
+
+status_file="$(mktemp -t changeset-status.XXXXXXXX)"
+trap 'rm -f -- "$status_file"' EXIT
+pnpm exec changeset status --output "$status_file"
+env -u GITHUB_OUTPUT -u GITHUB_STEP_SUMMARY node "$here/deploy-plan.mjs" "$status_file"
 pnpm exec changeset version

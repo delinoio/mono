@@ -298,6 +298,42 @@ func newLogtoRejectionClient(t *testing.T, acceptProfile func(*http.Request) boo
 	}), trace
 }
 
+// TestLogtoUserSelfHostedResource checks that a configured resource indicator
+// replaces `<Endpoint>/api` in the token request, as a self-hosted Logto needs,
+// while the token and profile requests still go to the endpoint.
+func TestLogtoUserSelfHostedResource(t *testing.T) {
+	const resource = "https://default.logto.app/api"
+	var gotResource atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/oidc/token":
+			_ = r.ParseForm()
+			gotResource.Store(r.Form.Get("resource"))
+			if r.Form.Get("resource") != resource || r.Form.Get("scope") != "all" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok", "expires_in": 3600})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/users/u1" && r.Header.Get("Authorization") == "Bearer tok":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "u1", "primaryEmail": "a@example.com", "name": "Ann"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	l := directory.NewLogto(directory.LogtoConfig{
+		Endpoint: srv.URL, Resource: resource, ClientID: "m2m", ClientSecret: "s3cret",
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+	user, err := l.User(context.Background(), "u1")
+	if err != nil {
+		t.Fatalf("User(u1) error = %v (token resource %v)", err, gotResource.Load())
+	}
+	if user.PrimaryEmail != "a@example.com" || user.Name != "Ann" {
+		t.Fatalf("User(u1) = %+v", user)
+	}
+}
+
 func TestLogtoTokenFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

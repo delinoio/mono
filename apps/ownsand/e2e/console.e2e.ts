@@ -17,7 +17,12 @@ const ACME_INVITATION_SECRET = "osi_7f3a_unused";
 
 type ResourceWrite = {
   resources?: { vcpuCount: number; memoryMib: string; diskGib: string };
-  limits?: { vcpuCount: number };
+  limits?: {
+    vcpuCount: number;
+    memoryMib: string;
+    diskGib: string;
+    vcpuOvercommitPercent: number;
+  };
 };
 
 function trackResourceMutation(
@@ -484,6 +489,56 @@ describe("devices", () => {
     expect(writes[0]?.limits?.vcpuCount).toBe(0);
     await expect(input).toHaveValue("0");
   });
+
+  for (const submit of ["Enter", "Save limits"] as const) {
+    test(`rejects a typed negative device vCPU limit on ${submit}`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+
+      const input = screen.getByLabel("vCPU limit");
+      const save = screen.getByRole("button", "Save limits");
+      const notifications = screen.getByRole("region", "Notifications");
+      const message = "vCPU limit must be a whole number from 0 to 2147483647.";
+      await expect(input).toHaveValue("16");
+      await trackResourceMutation(browser, "ReplaceDeviceLimits");
+      await input.fill("");
+      await browser.keyboard.type("-1");
+      if (submit === "Enter") {
+        await browser.keyboard.press("Enter");
+      } else {
+        await browser.keyboard.press("Tab");
+        await save.tap();
+      }
+      await expect(input).toHaveValue("-1");
+      await expect(input).toHaveAttribute("aria-invalid", "true");
+      await expect(notifications.getByText(message)).toBeVisible();
+      await expect(screen.getByText(message)).toHaveCount(2);
+      expect(await resourceWrites(browser)).toHaveLength(0);
+
+      await input.fill("-2");
+      await expect(input).toHaveValue("-2");
+      await expect(input).not.toHaveAttribute("aria-invalid", "true");
+      await input.fill("0");
+      await save.tap();
+      await expect(
+        notifications.getByText("The device limits are saved."),
+      ).toBeVisible();
+      await expect(input).toHaveValue("0");
+      const writes = await resourceWrites(browser);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.limits).toEqual({
+        vcpuCount: 0,
+        memoryMib: "65536",
+        diskGib: "500",
+        vcpuOvercommitPercent: 150,
+      });
+    });
+  }
 
   test("shows saved device limits when returning to the device page", async ({
     app,

@@ -172,7 +172,7 @@ func describeError(err error) string {
 }
 
 func (a *app) errorf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := safeText(fmt.Sprintf(format, args...))
 	if a.color {
 		fmt.Fprintf(a.env.Stderr, "%serror:%s %s\n", ansiRed, ansiReset, msg)
 		return
@@ -181,7 +181,7 @@ func (a *app) errorf(format string, args ...any) {
 }
 
 func (a *app) warnf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := safeText(fmt.Sprintf(format, args...))
 	if a.color {
 		fmt.Fprintf(a.env.Stderr, "%swarning:%s %s\n", ansiYellow, ansiReset, msg)
 		return

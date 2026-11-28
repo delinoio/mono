@@ -17,7 +17,7 @@ import { TEST_SETUP_MS, renderConsole } from "./test-support.tsx";
 /** The longest wait for one condition; a loaded CI runner needs more than one second. */
 const WAIT = { timeout: 10_000 };
 
-const OUT_OF_RANGE_VALUES = ["2147483648", "99999999999"];
+const OUT_OF_RANGE_VALUES = ["-1", "2147483648", "99999999999"];
 const VCPU_ERROR = "vCPU limit must be a whole number from 0 to 2147483647.";
 
 beforeEach(() => {
@@ -133,7 +133,12 @@ describe("device vCPU limit", () => {
       await commit("0");
       await save();
       await waitFor(() => expect(replaced).toHaveLength(2), WAIT);
-      expect(replaced[1]?.vcpuCount).toBe(0);
+      expect(replaced[1]).toMatchObject({
+        vcpuCount: 0,
+        memoryMib: 65536n,
+        diskGib: 500n,
+        vcpuOvercommitPercent: 150,
+      });
     },
     4 * WAIT.timeout + TEST_SETUP_MS,
   );

@@ -378,7 +378,7 @@ func unlinkWorld(t *testing.T, queuedJobs bool) (*ghWorld, string, *sandrunv1.Ru
 	eventually(t, "two registered idle runners", func() bool { return len(w.runnersIn(t, waiting)) == 2 })
 	runners := w.runnersIn(t, waiting)
 	var firstID string
-	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT runner_id FROM runners ORDER BY create_time DESC, runner_id DESC LIMIT 1").Scan(&firstID); err != nil {
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT runner_id FROM runners ORDER BY runner_id LIMIT 1").Scan(&firstID); err != nil {
 		t.Fatal(err)
 	}
 	if runners[0].GetRunnerId() != firstID {

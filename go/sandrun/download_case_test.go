@@ -40,6 +40,83 @@ func TestDownloadDestinationCaseCollision(t *testing.T) {
 	}
 }
 
+func TestDownloadDestinationNormalizationCollision(t *testing.T) {
+	const nfc, nfd = "caf\u00e9", "cafe\u0301"
+	parent := t.TempDir()
+	probe := filepath.Join(parent, "probe")
+	if err := os.Mkdir(probe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(probe, nfc), []byte("probe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(probe, nfd))
+	aliases := err == nil
+	if aliases && string(body) != "probe" || !aliases && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("filesystem normalization probe = %q, %v", body, err)
+	}
+	t.Logf("the staging volume aliases %+q and %+q: %t", nfc, nfd, aliases)
+
+	for _, tc := range []struct {
+		name              string
+		paths, diagnostic [2]string
+	}{
+		{name: "leaf", paths: [2]string{nfc + ".txt", nfd + ".txt"}},
+		{name: "parent", paths: [2]string{nfc + "/out.txt", nfd + "/out.txt"}},
+		{
+			name:       "parent-only",
+			paths:      [2]string{nfc + "/left.txt", nfd + "/right.txt"},
+			diagnostic: [2]string{nfc, nfd},
+		},
+	} {
+		for _, order := range [][2]int{{0, 1}, {1, 0}} {
+			for _, existing := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/first=%d/existing=%t", tc.name, order[0], existing), func(t *testing.T) {
+					var archive bytes.Buffer
+					tw := tar.NewWriter(&archive)
+					bodies := [2]string{"first", "second"}
+					for _, i := range order {
+						if err := tw.WriteHeader(&tar.Header{
+							Name: tc.paths[i], Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(bodies[i])),
+						}); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := io.WriteString(tw, bodies[i]); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := tw.Close(); err != nil {
+						t.Fatal(err)
+					}
+					dest, result, err := downloadCollisionFixture(t, t.TempDir(), existing, archive.Bytes())
+					if aliases {
+						names := tc.diagnostic
+						if names[0] == "" {
+							names = tc.paths
+						}
+						checkArchiveCollision(t, dest, result, err, existing, names[order[0]], names[order[1]])
+						return
+					}
+					if err != nil || result == nil || !result.Directory || result.Files != 2 || result.Bytes != 11 {
+						t.Fatalf("normalization-distinct download = %+v, %v", result, err)
+					}
+					if tc.name == "leaf" {
+						checkDownloadedFiles(t, dest, []string{tc.paths[1], tc.paths[0]}, []string{bodies[1], bodies[0]})
+						return
+					}
+					dirs, err := os.ReadDir(dest)
+					if err != nil || len(dirs) != 2 || dirs[0].Name() != nfd || dirs[1].Name() != nfc {
+						t.Fatalf("downloaded directories = %v, %v, want %+q and %+q", dirs, err, nfd, nfc)
+					}
+					for i, name := range tc.paths {
+						checkDownloadedFiles(t, filepath.Join(dest, filepath.Dir(name)), []string{filepath.Base(name)}, []string{bodies[i]})
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestDownloadDestinationHardLinkCaseCollision(t *testing.T) {
 	const anchor, first, second = "anchor.txt", "Report.txt", "report.txt"
 	parent := t.TempDir()
@@ -270,22 +347,35 @@ func TestDownloadArchiveMixedCaseCollision(t *testing.T) {
 }
 
 func TestDownloadArchiveMixedParentAliasCollision(t *testing.T) {
-	parent := t.TempDir()
-	if !caseSensitiveDir(t, parent) {
-		t.Skip("this fixture uses a separate case-variant parent symlink")
-	}
-	if err := os.Symlink(".", filepath.Join(parent, "probe-link")); err != nil {
-		t.Skipf("this destination does not support symbolic links: %v", err)
-	}
-	dir := &tar.Header{Name: "folder/", Typeflag: tar.TypeDir, Mode: 0o755}
-	parentLink := &tar.Header{Name: "Folder", Typeflag: tar.TypeSymlink, Linkname: "folder"}
-	anchor := &tar.Header{Name: "folder/anchor.txt", Typeflag: tar.TypeReg, Size: 1, Mode: 0o644}
-	file := &tar.Header{Name: "folder/report.txt", Typeflag: tar.TypeReg, Size: 2, Mode: 0o644}
-	link := &tar.Header{Name: "Folder/report.txt", Typeflag: tar.TypeSymlink, Linkname: "anchor.txt"}
-	for _, order := range [][]*tar.Header{{file, link}, {link, file}} {
-		t.Run(order[0].Name, func(t *testing.T) {
-			dest, result, err := downloadCaseArchive(t, t.TempDir(), true, dir, parentLink, anchor, order[0], order[1])
-			checkArchiveCollision(t, dest, result, err, true, order[0].Name, order[1].Name)
+	for _, test := range []struct{ name, dir, parentLink string }{
+		{"case", "folder", "Folder"},
+		{"normalization", "caf\u00e9", "cafe\u0301"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			probe := t.TempDir()
+			if err := os.Mkdir(filepath.Join(probe, test.dir), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(filepath.Join(probe, test.parentLink)); err == nil {
+				t.Skip("this fixture uses a separately named parent symlink")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(test.dir, filepath.Join(probe, test.parentLink)); err != nil {
+				t.Skipf("this destination does not support symbolic links: %v", err)
+			}
+
+			dir := &tar.Header{Name: test.dir + "/", Typeflag: tar.TypeDir, Mode: 0o755}
+			parentLink := &tar.Header{Name: test.parentLink, Typeflag: tar.TypeSymlink, Linkname: test.dir}
+			anchor := &tar.Header{Name: test.dir + "/anchor.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1}
+			file := &tar.Header{Name: test.dir + "/report.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2}
+			link := &tar.Header{Name: test.parentLink + "/report.txt", Typeflag: tar.TypeSymlink, Linkname: "anchor.txt"}
+			for _, order := range [][]*tar.Header{{file, link}, {link, file}} {
+				t.Run(order[0].Name, func(t *testing.T) {
+					dest, result, err := downloadCaseArchive(t, t.TempDir(), true, dir, parentLink, anchor, order[0], order[1])
+					checkArchiveCollision(t, dest, result, err, true, order[0].Name, order[1].Name)
+				})
+			}
 		})
 	}
 }
@@ -296,6 +386,11 @@ func downloadCaseArchive(t *testing.T, parent string, existing bool, entries ...
 	if err != nil {
 		t.Fatal(err)
 	}
+	return downloadCollisionFixture(t, parent, existing, body)
+}
+
+func downloadCollisionFixture(t *testing.T, parent string, existing bool, body []byte) (string, *DownloadResult, error) {
+	t.Helper()
 	fake := &scriptedDownloadSession{probe: fmt.Sprintf("dir %d", len(body)), chunks: [][]byte{body}, endSize: int64(len(body))}
 	client := newScriptedDownloadClient(t, fake)
 	dest := filepath.Join(parent, "result")
@@ -314,7 +409,7 @@ func downloadCaseArchive(t *testing.T, parent string, existing bool, entries ...
 
 func checkArchiveCollision(t *testing.T, dest string, result *DownloadResult, err error, existing bool, earlier, later string) {
 	t.Helper()
-	want := fmt.Sprintf("the archive entries %q and %q conflict", earlier, later)
+	want := fmt.Sprintf("the archive entries %+q and %+q conflict", earlier, later)
 	if result != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), want) {
 		t.Fatalf("archive download = %+v, %v, want failed_precondition with %q", result, err, want)
 	}
@@ -530,32 +625,39 @@ func TestDownloadArchiveRepeatedHardLinkName(t *testing.T) {
 }
 
 func TestDownloadArchiveDistinctHardLink(t *testing.T) {
-	dir := t.TempDir()
-	probe := filepath.Join(dir, "probe")
-	if err := os.Mkdir(probe, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if !caseSensitiveDir(t, probe) {
-		t.Skip("this destination volume does not store both names separately")
-	}
-	if err := os.Link(filepath.Join(probe, "case"), filepath.Join(probe, "CASE")); err != nil {
-		t.Skipf("this destination volume does not support hard links: %v", err)
-	}
+	for _, tc := range []struct{ name, first, second string }{
+		{"case", "Report.txt", "report.txt"},
+		{"normalization", "cafe\u0301.txt", "caf\u00e9.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := t.TempDir()
+			first := filepath.Join(probe, tc.first)
+			second := filepath.Join(probe, tc.second)
+			if err := os.WriteFile(first, []byte("probe"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(second); err == nil {
+				t.Skip("this destination volume does not store both names separately")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if err := os.Link(first, second); err != nil {
+				t.Skipf("this destination volume does not support hard links: %v", err)
+			}
 
-	// The second regular entry must replace just the distinct hard link,
-	// even though it shares the original file's identity before replacement.
-	result := filepath.Join(dir, "result")
-	if err := os.Mkdir(result, 0o755); err != nil {
-		t.Fatal(err)
+			// The second regular entry must replace just the distinct hard link,
+			// even though it shares the original file's identity before replacement.
+			result := t.TempDir()
+			extractor := archiveExtractor{fileLimit: 100, totalLimit: 1000, link: (*os.Root).Link}
+			_, err := extractor.extractArchive(t.Context(), tarOf(t,
+				&tar.Header{Name: tc.first, Typeflag: tar.TypeReg, Mode: 0o644, Size: 2},
+				&tar.Header{Name: tc.second, Typeflag: tar.TypeLink, Linkname: tc.first},
+				&tar.Header{Name: tc.second, Typeflag: tar.TypeReg, Mode: 0o644, Size: 3},
+			), result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkDownloadedFiles(t, result, []string{tc.first, tc.second}, []string{"xx", "xxx"})
+		})
 	}
-	extractor := archiveExtractor{fileLimit: 100, totalLimit: 1000, link: (*os.Root).Link}
-	_, err := extractor.extractArchive(t.Context(), tarOf(t,
-		&tar.Header{Name: "Report.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2},
-		&tar.Header{Name: "report.txt", Typeflag: tar.TypeLink, Linkname: "Report.txt"},
-		&tar.Header{Name: "report.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 3},
-	), result)
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkDownloadedFiles(t, result, []string{"Report.txt", "report.txt"}, []string{"xx", "xxx"})
 }

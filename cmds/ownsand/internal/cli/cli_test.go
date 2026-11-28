@@ -222,6 +222,51 @@ func TestExecExitStatus(t *testing.T) {
 	}
 }
 
+func TestExecDiagnosticsEscapeTextAndPreserveJSON(t *testing.T) {
+	r := newRunner(t)
+	for _, tc := range []struct {
+		command, event, diagnostic, escaped string
+		textStatus, jsonStatus              int
+	}{
+		{"fail-control", "failed", execFailureDiagnostic, "program missing\\nline two\\t日本語", ExitCommandNotStart, ExitOK},
+		{"denied-control", "data_path_error", "permission_denied: " + execDeniedDiagnostic, "data path: permission_denied: request denied\\r\\nline two", ExitDataPath, ExitDataPath},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			res := r.run("--no-color", "sandbox", "exec", r.f.sb, "--", tc.command)
+			if res.code != tc.textStatus || res.stdout != "" || strings.Count(res.stderr, "\n") != 1 || !strings.Contains(res.stderr, tc.escaped) {
+				t.Fatalf("text result: %+v", res)
+			}
+			assertNoControlBytes(t, res.stderr)
+
+			res = r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", tc.command)
+			if res.code != tc.jsonStatus || res.stderr != "" {
+				t.Fatalf("JSON result: %+v", res)
+			}
+			lines := strings.Split(strings.TrimSpace(res.stdout), "\n")
+			var event struct {
+				Event   string
+				Message string
+			}
+			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Event != tc.event || event.Message != tc.diagnostic {
+				t.Fatalf("JSON event = %+v, want %s with message %q", event, tc.event, tc.diagnostic)
+			}
+		})
+	}
+}
+
+func TestSecretFilePathErrorIsEscaped(t *testing.T) {
+	r := newRunner(t)
+	path := filepath.Join(t.TempDir(), "missing\nfile")
+	res := r.run("member", "accept", "--no-color", "--secret-file", path)
+	if res.code != ExitError || strings.Count(res.stderr, "\n") != 1 || !strings.Contains(res.stderr, "missing\\nfile") {
+		t.Fatalf("missing secret file: %+v", res)
+	}
+	assertNoControlBytes(t, res.stderr)
+}
+
 func TestExecJSONEvents(t *testing.T) {
 	r := newRunner(t)
 	res := r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", "exit3")
@@ -447,9 +492,10 @@ func TestAPIKeyTakesPrecedenceOverStoredTokens(t *testing.T) {
 
 // fakeLogto serves the device flow and the refresh token grant.
 type fakeLogto struct {
-	mu        sync.Mutex
-	polls     int
-	refreshes []string
+	mu                      sync.Mutex
+	polls                   int
+	refreshes               []string
+	deviceAuthorizationBody string
 }
 
 func (l *fakeLogto) handler(t *testing.T) http.Handler {
@@ -462,6 +508,10 @@ func (l *fakeLogto) handler(t *testing.T) http.Handler {
 		case r.URL.Path == "/oidc/device/auth":
 			if r.Form.Get("client_id") != "app" || !strings.Contains(r.Form.Get("scope"), "offline_access") || !slices.Contains(strings.Fields(r.Form.Get("scope")), RequiredLogtoScope) || r.Form.Get("resource") != DefaultLogtoResource {
 				t.Errorf("device auth form %v", r.Form)
+			}
+			if l.deviceAuthorizationBody != "" {
+				fmt.Fprint(w, l.deviceAuthorizationBody)
+				return
 			}
 			fmt.Fprint(w, `{"device_code":"dev-secret","user_code":"ABCD-EFGH","verification_uri":"https://login.example/device","expires_in":60,"interval":0}`)
 		case r.URL.Path == "/oidc/token" && r.Form.Get("grant_type") == "urn:ietf:params:oauth:grant-type:device_code":

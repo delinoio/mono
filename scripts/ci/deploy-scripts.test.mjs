@@ -3395,6 +3395,44 @@ test(
   },
 );
 
+for (const destination of ["current", "previous"]) {
+  test(
+    `droplet deploy rejects a directory at the ${destination} image state destination`,
+    { skip: skipDroplet },
+    (t) => {
+      const path = `state/api.${destination}`;
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        state: destination === "previous" ? `${olderImage}\n` : undefined,
+        prepare(deployRoot) {
+          mkdirSync(join(deployRoot, path), { recursive: true });
+        },
+      });
+
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.ok(
+        result.stderr.includes(`the route of api now serves ${dropletImage}`),
+        result.stderr,
+      );
+      assert.match(result.stderr, /state files .* were not updated/);
+      assert.ok(result.calls.some(isProxyLoad), result.calls.join("\n"));
+      const alias = `api-${dropletDeploymentUuid.replaceAll("-", "")}`;
+      assert.match(
+        result.read("caddy/sites/api.caddy"),
+        new RegExp(`reverse_proxy ${alias}:8080`),
+      );
+      assert.deepEqual(readdirSync(join(result.deployRoot, path)), []);
+      assert.ok(
+        !result.calls.some((call) => /^docker (stop|rm) /.test(call)),
+        result.calls.join("\n"),
+      );
+      if (destination === "previous") {
+        assert.equal(result.read("state/api.current"), `${olderImage}\n`);
+      }
+    },
+  );
+}
+
 test(
   "droplet deploy keeps the previous image for a rollback",
   { skip: skipDroplet },

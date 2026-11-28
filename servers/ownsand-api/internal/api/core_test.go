@@ -192,6 +192,216 @@ func TestInvitations(t *testing.T) {
 	}
 }
 
+func TestInvitationsRevokedWhenCreatorLosesMemberManagement(t *testing.T) {
+	for _, change := range []string{"remove", "leave", "demote"} {
+		t.Run(change, func(t *testing.T) {
+			env := testenv.New(t)
+			ctx := context.Background()
+			org := env.NewOrg("alice")
+			admin := env.User(org.Admin)
+
+			accepted := createMemberInvitation(t, ctx, admin, org.ID, ownsandv1.Role_ROLE_MEMBER)
+			if _, err := env.User("accepted-user").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{
+				InvitationSecret: accepted.GetInvitationSecret(),
+			})); err != nil {
+				t.Fatal(err)
+			}
+			revoked := createMemberInvitation(t, ctx, admin, org.ID, ownsandv1.Role_ROLE_MEMBER)
+			if _, err := org.OwnerClient.Member.RevokeInvitation(ctx, connect.NewRequest(&ownsandv1.RevokeInvitationRequest{
+				OrganizationId: org.ID, InvitationId: revoked.GetInvitation().GetInvitationId(),
+			})); err != nil {
+				t.Fatal(err)
+			}
+			expired := createMemberInvitation(t, ctx, admin, org.ID, ownsandv1.Role_ROLE_MEMBER)
+			env.Clock.Advance(7 * 24 * time.Hour)
+			settled := []*ownsandv1.CreateInvitationResponse{accepted, revoked, expired}
+			settledStates := make([][2]string, len(settled))
+			for i, inv := range settled {
+				settledStates[i] = invitationSettlement(t, env, inv.GetInvitation().GetInvitationId())
+			}
+
+			pending := []*ownsandv1.CreateInvitationResponse{
+				createMemberInvitation(t, ctx, admin, org.ID, ownsandv1.Role_ROLE_ADMIN),
+				createMemberInvitation(t, ctx, admin, org.ID, ownsandv1.Role_ROLE_MEMBER),
+			}
+			ownerInvite := createMemberInvitation(t, ctx, org.OwnerClient, org.ID, ownsandv1.Role_ROLE_MEMBER)
+			other := env.NewOrg("bob")
+			env.Join(other.ID, other.OwnerClient, org.Admin, ownsandv1.Role_ROLE_ADMIN)
+			otherInvite := createMemberInvitation(t, ctx, admin, other.ID, ownsandv1.Role_ROLE_MEMBER)
+			key, err := admin.APIKey.CreateApiKey(ctx, connect.NewRequest(&ownsandv1.CreateApiKeyRequest{OrganizationId: org.ID, Name: "admin key"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, err := admin.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{
+				OrganizationId: org.ID, Ttl: durationpb.New(time.Hour),
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			actor, reason := org.Owner, "membership_ended"
+			switch change {
+			case "remove":
+				_, err = org.OwnerClient.Member.RemoveMember(ctx, connect.NewRequest(&ownsandv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: org.Admin}))
+			case "leave":
+				actor = org.Admin
+				_, err = admin.Member.RemoveMember(ctx, connect.NewRequest(&ownsandv1.RemoveMemberRequest{OrganizationId: org.ID, UserId: org.Admin}))
+			case "demote":
+				reason = "role_lost_member_management"
+				updateInvitationCreatorRole(t, ctx, org, ownsandv1.Role_ROLE_ADMIN)
+				assertPendingInvitations(t, ctx, org, pending[0], pending[1], ownerInvite)
+				updateInvitationCreatorRole(t, ctx, org, ownsandv1.Role_ROLE_MEMBER)
+				updateInvitationCreatorRole(t, ctx, org, ownsandv1.Role_ROLE_ADMIN)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, inv := range pending {
+				id := inv.GetInvitation().GetInvitationId()
+				if got := invitationSettlement(t, env, id); got[0] != "" || got[1] == "" {
+					t.Fatalf("invitation %s settlement = %v, want revoked", id, got)
+				}
+				if _, err := env.User("invite-recipient").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{
+					InvitationSecret: inv.GetInvitationSecret(),
+				})); testenv.Code(err) != connect.CodeNotFound {
+					t.Fatalf("accept revoked invitation: %v", err)
+				}
+				if got := countRows(t, env, `SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = $2
+					AND actor_id = $3 AND actor_kind = $4 AND target_kind = $5 AND target_id = $6`,
+					org.ID, int16(ownsandv1.AuditAction_AUDIT_ACTION_INVITATION_REVOKED), actor, int16(ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER),
+					int16(ownsandv1.AuditTargetKind_AUDIT_TARGET_KIND_INVITATION), id); got != 1 {
+					t.Fatalf("revocation audits for %s by %s = %d, want 1", id, actor, got)
+				}
+			}
+			if got := countRows(t, env, "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = $2",
+				org.ID, int16(ownsandv1.AuditAction_AUDIT_ACTION_INVITATION_REVOKED)); got != 1+len(pending) {
+				t.Fatalf("total revocation audits = %d, want %d", got, 1+len(pending))
+			}
+			assertPendingInvitations(t, ctx, org, ownerInvite)
+			assertPendingInvitations(t, ctx, other, otherInvite)
+			for i, inv := range settled {
+				if got := invitationSettlement(t, env, inv.GetInvitation().GetInvitationId()); got != settledStates[i] {
+					t.Fatalf("settled invitation %d changed: %v, want %v", i, got, settledStates[i])
+				}
+			}
+			if got := countRows(t, env, "SELECT count(*) FROM api_keys WHERE api_key_id = $1 AND revoke_time IS NULL",
+				key.Msg.GetApiKey().GetApiKeyId()); got != 1 {
+				t.Fatal("organization API key was revoked")
+			}
+			if got := countRows(t, env, "SELECT count(*) FROM enrollment_tokens WHERE enrollment_token_id = $1 AND revoke_time IS NULL",
+				token.Msg.GetToken().GetEnrollmentTokenId()); got != 1 {
+				t.Fatal("organization enrollment token was revoked")
+			}
+
+			logs := env.Logs.String()
+			if strings.Contains(logs, pending[0].GetInvitationSecret()) || strings.Contains(logs, pending[1].GetInvitationSecret()) {
+				t.Fatal("logs contain an invitation secret")
+			}
+			var count int
+			for _, line := range strings.Split(logs, "\n") {
+				if !strings.Contains(line, "invitations_revoked_by_membership_change") {
+					continue
+				}
+				count++
+				var record struct {
+					Level          string `json:"level"`
+					OrganizationID string `json:"organization_id"`
+					UserID         string `json:"user_id"`
+					Count          int    `json:"count"`
+					Reason         string `json:"reason"`
+				}
+				if err := json.Unmarshal([]byte(line), &record); err != nil {
+					t.Fatal(err)
+				}
+				if record.Level != "INFO" || record.OrganizationID != org.ID || record.UserID != org.Admin || record.Count != len(pending) || record.Reason != reason {
+					t.Fatalf("revocation log = %+v", record)
+				}
+			}
+			if count != 1 {
+				t.Fatalf("revocation log count = %d, want 1", count)
+			}
+		})
+	}
+}
+
+func TestInvitationRevocationRollsBackWithMembershipChange(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	admin := env.User(org.Admin)
+	inv := createMemberInvitation(t, ctx, admin, org.ID, ownsandv1.Role_ROLE_MEMBER)
+	// Fail the final membership audit after the invitation update and audit.
+	if _, err := env.DB.Pool.Exec(ctx, fmt.Sprintf("ALTER TABLE audit_events ADD CHECK (action <> %d)",
+		ownsandv1.AuditAction_AUDIT_ACTION_MEMBER_REMOVED)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := org.OwnerClient.Member.RemoveMember(ctx, connect.NewRequest(&ownsandv1.RemoveMemberRequest{
+		OrganizationId: org.ID, UserId: org.Admin,
+	}))
+	if testenv.Code(err) != connect.CodeInternal {
+		t.Fatalf("remove member with a failed audit write: %v", err)
+	}
+	assertPendingInvitations(t, ctx, org, inv)
+	if got := countRows(t, env, "SELECT count(*) FROM memberships WHERE organization_id = $1 AND user_id = $2", org.ID, org.Admin); got != 1 {
+		t.Fatal("membership was deleted despite failed transaction")
+	}
+	if got := countRows(t, env, "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = $2",
+		org.ID, int16(ownsandv1.AuditAction_AUDIT_ACTION_INVITATION_REVOKED)); got != 0 {
+		t.Fatalf("revocation audits = %d, want 0 after rollback", got)
+	}
+	if strings.Contains(env.Logs.String(), "invitations_revoked_by_membership_change") {
+		t.Fatal("revocation logged despite failed transaction")
+	}
+}
+
+func createMemberInvitation(t *testing.T, ctx context.Context, creator *testenv.Clients, orgID string, role ownsandv1.Role) *ownsandv1.CreateInvitationResponse {
+	t.Helper()
+	resp, err := creator.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: orgID, Role: role}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.Msg
+}
+
+func updateInvitationCreatorRole(t *testing.T, ctx context.Context, org *testenv.Org, role ownsandv1.Role) {
+	t.Helper()
+	if _, err := org.OwnerClient.Member.UpdateMemberRole(ctx, connect.NewRequest(&ownsandv1.UpdateMemberRoleRequest{
+		OrganizationId: org.ID, UserId: org.Admin, Role: role,
+	})); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertPendingInvitations(t *testing.T, ctx context.Context, org *testenv.Org, want ...*ownsandv1.CreateInvitationResponse) {
+	t.Helper()
+	list, err := org.OwnerClient.Member.ListInvitations(ctx, connect.NewRequest(&ownsandv1.ListInvitationsRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries := list.Msg.GetInvitations(); len(entries) != len(want) {
+		t.Fatalf("pending invitations = %d, want %d", len(entries), len(want))
+	}
+	for _, inv := range want {
+		id := inv.GetInvitation().GetInvitationId()
+		if !slices.ContainsFunc(list.Msg.GetInvitations(), func(entry *ownsandv1.Invitation) bool {
+			return entry.GetInvitationId() == id && entry.GetState() == ownsandv1.InvitationState_INVITATION_STATE_PENDING
+		}) {
+			t.Fatalf("missing pending invitation %s", id)
+		}
+	}
+}
+
+func invitationSettlement(t *testing.T, env *testenv.Env, id string) [2]string {
+	t.Helper()
+	var times [2]string
+	if err := env.DB.Pool.QueryRow(context.Background(), `SELECT coalesce(accept_time::text, ''), coalesce(revoke_time::text, '')
+		FROM invitations WHERE invitation_id = $1`, id).Scan(&times[0], &times[1]); err != nil {
+		t.Fatal(err)
+	}
+	return times
+}
+
 // countJoined returns the number of MEMBER_JOINED audit events of an organization.
 func countJoined(t *testing.T, env *testenv.Env, orgID string) int {
 	t.Helper()

@@ -1806,75 +1806,109 @@ describe("runner profiles", () => {
     );
   });
 
-  test("shows field errors and saves after correcting the resource values", async ({
-    app,
-    screen,
-    browser,
-  }) => {
-    await app.open("/");
-    await screen.getByRole("button", "Sign in with Delino").tap();
-    await app.open(`/orgs/${ACME}/profiles`);
-    await screen.getByRole("button", "Create runner profile").tap();
+  for (const mode of ["create", "edit"] as const) {
+    test(`rejects invalid resources and saves corrected values in ${mode} mode`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/profiles`);
 
-    const dialog = screen.getByRole("dialog", "Create a runner profile");
-    await dialog.getByLabel("Name").tap();
-    await browser.keyboard.type("bounds-test");
-    const resources = [
-      [
-        "vCPUs",
-        "3000000000",
-        "1024",
-        "Enter a whole number of vCPUs from 1 to 1024.",
-      ],
-      [
-        "Memory (MiB)",
-        "10000000000000000000",
-        "16777216",
-        "Enter a whole number of MiB from 1 to 16777216.",
-      ],
-      [
-        "Disk (GiB)",
-        "1048577",
-        "1048576",
-        "Enter a whole number of GiB from 1 to 1048576.",
-      ],
-    ] as const;
-    for (const [label, invalid] of resources) {
-      await dialog.getByLabel(label).tap();
-      await browser.keyboard.press("ControlOrMeta+A");
-      await browser.keyboard.type(invalid);
-    }
-    await dialog.getByRole("button", "Create profile").tap();
-
-    for (const [label, , , message] of resources) {
-      await expect(dialog.getByLabel(label)).toHaveAttribute(
-        "aria-invalid",
-        "true",
+      const creating = mode === "create";
+      const row = screen.getByRole("listitem").filter({
+        hasText: creating ? "bounds-test ·" : "linux-build ·",
+      });
+      if (creating) {
+        await screen.getByRole("button", "Create runner profile").tap();
+      } else {
+        await row.getByRole("button", "Edit").tap();
+      }
+      const dialog = screen.getByRole(
+        "dialog",
+        creating ? "Create a runner profile" : "Edit linux-build",
       );
-      await expect(dialog.getByText(message)).toBeVisible();
-    }
-    await expect(
-      dialog.getByText("Something went wrong. Try again."),
-    ).toBeHidden();
-    for (const [label, , valid] of resources) {
-      await dialog.getByLabel(label).tap();
-      await browser.keyboard.press("ControlOrMeta+A");
-      await browser.keyboard.type(valid);
-    }
-    for (const [label, equalTtl] of [
-      ["Idle TTL (minutes)", "60"],
-      ["Maximum TTL (hours)", "1"],
-    ] as const) {
-      await dialog.getByLabel(label).tap();
-      await browser.keyboard.press("ControlOrMeta+A");
-      await browser.keyboard.type(equalTtl);
-    }
-    await dialog.getByRole("button", "Create profile").tap();
+      const submit = dialog.getByRole(
+        "button",
+        creating ? "Create profile" : "Save changes",
+      );
+      const setField = async (label: string, value: string) => {
+        await dialog.getByLabel(label).tap();
+        await browser.keyboard.press("ControlOrMeta+A");
+        await browser.keyboard.type(value);
+      };
+      if (creating) await setField("Name", "bounds-test");
 
-    await expect(dialog).toBeHidden();
-    const row = screen.getByRole("listitem").filter({ hasText: "bounds-test" });
-    await expect(row).toContainText("1024 vCPU · 16777216 MiB · 1048576 GiB");
-  });
+      const vcpus = dialog.getByLabel("vCPUs");
+      await setField("vCPUs", "0");
+      await browser.keyboard.press("Tab");
+      await submit.tap();
+      await expect(dialog.getByText("Enter at least 1 vCPU.")).toBeVisible();
+      await expect(vcpus).toHaveAttribute("aria-invalid", "true");
+      await expect(vcpus).toHaveValue("0");
+
+      await setField("vCPUs", "1.5");
+      await browser.keyboard.press("Enter");
+      await expect(
+        dialog.getByText("Enter a whole number of vCPUs from 1 to 1024."),
+      ).toBeVisible();
+      await expect(vcpus).toHaveAttribute("aria-invalid", "true");
+      await expect(vcpus).toHaveValue("1.5");
+
+      const resources = [
+        [
+          "vCPUs",
+          "3000000000",
+          "1024",
+          "Enter a whole number of vCPUs from 1 to 1024.",
+        ],
+        [
+          "Memory (MiB)",
+          "10000000000000000000",
+          "16777216",
+          "Enter a whole number of MiB from 1 to 16777216.",
+        ],
+        [
+          "Disk (GiB)",
+          "1048577",
+          "1048576",
+          "Enter a whole number of GiB from 1 to 1048576.",
+        ],
+      ] as const;
+      for (const [label, invalid] of resources) {
+        await setField(label, invalid);
+      }
+      await submit.tap();
+
+      for (const [label, , , message] of resources) {
+        await expect(dialog.getByLabel(label)).toHaveAttribute(
+          "aria-invalid",
+          "true",
+        );
+        await expect(dialog.getByText(message)).toBeVisible();
+      }
+      await expect(
+        dialog.getByText("Something went wrong. Try again."),
+      ).toBeHidden();
+
+      for (const [label, , maximum] of resources) {
+        await setField(label, creating ? maximum : "1");
+      }
+      if (creating) {
+        await setField("Idle TTL (minutes)", "60");
+        await setField("Maximum TTL (hours)", "1");
+      }
+      await submit.tap();
+
+      await expect(dialog).toBeHidden();
+      await expect(row).toContainText(
+        creating
+          ? "1024 vCPU · 16777216 MiB · 1048576 GiB"
+          : "1 vCPU · 1 MiB · 1 GiB",
+      );
+    });
+  }
 });
 
 describe("runner profiles", () => {

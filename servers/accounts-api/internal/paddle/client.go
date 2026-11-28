@@ -549,9 +549,9 @@ type Charge struct {
 //     response.
 //   - Paddle rejects the charge while the subscription is `past_due` and
 //     when the next billing period starts within 30 minutes.
-//   - The response is the subscription entity; the charge itself is not in
-//     it. accounts-api matches the transaction of the charge through the
-//     `top_up_id` custom data of the non-catalog price.
+//   - A response confirms acceptance only when it identifies the requested
+//     subscription. accounts-api matches the transaction of the charge
+//     through the `top_up_id` custom data of the non-catalog price.
 //   - `tax_mode: external` makes the price tax exclusive: Paddle adds the tax
 //     on top.
 func (c *Client) CreateOneTimeCharge(ctx context.Context, subscriptionID string, charge Charge) (Subscription, error) {
@@ -574,8 +574,13 @@ func (c *Client) CreateOneTimeCharge(ctx context.Context, subscriptionID string,
 		}},
 	}
 	var sub Subscription
-	err := c.do(ctx, http.MethodPost, "/subscriptions/"+url.PathEscape(subscriptionID)+"/charge", body, &sub)
-	return sub, err
+	if err := c.do(ctx, http.MethodPost, "/subscriptions/"+url.PathEscape(subscriptionID)+"/charge", body, &sub); err != nil {
+		return sub, err
+	}
+	if sub.ID == "" || sub.ID != subscriptionID {
+		return Subscription{}, errors.New("paddle charge response does not identify the requested subscription")
+	}
+	return sub, nil
 }
 
 // InvoiceURL returns the temporary link to the invoice PDF of a transaction

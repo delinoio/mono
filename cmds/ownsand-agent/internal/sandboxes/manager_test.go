@@ -3154,28 +3154,178 @@ func TestFailedUndoJoinsTheErrors(t *testing.T) {
 	}
 }
 
-// TestPauseDoesNotUndoWhenOnlyTheRecordSaveFails checks that a failure of
-// SaveSandbox after the in-memory change applied keeps the new state and does
-// not call the opposite runtime method.
 func TestPauseDoesNotUndoWhenOnlyTheRecordSaveFails(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
-	breakFile(t, filepath.Join(e.st.Dir(), store.SandboxesDir, id+".json"))
-	if en, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err == nil || en != nil {
-		t.Fatalf("pause = %v, %v; want an error and a nil entry", en, err)
+	created := e.create(10*time.Minute, 2*time.Hour)
+	id := created.GetSandboxId()
+	cmd := &ownsandv1.PauseSandboxCommand{SandboxId: id}
+	restore := breakFile(t, e.st.Path(store.SandboxesDir, id+".json"))
+	if en, err := e.m.Pause(ctx, cmd); en != nil || err == nil || !strings.Contains(err.Error(), "sandboxes: save record:") {
+		t.Fatalf("pause = %v, %v; want a nil entry and a save error", en, err)
 	}
-	if got, _ := e.m.State(id); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
-		t.Fatalf("record state = %v; want PAUSED", got)
+	e.m.Tick(ctx, true)
+	paused := e.out.entries[len(e.out.entries)-1]
+	if paused.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED || paused.GetRevision().GetCounter() != created.GetRevision().GetCounter()+1 {
+		t.Fatalf("resend = %v; want PAUSED with the next revision", paused)
+	}
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: paused.GetRevision()})
+	if en, err := e.m.Pause(ctx, cmd); en != nil || err == nil || !strings.Contains(err.Error(), "sandboxes: save record:") {
+		t.Fatalf("second pause = %v, %v; want a nil entry and a save error", en, err)
+	}
+
+	restore()
+	e.m.Tick(ctx, false)
+	saved := persistedRecord(t, e.st, id)
+	if saved.State != paused.GetState() || saved.Revision != paused.GetRevision().GetCounter() || !saved.Acked {
+		t.Fatalf("record after recovery = %+v; want the acknowledged PAUSED revision %d", saved, paused.GetRevision().GetCounter())
 	}
 	if paused, pauseCalls, resumeCalls := e.rt.vmState(id); !paused || pauseCalls != 1 || resumeCalls != 0 {
 		t.Fatalf("paused=%v pause calls=%d resume calls=%d; want true 1 0", paused, pauseCalls, resumeCalls)
 	}
-	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil {
-		t.Fatalf("second pause = %v", err)
+
+	e.rt = newFakeRuntime()
+	e.clk.Advance(11 * time.Minute)
+	e.restart()
+	record := persistedRecord(t, e.st, id)
+	if record.State != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || record.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("after idle deadline: %v %v; want FAILED with LOST_ON_DEVICE", record.State, record.EndReason)
 	}
-	if paused, pauseCalls, _ := e.rt.vmState(id); !paused || pauseCalls != 1 {
-		t.Fatalf("paused=%v pause calls=%d after the second pause; want true 1", paused, pauseCalls)
+	if err := e.st.SaveSandbox(id, &saved); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(2 * time.Hour)
+	e.restart()
+	record = persistedRecord(t, e.st, id)
+	if record.State != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || record.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("after max deadline: %v %v; want DELETED with MAX_TTL_EXPIRED", record.State, record.EndReason)
+	}
+}
+
+func TestResumeRecordSaveCanRecover(t *testing.T) {
+	for _, viaAck := range []bool{false, true} {
+		name := "repeated command"
+		if viaAck {
+			name = "acknowledgement"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			ctx := context.Background()
+			id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+			pause := &ownsandv1.PauseSandboxCommand{SandboxId: id}
+			resume := &ownsandv1.ResumeSandboxCommand{SandboxId: id}
+			paused, err := e.m.Pause(ctx, pause)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.clk.Advance(time.Minute)
+			wantIdle := e.clk.Now().Add(10 * time.Minute)
+			path := e.st.Path(store.SandboxesDir, id+".json")
+			restore := breakFile(t, path)
+			if en, err := e.m.Resume(ctx, resume); en != nil || err == nil || !strings.Contains(err.Error(), "sandboxes: save record:") {
+				t.Fatalf("resume = %v, %v; want a nil entry and a save error", en, err)
+			}
+			running := e.m.StateEntry(id)
+			if running.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING || running.GetRevision().GetCounter() != paused.GetRevision().GetCounter()+1 {
+				t.Fatalf("current record = %v; want RUNNING with the next revision", running)
+			}
+			restore()
+			if viaAck {
+				e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: running.GetRevision()})
+			} else if en, err := e.m.Resume(ctx, resume); err != nil || !proto.Equal(en, running) {
+				t.Fatalf("repeated resume = %v, %v; want %v", en, err, running)
+			}
+			saved := persistedRecord(t, e.st, id)
+			if saved.State != running.GetState() || saved.Revision != running.GetRevision().GetCounter() || saved.Acked != viaAck || !saved.IdleDeadline.Equal(wantIdle) {
+				t.Fatalf("record after recovery = %+v; want RUNNING revision %d, acked=%t and idle deadline %v", saved, running.GetRevision().GetCounter(), viaAck, wantIdle)
+			}
+
+			// A later same-target command has no pending write.
+			restore = breakFile(t, path)
+			defer restore()
+			if en, err := e.m.Resume(ctx, resume); err != nil || !proto.Equal(en, running) {
+				t.Fatalf("resume after the record was saved = %v, %v; want %v", en, err, running)
+			}
+			if paused, pauseCalls, resumeCalls := e.rt.vmState(id); paused || pauseCalls != 1 || resumeCalls != 1 {
+				t.Fatalf("paused=%v pause calls=%d resume calls=%d; want false 1 1", paused, pauseCalls, resumeCalls)
+			}
+		})
+	}
+}
+
+func TestPauseRecordSaveYieldsToNewerTransition(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	path := e.st.Path(store.SandboxesDir, id+".json")
+	restore := breakFile(t, path)
+	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err == nil {
+		t.Fatal("pause succeeded with the record path blocked")
+	}
+	paused := e.m.StateEntry(id)
+	if _, err := e.m.Resume(ctx, &ownsandv1.ResumeSandboxCommand{SandboxId: id}); err == nil {
+		t.Fatal("resume succeeded with the record path blocked")
+	}
+	running := e.m.StateEntry(id)
+	restore()
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: paused.GetRevision()})
+	e.m.Tick(ctx, false)
+	saved := persistedRecord(t, e.st, id)
+	if saved.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING || saved.Revision != running.GetRevision().GetCounter() || saved.Acked {
+		t.Fatalf("record after recovery = %+v; want unacknowledged RUNNING revision %d", saved, running.GetRevision().GetCounter())
+	}
+
+	restore = breakFile(t, path)
+	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err == nil {
+		t.Fatal("pause succeeded with the record path blocked")
+	}
+	restore()
+	deleted, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+	if err != nil || deleted.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("delete = %v, %v; want DELETED", deleted, err)
+	}
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: deleted.GetRevision()})
+	e.m.Tick(ctx, false)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat after terminal acknowledgement and tick = %v; want no record", err)
+	}
+}
+
+func TestPauseRecordSaveYieldsToMaxTTL(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	created := e.create(10*time.Minute, 2*time.Hour)
+	id := created.GetSandboxId()
+	cmd := &ownsandv1.PauseSandboxCommand{SandboxId: id}
+	restore := breakFile(t, e.st.Path(store.SandboxesDir, id+".json"))
+	if _, err := e.m.Pause(ctx, cmd); err == nil {
+		t.Fatal("pause succeeded with the record path blocked")
+	}
+	paused := e.m.StateEntry(id)
+	restore()
+
+	e.clk.Advance(2 * time.Hour)
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: paused.GetRevision()})
+	var commandErr *CommandError
+	if _, err := e.m.Pause(ctx, cmd); !errors.As(err, &commandErr) || commandErr.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("repeated pause after expiration = %v; want ABORTED", err)
+	}
+
+	// Tick claims the end, but it cannot save the teardown record until it
+	// gets the command lock. The expired PAUSED record must not be saved.
+	sb, _ := e.m.get(id)
+	saved := func() Record {
+		sb.cmdMu.Lock()
+		defer sb.cmdMu.Unlock()
+		e.m.Tick(ctx, false)
+		return persistedRecord(t, e.st, id)
+	}()
+	if saved.State != created.GetState() || saved.Revision != created.GetRevision().GetCounter() {
+		t.Fatalf("record before expiration teardown = %+v; want the original RUNNING revision", saved)
+	}
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if reason := endReason(e.m, id); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("expiration reason = %v; want MAX_TTL_EXPIRED", reason)
 	}
 }
 

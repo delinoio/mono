@@ -283,11 +283,14 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     fieldError?.field === field ? fieldError.message : undefined;
 
   // Editing a field clears its error: the message describes the old value.
+  const clearError = (field: DeviceLimitField) =>
+    setFieldError((current) => (current?.field === field ? null : current));
+
   const edit =
     <K extends keyof DeviceLimitsDraft>(field: DeviceLimitField, key: K) =>
     (value: NonNullable<DeviceLimitsDraft[K]> | null) => {
       setDraft((current) => ({ ...current, [key]: value }));
-      setFieldError((current) => (current?.field === field ? null : current));
+      clearError(field);
     };
 
   const save = async (event: FormEvent) => {
@@ -297,7 +300,9 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     // form asks for the value instead of sending a silent zero.
     const input = deviceLimitsInput(
       {
-        vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
+        vcpu: vcpuDraft.current?.hasFraction()
+          ? Number.NaN
+          : (vcpuDraft.current?.valueBelowMin() ?? vcpu),
         memoryMib: memory,
         diskGib: disk,
         overcommitPercent: Number(overcommit),
@@ -386,7 +391,9 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
               incrementLabel={t("common.increase")}
               value={vcpu}
               onValueChange={edit(DeviceLimitField.Vcpu, "vcpu")}
+              onInput={() => clearError(DeviceLimitField.Vcpu)}
               draftRef={vcpuDraft}
+              preserveBelowMin
               min={0}
               error={errorOf(DeviceLimitField.Vcpu)}
               disabled={!admin || pending}

@@ -2843,7 +2843,10 @@ describe("runner profiles", () => {
     "keeps the %s dialog open without sending a request for invalid resources",
     async (mode) => {
       const mock = createMockTransport();
-      const saveProfile = rs.fn();
+      const saves: {
+        method: string;
+        request: CreateRunnerProfileRequest | UpdateRunnerProfileRequest;
+      }[] = [];
       const transport: Transport = {
         ...mock,
         async unary(method, ...args) {
@@ -2852,7 +2855,11 @@ describe("runner profiles", () => {
               RunnerProfileService.method.createRunnerProfile.name ||
             method.name === RunnerProfileService.method.updateRunnerProfile.name
           ) {
-            saveProfile();
+            saves.push({
+              method: method.name,
+              request: args[3] as
+                CreateRunnerProfileRequest | UpdateRunnerProfileRequest,
+            });
           }
           return mock.unary(method, ...args);
         },
@@ -2878,43 +2885,85 @@ describe("runner profiles", () => {
       if (creating) {
         await type(form.getByRole("textbox", { name: "Name" }), "bounds-test");
       }
+      const submit = form.getByRole("button", {
+        name: creating ? "Create profile" : "Save changes",
+      });
       const resources = [
         [
           "vCPUs",
+          "1.5",
           "3000000000",
+          "1024",
+          "Enter at least 1 vCPU.",
           "Enter a whole number of vCPUs from 1 to 1024.",
         ],
         [
           "Memory (MiB)",
+          "4096.5",
           "10000000000000000000",
+          "16777216",
+          "Enter the memory in MiB.",
           "Enter a whole number of MiB from 1 to 16777216.",
         ],
         [
           "Disk (GiB)",
+          "32.5",
           "1048577",
+          "1048576",
+          "Enter the disk size in GiB.",
           "Enter a whole number of GiB from 1 to 1048576.",
         ],
       ] as const;
-      for (const [label, value] of resources) {
-        const input = form.getByLabelText(label);
-        await type(input, value);
-        fireEvent.blur(input);
-      }
-      await click(
-        form.getByRole("button", {
-          name: creating ? "Create profile" : "Save changes",
-        }),
-      );
+      for (const [
+        label,
+        fraction,
+        oversized,
+        maximum,
+        missingError,
+        rangeError,
+      ] of resources) {
+        const input = form.getByLabelText<HTMLInputElement>(label);
+        for (const [draft, message] of [
+          ["0", missingError],
+          [fraction, rangeError],
+          ["", missingError],
+          [oversized, rangeError],
+        ] as const) {
+          await type(input, draft);
+          fireEvent.blur(input);
+          await click(submit);
 
-      for (const [label, , message] of resources) {
-        expect(form.getByLabelText(label).getAttribute("aria-invalid")).toBe(
-          "true",
-        );
-        expect(form.getByText(message)).toBeTruthy();
+          expect(input.value).toBe(draft);
+          expect(input.getAttribute("aria-invalid")).toBe("true");
+          expect(form.getByText(message)).toBeTruthy();
+          expect(screen.getByRole("dialog")).toBe(dialog);
+          expect(saves).toHaveLength(0);
+        }
+        await type(input, creating ? maximum : "1");
       }
-      expect(form.queryByText("Something went wrong. Try again.")).toBeNull();
-      expect(screen.getByRole("dialog")).toBe(dialog);
-      expect(saveProfile).not.toHaveBeenCalled();
+      await click(submit);
+
+      await waitFor(() => expect(dialog.isConnected).toBe(false));
+      expect(saves).toHaveLength(1);
+      expect(saves[0]).toMatchObject({
+        method: creating ? "CreateRunnerProfile" : "UpdateRunnerProfile",
+        request: {
+          profile: {
+            resources: creating
+              ? { vcpuCount: 1024, memoryMib: 16777216n, diskGib: 1048576n }
+              : { vcpuCount: 1, memoryMib: 1n, diskGib: 1n },
+          },
+          ...(!creating && {
+            updateMask: {
+              paths: [
+                "resources.vcpu_count",
+                "resources.memory_mib",
+                "resources.disk_gib",
+              ],
+            },
+          }),
+        },
+      });
     },
   );
 
