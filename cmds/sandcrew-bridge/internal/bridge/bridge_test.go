@@ -689,6 +689,35 @@ func TestModeAndConfigOptionChanges(t *testing.T) {
 	h.checkLog()
 }
 
+func TestRejectedPermissionModeSwitchKeepsTheMode(t *testing.T) {
+	h := newHarness(t)
+	h.agent.rejectModes = []string{"default"}
+	h.run()
+	idle := h.waitIdle()
+	id := h.write(&sandcrewv1.BridgeInput{Input: &sandcrewv1.BridgeInput_SetMode{SetMode: &sandcrewv1.SetModeInput{
+		Target: &sandcrewv1.SetModeInput_PermissionMode{PermissionMode: sandcrewv1.PermissionMode_PERMISSION_MODE_ASK},
+	}}})
+	accepted := h.waitAccepted(idle, id)
+	rejected := h.waitKind(accepted, "bridge_error")
+	if kind := h.events()[rejected].GetBridgeError().GetKind(); kind != sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_OPTION_REJECTED {
+		t.Fatalf("bridge_error %s", kind)
+	}
+	// The agent stays in bypassPermissions, so the session stays in
+	// AUTO_APPROVE: a permission request is answered by the bridge.
+	h.write(prompt("permission"))
+	h.waitKind(rejected, "permission_response")
+	for _, e := range h.events()[accepted:] {
+		if e.GetModeChanged() != nil {
+			t.Fatalf("mode_changed after a rejected switch: %v", e)
+		}
+	}
+	if got := h.events()[h.waitKind(rejected, "permission_response")].GetPermissionResponse(); !got.GetAutoApproved() {
+		t.Fatalf("permission_response %v", got)
+	}
+	h.waitState(h.waitKind(rejected, "turn_ended"), sandcrewv1.AgentActivity_AGENT_ACTIVITY_IDLE)
+	h.checkLog()
+}
+
 func TestStartConfigModeAndOptions(t *testing.T) {
 	h := newHarness(t, func(_ *harness, start *sandcrewv1.BridgeStartConfig) {
 		start.ModeId = "plan"

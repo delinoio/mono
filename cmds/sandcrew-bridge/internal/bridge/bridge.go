@@ -408,7 +408,7 @@ func (b *Bridge) startAgent(ctx context.Context, startErr error) (ExitCode, bool
 	// Apply the start configuration: the permission mode first, then the
 	// requested agent mode and the configuration options. A rejected value
 	// writes OPTION_REJECTED and the session continues with the default.
-	b.applyPermissionMode(b.permissionMode)
+	b.applyPermissionMode(b.permissionMode, false)
 	if modeID := b.start.GetModeId(); modeID != "" {
 		b.applyModeID(modeID)
 	}
@@ -639,7 +639,7 @@ func (b *Bridge) apply(input *sandcrewv1.BridgeInput) {
 				return
 			}
 			if b.accept(id) {
-				b.applyPermissionMode(target.PermissionMode)
+				b.applyPermissionMode(target.PermissionMode, true)
 			}
 		default:
 			b.reject(id, malformed)
@@ -847,7 +847,14 @@ func (b *Bridge) applyModeID(id string) {
 // applyPermissionMode switches between AUTO_APPROVE and ASK: it switches
 // the agent to the vendor's auto-approve or asking mode when the agent
 // offers it, and in AUTO_APPROVE it answers the pending requests.
-func (b *Bridge) applyPermissionMode(mode sandcrewv1.PermissionMode) {
+//
+// When the agent rejects the vendor mode and keepOnReject is true, the
+// session keeps its permission mode: after a rejected switch to ASK the
+// agent can still run in its auto-approve mode, where it asks nothing. At
+// start (keepOnReject false) there is no previous mode; the agent then
+// stays in its initial mode, and the bridge answers the requests that the
+// agent sends according to the requested mode.
+func (b *Bridge) applyPermissionMode(mode sandcrewv1.PermissionMode, keepOnReject bool) {
 	target := b.spec.AskModeID
 	if mode == sandcrewv1.PermissionMode_PERMISSION_MODE_AUTO_APPROVE {
 		target = b.spec.AutoApproveModeID
@@ -862,6 +869,9 @@ func (b *Bridge) applyPermissionMode(mode sandcrewv1.PermissionMode) {
 	if switchMode {
 		if err := b.setAgentMode(target); err != nil {
 			b.optionRejected(fmt.Sprintf("the agent rejected mode %q: %s", target, rpcSummary(err)))
+			if keepOnReject {
+				return
+			}
 		}
 	}
 	b.mu.Lock()

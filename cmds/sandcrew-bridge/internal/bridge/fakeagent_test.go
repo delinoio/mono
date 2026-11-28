@@ -37,25 +37,27 @@ type fakeAgent struct {
 
 	writeMu sync.Mutex
 
-	mu             sync.Mutex
-	methods        []string
-	authMethodIDs  []string
-	setModes       []string
-	setOptions     []map[string]any
-	permissions    []map[string]any
-	modes          []string
-	currentMode    string
-	modelValue     string
-	fast           bool
-	nextID         int
-	responses      map[string]chan json.RawMessage
-	cancelled      chan struct{}
-	release        chan struct{}
-	exited         chan struct{}
-	exitOnce       sync.Once
-	exitCode       int
-	exitSignal     string
-	withoutModes   bool
+	mu            sync.Mutex
+	methods       []string
+	authMethodIDs []string
+	setModes      []string
+	setOptions    []map[string]any
+	permissions   []map[string]any
+	modes         []string
+	currentMode   string
+	modelValue    string
+	fast          bool
+	nextID        int
+	responses     map[string]chan json.RawMessage
+	cancelled     chan struct{}
+	release       chan struct{}
+	exited        chan struct{}
+	exitOnce      sync.Once
+	exitCode      int
+	exitSignal    string
+	withoutModes  bool
+	// rejectModes are offered modes that session/set_mode rejects.
+	rejectModes    []string
 	failSessionNew bool
 }
 
@@ -245,7 +247,7 @@ func (f *fakeAgent) handle(m rpc) {
 		_ = json.Unmarshal(m.Params, &params)
 		f.mu.Lock()
 		f.setModes = append(f.setModes, params.ModeID)
-		known := slices.Contains(f.modes, params.ModeID)
+		known := slices.Contains(f.modes, params.ModeID) && !slices.Contains(f.rejectModes, params.ModeID)
 		if known {
 			f.currentMode = params.ModeID
 		}
