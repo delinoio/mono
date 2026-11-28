@@ -49,18 +49,25 @@ func (f *fixture) createTransactionRequests() int {
 func TestStartSubscriptionRejectsAnUnusableTransaction(t *testing.T) {
 	t.Parallel()
 	for name, body := range map[string]string{
-		"empty object": `{"data":{}}`,
-		"empty ID":     `{"data":{"id":""}}`,
+		"empty object":            `{"data":{}}`,
+		"empty ID":                `{"data":{"id":"","status":"draft","collection_mode":"automatic"}}`,
+		"canceled":                `{"data":{"id":"txn_canceled","status":"canceled","collection_mode":"automatic"}}`,
+		"manual collection":       `{"data":{"id":"txn_manual","status":"draft","collection_mode":"manual"}}`,
+		"missing status":          `{"data":{"id":"txn_create","collection_mode":"automatic"}}`,
+		"unknown status":          `{"data":{"id":"txn_create","status":"unknown","collection_mode":"automatic"}}`,
+		"missing collection mode": `{"data":{"id":"txn_create","status":"draft"}}`,
+		"unknown collection mode": `{"data":{"id":"txn_create","status":"draft","collection_mode":"unknown"}}`,
+		"paid":                    `{"data":{"id":"txn_create","status":"paid","collection_mode":"automatic"}}`,
+		"completed":               `{"data":{"id":"txn_create","status":"completed","collection_mode":"automatic"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
 			acct := f.account()
 			f.paddle.Respond("POST /transactions", http.StatusCreated, body)
 
-			_, err := f.startCheckout(acct)
-			var connectErr *connect.Error
-			if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeUnavailable {
-				t.Fatalf("StartSubscription error = %v, want unavailable", err)
+			id, err := f.startCheckout(acct)
+			if id != "" || connect.CodeOf(err) != connect.CodeUnavailable {
+				t.Fatalf("StartSubscription = %q, %v; want no ID and unavailable", id, err)
 			}
 			if n := f.createTransactionRequests(); n != 1 {
 				t.Fatalf("create requests = %d, want 1", n)
@@ -135,6 +142,49 @@ func TestStartSubscriptionReplacesMissingCheckout(t *testing.T) {
 	}
 	if n := f.checkoutRows(acct); n != 2 {
 		t.Fatalf("checkout rows = %d, want 2", n)
+	}
+}
+
+func TestStartSubscriptionRetriesAnUnusableReplacement(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	acct := f.account()
+	first, err := f.startCheckout(acct)
+	if err != nil || first == "" {
+		t.Fatalf("first start = %q, %v", first, err)
+	}
+	f.paddle.SetTransactionStatus(first, paddle.TransactionStatusCanceled)
+	f.paddle.Respond("POST /transactions", http.StatusCreated,
+		`{"data":{"id":"txn_manual","status":"draft","collection_mode":"manual"}}`)
+
+	if id, err := f.startCheckout(acct); id != "" || connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatalf("replace checkout = %q, %v; want no ID and unavailable", id, err)
+	}
+	sub, err := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if err != nil || sub.Status != SubscriptionPending || sub.CheckoutTransactionID != first {
+		t.Fatalf("subscription = %+v, %v; want pending checkout %q", sub, err, first)
+	}
+	if mappings := f.checkoutRows(acct); mappings != 1 {
+		t.Fatalf("checkout mappings after failed replacement = %d, want 1", mappings)
+	}
+	if n := f.createTransactionRequests(); n != 2 {
+		t.Fatalf("create requests after failed replacement = %d, want 2", n)
+	}
+
+	f.paddle.Respond("POST /transactions", 0, "")
+	replacement, err := f.startCheckout(acct)
+	if err != nil || replacement == "" || replacement == first {
+		t.Fatalf("replacement retry = %q, %v; want a new checkout", replacement, err)
+	}
+	if mappings := f.count(`SELECT count(*) FROM paddle_checkouts
+		WHERE billing_account_id = $1 AND paddle_transaction_id IN ($2, $3)`, acct, first, replacement); mappings != 2 {
+		t.Fatalf("original and replacement mappings = %d, want 2", mappings)
+	}
+	if id, err := f.startCheckout(acct); err != nil || id != replacement {
+		t.Fatalf("reuse replacement = %q, %v; want %q", id, err, replacement)
+	}
+	if n := f.createTransactionRequests(); n != 3 {
+		t.Fatalf("create requests after replacement reuse = %d, want 3", n)
 	}
 }
 
