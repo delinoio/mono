@@ -9,6 +9,7 @@ package ownsand
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"net"
 	"net/http"
@@ -1109,7 +1110,15 @@ type fakeWrite struct {
 	path   string
 	digest []byte
 	data   []byte
-	done   *ownsandv1.WriteFileResponse
+	done   *fakeCompletedWrite
+}
+
+type fakeCompletedWrite struct {
+	sizeBytes   int64
+	mode        uint32
+	chunkOffset int64
+	chunkDigest [sha256.Size]byte
+	response    *ownsandv1.WriteFileResponse
 }
 
 func newFakeAgent() *fakeAgent {
@@ -1288,8 +1297,13 @@ func (a *fakeAgent) write(req *ownsandv1.WriteFileRequest, grantDigest []byte) (
 	if grantDigest != nil && !relaybinding.Equal(grantDigest, w.digest) {
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("digest mismatch"))
 	}
-	if w.done != nil {
-		return w.done, nil
+	finish := req.GetFinish()
+	if done := w.done; done != nil {
+		if finish == nil || finish.GetSizeBytes() != done.sizeBytes || finish.GetMode() != done.mode ||
+			req.GetOffset() != done.chunkOffset || sha256.Sum256(req.GetData()) != done.chunkDigest {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("write already finished with different finish fields"))
+		}
+		return done.response, nil
 	}
 	end := req.GetOffset() + int64(len(req.GetData()))
 	if int64(len(w.data)) < end {
@@ -1297,13 +1311,19 @@ func (a *fakeAgent) write(req *ownsandv1.WriteFileRequest, grantDigest []byte) (
 	}
 	copy(w.data[req.GetOffset():], req.GetData())
 	res := &ownsandv1.WriteFileResponse{WriteId: req.GetWriteId(), Offset: req.GetOffset(), Length: int64(len(req.GetData()))}
-	if fin := req.GetFinish(); fin != nil {
-		if fin.GetSizeBytes() != int64(len(w.data)) {
+	if finish != nil {
+		if finish.GetSizeBytes() != int64(len(w.data)) {
 			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("ranges do not cover the size"))
 		}
 		a.files[w.path] = append([]byte(nil), w.data...)
-		res.Finished, res.SizeBytes = true, fin.GetSizeBytes()+a.writeSizeDelta
-		w.done = res
+		res.Finished, res.SizeBytes = true, finish.GetSizeBytes()+a.writeSizeDelta
+		w.done = &fakeCompletedWrite{
+			sizeBytes:   finish.GetSizeBytes(),
+			mode:        finish.GetMode(),
+			chunkOffset: req.GetOffset(),
+			chunkDigest: sha256.Sum256(req.GetData()),
+			response:    res,
+		}
 	}
 	return res, nil
 }
