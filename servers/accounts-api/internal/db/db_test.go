@@ -41,6 +41,9 @@ func TestOpenRejectsMalformedURLWithoutEchoingIt(t *testing.T) {
 }
 
 func TestOpenDoesNotConnect(t *testing.T) {
+	// Skip pgx service lookup so the fixture does not require a local service file.
+	t.Setenv("PGSERVICE", "")
+
 	// Port 1 on loopback refuses connections; Open must still succeed.
 	d, err := db.Open(context.Background(), "postgres://user@127.0.0.1:1/none?connect_timeout=1")
 	if err != nil {
