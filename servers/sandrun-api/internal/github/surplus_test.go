@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
@@ -129,6 +130,150 @@ func TestSurplusLeaseRecovery(t *testing.T) {
 				t.Fatalf("redelivery changed the terminal request or queued another check: %v", got)
 			}
 		})
+	}
+}
+
+func TestSurplusRetriesRenamedRunnerRemoval(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	profileID := w.createProfile(t, ghProfile("linux", 1))
+	runSurplusTestDrivers(t, w)
+	waiting := sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	w.l.Engine.Pass(t.Context(), w.org.ID)
+	eventually(t, "old-label warm runner", func() bool { return len(w.runnersIn(t, waiting)) == 1 })
+	old := w.runnersIn(t, waiting)[0]
+	oldName := "sandrun-" + old.GetRunnerId()
+	oldReg, ok := w.gh.RunnerByName(oldName)
+	if !ok {
+		t.Fatal("old-label runner has no GitHub registration")
+	}
+
+	renameGitHubProfile(t, w, profileID)
+	// Keep the old runner through queued-event cleanup while the new runner starts.
+	w.gh.SetBusy(oldName, true)
+	w.send(t, "workflow_job", job("queued", 501, 1, []string{renamedLabel}, ""))
+	w.l.GitHub.Wait()
+	w.gh.SetBusy(oldName, false)
+	w.env.Clock.Advance(time.Second)
+	w.l.Engine.Pass(t.Context(), w.org.ID)
+	assertRenamedCapacity(t, w, old.GetRunnerId())
+	var current *sandrunv1.Runner
+	for _, r := range w.runnersIn(t, waiting) {
+		if r.GetRunnerId() != old.GetRunnerId() {
+			current = r
+		}
+	}
+	if current == nil || !current.GetCreatedAt().AsTime().After(old.GetCreatedAt().AsTime()) {
+		t.Fatalf("expected a newer current-label runner, got %v", current)
+	}
+
+	var oldAttempts, otherAttempts atomic.Int32
+	var orderViolation atomic.Bool
+	w.os.SetDeleteHook(func(context.Context) error {
+		if _, ok := w.gh.RunnerByName(oldName); ok {
+			orderViolation.Store(true)
+		}
+		return nil
+	})
+	var failOld atomic.Bool
+	failOld.Store(true)
+	w.gh.Update(func() {
+		w.gh.DeleteGate = func(id int64) {
+			status := 0
+			if id == oldReg.ID {
+				oldAttempts.Add(1)
+				if failOld.Load() {
+					status = http.StatusServiceUnavailable
+				}
+			} else {
+				otherAttempts.Add(1)
+			}
+			w.gh.Update(func() { w.gh.FailDelete = status })
+		}
+	})
+	w.send(t, "workflow_job", job("completed", 501, 1, []string{renamedLabel}, ""))
+	var generation string
+	var due time.Time
+	const checkQuery = "SELECT generation::text, check_after FROM github_surplus_checks WHERE organization_id = $1"
+	if err := w.env.DB.Pool.QueryRow(t.Context(), checkQuery, w.org.ID).Scan(&generation, &due); err != nil {
+		t.Fatal(err)
+	}
+
+	w.l.GitHub.CheckSurplusOnce(t.Context())
+	if oldAttempts.Load() != 1 || otherAttempts.Load() != 0 {
+		t.Fatalf("GitHub delete attempts for old runner = %d, for others = %d, want 1 and 0", oldAttempts.Load(), otherAttempts.Load())
+	}
+	assertRegistrationLabel(t, w, old.GetRunnerId(), "sandrun-linux", "acme")
+	assertRegistrationLabel(t, w, current.GetRunnerId(), renamedLabel, "acme")
+	if w.runner(t, old.GetRunnerId()).GetState() != waiting || w.runner(t, current.GetRunnerId()).GetState() != waiting ||
+		w.os.Active(w.osOrg) != 2 || w.os.Calls("DeleteSandbox") != 0 {
+		t.Fatal("failed rename cleanup changed a waiting runner or its sandbox")
+	}
+	var retryGeneration string
+	var retryDue time.Time
+	err := w.env.DB.Pool.QueryRow(t.Context(), checkQuery, w.org.ID).Scan(&retryGeneration, &retryDue)
+	if err != nil || retryGeneration != generation || !retryDue.After(due) {
+		t.Fatalf("retry generation = %q, due = %v, want %q after %v, error = %v", retryGeneration, retryDue, generation, due, err)
+	}
+
+	failOld.Store(false)
+	eventually(t, "same surplus check due for retry", func() bool {
+		var due bool
+		if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT check_after <= now() FROM github_surplus_checks WHERE generation = $1", generation).Scan(&due); err != nil {
+			t.Fatal(err)
+		}
+		return due
+	})
+	w.l.GitHub.CheckSurplusOnce(t.Context())
+	eventually(t, "old runner deleted", func() bool {
+		return w.runner(t, old.GetRunnerId()).GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETED
+	})
+	if oldAttempts.Load() != 2 || otherAttempts.Load() != 0 {
+		t.Fatalf("GitHub delete attempts after retry: old = %d, others = %d, want 2 and 0", oldAttempts.Load(), otherAttempts.Load())
+	}
+	if r := w.runner(t, old.GetRunnerId()); r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+		t.Fatalf("old runner end reason = %v, want CLEAN_UP", r.GetEndReason())
+	}
+	if _, ok := w.gh.RunnerByName(oldName); ok || orderViolation.Load() || w.os.Active(w.osOrg) != 1 {
+		t.Fatal("retry did not remove the old registration before deleting its sandbox")
+	}
+	for _, sandbox := range w.os.Sandboxes(w.osOrg) {
+		if sandbox.GetSandboxId() == old.GetOwnsandSandboxId() && sandbox.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatal("retry did not delete the old runner's sandbox")
+		}
+	}
+	assertRegistrationLabel(t, w, current.GetRunnerId(), renamedLabel, "acme")
+	if w.runner(t, current.GetRunnerId()).GetState() != waiting || pendingSurplusGeneration(t, w) != "" {
+		t.Fatal("retry did not preserve the warm reserve and acknowledge the generation")
+	}
+}
+
+func TestSurplusAcknowledgesBusyRenamedRunner(t *testing.T) {
+	w := newGHWorld(t, worldOpts{manualDispatch: true})
+	w.link(t, 501, "acme")
+	profileID := w.createProfile(t, ghProfile("linux", 1))
+	runSurplusTestDrivers(t, w)
+	waiting := sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	w.l.Engine.Pass(t.Context(), w.org.ID)
+	eventually(t, "old-label warm runner", func() bool { return len(w.runnersIn(t, waiting)) == 1 })
+	oldID := w.runnersIn(t, waiting)[0].GetRunnerId()
+	renameGitHubProfile(t, w, profileID)
+	w.gh.SetBusy("sandrun-"+oldID, true)
+
+	w.send(t, "workflow_job", job("completed", 501, 1, []string{renamedLabel}, ""))
+	if pendingSurplusGeneration(t, w) == "" {
+		t.Fatal("completion did not schedule a surplus check")
+	}
+	w.l.GitHub.CheckSurplusOnce(t.Context())
+	if w.gh.Calls("delete_runner") != 1 || !strings.Contains(w.env.Logs.String(), "github_runner_removal_refused") {
+		t.Fatal("GitHub refusal did not take the busy path")
+	}
+	assertRegistrationLabel(t, w, oldID, "sandrun-linux", "acme")
+	if w.runner(t, oldID).GetState() != waiting || w.os.Active(w.osOrg) != 1 || w.os.Calls("DeleteSandbox") != 0 {
+		t.Fatal("GitHub refusal changed the old runner or its sandbox")
+	}
+	if pendingSurplusGeneration(t, w) != "" {
+		t.Fatal("GitHub refusal left a pending retry")
 	}
 }
 
