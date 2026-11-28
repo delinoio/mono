@@ -1091,36 +1091,43 @@ func (s *stack) waitDeviceOnline(c *ownsand.Client, skip map[string]bool) string
 // control plane process for that message.
 func awaitDeviceReconciled(ctx context.Context, interval time.Duration, skip map[string]bool,
 	listOnline func(context.Context) ([]string, error), reconciled func(id string) bool, process string) (string, error) {
-	// pending is the last online device that was not reconciled.
+	// Keep the last eligible online observation even if it disappears from a later list.
 	pending := ""
+	var contextErr error
+poll:
 	for {
+		if contextErr = pollPhaseContextErr(ctx); contextErr != nil {
+			break
+		}
 		online, err := listOnline(ctx)
-		switch {
-		case err == nil:
-			pending = ""
-			for _, id := range online {
-				if skip[id] {
-					continue
-				}
-				if reconciled(id) {
-					return id, nil
-				}
-				if pending == "" {
-					pending = id
-				}
-			}
-		case ctx.Err() == nil:
+		if contextErr = pollPhaseContextErr(ctx); contextErr != nil {
+			break
+		}
+		if err != nil {
 			return "", fmt.Errorf("ListDevices: %w", err)
+		}
+		for _, id := range online {
+			if skip[id] {
+				continue
+			}
+			pending = id
+			ready := reconciled(id)
+			if contextErr = pollPhaseContextErr(ctx); contextErr != nil {
+				break poll
+			}
+			if ready {
+				return id, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
-			if pending == "" {
-				return "", errors.New("the device did not come online: no new device is ONLINE")
-			}
-			return "", fmt.Errorf("device %s is ONLINE but agent_state_report was not observed for it in the logs of process %s", pending, process)
 		case <-time.After(interval):
 		}
 	}
+	if pending == "" {
+		return "", fmt.Errorf("the device did not come online: no new device is ONLINE: %w", contextErr)
+	}
+	return "", fmt.Errorf("device %s was observed ONLINE, but the harness could not confirm its agent_state_report within the wait (process %s): %w", pending, process, contextErr)
 }
 
 // cliResult is the result of one CLI run.
