@@ -4,12 +4,15 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
@@ -260,4 +263,160 @@ func TestConcurrentCreateRPCAndOrganizationDeletion(t *testing.T) {
 			t.Logf("%s committed first: %d, deletion first: %d", rpc.name, committedFirst, deletedFirst)
 		})
 	}
+}
+
+// TestPlacementLocksDevicesInAscendingIDOrder checks that the locking query
+// takes the lower device lock first, even when a heap scan sees it last.
+func TestPlacementLocksDevicesInAscendingIDOrder(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	lower, higher := setupPlacementDevices(t, env, org, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	// Put the higher ID first in the heap and force the placement query to
+	// scan the heap. An index scan could hide a missing ORDER BY.
+	config := env.DB.Pool.Config().ConnConfig
+	database := pgx.Identifier{config.Database}.Sanitize()
+	for _, stmt := range []string{
+		"CREATE INDEX placement_test_reverse_devices ON devices (device_id DESC)",
+		"CLUSTER devices USING placement_test_reverse_devices",
+		"ALTER DATABASE " + database + " SET enable_indexscan = off",
+		"ALTER DATABASE " + database + " SET enable_bitmapscan = off",
+	} {
+		if _, err := env.DB.Pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.DB.Pool.Reset()
+
+	observer, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = observer.Close(context.Background()) }()
+	var first string
+	if err := observer.QueryRow(ctx, "SELECT device_id::text FROM devices ORDER BY ctid LIMIT 1").Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if first != higher {
+		t.Fatalf("first device in heap order = %s, want higher ID %s", first, higher)
+	}
+
+	holder := holdPlacementDevice(t, env, higher)
+	req := createReq(org.ID)
+	req.Placement = &ownsandv1.Placement{DeviceId: &lower}
+	done := make(chan error, 1)
+	go func() {
+		_, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(req))
+		done <- err
+	}()
+
+	waitForLockWaiter(t, env, "SELECT 1 FROM devices WHERE organization_id", "FOR UPDATE")
+	_, err = observer.Exec(ctx, "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE NOWAIT", lower)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("lock lower device while placement waits for higher device: got %v, want SQLSTATE 55P03", err)
+	}
+	t.Log("placement holds the lower device lock while waiting for the higher device lock")
+
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	err = <-done
+	requireNoDeadlock(t, "explicit create", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentPlacementReservesCapacityAcrossDevices(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	limits := &ownsandv1.DeviceLimits{VcpuCount: 2, MemoryMib: 1024, DiskGib: 10, VcpuOvercommitPercent: 100}
+	lower, higher := setupPlacementDevices(t, env, org, limits)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	// Both requests must reach placement before either reserves capacity.
+	holder := holdPlacementDevice(t, env, lower)
+	automatic, explicit := createReq(org.ID), createReq(org.ID)
+	explicit.Placement = &ownsandv1.Placement{DeviceId: &higher}
+	type result struct {
+		deviceID string
+		err      error
+	}
+	start := func(req *ownsandv1.CreateSandboxRequest) <-chan result {
+		done := make(chan result, 1)
+		go func() {
+			response, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(req))
+			if err != nil {
+				done <- result{err: err}
+				return
+			}
+			done <- result{deviceID: response.Msg.GetSandbox().GetDeviceId()}
+		}()
+		return done
+	}
+	automaticDone, explicitDone := start(automatic), start(explicit)
+	testenv.Eventually(t, "both creates waiting on device row locks", func() bool {
+		var waiting int
+		err := env.DB.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			AND query LIKE 'SELECT 1 FROM devices WHERE organization_id = %FOR UPDATE'`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waiting == 2
+	})
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, call := range []struct {
+		name, deviceID string
+		done           <-chan result
+	}{
+		{"automatic", lower, automaticDone},
+		{"explicit", higher, explicitDone},
+	} {
+		r := <-call.done
+		requireNoDeadlock(t, call.name, r.err)
+		if r.err != nil || r.deviceID != call.deviceID {
+			t.Fatalf("%s create: device = %s, err = %v, want device %s", call.name, r.deviceID, r.err, call.deviceID)
+		}
+		response, err := org.OwnerClient.Device.GetDevice(ctx,
+			connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: call.deviceID}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		allocation := response.Msg.GetDevice().GetAllocation()
+		if allocation.GetVcpuCount() != limits.GetVcpuCount() || allocation.GetMemoryMib() != limits.GetMemoryMib() || allocation.GetDiskGib() != limits.GetDiskGib() {
+			t.Fatalf("%s device allocation = %v, want 2 vCPU, 1024 MiB, 10 GiB", call.name, allocation)
+		}
+	}
+	if _, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID))); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("create with both devices full: got %v, want unavailable", err)
+	}
+	t.Log("both creates completed with one full reservation per device; a third create returned unavailable")
+}
+
+func setupPlacementDevices(t *testing.T, env *testenv.Env, org *testenv.Org, limits *ownsandv1.DeviceLimits) (lower, higher string) {
+	t.Helper()
+	a, _ := setupAgent(t, env, org, limits)
+	b, _ := setupAgent(t, env, org, limits)
+	return min(a.ID, b.ID), max(a.ID, b.ID)
+}
+
+func holdPlacementDevice(t *testing.T, env *testenv.Env, deviceID string) pgx.Tx {
+	t.Helper()
+	tx, err := env.DB.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	if _, err := tx.Exec(t.Context(), "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE", deviceID); err != nil {
+		t.Fatal(err)
+	}
+	return tx
 }

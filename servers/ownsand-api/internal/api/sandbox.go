@@ -101,10 +101,11 @@ func (s *Service) lookupIdempotent(ctx context.Context, q db.Querier, orgID, key
 	return loadSandbox(ctx, q, orgID, sandboxID, false)
 }
 
-// placementDevices loads every non-removed device of the organization for
-// the scheduler. The caller holds row locks on them.
+// placementDevices locks every non-removed device of the organization in
+// ascending device_id order so concurrent placements acquire the same locks in
+// the same order. It then loads the devices for the scheduler.
 func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string, lineage string) ([]scheduler.Device, error) {
-	if _, err := tx.Exec(ctx, "SELECT 1 FROM devices WHERE organization_id = $1 AND state <> $2 FOR UPDATE",
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM devices WHERE organization_id = $1 AND state <> $2 ORDER BY device_id FOR UPDATE",
 		orgID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED)); err != nil {
 		return nil, err
 	}
