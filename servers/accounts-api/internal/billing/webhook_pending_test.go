@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle/paddletest"
@@ -101,16 +102,16 @@ func TestAdjustmentBeforePurchaseMatchesGrantFirst(t *testing.T) {
 	}
 }
 
-// TestPendingAdjustmentsKeepTheCapAndAccumulate checks that the cap of the
-// purchase applies to pending adjustments in arrival order, with the credit
-// that usage already used turning into debt.
+// TestPendingAdjustmentsKeepTheCapAndAccumulate checks that pending adjustments
+// apply oldest first and together debit at most the purchase credit. The refund
+// arrives first with a higher ID and leaves $4 of the $10 cap for the chargeback.
 func TestPendingAdjustmentsKeepTheCapAndAccumulate(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
-	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_a", "refund", "approved", "txn_buy", 600))
-	f.clock.Advance(1)
-	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_b", "chargeback", "approved", "txn_buy", 1000))
+	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_b", "refund", "approved", "txn_buy", 600))
+	f.clock.Advance(time.Second)
+	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_a", "chargeback", "approved", "txn_buy", 1000))
 	f.webhook(paddle.EventTransactionCompleted, purchase("txn_buy", acct, LedgerSubscriptionCredit, 1000))
 	f.wantLedger(acct,
 		wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
