@@ -108,9 +108,9 @@ type Server struct {
 	linkKeys        map[string]string
 	integrationReqs []*sandrunv1.CreateAgentIntegrationRequest
 	integration     []*sandrunv1.AgentIntegration
-	queueByOrg      map[string]*scopedQueue
+	queueByOrg      map[string]*watchQueue
 	watchDone       chan struct{}
-	unscopedQueue   chan *sandrunv1.WatchQueueResponse
+	unscopedQueue   watchQueue
 
 	guest *guest
 }
@@ -127,9 +127,9 @@ func New() *Server {
 		sessionGets:   map[string]int{},
 		sessionExecs:  map[string]*sessionExecs{},
 		links:         map[string]*sandrunv1.OwnSandLink{},
-		queueByOrg:    map[string]*scopedQueue{},
+		queueByOrg:    map[string]*watchQueue{},
 		watchDone:     make(chan struct{}),
-		unscopedQueue: make(chan *sandrunv1.WatchQueueResponse, queueBufferSize),
+		unscopedQueue: watchQueue{ready: make(chan struct{})},
 	}
 	s.guest = newGuest(s)
 	opts := connect.WithInterceptors(&interceptor{s: s})
@@ -159,6 +159,7 @@ func (s *Server) Close() {
 	s.mu.Lock()
 	if s.queueByOrg != nil {
 		s.queueByOrg = nil
+		s.unscopedQueue = watchQueue{}
 		close(s.watchDone)
 	}
 	s.mu.Unlock()
