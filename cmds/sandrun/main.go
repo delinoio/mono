@@ -27,7 +27,7 @@ func runSandRun(interruptRestored func()) int {
 			interruptRestored()
 		}
 	}()
-	code := cli.Run(ctx, cli.Env{Args: os.Args[1:]})
+	code := runCLI(ctx, cli.Env{Args: os.Args[1:]})
 	stop()
 	return code
 }
