@@ -297,6 +297,60 @@ describe("sandboxes", () => {
     ).toBeVisible();
   });
 
+  for (const [field, name, expected, message] of [
+    ["vCPUs", "vcpuCount", 1, "Enter at least 1 vCPU."],
+    ["Disk (GiB)", "diskGib", "1", "Enter the disk size in GiB."],
+  ] as const) {
+    for (const submission of ["Enter", "blur"] as const) {
+      test(`rejects zero sandbox ${field} on ${submission}`, async ({
+        app,
+        screen,
+        browser,
+      }) => {
+        await app.open("/");
+        await screen.getByRole("button", "Sign in with Delino").tap();
+        await app.open(`/orgs/${ACME}/sandboxes`);
+        await screen.getByRole("button", "Create sandbox").tap();
+
+        const dialog = screen.getByRole("dialog", "Create a sandbox");
+        const input = dialog.getByLabel(field);
+        const create = dialog.getByRole("button", "Create");
+        await trackResourceMutation(browser, "CreateSandbox");
+        await input.tap();
+        await browser.keyboard.press("ControlOrMeta+A");
+        await browser.keyboard.type("0");
+        if (submission === "Enter") {
+          await browser.keyboard.press("Enter");
+        } else {
+          await browser.keyboard.press("Tab");
+          await create.tap();
+        }
+
+        await expect(dialog).toBeVisible();
+        await expect(input).toHaveValue("0");
+        await expect(input).toHaveAttribute("aria-invalid", "true");
+        await expect(dialog.getByText(message)).toBeVisible();
+        expect(await resourceWrites(browser)).toHaveLength(0);
+
+        if (submission === "Enter") {
+          await browser.keyboard.press("ArrowUp");
+        } else {
+          await input.tap();
+          await browser.keyboard.press("ControlOrMeta+A");
+          await browser.keyboard.type("1");
+        }
+        await expect(input).toHaveValue("1");
+        expect(await resourceWrites(browser)).toHaveLength(0);
+        await create.tap();
+        await expect(dialog).toBeHidden();
+        await expect(browser).toHaveURL(/\/sandboxes\/[0-9a-f-]+$/);
+        const writes = await resourceWrites(browser);
+        expect(writes).toHaveLength(1);
+        expect(writes[0]?.resources?.[name]).toBe(expected);
+      });
+    }
+  }
+
   for (const [field, name, fraction, correction, expected, message] of [
     [
       "vCPUs",
