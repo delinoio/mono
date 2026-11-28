@@ -1196,6 +1196,56 @@ test("capacity groups only open runners assigned to devices in the organization"
   ]);
 });
 
+test("capacity follows the OwnSand organization after relinking", async () => {
+  const transport = createMockTransport();
+  const work = createClient(WorkService, transport);
+  const links = createClient(OwnSandLinkService, transport);
+  const organization = { organizationId: MOCK_IDS.acme };
+  const ownsandOrganizationId = "0193a000-0000-7000-8000-00000000f036";
+
+  const { devices } = await work.getCapacity(organization);
+  expect(devices.map(({ name }) => name)).toEqual([
+    "build-box",
+    "studio-mac",
+    "win-desk",
+  ]);
+
+  await links.removeOwnSandLink(organization);
+  await expect(work.getCapacity(organization)).rejects.toMatchObject({
+    code: Code.FailedPrecondition,
+  });
+
+  await links.setOwnSandLink({
+    ...organization,
+    ownsandOrganizationId,
+    ownsandApiKey: "osk_fixture",
+  });
+  const { link } = await links.getOwnSandLink(organization);
+  expect(link?.ownsandOrganizationId).toBe(ownsandOrganizationId);
+  expect((await work.getCapacity(organization)).devices).toEqual([]);
+});
+
+test("capacity retains the device pool after a key replacement", async () => {
+  const transport = createMockTransport();
+  const work = createClient(WorkService, transport);
+  const links = createClient(OwnSandLinkService, transport);
+  const organization = { organizationId: MOCK_IDS.acme };
+  const before = await work.getCapacity(organization);
+  expect(before.devices.map(({ name }) => name)).toEqual([
+    "build-box",
+    "studio-mac",
+    "win-desk",
+  ]);
+
+  await links.setOwnSandLink({
+    ...organization,
+    ownsandOrganizationId: MOCK_IDS.ownsandAcme,
+    ownsandApiKey: "osk_fixture_replacement",
+  });
+
+  expect(await work.getCapacity(organization)).toEqual(before);
+});
+
 test.each([
   [MOCK_IDS.globex, "the organization has no OwnSand link"],
   [
