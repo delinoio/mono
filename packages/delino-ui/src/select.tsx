@@ -149,7 +149,7 @@ export function Select({
 }
 
 export type SelectOptionProps = Omit<
-  React.ComponentProps<typeof SelectItem>,
+  React.ComponentProps<typeof SelectItem<string>>,
   "children"
 > & {
   /**
