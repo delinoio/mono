@@ -153,6 +153,7 @@ func TestNewServerLogsRequestsRejectedBeforeTheHandler(t *testing.T) {
 
 func TestNewServerLogsHeaderReadTimeout(t *testing.T) {
 	const headerTimeout = 200 * time.Millisecond
+	const waitLimit = 5 * time.Second
 	for _, tc := range []struct {
 		name string
 		// send is written before the connection stalls.
@@ -162,19 +163,17 @@ func TestNewServerLogsHeaderReadTimeout(t *testing.T) {
 		{"partial request head", "GET /healthz HTTP/1.1\r\nHost: test\r\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			addr, logs := startRejectLogServer(t, headerTimeout, time.Minute)
+			addr, logs, observed := startReadDeadlineServer(t, headerTimeout, readTimeout)
 			conn := dialRaw(t, addr)
 			if tc.send != "" {
 				if _, err := io.WriteString(conn, tc.send); err != nil {
 					t.Fatalf("write: %v", err)
 				}
 			}
-			elapsed, response := expectClosedWithin(t, conn, 5*time.Second)
+			observed.assertReadTimeout(t, waitLimit, headerTimeout/2)
+			_, response := expectClosedWithin(t, conn, waitLimit)
 			if response != "" {
 				t.Errorf("response = %q, want none: net/http closes without a response", response)
-			}
-			if elapsed < headerTimeout/2 {
-				t.Errorf("connection closed after %v, want it to wait for ReadHeaderTimeout", elapsed)
 			}
 
 			records := waitForRejectedRecords(t, logs, 1)

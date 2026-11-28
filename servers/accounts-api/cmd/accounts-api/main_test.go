@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -637,24 +638,162 @@ func expectClosedWithin(t *testing.T, conn net.Conn, limit time.Duration) (time.
 	return elapsed, string(received)
 }
 
-func TestNewServerClosesConnectionWithStalledRequestBody(t *testing.T) {
-	const timeout = 300 * time.Millisecond
-	addr, _ := startShortTimeoutServer(t, timeout)
+// readDeadlineListener observes one loopback connection. Its buffers let the
+// server finish before the test reads any events or drains the client socket.
+type readDeadlineListener struct {
+	net.Listener
+	deadlines chan readDeadlineEvent
+	timedOut  chan time.Time
+	closed    chan struct{}
+}
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
+type readDeadlineEvent struct {
+	installedAt time.Time
+	deadline    time.Time
+}
+
+func startReadDeadlineServer(t *testing.T, headerTimeout, requestTimeout time.Duration) (string, *syncBuffer, *readDeadlineListener) {
+	t.Helper()
+	observed := &readDeadlineListener{
+		deadlines: make(chan readDeadlineEvent, 2),
+		timedOut:  make(chan time.Time, 1),
+		closed:    make(chan struct{}, 1),
 	}
-	defer conn.Close()
+	addr, logs, _, _ := startRejectLogServerWithShutdown(t, headerTimeout, time.Minute, func(srv *http.Server, listener net.Listener) net.Listener {
+		srv.ReadTimeout = requestTimeout
+		observed.Listener = listener
+		return observed
+	})
+	return addr, logs, observed
+}
+
+func (l *readDeadlineListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	// The fixture uses a TCP listener. Embedding TCPConn also preserves CloseWrite.
+	return &readDeadlineConn{TCPConn: conn.(*net.TCPConn), listener: l}, nil
+}
+
+type readDeadlineConn struct {
+	*net.TCPConn
+	listener *readDeadlineListener
+}
+
+func (c *readDeadlineConn) SetReadDeadline(deadline time.Time) error {
+	err := c.TCPConn.SetReadDeadline(deadline)
+	if now := time.Now(); err == nil && deadline.After(now) {
+		select {
+		case c.listener.deadlines <- readDeadlineEvent{installedAt: now, deadline: deadline}:
+		default:
+		}
+	}
+	return err
+}
+
+func (c *readDeadlineConn) Read(p []byte) (int, error) {
+	n, err := c.TCPConn.Read(p)
+	at := time.Now()
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		select {
+		case c.listener.timedOut <- at:
+		default:
+		}
+	}
+	return n, err
+}
+
+func (c *readDeadlineConn) Close() error {
+	err := c.TCPConn.Close()
+	if err == nil {
+		c.listener.closed <- struct{}{}
+	}
+	return err
+}
+
+var errClosedWithoutReadTimeout = errors.New("server closed the connection without a read timeout")
+
+func (l *readDeadlineListener) readTimeoutAfterClose(limit time.Duration) (time.Time, error) {
+	select {
+	case <-l.closed:
+	case <-time.After(limit):
+		return time.Time{}, fmt.Errorf("server did not close the connection within %v", limit)
+	}
+	// Read publishes its timeout before returning control to the server.
+	select {
+	case at := <-l.timedOut:
+		return at, nil
+	default:
+		return time.Time{}, errClosedWithoutReadTimeout
+	}
+}
+
+func (l *readDeadlineListener) nextDeadline(t *testing.T, phase string) readDeadlineEvent {
+	t.Helper()
+	select {
+	case event := <-l.deadlines:
+		return event
+	default:
+		t.Fatalf("server did not install a future %s read deadline", phase)
+		return readDeadlineEvent{}
+	}
+}
+
+func (l *readDeadlineListener) assertReadTimeout(t *testing.T, limit, minimum time.Duration) (readDeadlineEvent, time.Time) {
+	t.Helper()
+	timedOutAt, err := l.readTimeoutAfterClose(limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := l.nextDeadline(t, "header")
+	if elapsed := timedOutAt.Sub(initial.installedAt); elapsed < minimum {
+		t.Errorf("server read timed out after %v, want at least %v after it armed the header deadline", elapsed, minimum)
+	}
+	return initial, timedOutAt
+}
+
+func TestNewServerClosesConnectionWithStalledRequestBody(t *testing.T) {
+	const headerTimeout = 200 * time.Millisecond
+	const requestTimeout = 300 * time.Millisecond
+	const waitLimit = 10 * requestTimeout
+	addr, _, observed := startReadDeadlineServer(t, headerTimeout, requestTimeout)
+
+	conn := dialRaw(t, addr)
 	// Full headers with a declared body, then no body bytes.
 	if _, err := io.WriteString(conn, "POST /healthz HTTP/1.1\r\nHost: test\r\nContent-Length: 100\r\n\r\n"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	elapsed, _ := expectClosedWithin(t, conn, 10*timeout)
-	if elapsed < timeout/2 {
-		t.Errorf("connection closed after %v, want it held until about ReadTimeout %v", elapsed, timeout)
+	initial, timedOutAt := observed.assertReadTimeout(t, waitLimit, requestTimeout/2)
+	body := observed.nextDeadline(t, "whole-request")
+	// The whole-request deadline follows header parsing. net/http can anchor
+	// the header deadline earlier, when it sets up the connection.
+	const minimumShift = (requestTimeout - headerTimeout) / 2
+	if shift := body.deadline.Sub(initial.deadline); shift < minimumShift {
+		t.Errorf("whole-request deadline shifted by %v, want at least %v", shift, minimumShift)
 	}
+	if timedOutAt.Before(body.deadline) {
+		t.Error("server read timed out before the whole-request deadline")
+	}
+	expectClosedWithin(t, conn, waitLimit)
+}
+
+func TestReadDeadlineListenerDetectsEarlyClose(t *testing.T) {
+	t.Parallel()
+	const waitLimit = 5 * time.Second
+	addr, _, observed := startReadDeadlineServer(t, time.Minute, 2*time.Minute)
+	conn := dialRaw(t, addr)
+	// EOF at the start of the request makes the server close its socket while
+	// the header deadline is still in the future.
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("close client write side: %v", err)
+	}
+	if _, err := observed.readTimeoutAfterClose(waitLimit); !errors.Is(err, errClosedWithoutReadTimeout) {
+		t.Fatalf("wait for server timeout and close: got %v, want %v", err, errClosedWithoutReadTimeout)
+	}
+	observed.nextDeadline(t, "header")
+	expectClosedWithin(t, conn, waitLimit)
 }
 
 func TestNewServerClosesIdleKeepAliveConnection(t *testing.T) {
