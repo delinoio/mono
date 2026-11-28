@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
@@ -63,23 +64,30 @@ func multiFragmentFrame(t *testing.T, sess *p2pSession, id uint64) *ownsandv1.Da
 // bounded by the caller's context, not by this interval.
 const readyPoll = time.Millisecond
 
-// awaitReady waits until ready reports true and returns an error that names
-// the phase otherwise. It stops with a distinct error when the worker reports
-// completion on done first (the worker exited before the phase was reached)
-// and when ctx ends first (the phase never arrived). ready is checked before
-// the other outcomes, so a phase that was reached always wins.
-func awaitReady(ctx context.Context, phase string, ready func() bool, done <-chan error) error {
+// awaitReady waits until ready reports true and returns the channel for the
+// subsequent worker wait. It checks readiness again when the worker finishes
+// or ctx ends. If the worker result was already received, the returned channel
+// holds that result. If readiness is still false, the error names the phase.
+func awaitReady(ctx context.Context, phase string, ready func() bool, done <-chan error) (<-chan error, error) {
 	tick := time.NewTicker(readyPoll)
 	defer tick.Stop()
 	for {
 		if ready() {
-			return nil
+			return done, nil
 		}
 		select {
 		case err := <-done:
-			return fmt.Errorf("the worker exited before %s: %v", phase, err)
+			if ready() {
+				result := make(chan error, 1)
+				result <- err
+				return result, nil
+			}
+			return nil, fmt.Errorf("the worker exited before %s: %v", phase, err)
 		case <-ctx.Done():
-			return fmt.Errorf("%s never arrived: %w", phase, ctx.Err())
+			if ready() {
+				return done, nil
+			}
+			return nil, fmt.Errorf("%s never arrived: %w", phase, ctx.Err())
 		case <-tick.C:
 		}
 	}
@@ -108,12 +116,15 @@ func closed(ch <-chan struct{}) func() bool {
 	}
 }
 
-// requireReady fails the test with the phase-specific diagnostic of awaitReady.
-func requireReady(t *testing.T, ctx context.Context, phase string, ready func() bool, done <-chan error) {
+// requireReady returns the channel for the worker wait or fails the test with
+// the phase-specific diagnostic of awaitReady.
+func requireReady(t *testing.T, ctx context.Context, phase string, ready func() bool, done <-chan error) <-chan error {
 	t.Helper()
-	if err := awaitReady(ctx, phase, ready, done); err != nil {
+	workerDone, err := awaitReady(ctx, phase, ready, done)
+	if err != nil {
 		t.Fatal(err)
 	}
+	return workerDone
 }
 
 // requireWorker returns the worker result or fails the test with the
@@ -185,9 +196,9 @@ func TestSendCancelledBeforeFirstFragmentKeepsSession(t *testing.T) {
 	defer cancelSend()
 	errc := make(chan error, 1)
 	go func() { errc <- sess.send(sendCtx, frame) }()
-	requireReady(t, ctx, "the send waiting on the full buffer", closed(waiting), errc)
+	workerDone := requireReady(t, ctx, "the send waiting on the full buffer", closed(waiting), errc)
 	cancelSend()
-	if err := requireWorker(t, ctx, "after the send was canceled", errc); !errors.Is(err, context.Canceled) {
+	if err := requireWorker(t, ctx, "after the send was canceled", workerDone); !errors.Is(err, context.Canceled) {
 		t.Fatalf("send: want context.Canceled, got %v", err)
 	}
 	if sess.isDone() {
@@ -229,9 +240,9 @@ func TestSendCancelledAfterFirstFragmentRetiresSession(t *testing.T) {
 	defer cancelSend()
 	errc := make(chan error, 1)
 	go func() { errc <- sess.send(sendCtx, frame) }()
-	requireReady(t, ctx, "the send waiting on the full buffer", closed(waiting), errc)
+	workerDone := requireReady(t, ctx, "the send waiting on the full buffer", closed(waiting), errc)
 	cancelSend()
-	if err := requireWorker(t, ctx, "after the send was canceled", errc); !errors.Is(err, context.Canceled) {
+	if err := requireWorker(t, ctx, "after the send was canceled", workerDone); !errors.Is(err, context.Canceled) {
 		t.Fatalf("send: want context.Canceled, got %v", err)
 	}
 	if !sess.isDone() {
@@ -319,11 +330,11 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 			}()
 			// Wait until the stream is registered, then make the context done
 			// while the request still waits for the send turn.
-			requireReady(t, ctx, "the request registering its stream", func() bool { return streamCount(sess) == 1 }, errc)
+			workerDone := requireReady(t, ctx, "the request registering its stream", func() bool { return streamCount(sess) == 1 }, errc)
 			tc.end(cancelReq, deadlineCtx)
 			// The request must return while the turn is still held: it
 			// observes its own context and does not wait for the sender.
-			if err := requireWorker(t, ctx, "while the send turn was held", errc); !errors.Is(err, tc.want) {
+			if err := requireWorker(t, ctx, "while the send turn was held", workerDone); !errors.Is(err, tc.want) {
 				t.Fatalf("openStream: want %v, got %v", tc.want, err)
 			}
 			releaseTurn()
@@ -396,10 +407,11 @@ func TestWriteAttemptDeadlineDuringPeerSend(t *testing.T) {
 				_, err := fw.op.p2pAttempt(ctx, sess, req)
 				done <- err
 			}()
+			var workerDone <-chan error = done
 			if waiting != nil {
-				requireReady(t, setupCtx, "the send waiting on a full buffer", closed(waiting), done)
+				workerDone = requireReady(t, setupCtx, "the send waiting on a full buffer", closed(waiting), done)
 			}
-			err = requireWorker(t, setupCtx, "with the send still blocked", done)
+			err = requireWorker(t, setupCtx, "with the send still blocked", workerDone)
 			if tc.fragment == 0 {
 				sess.releaseSendTurn()
 			}
@@ -473,7 +485,7 @@ func TestWriteAttemptDeadlineIncludesPeerReplyWait(t *testing.T) {
 		_, err := op.p2pAttempt(ctx, sess, req)
 		done <- err
 	}()
-	requireReady(t, ctx, "the write waiting for the send turn", func() bool { return streamCount(sess) == 1 }, done)
+	workerDone := requireReady(t, ctx, "the write waiting for the send turn", func() bool { return streamCount(sess) == 1 }, done)
 	time.Sleep(budget / 2)
 	releasedAt := time.Now()
 	release()
@@ -485,7 +497,7 @@ func TestWriteAttemptDeadlineIncludesPeerReplyWait(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("the agent did not receive the write: %v", ctx.Err())
 	}
-	if err := requireWorker(t, ctx, "with the reply still held", done); !errors.Is(err, errAttemptDeadline) {
+	if err := requireWorker(t, ctx, "with the reply still held", workerDone); !errors.Is(err, errAttemptDeadline) {
 		t.Fatalf("attempt: got %v, want errAttemptDeadline", err)
 	}
 	if elapsed := time.Since(releasedAt); elapsed >= budget {
@@ -518,16 +530,15 @@ func TestWriteChunkCallerCancellationWhileWaitingToSend(t *testing.T) {
 		_, err := fw.WriteChunk(ctx, 0, []byte("x"))
 		done <- err
 	}()
-	requireReady(t, setupCtx, "the chunk waiting for the send turn", func() bool { return streamCount(sess) == 1 }, done)
+	workerDone := requireReady(t, setupCtx, "the chunk waiting for the send turn", func() bool { return streamCount(sess) == 1 }, done)
 	cancel()
-	if err := requireWorker(t, setupCtx, "after the caller canceled", done); err != context.Canceled {
+	if err := requireWorker(t, setupCtx, "after the caller canceled", workerDone); err != context.Canceled {
 		t.Fatalf("WriteChunk: got %v, want context.Canceled", err)
 	}
 }
 
-// TestAwaitReadyDiagnostics checks that the fixture waits end with a message
-// that names the phase when the worker exits first, when the phase never
-// arrives, and when the worker does not finish.
+// TestAwaitReadyDiagnostics checks readiness precedence, worker result
+// handoff, and the phase diagnostics when a fixture wait fails.
 func TestAwaitReadyDiagnostics(t *testing.T) {
 	t.Parallel()
 	never := func() bool { return false }
@@ -539,20 +550,78 @@ func TestAwaitReadyDiagnostics(t *testing.T) {
 	t.Run("ready wins over an exited worker and an ended context", func(t *testing.T) {
 		done := make(chan error, 1)
 		done <- errors.New("worker failed")
-		if err := awaitReady(ended, "phase-a", func() bool { return true }, done); err != nil {
+		workerDone, err := awaitReady(ended, "phase-a", func() bool { return true }, done)
+		if err != nil {
 			t.Fatalf("ready phase: %v", err)
 		}
+		if workerDone != done {
+			t.Fatal("readiness on the first check changed the worker completion channel")
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		want error
+	}{
+		{name: "worker error", want: errors.New("result")},
+		{name: "nil worker result"},
+	} {
+		t.Run(tc.name+" arrives after a false readiness sample", func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				waiting := make(chan struct{})
+				done := make(chan error, 1)
+				isReady := closed(waiting)
+				workerDone, err := awaitReady(ctx, "phase", func() bool {
+					sampled := isReady()
+					if !sampled {
+						close(waiting)
+						done <- tc.want
+					}
+					return sampled
+				}, done)
+				if err != nil {
+					t.Fatalf("ready phase: %v", err)
+				}
+				if got := requireWorker(t, ctx, "after readiness", workerDone); got != tc.want {
+					t.Fatalf("worker result: got %v, want %v", got, tc.want)
+				}
+			})
+		})
+	}
+	t.Run("context ends after a false readiness sample", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			waiting := make(chan struct{})
+			done := make(chan error, 1)
+			isReady := closed(waiting)
+			workerDone, err := awaitReady(ctx, "phase", func() bool {
+				sampled := isReady()
+				if !sampled {
+					close(waiting)
+					cancel()
+				}
+				return sampled
+			}, done)
+			if err != nil {
+				t.Fatalf("ready phase: %v", err)
+			}
+			if workerDone != done {
+				t.Fatal("context completion changed the worker completion channel")
+			}
+		})
 	})
 	t.Run("worker exits before readiness", func(t *testing.T) {
 		done := make(chan error, 1)
 		done <- errors.New("boom")
-		err := awaitReady(live, "phase-b", never, done)
+		_, err := awaitReady(live, "phase-b", never, done)
 		if err == nil || !strings.Contains(err.Error(), "worker exited before phase-b") || !strings.Contains(err.Error(), "boom") {
 			t.Fatalf("got %v, want the early exit with the worker error", err)
 		}
 	})
 	t.Run("readiness never arrives", func(t *testing.T) {
-		err := awaitReady(ended, "phase-c", never, make(chan error))
+		_, err := awaitReady(ended, "phase-c", never, make(chan error))
 		if err == nil || !strings.Contains(err.Error(), "phase-c never arrived") || !errors.Is(err, context.Canceled) {
 			t.Fatalf("got %v, want the missing milestone", err)
 		}
