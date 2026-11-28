@@ -533,6 +533,7 @@
   "integrations.github.groupDialog.description": "La configuración del grupo de ejecutores en GitHub determina qué repositorios pueden usar los ejecutores de SandRun.",
   "integrations.github.groupDialog.loading": "Cargando grupos de ejecutores",
   "integrations.github.groupDialog.label": "Grupo de ejecutores",
+  "integrations.github.groupDialog.placeholder": "Selecciona un grupo de ejecutores",
   "integrations.github.groupDialog.option": "{name} · {visibility}",
   "integrations.github.groupDialog.defaultOption": "{name} (predeterminado) · {visibility}",
   "integrations.agent.credential.environmentKey": "Clave de entorno",

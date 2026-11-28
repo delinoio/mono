@@ -536,7 +536,21 @@ function RunnerGroupDialog({
   const update = useMutation(GitHubService.method.updateGitHubInstallation, {
     onSuccess: () => invalidateServices(queryClient, GitHubService),
   });
-  const [group, setGroup] = useState(String(installation.githubRunnerGroupId));
+  const [groupId, setGroupId] = useState<string | null>(
+    String(installation.githubRunnerGroupId),
+  );
+  const selectedGroup = groups.data?.runnerGroups.find(
+    (group) => String(group.githubRunnerGroupId) === groupId,
+  );
+  const submitDisabled = selectedGroup === undefined || showsFullError(groups);
+  if (
+    groupId !== null &&
+    groups.data !== undefined &&
+    selectedGroup === undefined
+  ) {
+    setGroupId(null);
+  }
+
   return (
     <FormDialog
       open
@@ -544,13 +558,19 @@ function RunnerGroupDialog({
       title={t("integrations.github.groupDialog.title")}
       description={t("integrations.github.groupDialog.description")}
       submitLabel={t("common.save")}
-      submitDisabled={groups.data === undefined || showsFullError(groups)}
+      submitDisabled={submitDisabled}
       onSubmit={async (opening) => {
-        if (!can(role, Permission.ManageIntegrations)) return;
+        if (
+          !can(role, Permission.ManageIntegrations) ||
+          submitDisabled ||
+          selectedGroup === undefined
+        ) {
+          return;
+        }
         await update.mutateAsync({
           organizationId,
           installationId: installation.installationId,
-          githubRunnerGroupId: BigInt(group),
+          githubRunnerGroupId: selectedGroup.githubRunnerGroupId,
         });
         if (opening.isCurrent()) onClose();
       }}
@@ -562,8 +582,9 @@ function RunnerGroupDialog({
         {(data) => (
           <Select
             label={t("integrations.github.groupDialog.label")}
-            value={group}
-            onValueChange={(v) => v && setGroup(v)}
+            placeholder={t("integrations.github.groupDialog.placeholder")}
+            value={selectedGroup === undefined ? null : groupId}
+            onValueChange={setGroupId}
           >
             {data.runnerGroups.map((g) => (
               <SelectOption

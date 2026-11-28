@@ -1860,6 +1860,100 @@ describe("integrations", () => {
     await expect(list.getByText("acme-robotics · Active")).toBeVisible();
   });
 
+  for (const { result, name, nextGroup, nextId } of [
+    {
+      result: "default-only",
+      name: "requires a fresh runner group choice after removal",
+      nextGroup: "Default (default) · all",
+      nextId: "1",
+    },
+    {
+      result: "failure",
+      name: "retains the runner group after a transient refresh failure",
+      nextGroup: "sandrun-private · selected",
+      nextId: "7",
+    },
+  ] as const) {
+    test(name, async ({ app, browser, screen }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open("/runner-group-fixture.html");
+      const installation = screen
+        .getByRole("list", "GitHub installations")
+        .getByRole("listitem")
+        .filter({ hasText: "acme-robotics · Active" });
+      await installation.getByRole("button", "Change runner group").tap();
+
+      const dialog = screen.getByRole("dialog", "Change the runner group");
+      const group = dialog.getByRole("combobox", "Runner group");
+      const save = dialog.getByRole("button", "Save");
+      await group.tap();
+      await screen.getByRole("option", "sandrun-private · selected").tap();
+
+      await browser.evaluate(() => {
+        const fixture = window.sandrunRunnerGroupFixture;
+        fixture.releaseRefresh = fixture.holdRefresh();
+        return null;
+      });
+      await expect(group).toHaveText("sandrun-private · selected");
+      await browser.evaluate(async (result) => {
+        await window.sandrunRunnerGroupFixture.releaseRefresh!(result);
+        return null;
+      }, result);
+
+      if (result === "default-only") {
+        await expect(group).toHaveText("Choose a runner group");
+        await expect(save).toBeDisabled();
+        expect(
+          await browser.evaluate(() => {
+            const form = document.querySelector<HTMLFormElement>(
+              '[role="dialog"] form',
+            )!;
+            form.dispatchEvent(
+              new SubmitEvent("submit", { bubbles: true, cancelable: true }),
+            );
+            return window.sandrunRunnerGroupFixture.updates.length;
+          }),
+        ).toBe(0);
+        await app.screenshot("runner-group-removed");
+        await group.tap();
+        await expect(
+          screen.getByRole("option", "sandrun-private · selected"),
+        ).toBeHidden();
+        await screen.getByRole("option", nextGroup).tap();
+      } else {
+        await expect(dialog.getByRole("alert")).toContainText(
+          "The last refresh failed",
+        );
+        await expect(group).toHaveText(nextGroup);
+        await expect(save).toBeEnabled();
+        await app.screenshot("runner-group-refresh-failed");
+        await dialog.getByRole("button", "Try again").tap();
+        await expect(dialog.getByRole("alert")).toBeHidden();
+        await expect(group).toHaveText(nextGroup);
+      }
+
+      await expect(save).toBeEnabled();
+      await save.tap();
+      await expect(dialog).toBeHidden();
+      expect(
+        await browser.evaluate(() =>
+          window.sandrunRunnerGroupFixture.updates.map((update) => ({
+            organizationId: update.organizationId,
+            installationId: update.installationId,
+            groupId: String(update.githubRunnerGroupId),
+          })),
+        ),
+      ).toEqual([
+        {
+          organizationId: ACME,
+          installationId: "0193b000-0000-7000-8000-0000000000d1",
+          groupId: nextId,
+        },
+      ]);
+    });
+  }
+
   test("a member can read a later page and switch to another organization's list", async ({
     app,
     screen,

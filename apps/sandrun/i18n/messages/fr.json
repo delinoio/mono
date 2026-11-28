@@ -533,6 +533,7 @@
   "integrations.github.groupDialog.description": "Les paramètres du groupe de runners dans GitHub déterminent quels dépôts peuvent utiliser les runners SandRun.",
   "integrations.github.groupDialog.loading": "Chargement des groupes de runners",
   "integrations.github.groupDialog.label": "Groupe de runners",
+  "integrations.github.groupDialog.placeholder": "Choisir un groupe de runners",
   "integrations.github.groupDialog.option": "{name} · {visibility}",
   "integrations.github.groupDialog.defaultOption": "{name} (par défaut) · {visibility}",
   "integrations.agent.credential.environmentKey": "Clé d’environnement",

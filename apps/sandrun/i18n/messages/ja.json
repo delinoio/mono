@@ -533,6 +533,7 @@
   "integrations.github.groupDialog.description": "SandRun のランナーを使用できるリポジトリは、GitHub のランナーグループ設定で決まります。",
   "integrations.github.groupDialog.loading": "ランナーグループを読み込み中",
   "integrations.github.groupDialog.label": "ランナーグループ",
+  "integrations.github.groupDialog.placeholder": "ランナーグループを選択",
   "integrations.github.groupDialog.option": "{name} · {visibility}",
   "integrations.github.groupDialog.defaultOption": "{name}（既定） · {visibility}",
   "integrations.agent.credential.environmentKey": "環境キー",
