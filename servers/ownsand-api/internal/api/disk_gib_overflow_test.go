@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 
@@ -16,8 +17,8 @@ import (
 // TestCreateSandboxRejectsDiskGibOverflow sends a disk_gib whose byte count
 // does not fit in a signed 64-bit integer and expects invalid_argument that
 // names resources.disk_gib, before scheduling, with no sandbox record. The
-// largest representable size passes the validation and, with a device that
-// has less disk, fails the capacity check instead.
+// largest representable size reaches the scheduler, which rejects it for
+// exceeding the device's disk limit and leaves no sandbox record.
 func TestCreateSandboxRejectsDiskGibOverflow(t *testing.T) {
 	t.Parallel()
 	env := testenv.New(t)
@@ -33,13 +34,19 @@ func TestCreateSandboxRejectsDiskGibOverflow(t *testing.T) {
 		_, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(req))
 		requireInvalidNaming(t, env, "disk_gib "+name, err, "resources.disk_gib")
 	}
-	if n := countRows(t, env, "SELECT count(*) FROM sandboxes WHERE organization_id = $1", org.ID); n != 0 {
+	const sandboxCountQuery = "SELECT count(*) FROM sandboxes WHERE organization_id = $1"
+	if n := countRows(t, env, sandboxCountQuery, org.ID); n != 0 {
 		t.Fatalf("sandboxes after the rejected creates = %d, want 0", n)
 	}
 	req := createReq(org.ID)
 	req.Resources.DiskGib = validate.MaxDiskGiB
 	_, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(req))
-	if testenv.Code(err) == connect.CodeInvalidArgument {
-		t.Fatalf("largest representable disk_gib was rejected as invalid: %v", err)
+	const wantMessage = "no device can run the sandbox: the request needs more disk than the device limit"
+	var connectErr *connect.Error
+	if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeFailedPrecondition || connectErr.Message() != wantMessage {
+		t.Fatalf("create with maximum disk_gib = %v, want %v: %q", err, connect.CodeFailedPrecondition, wantMessage)
+	}
+	if n := countRows(t, env, sandboxCountQuery, org.ID); n != 0 {
+		t.Fatalf("sandboxes after the maximum disk_gib request = %d, want 0", n)
 	}
 }
