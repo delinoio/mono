@@ -190,11 +190,16 @@ describe("credentials", () => {
     const fixture = fileURLToPath(
       new URL("./testing/token-provider-cancellation.ts", import.meta.url),
     );
+    const preload = new URL(
+      "./testing/transpile-cancellation-fixture.mjs",
+      import.meta.url,
+    );
     execFileSync(
       process.execPath,
       [
         "--unhandled-rejections=strict",
-        "--experimental-transform-types",
+        "--import",
+        preload.href,
         // This fixture loads SDK source, so resolve the bindings to source too.
         "--conditions=browser",
         "--test",
