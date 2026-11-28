@@ -9,9 +9,8 @@ import (
 	"os"
 )
 
-// fileIdentity is not implemented on this platform. Without an identity the
-// helper keeps no write records: staging files of a helper process that
-// exited stay until somebody removes them. Implement it with the first guest
+// fileIdentity is not implemented on this platform. An identity is required
+// to create a recoverable staging file. Implement it with the first guest
 // image for this platform.
 type fileIdentity struct {
 	Device uint64 `json:"device"`

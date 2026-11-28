@@ -240,18 +240,17 @@ func testWriteExpiryOfLongStagingPath(t *testing.T, requestPath func(string) str
 func TestWriteRecoveryTimestampRange(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name   string
-		last   time.Time
-		legacy bool
+		name string
+		last time.Time
 	}{
-		{"before legacy range", time.Date(1600, 1, 1, 0, 0, 0, 123456789, time.UTC), false},
-		{"below minimum", time.Unix(0, math.MinInt64).Add(-time.Nanosecond), false},
-		{"minimum", time.Unix(0, math.MinInt64), true},
-		{"epoch", time.Unix(0, 0), true},
-		{"legacy range", time.Date(2026, 1, 1, 0, 0, 0, 123456789, time.UTC), true},
-		{"maximum", time.Unix(0, math.MaxInt64), true},
-		{"above maximum", time.Unix(0, math.MaxInt64).Add(time.Nanosecond), false},
-		{"after legacy range", time.Date(2300, 1, 1, 0, 0, 0, 123456789, time.UTC), false},
+		{"before legacy range", time.Date(1600, 1, 1, 0, 0, 0, 123456789, time.UTC)},
+		{"below minimum", time.Unix(0, math.MinInt64).Add(-time.Nanosecond)},
+		{"minimum", time.Unix(0, math.MinInt64)},
+		{"epoch", time.Unix(0, 0)},
+		{"legacy range", time.Date(2026, 1, 1, 0, 0, 0, 123456789, time.UTC)},
+		{"maximum", time.Unix(0, math.MaxInt64)},
+		{"above maximum", time.Unix(0, math.MaxInt64).Add(time.Nanosecond)},
+		{"after legacy range", time.Date(2300, 1, 1, 0, 0, 0, 123456789, time.UTC)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := &fakeClock{now: tc.last.Add(-3 * time.Second)}
@@ -275,13 +274,10 @@ func TestWriteRecoveryTimestampRange(t *testing.T) {
 			if err := json.Unmarshal(data, &fields); err != nil {
 				t.Fatal(err)
 			}
-			if tc.legacy {
-				if len(fields) != 5 || string(fields["version"]) != "1" || fields["last_chunk_unix_nano"] == nil {
-					t.Fatalf("expected the version-1 record shape, got %s", data)
-				}
-			} else if len(fields) != 6 || string(fields["version"]) != "2" ||
-				fields["last_chunk_unix_seconds"] == nil || fields["last_chunk_nanosecond"] == nil {
-				t.Fatalf("expected the version-2 record shape, got %s", data)
+			if len(fields) != 7 || string(fields["version"]) != "3" ||
+				fields["last_chunk_unix_seconds"] == nil || fields["last_chunk_nanosecond"] == nil ||
+				fields["reservation"] == nil {
+				t.Fatalf("expected the version-3 record shape, got %s", data)
 			}
 
 			clock.Advance(30 * time.Second)
@@ -1045,7 +1041,17 @@ func TestWriteFinishedRecordFailureIsRetriedBySweep(t *testing.T) {
 	// A record that cannot be removed (a directory with a file) does not fail
 	// the finish; the sweep keeps trying.
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("x"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1}}
+	// Establish the durable intent before blocking timestamp refreshes.
+	first := &ownsandv1.WriteFileRequest{
+		SandboxId: testSandbox, WriteId: req.GetWriteId(), Path: target, BindingSalt: make([]byte, 32),
+	}
+	if _, errd := h.write(first); errd != nil {
+		t.Fatal(errd)
+	}
 	rec := h.srv.writes.recordPath(req.GetWriteId())
+	if err := os.Remove(rec); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Join(rec, "blocker"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1176,11 +1182,11 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-func TestWriteRecordFailuresLogWriteIDWithoutPath(t *testing.T) {
+func TestWriteRecoveryIntentFailureLeavesNoStageAndLogsWithoutPath(t *testing.T) {
 	t.Parallel()
 	var logs syncBuffer
 	h := newHarness(t, func(c *Config) { c.Logger = slog.New(slog.NewJSONHandler(&logs, nil)) })
-	// Without the record directory every save fails; the upload still works.
+	// Without the record directory the helper cannot save the creation intent.
 	if err := os.RemoveAll(filepath.Join(h.srv.cfg.StateDir, "writes")); err != nil {
 		t.Fatal(err)
 	}
@@ -1188,11 +1194,15 @@ func TestWriteRecordFailuresLogWriteIDWithoutPath(t *testing.T) {
 	releaseOnCleanup(t, h)
 	target := filepath.Join(dir, "secret-name")
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("x"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1}}
-	if resp, errd := h.write(req); errd != nil || !resp.GetFinished() {
+	if resp, errd := h.write(req); errd == nil || resp != nil {
 		t.Fatalf("write without records: %v %v", resp, errd)
 	}
+	items, err := os.ReadDir(dir)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("initialization failure left files: %v, %v", items, err)
+	}
 	out := logs.String()
-	if !strings.Contains(out, "save write record failed") || !strings.Contains(out, req.GetWriteId()) {
+	if !strings.Contains(out, "save write intent failed") || !strings.Contains(out, req.GetWriteId()) {
 		t.Fatalf("missing log with the write id: %s", out)
 	}
 	for _, secret := range []string{dir, "secret-name", h.srv.cfg.StateDir} {
