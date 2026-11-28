@@ -376,7 +376,58 @@ func TestRequestURLsGrantTimeoutIsDistinct(t *testing.T) {
 	}
 }
 
+func TestRequestURLsReplyHonorsEndedContext(t *testing.T) {
+	live := context.Background()
+	past := time.Now().Add(-time.Second)
+	cause := errors.New("shutting down")
+	canceled, cancel := context.WithCancelCause(live)
+	canceledWait, stopCanceledWait := context.WithDeadline(canceled, past)
+	defer stopCanceledWait()
+	cancel(cause)
+	expired, cancelDeadline := context.WithDeadline(live, past)
+	defer cancelDeadline()
+	deadlineWait, stopDeadlineWait := context.WithTimeout(expired, time.Minute)
+	defer stopDeadlineWait()
+
+	contexts := []struct {
+		name    string
+		caller  context.Context
+		wait    context.Context
+		want    error
+		cause   error
+		wantNot error
+	}{
+		{"caller canceled with cause", canceled, canceledWait, context.Canceled, cause, errURLGrantTimeout},
+		{"caller deadline exceeded", expired, deadlineWait, context.DeadlineExceeded, nil, errURLGrantTimeout},
+		{"grant wait expired", live, expired, errURLGrantTimeout, nil, context.DeadlineExceeded},
+	}
+	grants := []struct {
+		name  string
+		grant *ownsandv1.SignedUrlGrant
+	}{
+		{"success", &ownsandv1.SignedUrlGrant{PartUrls: []*ownsandv1.SignedPartUrl{{PartNumber: 1}}}},
+		{"rejection", &ownsandv1.SignedUrlGrant{Error: &ownsandv1.ErrorDetail{Message: "no"}}},
+	}
+	for _, reply := range grants {
+		for _, tc := range contexts {
+			t.Run(reply.name+"/"+tc.name, func(t *testing.T) {
+				urls, err := signedURLGrantResult(tc.caller, tc.wait, reply.grant)
+				if urls != nil || !errors.Is(err, tc.want) {
+					t.Fatalf("urls = %v, err = %v, want nil URLs and %v", urls, err, tc.want)
+				}
+				if tc.cause != nil && !errors.Is(err, tc.cause) {
+					t.Errorf("error %q does not wrap %v", err, tc.cause)
+				}
+				if errors.Is(err, tc.wantNot) {
+					t.Errorf("error %q wraps %v", err, tc.wantNot)
+				}
+			})
+		}
+	}
+}
+
 func TestRequestURLsGrantAndRejectionRemoveWaiter(t *testing.T) {
+	part := &ownsandv1.SignedPartUrl{PartNumber: 1, Url: "https://example.test/part"}
 	for _, reject := range []bool{false, true} {
 		a, queue := newURLRequestAgent()
 		go func() {
@@ -386,16 +437,16 @@ func TestRequestURLsGrantAndRejectionRemoveWaiter(t *testing.T) {
 			if reject {
 				g.Error = &ownsandv1.ErrorDetail{Message: "no"}
 			} else {
-				g.PartUrls = []*ownsandv1.SignedPartUrl{{PartNumber: 1}}
+				g.PartUrls = []*ownsandv1.SignedPartUrl{part}
 			}
 			a.deliverURLs(g)
 		}()
 		urls, err := a.RequestURLs(context.Background(), "snap", ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD, []int32{1})
 		if reject {
-			if err == nil {
-				t.Error("rejected request returned no error")
+			if urls != nil || err == nil || err.Error() != "agent: signed URL request rejected: no" {
+				t.Errorf("urls = %v, err = %v, want nil URLs and the rejection diagnostic", urls, err)
 			}
-		} else if err != nil || len(urls) != 1 {
+		} else if err != nil || len(urls) != 1 || urls[0] != part {
 			t.Errorf("urls = %v, err = %v", urls, err)
 		}
 		if n := a.waiterCount(); n != 0 {

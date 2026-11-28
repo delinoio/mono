@@ -355,25 +355,32 @@ func (a *Agent) RequestURLs(ctx context.Context, snapshotID string, op ownsandv1
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	var grant *ownsandv1.SignedUrlGrant
 	select {
 	case <-waitCtx.Done():
-		// The parent context ended first (canceled, or its own earlier
-		// deadline): report that cause, not a missing grant. Only a live
-		// parent means that the grant wait itself timed out.
-		if ctx.Err() != nil {
-			cause := context.Cause(ctx)
-			if cause == ctx.Err() {
-				return nil, fmt.Errorf("agent: signed URL request ended: %w", ctx.Err())
-			}
-			return nil, fmt.Errorf("agent: signed URL request ended: %w: %w", ctx.Err(), cause)
-		}
-		return nil, errURLGrantTimeout
-	case g := <-ch:
-		if g.GetError() != nil {
-			return nil, fmt.Errorf("agent: signed URL request rejected: %s", g.GetError().GetMessage())
-		}
-		return g.GetPartUrls(), nil
+	case grant = <-ch:
 	}
+	return signedURLGrantResult(ctx, waitCtx, grant)
+}
+
+func signedURLGrantResult(ctx, waitCtx context.Context, grant *ownsandv1.SignedUrlGrant) ([]*ownsandv1.SignedPartUrl, error) {
+	// The select can receive a grant even when the wait has ended. Read the
+	// wait status first so any caller interruption that ended it is visible.
+	waitErr := waitCtx.Err()
+	if err := ctx.Err(); err != nil {
+		cause := context.Cause(ctx)
+		if cause == err {
+			return nil, fmt.Errorf("agent: signed URL request ended: %w", err)
+		}
+		return nil, fmt.Errorf("agent: signed URL request ended: %w: %w", err, cause)
+	}
+	if waitErr != nil {
+		return nil, errURLGrantTimeout
+	}
+	if rejection := grant.GetError(); rejection != nil {
+		return nil, fmt.Errorf("agent: signed URL request rejected: %s", rejection.GetMessage())
+	}
+	return grant.GetPartUrls(), nil
 }
 
 func (a *Agent) deliverURLs(g *ownsandv1.SignedUrlGrant) {
