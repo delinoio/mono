@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, test } from "@e2e-dev/web";
-import { expect } from "e2e";
+import { describe, test, type WebFixtures } from "@e2e-dev/web";
+import { expect, type TestFixtures } from "e2e";
 import { Role } from "@delino/sandrun-protos/v1/common_pb";
 import {
   DEV_SESSION_REFRESH_CASES,
@@ -12,6 +12,8 @@ import {
   integrationOpenings,
 } from "./integration-permission-fixture.ts";
 import { ORGANIZATION_CREATION_FIXTURE } from "./organization-creation-fixture.ts";
+import { MOCK_IDS } from "../src/mock/mock-api.ts";
+import { REQUEST_CANCELLATION_FIXTURE } from "./request-cancellation-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
@@ -1584,6 +1586,185 @@ describe("requests", () => {
     await screen.getByRole("checkbox", "Show ended requests").tap();
     await expect(table).toContainText("build (ubuntu)");
     await expect(endedRequest).toBeHidden();
+  });
+});
+
+describe("request cancellation", () => {
+  async function openRequests({
+    app,
+    browser,
+    screen,
+  }: WebFixtures & Pick<TestFixtures, "screen">) {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "enabled");
+      return null;
+    }, REQUEST_CANCELLATION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/requests`);
+    const table = screen.getByRole("table", "Requests");
+    const job = table
+      .getByRole("row")
+      .filter({ hasText: "acme-robotics/firmware · test (ubuntu)" });
+    const agent = table.getByRole("row").filter({ hasText: "sess_codex_4711" });
+    const cancel = job.getByRole("button", "Cancel", { exact: true });
+    const dialog = screen.getByRole("alertdialog", "Cancel this request?");
+    const confirm = dialog.getByRole("button", "Cancel request");
+    const notice = screen.getByText("The request is no longer queued.");
+    const cancellations = () =>
+      browser.evaluate(
+        () => window.sandrunRequestCancellationFixture!.state.cancellations,
+      );
+    const refreshCalls = () =>
+      browser.evaluate(
+        () => window.sandrunRequestCancellationFixture!.state.refreshCalls,
+      );
+
+    await cancel.tap();
+    await confirm.tap();
+    await expect.poll(cancellations).toEqual([MOCK_IDS.queuedJob]);
+    return {
+      job,
+      agent,
+      cancel,
+      dialog,
+      confirm,
+      notice,
+      cancellations,
+      refreshCalls,
+    };
+  }
+
+  test("retires Cancel when the request leaves the queue during confirmation", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const { job, cancel, dialog, notice, cancellations, refreshCalls } =
+      await openRequests({ app, browser, screen });
+    await browser.evaluate(() => {
+      window.sandrunRequestCancellationFixture!.completeCancellation("running");
+      return null;
+    });
+    await expect.poll(refreshCalls).toBe(1);
+    await expect(dialog).toHaveCount(0);
+    await expect(notice).toBeVisible();
+    await expect(
+      job.getByRole("cell", "Queued", { exact: true }),
+    ).toBeVisible();
+    await expect(cancel).toHaveCount(0);
+    await app.screenshot("request-cancellation-rejected-during-refresh");
+
+    await browser.evaluate(() => {
+      window.sandrunRequestCancellationFixture!.completeRefresh();
+      return null;
+    });
+    await expect(
+      job.getByRole("cell", "Running", { exact: true }),
+    ).toBeVisible();
+    await expect(cancel).toHaveCount(0);
+    expect(await cancellations()).toEqual([MOCK_IDS.queuedJob]);
+    await app.screenshot("request-cancellation-refreshed-to-running");
+  });
+
+  test("keeps a stale cancellation hidden and allows a failed list refresh to be retried", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const { job, cancel, dialog, notice } = await openRequests({
+      app,
+      browser,
+      screen,
+    });
+    await browser.evaluate(() => {
+      const fixture = window.sandrunRequestCancellationFixture!;
+      fixture.completeCancellation("ended");
+      fixture.completeRefresh(true);
+      return null;
+    });
+    const retry = screen.getByRole("button", "Try again", { exact: true });
+    await expect(retry).toBeEnabled();
+    await expect(dialog).toHaveCount(0);
+    await expect(notice).toBeVisible();
+    await expect(job).toBeVisible();
+    await expect(cancel).toHaveCount(0);
+    await app.screenshot("request-cancellation-list-recovery-available");
+
+    await browser.evaluate(() => {
+      window.sandrunRequestCancellationFixture!.completeRefresh();
+      return null;
+    });
+    await retry.tap();
+    await expect(job).toHaveCount(0);
+  });
+
+  test("refreshes the list after a late rejection and preserves the next confirmation", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const { job, agent, dialog, confirm, notice, cancellations, refreshCalls } =
+      await openRequests({ app, browser, screen });
+    await browser.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await agent.getByRole("button", "Cancel", { exact: true }).tap();
+    await expect(dialog).toBeVisible();
+    await browser.evaluate(() => {
+      const fixture = window.sandrunRequestCancellationFixture!;
+      fixture.completeCancellation("running");
+      fixture.completeRefresh();
+      return null;
+    });
+    await expect.poll(refreshCalls).toBe(1);
+    await expect(job.getByText("Running", { exact: true })).toBeVisible();
+    await expect(notice).toHaveCount(0);
+    await expect(confirm).toBeEnabled();
+    await app.screenshot(
+      "request-cancellation-next-confirmation-after-late-rejection",
+    );
+
+    await confirm.tap();
+    await expect(dialog).toHaveCount(0);
+    await expect(agent).toHaveCount(0);
+    expect(await cancellations()).toEqual([
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.queuedAgent,
+    ]);
+  });
+
+  test("retries transient cancellation failures and refreshes after success", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const { job, dialog, confirm, cancellations } = await openRequests({
+      app,
+      browser,
+      screen,
+    });
+    await browser.evaluate(() => {
+      window.sandrunRequestCancellationFixture!.completeCancellation(
+        "unavailable",
+      );
+      return null;
+    });
+    await expect(
+      dialog.getByText(
+        "SandRun is not available right now. Try again in a moment.",
+      ),
+    ).toBeVisible();
+    await expect(confirm).toBeEnabled();
+    await app.screenshot("request-cancellation-transient-retry");
+
+    await confirm.tap();
+    await expect(dialog).toHaveCount(0);
+    await expect(job).toHaveCount(0);
+    expect(await cancellations()).toEqual([
+      MOCK_IDS.queuedJob,
+      MOCK_IDS.queuedJob,
+    ]);
+    await app.screenshot("request-cancellation-list-after-success");
   });
 });
 

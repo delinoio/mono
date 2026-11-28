@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BadgeVariant } from "delino-ui/badge";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
@@ -83,6 +84,20 @@ export function RequestsPage() {
   const [profileId, setProfileId] = useState("");
   const [includeEnded, setIncludeEnded] = useState(false);
   const [canceling, setCanceling] = useState<Request>();
+  const [showCancellationRejection, setShowCancellationRejection] =
+    useState(false);
+  // Keep rejections with the query cache so they also cover stale filtered
+  // lists and cached rows shown after navigating back to Requests.
+  const rejectedCancellationsKey = [
+    "rejectedRequestCancellations",
+    organizationId,
+  ];
+  const { data: rejectedAttempts } = useQuery<ReadonlyMap<string, number>>({
+    queryKey: rejectedCancellationsKey,
+    queryFn: skipToken,
+  });
+  const isCancellationRejected = (request: Request) =>
+    request.startAttempts <= (rejectedAttempts?.get(request.requestId) ?? -1);
   const { query: profiles, profileNames } =
     useWorkRunnerProfiles(organizationId);
   const effectiveProfileId = profileNames?.has(profileId) ? profileId : "";
@@ -160,6 +175,11 @@ export function RequestsPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
+      {showCancellationRejection ? (
+        <div className="notice" role="alert">
+          <p>{t("requests.cancellationRejected")}</p>
+        </div>
+      ) : null}
       <RunnerProfileNotice query={profiles} />
       <QueryBoundary query={list} loading={t("requests.loading")}>
         {(data) => {
@@ -231,11 +251,15 @@ export function RequestsPage() {
                         <td>{formatTime(r.queuedAt, lang)}</td>
                         {admin ? (
                           <td>
-                            {r.state === RequestState.QUEUED ? (
+                            {r.state === RequestState.QUEUED &&
+                            !isCancellationRejected(r) ? (
                               <Button
                                 variant={ButtonVariant.Danger}
                                 size={ButtonSize.Small}
-                                onClick={() => setCanceling(r)}
+                                onClick={() => {
+                                  setShowCancellationRejection(false);
+                                  setCanceling(r);
+                                }}
                               >
                                 {t("common.cancel")}
                               </Button>
@@ -258,12 +282,38 @@ export function RequestsPage() {
         title={t("requests.cancelDialog.title")}
         description={t("requests.cancelDialog.description")}
         confirmLabel={t("requests.cancelDialog.confirm")}
-        onConfirm={() =>
-          cancel.mutateAsync({
-            organizationId,
-            requestId: canceling!.requestId,
-          })
+        confirmDisabled={
+          canceling !== undefined && isCancellationRejected(canceling)
         }
+        onConfirm={async (opening) => {
+          if (canceling === undefined) return;
+          const { requestId, startAttempts } = canceling;
+          try {
+            await cancel.mutateAsync({ organizationId, requestId });
+          } catch (error) {
+            if (
+              !(error instanceof ConnectError) ||
+              error.code !== Code.FailedPrecondition
+            ) {
+              throw error;
+            }
+            // A request can return to the queue after a failed runner start.
+            // A higher start-attempt count identifies that new queue entry.
+            queryClient.setQueryData<ReadonlyMap<string, number>>(
+              rejectedCancellationsKey,
+              (previous) =>
+                new Map(previous).set(
+                  requestId,
+                  Math.max(previous?.get(requestId) ?? -1, startAttempts),
+                ),
+            );
+            if (opening.isCurrent()) {
+              setShowCancellationRejection(true);
+              setCanceling(undefined);
+            }
+            await invalidateServices(queryClient, WorkService);
+          }
+        }}
       />
     </>
   );

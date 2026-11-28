@@ -307,6 +307,7 @@
   "requests.empty.description": "Une demande apparaît lorsque GitHub met en file d’attente une tâche portant une étiquette SandRun, lorsqu’un fournisseur demande une session d’agent ou lorsqu’un membre crée une session de développement.",
   "requests.column.source": "Source",
   "requests.column.queueWait": "Temps d’attente",
+  "requests.cancellationRejected": "La demande ne figure plus dans la file d’attente.",
   "requests.cancelDialog.title": "Annuler cette demande ?",
   "requests.cancelDialog.description": "La demande passe au statut « Annulée » et aucun exécuteur ne lui est attribué. Une tâche GitHub reste en file d’attente dans GitHub jusqu’à ce que GitHub l’annule.",
   "requests.cancelDialog.confirm": "Annuler la demande",

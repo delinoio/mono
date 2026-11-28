@@ -307,6 +307,7 @@
   "requests.empty.description": "As solicitações aparecem quando o GitHub coloca um job com um rótulo do SandRun na fila, um fornecedor solicita uma sessão de agente ou um membro cria uma sessão de desenvolvimento.",
   "requests.column.source": "Origem",
   "requests.column.queueWait": "Tempo de espera na fila",
+  "requests.cancellationRejected": "A solicitação não está mais na fila.",
   "requests.cancelDialog.title": "Cancelar esta solicitação?",
   "requests.cancelDialog.description": "A solicitação é encerrada com o status Cancelada e não recebe um executor. Se for um job do GitHub, ele permanece na fila do GitHub até que o GitHub o cancele.",
   "requests.cancelDialog.confirm": "Cancelar solicitação",

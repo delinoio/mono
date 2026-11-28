@@ -307,6 +307,7 @@
   "requests.empty.description": "GitHub が SandRun ラベル付きのジョブをキューに追加したとき、ベンダーがエージェントセッションを要求したとき、またはメンバーが開発セッションを作成したときに、リクエストが表示されます。",
   "requests.column.source": "ソース",
   "requests.column.queueWait": "キュー待機時間",
+  "requests.cancellationRejected": "リクエストはキューから外れました。",
   "requests.cancelDialog.title": "このリクエストをキャンセルしますか？",
   "requests.cancelDialog.description": "リクエストは「キャンセル済み」となり、ランナーは割り当てられません。GitHub のジョブは、GitHub がキャンセルするまで GitHub のキューに残ります。",
   "requests.cancelDialog.confirm": "リクエストをキャンセル",

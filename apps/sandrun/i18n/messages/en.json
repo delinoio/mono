@@ -307,6 +307,7 @@
   "requests.empty.description": "Requests appear when GitHub queues a job with a SandRun label, a vendor asks for an agent session or a member creates a dev session.",
   "requests.column.source": "Source",
   "requests.column.queueWait": "Queue wait",
+  "requests.cancellationRejected": "The request is no longer queued.",
   "requests.cancelDialog.title": "Cancel this request?",
   "requests.cancelDialog.description": "The request ends with Canceled and never gets a runner. A GitHub job stays queued in GitHub until GitHub cancels it.",
   "requests.cancelDialog.confirm": "Cancel request",

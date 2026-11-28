@@ -36,7 +36,7 @@ export const DEV_SESSION_REFRESH_CASES = [
     endedState: "Canceled",
     reason: "Canceled by user",
     failureMode: "fail-cancel",
-    error: "Fixture rejected cancellation.",
+    error: "SandRun is not available right now. Try again in a moment.",
     screenshot: "canceled-request",
   },
   {
@@ -106,7 +106,7 @@ export function devSessionRefreshFixture(
         if (mode === "fail-cancel" && req.requestId === MOCK_IDS.queuedDev) {
           throw new ConnectError(
             "Fixture rejected cancellation.",
-            Code.FailedPrecondition,
+            Code.Unavailable,
           );
         }
         return work.cancelRequest(req);

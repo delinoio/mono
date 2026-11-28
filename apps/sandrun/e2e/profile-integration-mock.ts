@@ -14,6 +14,10 @@ import {
   organizationCreationFixture,
   ORGANIZATION_CREATION_FIXTURE,
 } from "./organization-creation-fixture.ts";
+import {
+  REQUEST_CANCELLATION_FIXTURE,
+  requestCancellationFixture,
+} from "./request-cancellation-fixture.ts";
 import { createMockTransport as createSettingsMock } from "./settings-mock.ts";
 import {
   pagedProfileIntegrations,
@@ -28,6 +32,10 @@ import {
 declare global {
   interface Window {
     sandrunDevSessionReads?: boolean[];
+    sandrunRequestCancellationFixture?: Omit<
+      ReturnType<typeof requestCancellationFixture>,
+      "transport"
+    >;
     sandrunOrganizationCreationFixture?: Omit<
       ReturnType<typeof organizationCreationFixture>,
       "transport"
@@ -58,6 +66,13 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
     return transport;
   }
 
+  if (sessionStorage.getItem(REQUEST_CANCELLATION_FIXTURE) === "enabled") {
+    const { transport, ...fixture } = requestCancellationFixture(
+      createSettingsMock(options),
+    );
+    window.sandrunRequestCancellationFixture = fixture;
+    return transport;
+  }
   const createMode = sessionStorage.getItem(ORGANIZATION_CREATION_FIXTURE);
   if (
     createMode === "hold-list" ||
