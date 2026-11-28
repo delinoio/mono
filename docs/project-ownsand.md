@@ -77,6 +77,15 @@ The project has one hosted server deployable (the control plane on the shared Di
 - Sandbox, device, snapshot and agent-version-policy states use the enums in the [protos contract](protos-ownsand-api-contract.md#enums). Components must not compare free-form state strings.
 - A sandbox stays on the device that created it for its whole life. OwnSand never moves a sandbox to another device. When a device goes offline, its non-terminal sandboxes change to `unreachable`; `deleted` and `failed` sandboxes keep their state, according to the [control plane contract](servers-ownsand-api-foundation.md#agent-channel). When the agent reconnects, the agent reports the actual state and the control plane reconciles the stored state with it according to the [control plane contract](servers-ownsand-api-foundation.md#agent-channel).
 
+### Long-lived sandboxes (planned)
+
+Status: planned. These general capabilities are needed by long-lived sandboxes, such as the agent sessions of [SandCrew](project-sandcrew.md) that run in SandRun dev sessions. The current implementation keeps the existing rules until the changes that implement them.
+
+- Memory-state pause: a pause saves the VM memory state to the device disk and stops the VM, so a `PAUSED` sandbox holds only disk capacity (its disk and its memory state) and no vCPU or memory. A resume reserves vCPU and memory again on the same device, or fails with `unavailable`. A restore that fails ends the sandbox with `RESTORE_FAILED`. The [control plane contract](servers-ownsand-api-foundation.md#memory-state-pause) and the [agent contract](cmds-ownsand-agent-foundation.md#memory-state-pause) own the rules.
+- Paused sandboxes survive an agent restart, an agent update and a host reboot: the agent registers them again from their saved state.
+- Optional `max_ttl`: a sandbox without `max_ttl` has no maximum lifetime ([control plane contract](servers-ownsand-api-foundation.md#ttl)).
+- Windows guests need the `OUTBOUND` network mode for these sessions; it remains an open decision of the [agent contract](cmds-ownsand-agent-foundation.md#network-policy).
+
 ### Licensing and code sharing
 
 - `servers/ownsand-api/`, `cmds/ownsand-agent/` and `cmds/ownsand-guest/` use `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md). The control plane, the device agent and the guest helper hold the parts that a competing sandbox service would need. Every other OwnSand path uses Apache-2.0, including the CLI (`cmds/ownsand/`), the SDKs and the schemas, because external users import or install them.
@@ -180,6 +189,7 @@ The cross-component suite in `servers/ownsand-api/e2e/` (package `e2e`, licensed
 
 - [servers-ownsand-api-foundation.md](servers-ownsand-api-foundation.md)
 - [project-sandrun.md](project-sandrun.md): a consumer of the public API that runs GitHub Actions jobs and coding-agent sessions on OwnSand devices.
+- [project-sandcrew.md](project-sandcrew.md): a coding-agent session product on SandRun dev sessions that needs the long-lived sandbox capabilities.
 - [DigitalOcean bandwidth billing](https://docs.digitalocean.com/platform/billing/bandwidth/)
 - [repository-defaults.md](repository-defaults.md)
 - [repository-auth-contract.md](repository-auth-contract.md)

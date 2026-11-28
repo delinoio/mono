@@ -45,4 +45,5 @@
 - `cmds/ownsand-guest/` and `cmds/ownsand-agent/`: [project index](../docs/project-ownsand.md) and [device agent foundation contract](../docs/cmds-ownsand-agent-foundation.md)
 - `cmds/ownsand/`: [project index](../docs/project-ownsand.md) and [CLI foundation contract](../docs/cmds-ownsand-cli-foundation.md)
 - `cmds/sandrun/`: [project index](../docs/project-sandrun.md) and [CLI foundation contract](../docs/cmds-sandrun-cli-foundation.md)
+- `cmds/sandcrew-bridge/` (planned, Apache-2.0): [project index](../docs/project-sandcrew.md) and [guest bridge foundation contract](../docs/cmds-sandcrew-bridge-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.
