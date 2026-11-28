@@ -4,6 +4,7 @@ package db_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io/fs"
 	"net"
@@ -12,9 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/pressly/goose/v3"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
@@ -227,6 +230,26 @@ func embeddedVersions(t *testing.T) []int64 {
 	return versions
 }
 
+func TestEmbeddedMigrationsLoadWithoutDatabase(t *testing.T) {
+	// Goose collects migration sources before it uses the SQL handle.
+	if _, err := goose.NewProvider(goose.DialectPostgres, new(sql.DB), db.Migrations(), goose.WithDisableGlobalRegistry(true)); err != nil {
+		t.Fatalf("load embedded migrations: %v", err)
+	}
+}
+
+func TestEmbeddedMigrationProviderRejectsDuplicateVersion17(t *testing.T) {
+	sqlFile := &fstest.MapFile{Data: []byte("-- +goose Up\nSELECT 1;\n")}
+	files := fstest.MapFS{
+		"0017_billing_resume_command.sql": sqlFile,
+		"0017_billing_owner_unlinks.sql":  sqlFile,
+	}
+	_, err := goose.NewProvider(goose.DialectPostgres, new(sql.DB), files, goose.WithDisableGlobalRegistry(true))
+	const want = "found duplicate migration version 17"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("load migration fixture: got %v, want %q", err, want)
+	}
+}
+
 // TestMigrateIsIdempotent applies the migrations to a migrated database
 // again and checks that goose records every embedded migration once.
 func TestMigrateIsIdempotent(t *testing.T) {
@@ -237,6 +260,82 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 	if got, want := appliedVersions(t, ctx, d), embeddedVersions(t); !slices.Equal(got, want) {
 		t.Fatalf("goose_db_version versions = %v, want %v", got, want)
+	}
+}
+
+func TestMigrateOwnerUnlinksPreservesResumeCommand(t *testing.T) {
+	const (
+		resumeVersion       = 17
+		ownerUnlinksVersion = 18
+		org                 = "018f0000-0000-7000-8000-0000000000d1"
+		device              = "018f0000-0000-7000-8000-0000000000d2"
+		sandbox             = "018f0000-0000-7000-8000-0000000000d3"
+		resumeCommand       = "018f0000-0000-7000-8000-0000000000d4"
+		account             = "018f0000-0000-7000-8000-0000000000d5"
+	)
+	ctx := t.Context()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, resumeVersion))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	var ownerUnlinksExists bool
+	if err := d.Pool.QueryRow(ctx, "SELECT to_regclass('billing_owner_unlinks') IS NOT NULL").Scan(&ownerUnlinksExists); err != nil {
+		t.Fatal(err)
+	}
+	if ownerUnlinksExists {
+		t.Fatal("billing_owner_unlinks already exists at version 17")
+	}
+	if _, err := d.Pool.Exec(ctx, "INSERT INTO organizations (organization_id, name, create_time) VALUES ($1, 'org', now())", org); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, "UPDATE organization_billing SET billing_account_id = $2 WHERE organization_id = $1", org, account); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, insertInventoryDevice, device, org, int16(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO sandboxes (sandbox_id, organization_id, device_id, agent_state, vcpu_count, memory_mib, disk_gib,
+		guest_os, host_os, arch, network_mode, idle_ttl_ms, max_ttl_ms, max_deadline, created_by_kind, created_by_id, create_time, billing_resume_command_id)
+		VALUES ($1, $2, $3, 2, 1, 512, 1, 1, 1, 1, 1, 90000, 3600000, now() + interval '1 hour', 1, 'alice', now(), $4)`, sandbox, org, device, resumeCommand); err != nil {
+		t.Fatal(err)
+	}
+
+	wantVersions := append(appliedVersions(t, ctx, d), ownerUnlinksVersion)
+	wantAppliedAt := appliedAt(t, ctx, d, resumeVersion)
+	wantBilling := readBilling(t, ctx, d.Pool, org)
+	if wantBilling.count != 1 || wantBilling.account == nil || *wantBilling.account != account {
+		t.Fatalf("version 17 has no billing row linked to account %s", account)
+	}
+	for range 2 {
+		if err := d.MigrateUpTo(ctx, testenv.Discard(), ownerUnlinksVersion); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := appliedVersions(t, ctx, d); !slices.Equal(got, wantVersions) {
+		t.Fatalf("goose_db_version versions = %v, want %v", got, wantVersions)
+	}
+	if got := appliedAt(t, ctx, d, resumeVersion); !got.Equal(wantAppliedAt) {
+		t.Fatalf("version 17 application time = %v, want %v", got, wantAppliedAt)
+	}
+	if got := readBilling(t, ctx, d.Pool, org); !reflect.DeepEqual(got, wantBilling) {
+		t.Fatalf("organization billing changed: got %+v, want %+v", got, wantBilling)
+	}
+	var gotCommand string
+	if err := d.Pool.QueryRow(ctx, "SELECT billing_resume_command_id::text FROM sandboxes WHERE sandbox_id = $1", sandbox).Scan(&gotCommand); err != nil {
+		t.Fatal(err)
+	}
+	if gotCommand != resumeCommand {
+		t.Fatalf("billing resume command ID = %q, want %q", gotCommand, resumeCommand)
+	}
+	var ownerUnlinkTriggerExists bool
+	if err := d.Pool.QueryRow(ctx, `SELECT to_regclass('billing_owner_unlinks') IS NOT NULL,
+		EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'organization_billing'::regclass AND tgname = 'clear_billing_owner_unlink')`).
+		Scan(&ownerUnlinksExists, &ownerUnlinkTriggerExists); err != nil {
+		t.Fatal(err)
+	}
+	if !ownerUnlinksExists || !ownerUnlinkTriggerExists {
+		t.Fatalf("version 18 installed billing_owner_unlinks = %t, clear_billing_owner_unlink trigger = %t", ownerUnlinksExists, ownerUnlinkTriggerExists)
 	}
 }
 
