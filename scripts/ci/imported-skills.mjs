@@ -213,10 +213,9 @@ export function buildManifest(root) {
           .join("; "),
       );
     }
-    const files = {};
-    for (const file of entries.files) {
-      files[file] = hashFile(join(directory, file));
-    }
+    const files = Object.fromEntries(
+      entries.files.map((file) => [file, hashFile(join(directory, file))]),
+    );
     skills[name] = { lock: snapshotOf(entry), files };
   }
   return { version: 1, skills };
