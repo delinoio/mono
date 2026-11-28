@@ -219,14 +219,14 @@ async function startLauncher(t, { env = {} } = {}) {
   };
   child.stdout.on("data", (chunk) => (run.stdout += chunk));
   child.stderr.on("data", (chunk) => (run.stderr += chunk));
-  // "exit", not "close": a survivor that holds the output pipes open would
-  // delay "close" until it ends.
+  // Record process exit even if a descendant still holds the output pipes.
   run.exited = new Promise((resolve) =>
     child.once("exit", (code, signal) => {
       run.exit = { code, signal };
       resolve(run.exit);
     }),
   );
+  run.closed = new Promise((resolve) => child.once("close", resolve));
   t.after(() => {
     stopAll(run);
     rmSync(tmp, { recursive: true, force: true });
@@ -266,6 +266,26 @@ async function waitFor(run, predicate, what) {
   assert.fail(
     `timed out waiting for ${what}\nstdout: ${run.stdout}\nstderr: ${run.stderr}`,
   );
+}
+
+async function waitForClose(run) {
+  let timer;
+  try {
+    await Promise.race([
+      run.closed,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `timed out waiting for launcher output to close\nstdout: ${run.stdout}\nstderr: ${run.stderr}`,
+            ),
+          );
+        }, WaitTimeout);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const events = (output, event) =>
@@ -514,6 +534,7 @@ test(
     await waitServer(run);
 
     process.kill(-run.child.pid, "SIGINT");
+    await waitForClose(run);
     const { code } = await run.exited;
 
     assert.equal(code, 130, run.stderr);
@@ -549,6 +570,7 @@ test(
     // running until the second signal arrives.
     assert.equal(run.exit, null);
     process.kill(-run.child.pid, "SIGINT");
+    await waitForClose(run);
     const { code } = await run.exited;
 
     assert.equal(code, 130, run.stderr);
@@ -576,6 +598,7 @@ test(
     await waitServer(run);
 
     process.kill(run.child.pid, "SIGTERM");
+    await waitForClose(run);
     const { code } = await run.exited;
 
     assert.equal(code, 143, run.stderr);
@@ -601,6 +624,7 @@ test(
     const server = await waitServer(run);
 
     process.kill(-run.child.pid, "SIGQUIT");
+    await waitForClose(run);
     const { code } = await run.exited;
 
     assert.equal(code, 131, run.stderr);
