@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"runtime"
@@ -433,13 +434,12 @@ func TestSingleTerminationSignalDrainsInFlightRequestAndExitsZero(t *testing.T) 
 func TestSingleTerminationSignalWithoutTrafficExitsZero(t *testing.T) {
 	h := startHelperProcess(t, signalHelperHealthy)
 
-	resp, err := http.Get("http://" + h.addr + "/ping")
+	status, err := requestSignalHelperPing(t.Context(), "http://"+h.addr, 5*time.Second)
 	if err != nil {
-		t.Fatalf("GET /ping before any signal: %v", err)
+		t.Fatalf("GET /ping before any signal: %v; output:\n%s", err, h.out.String())
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("GET /ping status = %d, want %d", resp.StatusCode, http.StatusOK)
+	if status != http.StatusOK {
+		t.Errorf("GET /ping status = %d, want %d", status, http.StatusOK)
 	}
 
 	h.signal(syscall.SIGTERM)
@@ -447,6 +447,58 @@ func TestSingleTerminationSignalWithoutTrafficExitsZero(t *testing.T) {
 	ws := h.wait(5 * time.Second)
 	if !ws.Exited() || ws.ExitStatus() != 0 {
 		t.Errorf("wait status = %v, want exit status 0", ws)
+	}
+}
+
+func requestSignalHelperPing(ctx context.Context, baseURL string, timeout time.Duration) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/ping", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+func TestSignalHelperPingTimesOutWaitingForHeaders(t *testing.T) {
+	t.Parallel()
+
+	received := make(chan struct{})
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
+		close(received)
+		<-release
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := requestSignalHelperPing(t.Context(), server.URL, 500*time.Millisecond)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GET /ping error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GET /ping did not return before the test deadline")
+	}
+	select {
+	case <-received:
+	default:
+		t.Fatal("server did not receive GET /ping before the request deadline")
 	}
 }
 
