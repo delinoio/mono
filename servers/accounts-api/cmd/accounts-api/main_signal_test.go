@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
@@ -364,6 +365,11 @@ func getAsyncContext(ctx context.Context, url string) <-chan int {
 func TestSecondTerminationSignalTerminatesProcessDuringDrain(t *testing.T) {
 	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
 		t.Run(sig.String(), func(t *testing.T) {
+			// The helper restores the inherited SIGINT disposition when it
+			// releases its signal registration at the start of the drain.
+			if sig == syscall.SIGINT && signal.Ignored(os.Interrupt) {
+				t.Skip("parent process inherited an ignored SIGINT disposition")
+			}
 			h := startHelperProcess(t, signalHelperHealthy)
 			// The request outlives the whole test, so only the second signal can
 			// end the process before helperDrainTimeout.
