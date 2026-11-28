@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
@@ -57,6 +59,26 @@ func (f *exportVerifyFixture) verification(t *testing.T) (state ownsandv1.Snapsh
 		t.Fatal(err)
 	}
 	return ownsandv1.SnapshotExportState(export), verified, after
+}
+
+type exportManifestPart struct {
+	PartNumber int32
+	SizeBytes  int64
+	SHA256     []byte
+}
+
+func (f *exportVerifyFixture) manifest(t *testing.T) []exportManifestPart {
+	t.Helper()
+	rows, err := f.env.DB.Pool.Query(context.Background(),
+		"SELECT part_number, size_bytes, sha256 FROM snapshot_parts WHERE snapshot_id = $1 ORDER BY part_number", f.snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts, err := pgx.CollectRows(rows, pgx.RowToStructByPos[exportManifestPart])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parts
 }
 
 // run advances the clock by d and makes one verifier pass.
@@ -248,10 +270,37 @@ func TestExportVerificationRetriesAfterR2Failure(t *testing.T) {
 func TestExportVerificationWithoutObjectStore(t *testing.T) {
 	t.Parallel()
 	f := newExportVerifyFixture(t)
+	manifest := f.manifest(t)
+	if len(manifest) != 2 {
+		t.Fatalf("initial manifest has %d parts, want 2", len(manifest))
+	}
+	_, _, deadline := f.verification(t)
+	if want := f.exportedAt.Add(verifyDelay); deadline == nil || !deadline.Equal(want) {
+		t.Fatalf("initial verification deadline = %v, want %v", deadline, want)
+	}
+	if got := len(cleanupJobs(t, f.env)); got != 0 {
+		t.Fatalf("initial cleanup queue has %d jobs, want none", got)
+	}
+
 	f.env.App.Service.Objects = nil
-	f.run(verifyDelay)
-	f.run(time.Hour)
-	f.wantExported(t, false)
+	for i, delay := range []time.Duration{verifyDelay, time.Hour} {
+		f.run(delay)
+		state, verified, after := f.verification(t)
+		if state != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED || verified {
+			t.Fatalf("pass %d: export state %v, verified %v; want EXPORTED, unverified", i+1, state, verified)
+		}
+		if after == nil || !after.Equal(*deadline) {
+			t.Fatalf("pass %d: verification deadline = %v, want %v", i+1, after, deadline)
+		}
+		if got := f.manifest(t); !slices.EqualFunc(got, manifest, func(a, b exportManifestPart) bool {
+			return a.PartNumber == b.PartNumber && a.SizeBytes == b.SizeBytes && bytes.Equal(a.SHA256, b.SHA256)
+		}) {
+			t.Fatalf("pass %d: manifest = %+v, want %+v", i+1, got, manifest)
+		}
+		if jobs := cleanupJobs(t, f.env); len(jobs) != 0 {
+			t.Fatalf("pass %d: cleanup queue = %v, want empty", i+1, jobs)
+		}
+	}
 	f.wantLog(t, `"msg":"export_verification_retry"`, `"reason":"r2_not_configured"`)
 }
 
