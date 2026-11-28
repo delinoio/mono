@@ -229,6 +229,26 @@ func TestClientOneTimeCharge(t *testing.T) {
 		paddletest.ChargeTopUpID(charge) != "tu_1" || paddletest.ChargeAmountCents(charge) != "2500" {
 		t.Fatalf("charge body = %+v", charge.Body)
 	}
+	items, _ := charge.Body["items"].([]any)
+	item, _ := items[0].(map[string]any)
+	price, _ := item["price"].(map[string]any)
+	unitPrice, _ := price["unit_price"].(map[string]any)
+	for _, field := range []struct {
+		object map[string]any
+		key    string
+		path   string
+		want   string
+	}{
+		{unitPrice, "currency_code", "items[0].price.unit_price.currency_code", "USD"},
+		{price, "tax_mode", "items[0].price.tax_mode", "external"},
+	} {
+		value, present := field.object[field.key]
+		if !present {
+			t.Errorf("%s = <missing>, want %q", field.path, field.want)
+		} else if got, ok := value.(string); !ok || got != field.want {
+			t.Errorf("%s = %#v (%T), want %q", field.path, value, value, field.want)
+		}
+	}
 
 	fake.FailCharges(&paddletest.Failure{Status: http.StatusBadRequest, Code: paddle.CodePaymentDeclined})
 	_, err = client.CreateOneTimeCharge(ctx, "sub_1", paddle.Charge{ProductID: "pro", AmountCents: 2500, Description: "xx"})
