@@ -162,11 +162,11 @@ type Manager struct {
 	// waits for the running snapshot imports and wipes the local data, and
 	// nothing clears it, because the removal notice is final (a failed
 	// removal retries in the same process or after a restart that sets the
-	// fence again). While it is set, fresh creates, snapshot captures and
-	// snapshot imports cannot start. imports counts the imports
-	// that passed BeginSnapshotImport and did not end; importsDrained is
-	// closed (and cleared) when the count reaches zero while a RemoveAll
-	// waits for it.
+	// fence again). While it is set, fresh creates, periodic sandbox ends,
+	// snapshot captures and snapshot imports cannot start. imports counts
+	// the imports that passed BeginSnapshotImport and have yet to end.
+	// importsDrained is closed and cleared when the count reaches zero
+	// while RemoveAll waits for it.
 	removing       bool
 	imports        int
 	importsDrained chan struct{}
@@ -1305,7 +1305,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			sb.rec.IdleDeadline = now.Add(sb.rec.IdleTTL)
 			sb.idleDirty = true
 		}
-		if sb.rec.Live() {
+		if !m.removing && sb.rec.Live() {
 			if reason := sb.rec.endReasonAt(now); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
 				sb.ending = true
 				if sb.createCancel != nil {
@@ -1369,6 +1369,14 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			defer m.bg.Done()
 			e.sb.cmdMu.Lock()
 			defer e.sb.cmdMu.Unlock()
+			// Removal waits on cmdMu for any end admitted before its fence.
+			// A queued end must still own the registered sandbox to proceed.
+			m.mu.Lock()
+			admitted := !m.removing && m.sandboxes[e.sb.rec.SandboxID] == e.sb
+			m.mu.Unlock()
+			if !admitted {
+				return
+			}
 			if _, err := m.endLocked(ctx, e.sb, finalStateFor(e.reason), e.reason); err != nil {
 				m.logger.Error("end sandbox failed", "sandbox_id", e.sb.rec.SandboxID, "error", err)
 			}
