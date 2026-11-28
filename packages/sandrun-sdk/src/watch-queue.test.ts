@@ -5,6 +5,7 @@ import { RequestState, RunnerState } from "@delino/sandrun-protos/v1/common_pb";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   WorkService,
+  type WatchQueueResponse,
   WatchQueueResponseSchema,
 } from "@delino/sandrun-protos/v1/work_pb";
 import { MAX_BACKOFF_MS } from "./backoff.ts";
@@ -390,58 +391,116 @@ describe("watchQueue", () => {
   const bufferedRequest = create(WatchQueueResponseSchema, {
     event: { case: "request", value: { requestId: "buffered" } },
   });
-  const bufferedSnapshot = create(WatchQueueResponseSchema, {
+  const firstRunner = create(WatchQueueResponseSchema, {
+    event: { case: "runner", value: { runnerId: "first" } },
+  });
+  const firstSnapshot = create(WatchQueueResponseSchema, {
     event: { case: "snapshotComplete", value: {} },
   });
 
-  test.each([
-    ["request", bufferedRequest, "request buffered UNSPECIFIED"],
-    ["snapshot completion", bufferedSnapshot, "snapshot complete"],
-  ] as const)(
-    "closes the stream when a buffered %s arrives after abort",
-    async (_name, bufferedResponse, expected) => {
-      const clock = new RecordingClock();
-      let streams = 0;
-      let closed = 0;
-      const caller: WatchQueueCaller = {
-        async *watchQueue() {
-          streams++;
-          try {
-            yield firstRequest;
-            yield bufferedResponse;
-          } finally {
-            closed++;
-          }
-        },
-      };
+  function recordingCaller(
+    first: WatchQueueResponse,
+    second: () => WatchQueueResponse | Promise<WatchQueueResponse>,
+  ) {
+    const counts = { reads: 0, closes: 0, streams: 0 };
+    const caller: WatchQueueCaller = {
+      watchQueue() {
+        counts.streams++;
+        let reads = 0;
+        return {
+          [Symbol.asyncIterator](): AsyncIterator<WatchQueueResponse> {
+            return {
+              async next() {
+                counts.reads++;
+                switch (reads++) {
+                  case 0:
+                    return { done: false, value: first };
+                  case 1:
+                    return { done: false, value: await second() };
+                  default:
+                    return { done: true, value: undefined };
+                }
+              },
+              async return() {
+                counts.closes++;
+                return { done: true, value: undefined };
+              },
+            };
+          },
+        };
+      },
+    };
+    return { caller, counts };
+  }
 
+  test.each([
+    ["request", firstRequest, "request first UNSPECIFIED"],
+    ["runner", firstRunner, "runner first UNSPECIFIED"],
+    ["snapshot completion", firstSnapshot, "snapshot complete"],
+  ] as const)(
+    "closes the stream without another read when aborted after a %s",
+    async (_name, response, expected) => {
+      const clock = new RecordingClock();
       const abort = new AbortController();
+      const { caller, counts } = recordingCaller(
+        response,
+        () => bufferedRequest,
+      );
       const events = watchQueue(caller, {
         organizationId: ORG,
         signal: abort.signal,
         clock,
       });
-      expect(summarize((await events.next()).value!)).toBe(
-        "request first UNSPECIFIED",
-      );
+      expect(summarize((await events.next()).value!)).toBe(expected);
       abort.abort(new Error("stop the watch"));
       expect(await events.next()).toEqual({ done: true, value: undefined });
-      expect(closed).toBe(1);
-      expect(streams).toBe(1);
+      expect(counts).toEqual({ reads: 1, closes: 1, streams: 1 });
       expect(clock.sleeps).toEqual([]);
-
-      const live = watchQueue(caller, {
-        organizationId: ORG,
-        signal: new AbortController().signal,
-        clock,
-      });
-      expect(summarize((await live.next()).value!)).toBe(
-        "request first UNSPECIFIED",
-      );
-      expect(summarize((await live.next()).value!)).toBe(expected);
-      await live.return();
     },
   );
+
+  test("reads both responses in order when the signal stays active", async () => {
+    const { caller } = recordingCaller(firstRequest, () => bufferedRequest);
+    const events = watchQueue(caller, {
+      organizationId: ORG,
+      signal: new AbortController().signal,
+      clock: new RecordingClock(),
+    });
+    expect(summarize((await events.next()).value!)).toBe(
+      "request first UNSPECIFIED",
+    );
+    expect(summarize((await events.next()).value!)).toBe(
+      "request buffered UNSPECIFIED",
+    );
+    await events.return();
+  });
+
+  test("discards a response from a read that was pending at abort", async () => {
+    const clock = new RecordingClock();
+    const abort = new AbortController();
+    const readStarted = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<WatchQueueResponse>();
+    const { caller, counts } = recordingCaller(firstRequest, () => {
+      readStarted.resolve();
+      return response.promise;
+    });
+    const events = watchQueue(caller, {
+      organizationId: ORG,
+      signal: abort.signal,
+      clock,
+    });
+    expect(summarize((await events.next()).value!)).toBe(
+      "request first UNSPECIFIED",
+    );
+    const pending = events.next();
+    await readStarted.promise;
+    abort.abort();
+    response.resolve(bufferedRequest);
+
+    expect(await pending).toEqual({ done: true, value: undefined });
+    expect(counts).toEqual({ reads: 2, closes: 1, streams: 1 });
+    expect(clock.sleeps).toEqual([]);
+  });
 
   test("ends without a gap if the signal aborts as the backoff ends", async () => {
     const abort = new AbortController();
