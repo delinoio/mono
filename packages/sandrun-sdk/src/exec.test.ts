@@ -107,11 +107,10 @@ function execCaller(execDevSession: ExecCaller["execDevSession"]): ExecCaller {
 }
 
 /**
- * A dev session server: ExecDevSession runs `exec`, and the n-th
- * AttachDevSessionExec runs `attaches[n]`. A script entry that is a
- * ConnectError ends the stream with it; a script that runs out ends the
- * stream with an OK status and no final event, as the server does before
- * 14 minutes.
+ * A dev session server that plays `exec` and consumes one script per attach.
+ * An attach without a script fails with Code.Internal. Each script ends the
+ * stream with its ConnectError or, when exhausted, an OK status with no final
+ * event, as the server does before 14 minutes.
  */
 function execServer(exec: Script, attaches: Script[]) {
   const execs: ExecDevSessionRequest[] = [];
@@ -132,7 +131,15 @@ function execServer(exec: Script, attaches: Script[]) {
       },
       attachDevSessionExec(req) {
         attachRequests.push(req);
-        return play(attaches[attachRequests.length - 1] ?? []);
+        const attachNumber = attachRequests.length;
+        const script = attaches[attachNumber - 1];
+        if (script === undefined) {
+          throw new ConnectError(
+            `No script for attach request ${attachNumber} (${attaches.length} scripts supplied)`,
+            Code.Internal,
+          );
+        }
+        return play(script);
       },
     });
   });
@@ -353,6 +360,60 @@ describe("exec helper", () => {
     expect(server.calls).toHaveLength(1);
     expect(execs).toHaveLength(1);
     expect(attachRequests).toEqual([]);
+    expect(clock.sleeps).toEqual([]);
+  });
+
+  test("stops at the first attach request without a script", async () => {
+    const { server, execs, attachRequests } = execServer([started], []);
+    const clock = new RecordingClock();
+    const stream = client(server.fetch, clock).execDevSession({
+      ...execInput,
+      execId: EXEC,
+    });
+
+    expect((await stream.next()).value).toMatchObject({
+      kind: ExecEventKind.Started,
+    });
+    expect((await stream.next()).value).toMatchObject({
+      kind: ExecEventKind.Reattached,
+    });
+    await expect(stream.next()).rejects.toMatchObject({
+      code: Code.Internal,
+      rawMessage: "No script for attach request 1 (0 scripts supplied)",
+      cause: undefined,
+    });
+    expect(await stream.next()).toEqual({ done: true, value: undefined });
+    expect(execs).toHaveLength(1);
+    expect(attachRequests).toHaveLength(1);
+    expect(attachRequests[0]).toMatchObject({
+      execId: EXEC,
+      stdoutOffset: 0n,
+      stderrOffset: 0n,
+    });
+    expect(clock.sleeps).toEqual([]);
+  });
+
+  test("continues after an explicitly empty attach script", async () => {
+    const { server, execs, attachRequests } = execServer(
+      [started],
+      [[], [exited(0)]],
+    );
+    const clock = new RecordingClock();
+    const events: string[] = [];
+    for await (const event of client(server.fetch, clock).execDevSession(
+      execInput,
+    )) {
+      events.push(describeEvent(event));
+    }
+
+    expect(events).toEqual([
+      "started",
+      "reattach 0 0",
+      "reattach 0 0",
+      "exited 0",
+    ]);
+    expect(execs).toHaveLength(1);
+    expect(attachRequests).toHaveLength(2);
     expect(clock.sleeps).toEqual([]);
   });
 
