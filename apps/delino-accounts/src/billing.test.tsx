@@ -843,7 +843,7 @@ describe("pending subscription polling", () => {
     }
   });
 
-  test("a confirmation before the checkout closes does not poll or refresh twice", async () => {
+  test("a paid checkout refreshes on close and activation, then stops polling", async () => {
     const checkout = fakeCheckout();
     const api = await renderPending(SubscriptionStatus.NONE, { checkout });
     await act(async () => {
@@ -854,16 +854,30 @@ describe("pending subscription polling", () => {
     await advance(SETTLE_MS);
     await advance(SETTLE_MS);
     expect(checkout.opened).toEqual(["txn_checkout1"]);
+    expect(screen.getByText("Waiting for payment")).toBeTruthy();
+    const closeOffset = api.calls.length;
     // The webhook arrives before the poll runs and before the close callback.
     confirm(api);
     await act(async () => checkout.close());
     await advance(SETTLE_MS);
     await advance(SETTLE_MS);
+    const closeCalls = api.calls.slice(closeOffset);
+    expect(
+      closeCalls
+        .filter((call) => call.method === "GetBalance")
+        .map((call) => call.request.billingAccountId),
+    ).toEqual([ACCOUNT_ID, ACCOUNT_ID]);
+    expect(
+      closeCalls
+        .filter((call) => call.method === "GetSubscription")
+        .map((call) => call.request.billingAccountId),
+    ).toEqual([ACCOUNT_ID, ACCOUNT_ID]);
     expect(screen.queryByText("Waiting for payment")).toBeNull();
     expect(topUpDisabled()).toBe(false);
-    api.calls.length = 0;
+    expect(balanceNow()).toBe("$22.35");
+    const settledOffset = api.calls.length;
     await advance(POLL_MS * 5);
-    expect(api.calls).toEqual([]);
+    expect(api.calls.slice(settledOffset)).toEqual([]);
   });
 
   test("an unpaid closed checkout stays pending with reads only", async () => {
