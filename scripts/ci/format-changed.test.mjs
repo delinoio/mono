@@ -2135,8 +2135,15 @@ const brokenParents = [
   {
     name: "ENOTDIR",
     skip: false,
-    stagedPattern: /ENOTDIR.*a\/b\.ts/u,
-    explicitPattern: /ENOTDIR/u,
+    // Node can report ENOENT when a Windows lookup encounters a file as a parent.
+    stagedPattern:
+      process.platform === "win32"
+        ? /\((?:ENOENT|ENOTDIR)\).*a\/b\.ts\b/u
+        : /\(ENOTDIR\).*a\/b\.ts\b/u,
+    explicitPattern:
+      process.platform === "win32"
+        ? /^Error: (?:ENOENT|ENOTDIR):/u
+        : /^Error: ENOTDIR:/u,
     breakParent: (f) => {
       rmSync(join(f.cwd, "a"), { recursive: true });
       f.write("a", "not a directory\n");
