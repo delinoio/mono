@@ -475,8 +475,6 @@ func (w *execJSONWriter) event(ev ownsand.ExecEvent) error {
 		}
 		off, text := u.decode(ev.Offset, ev.Data)
 		if text == "" {
-			// The chunk holds only the start of a character; the next
-			// chunk carries it.
 			return nil
 		}
 		return w.writeOutput(ev.Kind, off, &text, nil)
@@ -499,8 +497,7 @@ func (w *execJSONWriter) writeOutput(k ownsand.ExecEventKind, off int64, text, b
 	return writeJSON(w.a.env.Stdout, execJSONEvent{Event: k.String(), ExecID: w.execID, Offset: &off, Data: text, DataBase64: b64})
 }
 
-// flush writes a held-back incomplete character of one stream as a
-// replacement character.
+// flush ends the contiguous span and writes any remaining replacement text.
 func (w *execJSONWriter) flush(k ownsand.ExecEventKind) error {
 	off, text, ok := w.stream(k).flush()
 	if !ok {
@@ -517,14 +514,13 @@ func (w *execJSONWriter) flushAll() error {
 	return w.flush(ownsand.ExecEventStderr)
 }
 
-// utf8Stream decodes one output stream as UTF-8 text. The guest splits
-// output into chunks without regard to character boundaries, so a
-// multibyte character can span two chunks: an incomplete character at the
-// end of a chunk is held back until the next contiguous chunk arrives, and
-// it is replaced with U+FFFD only when the stream ends or bytes are missing
-// after it. Other invalid bytes are replaced with U+FFFD.
+// utf8Stream decodes one output stream as UTF-8 text. The decoder holds
+// an incomplete character at the end of a chunk until more contiguous
+// bytes arrive or the span ends.
+// Each run of invalid bytes within a contiguous span becomes one U+FFFD.
 type utf8Stream struct {
-	pending []byte
+	pending    []byte
+	invalidRun bool
 	// next is the offset after the last byte received.
 	next    int64
 	started bool
@@ -534,23 +530,45 @@ type utf8Stream struct {
 // text of the complete characters in the pending bytes and data.
 func (u *utf8Stream) decode(off int64, data []byte) (int64, string) {
 	start := off - int64(len(u.pending))
-	buf := make([]byte, 0, len(u.pending)+len(data))
-	buf = append(append(buf, u.pending...), data...)
+	buf := data
+	if len(u.pending) > 0 {
+		buf = make([]byte, 0, len(u.pending)+len(data))
+		buf = append(append(buf, u.pending...), data...)
+	}
 	cut := incompleteRuneStart(buf)
 	u.pending = append(u.pending[:0], buf[cut:]...)
 	u.next, u.started = off+int64(len(data)), true
-	return start, strings.ToValidUTF8(string(buf[:cut]), string(utf8.RuneError))
+	buf = buf[:cut]
+	if len(buf) > 0 && utf8.Valid(buf) {
+		u.invalidRun = false
+		return start, string(buf)
+	}
+
+	var text strings.Builder
+	for i := 0; i < len(buf); {
+		r, size := utf8.DecodeRune(buf[i:])
+		invalid := r == utf8.RuneError && size == 1
+		if !invalid || !u.invalidRun {
+			if text.Len() == 0 {
+				start += int64(i)
+			}
+			text.WriteRune(r)
+		}
+		u.invalidRun = invalid
+		i += size
+	}
+	return start, text.String()
 }
 
-// flush returns the held-back bytes as replacement text.
+// flush treats held-back bytes as invalid and resets the stream state.
 func (u *utf8Stream) flush() (int64, string, bool) {
-	if len(u.pending) == 0 {
+	off := u.next - int64(len(u.pending))
+	replace := len(u.pending) > 0 && !u.invalidRun
+	*u = utf8Stream{}
+	if !replace {
 		return 0, "", false
 	}
-	off := u.next - int64(len(u.pending))
-	text := strings.ToValidUTF8(string(u.pending), string(utf8.RuneError))
-	u.pending = u.pending[:0]
-	return off, text, true
+	return off, string(utf8.RuneError), true
 }
 
 // incompleteRuneStart returns the index of an incomplete but so far valid
