@@ -181,6 +181,9 @@ type Manager struct {
 	// source determines whether cleanup must also clear a durable marker.
 	cleanupPending  map[string]cleanupSource
 	cleanupInFlight map[string]*cleanupAttempt
+	// recordRemovals holds acknowledged terminal IDs whose record files
+	// could not be removed. A successful save for the ID cancels the retry.
+	recordRemovals map[string]struct{}
 	// runningAttempts and runningBackoff bound the retries of the first
 	// RUNNING commit of a create; see publishRunning. Tests override them.
 	runningAttempts int
@@ -234,6 +237,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
 		runningAttempts: DefaultRunningAttempts, runningBackoff: DefaultRunningBackoff,
 		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, cleanupPending: map[string]cleanupSource{}, cleanupInFlight: map[string]*cleanupAttempt{}, importLocks: map[string]*importLock{}, reports: map[uint64]map[string]uint64{},
+		recordRemovals: make(map[string]struct{}),
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
 		if a.StateEpoch == "" {
@@ -425,10 +429,18 @@ func (m *Manager) commitRecordLocked(rec *Record, change func(*Record)) (recordC
 	change(rec)
 	rec.Revision = rev
 	rec.Acked = false
-	if err := m.st.SaveSandbox(rec.SandboxID, rec); err != nil {
-		return recordCommitSave, fmt.Errorf("sandboxes: save record: %w", err)
+	if err := m.saveRecordLocked(rec); err != nil {
+		return recordCommitSave, err
 	}
 	return "", nil
+}
+
+func (m *Manager) saveRecordLocked(rec *Record) error {
+	if err := m.st.SaveSandbox(rec.SandboxID, rec); err != nil {
+		return fmt.Errorf("sandboxes: save record: %w", err)
+	}
+	delete(m.recordRemovals, rec.SandboxID)
+	return nil
 }
 
 // errSandboxGone reports that updateIf skipped a stale sandbox: its guard
@@ -1207,8 +1219,8 @@ func (m *Manager) canRetryPauseResumeSaveLocked(sb *sandbox, now time.Time) bool
 // saveCurrentRecordLocked saves the record as it exists under m.mu, with
 // its current revision and acknowledgement.
 func (m *Manager) saveCurrentRecordLocked(sb *sandbox) error {
-	if err := m.st.SaveSandbox(sb.rec.SandboxID, sb.rec); err != nil {
-		return fmt.Errorf("sandboxes: save record: %w", err)
+	if err := m.saveRecordLocked(&sb.rec); err != nil {
+		return err
 	}
 	sb.pauseResumeSavePending = false
 	return nil
@@ -1276,8 +1288,9 @@ func (sb *sandbox) retryReasonBeforeDeadline() ownsandv1.SandboxEndReason {
 }
 
 // Tick enforces the TTLs, retries failed creates, cleanup of exited VMs and
-// unsaved pause or resume records, reports moved idle deadlines at most once
-// per minute and resends unacknowledged updates when resend is true.
+// unsaved pause or resume records, and removes acknowledged terminal records
+// from disk. It reports moved idle deadlines at most once per minute and
+// resends unacknowledged updates when resend is true.
 func (m *Manager) Tick(ctx context.Context, resend bool) {
 	now := m.now()
 	type expiry struct {
@@ -1300,6 +1313,9 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	if m.closed {
 		m.mu.Unlock()
 		return
+	}
+	for id := range m.recordRemovals {
+		m.removeRecordLocked(id)
 	}
 	execs := m.execs
 	for _, sb := range m.sandboxes {
@@ -1632,13 +1648,20 @@ func (m *Manager) dropLocked(id string) {
 		// Keep the delete marker so that a late create is still rejected;
 		// the record stays acknowledged.
 		sb.rec.Acked = true
-		_ = m.st.SaveSandbox(id, sb.rec)
+		_ = m.saveRecordLocked(&sb.rec)
 		return
 	}
 	delete(m.sandboxes, id)
+	m.removeRecordLocked(id)
+}
+
+func (m *Manager) removeRecordLocked(id string) {
 	if err := m.st.DeleteSandbox(id); err != nil {
+		m.recordRemovals[id] = struct{}{}
 		m.logger.Warn("delete sandbox record failed", "sandbox_id", id, "error", err)
+		return
 	}
+	delete(m.recordRemovals, id)
 }
 
 // Entries returns the entries of every sandbox, for status output.
