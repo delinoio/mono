@@ -56,17 +56,32 @@ describe("create organization navigation", () => {
     // The page's first load of the list passes; the refetch that follows the
     // create is held.
     let hold = false;
+    let createdOrganizationId: string | undefined;
+    const mock = createMockTransport();
+    const captureCreate: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        const response = await mock.unary(method, ...args);
+        if (method.name === "CreateOrganization") {
+          const { organization } =
+            response.message as unknown as CreateOrganizationResponse;
+          createdOrganizationId = organization?.organizationId;
+        }
+        return response;
+      },
+    };
     const { transport, calls } = holdingTransport(
       ["ListOrganizations"],
       () => hold,
+      captureCreate,
     );
     const dialog = await openAndName(transport, "Initech");
     hold = true;
     await submit(dialog);
     expect(calls.ListOrganizations?.length).toBeGreaterThan(0);
-    expect(window.location.pathname).toMatch(
-      /^\/orgs\/[0-9a-f-]{36}\/sandboxes$/,
-    );
+    expect(createdOrganizationId).toBeTruthy();
+    const expectedPath = `/orgs/${createdOrganizationId}/sandboxes`;
+    expect(window.location.pathname).toBe(expectedPath);
     expect(
       screen.queryByRole("dialog", { name: "Create an organization" }),
     ).toBeNull();
@@ -75,9 +90,7 @@ describe("create organization navigation", () => {
       for (const call of calls.ListOrganizations ?? []) call.settle();
     });
     await settle(100);
-    expect(window.location.pathname).toMatch(
-      /^\/orgs\/[0-9a-f-]{36}\/sandboxes$/,
-    );
+    expect(window.location.pathname).toBe(expectedPath);
     expect(
       screen
         .getByRole("combobox", { name: "Organization" })
