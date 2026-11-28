@@ -1405,9 +1405,30 @@ func TestLinkFlow(t *testing.T) {
 	w := newGHWorld(t, worldOpts{})
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin).GitHub
-	link := func(state, code string, id int64) error {
-		_, err := admin.LinkGitHubInstallation(ctx, connect.NewRequest(&sandrunv1.LinkGitHubInstallationRequest{OrganizationId: w.org.ID, GithubInstallationId: id, Code: code, State: state}))
-		return err
+	const (
+		noError          = connect.Code(0)
+		unknownStateCode = "test-link-flow-unknown-state-code"
+		badCode          = "test-link-flow-rejected-oauth-code"
+		stateCheckCode   = "oauthcode1"
+		personalCode     = "oauthcode2"
+		inaccessibleCode = "oauthcode3"
+		firstLinkCode    = "oauthcode4"
+		duplicateCode    = "oauthcode5"
+		crossOrgCode     = "oauthcode6"
+		relinkCode       = "oauthcode7"
+	)
+	type linkAttempt struct {
+		label string
+		code  string
+	}
+	var attempts []linkAttempt
+	link := func(label string, org testenv.Org, state, code string, id int64, want connect.Code) {
+		t.Helper()
+		attempts = append(attempts, linkAttempt{label: label, code: code})
+		_, err := w.env.User(org.Admin).GitHub.LinkGitHubInstallation(ctx, connect.NewRequest(&sandrunv1.LinkGitHubInstallationRequest{
+			OrganizationId: org.ID, GithubInstallationId: id, Code: code, State: state,
+		}))
+		wantCode(t, label, err, want)
 	}
 	w.gh.AddInstallation(501, "acme", "Organization", "octo")
 	w.gh.AddInstallation(502, "octo", "User", "octo")
@@ -1418,30 +1439,28 @@ func TestLinkFlow(t *testing.T) {
 		resp.Msg.GetExpireTime().AsTime().Sub(w.env.Clock.Now()) != 10*time.Minute {
 		t.Fatalf("url %v %v", resp, err)
 	}
-	wantCode(t, "unknown state", link("nope", "c", 501), connect.CodeInvalidArgument)
+	link("unknown state", w.org, "nope", unknownStateCode, 501, connect.CodeInvalidArgument)
 	// A state of another user (the owner) does not work for the admin.
 	ownerState := w.installState(t, w.org.Owner)
-	w.gh.AddCode("oauthcode1", "octo")
-	wantCode(t, "state of another user", link(ownerState, "oauthcode1", 501), connect.CodeInvalidArgument)
+	w.gh.AddCode(stateCheckCode, "octo")
+	link("state of another user", w.org, ownerState, stateCheckCode, 501, connect.CodeInvalidArgument)
 	// Expired after 10 minutes.
 	expired := w.installState(t, w.org.Admin)
 	w.env.Clock.Advance(11 * time.Minute)
-	wantCode(t, "expired state", link(expired, "oauthcode1", 501), connect.CodeInvalidArgument)
+	link("expired state", w.org, expired, stateCheckCode, 501, connect.CodeInvalidArgument)
 	// A bad code consumes the state.
 	state := w.installState(t, w.org.Admin)
-	wantCode(t, "bad code", link(state, "wrong", 501), connect.CodeInvalidArgument)
-	wantCode(t, "used state", link(state, "oauthcode1", 501), connect.CodeInvalidArgument)
+	link("bad code", w.org, state, badCode, 501, connect.CodeInvalidArgument)
+	link("used state", w.org, state, stateCheckCode, 501, connect.CodeInvalidArgument)
 	// Personal accounts and installations that the user cannot access fail.
-	w.gh.AddCode("oauthcode2", "octo")
-	wantCode(t, "personal account", link(w.installState(t, w.org.Admin), "oauthcode2", 502), connect.CodeFailedPrecondition)
-	w.gh.AddCode("oauthcode3", "octo")
-	wantCode(t, "not the user's installation", link(w.installState(t, w.org.Admin), "oauthcode3", 503), connect.CodePermissionDenied)
-	w.gh.AddCode("oauthcode4", "octo")
-	if err := link(w.installState(t, w.org.Admin), "oauthcode4", 501); err != nil {
-		t.Fatal(err)
-	}
-	w.gh.AddCode("oauthcode5", "octo")
-	wantCode(t, "linked twice", link(w.installState(t, w.org.Admin), "oauthcode5", 501), connect.CodeAlreadyExists)
+	w.gh.AddCode(personalCode, "octo")
+	link("personal account", w.org, w.installState(t, w.org.Admin), personalCode, 502, connect.CodeFailedPrecondition)
+	w.gh.AddCode(inaccessibleCode, "octo")
+	link("not the user's installation", w.org, w.installState(t, w.org.Admin), inaccessibleCode, 503, connect.CodePermissionDenied)
+	w.gh.AddCode(firstLinkCode, "octo")
+	link("first link", w.org, w.installState(t, w.org.Admin), firstLinkCode, 501, noError)
+	w.gh.AddCode(duplicateCode, "octo")
+	link("linked twice", w.org, w.installState(t, w.org.Admin), duplicateCode, 501, connect.CodeAlreadyExists)
 
 	// Another SandRun organization cannot link the same installation.
 	other := w.env.NewOrg("bob")
@@ -1450,10 +1469,8 @@ func TestLinkFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, s, _ := strings.Cut(st.Msg.GetUrl(), "?state=")
-	w.gh.AddCode("oauthcode6", "octo")
-	_, err = w.env.User(other.Admin).GitHub.LinkGitHubInstallation(ctx, connect.NewRequest(&sandrunv1.LinkGitHubInstallationRequest{OrganizationId: other.ID,
-		GithubInstallationId: 501, Code: "oauthcode6", State: s}))
-	wantCode(t, "another organization", err, connect.CodeAlreadyExists)
+	w.gh.AddCode(crossOrgCode, "octo")
+	link("another organization", other, s, crossOrgCode, 501, connect.CodeAlreadyExists)
 
 	list, err := admin.ListGitHubInstallations(ctx, connect.NewRequest(&sandrunv1.ListGitHubInstallationsRequest{OrganizationId: w.org.ID}))
 	if err != nil || len(list.Msg.GetInstallations()) != 1 {
@@ -1503,12 +1520,20 @@ func TestLinkFlow(t *testing.T) {
 		}
 	}
 	// After the unlink, the installation can be linked again.
-	w.gh.AddCode("oauthcode7", "octo")
-	if err := link(w.installState(t, w.org.Admin), "oauthcode7", 501); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(w.env.Logs.String(), "oauthcode4") && strings.Contains(w.env.Logs.String(), `"code":"oauthcode4"`) {
-		t.Fatal("an OAuth code was logged")
+	w.gh.AddCode(relinkCode, "octo")
+	link("relink", w.org, w.installState(t, w.org.Admin), relinkCode, 501, noError)
+	for _, log := range []struct {
+		name string
+		text string
+	}{
+		{name: "control-plane", text: w.env.Logs.String()},
+		{name: "GitHub API client", text: w.ghLogs.String()},
+	} {
+		for _, attempt := range attempts {
+			if strings.Contains(log.text, attempt.code) {
+				t.Errorf("%s: synthetic OAuth code found in %s log", attempt.label, log.name)
+			}
+		}
 	}
 }
 
