@@ -543,6 +543,37 @@ describe("chat view", () => {
     });
   });
 
+  test("reloads the session after the first stream catches up", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    const { transport: recorded, calls } = recording(base);
+    let caughtUp = false;
+    const transport: Transport = {
+      ...recorded,
+      async stream(method, ...rest) {
+        const response = await recorded.stream(method, ...rest);
+        if (method.name !== "WatchSession") return response;
+        return {
+          ...response,
+          message: (async function* () {
+            for await (const message of response.message) {
+              if ((message as WatchSessionResponse).event.case === "caughtUp") {
+                caughtUp = true;
+              }
+              yield message;
+            }
+          })(),
+        };
+      },
+    };
+    const gets = () => calls.filter((c) => c.method === "GetSession").length;
+    renderConsole(chatPath, { transport });
+    await screen.findByRole("region", { name: "Transcript" });
+    await waitFor(() => expect(caughtUp).toBe(true));
+    // The session can change between its load and the subscription, and
+    // the stream does not replay session changes.
+    await waitFor(() => expect(gets()).toBeGreaterThan(1));
+  });
+
   test("shows every kind of transcript event", async () => {
     renderConsole(chatPath);
     const transcript = await screen.findByRole("region", {

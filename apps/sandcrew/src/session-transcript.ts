@@ -111,14 +111,9 @@ export function useSessionTranscript(
   );
 
   const streamKey = `${organizationId}:${sessionId}`;
-  const watchedKey = useRef<string>(undefined);
   const stream = useStream(
     async (signal, onLive) => {
       const client = createClient(SessionService, transport);
-      // The first stream of a session starts with the session load; later
-      // streams may have missed session changes.
-      const reopened = watchedKey.current === streamKey;
-      watchedKey.current = streamKey;
       for await (const response of client.watchSession(
         { organizationId, sessionId, afterSequence: lastSequence.current },
         { signal },
@@ -133,9 +128,10 @@ export function useSessionTranscript(
             break;
           case "caughtUp":
             onLive();
-            if (reopened) {
-              void queryClient.invalidateQueries({ queryKey: sessionKey });
-            }
+            // The stream replays transcript events but not session changes,
+            // and the session can change before any stream subscribes: the
+            // first stream after the session load, or a reopened one.
+            void queryClient.invalidateQueries({ queryKey: sessionKey });
             break;
           default:
             break;
