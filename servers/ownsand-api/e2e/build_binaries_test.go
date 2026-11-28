@@ -65,6 +65,7 @@ func (f *fakeBuildSteps) remaining(t *testing.T) []string {
 }
 
 func TestBinaryBuilderReportsModuleRootFailureOnEveryCall(t *testing.T) {
+	t.Parallel()
 	f := newFakeBuildSteps(t, errors.New("go env GOMOD: simulated"), nil)
 	builder := newBinaryBuilder(f.steps)
 	for i := range 2 {
@@ -85,6 +86,7 @@ func TestBinaryBuilderReportsModuleRootFailureOnEveryCall(t *testing.T) {
 }
 
 func TestBinaryBuilderReportsBuildFailureOnEveryCall(t *testing.T) {
+	t.Parallel()
 	f := newFakeBuildSteps(t, nil, errors.New("go build: simulated"))
 	builder := newBinaryBuilder(f.steps)
 	for i := range 2 {
@@ -105,6 +107,7 @@ func TestBinaryBuilderReportsBuildFailureOnEveryCall(t *testing.T) {
 }
 
 func TestBinaryBuilderBuildsOnce(t *testing.T) {
+	t.Parallel()
 	f := newFakeBuildSteps(t, nil, nil)
 	builder := newBinaryBuilder(f.steps)
 	first, err := builder()

@@ -24,6 +24,7 @@ import (
 // a retry delay (not a grant-limit result and not a grant that Admittable would
 // reject), and the authorization_id is free for a retry.
 func TestAuthorizeRelayAckAfterAdmissionDeadline(t *testing.T) {
+	t.Parallel()
 	// The acknowledgement wait is far longer than the test, so the wait ends
 	// only by the acknowledgement and never by its own timeout.
 	env := testenv.New(t, func(o *app.Options) {

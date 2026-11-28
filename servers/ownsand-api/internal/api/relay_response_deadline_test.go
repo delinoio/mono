@@ -93,6 +93,7 @@ func relayRequestWithGrant[T any](token, grantID string, message *T) *connect.Re
 }
 
 func TestRelayResponseWriteDeadline(t *testing.T) {
+	t.Parallel()
 	const (
 		rotation = 450 * time.Millisecond
 		hard     = 1800 * time.Millisecond

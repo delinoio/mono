@@ -62,6 +62,7 @@ func (g *codexFailureGate) pause(ctx context.Context) {
 }
 
 func TestCodexSessionFailedReleasesComputeDuringDispatch(t *testing.T) {
+	t.Parallel()
 	for _, dispatchFirst := range []bool{true, false} {
 		name := "failure first"
 		query := "SELECT " + work.RequestColumns + " FROM requests WHERE request_id = $1 FOR UPDATE"
@@ -196,6 +197,7 @@ func TestCodexSessionFailedReleasesComputeDuringDispatch(t *testing.T) {
 }
 
 func TestCodexSessionFailedReleasesComputeAfterRedelivery(t *testing.T) {
+	t.Parallel()
 	w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	ctx := t.Context()
 	const sid = "sess_rollback"

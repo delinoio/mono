@@ -27,6 +27,7 @@ func expiryAmountFixture(t *testing.T) (f *fixture, acct, grant, id string) {
 }
 
 func TestCreditExpiryNotificationReadsCommittedRemainder(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		spent int64
@@ -70,6 +71,7 @@ func TestCreditExpiryNotificationReadsCommittedRemainder(t *testing.T) {
 }
 
 func TestCreditExpiryNotificationSuppressesAfterDirectoryLookup(t *testing.T) {
+	t.Parallel()
 	f, acct, _, id := expiryAmountFixture(t)
 	first, second := f.resendRecipients(acct)
 	lookup, release := make(chan struct{}), make(chan struct{})
@@ -107,6 +109,7 @@ func TestCreditExpiryNotificationSuppressesAfterDirectoryLookup(t *testing.T) {
 }
 
 func TestCreditExpiryNotificationKeepsAttemptedAmount(t *testing.T) {
+	t.Parallel()
 	for _, spend := range []int64{4 * usd, 10 * usd} {
 		t.Run(FormatUSD(spend), func(t *testing.T) {
 			f, acct, grant, id := expiryAmountFixture(t)
@@ -176,6 +179,7 @@ func TestCreditExpiryNotificationKeepsAttemptedAmount(t *testing.T) {
 }
 
 func TestCreditExpiryNotificationLegacyAmount(t *testing.T) {
+	t.Parallel()
 	for _, spend := range []int64{4 * usd, 10 * usd} {
 		t.Run(FormatUSD(spend), func(t *testing.T) {
 			f, acct, _, id := expiryAmountFixture(t)
@@ -210,6 +214,7 @@ func TestCreditExpiryNotificationLegacyAmount(t *testing.T) {
 }
 
 func TestCreditExpiryNotificationChecksGrantIdentityAndExpiry(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"absent grant", "different account", "malformed key", "grant expired"} {
 		t.Run(name, func(t *testing.T) {
 			f, _, grant, id := expiryAmountFixture(t)
@@ -235,6 +240,7 @@ func TestCreditExpiryNotificationChecksGrantIdentityAndExpiry(t *testing.T) {
 }
 
 func TestCreditExpiryNotificationRetriesGrantReadFailure(t *testing.T) {
+	t.Parallel()
 	f, _, _, id := expiryAmountFixture(t)
 	f.execResendSQL("ALTER TABLE credit_grants RENAME COLUMN remaining_usd_micros TO remaining_unavailable")
 	if err := f.s.DeliverNotifications(ctx()); err != nil {

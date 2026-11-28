@@ -142,6 +142,7 @@ func connStaysOpen(t *testing.T, conn *hub.Conn) {
 // the budget: the attempt ends as EXPORT_FAILED on the same channel, the
 // channel stays open, and a repeat export dispatches exactly one command.
 func TestExportFailUpdateRetriesTransientError(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, exportFailTiming(10*time.Second, 20*time.Millisecond))
 	fault := newExportFailFault(t, env)
 	fault.on("40001", 2) // serialization_failure for the first two calls
@@ -184,6 +185,7 @@ func TestExportFailUpdateRetriesTransientError(t *testing.T) {
 // that the state report of the replacement channel then fails the abandoned
 // attempt so that an explicit retry sends one new command.
 func TestExportFailUpdateUnresolvedClosesChannel(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name         string
 		code         string
@@ -244,6 +246,7 @@ func TestExportFailUpdateUnresolvedClosesChannel(t *testing.T) {
 // failed the attempt. None of them changes another attempt's row and none
 // closes the current channel.
 func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
+	t.Parallel()
 	type scenario struct {
 		name string
 		// act changes the world while the compensation waits for its next

@@ -131,6 +131,7 @@ func importExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client
 // the device reports on its new channel, and an explicit retry exports it
 // and an import on a second device restores the data.
 func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
+	t.Parallel()
 	s, c, ctx, snapID, data := exportRecoveryFixture(t)
 	sourceID := s.agents[0].deviceID
 	position := s.logs.position()
@@ -150,6 +151,7 @@ func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 // the snapshot ends EXPORT_FAILED when the device reconnects, and an
 // explicit retry exports it.
 func TestSnapshotExportRecoversAfterControlPlaneRestart(t *testing.T) {
+	t.Parallel()
 	s, c, ctx, snapID, data := exportRecoveryFixture(t)
 	s.killAPI(t)
 	position := s.logs.position()

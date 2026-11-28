@@ -19,6 +19,7 @@ import (
 // the reported allocation use that effective size, that the sandbox keeps the
 // requested size, and that a Linux device keeps the requested size.
 func TestHyperVMemoryRounding(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -109,6 +110,7 @@ func TestHyperVMemoryRounding(t *testing.T) {
 }
 
 func TestHyperVMemoryMaxInt64(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

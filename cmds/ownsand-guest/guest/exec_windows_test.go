@@ -20,6 +20,7 @@ import (
 // TestTerminateEndsTheProcessTree starts cmd.exe with a ping child and
 // checks that terminate ends both through the job object.
 func TestTerminateEndsTheProcessTree(t *testing.T) {
+	t.Parallel()
 	cmd := exec.Command("cmd.exe", "/c", "ping -n 60 127.0.0.1 >nul")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -107,6 +108,7 @@ func processEnded(t *testing.T, pid uint32, wait time.Duration) bool {
 // that a Go release that changes them fails here instead of timing out
 // finished commands again.
 func TestProcessExited(t *testing.T) {
+	t.Parallel()
 	start := func(t *testing.T, mode string) *exec.Cmd {
 		t.Helper()
 		cmd := exec.Command(helperCommand()[0], helperCommand()[1:]...)
@@ -153,6 +155,7 @@ func TestProcessExited(t *testing.T) {
 // direct child needs to start a process and shorter than the drain after it,
 // so the margins on both sides are about a second.
 func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	pidFile, stopFile := execSurvivorFiles(t)
 	req := helperExecReq(t, "spawn", pidFile, 1500*time.Millisecond)
@@ -175,6 +178,7 @@ func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
 // TestExecTimeoutKillsLiveChild checks that a direct child that outlives its
 // timeout is still terminated and reported as timed out.
 func TestExecTimeoutKillsLiveChild(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	req := helperExecReq(t, "sleep", pidFile, 1500*time.Millisecond)

@@ -49,6 +49,7 @@ func setupAgent(t *testing.T, env *testenv.Env, org *testenv.Org, limits *ownsan
 // TestHeartbeatStoresUpdateState checks that a heartbeat stores the update
 // state and starts and clears pending_idle_since.
 func TestHeartbeatStoresUpdateState(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev, agent := setupAgent(t, env, org, nil)
@@ -107,6 +108,7 @@ func waitState(t *testing.T, c *testenv.Clients, orgID, id string, want ownsandv
 }
 
 func TestSandboxLifecycleOverTheAgentChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -184,6 +186,7 @@ func TestSandboxLifecycleOverTheAgentChannel(t *testing.T) {
 }
 
 func TestCreateIdempotency(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -224,6 +227,7 @@ func TestCreateIdempotency(t *testing.T) {
 }
 
 func TestOfflineDeleteAndReconciliation(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 300 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -293,6 +297,7 @@ func TestOfflineDeleteAndReconciliation(t *testing.T) {
 // device, which waits through at least one poll, leaves no sandbox watch
 // registration behind and keeps the pending delete.
 func TestOfflineDeleteLeavesNoWatchers(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 1500 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -326,6 +331,7 @@ func TestOfflineDeleteLeavesNoWatchers(t *testing.T) {
 // TestWaitSandboxCancelledWaiterLeavesOtherWaiter checks that cancelling one
 // waiter unregisters it and that a terminal update still wakes the other.
 func TestWaitSandboxCancelledWaiterLeavesOtherWaiter(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 20 * time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -411,6 +417,7 @@ func TestWaitSandboxCancelledWaiterLeavesOtherWaiter(t *testing.T) {
 }
 
 func TestRevisionRuleAndAbsorbingStates(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -451,6 +458,7 @@ func TestRevisionRuleAndAbsorbingStates(t *testing.T) {
 }
 
 func TestCreateRejectedByAgent(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -477,6 +485,7 @@ func TestCreateRejectedByAgent(t *testing.T) {
 }
 
 func TestHeartbeatTimeoutAndReplacement(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 400 * time.Millisecond, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -518,6 +527,7 @@ func TestHeartbeatTimeoutAndReplacement(t *testing.T) {
 // replacement channel registered and applied its state report. The last
 // channel's close still marks the device offline.
 func TestOfflineWriteOfClosedChannelSkipsReplacement(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -651,6 +661,7 @@ func deviceOfflineLogs(t *testing.T, env *testenv.Env, deviceID string) []offlin
 // ONLINE device OFFLINE when the lease holder has no channel at all, and
 // leaves a recent device and terminal sandboxes unchanged.
 func TestOfflineSweepWithEmptyRegistry(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 400 * time.Millisecond, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -712,6 +723,7 @@ func TestOfflineSweepWithEmptyRegistry(t *testing.T) {
 }
 
 func TestConcurrentReservation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -742,6 +754,7 @@ func TestConcurrentReservation(t *testing.T) {
 }
 
 func TestConfigurationPushAndAgentUpdates(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -786,6 +799,8 @@ func TestConfigurationPushAndAgentUpdates(t *testing.T) {
 // version still gets the revocation recovery instead of a withdrawal, and an
 // older agent that answers UNIMPLEMENTED only produces a log line.
 func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
+	// Not parallel: the test reads the stacks of every goroutine in the
+	// process, so goroutines of a parallel test would change its result.
 	const (
 		follow = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT
 		hold   = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD
@@ -1058,6 +1073,7 @@ func awaitUpdateLockWait(t *testing.T) {
 // strictly newer, a pin is sent as it is, and a revocation recovery selects
 // the default even when it is lower.
 func TestAgentUpdateTargetOrdering(t *testing.T) {
+	t.Parallel()
 	type release struct {
 		version            string
 		isDefault, revoked bool
@@ -1156,6 +1172,7 @@ func TestAgentUpdateTargetOrdering(t *testing.T) {
 // version that it already runs makes it drop that update. FOLLOW_DEFAULT with
 // an equal default sends nothing.
 func TestPinEqualToRunningVersionDropsQueuedUpdate(t *testing.T) {
+	t.Parallel()
 	const (
 		follow = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT
 		pin    = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_PIN
@@ -1293,6 +1310,7 @@ func TestPinEqualToRunningVersionDropsQueuedUpdate(t *testing.T) {
 }
 
 func TestDeviceRemovalOverTheChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1326,6 +1344,7 @@ func TestDeviceRemovalOverTheChannel(t *testing.T) {
 // delete-snapshot command to the device, and that a state report that
 // lists a snapshot without a record gets the command too.
 func TestDeleteSnapshotDeletesLocalCopy(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -1371,6 +1390,7 @@ func TestDeleteSnapshotDeletesLocalCopy(t *testing.T) {
 }
 
 func TestSnapshotsTemplatesAndExport(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1461,6 +1481,7 @@ func TestSnapshotsTemplatesAndExport(t *testing.T) {
 }
 
 func TestOrganizationDeletionFinalSweepRetries(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1511,6 +1532,7 @@ func containsAny(s string, subs ...string) bool {
 }
 
 func TestChannelNeedsLease(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
@@ -1711,6 +1733,7 @@ func awaitReceive(t *testing.T, what string, ch <-chan receiveResult) receiveRes
 // closed is answered unavailable, sends no configuration and leaves the hub
 // unchanged.
 func TestChannelAdmissionAfterLeaseLoss(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
@@ -1759,6 +1782,7 @@ func TestChannelAdmissionAfterLeaseLoss(t *testing.T) {
 // every later one, also when entered is full, and that a second release does
 // not panic.
 func TestGateLeaseRelease(t *testing.T) {
+	t.Parallel()
 	gate := &gateLease{held: true, entered: make(chan struct{}, 1), proceed: make(chan struct{})}
 	t.Cleanup(gate.release)
 
@@ -1807,6 +1831,7 @@ func TestGateLeaseRelease(t *testing.T) {
 // and that the device then connects to the successor and gets its
 // configuration and heartbeat acknowledgements.
 func TestChannelRegisteredBeforeLeaseLossCloses(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
@@ -1906,6 +1931,7 @@ func importCreateReq(orgID, snapID, deviceID string) *ownsandv1.CreateSandboxReq
 // connected device fails the create, releases its reservation and keeps a
 // late import success from reviving it.
 func TestImportWaitExpiryFailsCreate(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: 300 * time.Millisecond}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -1972,6 +1998,7 @@ func TestImportWaitExpiryFailsCreate(t *testing.T) {
 // TestImportBeforeWaitExpiryCreates checks that a timely import result
 // registers the destination copy before the server sends the create command.
 func TestImportBeforeWaitExpiryCreates(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: 5 * time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx, cancel := context.WithCancel(t.Context())
@@ -2055,6 +2082,7 @@ func (c *offsetClock) Advance(d time.Duration) { c.offset.Add(int64(d)) }
 // refused. The test moves the local lease deadline clock past the TTL; the
 // next scheduled renewal is 10 seconds away, so nothing renews in between.
 func TestChannelClosesAtLeaseExpiry(t *testing.T) {
+	t.Parallel()
 	clock := &offsetClock{}
 	env := testenv.New(t, func(o *app.Options) { o.LeaseDeadlineNow = clock.Now })
 	org := env.NewOrg("alice")
@@ -2091,6 +2119,7 @@ func TestChannelClosesAtLeaseExpiry(t *testing.T) {
 // sum exceeds the int32 range are reported exactly, and that placement uses
 // the exact sum instead of failing in SQL.
 func TestAggregateVCPUAllocationAboveInt32(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

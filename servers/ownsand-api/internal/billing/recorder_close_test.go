@@ -14,6 +14,7 @@ import (
 // count added before it and that a count added after it is dropped with a
 // log record, not kept in memory.
 func TestRecorderSealAndClose(t *testing.T) {
+	t.Parallel()
 	var logs bytes.Buffer
 	r := NewRecorder(slog.New(slog.NewJSONHandler(&logs, nil)))
 	org := "0190f3a4-0000-7000-8000-000000000001"

@@ -163,6 +163,7 @@ func (f fakeLockHolderTx) Rollback(context.Context) error {
 func noPause(context.Context) {}
 
 func TestReleaseOnVerifiedWaitAdvancesBeforeCommit(t *testing.T) {
+	t.Parallel()
 	var events []string
 	polls := 0
 	observe := func(_ context.Context, pid int32) (bool, error) {
@@ -183,6 +184,7 @@ func TestReleaseOnVerifiedWaitAdvancesBeforeCommit(t *testing.T) {
 }
 
 func TestReleaseOnVerifiedWaitReportsCommitError(t *testing.T) {
+	t.Parallel()
 	var events []string
 	commitErr := errors.New("commit failed")
 	got := releaseOnVerifiedWait(context.Background(), fakeLockHolderTx{events: &events, commitErr: commitErr}, 1,
@@ -195,6 +197,7 @@ func TestReleaseOnVerifiedWaitReportsCommitError(t *testing.T) {
 // Without any matching waiter the observation ends with its context. The
 // holder is rolled back, the clock does not move and the timeout is reported.
 func TestReleaseOnVerifiedWaitWithoutWaiterRollsBack(t *testing.T) {
+	t.Parallel()
 	var events []string
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -221,6 +224,7 @@ func TestReleaseOnVerifiedWaitWithoutWaiterRollsBack(t *testing.T) {
 
 // An observation that fails must not be read as a wait.
 func TestReleaseOnVerifiedWaitObservationErrorRollsBack(t *testing.T) {
+	t.Parallel()
 	var events []string
 	queryErr := errors.New("pg_stat_activity query failed")
 	got := releaseOnVerifiedWait(context.Background(), fakeLockHolderTx{events: &events}, 1,
@@ -236,6 +240,7 @@ func TestReleaseOnVerifiedWaitObservationErrorRollsBack(t *testing.T) {
 
 // A context that ended before the first poll never reports a wait.
 func TestWaitForBlockedAcceptanceEndedContext(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	called := false
@@ -288,6 +293,7 @@ func backendBlockedOn(t *testing.T, pool *pgxpool.Pool, statement string, args .
 // backend, and neither a different statement blocked by the holder nor the
 // acceptance statement blocked by another backend.
 func TestPgBlockedAcceptanceObserverMatchesOnlyTheAcceptanceWaiter(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()

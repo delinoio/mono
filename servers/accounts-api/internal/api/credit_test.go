@@ -78,6 +78,7 @@ func ledgerKinds(t *testing.T, env *testenv.Env, userID, accountID string) []str
 }
 
 func TestCreditRoles(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	id := f.AccountID
@@ -169,6 +170,7 @@ func TestCreditRoles(t *testing.T) {
 }
 
 func TestSubscriptionLifecycle(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	owner := env.Credit(f.Owner.ID)
@@ -269,6 +271,7 @@ func TestSubscriptionLifecycle(t *testing.T) {
 // subscription for the deleted account. A Paddle failure fails the deletion
 // and leaves the account and its open checkout.
 func TestSubscriptionChangeRequiresPaddleConfirmation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		paddleCall string
@@ -400,6 +403,7 @@ func TestSubscriptionChangeRequiresPaddleConfirmation(t *testing.T) {
 }
 
 func TestDeleteBillingAccountCancelsPendingCheckout(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	started, err := env.Credit(f.Owner.ID).StartSubscription(ctx(), connect.NewRequest(&accountsv1.StartSubscriptionRequest{BillingAccountId: f.AccountID}))
@@ -489,6 +493,7 @@ func injectMemberDeleteFailure(t *testing.T, env *testenv.Env) {
 }
 
 func TestStartSubscriptionReplacesCanceledCheckoutAfterDeleteRollback(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	owner := env.Credit(f.Owner.ID)
@@ -599,6 +604,7 @@ func TestStartSubscriptionReplacesCanceledCheckoutAfterDeleteRollback(t *testing
 // completes the deletion after it reads the canceled subscription at Paddle,
 // with one cancellation request that Paddle accepted and one forfeiture.
 func TestDeleteBillingAccountRetryAfterRollback(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subID := subscribe(t, env, f)
@@ -658,6 +664,7 @@ func TestDeleteBillingAccountRetryAfterRollback(t *testing.T) {
 // and leaves the account, the subscription and the credit as they were. The
 // retry after a confirmed answer completes the deletion.
 func TestDeleteBillingAccountRequiresConfirmedCancellation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subID := subscribe(t, env, f)
@@ -692,6 +699,7 @@ func TestDeleteBillingAccountRequiresConfirmedCancellation(t *testing.T) {
 }
 
 func TestManualTopUp(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	admin := env.Credit(f.Admin.ID)
@@ -796,6 +804,7 @@ func TestManualTopUp(t *testing.T) {
 }
 
 func TestRefundAndSettings(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)

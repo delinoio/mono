@@ -93,6 +93,7 @@ func TestCLISubtestFailures(t *testing.T) {
 }
 
 func TestCLISubtestConfigDirectories(t *testing.T) {
+	t.Parallel()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -141,6 +142,7 @@ func TestCLISubtestConfigDirectories(t *testing.T) {
 
 // TestCLIStandInProcess runs in the test binary copied into the CLI's path.
 func TestCLIStandInProcess(t *testing.T) {
+	t.Parallel()
 	if flag.NArg() != 2 || flag.Arg(0) != "stand-in" {
 		t.Skip("only runs as the CLI stand-in")
 	}

@@ -15,6 +15,7 @@ import (
 // These tests need no database and run without OWNSAND_E2E.
 
 func TestPollHealthyBoundsAHungRequest(t *testing.T) {
+	t.Parallel()
 	arrived := make(chan struct{}, 1)
 	cancelled := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +48,7 @@ func TestPollHealthyBoundsAHungRequest(t *testing.T) {
 }
 
 func TestPollHealthyRetriesUntilReady(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
@@ -69,6 +71,7 @@ func TestPollHealthyRetriesUntilReady(t *testing.T) {
 // deadline; the timeout error must still report the last status that a
 // probe observed.
 func TestPollHealthyReportsLastStatusOnTimeout(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
@@ -92,6 +95,7 @@ func TestPollHealthyReportsLastStatusOnTimeout(t *testing.T) {
 }
 
 func TestPollReadyWhileSkipsTheProbeWhenTheProcessAlreadyExited(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -110,6 +114,7 @@ func TestPollReadyWhileSkipsTheProbeWhenTheProcessAlreadyExited(t *testing.T) {
 }
 
 func TestPollReadyWhileCancelsAHungRequestOnProcessExit(t *testing.T) {
+	t.Parallel()
 	arrived := make(chan struct{})
 	canceled := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +154,7 @@ func TestPollReadyWhileCancelsAHungRequestOnProcessExit(t *testing.T) {
 }
 
 func TestPollReadyWhileRejectsA200WhenTheProcessExitsDuringTheOwnershipCheck(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -168,6 +174,7 @@ func TestPollReadyWhileRejectsA200WhenTheProcessExitsDuringTheOwnershipCheck(t *
 // another server that holds the address cannot stand in for it while the
 // process is still running.
 func TestPollReadyWhileWaitsForOwnership(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -186,6 +193,7 @@ func TestPollReadyWhileWaitsForOwnership(t *testing.T) {
 // A process that never owns the listener fails when it exits, promptly and
 // with the process-exit error, although another server answers 200.
 func TestPollReadyWhileFailsPromptlyWhenTheProcessExitsUnowned(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))

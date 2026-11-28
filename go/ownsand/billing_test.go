@@ -40,6 +40,7 @@ func (f *fakeBilling) GetBillingUsage(_ context.Context, req *connect.Request[ow
 }
 
 func TestBillingServiceFillsOrganization(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)
 	st, err := c.Billing().GetStatus(context.Background(), nil)
@@ -102,6 +103,7 @@ func checkBillingErr(t *testing.T, err error, reason ownsandv1.BillingReason, wa
 }
 
 func TestBillingReasonOf(t *testing.T) {
+	t.Parallel()
 	for _, reason := range billingReasons {
 		err := billingErr(reason)
 		if got := BillingReasonOf(err); got != reason {
@@ -131,6 +133,7 @@ func TestBillingReasonOf(t *testing.T) {
 }
 
 func TestCreateSandboxBillingErrorIsNotRetried(t *testing.T) {
+	t.Parallel()
 	for _, reason := range billingReasons {
 		t.Run(reason.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -151,6 +154,7 @@ func TestCreateSandboxBillingErrorIsNotRetried(t *testing.T) {
 }
 
 func TestCreateSandboxRateLimitIsStillRetried(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.mu.Lock()
 	cp.createErr = func(n int) error {
@@ -173,6 +177,7 @@ func TestCreateSandboxRateLimitIsStillRetried(t *testing.T) {
 }
 
 func TestAuthorizeRelayBillingErrorIsNotRetried(t *testing.T) {
+	t.Parallel()
 	for _, reason := range billingReasons {
 		t.Run(reason.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -194,6 +199,7 @@ func TestAuthorizeRelayBillingErrorIsNotRetried(t *testing.T) {
 }
 
 func TestRelayRPCBillingErrorIsNotRetried(t *testing.T) {
+	t.Parallel()
 	reason := ownsandv1.BillingReason_BILLING_REASON_SUSPENDED
 	ops := map[string]struct {
 		methods []string
@@ -236,6 +242,7 @@ func TestRelayRPCBillingErrorIsNotRetried(t *testing.T) {
 // A billing error inside relay recovery ends the operation at once, both from
 // the AuthorizeRelay renewal and from the continuation stream.
 func TestBillingErrorInRelayRecoveryIsNotRetried(t *testing.T) {
+	t.Parallel()
 	reason := ownsandv1.BillingReason_BILLING_REASON_SUSPENDED
 	t.Run("authorize renewal", func(t *testing.T) {
 		cp := newFakeCP(t)
@@ -281,6 +288,7 @@ func TestBillingErrorInRelayRecoveryIsNotRetried(t *testing.T) {
 }
 
 func TestOpenSessionBillingErrorEndsOperation(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportAuto, TransportPeerToPeer} {
 		t.Run(tr.String(), func(t *testing.T) {
 			reason := ownsandv1.BillingReason_BILLING_REASON_SUSPENDED

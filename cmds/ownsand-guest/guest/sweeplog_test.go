@@ -28,6 +28,7 @@ func settledReadEntry(snapshot string, lastEnd time.Time) *readEntry {
 }
 
 func TestReadSweepFailureLogsNoPath(t *testing.T) {
+	t.Parallel()
 	logger, buf := newBufferLogger()
 	dir := filepath.Join(t.TempDir(), "secret-reads")
 	m, err := newReadManager(dir, time.Now, logger)
@@ -58,6 +59,7 @@ func TestReadSweepFailureLogsNoPath(t *testing.T) {
 }
 
 func TestReadSweepSuccessAndMissingLogNoWarning(t *testing.T) {
+	t.Parallel()
 	logger, buf := newBufferLogger()
 	dir := t.TempDir()
 	m, err := newReadManager(dir, time.Now, logger)
@@ -78,6 +80,7 @@ func TestReadSweepSuccessAndMissingLogNoWarning(t *testing.T) {
 }
 
 func TestWriteSweepFailureLogsNoPath(t *testing.T) {
+	t.Parallel()
 	logger, buf := newBufferLogger()
 	m, err := newWriteManager("", time.Now, logger)
 	if err != nil {

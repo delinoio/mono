@@ -20,6 +20,7 @@ import (
 )
 
 func TestPendingUnlinkNullableBatch(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 27, 9, 0, 0, 0, time.UTC)
 	f := &statusFixture{fixture: newFixture(t, t0)}
 	ctx := t.Context()

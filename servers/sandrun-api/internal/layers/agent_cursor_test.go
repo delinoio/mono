@@ -72,6 +72,7 @@ func startCursorWorldRelisting(t *testing.T, guest sandrunv1.GuestOs, timing age
 }
 
 func TestCursorClaimDuringProfileDeletion(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	const id = "bc-deleted-profile"
 	holder := holdTx(t, w.env, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", w.profileID)
@@ -90,6 +91,7 @@ func TestCursorClaimDuringProfileDeletion(t *testing.T) {
 }
 
 func TestCursorClaimDuringProfileDeletionRetriesRelease(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"poll", "repeated_demand", "lease_turnover"} {
 		t.Run(scenario, func(t *testing.T) {
 			timing := fastAgentTiming()
@@ -185,6 +187,7 @@ func TestCursorClaimDuringProfileDeletionRetriesRelease(t *testing.T) {
 // the claim's worker ID, becomes BUSY when the worker connects, and its
 // exit ends the request (ENDED, COMPLETED) and the runner.
 func TestCursorRequestLifecycle(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.cursor.AddRequest("bc-1", true)
 	req := w.requestBySource(t, "bc-1")
@@ -258,6 +261,7 @@ func TestCursorRequestLifecycle(t *testing.T) {
 }
 
 func TestCursorCredentialCleanupFailure(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		started bool
@@ -312,6 +316,7 @@ func TestCursorCredentialCleanupFailure(t *testing.T) {
 // later poll does not release the follow-up's claim (Cursor identifies a
 // claim only by the request ID).
 func TestCursorFollowUpBeforeRelease(t *testing.T) {
+	t.Parallel()
 	timing := fastAgentTiming()
 	timing.PollInterval = time.Hour // the test runs the poller with Poll
 	w := newCursorWorldTiming(t, sandrunv1.GuestOs_GUEST_OS_LINUX, timing)
@@ -356,6 +361,7 @@ func TestCursorFollowUpBeforeRelease(t *testing.T) {
 // TestCursorDuplicateEvents: repeated created events and lists of the same
 // pending request create one request and one claim.
 func TestCursorDuplicateEvents(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
@@ -385,6 +391,7 @@ func TestCursorDuplicateEvents(t *testing.T) {
 // cancellation, SandRun ends the waiting turn with `fail` and a message; a
 // canceled entry that Cursor shows again is not claimed again.
 func TestCursorClaimEndsBeforeRunner(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
@@ -462,6 +469,7 @@ func TestCursorClaimEndsBeforeRunner(t *testing.T) {
 }
 
 func TestCursorClaimExpiresAtRunnerBinding(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		raceSweep bool
@@ -515,6 +523,7 @@ func TestCursorClaimExpiresAtRunnerBinding(t *testing.T) {
 }
 
 func TestCursorClaimRejectedWithoutEligibleDevice(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		advance time.Duration
@@ -581,6 +590,7 @@ func TestCursorClaimRejectedWithoutEligibleDevice(t *testing.T) {
 // queued request's claim fails at the profile deletion, the integration
 // cannot be deleted until the claim poller released the claim.
 func TestCursorIntegrationDeletionKeepsHeldClaims(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
@@ -615,6 +625,7 @@ func TestCursorIntegrationDeletionKeepsHeldClaims(t *testing.T) {
 }
 
 func TestCursorWatchPaginationRepeats(t *testing.T) {
+	t.Parallel()
 	const (
 		firstToken  = "page-token-A"
 		secondToken = "page-token-B"
@@ -674,6 +685,7 @@ func TestCursorWatchPaginationRepeats(t *testing.T) {
 }
 
 func TestCursorWatchPaginationUsesFinalCursor(t *testing.T) {
+	t.Parallel()
 	fake := cursorfake.New(t, cursorKey, "sandrun-pool")
 	fake.AddRequest("first", false)
 	fake.AddRequest("second", false)
@@ -696,6 +708,7 @@ func TestCursorWatchPaginationUsesFinalCursor(t *testing.T) {
 }
 
 func TestCursorWatchRelistsWhileClaimIsBlocked(t *testing.T) {
+	t.Parallel()
 	for _, source := range []string{"list", "stream"} {
 		t.Run(source, func(t *testing.T) {
 			fake := cursorfake.New(t, cursorKey, "sandrun-pool")
@@ -763,6 +776,7 @@ func TestCursorWatchRelistsWhileClaimIsBlocked(t *testing.T) {
 }
 
 func TestCursorWatchResumesAfterAdmissionOverflow(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"stable prefix", "shrunken list", "changed marker"} {
 		t.Run(scenario, func(t *testing.T) {
 			w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
@@ -846,6 +860,7 @@ func TestCursorWatchResumesAfterAdmissionOverflow(t *testing.T) {
 }
 
 func TestCursorWatchStopCancelsAdmission(t *testing.T) {
+	t.Parallel()
 	fake := cursorfake.New(t, cursorKey, "sandrun-pool")
 	canceled := fake.HoldClaim("blocked", make(chan struct{}))
 	fake.AddRequest("blocked", false)
@@ -878,6 +893,7 @@ func TestCursorWatchStopCancelsAdmission(t *testing.T) {
 // TestCursorWatchReconnect: after the stream drops, SandRun reconnects with
 // backoff, lists again and claims a request whose created event it missed.
 func TestCursorWatchReconnect(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
@@ -895,6 +911,7 @@ func TestCursorWatchReconnect(t *testing.T) {
 }
 
 func TestCursorWatchReconnectExpiredCursor(t *testing.T) {
+	t.Parallel()
 	fake := cursorfake.New(t, cursorKey, "sandrun-pool")
 	fake.AddRequest("bc-relisted", false)
 	fake.ScriptPages(cursorfake.Page{}, cursorfake.Page{
@@ -919,6 +936,7 @@ func TestCursorWatchReconnectExpiredCursor(t *testing.T) {
 // TestCursorWindowsNeedsGitBash: on Windows, Prepare fails clearly when
 // the guest has no Git Bash, and the request returns to the queue.
 func TestCursorWindowsNeedsGitBash(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_WINDOWS)
 	w.guest.mu.Lock()
 	w.guest.installCode = 14
@@ -935,6 +953,7 @@ func TestCursorWindowsNeedsGitBash(t *testing.T) {
 }
 
 func TestCursorPreparationTimeoutFailsRunner(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.guest.mu.Lock()
 	w.guest.installTimedOut = true
@@ -958,6 +977,7 @@ func TestCursorPreparationTimeoutFailsRunner(t *testing.T) {
 // watch and fails the queued request's turn while the key still exists; a
 // failed release stops the deletion.
 func TestCursorOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
@@ -992,6 +1012,7 @@ func TestCursorOrganizationDeletion(t *testing.T) {
 }
 
 func TestCursorOrganizationDeletionKeepsTerminalHeldClaims(t *testing.T) {
+	t.Parallel()
 	timing := fastAgentTiming()
 	timing.PollInterval = time.Hour // Keep the poller from releasing the claims during the test.
 	w := newCursorWorldTiming(t, sandrunv1.GuestOs_GUEST_OS_LINUX, timing)
@@ -1048,6 +1069,7 @@ func TestCursorOrganizationDeletionKeepsTerminalHeldClaims(t *testing.T) {
 }
 
 func TestCursorOrganizationDeletionReleasesBusyRunnerClaim(t *testing.T) {
+	t.Parallel()
 	timing := fastAgentTiming()
 	timing.PollInterval = time.Hour // Prevent a background release after the work hook ends the request.
 	w := newCursorWorldTiming(t, sandrunv1.GuestOs_GUEST_OS_LINUX, timing)
@@ -1105,6 +1127,7 @@ func (*cursorRequestReadFault) TraceQueryEnd(context.Context, *pgx.Conn, pgx.Tra
 // TestCursorOrganizationDeletionRequestReadFailure faults the follow-up
 // request read after the agent hook has found a held claim.
 func TestCursorOrganizationDeletionRequestReadFailure(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	fake := cursorfake.New(t, cursorKey, "sandrun-pool")
 	fault := &cursorRequestReadFault{}
@@ -1186,6 +1209,7 @@ func (w *cursorWorld) assertOrganizationRetainedClaim(t *testing.T, requestID, v
 }
 
 func TestCursorOrganizationDeletionDatabaseFailure(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		setup     string

@@ -70,6 +70,10 @@ type fixture struct {
 	paddle *paddletest.Server
 	email  *email.Fake
 	dir    *directory.Fake
+	// lastAccountSeq is the number in the user IDs of the newest account that
+	// account created. Tests run in parallel, so accountSeq itself can be
+	// ahead of this fixture.
+	lastAccountSeq int64
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -116,6 +120,7 @@ func (f *fixture) account() string {
 		f.t.Fatal(err)
 	}
 	n := accountSeq.Add(1)
+	f.lastAccountSeq = n
 	now := f.clock.Now()
 	_, err = f.db.Pool.Exec(ctx(), `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time)
 		VALUES ($1, $2, $3, $3)`, id, fmt.Sprintf("Account %d", n), now)
@@ -258,6 +263,7 @@ func (f *fixture) wantLedger(accountID string, want ...wantEntry) {
 // signed balance, where negating the balance would overflow: the whole grant
 // pays off debt and no credit remains.
 func TestLedgerGrantAtMinimumBalance(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	if _, err := f.db.Pool.Exec(ctx(), `UPDATE billing_accounts SET balance_usd_micros = $2 WHERE billing_account_id = $1`,
@@ -276,6 +282,7 @@ func TestLedgerGrantAtMinimumBalance(t *testing.T) {
 }
 
 func TestLedgerFIFOAndDebtPayoff(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	first := f.grant(acct, LedgerSubscriptionCredit, 10*usd)
@@ -323,6 +330,7 @@ func TestLedgerFIFOAndDebtPayoff(t *testing.T) {
 }
 
 func TestLedgerConcurrentDeductions(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.grant(acct, LedgerManualTopUp, 10*usd)
@@ -352,6 +360,7 @@ func TestLedgerConcurrentDeductions(t *testing.T) {
 }
 
 func TestLedgerExpiry(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	old := f.grant(acct, LedgerSubscriptionCredit, 10*usd)
@@ -415,6 +424,7 @@ func TestLedgerExpiry(t *testing.T) {
 }
 
 func TestBalanceHidesDueExpiry(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.grant(acct, LedgerSubscriptionCredit, 10*usd)
@@ -466,6 +476,7 @@ func wantBalance(t *testing.T, label string, balance int64, grants []CreditGrant
 // the first statement of Balance ran, so that a read with several
 // statements would see the old balance and the new grants.
 func TestBalanceIsOneSnapshot(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		change        func(f *fixture, acct string, first string)
@@ -515,6 +526,7 @@ func TestBalanceIsOneSnapshot(t *testing.T) {
 }
 
 func TestBalanceWithoutUsableGrants(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 
 	// An account without grants has a zero balance and no grants.
@@ -565,6 +577,7 @@ func TestBalanceWithoutUsableGrants(t *testing.T) {
 
 // Grants with the same expiry are consumed in ID order, and so listed.
 func TestBalanceOrdersEqualExpiryByID(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	now := f.clock.Now()
@@ -596,6 +609,7 @@ func TestBalanceOrdersEqualExpiryByID(t *testing.T) {
 }
 
 func TestRefundMakesBalanceNegative(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	first := f.grant(acct, LedgerManualTopUp, 25*usd)
@@ -624,6 +638,7 @@ func TestRefundMakesBalanceNegative(t *testing.T) {
 }
 
 func TestLowBalanceAlertOncePerCrossing(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.grant(acct, LedgerManualTopUp, 25*usd)
@@ -686,6 +701,7 @@ func (f *fixture) expiringFixture() string {
 }
 
 func TestZeroDeductionInlineExpiryQueuesLowBalance(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.expiringFixture()
 	res := f.deduct(acct, 0)
@@ -700,6 +716,7 @@ func TestZeroDeductionInlineExpiryQueuesLowBalance(t *testing.T) {
 }
 
 func TestZeroDeductionInlineExpiryNeverQueuesAutoTopUp(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -725,6 +742,7 @@ func TestZeroDeductionInlineExpiryNeverQueuesAutoTopUp(t *testing.T) {
 }
 
 func TestGrantAfterInlineExpiryQueuesLowBalance(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.expiringFixture()
 	// 25 USD before, 5 USD after the expiry, 8 USD after the grant: a
@@ -737,6 +755,7 @@ func TestGrantAfterInlineExpiryQueuesLowBalance(t *testing.T) {
 }
 
 func TestGrantAfterInlineExpiryDoesNotQueueAutoTopUp(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -754,6 +773,7 @@ func TestGrantAfterInlineExpiryDoesNotQueueAutoTopUp(t *testing.T) {
 }
 
 func TestGrantRestoringBalanceRearmsLowBalance(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.expiringFixture()
 	f.deduct(acct, 0) // the inline expiry brings the balance to 5 USD and alerts
@@ -765,6 +785,7 @@ func TestGrantRestoringBalanceRearmsLowBalance(t *testing.T) {
 }
 
 func TestInlineExpiryAboveThresholdQueuesNoLowBalance(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
@@ -848,6 +869,7 @@ func (f *fixture) topUpStatuses(accountID string) []string {
 }
 
 func TestAutoTopUpMonthlyCap(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	telemetry := f.captureBillingTelemetry()
 	acct := f.account()
@@ -914,6 +936,7 @@ func TestAutoTopUpMonthlyCap(t *testing.T) {
 }
 
 func TestAutoTopUpShutoffAfterTwoFailures(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -965,6 +988,7 @@ func TestAutoTopUpShutoffAfterTwoFailures(t *testing.T) {
 }
 
 func TestAutoTopUpPastDueAndTimeout(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
@@ -1044,6 +1068,7 @@ func (f *fixture) wantObsoleteTopUp(accountID string) {
 }
 
 func TestPendingAutoTopUpClosedWhenDisabled(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -1061,6 +1086,7 @@ func TestPendingAutoTopUpClosedWhenDisabled(t *testing.T) {
 }
 
 func TestPendingAutoTopUpClosedWhenAmountLowered(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -1073,6 +1099,7 @@ func TestPendingAutoTopUpClosedWhenAmountLowered(t *testing.T) {
 }
 
 func TestPendingAutoTopUpClosedWhenCapLowered(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -1105,6 +1132,7 @@ func TestPendingAutoTopUpClosedWhenCapLowered(t *testing.T) {
 }
 
 func TestPendingAutoTopUpStillValidChargesOnce(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -1130,6 +1158,7 @@ func TestPendingAutoTopUpStillValidChargesOnce(t *testing.T) {
 }
 
 func TestSubmittedAutoTopUpSurvivesSettingsChange(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
@@ -1166,6 +1195,7 @@ func autoSettings(enabled bool, threshold, amount, limit int64) *accountsv1.Auto
 // process the charge, so the manual top-up is removed and the same
 // idempotency key charges again.
 func TestManualTopUpUnreadableRateLimitCanBeRetried(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)

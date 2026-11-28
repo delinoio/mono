@@ -116,6 +116,7 @@ func wantResourceExhausted(t *testing.T, label string, status int, body string) 
 // request, also a compressed one that inflates over the limit, with
 // resource_exhausted before the authentication interceptor sees it.
 func TestRequestSizeLimit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	oversized := make([]byte, 2*requestLimit)
 	// 4 MiB of empty `reports` entries: field 1, length 0.
@@ -149,6 +150,7 @@ func TestRequestSizeLimit(t *testing.T) {
 // TestRequestSizeLimitKeepsSmallRequests checks that the limit leaves small
 // requests alone: an unauthenticated one still fails with unauthenticated.
 func TestRequestSizeLimitKeepsSmallRequests(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	small, err := proto.Marshal(&accountsv1.ListBillingStatusChangesRequest{Service: ownsand})
 	if err != nil {
@@ -171,6 +173,7 @@ func TestRequestSizeLimitKeepsSmallRequests(t *testing.T) {
 // request (500 reports, 128-byte organization IDs, large int64 values) is
 // far under the limit and still succeeds over the binary and JSON encodings.
 func TestReportUsageMaximumRequest(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	token := env.Issuer.MachineToken(t, testenv.UsageClientID, auth.ScopeReportUsage)
 	start := window(env.Clock.Now()).Add(-billing.WindowLength)
@@ -218,6 +221,7 @@ func TestReportUsageMaximumRequest(t *testing.T) {
 // TestRequestSizeLimitKeepsWebhookLimit checks that the Paddle webhook keeps
 // its own 1 MiB body limit, which answers 413 and not a Connect error.
 func TestRequestSizeLimitKeepsWebhookLimit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	if status := env.PostWebhook(make([]byte, requestLimit+1), ""); status != http.StatusRequestEntityTooLarge {
 		t.Errorf("webhook over 1 MiB: status %d, want 413", status)

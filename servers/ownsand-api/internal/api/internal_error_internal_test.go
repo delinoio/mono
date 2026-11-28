@@ -20,6 +20,7 @@ import (
 // Connect error passes through unchanged, and anything else is logged and
 // redacted as internal.
 func TestServiceInternalErrorMapping(t *testing.T) {
+	t.Parallel()
 	detail, err := connect.NewErrorDetail(wrapperspb.String("kept"))
 	if err != nil {
 		t.Fatal(err)

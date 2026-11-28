@@ -43,6 +43,7 @@ func symlinkFixture(t *testing.T) (root, viaLink string) {
 }
 
 func TestReadFileResolvesDotDotAfterSymlink(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	root, viaLink := symlinkFixture(t)
 	if got, want := filepath.Clean(viaLink), filepath.Join(root, "front", "file"); got != want {
@@ -73,6 +74,7 @@ func TestReadFileResolvesDotDotAfterSymlink(t *testing.T) {
 }
 
 func TestWriteFileResolvesDotDotAfterSymlink(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	root, viaLink := symlinkFixture(t)
 	id := newID(t)
@@ -122,6 +124,7 @@ func TestWriteFileResolvesDotDotAfterSymlink(t *testing.T) {
 }
 
 func TestWriteFileTargetForms(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	dir := t.TempDir()
 	write := func(path string) *ownsandv1.ErrorDetail {
@@ -160,6 +163,7 @@ func TestWriteFileTargetForms(t *testing.T) {
 }
 
 func TestSplitTargetPOSIX(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct{ in, dir, base string }{
 		{"/a/b", "/a/", "b"},
 		{"/file", "/", "file"},

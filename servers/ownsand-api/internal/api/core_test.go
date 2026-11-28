@@ -32,6 +32,7 @@ import (
 )
 
 func TestOrganizationLifecycleAndPagination(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	alice := env.User("alice")
@@ -93,6 +94,7 @@ func TestOrganizationLifecycleAndPagination(t *testing.T) {
 }
 
 func TestTransferOwnershipAndLeave(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -140,6 +142,7 @@ func TestTransferOwnershipAndLeave(t *testing.T) {
 }
 
 func TestInvitations(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -447,6 +450,7 @@ type queryRower interface {
 // An unrelated membership insert that waits on a lock in another database of
 // the same server must not satisfy the race fixture's synchronization check.
 func TestMembershipInsertBlockedByIgnoresOtherDatabases(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	other := dbtest.New(t)
 	ctx := context.Background()
@@ -511,6 +515,7 @@ func TestMembershipInsertBlockedByIgnoresOtherDatabases(t *testing.T) {
 // membership unique index, gets already_exists and leaves its invitation
 // unused and unaudited.
 func TestInvitationsConcurrentAcceptByMember(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -584,6 +589,7 @@ func TestInvitationsConcurrentAcceptByMember(t *testing.T) {
 // A unique violation other than the (organization, user) membership key
 // still fails as internal and leaves the invitation pending.
 func TestInvitationsUnrelatedUniqueViolation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -616,6 +622,7 @@ func TestInvitationsUnrelatedUniqueViolation(t *testing.T) {
 }
 
 func TestAPIKeyLifecycle(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -644,6 +651,7 @@ func TestAPIKeyLifecycle(t *testing.T) {
 }
 
 func TestAPIKeyOrganizationIDCase(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	var org, other *testenv.Org
@@ -683,6 +691,7 @@ func TestAPIKeyOrganizationIDCase(t *testing.T) {
 }
 
 func TestChallengeRateLimitSharesBucketAcrossCase(t *testing.T) {
+	t.Parallel()
 	limits := api.Limits{
 		PerDevice: ratelimit.New(0.001, 2, nil),
 		PerPrefix: ratelimit.New(1000, 1000, nil),
@@ -714,6 +723,7 @@ func TestChallengeRateLimitSharesBucketAcrossCase(t *testing.T) {
 }
 
 func TestAPIKeyFailureRateLimit(t *testing.T) {
+	t.Parallel()
 	limits := api.Limits{
 		PerDevice: ratelimit.New(1000, 1000, nil),
 		PerPrefix: ratelimit.New(0.001, 3, nil),
@@ -783,6 +793,7 @@ func TestAPIKeyFailureRateLimit(t *testing.T) {
 }
 
 func TestValidAPIKeyAcceptedWhenPrefixIsRateLimited(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		o.Limits.PerPrefix = ratelimit.New(0.001, 3, o.Now)
 		// Organization setup accepts two invitations from the same client.
@@ -806,6 +817,7 @@ func TestValidAPIKeyAcceptedWhenPrefixIsRateLimited(t *testing.T) {
 }
 
 func TestValidAPIKeyTakesNoRateLimitToken(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		o.Limits.PerPrefix = ratelimit.New(0.001, 3, o.Now)
 		// Organization setup accepts two invitations from the same client.
@@ -840,6 +852,7 @@ func otherAPIKeyWithSamePrefix(key string) string {
 }
 
 func TestEnrollment(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -951,6 +964,7 @@ func TestEnrollment(t *testing.T) {
 }
 
 func TestDeviceAuthenticationAndRemoval(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1043,6 +1057,7 @@ func TestDeviceAuthenticationAndRemoval(t *testing.T) {
 }
 
 func TestRemovedDeviceAfterOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1089,6 +1104,7 @@ func TestRemovedDeviceAfterOrganizationDeletion(t *testing.T) {
 // no inventory (also after a late capability and update-field write), keep
 // their identity and expiry, and still answer the signed removal paths.
 func TestRemovedDeviceRowsHoldNoInventory(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1191,6 +1207,7 @@ func TestRemovedDeviceRowsHoldNoInventory(t *testing.T) {
 }
 
 func TestDeviceLimitsAndAllocation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1280,6 +1297,7 @@ func TestDeviceLimitsAndAllocation(t *testing.T) {
 }
 
 func TestAgentVersionPolicy(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1309,6 +1327,7 @@ func TestAgentVersionPolicy(t *testing.T) {
 // TestAuditAndLogRedaction checks that audit events are written for admin
 // actions and that no secret appears in the logs or the audit table.
 func TestAuditAndLogRedaction(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1387,6 +1406,7 @@ func TestAuditAndLogRedaction(t *testing.T) {
 }
 
 func TestChallengeRateLimit(t *testing.T) {
+	t.Parallel()
 	limits := api.Limits{
 		PerDevice: ratelimit.New(0.001, 2, nil),
 		PerPrefix: ratelimit.New(1000, 1000, nil),
@@ -1443,6 +1463,7 @@ func rateLimitRetry(t *testing.T, err error) time.Duration {
 // TestClientRateLimitSharedBucket checks that device RPCs, AcceptInvitation
 // and failed API key validations draw from one per-client-address bucket.
 func TestClientRateLimitSharedBucket(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, clientBucketLimits)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -1545,6 +1566,7 @@ func TestClientRateLimitSharedBucket(t *testing.T) {
 // without a resolved client address skips only the client bucket and that
 // the per-device limit still applies next to it.
 func TestClientRateLimitUnresolvedAddressAndOtherLimits(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		clientBucketLimits(o)
 		o.Limits.PerDevice = ratelimit.New(0.001, 3, o.Now)
@@ -1596,6 +1618,7 @@ func addressBurstLimits(mode config.ClientAddressMode) func(*app.Options) {
 // in each mode, with a one-token bucket and requests that name distinct
 // devices from one TCP peer behind a proxy.
 func TestClientAddressModes(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	challenge := func(c *testenv.Clients) error {
 		id, _ := uuidv7.NewString()
@@ -1641,6 +1664,7 @@ func TestClientAddressModes(t *testing.T) {
 // TestChallengeLimitWithoutClientAddress checks that the per-device budget
 // still applies when requests have no client address.
 func TestChallengeLimitWithoutClientAddress(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, addressBurstLimits(config.ClientAddressNone))
 	ctx := context.Background()
 	id, _ := uuidv7.NewString()

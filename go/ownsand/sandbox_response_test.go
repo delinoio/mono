@@ -101,6 +101,7 @@ func startResourceControlPlane(t *testing.T, empty bool) (*resourceControlPlane,
 // sandbox or snapshot is an error, and that a response with the resource keeps
 // the current result.
 func TestMissingResourceResponses(t *testing.T) {
+	t.Parallel()
 	calls := map[string]func(*testing.T, *Client, *Sandbox) (hasResource bool, err error){
 		"CreateSandbox": func(t *testing.T, c *Client, _ *Sandbox) (bool, error) {
 			sb, err := c.CreateSandbox(context.Background(), validParams())
@@ -166,6 +167,7 @@ func TestMissingResourceResponses(t *testing.T) {
 // TestWaitStableStopsOnMissingResource checks that a missing sandbox in a
 // GetSandbox response ends WaitStable with the error and does not poll again.
 func TestWaitStableStopsOnMissingResource(t *testing.T) {
+	t.Parallel()
 	cp, _, s := startResourceControlPlane(t, true)
 	// The deadline only keeps a regression from hanging the test: without the
 	// check, WaitStable polls a nil sandbox forever.

@@ -22,6 +22,7 @@ func (f *fixture) cancelSubscription(subID string) {
 // the settings revalidation runs before the subscription check, so the top-up
 // does not count as a failed charge and sends no email.
 func TestPendingAutoTopUpClosedAsObsoleteWithCanceledSubscription(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
@@ -39,6 +40,7 @@ func TestPendingAutoTopUpClosedAsObsoleteWithCanceledSubscription(t *testing.T) 
 // automatic top-up is counted, the owner and admins get the payment failure
 // email and Paddle is not called.
 func TestPendingAutoTopUpFailsWithCanceledSubscriptionWhenSettingsAllow(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)

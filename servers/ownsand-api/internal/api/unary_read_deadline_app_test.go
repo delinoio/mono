@@ -22,6 +22,7 @@ import (
 // time succeeds, and the agent channel and the relay RPCs are not bounded by
 // it (the relay keeps its own request deadline).
 func TestUnaryBodyReadDeadlineOnTheWiredApp(t *testing.T) {
+	t.Parallel()
 	const deadline = 400 * time.Millisecond
 	env := testenv.New(t, func(o *app.Options) { o.Timing.UnaryBodyReadDeadline = deadline })
 	org, agent, sandboxID := runningSandbox(t, env)

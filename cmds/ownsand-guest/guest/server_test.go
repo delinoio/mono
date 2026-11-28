@@ -176,6 +176,7 @@ func errorCode(err error) connect.Code {
 }
 
 func TestCheckReadyAndSetClock(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	resp, err := h.client.CheckReady(context.Background(), connect.NewRequest(&ownsandv1.CheckReadyRequest{}))
 	if err != nil {
@@ -193,6 +194,7 @@ func TestCheckReadyAndSetClock(t *testing.T) {
 }
 
 func TestUnknownKindGetsErrorFrame(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -250,6 +252,7 @@ func findRecord(recs []map[string]any, msg string) map[string]any {
 }
 
 func TestSetClockLogsAppliedOffset(t *testing.T) {
+	t.Parallel()
 	base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name   string
@@ -295,6 +298,7 @@ func TestSetClockLogsAppliedOffset(t *testing.T) {
 }
 
 func TestSetClockSetterErrorMapping(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		err  error
@@ -327,6 +331,7 @@ func TestSetClockSetterErrorMapping(t *testing.T) {
 }
 
 func TestSetClockIgnoreModeNeverCallsSetter(t *testing.T) {
+	t.Parallel()
 	logs := &lockedBuffer{}
 	var called atomic.Bool
 	h := newHarness(t, func(cfg *Config) {

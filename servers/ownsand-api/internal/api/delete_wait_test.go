@@ -60,6 +60,7 @@ func (tr *deleteWaitTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn,
 func (*deleteWaitTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestDeleteSandboxWaitDeadline(t *testing.T) {
+	t.Parallel()
 	const commandWait = 900 * time.Millisecond
 	for _, scenario := range []struct {
 		name      string

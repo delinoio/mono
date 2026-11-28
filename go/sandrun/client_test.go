@@ -398,8 +398,15 @@ func TestPaginationRepeatedStartingToken(t *testing.T) {
 						t.Errorf("page size for token %q = %d, want %d", token, got, pageSize)
 					}
 					mu.Lock()
-					tokens = append(tokens, token)
+					// Keep the expected requests and the first excess token for diagnostics.
+					if len(tokens) <= len(tc.wantTokens) {
+						tokens = append(tokens, token)
+					}
+					exceededBudget := len(tokens) > len(tc.wantTokens)
 					mu.Unlock()
+					if exceededBudget {
+						return nil, connect.NewError(connect.CodeResourceExhausted, fmt.Errorf("pagination fixture request budget exceeded at token %q", token))
+					}
 					next, ok := tc.nextTokens[token]
 					if !ok {
 						return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("unexpected page token %q", token))
@@ -417,7 +424,9 @@ func TestPaginationRepeatedStartingToken(t *testing.T) {
 			}
 
 			req := &sandrunv1.ListOrganizationsRequest{PageToken: "resume", PageSize: pageSize}
-			orgs, err := Collect(client.AllOrganizations(t.Context(), req))
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			orgs, err := Collect(client.AllOrganizations(ctx, req))
 			var gotIDs []string
 			for _, org := range orgs {
 				gotIDs = append(gotIDs, org.GetOrganizationId())

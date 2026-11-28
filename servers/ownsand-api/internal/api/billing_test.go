@@ -334,6 +334,7 @@ func pauseCommands(agent *testenv.FakeAgent, sandboxID string) int {
 // exactly its RPCs with its reason, the suspension pauses the running
 // sandboxes and marks them, and the recovery resumes only those.
 func TestBillingPhasesOfLinkedOrganization(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	org := linkedOrg(t, env, fake, "alice", billingAccountA)
@@ -476,6 +477,7 @@ func TestBillingPhasesOfLinkedOrganization(t *testing.T) {
 // creation, suspended 3 days later, and a link to a billing account in
 // non-payment keeps the earlier block start.
 func TestBillingUnlinkedOrganization(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	created := env.Clock.Now()
@@ -548,6 +550,7 @@ func TestBillingUnlinkedOrganization(t *testing.T) {
 }
 
 func TestBillingConditionalUnlink(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := t.Context()
 	org := linkedOrg(t, env, fake, "owner", billingAccountA)
@@ -629,6 +632,7 @@ func TestBillingConditionalUnlink(t *testing.T) {
 // is more than 1 hour old is allowed by the RPC gates, with a warning, and
 // that the fail open never resumes a billing-paused sandbox.
 func TestBillingFailOpen(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	org := linkedOrg(t, env, fake, "carol", billingAccountA)
@@ -694,6 +698,7 @@ func TestBillingFailOpen(t *testing.T) {
 // and that an unlink that delino-accounts could not take is retried before
 // the new owner's link.
 func TestBillingOwnershipTransferAndDeletionUnlink(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	org := linkedOrg(t, env, fake, "dave", billingAccountA)
@@ -771,6 +776,7 @@ func TestBillingOwnershipTransferAndDeletionUnlink(t *testing.T) {
 // ownership moves to the admin, the new owner cannot resume the listing of
 // the former owner, and the error is an invalid argument.
 func TestBillingLinkableAccountsTokenBoundToUser(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	org := env.NewUnlinkedOrg("ivy")
@@ -806,6 +812,7 @@ func TestBillingLinkableAccountsTokenBoundToUser(t *testing.T) {
 
 // TestBillingRPCs checks the BillingService answers and their errors.
 func TestBillingRPCs(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	org := env.NewUnlinkedOrg("gina")
@@ -937,6 +944,7 @@ func TestBillingRPCs(t *testing.T) {
 // TestBillingErrorDetailCodecs checks that a billing rejection carries the
 // billing reason in the binary protobuf and in the Connect JSON encoding.
 func TestBillingErrorDetailCodecs(t *testing.T) {
+	t.Parallel()
 	env, _ := billingEnv(t)
 	org := env.NewUnlinkedOrg("hank")
 	req := &ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)}
@@ -956,6 +964,7 @@ func TestBillingErrorDetailCodecs(t *testing.T) {
 // creation commits, so its owner can link a billing account with the normal
 // gates, and a non-owner still cannot.
 func TestBillingLegacyWriterOrganization(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	const owner, admin, orgID = "legacy-owner", "legacy-admin", "018f0000-0000-7000-8000-0000000000f1"
@@ -1098,6 +1107,7 @@ func (f *linkAttemptFixture) restart() *billing.Statuses {
 // delino-accounts lost stays recorded across a restart, that the lease
 // holder removes the unconfirmed remote link, and that a retry then links.
 func TestBillingLinkLostResponseIsReconciled(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "ivy")
 	ctx := context.Background()
 	f.loseLinkResponse(t)
@@ -1138,6 +1148,7 @@ func TestBillingLinkLostResponseIsReconciled(t *testing.T) {
 // TestBillingLinkLostResponseRetryRecovers checks that an authorized retry
 // of the same account recovers the link after the deadline.
 func TestBillingLinkLostResponseRetryRecovers(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "jack")
 	f.loseLinkResponse(t)
 	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodeUnavailable {
@@ -1167,6 +1178,7 @@ func TestBillingLinkLostResponseRetryRecovers(t *testing.T) {
 // delino-accounts rejects leaves neither a local link nor the unconfirmed
 // remote link of the earlier attempt.
 func TestBillingLinkLostResponseThenRejectedRetry(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "kim")
 	f.loseLinkResponse(t)
 	f.env.Clock.Advance(time.Minute)
@@ -1185,6 +1197,7 @@ func TestBillingLinkLostResponseThenRejectedRetry(t *testing.T) {
 // stays idempotent: a repeated unlink confirms with delino-accounts again,
 // even though no record is left.
 func TestBillingUnlinkRemovesUnconfirmedLink(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "lena")
 	f.loseLinkResponse(t)
 	f.env.Clock.Advance(time.Minute)
@@ -1223,6 +1236,7 @@ func TestBillingUnlinkRemovesUnconfirmedLink(t *testing.T) {
 // ownership transfer and an organization deletion remove the remote link of
 // an attempt that has no cached account ID.
 func TestBillingTransferAndDeletionRemoveUnconfirmedLink(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	f := newLinkAttemptFixture(t, "mona")
 	f.loseLinkResponse(t)
@@ -1276,6 +1290,7 @@ func TestBillingTransferAndDeletionRemoveUnconfirmedLink(t *testing.T) {
 // accepted but that the local transaction could not record stays available
 // for reconciliation, and that a retry recovers.
 func TestBillingLinkLocalCommitFailure(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "pia")
 	ctx := context.Background()
 	// A trigger fails the local write of the link, as a failed local commit
@@ -1326,6 +1341,7 @@ func TestBillingLinkLocalCommitFailure(t *testing.T) {
 // TestBillingLinkDefinitiveFailureLeavesNothing checks that a link that
 // delino-accounts rejects leaves no record and sends no unlink.
 func TestBillingLinkDefinitiveFailureLeavesNothing(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "quin")
 	f.fake.AddAccount(billingAccountC, "Viewed", map[string]accountsv1.BillingAccountRole{f.org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_VIEWER})
 	for _, tc := range []struct {
@@ -1365,6 +1381,7 @@ func TestBillingLinkDefinitiveFailureLeavesNothing(t *testing.T) {
 // old link attempt cannot record a link after a newer authorized operation
 // took the attempt over, and that no unlink overtakes the running call.
 func TestBillingLinkStaleCompletionDoesNothing(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "rosa")
 	ctx := context.Background()
 	gate := f.fake.Hold(accountstest.MethodLinkOrganization)
@@ -1435,6 +1452,7 @@ func TestBillingLinkStaleCompletionDoesNothing(t *testing.T) {
 // cleanup row; once the guard expires, the next request removes the old
 // remote link and the new owner links.
 func TestBillingTakeoverGuardBlocksOwnerRequests(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "tess")
 	ctx := context.Background()
 	gate := f.fake.Hold(accountstest.MethodLinkOrganization)
@@ -1529,6 +1547,7 @@ func (f *linkAttemptFixture) holdPendingUnlinkOfNewOwner(t *testing.T) (*account
 // call that starts now from the cleanup worker. The attempt row is removed
 // because no call was made, and a prompt retry links.
 func TestBillingLinkExpiredBeforeDispatchStartsNoCall(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "uma")
 	gate, done := f.holdPendingUnlinkOfNewOwner(t)
 	linkCalls := f.fake.Calls(accountstest.MethodLinkOrganization)
@@ -1563,6 +1582,7 @@ func TestBillingLinkExpiredBeforeDispatchStartsNoCall(t *testing.T) {
 // it takes effect. The OwnSand call times out within the remaining dispatch
 // window, and cleanup waits for the persisted deadline to protect the late link.
 func TestBillingLinkBoundsCallToRemainingWindow(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "vera")
 	ctx := t.Context()
 	gate, done := f.holdPendingUnlinkOfNewOwner(t)
@@ -1645,6 +1665,7 @@ func (f *linkAttemptFixture) linkUpstreamOnly(t *testing.T) {
 // repeatable, lets the owner link another billing account afterwards, and
 // that a caller without the owner role triggers no upstream unlink.
 func TestBillingUnlinkRemovesUntracedLink(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "ruth")
 	f.fake.AddAccount(billingAccountB, "Second of ruth", map[string]accountsv1.BillingAccountRole{f.org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
 	f.linkUpstreamOnly(t)
@@ -1694,6 +1715,7 @@ func TestBillingUnlinkRemovesUntracedLink(t *testing.T) {
 // owner's link, and that a retry that runs after the new owner linked
 // removes nothing of the new link.
 func TestBillingTransferAndDeletionRemoveUntracedLink(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	// Transfer: the unlink works at once.
 	f := newLinkAttemptFixture(t, "sara")

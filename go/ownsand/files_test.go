@@ -33,6 +33,7 @@ func randomBytes(t *testing.T, n int) []byte {
 }
 
 func TestReadFileBothTransports(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -54,6 +55,7 @@ func TestReadFileBothTransports(t *testing.T) {
 // size that differs from the delivered bytes fails with a DataPathError and
 // does not retry, and that a matching size still succeeds.
 func TestReadFileFinalSizeMismatch(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -92,6 +94,7 @@ func TestReadFileFinalSizeMismatch(t *testing.T) {
 }
 
 func TestReadFileResumesWithSameReadID(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(cp *fakeCP){
 		"relay disconnect after a chunk": func(cp *fakeCP) {
 			cp.relayScript = func(_ string, n int) relayAction {
@@ -142,6 +145,7 @@ func TestReadFileResumesWithSameReadID(t *testing.T) {
 }
 
 func TestReadFileStreamClosedWithoutAcceptedResumesAtNextOffset(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
 	want := randomBytes(t, 95)
@@ -173,6 +177,7 @@ func TestReadFileStreamClosedWithoutAcceptedResumesAtNextOffset(t *testing.T) {
 }
 
 func TestReadFileStreamClosedWithoutAcceptedEndsWithLastErrorAtWindow(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.setFile("/f", randomBytes(t, 20))
 	cp.relayScript = func(string, int) relayAction { return relayAction{noAccept: true} }
@@ -198,6 +203,7 @@ func TestReadFileStreamClosedWithoutAcceptedEndsWithLastErrorAtWindow(t *testing
 }
 
 func TestReadFileContinuationNotAcceptedEndsAtRecoveryDeadline(t *testing.T) {
+	t.Parallel()
 	for name, act := range map[string]relayAction{
 		"blocked receive": {holdOpen: true},
 		"keepalives only": {keepalivesOnly: true},
@@ -240,6 +246,7 @@ func TestReadFileContinuationNotAcceptedEndsAtRecoveryDeadline(t *testing.T) {
 }
 
 func TestReadFileContinuationAcceptedBeforeDeadlineStaysOpenPastIt(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
 	want := randomBytes(t, 95)
@@ -263,6 +270,7 @@ func TestReadFileContinuationAcceptedBeforeDeadlineStaysOpenPastIt(t *testing.T)
 }
 
 func TestReadFileInterruptedAfterAcceptanceResumesSavedBudget(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
 	cp.agent.setFile("/f", randomBytes(t, 95))
@@ -288,6 +296,7 @@ func TestReadFileInterruptedAfterAcceptanceResumesSavedBudget(t *testing.T) {
 }
 
 func TestReadFileResumesOnNewSession(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
 	want := randomBytes(t, 95)
@@ -332,6 +341,7 @@ func checkReadRequests(t *testing.T, cp *fakeCP, want []int64) {
 // event): a retirement is not a failure. The replacement session stays
 // peer-to-peer and continues the same read_id at the same offset.
 func TestReadFileServedSessionRetirementsDoNotHitFailureCap(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
 	want := randomBytes(t, 95)
@@ -367,6 +377,7 @@ func TestReadFileServedSessionRetirementsDoNotHitFailureCap(t *testing.T) {
 // retirements of served sessions after some bytes arrived continue the read at
 // the next undelivered offset, so the caller receives each byte once.
 func TestReadFileServedRetirementsContinueAtDeliveredOffset(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
 	want := randomBytes(t, 95)
@@ -407,6 +418,7 @@ func TestReadFileServedRetirementsContinueAtDeliveredOffset(t *testing.T) {
 // retirement before the agent served the read still counts as a failure: six
 // of them in a row end the read with a data path error.
 func TestReadFileRepeatedUnservedSessionRetirementsHitFailureCap(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.setFile("/f", randomBytes(t, 20))
 	s := cp.handle(t, cp.client(t, TransportAuto))
@@ -457,6 +469,7 @@ func (w *prefixWriter) Write(p []byte) (int, error) {
 }
 
 func TestReadFileCallbackErrorCountsAcceptedPrefix(t *testing.T) {
+	t.Parallel()
 	writeErr := errors.New("writer full")
 	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
 		for _, accept := range []int{0, 3} {
@@ -494,6 +507,7 @@ func TestReadFileCallbackErrorCountsAcceptedPrefix(t *testing.T) {
 }
 
 func TestReadFileCompleteChunksCountOnce(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -511,6 +525,7 @@ func TestReadFileCompleteChunksCountOnce(t *testing.T) {
 }
 
 func TestReadFileNotFoundIsVisible(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
 		s := cp.handle(t, cp.client(t, tr))
@@ -549,6 +564,7 @@ func TestReadFileNotFoundIsVisible(t *testing.T) {
 const fullChunkWriteAttemptDeadline = 5 * time.Second
 
 func TestWriteFileChunkedBothTransports(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -583,6 +599,7 @@ func TestWriteFileChunkedBothTransports(t *testing.T) {
 }
 
 func TestWriteFileFinalSizeMismatch(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -631,6 +648,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 }
 
 func TestWriteFileObservesCancellationBeforeReadingTheSource(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			chunk := datapath.MaxFileChunkSize
@@ -719,6 +737,7 @@ func fullChunk(b byte) func(p []byte) (int, error) {
 }
 
 func TestWriteFileObservesCancellationInsideAChunkFill(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			t.Run("partial first read", func(t *testing.T) {
@@ -794,6 +813,7 @@ func (s *shortReader) Read(p []byte) (int, error) {
 }
 
 func TestWriteFileRejectsOutOfRangeModeBeforeUpload(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -823,6 +843,7 @@ func TestWriteFileRejectsOutOfRangeModeBeforeUpload(t *testing.T) {
 }
 
 func TestWriteFileModeLimit(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		mode uint32
@@ -858,6 +879,7 @@ func (r *truncatedReader) Read(p []byte) (int, error) {
 }
 
 func TestWriteFileSourceEnd(t *testing.T) {
+	t.Parallel()
 	chunk := datapath.MaxFileChunkSize
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		for _, size := range []int{10, chunk + 10} {
@@ -889,6 +911,7 @@ func TestWriteFileSourceEnd(t *testing.T) {
 }
 
 func TestWriteEmptyFile(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -905,6 +928,7 @@ func TestWriteEmptyFile(t *testing.T) {
 }
 
 func TestWriteFileRetries(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(n int) relayAction{
 		"deadline exceeded": func(n int) relayAction {
 			if n == 2 {
@@ -969,6 +993,7 @@ func writeRetryFixture(t *testing.T, cp *fakeCP, window time.Duration) (*FileWri
 }
 
 func TestWriteFileRelayAttemptStartsNoRetryAfterRecoveryWindow(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	fw, req := writeRetryFixture(t, cp, 50*time.Millisecond)
 	// A valid grant makes ensure succeed without a renewal, so the window
@@ -996,6 +1021,7 @@ func TestWriteFileRelayAttemptStartsNoRetryAfterRecoveryWindow(t *testing.T) {
 }
 
 func TestWriteFileRelayAttemptStartsInitialWriteWithInactiveWindow(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	fw, req := writeRetryFixture(t, cp, 300*time.Millisecond)
 	// A window that never started is not part of a recovery, however much
@@ -1012,6 +1038,7 @@ func TestWriteFileRelayAttemptStartsInitialWriteWithInactiveWindow(t *testing.T)
 }
 
 func TestWriteFileRetryStartedBeforeDeadlineMayFinishAfterIt(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.relayScript = func(_ string, n int) relayAction {
 		switch n {
@@ -1044,6 +1071,7 @@ func TestWriteFileRetryStartedBeforeDeadlineMayFinishAfterIt(t *testing.T) {
 }
 
 func TestWriteFileRenewsGrantBeforeChunk(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	// The grant would expire during the next call (write call limit plus
 	// 30 seconds, scaled), so each chunk renews it first.
@@ -1065,6 +1093,7 @@ func TestWriteFileRenewsGrantBeforeChunk(t *testing.T) {
 }
 
 func TestWriteFileRenewsAfterIdleGrant(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)
 	c.timing.grantIdle = 150 * time.Millisecond
@@ -1106,6 +1135,7 @@ func (r *slowReader) Read(p []byte) (int, error) {
 }
 
 func TestWriteFileContinuesOnRelayAfterChannelFailure(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.p2pScript = func(n int) p2pAction {
 		if n == 2 {
@@ -1176,6 +1206,7 @@ func (r *firstByteDelayReader) Read(p []byte) (int, error) {
 // write_id is created after chunk 1 and its lookahead are read, so a slow
 // source does not age the UUID v7 timestamp before the first send.
 func TestWriteFileGeneratesWriteIDWhenFirstRequestIsReady(t *testing.T) {
+	t.Parallel()
 	const delay = 1500 * time.Millisecond
 	cases := map[string]func() (io.Reader, *time.Time){
 		"slow first byte": func() (io.Reader, *time.Time) {
@@ -1227,6 +1258,7 @@ func TestWriteFileGeneratesWriteIDWhenFirstRequestIsReady(t *testing.T) {
 // binding salt and the grant digest are fixed once the first request is ready
 // and that a retry after a failure reuses them, also for a slow source.
 func TestWriteFileRetryKeepsOperationIdentity(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.relayScript = func(_ string, n int) relayAction {
 		if n == 1 {
@@ -1279,6 +1311,7 @@ func TestWriteFileRetryKeepsOperationIdentity(t *testing.T) {
 }
 
 func TestReadFileFromValidationErrorPreservesOffset(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportRelay))
 	readID := mustID(t)
@@ -1319,6 +1352,7 @@ func TestReadFileFromValidationErrorPreservesOffset(t *testing.T) {
 // across calls with different spellings of the same read_id and across a
 // relay disconnect.
 func TestReadFileFromOffsetAcrossCalls(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -1403,6 +1437,7 @@ type writerFunc func(p []byte) (int, error)
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestOpenFileWriteBindingSalt(t *testing.T) {
+	t.Parallel()
 	s := &Sandbox{org: mustID(t), id: mustID(t)}
 	params := FileWriteParams{WriteID: mustID(t), Path: "/out"}
 
@@ -1453,6 +1488,7 @@ func TestOpenFileWriteBindingSalt(t *testing.T) {
 // separate calls and out of order, and that a second FileWrite with the same
 // write_id and salt (another process) continues it.
 func TestFileWriteChunksAcrossCalls(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -1542,6 +1578,7 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 }
 
 func TestFileWriteFinishChecksDeclaredSize(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			for _, tc := range []struct {
@@ -1585,6 +1622,7 @@ func TestFileWriteFinishChecksDeclaredSize(t *testing.T) {
 }
 
 func TestFileWriteQueuedCalls(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		finish bool

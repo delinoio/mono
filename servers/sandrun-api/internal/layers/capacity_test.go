@@ -16,6 +16,7 @@ import (
 )
 
 func TestGetCapacityRunnerCounts(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := t.Context()
 	w.fake.SetDevices(w.osOrg,

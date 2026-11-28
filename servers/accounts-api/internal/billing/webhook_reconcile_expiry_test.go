@@ -16,6 +16,7 @@ import (
 // while the task waited is expired first and is not consumed, and the
 // pending row is deleted once.
 func TestReconcilePendingAdjustmentExpiresGrantDueWhileWaitingForLocks(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	if code := f.webhook(paddle.EventTransactionCompleted, purchase("txn_rec", acct, LedgerManualTopUp, 2500)); code != http.StatusOK {

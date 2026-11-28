@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/servers/internal/dbtestslot"
 	"github.com/delinoio/mono/servers/internal/dbtesturl"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 )
@@ -54,6 +55,9 @@ func NewURLAtVersion(t testing.TB, maxVersion int64) string {
 func newURL(t testing.TB, maxVersion int64) string {
 	t.Helper()
 	admin := URL(t)
+	// Take the slot before the setup timeout starts: the wait for a slot
+	// can be longer than the setup.
+	dbtestslot.Acquire(t, admin)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	adminConfig, err := parseAdminConfig(admin)

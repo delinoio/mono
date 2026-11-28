@@ -18,6 +18,7 @@ import (
 // 10 seconds before the window ends is applied although the wall clock
 // jumped 10 minutes ahead.
 func TestCommandGraceIgnoresForwardWallStep(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	org := env.NewOrg("alice")
@@ -51,6 +52,7 @@ func TestCommandGraceIgnoresForwardWallStep(t *testing.T) {
 // ignored, although the wall clock is still before the time the channel
 // closed.
 func TestCommandGraceIgnoresBackwardWallStep(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	org := env.NewOrg("alice")
@@ -79,6 +81,7 @@ func TestCommandGraceIgnoresBackwardWallStep(t *testing.T) {
 // before the time the channel closed. The sweep is slowed so only take can
 // decide.
 func TestCommandGraceTakeRejectsExpiredBeforeSweep(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	timing.OfflineSweep = time.Hour
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })

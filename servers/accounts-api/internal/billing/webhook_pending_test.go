@@ -46,6 +46,7 @@ func purchase(txnID, acct string, kind LedgerKind, cents int64) map[string]any {
 // adjustment has the same final ledger effect in either delivery order, for a
 // subscription credit and for a top-up.
 func TestAdjustmentBeforePurchaseMatchesGrantFirst(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		kind  LedgerKind
@@ -104,6 +105,7 @@ func TestAdjustmentBeforePurchaseMatchesGrantFirst(t *testing.T) {
 // purchase applies to pending adjustments in arrival order, with the credit
 // that usage already used turning into debt.
 func TestPendingAdjustmentsKeepTheCapAndAccumulate(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_a", "refund", "approved", "txn_buy", 600))
@@ -124,6 +126,7 @@ func TestPendingAdjustmentsKeepTheCapAndAccumulate(t *testing.T) {
 // never creates a grant is not affected, and that adjustments that are not
 // approved, or that belong to another purchase, are not applied.
 func TestPendingAdjustmentWithoutGrantHasNoEffect(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_wait", "refund", "pending_approval", "txn_other", 500))
@@ -155,6 +158,7 @@ func TestPendingAdjustmentWithoutGrantHasNoEffect(t *testing.T) {
 // adjustment at the same time. Whatever the interleaving, the purchase has
 // one grant, the adjustment removes credit once and no pending row is left.
 func TestOverlappingAdjustmentAndPurchaseApplyOnce(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	for i := range 12 {
 		acct := f.account()
@@ -201,6 +205,7 @@ func TestOverlappingAdjustmentAndPurchaseApplyOnce(t *testing.T) {
 // and checks that the grant, the refund, the ledger and the event record roll
 // back together, and that Paddle's retry commits one result.
 func TestPendingAdjustmentFailureRollsBackTheGrant(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	telemetry := f.captureBillingTelemetry()
 	acct := f.account()

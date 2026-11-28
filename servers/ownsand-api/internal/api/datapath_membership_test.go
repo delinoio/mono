@@ -51,6 +51,7 @@ func membershipGrantRequest(exec *ownsandv1.ExecRequest) *ownsandv1.AuthorizeRel
 // The peer commits the removal without waking the lease holder. Deliver the
 // event only after the replacement membership has authorized new work.
 func TestDelayedMembershipRevocation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		o.Timing.EventPoll = time.Hour
 		o.RelayTiming.Signaling = 20 * time.Second
@@ -221,6 +222,7 @@ func TestDelayedMembershipRevocation(t *testing.T) {
 }
 
 func TestReauthorizeDataPathAfterMembershipReplacement(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) { o.Timing.EventPoll = time.Hour })
 	org, agent, sandboxID := runningSandbox(t, env)
 	peer := env.StartPeer()

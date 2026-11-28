@@ -50,6 +50,7 @@ func createSandboxCommands(agent *testenv.FakeAgent) int {
 // one import command, the waiting create completes, and a later deletion of
 // the snapshot includes the importing device.
 func TestImportResultAppliesAfterTransientError(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
@@ -99,6 +100,7 @@ func TestImportResultAppliesAfterTransientError(t *testing.T) {
 // that finds the snapshot deleted registers no row and makes the server send
 // delete_snapshot to the importer, like a result that arrives late.
 func TestImportResultRetryAfterSnapshotDeletionSendsDelete(t *testing.T) {
+	t.Parallel()
 	// A long backoff leaves time to delete the snapshot before the next attempt.
 	env := testenv.New(t, retryTiming(10*time.Second, 600*time.Millisecond))
 	org := env.NewOrg("alice")
@@ -140,6 +142,7 @@ func TestImportResultRetryAfterSnapshotDeletionSendsDelete(t *testing.T) {
 // device, and that the state report of the replacement channel then records
 // the copy that the agent lists.
 func TestImportResultAbandonedClosesChannelAndRecoversCopy(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		code    string
@@ -221,6 +224,7 @@ func importResultEventLogged(env *testenv.Env, event, commandID, channelID strin
 // stops its retry and that the replacement's initial state report records the
 // copy.
 func TestImportResultRetryStopsOnReplacedChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)

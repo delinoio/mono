@@ -20,6 +20,7 @@ import (
 // the retries of pending unlinks run apart from the other steps of the
 // status worker.
 func TestRunSlowPendingUnlinkDoesNotDelayWorker(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name string
@@ -86,6 +87,7 @@ func TestRunSlowPendingUnlinkDoesNotDelayWorker(t *testing.T) {
 // that it started: it returns only after the batch ended, and the batch ends
 // with the context of Run.
 func TestRunStopsWithSlowPendingUnlink(t *testing.T) {
+	t.Parallel()
 	f := newStatusFixture(t, time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC))
 	f.addOrg(t, org1)
 	f.link(t, org1, accountA)
@@ -106,6 +108,7 @@ func TestRunStopsWithSlowPendingUnlink(t *testing.T) {
 // nothing without the lease and stops at the next row when the lease is lost
 // during the batch.
 func TestRetryPendingUnlinksStopsWithoutLease(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := t.Context()

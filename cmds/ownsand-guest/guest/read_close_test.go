@@ -56,6 +56,8 @@ func newCloseTestServer(t *testing.T, dir string) *Server {
 // one in the state directory of a replacement helper, after the first server
 // was closed and its lock released.
 func TestReadWorkerCannotCreateAfterClose(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (readCloseGrace)
+	// that other tests read.
 	setReadCloseGrace(t, 50*time.Millisecond)
 	dir := t.TempDir()
 	src := filepath.Join(t.TempDir(), "src")
@@ -100,6 +102,7 @@ func TestReadWorkerCannotCreateAfterClose(t *testing.T) {
 // Close waits for a worker that ends within the grace, and a handler that
 // waits for the snapshot is released by the snapshot result.
 func TestReadCloseWaitsForWorkerWithinGrace(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		const grace = 10 * time.Second
 		dir := t.TempDir()
@@ -169,6 +172,8 @@ func TestReadCloseWaitsForWorkerWithinGrace(t *testing.T) {
 // A late cleanup of an old worker must keep the snapshot of the same read_id
 // in the replacement helper.
 func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (readCloseGrace)
+	// that other tests read.
 	setReadCloseGrace(t, 50*time.Millisecond)
 	dir := t.TempDir()
 	src := filepath.Join(t.TempDir(), "src")
@@ -220,6 +225,8 @@ func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) {
 }
 
 func TestReadShutdownHandsOffWhileSnapshotIOBlocked(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (readCloseGrace)
+	// that other tests read.
 	for _, phase := range []string{"create", "created", "failed preparation", "expiry", "admission retry"} {
 		t.Run(phase, func(t *testing.T) {
 			const grace = 40 * time.Millisecond
@@ -336,6 +343,7 @@ func TestReadShutdownHandsOffWhileSnapshotIOBlocked(t *testing.T) {
 }
 
 func TestReadPendingRemovalReservesIDAfterExpiry(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	src := filepath.Join(t.TempDir(), "src")
 	const original, updated = "original", "updated after expiry"

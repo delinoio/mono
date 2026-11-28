@@ -243,6 +243,7 @@ func (c *writeResultCall) requireCallFrames(t *testing.T, want int) {
 }
 
 func TestRelayWriteFileResultCallbackStopsOnCleanup(t *testing.T) {
+	t.Parallel()
 	var c *writeResultCall
 	if !t.Run("withheld result", func(t *testing.T) {
 		c = startWriteResultCall(t, 15*time.Second)
@@ -268,6 +269,7 @@ func TestRelayWriteFileResultCallbackStopsOnCleanup(t *testing.T) {
 // the deadline and its stream close frame is queued behind the frames that
 // are already there.
 func TestRelayWriteFileResultCreditReturnHonorsDeadline(t *testing.T) {
+	t.Parallel()
 	// The deadline counts from the stream allocation, and stalling the
 	// connection takes a while, so it leaves room for that.
 	c := startWriteResultCall(t, 4*time.Second)
@@ -301,6 +303,7 @@ func TestRelayWriteFileResultCreditReturnHonorsDeadline(t *testing.T) {
 // cancels while the credit return waits keeps its precedence over the
 // deadline: the handler ends with the caller's cancellation.
 func TestRelayWriteFileCallerCancelDuringCreditReturn(t *testing.T) {
+	t.Parallel()
 	c := startWriteResultCall(t, 30*time.Second)
 	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
 	c.releaseWriteResult()
@@ -320,6 +323,7 @@ func TestRelayWriteFileCallerCancelDuringCreditReturn(t *testing.T) {
 // time returns the agent's response, accounts for the result once and returns
 // the credit once.
 func TestRelayWriteFileResultWithinBudget(t *testing.T) {
+	t.Parallel()
 	c := startWriteResultCall(t, 2*time.Second)
 	c.releaseWriteResult()
 	if err := c.waitDone(t, 5*time.Second); err != nil {

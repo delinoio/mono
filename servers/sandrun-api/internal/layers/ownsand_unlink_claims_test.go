@@ -31,6 +31,7 @@ const (
 )
 
 func TestOwnSandUnlinkReleasesItsOwnClaimsAfterCommit(t *testing.T) {
+	t.Parallel()
 	for _, outcome := range []string{"commit", "rollback"} {
 		t.Run(outcome, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
@@ -132,6 +133,7 @@ func TestOwnSandUnlinkReleasesItsOwnClaimsAfterCommit(t *testing.T) {
 }
 
 func TestOwnSandUnlinkClaimReleaseRetries(t *testing.T) {
+	t.Parallel()
 	w := newUnlinkClaimWorld(t)
 	const vendorID = "retry"
 	id := w.queueUnlinkClaim(t, vendorID)

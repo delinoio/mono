@@ -31,6 +31,7 @@ func requireNoInternalError(t *testing.T, env *testenv.Env) {
 // request: a NUL byte is invalid_argument and never reaches Postgres, which
 // cannot store U+0000 in text. Other unknown IDs keep their results.
 func TestUserIDRejectsNULBytes(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	org := newOrg(t)

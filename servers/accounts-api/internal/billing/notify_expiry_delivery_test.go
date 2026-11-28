@@ -15,6 +15,7 @@ import (
 )
 
 func TestCreditExpiryNotificationRetriesOnlyBeforeExpiry(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		offset     time.Duration
@@ -72,6 +73,7 @@ func (f notificationDirectoryFunc) User(ctx context.Context, userID string) (dir
 }
 
 func TestCreditExpiryNotificationRetiresDuringRecipientLookup(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	expiry := f.clock.Now().Add(24 * time.Hour)
@@ -95,6 +97,7 @@ func TestCreditExpiryNotificationRetiresDuringRecipientLookup(t *testing.T) {
 }
 
 func TestCreditExpiryNotificationRetiresWithInvalidExpiry(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	id, _ := f.queueNotice(acct)

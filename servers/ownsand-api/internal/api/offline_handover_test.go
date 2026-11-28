@@ -71,6 +71,7 @@ func waitForOfflineLeaseSkip(t *testing.T, env *testenv.Env, deviceID string) {
 // TestOfflineWriteAfterLeaseHandover keeps the old handler alive until the
 // new holder has acknowledged the same device's full state report.
 func TestOfflineWriteAfterLeaseHandover(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev, _ := setupAgent(t, env, org, nil)
@@ -111,6 +112,7 @@ func TestOfflineWriteAfterLeaseHandover(t *testing.T) {
 }
 
 func TestOfflineWriteDuringLeaseLossWhileDeviceRowHeld(t *testing.T) {
+	t.Parallel()
 	for _, sameInstance := range []bool{false, true} {
 		name := "takeover"
 		if sameInstance {
@@ -158,6 +160,7 @@ func TestOfflineWriteDuringLeaseLossWhileDeviceRowHeld(t *testing.T) {
 }
 
 func TestOfflineWriteFromEarlierLeasePeriodAfterReacquisition(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
@@ -186,6 +189,7 @@ func TestOfflineWriteFromEarlierLeasePeriodAfterReacquisition(t *testing.T) {
 }
 
 func TestOfflineWriteChecksExpiryAfterLeaseRowWait(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev, agent := setupAgent(t, env, org, nil)

@@ -32,6 +32,7 @@ func readbackLimitsProblem(got *connect.Response[ownsandv1.GetDeviceResponse], e
 }
 
 func TestReadbackLimitsProblem(t *testing.T) {
+	t.Parallel()
 	want := &ownsandv1.DeviceLimits{VcpuCount: 2, MemoryMib: 2048, DiskGib: 20, VcpuOvercommitPercent: 100}
 	response := func(l *ownsandv1.DeviceLimits) *connect.Response[ownsandv1.GetDeviceResponse] {
 		return connect.NewResponse(&ownsandv1.GetDeviceResponse{Device: &ownsandv1.Device{Limits: l}})

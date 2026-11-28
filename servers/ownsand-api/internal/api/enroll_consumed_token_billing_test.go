@@ -36,6 +36,7 @@ func requireInvalidEnrollmentToken(t *testing.T, step string, err error) {
 // an eligible retry sees the billing result, and a first enrollment is gated
 // by billing without consuming the token.
 func TestEnrollConsumedTokenIsValidatedBeforeBilling(t *testing.T) {
+	t.Parallel()
 	env, fake := billingEnv(t)
 	ctx := context.Background()
 	org := linkedOrg(t, env, fake, "alice", billingAccountA)

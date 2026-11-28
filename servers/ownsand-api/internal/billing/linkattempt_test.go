@@ -17,6 +17,7 @@ import (
 // only when it, and the time that delino-accounts can still need after the
 // client gave up, end before the persisted call deadline.
 func TestLinkCallBudget(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 	deadline := t0.Add(billing.LinkCallTimeout + 15*time.Second)
 	for _, tc := range []struct {
@@ -40,6 +41,7 @@ func TestLinkCallBudget(t *testing.T) {
 // with a running call is admitted for dispatch: an ownership transfer, a
 // release of the call and a missing row all end it.
 func TestLinkAttemptRunning(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	d := dbtest.New(t)
 	const orgID, attempt = "0190f3a4-0000-7000-8000-0000000000d1", "0190f3a4-0000-7000-8000-0000000000e1"

@@ -36,6 +36,7 @@ const (
 // the 3-day suspension of a block, the 1-hour fail open of a linked
 // organization and the reported fields.
 func TestStatusPhases(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 	unlinked := billing.Status{OrganizationID: org1, Phase: billing.PhaseBlocked, BlockedSince: &t0}
 	if got := unlinked.Enforced(t0.Add(72*time.Hour - time.Second)); got != billing.PhaseBlocked {
@@ -186,6 +187,7 @@ func (f *statusFixture) assertPollLog(t *testing.T, logsBefore string, wantCurso
 // standing allows it, polled changes block and suspend it, and an unlink
 // keeps the block start of the non-payment.
 func TestStatusPollAndLinks(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
@@ -353,6 +355,7 @@ func TestStatusPollPagination(t *testing.T) {
 // non-payment to a billing account in non-payment keeps the earlier block
 // start, and that an unlink of an allowed organization starts a new block.
 func TestLinkKeepsEarlierBlockStart(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
@@ -427,6 +430,7 @@ func (f *statusFixture) removeLink(t *testing.T, org, source string) string {
 // the phase stays BLOCKED or SUSPENDED, and that an organization without a
 // link logs nothing and runs no hook.
 func TestLinkRemovalIsLogged(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		source  string
@@ -509,6 +513,7 @@ func TestLinkRemovalIsLogged(t *testing.T) {
 // TestPendingUnlinkRetries checks that a pending unlink is retried with
 // back-off until delino-accounts accepts it.
 func TestPendingUnlinkRetries(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
@@ -574,6 +579,7 @@ func TestPendingUnlinkRetries(t *testing.T) {
 // lease holder retries a due pending unlink at every tick, not only at a
 // poll, and that an instance without the lease never retries.
 func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
@@ -685,6 +691,7 @@ func startStatusRun(t *testing.T, statuses *billing.Statuses, gate *accountstest
 // bounds are generous: the old behavior (an interval of Poll plus Tick)
 // averages 250 ms for the 200 ms interval, the expected one 200 ms.
 func TestRunPollCadence(t *testing.T) {
+	t.Parallel()
 	const (
 		poll = 200 * time.Millisecond
 		tick = 50 * time.Millisecond
@@ -721,6 +728,7 @@ func TestRunPollCadence(t *testing.T) {
 // tick, KickPoll makes the next step poll, and an instance without the lease
 // never polls.
 func TestRunPollTriggers(t *testing.T) {
+	t.Parallel()
 	f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
 	var mu sync.Mutex
 	isHeld := false
@@ -750,6 +758,7 @@ func TestRunPollTriggers(t *testing.T) {
 }
 
 func TestRunPollOnLeaseReacquisition(t *testing.T) {
+	t.Parallel()
 	for _, observeLoss := range []bool{true, false} {
 		name := "loss between steps"
 		if observeLoss {
@@ -812,6 +821,7 @@ func TestRunPollOnLeaseReacquisition(t *testing.T) {
 // TestRunFailedPollRetriesAtNextInterval checks that a failed poll is retried
 // at the next poll interval, not at every tick.
 func TestRunFailedPollRetriesAtNextInterval(t *testing.T) {
+	t.Parallel()
 	f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
 	f.fake.Fail(accountstest.MethodListBillingStatusChanges, connect.NewError(connect.CodeUnavailable, errors.New("down")))
 	f.runStatuses(t, billing.StatusTiming{Poll: 300 * time.Millisecond, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), nil, nil)
@@ -825,6 +835,7 @@ func TestRunFailedPollRetriesAtNextInterval(t *testing.T) {
 
 // TestStatusMetrics checks the organizations-per-phase gauge.
 func TestStatusMetrics(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
@@ -1003,6 +1014,7 @@ func (w *statusWorker) waitForResult(t *testing.T) error {
 // the row as the lock holder left it and a clock reading that it takes after
 // the wait.
 func TestPendingUnlinkLockWait(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
 	ctx := context.Background()
 

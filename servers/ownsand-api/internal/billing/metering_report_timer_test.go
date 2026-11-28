@@ -83,6 +83,7 @@ func runWithFakeReportTimer(t *testing.T, m *billing.Metering) (*fakeReportTimer
 // real tickers of the other workers never fire and the Reset duration shows
 // which interval the reporter chose.
 func TestRunReportsDueRowsAfterLeaseHandover(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Minute))
 	accounts, client := newFakeAccounts(t)
 	ctx := context.Background()
@@ -161,6 +162,7 @@ func TestRunReportsDueRowsAfterLeaseHandover(t *testing.T) {
 }
 
 func TestRunReportsDueRowsAfterLeaseReacquisition(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Minute))
 	accounts, client := newFakeAccounts(t)
 	ctx := t.Context()

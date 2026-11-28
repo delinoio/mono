@@ -14,6 +14,7 @@ import (
 )
 
 func TestSplitTimevalRoundsUpAndCarries(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		in       time.Time
@@ -40,6 +41,7 @@ func TestSplitTimevalRoundsUpAndCarries(t *testing.T) {
 }
 
 func TestTimevalForFillsPlatformStruct(t *testing.T) {
+	t.Parallel()
 	const seconds int64 = 10413792000
 	tv, err := timevalFor(time.Unix(seconds, 0).UTC())
 	if reflect.TypeOf(tv.Sec).Bits() == 32 {
@@ -60,6 +62,7 @@ func TestTimevalForFillsPlatformStruct(t *testing.T) {
 }
 
 func TestTimevalForCarryReachesStruct(t *testing.T) {
+	t.Parallel()
 	tv, err := timevalFor(time.Date(2026, 1, 1, 0, 0, 0, 999999999, time.UTC))
 	if err != nil {
 		t.Fatalf("timevalFor returned an error: %v", err)
@@ -70,6 +73,7 @@ func TestTimevalForCarryReachesStruct(t *testing.T) {
 }
 
 func TestFitsIntegerNarrowFields(t *testing.T) {
+	t.Parallel()
 	var narrow int32 = 7
 	if fitsInteger(&narrow, 10413792000) {
 		t.Fatal("fitsInteger accepted a value that does not fit int32")

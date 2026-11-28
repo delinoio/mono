@@ -22,6 +22,7 @@ func relayStdout(id uint64, data string) *ownsandv1.DataFrame {
 }
 
 func TestRelayStreamEndRechecksAdmissionAfterQueueWake(t *testing.T) {
+	t.Parallel()
 	for _, inbound := range []struct {
 		name  string
 		frame *ownsandv1.DataFrame
@@ -104,6 +105,7 @@ func TestRelayStreamEndRechecksAdmissionAfterQueueWake(t *testing.T) {
 }
 
 func TestRelayTerminalFollowsQueuedFrames(t *testing.T) {
+	t.Parallel()
 	for _, action := range []string{"revocation", "protocol error", "dispatcher error"} {
 		t.Run(action, func(t *testing.T) {
 			f := newRevokeFixture(t, 4)
@@ -162,6 +164,7 @@ func TestRelayTerminalFollowsQueuedFrames(t *testing.T) {
 }
 
 func TestRelayFullQueueTerminationReleasesWaitingSenders(t *testing.T) {
+	t.Parallel()
 	for _, action := range []string{"revocation", "protocol error"} {
 		t.Run(action, func(t *testing.T) {
 			f, g, st := blockedSendFixture(t)
@@ -210,6 +213,7 @@ func TestRelayFullQueueTerminationReleasesWaitingSenders(t *testing.T) {
 // process-runtime guest. A second exec lets the original command print its
 // final output only after the first relay stream has ended.
 func TestRelayTerminalOrderWithProcessGuest(t *testing.T) {
+	t.Parallel()
 	for _, action := range []string{"revocation", "close", "error"} {
 		t.Run(action, func(t *testing.T) {
 			e := newRelayEnv(t, Timing{}, RelayLimits{})

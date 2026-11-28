@@ -110,6 +110,7 @@ func equalIDs(a, b []int64) bool {
 }
 
 func TestControlCursorHeldBatchAdvances(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 1200)
 	h.acquire(0, nil)
 	h.c.processEvents(context.Background())
@@ -122,6 +123,7 @@ func TestControlCursorHeldBatchAdvances(t *testing.T) {
 }
 
 func TestControlCursorLossLeavesUnset(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 3)
 	h.acquire(0, nil)
 	h.onHandle = func(id int64) {
@@ -139,6 +141,7 @@ func TestControlCursorLossLeavesUnset(t *testing.T) {
 }
 
 func TestControlCursorReacquireKeepsLatestID(t *testing.T) {
+	t.Parallel()
 	// The loss and the reacquisition both happen while the batch delivers
 	// event 1; the rest of the page and the later pages, including events
 	// above the new LatestID, must not be delivered, and
@@ -161,6 +164,7 @@ func TestControlCursorReacquireKeepsLatestID(t *testing.T) {
 }
 
 func TestControlCursorReacquireBetweenPages(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 1200)
 	h.acquire(0, nil)
 	reads := 0
@@ -182,6 +186,7 @@ func TestControlCursorReacquireBetweenPages(t *testing.T) {
 }
 
 func TestControlCursorReacquireWithZeroLatestID(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 2)
 	h.acquire(0, nil)
 	h.onHandle = func(id int64) {
@@ -200,6 +205,7 @@ func TestControlCursorReacquireWithZeroLatestID(t *testing.T) {
 }
 
 func TestControlCursorFailedLatestIDRead(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 2)
 	h.acquire(0, nil)
 	h.onHandle = func(id int64) {
@@ -218,6 +224,7 @@ func TestControlCursorFailedLatestIDRead(t *testing.T) {
 }
 
 func TestControlCursorReacquireWithEqualCursor(t *testing.T) {
+	t.Parallel()
 	// The reacquired LatestID equals the cursor that the stale batch would
 	// publish; the stale batch still delivers nothing more.
 	h := newCursorHarness(t, 3)
@@ -253,6 +260,7 @@ func TestControlCursorReacquireWithEqualCursor(t *testing.T) {
 }
 
 func TestControlCursorRetryEstablishesBaselineWithoutDeliveringEvents(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 2)
 	h.acquire(0, errors.New("database unavailable"))
 	h.latest, h.latestErr = 2, nil
@@ -266,6 +274,7 @@ func TestControlCursorRetryEstablishesBaselineWithoutDeliveringEvents(t *testing
 }
 
 func TestControlCursorInitSupersededByLeaseLost(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 10)
 	h.acquire(0, errors.New("database unavailable"))
 	h.interceptFirstLatestID(func() (int64, error) {
@@ -287,6 +296,7 @@ func TestControlCursorInitSupersededByLeaseLost(t *testing.T) {
 }
 
 func TestControlCursorInitSupersededByReacquire(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 10)
 	h.acquire(0, errors.New("database unavailable"))
 	h.interceptFirstLatestID(func() (int64, error) {
@@ -308,6 +318,7 @@ func TestControlCursorInitSupersededByReacquire(t *testing.T) {
 }
 
 func TestControlCursorRetryCannotSeedNewPeriod(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 10)
 	h.c.S.Lease = &ownershipLease{held: true}
 	h.c.S.BaselineReady = h.c.baselineReady
@@ -336,6 +347,7 @@ func TestControlCursorRetryCannotSeedNewPeriod(t *testing.T) {
 }
 
 func TestControlCursorInitFailedReadLeavesStateUnchanged(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 2)
 	h.acquire(0, errors.New("database unavailable"))
 	h.c.processEvents(context.Background())
@@ -357,6 +369,7 @@ func TestControlCursorInitFailedReadLeavesStateUnchanged(t *testing.T) {
 }
 
 func TestControlCursorInitKeepsGeneration(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 2)
 	h.acquire(0, errors.New("database unavailable"))
 	h.latest, h.latestErr = 2, nil
@@ -374,6 +387,7 @@ func TestControlCursorInitKeepsGeneration(t *testing.T) {
 // before the lease and after its loss or a failed read, the last processed
 // delivery ID while the lease is held.
 func TestControlProcessedCursor(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 3)
 	if _, ok := h.c.ProcessedCursor(); ok {
 		t.Fatal("cursor reported before the lease was acquired")
@@ -426,6 +440,7 @@ func admit(s *Service) (admitted bool, registered int) {
 // first acquisition and after a loss, and admitted once the event processor
 // stored the baseline.
 func TestControlBaselineGatesChannelAdmission(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 0)
 	lease := &ownershipLease{held: true}
 	h.c.S.Lease = lease
@@ -472,6 +487,7 @@ func TestControlBaselineGatesChannelAdmission(t *testing.T) {
 // baseline is also unset while the first read of the period is in flight, so
 // a channel that connects during the read is refused.
 func TestControlBaselineAdmissionRefusedWhileFirstReadPending(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 0)
 	h.c.S.Lease = &ownershipLease{held: true}
 	h.c.S.BaselineReady = h.c.baselineReady
@@ -494,6 +510,7 @@ func TestControlBaselineAdmissionRefusedWhileFirstReadPending(t *testing.T) {
 // TestControlBaselineAdmissionWithoutGate checks that a service without a
 // control worker (nil BaselineReady) keeps admitting while the lease is held.
 func TestControlBaselineAdmissionWithoutGate(t *testing.T) {
+	t.Parallel()
 	s := &Service{Lease: &ownershipLease{held: true}}
 	if ok, n := admit(s); !ok || n != 1 {
 		t.Fatalf("admitted = %v, registered = %d without a gate; want admitted once", ok, n)
@@ -503,6 +520,7 @@ func TestControlBaselineAdmissionWithoutGate(t *testing.T) {
 // TestControlWiresBaselineGate checks that NewControl installs the gate, and
 // that the gate follows the cursor of that control worker.
 func TestControlWiresBaselineGate(t *testing.T) {
+	t.Parallel()
 	s := &Service{Hub: hub.New(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Lease: &ownershipLease{held: true}}
 	c := NewControl(s)
 	c.latestID = func(context.Context) (int64, error) { return 4, nil }

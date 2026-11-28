@@ -84,6 +84,7 @@ func endIdle(t *testing.T, cp *fakeCP, sess *p2pSession, e idleEnd) {
 // relay: the next and every later operation use the relay without another
 // GetIceServers or OpenSession call.
 func TestIdleSessionFailureMovesAutomaticHandleToRelay(t *testing.T) {
+	t.Parallel()
 	for _, tc := range idleFailures {
 		t.Run(tc.name, func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -120,6 +121,7 @@ func TestIdleSessionFailureMovesAutomaticHandleToRelay(t *testing.T) {
 // session-end frame or a retirement of an idle session is not a failure: the
 // next operation opens a new session on the same transport and uses no relay.
 func TestIdleRoutineSessionEndKeepsDirectSetupAvailable(t *testing.T) {
+	t.Parallel()
 	for _, tc := range idleRoutineEnds {
 		t.Run(tc.name, func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -150,6 +152,7 @@ func TestIdleRoutineSessionEndKeepsDirectSetupAvailable(t *testing.T) {
 // peer-to-peer handle never moves to the relay: after an idle failure the
 // next operation opens a new session.
 func TestIdleSessionFailureOnForcedPeerToPeerReopens(t *testing.T) {
+	t.Parallel()
 	for _, tc := range idleFailures {
 		t.Run(tc.name, func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -177,6 +180,7 @@ func TestIdleSessionFailureOnForcedPeerToPeerReopens(t *testing.T) {
 // start together after an idle failure all use the relay and none of them
 // sets up a session.
 func TestConcurrentOperationsAfterIdleFailureUseRelay(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 	sess := openIdleSession(t, cp, s)
@@ -213,6 +217,7 @@ func TestConcurrentOperationsAfterIdleFailureUseRelay(t *testing.T) {
 // terminal cause of a session that is no longer installed does not move the
 // handle to the relay or forget the session that replaced it.
 func TestOldSessionFailureDoesNotChangeTheRouteOfItsReplacement(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 	old := openIdleSession(t, cp, s)
@@ -246,6 +251,7 @@ func TestOldSessionFailureDoesNotChangeTheRouteOfItsReplacement(t *testing.T) {
 // rejects every operation with errHandleClosed after an idle failure, on the
 // automatic and the forced transport, and calls nothing.
 func TestCloseAfterIdleFailureStillBlocksSetup(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportAuto, TransportPeerToPeer} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)

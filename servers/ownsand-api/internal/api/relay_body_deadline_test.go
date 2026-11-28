@@ -166,6 +166,7 @@ func streamOf(r *testenv.FakeRelay, grant string) uint64 {
 // a body that arrives after the deadline ends the call with deadline_exceeded,
 // and the agent sees a stream open and a stream close but no request frame.
 func TestRelayBodyDeadline(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
 			RequestDeadline: 600 * time.Millisecond, GrantAck: time.Second, Signaling: 2 * time.Second}
@@ -287,6 +288,7 @@ func countRequestFrames(r *testenv.FakeRelay, id uint64) int {
 // budget and whose agent never answers ends at the original absolute
 // deadline, not one full deadline after the upload.
 func TestRelayBudgetCoversUpload(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
 			RequestDeadline: time.Second, GrantAck: time.Second, Signaling: 2 * time.Second}
@@ -347,6 +349,7 @@ func TestRelayBudgetCoversUpload(t *testing.T) {
 // rejected, and the rejection logged, before the request body arrives, and
 // that no stream is allocated for it.
 func TestRelayGateRejectsBeforeBody(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	r := agent.ConnectRelay(serveRelay)
@@ -378,6 +381,7 @@ func TestRelayGateRejectsBeforeBody(t *testing.T) {
 // the grant is rejected after decoding and that its stream, opened by the gate,
 // is closed.
 func TestRelayGateGrantMismatch(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	r := agent.ConnectRelay(serveRelay)

@@ -20,6 +20,7 @@ import (
 )
 
 func TestWarmBindingQueueDeadline(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		advance time.Duration
@@ -74,6 +75,7 @@ func TestWarmBindingQueueDeadline(t *testing.T) {
 }
 
 func TestColdBindingQueueDeadline(t *testing.T) {
+	t.Parallel()
 	const maxQueueWait = time.Second
 	for _, tc := range []struct {
 		name    string

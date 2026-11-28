@@ -28,6 +28,7 @@ func gatedExec(t *testing.T) (req *ownsandv1.ExecRequest, release func()) {
 }
 
 func TestRunWaitsForOpenStreamAfterContextEnds(t *testing.T) {
+	t.Parallel()
 	rig := startShutdownRig(t)
 	req, release := gatedExec(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -62,6 +63,8 @@ func TestRunWaitsForOpenStreamAfterContextEnds(t *testing.T) {
 }
 
 func TestRunClosesConnectionsAfterGrace(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (shutdownGrace)
+	// that other tests read.
 	setShutdownGrace(t, 600*time.Millisecond)
 	rig := startShutdownRig(t)
 	req, _ := gatedExec(t) // Never released: the stream outlasts the grace.

@@ -39,6 +39,7 @@ func mustUpper(t *testing.T, id string) string {
 // of DeleteSnapshot and DeleteOrganization use the lowercase prefixes that the
 // signed object keys use, whichever case the caller wrote.
 func TestUppercaseIDsInDeletionCleanupPrefixes(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -98,6 +99,7 @@ func TestUppercaseIDsInDeletionCleanupPrefixes(t *testing.T) {
 // cases, that the agent commands, the audit target and the responses carry
 // lowercase identifiers, and that malformed identifiers stay invalid.
 func TestUppercaseIDsInSandboxRPCs(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -199,6 +201,7 @@ func TestUppercaseIDsInSandboxRPCs(t *testing.T) {
 // TestUppercaseIDsInOrganizationRPCs checks that responses and audit targets
 // of the organization-scoped RPCs carry the lowercase organization ID.
 func TestUppercaseIDsInOrganizationRPCs(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -241,6 +244,7 @@ func TestUppercaseIDsInOrganizationRPCs(t *testing.T) {
 // spelling of the grant and of the forwarded request, and that exec_id stays
 // lowercase-only.
 func TestUppercaseIDsOnRelay(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -424,6 +428,7 @@ func withUpperID(t *testing.T, e *ownsandv1.SandboxStateEntry) *ownsandv1.Sandbo
 // uppercase wakes it at once, not at the next one second poll. The watchers
 // are keyed by the lowercase ID.
 func TestUppercaseSandboxIDInCommandResultWakesWaiter(t *testing.T) {
+	t.Parallel()
 	env := longCommandWaitEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -483,6 +488,7 @@ func TestUppercaseSandboxIDInCommandResultWakesWaiter(t *testing.T) {
 // DeleteSandbox at once, and that the response and the stored row keep the
 // lowercase ID.
 func TestUppercaseSandboxIDInSandboxUpdateWakesWaiter(t *testing.T) {
+	t.Parallel()
 	env := longCommandWaitEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -527,6 +533,7 @@ func TestUppercaseSandboxIDInSandboxUpdateWakesWaiter(t *testing.T) {
 // unknown sandbox are acknowledged, change nothing and leave a waiting
 // DeleteSandbox waiting.
 func TestUppercaseStaleAndUnknownSandboxUpdatesKeepWaiter(t *testing.T) {
+	t.Parallel()
 	env := longCommandWaitEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -584,6 +591,7 @@ func TestUppercaseStaleAndUnknownSandboxUpdatesKeepWaiter(t *testing.T) {
 // TestLowercaseSandboxIDInSandboxUpdateWakesWaiter keeps the lowercase
 // spelling working: it wakes a waiting DeleteSandbox at once.
 func TestLowercaseSandboxIDInSandboxUpdateWakesWaiter(t *testing.T) {
+	t.Parallel()
 	env := longCommandWaitEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -621,6 +629,7 @@ func TestLowercaseSandboxIDInSandboxUpdateWakesWaiter(t *testing.T) {
 // results with an uppercase sandbox_id are applied to the lowercase row and
 // answered with the lowercase ID.
 func TestUppercaseSandboxIDInPauseResumeResults(t *testing.T) {
+	t.Parallel()
 	env := longCommandWaitEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

@@ -69,6 +69,7 @@ func expectUsage(t *testing.T, env *testenv.Env, orgID string, want map[ownsandv
 // that end with OK are counted, in their class, and that rejected calls,
 // the agent channel and STUN produce no usage.
 func TestRPCMetering(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	// CreateOrganization and AcceptInvitation are not billed; the two
@@ -176,6 +177,7 @@ func TestRPCMetering(t *testing.T) {
 // TestDeleteOrganizationKeepsUsage checks that the usage of a deleted
 // organization, including the deletion call itself, stays counted.
 func TestDeleteOrganizationKeepsUsage(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -215,6 +217,7 @@ func (c *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 // the exact response body bytes of Exec and ReadFile, framing included, and
 // that a WriteFile request frame toward the agent is counted.
 func TestRelayEgressMetering(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -316,6 +319,7 @@ func TestRelayEgressMetering(t *testing.T) {
 // a finished RPC is written by the final flush, and an RPC that records usage
 // after the final flush adds nothing to the counter rows.
 func TestFinalUsageFlushClosesRecorder(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

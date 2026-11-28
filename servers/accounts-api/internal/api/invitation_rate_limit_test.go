@@ -98,6 +98,7 @@ func rateLimitRecords(t *testing.T, env *testenv.Env) []map[string]any {
 // earlier invitation was revoked. The failed call sends no email and stores no
 // row. Invitations count for 24 hours.
 func TestInvitationLimitPerAddress(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -132,6 +133,7 @@ func TestInvitationLimitPerAddress(t *testing.T) {
 // The address limit counts the invitations of every inviter and every billing
 // account.
 func TestInvitationLimitPerAddressAcrossInviters(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	first := newPerson(env, "first")
 	second := newPerson(env, "second")
@@ -155,6 +157,7 @@ func TestInvitationLimitPerAddressAcrossInviters(t *testing.T) {
 
 // The inviter limit counts across billing accounts and revoked invitations.
 func TestInvitationLimitPerInviterAcrossAccounts(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	var accounts []string
@@ -190,6 +193,7 @@ func TestInvitationLimitPerInviterAcrossAccounts(t *testing.T) {
 // Concurrent calls of one inviter to different addresses cannot go above the
 // limit, also across billing accounts, which hold different account locks.
 func TestInvitationLimitConcurrentCalls(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accounts := []string{
@@ -232,6 +236,7 @@ func TestInvitationLimitConcurrentCalls(t *testing.T) {
 // Concurrent calls of different inviters to one address cannot go above the
 // address limit either.
 func TestInvitationLimitConcurrentCallsToOneAddress(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	const callers = 8
 	people := make([]person, callers)
@@ -270,6 +275,7 @@ func TestInvitationLimitConcurrentCallsToOneAddress(t *testing.T) {
 // The rejection is logged with the account, the inviter and the limit kind,
 // and never with the address.
 func TestInvitationLimitLogHoldsNoAddress(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -323,6 +329,7 @@ func TestInvitationLimitLogHoldsNoAddress(t *testing.T) {
 // transaction and still counts, so failing sends cannot reset a limit. A
 // pending duplicate keeps the already_exists error and counts nothing.
 func TestInvitationLimitCountsFailedSendsAndKeepsDuplicateError(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -347,6 +354,7 @@ func TestInvitationLimitCountsFailedSendsAndKeepsDuplicateError(t *testing.T) {
 // Invitations below the limits are not affected: an owner revokes and invites
 // again, and invites the address again after the invitation expired.
 func TestInvitationLimitLeavesNormalFlowsAlone(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()

@@ -58,6 +58,7 @@ func (c linkDispatchClient) LinkOrganization(ctx context.Context, req *connect.R
 }
 
 func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
+	t.Parallel()
 	const replacementID = "01900000-0000-7000-8000-00000000ff01"
 	type ownershipChange int
 	const (

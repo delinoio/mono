@@ -27,6 +27,7 @@ func (f *fixture) expiryNoticeState(grantID string) (notices int, marked bool) {
 // billing account lock queues no "expires in 7 days" notice when the grant
 // expires during the wait, and does not mark the grant as noticed.
 func TestQueueExpiryNoticesSkipsGrantThatExpiresWhileWaitingForLocks(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	grantID := f.grant(acct, LedgerSubscriptionCredit, 10*usd)
@@ -65,6 +66,7 @@ func TestQueueExpiryNoticesSkipsGrantThatExpiresWhileWaitingForLocks(t *testing.
 // grant that still expires in the future after the lock wait gets exactly one
 // notice, and a second run adds none.
 func TestQueueExpiryNoticesQueuesOneNoticeForFutureExpiry(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	grantID := f.grant(acct, LedgerSubscriptionCredit, 10*usd)

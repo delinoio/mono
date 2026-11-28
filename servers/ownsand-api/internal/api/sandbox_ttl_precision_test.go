@@ -20,6 +20,7 @@ import (
 // accepts every positive duration, so create, get, an idempotent replay and
 // the command that the agent receives must report the same TTL.
 func TestSandboxTTLKeepsSubMillisecondPrecision(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name      string
 		idle, max time.Duration
@@ -85,6 +86,7 @@ func TestSandboxTTLKeepsSubMillisecondPrecision(t *testing.T) {
 // for a row that the previous release inserts after the migration during a
 // rolling deployment. A row with both column sets reads the exact value.
 func TestSandboxTTLOfLegacyRows(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

@@ -94,6 +94,7 @@ func waitForExportVerification(parent context.Context, deadline time.Time, readV
 // the verification (15 minutes after the export) is skipped by moving
 // export_verify_after into the past in the database.
 func TestSnapshotExportVerification(t *testing.T) {
+	t.Parallel()
 	s := newStack(t, stackOptions{agents: 1, objects: true})
 	ctx := s.ctx(8 * time.Minute)
 	c := s.apiKeyClient(ownsand.TransportRelay)
@@ -190,6 +191,7 @@ func TestSnapshotExportVerification(t *testing.T) {
 }
 
 func TestWaitForExportVerificationCancelsPostgresQuery(t *testing.T) {
+	t.Parallel()
 	parent, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	conn, err := pgx.Connect(parent, dbtest.URL(t))

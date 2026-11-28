@@ -23,6 +23,7 @@ import (
 )
 
 func TestCancelRequestTelemetryAfterCommit(t *testing.T) {
+	t.Parallel()
 	w, reader := newWorkTelemetryWorld(t)
 	owner := w.env.User(w.org.Owner)
 	profileID := w.createProfile(t, devProfileProto("dev", 0, sandrunv1.Priority_PRIORITY_NORMAL))
@@ -94,6 +95,7 @@ func TestCancelRequestTelemetryAfterCommit(t *testing.T) {
 }
 
 func TestRequestStartTelemetryAfterCommit(t *testing.T) {
+	t.Parallel()
 	w, reader := newWorkTelemetryWorld(t)
 	profileID := w.createProfile(t, devProfileProto("dev", 0, sandrunv1.Priority_PRIORITY_NORMAL))
 	id := w.createSession(t, w.env.User(w.org.Owner), profileID).GetDevSessionId()
@@ -121,6 +123,7 @@ func TestRequestStartTelemetryAfterCommit(t *testing.T) {
 }
 
 func TestRunnerReadinessTelemetryAfterCommit(t *testing.T) {
+	t.Parallel()
 	w, reader := newWorkTelemetryWorld(t)
 	const preparing = sandrunv1.RunnerState_RUNNER_STATE_PREPARING
 	const warm = sandrunv1.RunnerState_RUNNER_STATE_WARM

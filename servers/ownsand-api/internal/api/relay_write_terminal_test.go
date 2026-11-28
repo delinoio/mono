@@ -15,6 +15,7 @@ import (
 )
 
 func TestRelayWriteFileTerminalBeforeCredit(t *testing.T) {
+	t.Parallel()
 	for _, terminal := range writeTerminalResponses() {
 		t.Run(terminal.name, func(t *testing.T) {
 			c := startWriteCall(t, 15*time.Second, 0)
@@ -63,6 +64,7 @@ func TestRelayWriteFileTerminalBeforeCredit(t *testing.T) {
 }
 
 func TestRelayWriteFileNoCreditLocalExit(t *testing.T) {
+	t.Parallel()
 	for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeCanceled} {
 		t.Run(code.String(), func(t *testing.T) {
 			c := startWriteCall(t, 2*time.Second, 0)

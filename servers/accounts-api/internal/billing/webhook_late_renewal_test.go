@@ -38,6 +38,7 @@ func (f *fixture) pastDueAtPeriod(subID string, periodEnd time.Time) {
 // credit once but does not make the subscription ACTIVE, while the payment of
 // the current period still recovers it.
 func TestLateRenewalPaymentKeepsNewerPastDueStatus(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
@@ -95,6 +96,7 @@ func TestLateRenewalPaymentKeepsNewerPastDueStatus(t *testing.T) {
 // payment of the same period as the stored one and a payment of a newer
 // period all still activate a PAST_DUE subscription.
 func TestRenewalPaymentOutsideOlderPeriodStillRecoversPastDue(t *testing.T) {
+	t.Parallel()
 	currentEnd := time.Date(2030, time.March, 1, 0, 0, 0, 0, time.UTC)
 	for name, periodEnd := range map[string]time.Time{
 		"no billing period": {},

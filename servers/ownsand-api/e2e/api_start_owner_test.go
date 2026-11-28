@@ -32,6 +32,7 @@ func foreignHealthServer(t *testing.T) *httptest.Server {
 }
 
 func TestHasServerStartedMatchesProcessAndAddress(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	appendLines(logs,
 		startedLine("api", "127.0.0.1:41999"),
@@ -54,6 +55,7 @@ func TestHasServerStartedMatchesProcessAndAddress(t *testing.T) {
 // A foreign 200 does not count while the process owns nothing, and the wait
 // ends with errProcessExited when the process exits.
 func TestStartAPIWaitRejectsAForeignAnswerUntilTheProcessExits(t *testing.T) {
+	t.Parallel()
 	srv := foreignHealthServer(t)
 	logs := &logSink{}
 	// The foreign server answers on a port of its own; the process claims
@@ -85,6 +87,7 @@ func TestStartAPIWaitRejectsAForeignAnswerUntilTheProcessExits(t *testing.T) {
 
 // The record of another attempt (process name) does not give ownership.
 func TestStartAPIWaitIgnoresTheRecordOfAnotherAttempt(t *testing.T) {
+	t.Parallel()
 	srv := foreignHealthServer(t)
 	logs := &logSink{}
 	appendLines(logs, startedLine("api", ownerAddr))
@@ -106,6 +109,7 @@ func TestStartAPIWaitIgnoresTheRecordOfAnotherAttempt(t *testing.T) {
 
 // The wait returns once the process logs server_started for the address.
 func TestStartAPIWaitSucceedsAfterServerStarted(t *testing.T) {
+	t.Parallel()
 	srv := foreignHealthServer(t)
 	logs := &logSink{}
 	checks := 0
@@ -127,6 +131,7 @@ func TestStartAPIWaitSucceedsAfterServerStarted(t *testing.T) {
 // pollHealthyWhile keeps its documented contract: a healthy server with an
 // open or nil exit channel returns nil at once, a closed one wins.
 func TestPollHealthyWhileAnswerAndExitChannel(t *testing.T) {
+	t.Parallel()
 	srv := foreignHealthServer(t)
 	if err := pollHealthyWhile(srv.URL, 30*time.Second, nil); err != nil {
 		t.Fatalf("nil exited: %v", err)

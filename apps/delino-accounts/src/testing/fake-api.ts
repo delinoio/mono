@@ -617,10 +617,24 @@ export function createFakeApi({
       async listLedgerEntries(req) {
         record("ListLedgerEntries", req);
         await api.gates.get("ListLedgerEntries");
-        const { page, nextPageToken } = paginate(
-          load(req.billingAccountId).account.ledger,
-          req,
-        );
+        const { account } = load(req.billingAccountId);
+        const ledger = account.ledger.toSorted((left, right) => {
+          const leftTime = left.createTime;
+          const rightTime = right.createTime;
+          if (leftTime !== rightTime) {
+            if (leftTime === undefined) return 1;
+            if (rightTime === undefined) return -1;
+            if (leftTime.seconds !== rightTime.seconds) {
+              return leftTime.seconds > rightTime.seconds ? -1 : 1;
+            }
+            if (leftTime.nanos !== rightTime.nanos) {
+              return rightTime.nanos - leftTime.nanos;
+            }
+          }
+          if (left.ledgerEntryId === right.ledgerEntryId) return 0;
+          return left.ledgerEntryId > right.ledgerEntryId ? -1 : 1;
+        });
+        const { page, nextPageToken } = paginate(ledger, req);
         return { ledgerEntries: page, nextPageToken };
       },
       getSubscription(req) {
@@ -831,8 +845,9 @@ export function addLinkedOrganizations(
 }
 
 /**
- * Adds usage ledger entries `ledger-0001` and so on, newest first like the
- * seeded entries, after the seeded ones. Each entry takes 1 micro-USD.
+ * Appends November 2 usage entries in ascending ID order. ListLedgerEntries
+ * sorts these entries together with the other ledger entries. Each entry
+ * deducts 1 micro-USD.
  */
 export function addLedgerEntries(account: FakeAccount, count: number) {
   for (let n = 1; n <= count; n++) {

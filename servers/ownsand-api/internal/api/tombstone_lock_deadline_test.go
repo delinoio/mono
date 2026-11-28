@@ -16,6 +16,7 @@ import (
 )
 
 func TestTombstoneDeadlineIsEnforcedAtTheDeviceRowLock(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	agent := env.Clients("").Agent

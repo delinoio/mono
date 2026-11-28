@@ -171,7 +171,8 @@ func TestCursorNextPreservesReadyEventsOnCancellation(t *testing.T) {
 func TestCursorWaitsAndKeepalive(t *testing.T) {
 	l := New("e", 64)
 	c := l.Cursor(0, 0)
-	ctx := context.Background()
+	ctx, cancelTimeout := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelTimeout()
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		l.Start(time.Now())

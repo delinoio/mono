@@ -76,6 +76,7 @@ func readOrgCounts(t *testing.T, env *testenv.Env, org *testenv.Org) orgCounts {
 // holds the organization lock, lets the former owner's deletion block on it,
 // commits the transfer and expects the deletion to see the new roles.
 func TestDeleteOrganizationAfterOwnershipTransfer(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -119,6 +120,7 @@ func TestDeleteOrganizationAfterOwnershipTransfer(t *testing.T) {
 // transfer that waits for the organization lock while a deletion commits
 // gets not_found and writes nothing.
 func TestTransferOwnershipAfterOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -155,6 +157,7 @@ func TestTransferOwnershipAfterOrganizationDeletion(t *testing.T) {
 // TestConcurrentDeleteAndTransfer fires both owner-only mutations at once and
 // expects one of the two serial outcomes.
 func TestConcurrentDeleteAndTransfer(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	for i := 0; i < 10; i++ {

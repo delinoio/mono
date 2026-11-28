@@ -78,6 +78,7 @@ func (f *pendingFixture) exists(t *testing.T) bool {
 }
 
 func TestReadSweepRetriesFailedRemoval(t *testing.T) {
+	t.Parallel()
 	f := newPendingFixture(t, "read-1")
 	m := f.m
 	first := f.end.Add(m.retention)
@@ -137,6 +138,7 @@ func TestReadSweepRetriesFailedRemoval(t *testing.T) {
 }
 
 func TestReadSweepRetriesPastExpiredMemory(t *testing.T) {
+	t.Parallel()
 	f := newPendingFixture(t, "read-1")
 	m := f.m
 	first := f.end.Add(m.retention)
@@ -164,6 +166,7 @@ func TestReadSweepRetriesPastExpiredMemory(t *testing.T) {
 }
 
 func TestReadSweepAbsentFileClearsPending(t *testing.T) {
+	t.Parallel()
 	f := newPendingFixture(t, "read-1")
 	m := f.m
 	first := f.end.Add(m.retention)
@@ -187,6 +190,7 @@ func TestReadSweepAbsentFileClearsPending(t *testing.T) {
 }
 
 func TestReadSweepImmediateSuccessLeavesNothingPending(t *testing.T) {
+	t.Parallel()
 	f := newPendingFixture(t, "read-1")
 	m := f.m
 	f.rm.fail = false
@@ -200,6 +204,7 @@ func TestReadSweepImmediateSuccessLeavesNothingPending(t *testing.T) {
 }
 
 func TestReadSweepPendingSkipsLiveEntries(t *testing.T) {
+	t.Parallel()
 	f := newPendingFixture(t, "read-1")
 	m := f.m
 	// An entry that is active, or whose snapshot is still being prepared, is
@@ -228,6 +233,7 @@ func TestReadSweepPendingSkipsLiveEntries(t *testing.T) {
 }
 
 func TestReadBeginSettlesPendingRemovalFirst(t *testing.T) {
+	t.Parallel()
 	f := newPendingFixture(t, "read-1")
 	m := f.m
 	src := filepath.Join(t.TempDir(), "source")
@@ -280,6 +286,7 @@ func TestReadBeginSettlesPendingRemovalFirst(t *testing.T) {
 }
 
 func TestReadPreparationRetriesFailedRemoval(t *testing.T) {
+	t.Parallel()
 	for _, retry := range []string{"sweep", "already-absent", "same-ID admission"} {
 		t.Run(retry, func(t *testing.T) {
 			h := newHarness(t, nil)
@@ -389,6 +396,7 @@ func TestReadPreparationRetriesFailedRemoval(t *testing.T) {
 }
 
 func TestReadPreparationPreservesExistingDestination(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	m := h.srv.reads
 	path := filepath.Join(t.TempDir(), "source")

@@ -228,6 +228,7 @@ func listFakeS3Objects(t *testing.T, ctx context.Context, client *http.Client, f
 }
 
 func TestFakeS3ListObjectsV2(t *testing.T) {
+	t.Parallel()
 	f := newFakeS3(t)
 	client := &http.Client{Timeout: 10 * time.Second}
 	for _, object := range []struct{ key, body string }{
@@ -247,6 +248,7 @@ func TestFakeS3ListObjectsV2(t *testing.T) {
 }
 
 func TestFakeS3ListObjectsV2ConcurrentPut(t *testing.T) {
+	t.Parallel()
 	f := newFakeS3(t)
 	defer f.releasePuts()
 	client := &http.Client{Timeout: 10 * time.Second}

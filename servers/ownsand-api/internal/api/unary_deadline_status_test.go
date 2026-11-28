@@ -20,6 +20,7 @@ import (
 // matching status: deadline_exceeded for a deadline that already passed and
 // canceled for a canceled caller.
 func TestListOrganizationsContextStatus(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	handler := api.OrganizationHandler{Service: env.App.Service}
 	principal := auth.WithPrincipal(context.Background(), auth.Principal{Kind: ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER, ID: "alice"})
