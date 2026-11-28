@@ -2,7 +2,7 @@
 import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
-import { NumberInput } from "delino-ui/number-input";
+import { NumberInput, type NumberInputDraft } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
 import {
@@ -16,7 +16,7 @@ import {
   type RunnerProfile,
   RunnerProfileService,
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useAgentIntegrations } from "../api.ts";
 import { SetupEmpty, SetupStep } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
@@ -33,6 +33,7 @@ import {
   CODEX_GUEST_OS_UNAVAILABLE,
   emptyProfileForm,
   formFromProfile,
+  MAX_WARM_COUNT,
   type ProfileErrors,
   profileErrors,
   type ProfileFormValues,
@@ -283,6 +284,7 @@ function ProfileDialog({
   );
   const [values, setValues] = useState<ProfileFormValues>(initial);
   const [errors, setErrors] = useState<ProfileErrors>({});
+  const warmCountDraft = useRef<NumberInputDraft>(null);
   const { integrations, hasNextPage, isLoadingMore, query } = agentIntegrations;
   const refresh = () => refreshRunnerProfiles(queryClient);
   const createProfile = useMutation(
@@ -364,7 +366,10 @@ function ProfileDialog({
           guestOsUnavailable)
       }
       onSubmit={async (opening) => {
-        const found = profileErrors(values, vendor, t);
+        const submitted = warmCountDraft.current?.isInvalid()
+          ? { ...values, warmCount: null }
+          : values;
+        const found = profileErrors(submitted, vendor, t);
         if (Object.keys(found).length > 0) {
           setErrors(found);
           return;
@@ -372,15 +377,15 @@ function ProfileDialog({
         if (creating) {
           await createProfile.mutateAsync({
             organizationId,
-            profile: profileFromForm(values),
+            profile: profileFromForm(submitted),
           });
         } else {
-          const mask = profileUpdateMask(initial, values);
+          const mask = profileUpdateMask(initial, submitted);
           if (mask.paths.length > 0) {
             await updateProfile.mutateAsync({
               organizationId,
               runnerProfileId: profile.runnerProfileId,
-              profile: profileFromForm(values),
+              profile: profileFromForm(submitted),
               updateMask: mask,
             });
           }
@@ -591,8 +596,10 @@ function ProfileDialog({
           incrementLabel={t("common.increase")}
           value={values.warmCount}
           onValueChange={(v) => set("warmCount", v)}
+          draftRef={warmCountDraft}
+          validateDraftBounds
           min={0}
-          max={10}
+          max={MAX_WARM_COUNT}
           error={errors.warmCount}
         />
       </div>

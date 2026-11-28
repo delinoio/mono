@@ -3649,6 +3649,82 @@ describe("runner profiles", () => {
     },
   );
 
+  test.each([
+    ["create", 10],
+    ["create", 4],
+    ["edit", 0],
+    ["edit", 4],
+  ] as const)(
+    "blocks invalid warm counts on %s and saves the corrected count %i",
+    async (mode, corrected) => {
+      const mock = createMockTransport();
+      const saves: (CreateRunnerProfileRequest | UpdateRunnerProfileRequest)[] =
+        [];
+      const transport: Transport = {
+        ...mock,
+        async unary(method, ...args) {
+          if (
+            method.name ===
+              RunnerProfileService.method.createRunnerProfile.name ||
+            method.name === RunnerProfileService.method.updateRunnerProfile.name
+          ) {
+            saves.push(
+              args[3] as
+                CreateRunnerProfileRequest | UpdateRunnerProfileRequest,
+            );
+          }
+          return mock.unary(method, ...args);
+        },
+      };
+      renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, { transport });
+
+      const creating = mode === "create";
+      if (creating) {
+        await click(
+          await screen.findByRole("button", { name: "Create runner profile" }),
+        );
+      } else {
+        const row = (
+          await screen.findByLabelText("runs-on label of linux-build")
+        ).closest("li")!;
+        await click(within(row).getByRole("button", { name: "Edit" }));
+      }
+      const dialog = await screen.findByRole("dialog", {
+        name: creating ? "Create a runner profile" : "Edit linux-build",
+      });
+      const form = within(dialog);
+      if (creating) {
+        await type(form.getByLabelText("Name"), "warm-count-check");
+      }
+      const warmCount = form.getByLabelText<HTMLInputElement>("Warm count");
+      const submit = form.getByRole("button", {
+        name: creating ? "Create profile" : "Save changes",
+      });
+
+      for (const draft of ["1.5", "11", ""]) {
+        await type(warmCount, draft);
+        await act(async () => fireEvent.blur(warmCount));
+        await click(submit);
+
+        expect(warmCount.value).toBe(draft);
+        expect(warmCount.getAttribute("aria-invalid")).toBe("true");
+        expect(form.getByText("Enter a warm count from 0 to 10.")).toBeTruthy();
+        expect(screen.getByRole("dialog")).toBe(dialog);
+        expect(saves).toHaveLength(0);
+      }
+
+      await type(warmCount, String(corrected));
+      await click(submit);
+
+      await waitFor(() => expect(dialog.isConnected).toBe(false));
+      expect(saves).toHaveLength(1);
+      expect(saves[0]).toMatchObject({
+        profile: { warmCount: corrected },
+        ...(!creating && { updateMask: { paths: ["warm_count"] } }),
+      });
+    },
+  );
+
   test("shows a subsecond maximum queue wait in the profile row", async () => {
     const mock = createMockTransport();
     const transport: Transport = {
