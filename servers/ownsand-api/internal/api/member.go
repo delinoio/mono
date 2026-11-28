@@ -16,7 +16,6 @@ import (
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
-	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 )
 
@@ -93,6 +92,19 @@ func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Reques
 		// a foreign key violation (internal) once the deletion commits.
 		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
 			return err
+		}
+		// A concurrent removal or demotion either commits before this
+		// check or waits for this invitation and revokes it.
+		var lockedRole int16
+		err = tx.QueryRow(ctx, "SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR SHARE", orgID, p.ID).Scan(&lockedRole)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound("organization")
+		}
+		if err != nil {
+			return err
+		}
+		if !authz.RoleAllowed(ownsandv1.Role(lockedRole), authz.ActionManageMembers) {
+			return errPermission("the caller's role does not allow this action")
 		}
 		secret, err := auth.NewSecret(auth.SecretInvitation)
 		if err != nil {
@@ -381,15 +393,62 @@ func (h MemberHandler) ListMembers(ctx context.Context, req *connect.Request[own
 	return connect.NewResponse(resp), nil
 }
 
-// loadMembership returns the membership ID and role of userID.
-func loadMembership(ctx context.Context, q db.Querier, orgID, userID string) (string, ownsandv1.Role, error) {
+// lockMembershipForChange locks the organization before its membership and
+// invitations, in the same order as organization deletion.
+func lockMembershipForChange(ctx context.Context, tx pgx.Tx, orgID, userID string) (string, ownsandv1.Role, error) {
+	if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return "", 0, errNotFound("member")
+		}
+		return "", 0, err
+	}
 	var id string
 	var role int16
-	err := q.QueryRow(ctx, "SELECT membership_id::text, role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE", orgID, userID).Scan(&id, &role)
+	err := tx.QueryRow(ctx, "SELECT membership_id::text, role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE", orgID, userID).Scan(&id, &role)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", 0, errNotFound("member")
 	}
 	return id, ownsandv1.Role(role), err
+}
+
+// The caller holds the creator's membership lock. Revoke before writing the
+// membership row so an acceptance that already locked an invitation can
+// finish its membership insert while this transaction waits.
+func (h MemberHandler) revokeInvitationsByCreatorTx(ctx context.Context, tx pgx.Tx, orgID, userID string, actor auth.Principal) (int, error) {
+	rows, err := tx.Query(ctx, `UPDATE invitations SET revoke_time = $4
+		WHERE organization_id = $1 AND created_by_kind = $2 AND created_by_id = $3
+			AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $4
+		RETURNING invitation_id::text`, orgID, int16(ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER), userID, h.now())
+	if err != nil {
+		return 0, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if err := h.writeAudit(ctx, tx, auditEvent{
+			OrganizationID: orgID, Action: ownsandv1.AuditAction_AUDIT_ACTION_INVITATION_REVOKED, Actor: actor,
+			TargetKind: ownsandv1.AuditTargetKind_AUDIT_TARGET_KIND_INVITATION, TargetID: id,
+		}); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
+type invitationRevocationReason string
+
+const (
+	invitationsMembershipEnded          invitationRevocationReason = "membership_ended"
+	invitationsRoleLostMemberManagement invitationRevocationReason = "role_lost_member_management"
+)
+
+func (h MemberHandler) logInvitationRevocations(ctx context.Context, orgID, userID string, count int, reason invitationRevocationReason) {
+	if count > 0 {
+		h.Logger.InfoContext(ctx, "invitations_revoked_by_membership_change",
+			slog.String("organization_id", orgID), slog.String("user_id", userID), slog.Int("count", count), slog.String("reason", string(reason)))
+	}
 }
 
 func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Request[ownsandv1.UpdateMemberRoleRequest]) (*connect.Response[ownsandv1.UpdateMemberRoleResponse], error) {
@@ -400,6 +459,7 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 	target := req.Msg.GetUserId()
 	role := req.Msg.GetRole()
 	var resp *ownsandv1.UpdateMemberRoleResponse
+	var revokedInvitations int
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageMembers)
 		if err != nil {
@@ -414,12 +474,18 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 		if role != ownsandv1.Role_ROLE_ADMIN && role != ownsandv1.Role_ROLE_MEMBER {
 			return errInvalidf("invalid role: must be ROLE_ADMIN or ROLE_MEMBER; use TransferOwnership for the owner")
 		}
-		membershipID, current, err := loadMembership(ctx, tx, orgID, target)
+		membershipID, current, err := lockMembershipForChange(ctx, tx, orgID, target)
 		if err != nil {
 			return err
 		}
 		if current == ownsandv1.Role_ROLE_OWNER {
 			return errPermission("the owner's role changes only with TransferOwnership")
+		}
+		if authz.RoleAllowed(current, authz.ActionManageMembers) && !authz.RoleAllowed(role, authz.ActionManageMembers) {
+			revokedInvitations, err = h.revokeInvitationsByCreatorTx(ctx, tx, orgID, target, p)
+			if err != nil {
+				return err
+			}
 		}
 		var joined time.Time
 		if err := tx.QueryRow(ctx, "UPDATE memberships SET role = $3 WHERE organization_id = $1 AND user_id = $2 RETURNING join_time", orgID, target, int16(role)).Scan(&joined); err != nil {
@@ -437,6 +503,7 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 	if err != nil {
 		return nil, h.internal(ctx, "update member role", err)
 	}
+	h.logInvitationRevocations(ctx, orgID, target, revokedInvitations, invitationsRoleLostMemberManagement)
 	return connect.NewResponse(resp), nil
 }
 
@@ -446,6 +513,7 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[ow
 		return nil, err
 	}
 	target := req.Msg.GetUserId()
+	var revokedInvitations int
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, err := principal(ctx)
 		if err != nil {
@@ -468,12 +536,16 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[ow
 		if err := validate.NoNUL("user_id", target); err != nil {
 			return errInvalid(err)
 		}
-		membershipID, role, err := loadMembership(ctx, tx, orgID, target)
+		membershipID, role, err := lockMembershipForChange(ctx, tx, orgID, target)
 		if err != nil {
 			return err
 		}
 		if role == ownsandv1.Role_ROLE_OWNER {
 			return errPermission("the owner cannot be removed")
+		}
+		revokedInvitations, err = h.revokeInvitationsByCreatorTx(ctx, tx, orgID, target, p)
+		if err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM memberships WHERE organization_id = $1 AND user_id = $2", orgID, target); err != nil {
 			return err
@@ -489,6 +561,7 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[ow
 	if err != nil {
 		return nil, h.internal(ctx, "remove member", err)
 	}
+	h.logInvitationRevocations(ctx, orgID, target, revokedInvitations, invitationsMembershipEnded)
 	h.notify()
 	return connect.NewResponse(&ownsandv1.RemoveMemberResponse{}), nil
 }
