@@ -299,13 +299,14 @@ func (b *Bridge) run(ctx context.Context) ExitCode {
 		return ExitEventLogFailed
 	}
 
-	if code, ok := b.startAgent(ctx, startErr); !ok {
-		if b.agent != nil {
-			b.stopAgent()
-		}
+	code, ok := b.startAgent(ctx, startErr)
+	// Every return after the agent started, also with a start failure or
+	// an event log failure, waits for the stop of the agent process group:
+	// main exits right after Run, which would end the SIGKILL escalation.
+	defer b.stopAndWait()
+	if !ok {
 		return code
 	}
-	defer b.stopAgent()
 
 	if b.inbox, err = inbox.New(filepath.Join(b.cfg.StateDir, InboxDirName)); err != nil {
 		b.logger.Error("inbox unusable", "error", err)
@@ -506,6 +507,20 @@ func (b *Bridge) agentExited() ExitCode {
 func (b *Bridge) stopAgent() {
 	if b.agent != nil {
 		b.agent.Stop()
+	}
+}
+
+// stopAndWait stops the agent and waits until its process ended, at most
+// stopTimeout.
+func (b *Bridge) stopAndWait() {
+	if b.agent == nil {
+		return
+	}
+	b.stopAgent()
+	select {
+	case <-b.agent.Done():
+	case <-time.After(stopTimeout):
+		b.logger.Warn("the agent did not stop in time")
 	}
 }
 

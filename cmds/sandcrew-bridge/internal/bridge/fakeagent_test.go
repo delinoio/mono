@@ -56,6 +56,8 @@ type fakeAgent struct {
 	exitCode      int
 	exitSignal    string
 	withoutModes  bool
+	// killDelay delays the process exit after Kill.
+	killDelay time.Duration
 	// onSessionNew runs before the session/new answer.
 	onSessionNew func()
 	// rejectModes are offered modes that session/set_mode rejects.
@@ -94,7 +96,17 @@ func (f *fakeAgent) Wait() agent.Exit {
 	return agent.Exit{Code: f.exitCode, Signal: f.exitSignal}
 }
 
-func (f *fakeAgent) Kill() { f.exit(-1, "terminated") }
+func (f *fakeAgent) Kill() {
+	if f.killDelay > 0 {
+		// Like a process group whose tools stop only after the escalation.
+		go func() {
+			time.Sleep(f.killDelay)
+			f.exit(-1, "killed")
+		}()
+		return
+	}
+	f.exit(-1, "terminated")
+}
 
 func (f *fakeAgent) exit(code int, signal string) {
 	f.exitOnce.Do(func() {

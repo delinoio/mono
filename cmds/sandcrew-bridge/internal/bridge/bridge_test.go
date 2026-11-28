@@ -954,6 +954,7 @@ func TestStartFailures(t *testing.T) {
 		}, sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_AGENT_START_FAILED},
 		{"session/new failure", func(h *harness, _ *sandcrewv1.BridgeStartConfig) {
 			h.agent.failSessionNew = true
+			h.agent.killDelay = 100 * time.Millisecond
 		}, sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_AGENT_START_FAILED},
 		{"unreadable start.json", nil, sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_AGENT_START_FAILED},
 	}
@@ -972,6 +973,14 @@ func TestStartFailures(t *testing.T) {
 			h.run()
 			if code := h.wait(); code != ExitStartFailed {
 				t.Fatalf("exit code %d, want %d", code, ExitStartFailed)
+			}
+			// A started agent has ended when Run returns.
+			if len(h.launches) > 0 {
+				select {
+				case <-h.agent.exited:
+				default:
+					t.Fatal("Run returned before the agent process ended")
+				}
 			}
 			events := h.events()
 			got := kinds(events)
@@ -1020,6 +1029,7 @@ func TestEventLogFailureStopsTheBridge(t *testing.T) {
 		file = &failingFile{file: f, limit: 1 << 30}
 		return file, nil
 	}
+	h.agent.killDelay = 100 * time.Millisecond
 	h.run()
 	idle := h.waitIdle()
 	file.mu.Lock()
@@ -1039,10 +1049,11 @@ func TestEventLogFailureStopsTheBridge(t *testing.T) {
 	if last.GetBridgeError().GetKind() != sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED || last.GetSequence() != events[idle].GetSequence() {
 		t.Fatalf("last event %v, want EVENT_LOG_WRITE_FAILED with the last logged sequence %d", last, events[idle].GetSequence())
 	}
+	// Run waits for the stop of the agent before it returns.
 	select {
 	case <-h.agent.exited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the agent was not stopped")
+	default:
+		t.Fatal("Run returned before the agent process ended")
 	}
 }
 
