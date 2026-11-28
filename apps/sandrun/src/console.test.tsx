@@ -5770,7 +5770,7 @@ describe("work", () => {
       "refreshes both cached session lists after a successful $page action",
       async (scenario) => {
         const { transport, reads } = devSessionRefreshFixture(
-          createMockTransport(),
+          createMockTransport,
           "success",
         );
         // An indefinitely fresh cache can only refetch on return if invalidated.
@@ -5827,7 +5827,7 @@ describe("work", () => {
       "keeps the error and active session after a rejected $page action",
       async (scenario) => {
         const { transport, reads } = devSessionRefreshFixture(
-          createMockTransport(),
+          createMockTransport,
           scenario.failureMode,
         );
         const queryClient = renderConsole(

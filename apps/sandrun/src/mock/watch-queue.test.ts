@@ -17,10 +17,13 @@ import {
   AuditTargetKind,
 } from "@delino/sandrun-protos/v1/audit_pb";
 import {
+  RequestEndReason,
   RequestState,
   RunnerEndReason,
   RunnerState,
+  WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
+import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import {
   CancelRequestRequestSchema,
   GetRunnerRequestSchema,
@@ -31,6 +34,7 @@ import { afterEach, beforeEach, expect, rs, test } from "@rstest/core";
 import {
   createMockTransport,
   MOCK_IDS,
+  MOCK_USER,
   type MockTransportOptions,
 } from "./mock-api.ts";
 
@@ -71,6 +75,7 @@ function openWatch(organizationId: string, options?: MockTransportOptions) {
   const remove = rs.spyOn(context.signal, "removeEventListener");
   return {
     context,
+    transport,
     work: createClient(WorkService, transport),
     audit: createClient(AuditService, transport),
     getStoredRunner: async (runnerId: string) => {
@@ -102,10 +107,12 @@ function openWatch(organizationId: string, options?: MockTransportOptions) {
 }
 
 async function readSnapshot(stream: ReturnType<typeof openWatch>["stream"]) {
+  const events = [];
   for (;;) {
     const { value, done } = await stream.next();
     if (done) throw new Error("Expected a complete snapshot");
-    if (value.event?.case === "snapshotComplete") return;
+    if (value.event?.case === "snapshotComplete") return events;
+    events.push(value.event);
   }
 }
 
@@ -146,49 +153,251 @@ test.each([RunnerState.DELETED, RunnerState.DELETING, RunnerState.FAILED])(
   },
 );
 
-test("deleting a warm runner records one result, update and audit event across retries", async () => {
-  const firstDeletionTime = Date.UTC(2026, 0, 1);
-  rs.setSystemTime(firstDeletionTime);
-  const organizationId = MOCK_IDS.acme;
-  const runnerId = MOCK_IDS.warmRunner;
-  const request = { organizationId, runnerId };
-  const { work, audit, stream } = openWatch(organizationId);
-  const history = await audit.listAuditEvents({ organizationId });
-  await readSnapshot(stream);
+const organizationId = MOCK_IDS.acme;
+const terminalRequestId = "terminal-agent-request";
+const terminalRunnerId = "runner-with-terminal-request";
+const terminalFixture: MockTransportOptions = {
+  workFixtures: [
+    {
+      organizationId,
+      requests: [
+        {
+          requestId: terminalRequestId,
+          runnerId: terminalRunnerId,
+          kind: WorkloadKind.AGENT_SESSION,
+          state: RequestState.CANCELED,
+          endReason: RequestEndReason.CANCELED_BY_USER,
+          endedAt: timestampFromMs(Date.UTC(2025, 0, 1)),
+        },
+      ],
+      runners: [
+        {
+          runnerId: terminalRunnerId,
+          requestId: terminalRequestId,
+          kind: WorkloadKind.AGENT_SESSION,
+          state: RunnerState.BUSY,
+        },
+      ],
+    },
+  ],
+};
 
-  try {
-    const deleted = await work.deleteRunner(request);
-    expect(deleted.runner).toMatchObject({
-      runnerId,
-      state: RunnerState.DELETED,
-      endReason: RunnerEndReason.DELETED_BY_USER,
-      endedAt: timestampFromMs(firstDeletionTime),
-    });
-    const update = stream.next();
-    rs.advanceTimersByTime(10_000);
-    await expect(update).resolves.toMatchObject({
-      value: { event: { case: "runner", value: deleted.runner } },
-    });
+test.each([
+  { label: "a warm runner", runnerId: MOCK_IDS.warmRunner },
+  {
+    label: "a GitHub runner",
+    runnerId: MOCK_IDS.busyRunner,
+    requestId: MOCK_IDS.runningJob,
+  },
+  {
+    label: "a runner bound to a terminal request",
+    runnerId: terminalRunnerId,
+    requestId: terminalRequestId,
+    options: terminalFixture,
+  },
+])(
+  "deleting $label records one runner update and one audit event across retries",
+  async ({ runnerId, requestId, options }) => {
+    const firstDeletionTime = Date.UTC(2026, 0, 1);
+    rs.setSystemTime(firstDeletionTime);
 
-    expect(await work.deleteRunner(request)).toEqual(deleted);
-    expect((await work.getRunner(request)).runner).toEqual(deleted.runner);
-    const { events } = await audit.listAuditEvents({ organizationId });
-    expect(events[0]).toMatchObject({
-      action: AuditAction.RUNNER_DELETED,
-      targetKind: AuditTargetKind.RUNNER,
-      targetId: runnerId,
-    });
-    expect(events.slice(1)).toEqual(history.events);
+    const request = { organizationId, runnerId };
+    const { work, audit, stream } = openWatch(organizationId, options);
+    const readRequest = async () =>
+      requestId
+        ? (await work.getRequest({ organizationId, requestId })).request
+        : undefined;
+    const before = structuredClone(await readRequest());
+    const history = await audit.listAuditEvents({ organizationId });
+    await readSnapshot(stream);
 
-    const next = stream.next();
-    rs.advanceTimersByTime(10_000);
-    await expect(next).resolves.toMatchObject({
-      value: { event: { case: "keepalive" } },
+    try {
+      const deleted = await work.deleteRunner(request);
+      expect(deleted.runner).toMatchObject({
+        runnerId,
+        state: RunnerState.DELETED,
+        endReason: RunnerEndReason.DELETED_BY_USER,
+        endedAt: timestampFromMs(firstDeletionTime),
+      });
+      const update = stream.next();
+      rs.advanceTimersByTime(10_000);
+      await expect(update).resolves.toMatchObject({
+        value: { event: { case: "runner", value: deleted.runner } },
+      });
+
+      expect(await readRequest()).toEqual(before);
+      expect(await work.deleteRunner(request)).toEqual(deleted);
+      expect((await work.getRunner(request)).runner).toEqual(deleted.runner);
+      const { events } = await audit.listAuditEvents({ organizationId });
+      expect(events[0]).toMatchObject({
+        action: AuditAction.RUNNER_DELETED,
+        targetKind: AuditTargetKind.RUNNER,
+        targetId: runnerId,
+      });
+      expect(events.slice(1)).toEqual(history.events);
+
+      const next = stream.next();
+      rs.advanceTimersByTime(10_000);
+      await expect(next).resolves.toMatchObject({
+        value: { event: { case: "keepalive" } },
+      });
+    } finally {
+      await stream.return?.();
+    }
+  },
+);
+
+test.each([
+  {
+    label: "running dev session",
+    kind: WorkloadKind.DEV_SESSION,
+    requestState: RequestState.RUNNING,
+    runnerState: RunnerState.BUSY,
+    endState: RequestState.ENDED,
+    endReason: RequestEndReason.SESSION_DELETED,
+  },
+  {
+    label: "starting agent session",
+    kind: WorkloadKind.AGENT_SESSION,
+    requestState: RequestState.STARTING,
+    runnerState: RunnerState.PREPARING,
+    endState: RequestState.FAILED,
+    endReason: RequestEndReason.RUNNER_LOST,
+  },
+])(
+  "deleting the runner for a $label ends the request exactly once",
+  async ({ kind, requestState, runnerState, endState, endReason }) => {
+    const organizationId = MOCK_IDS.acme;
+    const requestId = "bound-request";
+    const runnerId = "bound-runner";
+    const now = Date.UTC(2026, 0, 1);
+    const endedAt = timestampFromMs(now);
+    rs.setSystemTime(now);
+    const { transport, work, audit, stream } = openWatch(organizationId, {
+      workFixtures: [
+        {
+          organizationId,
+          requests: [{ requestId, runnerId, kind, state: requestState }],
+          runners: [{ runnerId, requestId, kind, state: runnerState }],
+          devSessions:
+            kind === WorkloadKind.DEV_SESSION
+              ? [
+                  {
+                    devSessionId: requestId,
+                    runnerId,
+                    ownerUserId: MOCK_USER,
+                    state: requestState,
+                  },
+                ]
+              : [],
+        },
+      ],
     });
-  } finally {
-    await stream.return?.();
-  }
-});
+    const deletion = { organizationId, runnerId };
+    const request = { organizationId, requestId };
+    const list = { organizationId };
+    const history = { organizationId, includeEnded: true };
+    const auditsBefore = await audit.listAuditEvents(list);
+    const eventsMatch = (event: unknown) =>
+      expect.objectContaining({ case: "request", value: event });
+    const endedRequest = { requestId, state: endState, endReason, endedAt };
+
+    try {
+      expect(await readSnapshot(stream)).toContainEqual(
+        eventsMatch(
+          expect.objectContaining({ requestId, state: requestState }),
+        ),
+      );
+      const deleted = await work.deleteRunner(deletion);
+      expect(deleted.runner).toMatchObject({
+        runnerId,
+        state: RunnerState.DELETED,
+        endReason: RunnerEndReason.DELETED_BY_USER,
+      });
+      const firstUpdate = await stream.next();
+      const secondUpdate = stream.next();
+      rs.advanceTimersByTime(10_000);
+      const updates = [
+        firstUpdate.value?.event,
+        (await secondUpdate).value?.event,
+      ];
+      expect(updates).toEqual(
+        expect.arrayContaining([
+          eventsMatch(expect.objectContaining(endedRequest)),
+          { case: "runner", value: deleted.runner },
+        ]),
+      );
+
+      expect((await work.getRequest(request)).request).toMatchObject(
+        endedRequest,
+      );
+      expect(
+        (await work.listRequests(list)).requests.map((r) => r.requestId),
+      ).not.toContain(requestId);
+      expect((await work.listRequests(history)).requests).toContainEqual(
+        expect.objectContaining(endedRequest),
+      );
+
+      if (kind === WorkloadKind.DEV_SESSION) {
+        const sessions = createClient(DevSessionService, transport);
+        const session = {
+          devSessionId: requestId,
+          state: endState,
+          endReason,
+          endedAt,
+        };
+        expect(
+          (
+            await sessions.getDevSession({
+              organizationId,
+              devSessionId: requestId,
+            })
+          ).devSession,
+        ).toMatchObject(session);
+        expect(
+          (await sessions.listDevSessions(list)).devSessions.map(
+            (s) => s.devSessionId,
+          ),
+        ).not.toContain(requestId);
+        expect(
+          (await sessions.listDevSessions(history)).devSessions,
+        ).toContainEqual(expect.objectContaining(session));
+      }
+
+      const fresh = work.watchQueue(list)[Symbol.asyncIterator]();
+      try {
+        expect(await readSnapshot(fresh)).not.toContainEqual(
+          eventsMatch(expect.objectContaining({ requestId })),
+        );
+      } finally {
+        await fresh.return?.();
+      }
+
+      const auditsAfter = await audit.listAuditEvents(list);
+      const [newAudit, ...olderAudits] = auditsAfter.events;
+      expect(newAudit).toMatchObject({
+        action: AuditAction.RUNNER_DELETED,
+        targetKind: AuditTargetKind.RUNNER,
+        targetId: runnerId,
+      });
+      expect(olderAudits).toEqual(auditsBefore.events);
+
+      rs.setSystemTime(now + 1_000);
+      expect(await work.deleteRunner(deletion)).toEqual(deleted);
+      expect((await work.getRequest(request)).request).toMatchObject(
+        endedRequest,
+      );
+      expect(await audit.listAuditEvents(list)).toEqual(auditsAfter);
+      const next = stream.next();
+      rs.advanceTimersByTime(10_000);
+      await expect(next).resolves.toMatchObject({
+        value: { event: { case: "keepalive" } },
+      });
+    } finally {
+      await stream.return?.();
+    }
+  },
+);
 
 test("releases each wait after a keepalive or queue event", async () => {
   const { stream, cancelRequest, pendingAbortListeners } = openWatch(
