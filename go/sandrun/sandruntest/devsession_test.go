@@ -286,13 +286,15 @@ func TestListDevSessionsFilters(t *testing.T) {
 	org := s.AddOrganization("first").GetOrganizationId()
 	other := s.AddOrganization("second").GetOrganizationId()
 	s.mu.Lock()
-	s.sessions = []*sandrunv1.DevSession{
+	for _, ds := range []*sandrunv1.DevSession{
 		{DevSessionId: "other-org", OrganizationId: other, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: ended},
 		{DevSessionId: "second-ended", OrganizationId: org, RunnerProfileId: secondListProfile, OwnerUserId: s.UserID, State: ended},
 		{DevSessionId: "other-owner", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: otherOwner, State: ended},
 		{DevSessionId: "first-running", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: running},
 		{DevSessionId: "first-ended", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: ended},
 		{DevSessionId: "unspecified", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID},
+	} {
+		s.sessions = append(s.sessions, &devSessionRecord{session: ds})
 	}
 	s.mu.Unlock()
 	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
@@ -377,7 +379,7 @@ func TestCloseDuringExecStart(t *testing.T) {
 			WorkspacePath:  workspace,
 		}
 		s := &Server{
-			sessions:     []*sandrunv1.DevSession{ds},
+			sessions:     []*devSessionRecord{{session: ds}},
 			sessionExecs: make(map[string]*sessionExecs),
 		}
 		g := newGuest(s)

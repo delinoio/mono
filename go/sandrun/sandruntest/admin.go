@@ -80,7 +80,8 @@ func (s *Server) AddDevSessionProfile(orgID, name string, os sandrunv1.GuestOs, 
 	return proto.CloneOf(p)
 }
 
-// AddRequest and AddRunner seed the work lists and the queue snapshot.
+// AddRequest seeds a work request. A dev session with the same organization
+// and ID takes precedence.
 func (s *Server) AddRequest(r *sandrunv1.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -505,6 +506,54 @@ type workService struct {
 	s *Server
 }
 
+// workRequestLocked projects the session as a work request. The timestamps
+// still belong to the session, so callers clone the result before releasing mu.
+func (record *devSessionRecord) workRequestLocked() *sandrunv1.Request {
+	ds := record.session
+	return &sandrunv1.Request{
+		RequestId:       ds.GetDevSessionId(),
+		OrganizationId:  ds.GetOrganizationId(),
+		RunnerProfileId: ds.GetRunnerProfileId(),
+		OwnerUserId:     ds.GetOwnerUserId(),
+		Kind:            sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION,
+		Priority:        record.priority,
+		State:           ds.GetState(),
+		EndReason:       ds.GetEndReason(),
+		QueuedAt:        ds.GetQueuedAt(),
+		StartedAt:       ds.GetStartedAt(),
+		EndedAt:         ds.GetEndedAt(),
+		RunnerId:        ds.GetRunnerId(),
+	}
+}
+
+// organizationRequestsLocked combines session and seeded requests before callers filter them.
+func (s *Server) organizationRequestsLocked(orgID string) []*sandrunv1.Request {
+	var sessionRequests []*sandrunv1.Request
+	sessionIDs := make(map[string]struct{})
+	for _, record := range s.sessions {
+		if ds := record.session; ds.GetOrganizationId() == orgID {
+			sessionIDs[ds.GetDevSessionId()] = struct{}{}
+			sessionRequests = append(sessionRequests, record.workRequestLocked())
+		}
+	}
+	var requests []*sandrunv1.Request
+	for _, r := range s.requests {
+		if _, shadowed := sessionIDs[r.GetRequestId()]; r.GetOrganizationId() == orgID && !shadowed {
+			requests = append(requests, r)
+		}
+	}
+	return append(requests, sessionRequests...)
+}
+
+func (s *Server) findSeededRequestLocked(orgID, id string) *sandrunv1.Request {
+	for _, r := range s.requests {
+		if r.GetOrganizationId() == orgID && r.GetRequestId() == id {
+			return r
+		}
+	}
+	return nil
+}
+
 func terminalRunner(st sandrunv1.RunnerState) bool {
 	return st == sandrunv1.RunnerState_RUNNER_STATE_DELETED || st == sandrunv1.RunnerState_RUNNER_STATE_FAILED
 }
@@ -643,8 +692,8 @@ func (w *workService) ListRequests(_ context.Context, req *connect.Request[sandr
 		return nil, err
 	}
 	var mine []*sandrunv1.Request
-	for _, r := range w.s.requests {
-		if r.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && r.GetRunnerProfileId() != profileID) {
+	for _, r := range w.s.organizationRequestsLocked(m.GetOrganizationId()) {
+		if profileID != "" && r.GetRunnerProfileId() != profileID {
 			continue
 		}
 		if kind != sandrunv1.WorkloadKind_WORKLOAD_KIND_UNSPECIFIED && r.GetKind() != kind {
@@ -670,29 +719,43 @@ func (w *workService) ListRequests(_ context.Context, req *connect.Request[sandr
 func (w *workService) GetRequest(_ context.Context, req *connect.Request[sandrunv1.GetRequestRequest]) (*connect.Response[sandrunv1.GetRequestResponse], error) {
 	w.s.mu.Lock()
 	defer w.s.mu.Unlock()
-	for _, r := range w.s.requests {
-		if r.GetOrganizationId() == req.Msg.GetOrganizationId() && r.GetRequestId() == req.Msg.GetRequestId() {
-			return connect.NewResponse(&sandrunv1.GetRequestResponse{Request: proto.CloneOf(r)}), nil
-		}
+	orgID, id := req.Msg.GetOrganizationId(), req.Msg.GetRequestId()
+	if ds := w.s.findSessionLocked(orgID, id); ds != nil {
+		return connect.NewResponse(&sandrunv1.GetRequestResponse{Request: proto.CloneOf(ds.workRequestLocked())}), nil
 	}
-	return nil, notFound("request")
+	r := w.s.findSeededRequestLocked(orgID, id)
+	if r == nil {
+		return nil, notFound("request")
+	}
+	return connect.NewResponse(&sandrunv1.GetRequestResponse{Request: proto.CloneOf(r)}), nil
 }
 
 func (w *workService) CancelRequest(_ context.Context, req *connect.Request[sandrunv1.CancelRequestRequest]) (*connect.Response[sandrunv1.CancelRequestResponse], error) {
 	w.s.mu.Lock()
 	defer w.s.mu.Unlock()
-	for _, r := range w.s.requests {
-		if r.GetOrganizationId() == req.Msg.GetOrganizationId() && r.GetRequestId() == req.Msg.GetRequestId() {
-			if r.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
-				return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the request is not queued"))
-			}
-			r.State = sandrunv1.RequestState_REQUEST_STATE_CANCELED
-			r.EndReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER
-			r.EndedAt = timestamppb.Now()
-			return connect.NewResponse(&sandrunv1.CancelRequestResponse{Request: proto.CloneOf(r)}), nil
-		}
+	orgID, id := req.Msg.GetOrganizationId(), req.Msg.GetRequestId()
+	ds := w.s.findSessionLocked(orgID, id)
+	var r *sandrunv1.Request
+	if ds != nil {
+		r = ds.workRequestLocked()
+	} else {
+		r = w.s.findSeededRequestLocked(orgID, id)
 	}
-	return nil, notFound("request")
+	if r == nil {
+		return nil, notFound("request")
+	}
+	if r.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the request is not queued"))
+	}
+	if ds != nil {
+		cancelQueuedSessionLocked(ds.session)
+		r = ds.workRequestLocked()
+	} else {
+		r.State = sandrunv1.RequestState_REQUEST_STATE_CANCELED
+		r.EndReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER
+		r.EndedAt = timestamppb.Now()
+	}
+	return connect.NewResponse(&sandrunv1.CancelRequestResponse{Request: proto.CloneOf(r)}), nil
 }
 
 func (w *workService) ListRunners(_ context.Context, req *connect.Request[sandrunv1.ListRunnersRequest]) (*connect.Response[sandrunv1.ListRunnersResponse], error) {
@@ -763,8 +826,8 @@ func (w *workService) WatchQueue(ctx context.Context, req *connect.Request[sandr
 		return err
 	}
 	var snap []*sandrunv1.WatchQueueResponse
-	for _, r := range w.s.requests {
-		if r.GetOrganizationId() == orgID && !terminalRequest(r.GetState()) {
+	for _, r := range w.s.organizationRequestsLocked(orgID) {
+		if !terminalRequest(r.GetState()) {
 			snap = append(snap, &sandrunv1.WatchQueueResponse{Event: &sandrunv1.WatchQueueResponse_Request{Request: proto.CloneOf(r)}})
 		}
 	}

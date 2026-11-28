@@ -203,6 +203,205 @@ func TestListRequestsOrderAcrossPages(t *testing.T) {
 	}
 }
 
+func requireDevSessionWorkRequest(t *testing.T, got *sandrunv1.Request, ds *sandrunv1.DevSession, priority sandrunv1.Priority) {
+	t.Helper()
+	want := &sandrunv1.Request{
+		RequestId:       ds.GetDevSessionId(),
+		OrganizationId:  ds.GetOrganizationId(),
+		RunnerProfileId: ds.GetRunnerProfileId(),
+		OwnerUserId:     ds.GetOwnerUserId(),
+		Kind:            sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION,
+		Priority:        priority,
+		State:           ds.GetState(),
+		EndReason:       ds.GetEndReason(),
+		QueuedAt:        ds.GetQueuedAt(),
+		StartedAt:       ds.GetStartedAt(),
+		EndedAt:         ds.GetEndedAt(),
+		RunnerId:        ds.GetRunnerId(),
+	}
+	if !proto.Equal(got, want) {
+		t.Fatalf("work request = %v, want %v", got, want)
+	}
+}
+
+func TestWorkRequestCancelsQueuedDevSession(t *testing.T) {
+	t.Parallel()
+	const (
+		queued = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+		job    = sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB
+		high   = sandrunv1.Priority_PRIORITY_HIGH
+	)
+	s := New()
+	t.Cleanup(s.Close)
+	s.NewSessionState = queued
+	org := s.AddOrganization("session owner").GetOrganizationId()
+	other := s.AddOrganization("other").GetOrganizationId()
+	profiles := sandrunv1connect.NewRunnerProfileServiceClient(http.DefaultClient, s.URL)
+	dev := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+	work := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	profile, err := profiles.CreateRunnerProfile(t.Context(), listTestRequest(&sandrunv1.CreateRunnerProfileRequest{
+		OrganizationId: org,
+		Profile: &sandrunv1.RunnerProfile{
+			Name: "development", WorkloadKind: sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION,
+			GuestOs: sandrunv1.GuestOs_GUEST_OS_LINUX, Priority: high, WorkspacePath: t.TempDir(),
+		},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileID := profile.Msg.GetProfile().GetRunnerProfileId()
+	created, err := dev.CreateDevSession(t.Context(), listTestRequest(&sandrunv1.CreateDevSessionRequest{
+		OrganizationId: org, RunnerProfileId: profileID,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds := created.Msg.GetDevSession()
+	id := ds.GetDevSessionId()
+	if ds.GetState() != queued || ds.GetQueuedAt() == nil {
+		t.Fatalf("unexpected queued session: %v", ds)
+	}
+	getWork := func(orgID string) (*sandrunv1.Request, error) {
+		res, err := work.GetRequest(t.Context(), listTestRequest(&sandrunv1.GetRequestRequest{OrganizationId: orgID, RequestId: id}))
+		if err != nil {
+			return nil, err
+		}
+		return res.Msg.GetRequest(), nil
+	}
+	cancel := func(orgID string) (*sandrunv1.Request, error) {
+		res, err := work.CancelRequest(t.Context(), listTestRequest(&sandrunv1.CancelRequestRequest{OrganizationId: orgID, RequestId: id}))
+		if err != nil {
+			return nil, err
+		}
+		return res.Msg.GetRequest(), nil
+	}
+
+	r, err := getWork(org)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireDevSessionWorkRequest(t, r, ds, high)
+
+	// A later profile change must not change the saved priority of the session.
+	s.mu.Lock()
+	s.profiles[0].Priority = sandrunv1.Priority_PRIORITY_LOW
+	s.mu.Unlock()
+	seed := &sandrunv1.Request{RequestId: id, OrganizationId: org, Kind: job, State: queued}
+	s.AddRequest(seed)
+	r, err = getWork(org)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireDevSessionWorkRequest(t, r, ds, high)
+
+	list, err := work.ListRequests(t.Context(), listTestRequest(&sandrunv1.ListRequestsRequest{
+		OrganizationId: org, RunnerProfileId: profileID, Kind: sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION,
+		States: []sandrunv1.RequestState{queued}, PageSize: 1,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := list.Msg.GetRequests(); len(rows) != 1 || !proto.Equal(rows[0], r) || list.Msg.GetNextPageToken() != "" {
+		t.Fatalf("filtered work list = %v, want one projected request", list.Msg)
+	}
+
+	if _, err := getWork(other); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Errorf("cross-organization lookup = %v, want not_found", err)
+	}
+	if _, err := cancel(other); connect.CodeOf(err) != connect.CodeNotFound {
+		t.Errorf("cross-organization cancellation = %v, want not_found", err)
+	}
+	// An identical ID in another organization still refers to its own seed.
+	seed.OrganizationId = other
+	s.AddRequest(seed)
+	standalone, err := getWork(other)
+	if err != nil || !proto.Equal(standalone, seed) {
+		t.Fatalf("standalone work lookup = %v, %v, want %v", standalone, err, seed)
+	}
+	standalone, err = cancel(other)
+	if err != nil || standalone.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+		standalone.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER || standalone.GetEndedAt() == nil {
+		t.Fatalf("standalone work cancellation = %v, %v", standalone, err)
+	}
+
+	canceled, err := cancel(org)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+		canceled.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER || canceled.GetEndedAt() == nil {
+		t.Fatalf("unexpected canceled request: %v", canceled)
+	}
+	session, err := dev.GetDevSession(t.Context(), listTestRequest(&sandrunv1.GetDevSessionRequest{OrganizationId: org, DevSessionId: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireDevSessionWorkRequest(t, canceled, session.Msg.GetDevSession(), high)
+	if _, err := cancel(org); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Errorf("repeat cancellation = %v, want failed_precondition", err)
+	}
+	if current, err := getWork(org); err != nil || !proto.Equal(current, canceled) {
+		t.Errorf("work request after repeat cancellation = %v, %v, want %v", current, err, canceled)
+	}
+	for _, includeEnded := range []bool{false, true} {
+		list, err := work.ListRequests(t.Context(), listTestRequest(&sandrunv1.ListRequestsRequest{OrganizationId: org, IncludeEnded: includeEnded}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := list.Msg.GetRequests()
+		if (!includeEnded && len(rows) != 0) || (includeEnded && (len(rows) != 1 || !proto.Equal(rows[0], canceled))) {
+			t.Errorf("work list with include_ended=%t = %v", includeEnded, list.Msg)
+		}
+	}
+}
+
+func TestWorkRequestFollowsDevSessionPromotionAndDeletion(t *testing.T) {
+	t.Parallel()
+	s := New()
+	t.Cleanup(s.Close)
+	s.NewSessionState = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+	s.PromoteAfterGets = 1
+	dev, ds := createExecTestSession(t, t.Context(), s, t.TempDir())
+	work := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	org, id := ds.GetOrganizationId(), ds.GetDevSessionId()
+	getWork := func() *sandrunv1.Request {
+		t.Helper()
+		res, err := work.GetRequest(t.Context(), listTestRequest(&sandrunv1.GetRequestRequest{OrganizationId: org, RequestId: id}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Msg.GetRequest()
+	}
+
+	promoted, err := dev.GetDevSession(t.Context(), listTestRequest(&sandrunv1.GetDevSessionRequest{OrganizationId: org, DevSessionId: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := promoted.Msg.GetDevSession()
+	if running.GetState() != sandrunv1.RequestState_REQUEST_STATE_RUNNING || running.GetRunnerId() == "" || running.GetStartedAt() == nil {
+		t.Fatalf("unexpected promoted session: %v", running)
+	}
+	const priority = sandrunv1.Priority_PRIORITY_NORMAL
+	requireDevSessionWorkRequest(t, getWork(), running, priority)
+
+	_, err = work.CancelRequest(t.Context(), listTestRequest(&sandrunv1.CancelRequestRequest{OrganizationId: org, RequestId: id}))
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Errorf("running cancellation = %v, want failed_precondition", err)
+	}
+	requireDevSessionWorkRequest(t, getWork(), running, priority)
+
+	deleted, err := dev.DeleteDevSession(t.Context(), listTestRequest(&sandrunv1.DeleteDevSessionRequest{OrganizationId: org, DevSessionId: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := deleted.Msg.GetDevSession()
+	if ended.GetState() != sandrunv1.RequestState_REQUEST_STATE_ENDED ||
+		ended.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED || ended.GetEndedAt() == nil {
+		t.Fatalf("unexpected deleted session: %v", ended)
+	}
+	requireDevSessionWorkRequest(t, getWork(), ended, priority)
+}
+
 func TestListRunnersFilters(t *testing.T) {
 	const (
 		busy     = sandrunv1.RunnerState_RUNNER_STATE_BUSY

@@ -97,7 +97,7 @@ type Server struct {
 	orgs            []*sandrunv1.Organization
 	members         map[string][]*sandrunv1.Member
 	profiles        []*sandrunv1.RunnerProfile
-	sessions        []*sandrunv1.DevSession
+	sessions        []*devSessionRecord
 	sessionGets     map[string]int
 	sessionExecs    map[string]*sessionExecs
 	apiKeys         []*sandrunv1.ApiKey
