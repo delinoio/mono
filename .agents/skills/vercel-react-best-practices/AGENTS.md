@@ -1325,7 +1325,7 @@ Each item independently chains `getChat` → `getUser`, so a slow chat doesn't b
 
 Use `React.cache()` for server-side request deduplication. Authentication and database queries benefit most.
 
-**Usage:**
+Define each memoized wrapper once at module scope. Call it during a React Server Component render. Calls to the same wrapper with matching arguments share a result within that render request. At module scope, each call executes the underlying function.
 
 ```typescript
 import { cache } from 'react'
@@ -1337,44 +1337,43 @@ export const getCurrentUser = cache(async () => {
     where: { id: session.user.id }
   })
 })
+
+export async function CurrentUser() {
+  await Promise.all([getCurrentUser(), getCurrentUser()]) // One query if signed in
+  return null
+}
 ```
 
-Within a single request, multiple calls to `getCurrentUser()` execute the query only once.
+**Argument identity**
 
-**Avoid inline objects as arguments:**
-
-`React.cache()` uses shallow equality (`Object.is`) to determine cache hits. Inline objects create new references each call, preventing cache hits.
-
-**Incorrect: always cache miss**
+Primitive arguments match by value. Object arguments match by reference. Reuse the same object to share the result. Two object literals with the same fields create separate cache entries.
 
 ```typescript
-const getUser = cache(async (params: { uid: number }) => {
-  return await db.user.findUnique({ where: { id: params.uid } })
-})
+import { cache } from 'react'
 
-// Each call creates new object, never hits cache
-getUser({ uid: 1 })
-getUser({ uid: 1 })  // Cache miss, runs query again
-```
-
-**Correct: cache hit**
-
-```typescript
 const getUser = cache(async (uid: number) => {
   return await db.user.findUnique({ where: { id: uid } })
 })
 
-// Primitive args use value equality
-getUser(1)
-getUser(1)  // Cache hit, returns cached result
-```
+const getUserByParams = cache(async (params: { uid: number }) => {
+  return await db.user.findUnique({ where: { id: params.uid } })
+})
 
-If you must pass objects, pass the same reference:
+export async function PrimitiveArgument() {
+  await Promise.all([getUser(1), getUser(1)]) // One query
+  return null
+}
 
-```typescript
-const params = { uid: 1 }
-getUser(params)  // Query runs
-getUser(params)  // Cache hit (same reference)
+export async function SharedObjectArgument() {
+  const params = { uid: 1 }
+  await Promise.all([getUserByParams(params), getUserByParams(params)]) // One query
+  return null
+}
+
+export async function FreshObjectArguments() {
+  await Promise.all([getUserByParams({ uid: 1 }), getUserByParams({ uid: 1 })]) // Two queries
+  return null
+}
 ```
 
 **Next.js-Specific Note:**
