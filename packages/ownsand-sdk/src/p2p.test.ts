@@ -3230,29 +3230,29 @@ describe("peer-to-peer data path", () => {
     ] as const)(
       "while %s of the peer connection is pending",
       (method, opens) => {
-        /** Starts two waiters, one without a signal, and holds `method`. */
-        async function start() {
+        /** Starts two waiters and holds `method`. */
+        async function start(secondSignal?: AbortSignal) {
           const { h, rtc } = p2pSetup(exiting, { hold: [method] });
           const sandbox = h.client.sandbox(SANDBOX);
-          const controller = new AbortController();
-          const withSignal = sandbox
-            .run({ command: ["a"], signal: controller.signal })
+          const firstController = new AbortController();
+          const first = sandbox
+            .run({ command: ["a"], signal: firstController.signal })
             .catch((e) => e);
-          const withoutSignal = sandbox.run({ command: ["b"] }).catch((e) => e);
+          const second = sandbox
+            .run({ command: ["b"], signal: secondSignal })
+            .catch((e) => e);
           // Gathering takes 100 virtual ms and the fake OpenSession is instant.
           await h.clock.advance(1_000);
           expect(rtc.held(method)).toBe(1);
           expect(rtc.connections).toHaveLength(1);
           expect(h.api.callsOf("OpenSession")).toHaveLength(opens);
-          return { h, rtc, sandbox, controller, withSignal, withoutSignal };
+          return { h, rtc, sandbox, firstController, first, second };
         }
 
         test("a close ends every waiter, closes the peer connection and starts no relay", async () => {
-          const { h, rtc, sandbox, withSignal, withoutSignal } = await start();
+          const { h, rtc, sandbox, first, second } = await start();
           sandbox.close();
-          const errors = await h.clock.run(
-            Promise.all([withSignal, withoutSignal]),
-          );
+          const errors = await h.clock.run(Promise.all([first, second]));
           expect(errors[0]).toBeInstanceOf(OwnSandHandleClosedError);
           expect(errors[1]).toBeInstanceOf(OwnSandHandleClosedError);
           expect(rtc.closedConnections).toBe(1);
@@ -3262,9 +3262,9 @@ describe("peer-to-peer data path", () => {
         });
 
         test("a late completion after the close installs no peer", async () => {
-          const { h, rtc, sandbox, withSignal, withoutSignal } = await start();
+          const { h, rtc, sandbox, first, second } = await start();
           sandbox.close();
-          await h.clock.run(Promise.all([withSignal, withoutSignal]));
+          await h.clock.run(Promise.all([first, second]));
           rtc.release(method);
           await h.clock.settle();
           // The late completion starts no further signaling or channel work.
@@ -3281,20 +3281,28 @@ describe("peer-to-peer data path", () => {
         });
 
         test("the last caller that aborts ends with its reason and closes the peer connection", async () => {
-          const { h, rtc, sandbox, controller, withSignal, withoutSignal } =
-            await start();
-          const reason = new Error("caller cancelled");
-          // The caller without a signal still waits, so the abort keeps the
-          // shared setup.
-          controller.abort(reason);
-          expect(await h.clock.run(withSignal)).toBe(reason);
-          expect(rtc.closedConnections).toBe(0);
-          // The close then ends the remaining waiter.
-          sandbox.close();
-          expect(await h.clock.run(withoutSignal)).toBeInstanceOf(
-            OwnSandHandleClosedError,
+          const secondController = new AbortController();
+          const { h, rtc, firstController, first, second } = await start(
+            secondController.signal,
           );
+          let secondSettled = false;
+          void second.then(() => {
+            secondSettled = true;
+          });
+
+          const firstReason = new Error("first caller cancelled");
+          firstController.abort(firstReason);
+          expect(await h.clock.run(first)).toBe(firstReason);
+          expect(secondSettled).toBe(false);
+          expect(rtc.closedConnections).toBe(0);
+
+          const secondReason = new Error("second caller cancelled");
+          secondController.abort(secondReason);
+          expect(await h.clock.run(second)).toBe(secondReason);
+          expect(rtc.held(method)).toBe(1);
           expect(rtc.closedConnections).toBe(1);
+          expect(rtc.channels[0]!.readyState).toBe("closed");
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
         });
       },
     );
