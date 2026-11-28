@@ -7,6 +7,7 @@ package dataplane
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -194,6 +195,124 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type observedRelayBody struct {
+	io.ReadCloser
+	reads   atomic.Int32
+	closes  atomic.Int32
+	onClose func()
+}
+
+func (b *observedRelayBody) Read(p []byte) (int, error) {
+	b.reads.Add(1)
+	return b.ReadCloser.Read(p)
+}
+
+func (b *observedRelayBody) Close() error {
+	if b.closes.Add(1) == 1 && b.onClose != nil {
+		b.onClose()
+	}
+	return b.ReadCloser.Close()
+}
+
+func TestRelayConnectCleansUpRejectedResponse(t *testing.T) {
+	t.Parallel()
+	transportErr := errors.New("relay transport failed")
+	for _, tc := range []struct {
+		name         string
+		transportErr error
+	}{
+		{name: "rejected response"},
+		{name: "transport error", transportErr: transportErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &observedRelayBody{ReadCloser: io.NopCloser(strings.NewReader("relay unavailable"))}
+			e := newRelayEnvWrapped(t, Timing{}, RelayLimits{}, func(http.RoundTripper) http.RoundTripper {
+				return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					defer req.Body.Close()
+					// Read both startup envelopes so the reply, rather than an
+					// interrupted Send, determines the result of this attempt.
+					for range 2 {
+						var header [5]byte
+						if _, err := io.ReadFull(req.Body, header[:]); err != nil {
+							return nil, err
+						}
+						size := binary.BigEndian.Uint32(header[1:])
+						if _, err := io.CopyN(io.Discard, req.Body, int64(size)); err != nil {
+							return nil, err
+						}
+					}
+					if tc.transportErr != nil {
+						return nil, tc.transportErr
+					}
+					return &http.Response{StatusCode: http.StatusServiceUnavailable, ProtoMajor: 2, Body: body}, nil
+				})
+			})
+			r := e.dp.relay
+			r.mu.Lock()
+			r.running = true // Drive one attempt directly to observe the returned error.
+			r.mu.Unlock()
+			e.execGrant(e.execReq("/bin/true"))
+			var openedAt time.Time
+			probeLost, err := r.connectOnce(e.ch, &openedAt)
+			if probeLost || connect.CodeOf(err) != connect.CodeUnavailable {
+				t.Fatalf("connectOnce returned probeLost=%v, err=%v", probeLost, err)
+			}
+			if tc.transportErr != nil {
+				if !errors.Is(err, tc.transportErr) {
+					t.Fatalf("connectOnce error = %v, want %v", err, tc.transportErr)
+				}
+				return
+			}
+			waitFor(t, "rejected relay response body close", func() bool { return body.closes.Load() > 0 })
+			if reads, closes := body.reads.Load(), body.closes.Load(); reads != 0 || closes != 1 {
+				t.Fatalf("rejected response had %d reads and %d closes, want 0 and 1", reads, closes)
+			}
+		})
+	}
+}
+
+func TestRelayResponseAcquiredAfterCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	releaseTransport := sync.OnceFunc(func() { close(release) })
+	defer releaseTransport()
+	body := &observedRelayBody{ReadCloser: http.NoBody}
+	transport := countingTransport{base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		close(started)
+		<-release
+		return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+	})}
+	req, err := http.NewRequestWithContext(withConn(ctx, &rconn{}), http.MethodPost, "http://relay.test/connect", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan *http.Response, 1)
+	go func() {
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Errorf("round trip: %v", err)
+		}
+		result <- resp
+	}()
+	<-started
+	cancel()
+	releaseTransport()
+	resp := <-result
+	if resp == nil {
+		t.Fatal("transport did not return a response")
+	}
+	waitFor(t, "late relay response body close", func() bool { return body.closes.Load() > 0 })
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if closes := body.closes.Load(); closes != 1 {
+		t.Fatalf("late response had %d closes, want 1", closes)
+	}
+}
 
 // gatedBody is a response body whose Read blocks until release is closed and
 // then returns data, so a test completes a read at a chosen moment.
@@ -2260,7 +2379,27 @@ func (e *relayEnv) loseChannelWithBufferedPeer(s *session) {
 func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
 	t.Parallel()
 	const flush = 10 * time.Second
-	e := newRelayEnv(t, Timing{FlushDeadline: flush}, RelayLimits{})
+	var attempts atomic.Int32
+	firstBody := make(chan *observedRelayBody, 1)
+	closeStarted := make(chan struct{})
+	release := make(chan struct{})
+	releaseClose := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseClose)
+	e := newRelayEnvWrapped(t, Timing{FlushDeadline: flush}, RelayLimits{}, func(base http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			first := attempts.Add(1) == 1
+			resp, err := base.RoundTrip(req)
+			if err == nil && first {
+				body := &observedRelayBody{ReadCloser: resp.Body, onClose: func() {
+					close(closeStarted)
+					<-release
+				}}
+				resp.Body = body
+				firstBody <- body
+			}
+			return resp, err
+		})
+	})
 	type event struct {
 		frame *ownsandv1.DataFrame
 		err   error
@@ -2317,6 +2456,11 @@ waitForClose:
 			t.Fatal("the request side never closed")
 		}
 	}
+	select {
+	case <-closeStarted:
+	case <-time.After(flush):
+		t.Fatal("the retired relay response did not start closing")
+	}
 	e.ch = newChannel(2)
 	e.dp.ChannelOpened(e.ch)
 	req = e.execReq("/bin/true")
@@ -2332,6 +2476,10 @@ waitForClose:
 	case <-peer.ctx.Done():
 		t.Fatal("the new generation did not serve a request during the old peer drain")
 	default:
+	}
+	releaseClose()
+	if closes := (<-firstBody).closes.Load(); closes != 1 {
+		t.Fatalf("retired response had %d closes, want 1", closes)
 	}
 	releasePeer()
 	caller.waitClosed()

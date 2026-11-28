@@ -221,16 +221,23 @@ func (r *relay) outboundDequeued(c *rconn) {
 // countingBody reports every block of bytes that arrives on the relay
 // connection, also of a frame still in transit.
 type countingBody struct {
-	io.ReadCloser
-	note func()
+	io.Reader
+	note      func()
+	closeBody func() error
+	stopClose func() bool
 }
 
-func (b countingBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
 	if n > 0 {
 		b.note()
 	}
 	return n, err
+}
+
+func (b *countingBody) Close() error {
+	b.stopClose()
+	return b.closeBody()
 }
 
 // connCtxKey keys the relay connection that issued a request in the
@@ -250,7 +257,7 @@ func withConn(ctx context.Context, c *rconn) context.Context {
 // read of a retired response can finish after the loop installed a
 // replacement connection (awaitTeardown waits at most teardownGrace for the
 // old goroutines), and it must not refresh the replacement's receive clock.
-// A request without a bound connection is not counted.
+// An unbound request keeps its original response body.
 type countingTransport struct {
 	base http.RoundTripper
 }
@@ -258,8 +265,18 @@ type countingTransport struct {
 func (t countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
 	if err == nil && resp.Body != nil {
-		if c, _ := req.Context().Value(connCtxKey{}).(*rconn); c != nil {
-			resp.Body = countingBody{ReadCloser: resp.Body, note: c.noteRecv}
+		ctx := req.Context()
+		if c, _ := ctx.Value(connCtxKey{}).(*rconn); c != nil {
+			closeBody := sync.OnceValue(resp.Body.Close)
+			// Register at acquisition so cleanup also reaches responses that
+			// Connect rejects or has yet to publish. AfterFunc runs even if
+			// ctx has ended and keeps a blocked close off the relay loop.
+			resp.Body = &countingBody{
+				Reader:    resp.Body,
+				note:      c.noteRecv,
+				closeBody: closeBody,
+				stopClose: context.AfterFunc(ctx, func() { _ = closeBody() }),
+			}
 		}
 	}
 	return resp, err
