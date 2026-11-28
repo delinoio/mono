@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "70c4f0ee765921542bc463e9fe69a5895e42be0b3524159c9fb72b0e7448c88f",
+        "AGENTS.md": "67a2c8fef1dcae413cf579d9e4c89717c642d743742d9a9be0a2f8931f4d1374",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -144,7 +144,7 @@
         "rules/server-cache-lru.md": "1924b64561841923b88a657085097a0aeba3e0ba2d5470b9f5c15cc10d6ae70f",
         "rules/server-cache-react.md": "a6bdb9ba662f1e792245f65752f361930bd559721f046401d4fc1f91f4dc865b",
         "rules/server-dedup-props.md": "0600c427c94fc0f2ae0dceed93bbc8a3183a7becd05c21d725afc9b881b5b0d4",
-        "rules/server-hoist-static-io.md": "05df30b52f67a2765b5da4ee5bd6a846476568006737a45ffdb6a33bde67f251",
+        "rules/server-hoist-static-io.md": "05dfcd5a50a114bebe4673cb5cbd300dbf413eccda1d80c785a684dc25d90742",
         "rules/server-no-shared-module-state.md": "4d869bf1cd2f1632e5ca4c0e64b1cf0e71c5f5a0f940bc8a22174d205e735ed7",
         "rules/server-parallel-fetching.md": "569a2e9fc04f9606686cd75c5894ef8781b502786a7fffe241396846c7733472",
         "rules/server-parallel-nested-fetching.md": "ad5d9656984d4a959997a2367bf59cc6632297b4634a1dd13a087939d83f30b3",
