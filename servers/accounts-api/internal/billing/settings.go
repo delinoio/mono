@@ -82,19 +82,42 @@ func MonthToDate(ctx context.Context, q db.Querier, accountID string, now time.T
 	return monthToDateExcept(ctx, q, accountID, now, "")
 }
 
+// monthToDateSQL returns one row even when no top-ups qualify.
+const monthToDateSQL = `SELECT COALESCE(SUM(amount_usd_micros), 0) AS total FROM top_ups
+	WHERE billing_account_id = $1 AND kind = 'auto'
+		AND (status <> 'failed' OR failure_reason = 'timed_out')
+		AND COALESCE(cap_time, create_time) >= $2 AND COALESCE(cap_time, create_time) < $3`
+
 // monthToDateExcept is MonthToDate without the top-up exceptID, so that a
 // pending top-up can be checked against the monthly cap without counting
 // itself. An empty exceptID excludes nothing.
 func monthToDateExcept(ctx context.Context, q db.Querier, accountID string, now time.Time, exceptID string) (int64, error) {
 	start := MonthStart(now)
 	var sum int64
-	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(amount_usd_micros), 0) FROM top_ups
-		WHERE billing_account_id = $1 AND kind = 'auto'
-			AND (status <> 'failed' OR failure_reason = 'timed_out')
-			AND COALESCE(cap_time, create_time) >= $2 AND COALESCE(cap_time, create_time) < $3
-			AND ($4::text = '' OR top_up_id::text <> $4::text)`,
+	err := q.QueryRow(ctx, monthToDateSQL+` AND ($4::text = '' OR top_up_id::text <> $4::text)`,
 		accountID, start, start.AddDate(0, 1, 0), exceptID).Scan(&sum)
 	return sum, err
+}
+
+// LoadAutoTopUpSettings reads the settings and cap usage from one snapshot.
+// The aggregate supplies a row even when the account has no saved settings.
+func LoadAutoTopUpSettings(ctx context.Context, q db.Querier, accountID string, now time.Time) (*accountsv1.AutoTopUpSettings, error) {
+	start := MonthStart(now)
+	var st Settings
+	var total int64
+	err := q.QueryRow(ctx, `SELECT COALESCE(s.auto_top_up_enabled, false),
+		COALESCE(s.auto_top_up_threshold_usd_micros, 0),
+		COALESCE(s.auto_top_up_amount_usd_micros, 0),
+		COALESCE(s.auto_top_up_monthly_cap_usd_micros, 0),
+		COALESCE(s.auto_top_up_consecutive_failures, 0),
+		cap_usage.total
+	FROM (`+monthToDateSQL+`) AS cap_usage
+	LEFT JOIN credit_settings s ON s.billing_account_id = $1`, accountID, start, start.AddDate(0, 1, 0)).
+		Scan(&st.AutoEnabled, &st.AutoThreshold, &st.AutoAmount, &st.AutoCap, &st.ConsecutiveFailures, &total)
+	if err != nil {
+		return nil, err
+	}
+	return st.AutoTopUpProto(total), nil
 }
 
 // AutoTopUpProto returns the automatic top-up settings message.
