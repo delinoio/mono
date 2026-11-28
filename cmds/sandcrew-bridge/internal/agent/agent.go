@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -117,11 +118,20 @@ func ExecProcess(name string, args []string, dir string, env []string, stderr io
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	// The bridge owns the read end of stdout. Cmd.StdoutPipe would be
+	// closed by Cmd.Wait at the exit of the process and drop the ACP
+	// messages that the bridge has not read yet.
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
+		stdin.Close()
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
+	cmd.Stdout = stdoutWriter
+	err = cmd.Start()
+	stdoutWriter.Close()
+	if err != nil {
+		stdin.Close()
+		stdout.Close()
 		return nil, err
 	}
 	return &execProcess{cmd: cmd, stdin: stdin, stdout: stdout, exited: make(chan struct{})}, nil
@@ -130,7 +140,7 @@ func ExecProcess(name string, args []string, dir string, env []string, stderr io
 type execProcess struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
-	stdout io.Reader
+	stdout *os.File
 	exited chan struct{}
 }
 
@@ -167,6 +177,11 @@ func (p *execProcess) Kill() {
 		}
 	}()
 }
+
+// drainTimeout bounds the reading of the remaining ACP messages after the
+// agent process ended. A child of the adapter that keeps stdout open
+// would otherwise keep the reader waiting.
+var drainTimeout = 2 * time.Second
 
 // ACPAgent is the ACP implementation of Agent.
 type ACPAgent struct {
@@ -209,8 +224,22 @@ func NewACPAgent(process Process, opts ACPOptions) *ACPAgent {
 	}
 	a.conn = acp.NewConn(process.Stdout(), process.Stdin(), connHandler{a})
 	go func() {
-		a.exit = process.Wait()
-		// Wait returns after the stdout copy ended; fail pending calls.
+		exit := process.Wait()
+		// Handle the messages that the agent wrote before its exit, so
+		// agent_exited is the last event.
+		select {
+		case <-a.conn.Done():
+		case <-time.After(drainTimeout):
+			a.logger.Warn("the agent output did not end after the agent exit")
+			if closer, ok := process.Stdout().(io.Closer); ok {
+				_ = closer.Close()
+			}
+			select {
+			case <-a.conn.Done():
+			case <-time.After(drainTimeout):
+			}
+		}
+		a.exit = exit
 		a.conn.Close()
 		close(a.done)
 	}()

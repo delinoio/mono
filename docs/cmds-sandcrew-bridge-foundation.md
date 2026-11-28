@@ -65,7 +65,7 @@ The bridge keeps its files in `<workspace>/.sandcrew/`, where `<workspace>` is t
 - `sandcrew-api` reads the log from a stored `log_end_offset` to recover events that it missed on stdout. The bridge never rewrites or truncates the log.
 - Mapping from ACP follows the [protos contract](protos-sandcrew-api-contract.md#bridge-schema). ACP updates without a mapped case become `unknown_update` with the original JSON. ACP JSON-RPC errors of the agent, malformed messages, mapped updates that do not parse and agent requests for client methods that the bridge does not offer (answered with JSON-RPC `-32601`) become `bridge_error` `ACP_PROTOCOL_ERROR`; the bridge continues when the agent process continues. A failed `session/prompt` writes `ACP_PROTOCOL_ERROR` with the JSON-RPC error code only (the agent message can repeat prompt content), then `turn_ended` without a stop reason.
 - `session_state` events report `AgentActivity` changes: `STARTING` at start, `WORKING` while a turn runs, `WAITING_FOR_PERMISSION` while an ASK-mode permission request is pending, and `IDLE` after `turn_ended` when no prompt is queued. A queued prompt starts directly after `turn_ended` without an `IDLE`.
-- When the agent process ends, the bridge writes `agent_exited` with its exit code or signal and exits with code `0`.
+- When the agent process ends, the bridge first handles the ACP messages that the agent wrote before its exit, until its stdout ends (at most 2 seconds, because a child process can keep stdout open). Then it writes `agent_exited` with its exit code or signal and exits with code `0`.
 
 ### Permissions
 
