@@ -3,13 +3,19 @@
 package work
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/profile"
 )
 
@@ -153,5 +159,114 @@ func TestRunnerProtoGitHubInstallation(t *testing.T) {
 	r.Kind = sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION
 	if r.Proto().GetGithubInstallationId() != 0 {
 		t.Fatal("installation on a dev session runner")
+	}
+}
+
+// workIDRows returns one valid ID followed by a scan or iteration error.
+type workIDRows struct {
+	pgx.Rows
+
+	failScan bool
+	fail     func() error
+	err      error
+	index    int
+	closed   bool
+}
+
+func (r *workIDRows) Next() bool {
+	r.index++
+	switch {
+	case r.fail == nil:
+		return false
+	case r.index == 1:
+		return true
+	case r.index == 2 && r.failScan:
+		return true
+	default:
+		r.err = r.fail()
+		return false
+	}
+}
+
+func (r *workIDRows) Scan(dst ...any) error {
+	if r.index == 2 {
+		return r.fail()
+	}
+	*dst[0].(*string) = "first-id"
+	return nil
+}
+
+func (r *workIDRows) Close()     { r.closed = true }
+func (r *workIDRows) Err() error { return r.err }
+
+func TestWorkIDReadFailure(t *testing.T) {
+	errRead := errors.New("work ID read failed")
+	for _, operation := range []struct {
+		name    string
+		warning string
+		run     func(*Engine, context.Context)
+	}{
+		{"dispatch", "dispatcher_list_failed", (*Engine).passAll},
+		{"expiry", "dispatcher_pass_failed", func(e *Engine, ctx context.Context) { e.Pass(ctx, "org") }},
+		{"reconcile", "reconcile_list_failed", (*Engine).reconcile},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			for _, scenario := range []struct {
+				name     string
+				failScan bool
+				cancel   bool
+				empty    bool
+			}{
+				{name: "scan", failScan: true},
+				{name: "iteration"},
+				{name: "canceled scan", failScan: true, cancel: true},
+				{name: "canceled iteration", cancel: true},
+				{name: "empty", empty: true},
+			} {
+				t.Run(scenario.name, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					rows := &workIDRows{failScan: scenario.failScan}
+					if !scenario.empty {
+						rows.fail = func() error {
+							if scenario.cancel {
+								cancel()
+							}
+							return errRead
+						}
+					}
+					var logs bytes.Buffer
+					// Leave the pool and links unset. Any expiry transaction
+					// or later steps of an organization pass would panic.
+					e := &Engine{svc: &api.Service{Now: time.Now, Logger: slog.New(slog.NewTextHandler(&logs, nil))}}
+					var queries int
+					e.queryWorkIDs = func(context.Context, string, ...any) (pgx.Rows, error) {
+						queries++
+						return rows, nil
+					}
+					e.SetReconcileDriverObserver(func(string, bool) {
+						t.Error("made a driver decision with no complete runner IDs")
+					})
+
+					if scenario.empty && operation.name == "expiry" {
+						if err := e.expire(ctx, "org"); err != nil {
+							t.Fatalf("empty expiry returned %v", err)
+						}
+					} else {
+						operation.run(e, ctx)
+					}
+					if !rows.closed || queries != 1 {
+						t.Fatalf("rows closed = %v, queries = %d, want closed rows and one query", rows.closed, queries)
+					}
+					if scenario.empty || scenario.cancel {
+						if logs.Len() != 0 {
+							t.Fatalf("unexpected warning: %s", &logs)
+						}
+					} else if !strings.Contains(logs.String(), operation.warning) || !strings.Contains(logs.String(), errRead.Error()) {
+						t.Fatalf("want %q with the read error, got %s", operation.warning, &logs)
+					}
+				})
+			}
+		})
 	}
 }

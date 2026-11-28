@@ -118,6 +118,8 @@ type Engine struct {
 	timing   Timing
 	adapters map[sandrunv1.WorkloadKind]Adapter
 
+	queryWorkIDs func(context.Context, string, ...any) (pgx.Rows, error)
+
 	observeReconcileDriverDecision func(runnerID string, registered bool)
 
 	kicks chan string
@@ -134,7 +136,8 @@ type Engine struct {
 // New returns an engine. Register adapters before the app runs.
 func New(svc *api.Service, links *link.Links, profiles *profile.Profiles, m *metrics.Metrics, timing Timing) *Engine {
 	e := &Engine{svc: svc, links: links, profiles: profiles, m: m, timing: timing,
-		adapters: map[sandrunv1.WorkloadKind]Adapter{}, kicks: make(chan string, 1024), drivers: map[string]chan struct{}{}}
+		queryWorkIDs: svc.DB.Pool.Query,
+		adapters:     map[sandrunv1.WorkloadKind]Adapter{}, kicks: make(chan string, 1024), drivers: map[string]chan struct{}{}}
 	svc.OnWorkChange = e.Kick
 	return e
 }

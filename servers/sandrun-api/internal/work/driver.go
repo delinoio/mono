@@ -54,21 +54,17 @@ func (e *Engine) RunReconciler(ctx context.Context) error {
 }
 
 func (e *Engine) reconcile(ctx context.Context) {
-	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT runner_id::text FROM runners WHERE state = ANY($1) OR sandbox_cleanup", openRunnerStates)
+	rows, err := e.queryWorkIDs(ctx, "SELECT runner_id::text FROM runners WHERE state = ANY($1) OR sandbox_cleanup", openRunnerStates)
+	var ids []string
+	if err == nil {
+		ids, err = pgx.CollectRows(rows, pgx.RowTo[string])
+	}
 	if err != nil {
 		if ctx.Err() == nil {
 			e.svc.Logger.WarnContext(ctx, "reconcile_list_failed", slog.Any("error", err))
 		}
 		return
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	rows.Close()
 	for _, id := range ids {
 		registered := e.ensureDriver(id)
 		if e.observeReconcileDriverDecision != nil {
