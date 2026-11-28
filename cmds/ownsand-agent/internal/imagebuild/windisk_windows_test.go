@@ -11,7 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +19,7 @@ import (
 
 const (
 	driveLetterHolderEnv     = "OWNSAND_TEST_DRIVE_LETTER_MUTEX"
-	driveLetterHolderFailure = "OWNSAND_TEST_DISKPART_FAILURE"
+	driveLetterHolderOutcome = "OWNSAND_TEST_DISKPART_OUTCOME"
 	firstDrivePairMask       = 1<<('Z'-'A') | 1<<('Y'-'A')
 )
 
@@ -32,12 +32,22 @@ func TestDriveLetterMutexHolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outcome := os.Getenv(driveLetterHolderOutcome)
 	exitErr := errors.New("injected DiskPart failure")
+	var wantErr error
+	switch outcome {
+	case "failure":
+		wantErr = exitErr
+	case "canceled":
+		wantErr = context.Canceled
+	}
 	disk := &attachedDisk{number: 42}
 	var release [1]byte
-	err = disk.partitionWith(context.Background(), scratch, name, func() (uint32, error) {
+	err = disk.partitionWith(ctx, scratch, name, func() (uint32, error) {
 		return 0, nil
-	}, func(_ context.Context, tool string, args ...string) (string, error) {
+	}, func(ctx context.Context, tool string, args ...string) (string, error) {
 		script, err := os.ReadFile(args[1])
 		if err != nil {
 			return "", err
@@ -51,15 +61,30 @@ func TestDriveLetterMutexHolder(t *testing.T) {
 		if _, err := io.ReadFull(os.Stdin, release[:]); err != nil {
 			return "", err
 		}
-		if os.Getenv(driveLetterHolderFailure) == "true" {
+		switch outcome {
+		case "failure":
 			return "injected tool output", exitErr
+		case "canceled":
+			cancel()
+			return "injected tool output", ctx.Err()
 		}
 		// Simulate DiskPart making the selected letters visible before exit.
 		return "", os.WriteFile("assigned", nil, 0o600)
+	}, func(delay time.Duration) {
+		if delay != 15*time.Second {
+			t.Fatalf("DiskPart shutdown delay = %v, want 15s", delay)
+		}
+		// Keep the shutdown interval open until the parent tests a canceled waiter.
+		if err := os.WriteFile("shutdown", nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(os.Stdin, release[:]); err != nil {
+			t.Fatal(err)
+		}
 	})
-	if os.Getenv(driveLetterHolderFailure) == "true" {
-		if !errors.Is(err, exitErr) || !strings.Contains(err.Error(), "injected tool output") {
-			t.Fatalf("partition error = %v, want injected DiskPart failure and output", err)
+	if wantErr != nil {
+		if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "injected tool output") {
+			t.Fatalf("partition error = %v, want %v and the tool output", err, wantErr)
 		}
 	} else if err != nil {
 		t.Fatal(err)
@@ -73,13 +98,14 @@ func TestDriveLetterMutexHolder(t *testing.T) {
 
 func TestPartitionWaitsForDriveLetterAssignments(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		failHolder bool
-		system     string
-		windows    string
+		name    string
+		outcome string
+		system  string
+		windows string
 	}{
 		{name: "fresh mask", system: "X", windows: "W"},
-		{name: "holder failure", failHolder: true, system: "Z", windows: "Y"},
+		{name: "holder failure", outcome: "failure", system: "Z", windows: "Y"},
+		{name: "holder cancellation", outcome: "canceled", system: "Z", windows: "Y"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			holderScratch, waiterScratch := t.TempDir(), t.TempDir()
@@ -89,7 +115,7 @@ func TestPartitionWaitsForDriveLetterAssignments(t *testing.T) {
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDriveLetterMutexHolder$", "-test.v")
 			cmd.Dir = holderScratch
 			cmd.Env = append(os.Environ(), driveLetterHolderEnv+"="+name,
-				driveLetterHolderFailure+"="+strconv.FormatBool(tc.failHolder))
+				driveLetterHolderOutcome+"="+tc.outcome)
 			var output bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &output, &output
 			stdin, err := cmd.StdinPipe()
@@ -109,41 +135,37 @@ func TestPartitionWaitsForDriveLetterAssignments(t *testing.T) {
 				cancel()
 				<-holderDone
 			}()
-			ready := filepath.Join(holderScratch, "ready")
-			for {
-				if _, err := os.Stat(ready); err == nil {
-					break
-				} else if !errors.Is(err, os.ErrNotExist) {
-					t.Fatal(err)
-				}
-				select {
-				case <-holderDone:
-					t.Fatalf("holder exited before assigning drive letters: %v\n%s", holderErr, &output)
-				case <-ctx.Done():
-					t.Fatal("holder did not reach DiskPart")
-				case <-time.After(10 * time.Millisecond):
+			waitForHolder := func(marker string) {
+				t.Helper()
+				for {
+					if _, err := os.Stat(filepath.Join(holderScratch, marker)); err == nil {
+						return
+					} else if !errors.Is(err, os.ErrNotExist) {
+						t.Fatal(err)
+					}
+					select {
+					case <-holderDone:
+						t.Fatalf("holder exited before %s: %v\n%s", marker, holderErr, &output)
+					case <-ctx.Done():
+						t.Fatalf("holder did not reach %s", marker)
+					case <-time.After(10 * time.Millisecond):
+					}
 				}
 			}
+			waitForHolder("ready")
 
 			waiter := &attachedDisk{number: 43}
-			waitCtx, stop := context.WithTimeout(ctx, 150*time.Millisecond)
-			err = waiter.partitionWith(waitCtx, waiterScratch, name, func() (uint32, error) {
-				t.Error("canceled waiter read the drive mask")
-				return 0, nil
-			}, func(context.Context, string, ...string) (string, error) {
-				t.Error("canceled waiter started DiskPart")
-				return "", nil
-			})
-			stop()
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("canceled waiter error = %v, want deadline exceeded", err)
-			}
-
 			waiterDone := make(chan struct{})
+			waiterMayReadMask := make(chan struct{})
 			var waiterErr error
 			go func() {
 				defer close(waiterDone)
 				waiterErr = waiter.partitionWith(ctx, waiterScratch, name, func() (uint32, error) {
+					select {
+					case <-waiterMayReadMask:
+					default:
+						return 0, errors.New("waiter read the drive mask before the holder finished")
+					}
 					_, err := os.Stat(filepath.Join(holderScratch, "assigned"))
 					if errors.Is(err, os.ErrNotExist) {
 						return 0, nil
@@ -156,7 +178,7 @@ func TestPartitionWaitsForDriveLetterAssignments(t *testing.T) {
 						err = fmt.Errorf("unexpected second partition script: %s", script)
 					}
 					return "", err
-				})
+				}, func(time.Duration) {})
 			}()
 			defer func() {
 				cancel()
@@ -167,6 +189,26 @@ func TestPartitionWaitsForDriveLetterAssignments(t *testing.T) {
 				t.Fatalf("waiter returned while the holder was still in DiskPart: %v", waiterErr)
 			case <-time.After(150 * time.Millisecond):
 			}
+			if _, err := stdin.Write([]byte{1}); err != nil {
+				t.Fatal(err)
+			}
+			waitForHolder("shutdown")
+			waitCtx, stop := context.WithTimeout(ctx, 150*time.Millisecond)
+			canceledWaiter := &attachedDisk{number: 44}
+			err = canceledWaiter.partitionWith(waitCtx, waiterScratch, name, func() (uint32, error) {
+				t.Error("canceled waiter read the drive mask during shutdown")
+				return 0, nil
+			}, func(context.Context, string, ...string) (string, error) {
+				t.Error("canceled waiter started DiskPart during shutdown")
+				return "", nil
+			}, func(time.Duration) {
+				t.Error("canceled waiter started a shutdown wait")
+			})
+			stop()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("canceled waiter error = %v, want deadline exceeded", err)
+			}
+			close(waiterMayReadMask)
 			if _, err := stdin.Write([]byte{1}); err != nil {
 				t.Fatal(err)
 			}
@@ -193,15 +235,48 @@ func TestPartitionWaitsForDriveLetterAssignments(t *testing.T) {
 }
 
 func TestPartitionRequiresTwoFreeDriveLetters(t *testing.T) {
-	name := fmt.Sprintf(`Local\Delino.OwnSand.Test.DriveLetters.%d.%d`, os.Getpid(), time.Now().UnixNano())
-	disk := &attachedDisk{number: 42}
-	err := disk.partitionWith(context.Background(), t.TempDir(), name, func() (uint32, error) {
-		return ^uint32(1 << ('Z' - 'A')), nil
-	}, func(context.Context, string, ...string) (string, error) {
-		t.Fatal("started DiskPart with only one free letter")
-		return "", nil
-	})
-	if err == nil || err.Error() != "imagebuild: no free drive letters for the image partitions" {
-		t.Fatalf("partition error = %v, want insufficient drive letters", err)
+	maskErr := errors.New("injected drive mask error")
+	for _, tc := range []struct {
+		name        string
+		mask        uint32
+		maskErr     error
+		wantErr     error
+		wantMessage string
+	}{
+		{name: "one free letter", mask: ^uint32(1 << ('Z' - 'A')), wantMessage: "imagebuild: no free drive letters for the image partitions"},
+		{name: "mask read failure", maskErr: maskErr, wantErr: maskErr},
+		{name: "script write failure", wantErr: os.ErrNotExist},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := fmt.Sprintf(`Local\Delino.OwnSand.Test.DriveLetters.%d.%d`, os.Getpid(), time.Now().UnixNano())
+			// Require a different thread for the waiter. Windows mutexes allow
+			// the owning thread to acquire the mutex again without blocking.
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			// The missing scratch directory forces a script write error if mask validation succeeds.
+			scratch := filepath.Join(t.TempDir(), "missing")
+			disk := &attachedDisk{number: 42}
+			err := disk.partitionWith(context.Background(), scratch, name, func() (uint32, error) {
+				return tc.mask, tc.maskErr
+			}, func(context.Context, string, ...string) (string, error) {
+				t.Fatal("started DiskPart after a pre-launch failure")
+				return "", nil
+			}, func(time.Duration) {
+				t.Fatal("waited for DiskPart shutdown after a pre-launch failure")
+			})
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("partition error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantMessage != "" && (err == nil || err.Error() != tc.wantMessage) {
+				t.Fatalf("partition error = %v, want %q", err, tc.wantMessage)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			waiter := make(chan error, 1)
+			go func() { waiter <- withDriveLetterMutex(ctx, name, func() error { return nil }) }()
+			if err := <-waiter; err != nil {
+				t.Fatalf("acquire mutex after pre-launch failure: %v", err)
+			}
+		})
 	}
 }
