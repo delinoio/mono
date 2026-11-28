@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -73,6 +74,8 @@ type usageKey struct {
 	meter accountsv1.Meter
 	month time.Time // first instant of the UTC month of the window start
 }
+
+const usageReportWindow = 5 * time.Minute
 
 type usageReportKey struct {
 	service     accountsv1.ServiceId
@@ -360,7 +363,7 @@ type handler struct{ f *Server }
 
 // usageLinkLocked returns the latest nonempty link that overlaps the usage window.
 func (f *Server) usageLinkLocked(org string, windowStart time.Time) *link {
-	windowEnd := windowStart.Add(5 * time.Minute)
+	windowEnd := windowStart.Add(usageReportWindow)
 	var latest *link
 	for _, l := range f.linkHistory[org] {
 		if !l.since.Before(windowEnd) {
@@ -384,16 +387,71 @@ func addMonthlyUsage(total, increment int64) int64 {
 	return total + increment
 }
 
+func validateUsageReport(r *accountsv1.UsageReport, now time.Time) error {
+	if r == nil {
+		return errors.New("is missing")
+	}
+	service := r.GetService()
+	if _, known := accountsv1.ServiceId_name[int32(service)]; !known || service == accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED {
+		return errors.New("service must be a known service")
+	}
+	org := r.GetOrganizationId()
+	if len(org) < 1 || len(org) > 128 {
+		return errors.New("organization_id must have 1 to 128 bytes of printable ASCII")
+	}
+	for i := range len(org) {
+		if org[i] < 0x20 || org[i] > 0x7e {
+			return errors.New("organization_id must have 1 to 128 bytes of printable ASCII")
+		}
+	}
+	switch r.GetMeter() {
+	case accountsv1.Meter_METER_OWNSAND_RELAY_EGRESS, accountsv1.Meter_METER_OWNSAND_R2_STORAGE,
+		accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC:
+		if service != accountsv1.ServiceId_SERVICE_ID_OWNSAND {
+			return errors.New("meter must belong to the service")
+		}
+	default:
+		return errors.New("meter must be a known meter")
+	}
+	window := r.GetWindowStart()
+	if window.CheckValid() != nil {
+		return errors.New("window_start is required")
+	}
+	if window.GetNanos() != 0 || window.GetSeconds()%int64(usageReportWindow/time.Second) != 0 {
+		return errors.New("window_start must be aligned to 5 minutes")
+	}
+	if window.AsTime().Add(usageReportWindow).After(now.Add(time.Minute)) {
+		return errors.New("the window must not end more than 1 minute after the server time")
+	}
+	if r.GetQuantity() < 0 {
+		return errors.New("quantity must not be negative")
+	}
+	if r.GetAmountUsdMicros() < 0 {
+		return errors.New("amount_usd_micros must not be negative")
+	}
+	return nil
+}
+
 func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.ReportUsageRequest]) (*connect.Response[accountsv1.ReportUsageResponse], error) {
 	f := h.f
 	if err := f.begin(MethodReportUsage); err != nil {
 		return nil, err
 	}
+	reports := req.Msg.GetReports()
+	if len(reports) == 0 || len(reports) > 500 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("reports must hold 1 to 500 reports"))
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	now := f.now().UTC()
+	for i, r := range reports {
+		if err := validateUsageReport(r, now); err != nil {
+			return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("reports[%d]: %w", i, err))
+		}
+	}
 	resp := &accountsv1.ReportUsageResponse{}
 	named := map[string]bool{}
-	for _, r := range req.Msg.GetReports() {
+	for _, r := range reports {
 		org := r.GetOrganizationId()
 		windowStart := r.GetWindowStart().AsTime()
 		key := usageReportKey{service: r.GetService(), org: org, meter: r.GetMeter(), windowStart: windowStart}
@@ -411,7 +469,7 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 				previousBalance := a.balance
 				a.balance -= r.GetAmountUsdMicros()
 				if a.status == accountsv1.BillingStatus_BILLING_STATUS_ALLOWED && previousBalance > 0 && a.balance <= 0 {
-					f.setAccountStatusLocked(a, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, f.now().UTC())
+					f.setAccountStatusLocked(a, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, now)
 				}
 			} else {
 				attribution.unattributed = true

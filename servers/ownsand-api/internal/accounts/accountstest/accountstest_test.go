@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -201,6 +202,191 @@ func TestAddMonthlyUsageWithNegativeTotal(t *testing.T) {
 	}
 }
 
+func TestReportUsageRejectsMalformedReports(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.March, 31, 23, 30, 0, 0, time.UTC)
+	f := New(t, func() time.Time { return now })
+	client := f.Client()
+	valid := &accountsv1.UsageReport{
+		Service: accountsv1.ServiceId_SERVICE_ID_OWNSAND, OrganizationId: "org-1",
+		Meter: accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, WindowStart: timestamppb.New(now.Add(-time.Hour)),
+	}
+	for name, change := range map[string]func(*accountsv1.UsageReport){
+		"missing service": func(r *accountsv1.UsageReport) { r.Service = accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED },
+		"unknown service": func(r *accountsv1.UsageReport) { r.Service = 99 },
+		"missing meter":   func(r *accountsv1.UsageReport) { r.Meter = accountsv1.Meter_METER_UNSPECIFIED },
+		"unknown meter":   func(r *accountsv1.UsageReport) { r.Meter = 99 },
+		"empty org":       func(r *accountsv1.UsageReport) { r.OrganizationId = "" },
+		"long org":        func(r *accountsv1.UsageReport) { r.OrganizationId = strings.Repeat("a", 129) },
+		"non-ASCII org":   func(r *accountsv1.UsageReport) { r.OrganizationId = "org-é" },
+		"ASCII DEL":       func(r *accountsv1.UsageReport) { r.OrganizationId = "org\x7f" },
+		"ASCII control":   func(r *accountsv1.UsageReport) { r.OrganizationId = "org\n" },
+		"missing window":  func(r *accountsv1.UsageReport) { r.WindowStart = nil },
+		"invalid timestamp": func(r *accountsv1.UsageReport) {
+			r.WindowStart = timestamppb.New(time.Date(0, time.December, 31, 0, 0, 0, 0, time.UTC))
+		},
+		"unaligned seconds": func(r *accountsv1.UsageReport) { r.WindowStart.Seconds++ },
+		"unaligned nanos":   func(r *accountsv1.UsageReport) { r.WindowStart.Nanos++ },
+		"future window":     func(r *accountsv1.UsageReport) { r.WindowStart = timestamppb.New(now) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := proto.CloneOf(valid)
+			change(bad)
+			_, err := client.ReportUsage(t.Context(), connect.NewRequest(&accountsv1.ReportUsageRequest{
+				Reports: []*accountsv1.UsageReport{valid, bad, {}},
+			}))
+			if connect.CodeOf(err) != connect.CodeInvalidArgument || !strings.Contains(err.Error(), "reports[1]") {
+				t.Fatalf("ReportUsage error = %v, want InvalidArgument naming reports[1]", err)
+			}
+		})
+	}
+}
+
+func TestReportUsageBatchAndWindowLimits(t *testing.T) {
+	t.Parallel()
+	// At this clock reading, the first window ends exactly one minute ahead.
+	now := time.Date(2026, time.March, 31, 23, 29, 0, 0, time.UTC)
+	f := New(t, func() time.Time { return now })
+	client := f.Client()
+	reports := make([]*accountsv1.UsageReport, 501)
+	for i := range reports {
+		reports[i] = &accountsv1.UsageReport{
+			Service: accountsv1.ServiceId_SERVICE_ID_OWNSAND, OrganizationId: " ",
+			Meter:       accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC,
+			WindowStart: timestamppb.New(now.Add(-4*time.Minute - time.Duration(i)*5*time.Minute)),
+		}
+	}
+	reports[1].OrganizationId = strings.Repeat("~", 128)
+	reports[499].WindowStart = timestamppb.New(time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC))
+	send := func(batch []*accountsv1.UsageReport) (*connect.Response[accountsv1.ReportUsageResponse], error) {
+		return client.ReportUsage(t.Context(), connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: batch}))
+	}
+	for _, size := range []int{0, 501} {
+		_, err := send(reports[:size])
+		if connect.CodeOf(err) != connect.CodeInvalidArgument {
+			t.Fatalf("ReportUsage with %d reports: error = %v, want InvalidArgument", size, err)
+		}
+	}
+	f.mu.Lock()
+	usage, reported := len(f.usage), len(f.reported)
+	f.mu.Unlock()
+	if usage != 0 || reported != 0 {
+		t.Fatalf("after rejected batch sizes: usage buckets = %d, reported keys = %d, want both zero", usage, reported)
+	}
+	resp, err := send(reports[:500])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Msg.GetResults(); len(got) != 500 || got[0].GetDuplicate() || got[499].GetDuplicate() {
+		t.Fatalf("ReportUsage with 500 reports returned %d results, want 500 new results", len(got))
+	}
+}
+
+func TestReportUsageRejectsBatchBeforeWriting(t *testing.T) {
+	t.Parallel()
+	const (
+		org     = "org-1"
+		user    = "user-1"
+		account = "ba-1"
+		balance = 10_000_000
+		service = accountsv1.ServiceId_SERVICE_ID_OWNSAND
+		meter   = accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC
+	)
+	start := time.Date(2026, time.March, 31, 22, 55, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name             string
+		quantity, amount int64
+	}{
+		{name: "negative quantity", quantity: -1, amount: 3},
+		{name: "negative amount", quantity: 1, amount: -3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var elapsed atomic.Int64
+			f := New(t, func() time.Time { return start.Add(time.Duration(elapsed.Load())) })
+			f.AddAccount(account, "Account", map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+			client := f.Client()
+			ctx := t.Context()
+			link, err := client.LinkOrganization(ctx, connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+				Service: service, OrganizationId: org, BillingAccountId: account, UserId: user,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			elapsed.Store(int64(35 * time.Minute))
+			reports := []*accountsv1.UsageReport{
+				{Service: service, OrganizationId: org, Meter: meter, WindowStart: timestamppb.New(start.Add(5 * time.Minute)), Quantity: 10, AmountUsdMicros: 5},
+				{Service: service, OrganizationId: org, Meter: meter, WindowStart: timestamppb.New(start.Add(10 * time.Minute)), Quantity: tc.quantity, AmountUsdMicros: tc.amount},
+			}
+			send := func() (*connect.Response[accountsv1.ReportUsageResponse], error) {
+				return client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: reports}))
+			}
+			assertBilling := func(quantity, amount int64) {
+				t.Helper()
+				resp, err := client.GetOrganizationBilling(ctx, connect.NewRequest(&accountsv1.GetOrganizationBillingRequest{
+					Service: service, OrganizationId: org,
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := resp.Msg.GetBalanceUsdMicros(), balance-amount; got != want {
+					t.Fatalf("balance = %d, want %d", got, want)
+				}
+				want := &accountsv1.MeterUsage{Meter: meter, Quantity: quantity, AmountUsdMicros: amount}
+				for _, got := range resp.Msg.GetMeterUsages() {
+					if got.GetMeter() == meter {
+						if !proto.Equal(got, want) {
+							t.Fatalf("monthly usage = %v, want %v", got, want)
+						}
+						return
+					}
+				}
+				t.Fatalf("monthly usage has no entry for %s", meter)
+			}
+
+			if _, err := send(); connect.CodeOf(err) != connect.CodeInvalidArgument || !strings.Contains(err.Error(), "reports[1]") {
+				t.Fatalf("ReportUsage error = %v, want InvalidArgument naming reports[1]", err)
+			}
+			assertBilling(0, 0)
+
+			reports[1].Quantity, reports[1].AmountUsdMicros = 1, 3
+			for _, duplicate := range []bool{false, true} {
+				resp, err := send()
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := &accountsv1.ReportUsageResponse{Statuses: []*accountsv1.OrganizationBillingStatus{link.Msg.GetStatus()}}
+				for _, r := range reports {
+					want.Results = append(want.Results, &accountsv1.UsageReportResult{
+						Service: service, OrganizationId: org, Meter: meter, WindowStart: r.GetWindowStart(),
+						Duplicate: duplicate, BillingAccountId: account,
+					})
+				}
+				if !proto.Equal(resp.Msg, want) {
+					t.Fatalf("ReportUsage response = %v, want %v", resp.Msg, want)
+				}
+				assertBilling(11, 8)
+			}
+		})
+	}
+}
+
+func TestReportUsageFailureInjectionPrecedesValidation(t *testing.T) {
+	t.Parallel()
+	var reads atomic.Int64
+	f := New(t, func() time.Time {
+		reads.Add(1)
+		return time.Time{}
+	})
+	f.Fail(MethodReportUsage, connect.NewError(connect.CodeUnavailable, errors.New("injected failure")))
+	_, err := f.Client().ReportUsage(t.Context(), connect.NewRequest(&accountsv1.ReportUsageRequest{}))
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatalf("ReportUsage error = %v, want Unavailable", err)
+	}
+	if calls, clockReads := f.Calls(MethodReportUsage), reads.Load(); calls != 1 || clockReads != 0 {
+		t.Fatalf("ReportUsage calls = %d and clock reads = %d, want 1 and 0", calls, clockReads)
+	}
+}
+
 func TestReportUsageRefreshesBillingStatusOnBalanceExhaustion(t *testing.T) {
 	const (
 		account   = "ba-1"
@@ -250,8 +436,11 @@ func TestReportUsageRefreshesBillingStatusOnBalanceExhaustion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var elapsed atomic.Int64
-			f := New(t, func() time.Time { return start.Add(time.Duration(elapsed.Load())) })
+			var elapsed, reads atomic.Int64
+			f := New(t, func() time.Time {
+				reads.Add(1)
+				return start.Add(time.Duration(elapsed.Load()))
+			})
 			f.AddAccount(account, "Account", map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
 			client := f.Client()
 			ctx := t.Context()
@@ -276,12 +465,16 @@ func TestReportUsageRefreshesBillingStatusOnBalanceExhaustion(t *testing.T) {
 			for i, c := range tt.charges {
 				chargeTime := c.windowOffset + 5*time.Minute
 				elapsed.Store(int64(chargeTime))
+				before := reads.Load()
 				report, err := client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: []*accountsv1.UsageReport{{
 					Service: service, OrganizationId: orgs[0], Meter: accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC,
 					WindowStart: timestamppb.New(start.Add(c.windowOffset)), Quantity: 1, AmountUsdMicros: c.amount,
 				}}}))
 				if err != nil {
 					t.Fatal(err)
+				}
+				if got := reads.Load() - before; got != 1 {
+					t.Fatalf("ReportUsage read the clock %d times, want 1", got)
 				}
 				results := report.Msg.GetResults()
 				if len(results) != 1 || results[0].GetDuplicate() != c.duplicate ||
