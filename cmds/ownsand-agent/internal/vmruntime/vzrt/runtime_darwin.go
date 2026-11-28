@@ -157,7 +157,8 @@ func (r *Runtime) Capabilities(ctx context.Context) vmruntime.Capabilities {
 		check(checkImage, false, "kernel or root file system is missing")
 	}
 	check(checkNetwork, true, "OUTBOUND sandboxes use the agent's userspace network stack")
-	macModel, macDetail := r.macOSImage()
+	macModel, macDetail, deferred := r.macOSImage()
+	caps.Deferred = deferred
 	check(checkMacOSImage, macModel != nil, macDetail)
 	if framework && entitled {
 		caps.GuestOSes = []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_LINUX}

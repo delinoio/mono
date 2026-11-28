@@ -257,22 +257,35 @@ func recoverWithLocks(dir string, acquire func(string, lockMode) (*Lock, error))
 // returning. When a backup needs recovery, release shared access before
 // taking the build and publication locks, then select the image again.
 func WithBaseImage(ctx context.Context, dir string, read func() error) error {
+	return withBaseImage(dir, func(path string, mode lockMode) (*Lock, error) {
+		return waitLock(ctx, path, mode)
+	}, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return read()
+	})
+}
+
+// TryWithBaseImage keeps the installed image stable while read runs. It
+// returns ErrLocked (possibly wrapped) if publication or recovery would wait
+// for a lock. The caller must retry before drawing conclusions about the image.
+func TryWithBaseImage(dir string, read func() error) error {
+	return withBaseImage(dir, tryLock, read)
+}
+
+func withBaseImage(dir string, acquire func(string, lockMode) (*Lock, error), read func() error) error {
 	for {
-		lock, err := waitLock(ctx, publicationLockPath(dir), sharedLock)
+		lock, err := acquire(publicationLockPath(dir), sharedLock)
 		if err != nil {
 			return fmt.Errorf("images: read %s: %w", dir, err)
 		}
 		if _, needed := recoveryNeeded(dir); !needed {
 			defer lock.releaseAndLog()
-			if err := ctx.Err(); err != nil {
-				return err
-			}
 			return read()
 		}
 		lock.releaseAndLog()
-		if _, err := recoverWithLocks(dir, func(path string, mode lockMode) (*Lock, error) {
-			return waitLock(ctx, path, mode)
-		}); err != nil {
+		if _, err := recoverWithLocks(dir, acquire); err != nil {
 			return err
 		}
 	}

@@ -7,6 +7,7 @@ package vzrt
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -33,32 +34,48 @@ func (r *Runtime) MacOSHardwareModelSupported(model []byte) bool {
 
 var _ vmruntime.MacOSHardwareModelChecker = (*Runtime)(nil)
 
-// macOSImage returns the hardware model of the built macOS base image, or
-// nil and the reason why there is no usable image.
-func (r *Runtime) macOSImage() ([]byte, string) {
+// macOSImage reports the installed hardware model. A deferred read means
+// publication or recovery holds a lock needed to inspect the image.
+func (r *Runtime) macOSImage() (model []byte, detail string, deferred bool) {
 	if !macOSGuestsSupported {
-		return nil, "macOS guests need an Apple silicon Mac"
+		return nil, "macOS guests need an Apple silicon Mac", false
 	}
 	dir := r.opts.MacOSImage
 	if dir == "" {
-		return nil, "no macOS image directory is configured"
+		return nil, "no macOS image directory is configured", false
 	}
-	// Resolve first restores the previous image when an image build ended
-	// between the two renames of its install.
-	if _, err := images.Resolve(dir); err != nil {
-		return nil, "the macOS base image is not built; run `ownsand-agent image build`"
+	err := images.TryWithBaseImage(dir, func() error {
+		metadata, err := images.ReadMetadata(dir)
+		if err != nil || metadata.GuestOS != ownsandv1.GuestOs_GUEST_OS_MACOS {
+			detail = "the macOS base image is not built; run `ownsand-agent image build`"
+			return nil
+		}
+		if _, err := images.MacOSStorage(dir); err != nil {
+			detail = "the macOS base image is incomplete; build it again"
+			return nil
+		}
+		data, err := os.ReadFile(filepath.Join(dir, images.MacOSHardwareModel))
+		if err != nil {
+			detail = "the macOS base image has no hardware model; build it again"
+			return nil
+		}
+		model = data
+		return nil
+	})
+	if errors.Is(err, images.ErrLocked) {
+		return nil, "macOS base image inspection deferred while publication access is busy", true
 	}
-	if _, err := images.MacOSStorage(dir); err != nil {
-		return nil, "the macOS base image is incomplete; build it again"
-	}
-	model, err := os.ReadFile(filepath.Join(dir, images.MacOSHardwareModel))
 	if err != nil {
-		return nil, "the macOS base image has no hardware model; build it again"
+		r.logger.Warn("inspect the macOS base image failed", "dir", dir, "error", err)
+		return nil, "the macOS base image could not be inspected", false
+	}
+	if model == nil {
+		return nil, detail, false
 	}
 	if !macOSHardwareModelSupported(model) {
-		return nil, "this Mac does not support the hardware model of the macOS base image"
+		return nil, "this Mac does not support the hardware model of the macOS base image", false
 	}
-	return model, "the macOS base image is present"
+	return model, "the macOS base image is present", false
 }
 
 // reserveMachineID records id as the machine identifier of v unless another

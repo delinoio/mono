@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
@@ -411,5 +413,188 @@ func TestRequestURLsWithoutChannelRemovesWaiter(t *testing.T) {
 	}
 	if n := a.waiterCount(); n != 0 {
 		t.Errorf("%d URL waiters left behind", n)
+	}
+}
+
+type capabilityProbeRuntime struct {
+	vmruntime.Runtime
+	probe func(context.Context) vmruntime.Capabilities
+}
+
+func (r capabilityProbeRuntime) Capabilities(ctx context.Context) vmruntime.Capabilities {
+	return r.probe(ctx)
+}
+
+func macOSCapabilities(model string) vmruntime.Capabilities {
+	return vmruntime.Capabilities{
+		GuestOSes:            []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_MACOS},
+		BaseImages:           []ownsandv1.BaseImage{ownsandv1.BaseImage_BASE_IMAGE_MACOS},
+		MacOSGuestsSupported: true,
+		MacOSHardwareModels:  [][]byte{[]byte(model)},
+	}
+}
+
+func TestHeartbeatRetriesDeferredCapabilities(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	var free atomic.Int64
+	var sample atomic.Pointer[vmruntime.Capabilities]
+	var deferrals atomic.Int32
+	initial := macOSCapabilities("previous")
+	sample.Store(&initial)
+	h := startWith(t, cp, st, id, func(o *Options) {
+		o.FreeDisk = func() (int64, error) { return free.Load(), nil }
+		o.Runtime = capabilityProbeRuntime{Runtime: o.Runtime, probe: func(context.Context) vmruntime.Capabilities {
+			caps := *sample.Load()
+			if caps.Deferred {
+				deferrals.Add(1)
+			}
+			return caps
+		}}
+	})
+
+	isCapability := func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil }
+	isState := func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil }
+	isHeartbeat := func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeat() != nil }
+	previous, first := h.wait(0, "initial capability report", isCapability)
+	assertMacOSCapabilityModel(t, previous, []byte("previous"))
+	_, state := h.wait(first+1, "initial state report", isState)
+	var oldStatus Status
+	if err := st.LoadStatus(&oldStatus); err != nil {
+		t.Fatal(err)
+	}
+
+	sample.Store(&vmruntime.Capabilities{Deferred: true})
+	free.Store(capabilityDiskDelta + 1)
+	waitForCapabilityDeferrals(t, &deferrals, 2)
+	h.wait(state+1, "heartbeat while capability refresh is deferred", isHeartbeat)
+	var status Status
+	if err := st.LoadStatus(&status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.CapabilitiesAt.Equal(oldStatus.CapabilitiesAt) ||
+		!slices.Equal(status.BaseImages, []string{ownsandv1.BaseImage_BASE_IMAGE_MACOS.String()}) {
+		t.Fatalf("capability status changed under contention: %+v", status)
+	}
+	if got, _ := cp.WaitFor(0, first+1, isCapability); got != nil {
+		t.Fatalf("published a capability report while deferred: %v", got)
+	}
+
+	// The original disk trigger clears before publication ends. The deferred
+	// refresh must still be due on the next heartbeat.
+	free.Store(0)
+	waitForCapabilityDeferrals(t, &deferrals, deferrals.Load()+2)
+	replacement := macOSCapabilities("replacement")
+	sample.Store(&replacement)
+	report, next := h.wait(first+1, "replacement capability report", isCapability)
+	assertMacOSCapabilityModel(t, report, []byte("replacement"))
+	if got := report.GetCapabilityReport().GetCapabilities().GetFreeDiskBytes(); got != 0 {
+		t.Fatalf("replacement report has %d free bytes, want 0", got)
+	}
+	if cp.Channels() != 1 {
+		t.Fatalf("heartbeat refresh reconnected %d times", cp.Channels()-1)
+	}
+
+	sample.Store(&vmruntime.Capabilities{})
+	free.Store(capabilityDiskDelta + 1)
+	absent, _ := h.wait(next+1, "authoritative report with no image", isCapability)
+	if caps := absent.GetCapabilityReport().GetCapabilities(); len(caps.GetBuiltBaseImages()) != 0 || len(caps.GetMacosHardwareModels()) != 0 {
+		t.Fatalf("authoritative report retained the previous image: %v", caps)
+	}
+	status = Status{}
+	if err := st.LoadStatus(&status); err != nil || len(status.BaseImages) != 0 {
+		t.Fatalf("authoritative report did not clear the local status: %+v, %v", status, err)
+	}
+}
+
+func TestChannelDefersInitialCapabilities(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		name := "resample"
+		if stop {
+			name = "cancel"
+		}
+		t.Run(name, func(t *testing.T) {
+			cp := testcp.New(t)
+			st, id := enrollDevice(t, cp)
+			var ready atomic.Bool
+			var complete atomic.Int32
+			probes := make(chan struct{}, 2)
+			h := startWith(t, cp, st, id, func(o *Options) {
+				o.HeartbeatInterval = time.Hour
+				o.Runtime = capabilityProbeRuntime{Runtime: o.Runtime, probe: func(context.Context) vmruntime.Capabilities {
+					if !ready.Load() {
+						select {
+						case probes <- struct{}{}:
+						default:
+						}
+						return vmruntime.Capabilities{Deferred: true}
+					}
+					if complete.Add(1) == 1 {
+						return macOSCapabilities("replacement")
+					}
+					return vmruntime.Capabilities{}
+				}}
+			})
+			for range 2 {
+				select {
+				case <-probes:
+				case <-time.After(10 * time.Second):
+					t.Fatal("initial capability sampling did not retry")
+				}
+			}
+			if cp.Received() != 0 {
+				t.Fatalf("received %d channel messages before authoritative sample", cp.Received())
+			}
+			if stop {
+				h.stop()
+				select {
+				case err := <-h.errc:
+					if err != nil {
+						t.Fatalf("cancel deferred setup: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("deferred setup did not stop")
+				}
+				if cp.Received() != 0 {
+					t.Fatalf("cancelled setup sent %d channel messages", cp.Received())
+				}
+				return
+			}
+			ready.Store(true)
+			report, index := h.wait(0, "initial capability report", func(e *ownsandv1.AgentEnvelope) bool {
+				return e.GetCapabilityReport() != nil
+			})
+			assertMacOSCapabilityModel(t, report, []byte("replacement"))
+			state, _ := h.wait(index+1, "initial state report", func(e *ownsandv1.AgentEnvelope) bool {
+				return e.GetStateReport() != nil
+			})
+			if got := state.GetStateReport().GetBuiltBaseImages(); !slices.Equal(got, report.GetCapabilityReport().GetCapabilities().GetBuiltBaseImages()) {
+				t.Fatalf("state report images = %v, want the same images as the capability report", got)
+			}
+			if n := complete.Load(); n != 1 {
+				t.Fatalf("channel setup used %d authoritative samples, want 1", n)
+			}
+		})
+	}
+}
+
+func assertMacOSCapabilityModel(t *testing.T, env *ownsandv1.AgentEnvelope, model []byte) {
+	t.Helper()
+	caps := env.GetCapabilityReport().GetCapabilities()
+	models := caps.GetMacosHardwareModels()
+	if !slices.Contains(caps.GetBuiltBaseImages(), ownsandv1.BaseImage_BASE_IMAGE_MACOS) ||
+		len(models) != 1 || !bytes.Equal(models[0], model) {
+		t.Fatalf("capability report base images = %v, model count = %d, want a macOS image with the expected model", caps.GetBuiltBaseImages(), len(models))
+	}
+}
+
+func waitForCapabilityDeferrals(t *testing.T, deferred *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for deferred.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("observed %d capability deferrals, want at least %d", deferred.Load(), want)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
