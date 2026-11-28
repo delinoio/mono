@@ -58,11 +58,11 @@ beforeEach(() => {
     );
     if (url.pathname === "/oidc/.well-known/openid-configuration") {
       discoveryRequests++;
-      if (!discoveryWorks) {
-        throw new TypeError("secret-detail: network down");
-      }
       if (discoveryGate) {
         await discoveryGate;
+      }
+      if (!discoveryWorks) {
+        throw new TypeError("secret-detail: network down");
       }
       return Response.json({
         authorization_endpoint: "https://logto.test/oidc/auth",
@@ -138,13 +138,36 @@ describe("sign-in that fails before the redirect", () => {
       expect(button.disabled).toBe(false);
       expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBeNull();
 
-      // A repeated failure shows the alert again.
-      const before = discoveryRequests;
-      await click("Sign in with Delino");
-      await waitFor(() => expect(discoveryRequests).toBeGreaterThan(before), {
-        timeout: SDK_WAIT_MS,
+      // Hold discovery open so the previous alert must clear before the retry fails.
+      const beforeRetry = discoveryRequests;
+      let releaseDiscovery!: () => void;
+      discoveryGate = new Promise<void>((resolve) => {
+        releaseDiscovery = resolve;
       });
-      expect(await screen.findByText(FAILURE_TEXT)).toBeTruthy();
+      try {
+        await click("Sign in with Delino");
+        await waitFor(() => expect(discoveryRequests).toBe(beforeRetry + 1), {
+          timeout: SDK_WAIT_MS,
+        });
+        expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+      } finally {
+        await act(async () => {
+          discoveryGate = undefined;
+          releaseDiscovery();
+        });
+      }
+
+      const retryAlert = await screen.findByText(
+        FAILURE_TEXT,
+        {},
+        { timeout: SDK_WAIT_MS },
+      );
+      expect(retryAlert.getAttribute("role")).toBe("alert");
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", {
+          name: "Sign in with Delino",
+        }).disabled,
+      ).toBe(false);
 
       // A successful retry clears the alert and starts the redirect to the
       // existing callback address.

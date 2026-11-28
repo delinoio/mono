@@ -42,6 +42,7 @@ const CONFIG = {
 const realFetch = globalThis.fetch;
 let discoveryWorks = false;
 let discoveryRequests = 0;
+let discoveryGate: Promise<void> | undefined;
 let tokenRequests = 0;
 
 const APP_URL = "http://localhost:3000/";
@@ -55,11 +56,15 @@ beforeEach(() => {
   window.sessionStorage.clear();
   discoveryWorks = false;
   discoveryRequests = 0;
+  discoveryGate = undefined;
   tokenRequests = 0;
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = input instanceof Request ? input.url : String(input);
     if (url === `${LOGTO_ENDPOINT}/oidc/.well-known/openid-configuration`) {
       discoveryRequests++;
+      if (discoveryGate) {
+        await discoveryGate;
+      }
       if (!discoveryWorks) {
         throw new TypeError("secret-detail: network down");
       }
@@ -139,13 +144,6 @@ async function findButton(name: string) {
   )) as HTMLButtonElement;
 }
 
-/** Waits until one more discovery request was made, so a failed attempt ended. */
-async function attemptEnded(before: number) {
-  await waitFor(() => expect(discoveryRequests).toBeGreaterThan(before), {
-    timeout: SDK_WAIT_MS,
-  });
-}
-
 /** Waits for the redirect start: the SDK saved its sign-in session. */
 async function expectRedirectStarted() {
   await waitFor(
@@ -181,11 +179,36 @@ describe("sign-in that fails before the redirect (real SDK)", () => {
       expect(button.disabled).toBe(false);
       expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBeNull();
 
-      // A repeated failure shows the alert again.
-      const before = discoveryRequests;
-      await click("Sign in with Delino");
-      await attemptEnded(before);
-      expect(await screen.findByText(FAILURE_TEXT)).toBeTruthy();
+      // Hold discovery open so the previous alert must clear before the retry fails.
+      const beforeRetry = discoveryRequests;
+      let releaseDiscovery!: () => void;
+      discoveryGate = new Promise<void>((resolve) => {
+        releaseDiscovery = resolve;
+      });
+      try {
+        await click("Sign in with Delino");
+        await waitFor(() => expect(discoveryRequests).toBe(beforeRetry + 1), {
+          timeout: SDK_WAIT_MS,
+        });
+        expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+      } finally {
+        await act(async () => {
+          discoveryGate = undefined;
+          releaseDiscovery();
+        });
+      }
+
+      const retryAlert = await screen.findByText(
+        FAILURE_TEXT,
+        {},
+        { timeout: SDK_WAIT_MS },
+      );
+      expect(retryAlert.getAttribute("role")).toBe("alert");
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", {
+          name: "Sign in with Delino",
+        }).disabled,
+      ).toBe(false);
 
       // A successful retry clears the alert and starts the redirect.
       discoveryWorks = true;
