@@ -215,6 +215,7 @@ func newHandler(cfg config.Config, database *db.DB, logger *slog.Logger, appMetr
 	}
 	dir := directory.NewLogto(directory.LogtoConfig{
 		Endpoint:     cfg.LogtoManagementEndpoint,
+		Resource:     cfg.LogtoManagementResource,
 		ClientID:     cfg.LogtoM2MClientID,
 		ClientSecret: cfg.LogtoM2MClientSecret,
 		Logger:       logger,

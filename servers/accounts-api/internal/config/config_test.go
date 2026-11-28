@@ -374,6 +374,31 @@ func TestLoadBillingOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadLogtoManagementResource(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{EnvLogtoManagementResource: " \t "}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.LogtoManagementResource != "" {
+		t.Errorf("LogtoManagementResource = %q, want empty (the directory client derives <endpoint>/api)", cfg.LogtoManagementResource)
+	}
+	for _, value := range []string{"https://default.logto.app/api", "https://default.logto.app/api/"} {
+		cfg, err := Load(lookupFrom(map[string]string{EnvLogtoManagementResource: " " + value + " "}))
+		if err != nil {
+			t.Fatalf("Load(%q) error = %v", value, err)
+		}
+		if cfg.LogtoManagementResource != value {
+			t.Errorf("LogtoManagementResource = %q, want %q unchanged", cfg.LogtoManagementResource, value)
+		}
+	}
+	for _, value := range []string{"default.logto.app/api", "ftp://default.logto.app/api", "https://:443/api", "https://default.logto.app/api?x=1", "https://default.logto.app:70000/api"} {
+		_, err := Load(lookupFrom(map[string]string{EnvLogtoManagementResource: value}))
+		if err == nil || err.Error() != EnvLogtoManagementResource+" must be an http or https URL" {
+			t.Errorf("Load(%q) error = %v, want an invalid URL error that names the variable", value, err)
+		}
+	}
+}
+
 func TestLoadRequiresBillingValues(t *testing.T) {
 	for name := range requiredValues {
 		t.Run(name, func(t *testing.T) {
