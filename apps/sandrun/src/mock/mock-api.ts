@@ -1011,8 +1011,8 @@ export function createMockTransport(
   };
   const credentialStates = (
     vendor: AgentVendor,
-    previous: AgentIntegration["credentials"],
     req: Pick<CreateAgentIntegrationRequest, "credentials">,
+    previous?: AgentIntegration["credentials"],
   ): AgentIntegration["credentials"] => {
     const c = req.credentials;
     if (c.case === undefined) {
@@ -1052,8 +1052,14 @@ export function createMockTransport(
         );
         break;
     }
+    if (previous !== undefined && supplied.every(([, value]) => value === "")) {
+      throw new ConnectError(
+        "invalid credentials: set at least one credential to replace",
+        Code.InvalidArgument,
+      );
+    }
     return supplied.map(([credential, value]) => {
-      const old = previous.find((p) => p.credential === credential);
+      const old = previous?.find((p) => p.credential === credential);
       if (value !== "") {
         return {
           $typeName: "delino.sandrun.v1.AgentCredentialState",
@@ -1641,7 +1647,7 @@ export function createMockTransport(
           vendor: req.vendor,
           name,
           settings: req.settings,
-          credentials: credentialStates(req.vendor, [], req),
+          credentials: credentialStates(req.vendor, req),
           webhookUrl:
             req.vendor === AgentVendor.OPENAI_CODEX
               ? `${MOCK_API_ORIGIN}/webhooks/openai/${id}`
@@ -1698,7 +1704,7 @@ export function createMockTransport(
           : i.settings;
         const replaceCredentials = hasPath(req.updateMask, "credentials");
         const credentials = replaceCredentials
-          ? credentialStates(i.vendor, i.credentials, req)
+          ? credentialStates(i.vendor, req, i.credentials)
           : i.credentials;
 
         Object.assign(i, { name, settings, credentials });

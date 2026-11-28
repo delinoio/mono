@@ -20,6 +20,8 @@ export default mergeRsbuildConfig(consoleConfig, {
   source: {
     entry: {
       index: "./src/index.tsx",
+      "credential-replacement-fixture":
+        "./e2e/credential-replacement-fixture.ts",
       "direct-action-fixture": "./e2e/direct-action-fixture.tsx",
     },
   },
