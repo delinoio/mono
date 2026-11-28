@@ -591,6 +591,8 @@ SandRun records request-ended, queue-wait and runner-start measurements after th
 
 If `METRICS_ADDR` is empty, SandRun starts without a metrics listener. If the configured address cannot bind, startup fails before the lease workers start. If the listener fails permanently after binding, SandRun logs the cause, stops the lease workers and releases the lease, and then drains public HTTP within the shutdown timeout. The process exits with a nonzero status and logs the original listener error, even if a termination signal arrives during the same shutdown. A clean signal shutdown exits successfully.
 
+If the public and metrics listeners both fail during shutdown, the exit log includes both errors. Both listeners retry temporary accept errors, and closing a healthy listener during shutdown is expected.
+
 | Metric                                       | Type      | Labels                        |
 | -------------------------------------------- | --------- | ----------------------------- |
 | `sandrun_requests`                           | gauge     | `kind`, `priority`, `state`   |
