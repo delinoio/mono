@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -146,27 +147,47 @@ func TestReadFileResumesWithSameReadID(t *testing.T) {
 
 func TestReadFileStreamClosedWithoutAcceptedResumesAtNextOffset(t *testing.T) {
 	t.Parallel()
+	const resumeOffset = 20
+	const readTimeout = 5 * time.Second
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
 	want := randomBytes(t, 95)
 	cp.agent.setFile("/f", want)
+	firstChunksReceived := make(chan struct{})
 	cp.relayScript = func(_ string, n int) relayAction {
 		switch n {
 		case 1:
-			return relayAction{abortAfter: 2}
+			return relayAction{abortAfter: 2, readAbortGate: firstChunksReceived}
 		case 2:
 			return relayAction{noAccept: true}
 		}
 		return relayAction{}
 	}
-	s := cp.handle(t, cp.client(t, TransportRelay))
+	c := cp.client(t, TransportRelay)
+	// Let the request deadline fail the read if the abort gate never opens.
+	c.timing.streamStall = 2 * readTimeout
+	s := cp.handle(t, c)
 	var out bytes.Buffer
-	size, err := s.ReadFile(context.Background(), "/f", &out)
+	writer := writerFunc(func(p []byte) (int, error) {
+		before := out.Len()
+		n, err := out.Write(p)
+		if before < resumeOffset && out.Len() >= resumeOffset {
+			close(firstChunksReceived)
+		}
+		return n, err
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), readTimeout)
+	defer cancel()
+	size, err := s.ReadFile(ctx, "/f", writer)
 	if err != nil || size != int64(len(want)) || !bytes.Equal(out.Bytes(), want) {
 		t.Fatalf("read %d bytes: %v", size, err)
 	}
 	if n := cp.relayCount("ReadFile"); n != 3 {
 		t.Fatalf("%d ReadFile calls, want 3", n)
+	}
+	wantOffsets := []int64{0, resumeOffset, resumeOffset}
+	if got := cp.relayReadOffsets(); !slices.Equal(got, wantOffsets) {
+		t.Fatalf("ReadFile offsets = %v, want %v", got, wantOffsets)
 	}
 	cp.agent.mu.Lock()
 	reads := len(cp.agent.reads)

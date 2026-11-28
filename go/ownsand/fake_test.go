@@ -109,6 +109,9 @@ type relayAction struct {
 	// abortAfterKeepalives aborts the connection after the accepted
 	// keepalives, without any data.
 	abortAfterKeepalives bool
+	// readAbortGate delays a scripted read abort until the client receives
+	// the sent chunks or the request context ends.
+	readAbortGate <-chan struct{}
 }
 
 // p2pAction scripts one data channel request.
@@ -199,6 +202,7 @@ type fakeCP struct {
 	relayCalls  map[string]int
 	relayLog    []string
 	relayExecs  []*ownsandv1.ExecRequest
+	readOffsets []int64
 	// heldEnded records when a held (holdOpen or keepalivesOnly) relay
 	// stream ended because the caller cancelled it, and when it began.
 	heldStarts  []time.Time
@@ -336,6 +340,12 @@ func (cp *fakeCP) relayCount(method string) int {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	return cp.relayCalls[method]
+}
+
+func (cp *fakeCP) relayReadOffsets() []int64 {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return append([]int64(nil), cp.readOffsets...)
 }
 
 func (cp *fakeCP) authRequests() []*ownsandv1.AuthorizeRelayRequest {
@@ -957,6 +967,11 @@ func (f *fakeRelay) AttachExec(ctx context.Context, req *connect.Request[ownsand
 }
 
 func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1.ReadFileRequest], stream *connect.ServerStream[ownsandv1.ReadFileResponse]) error {
+	cp := f.cp
+	cp.mu.Lock()
+	cp.readOffsets = append(cp.readOffsets, req.Msg.GetOffset())
+	cp.mu.Unlock()
+
 	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	req.Msg.ReadId = canonicalFakeID(req.Msg.GetReadId())
 	g, act, err := f.begin("ReadFile", req.Header(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE)
@@ -991,13 +1006,20 @@ func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1
 		}
 	}
 	chunks := 0
-	err = f.cp.agent.serveRead(req.Msg, func(ev *ownsandv1.FileReadEvent) error {
+	err = cp.agent.serveRead(req.Msg, func(ev *ownsandv1.FileReadEvent) error {
 		if err := stream.Send(&ownsandv1.ReadFileResponse{Event: ev}); err != nil {
 			return err
 		}
 		if ev.GetChunk() != nil {
 			chunks++
 			if act.abortAfter > 0 && chunks >= act.abortAfter {
+				if act.readAbortGate != nil {
+					select {
+					case <-act.readAbortGate:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
 				panic(http.ErrAbortHandler)
 			}
 			if act.endAfter > 0 && chunks >= act.endAfter {
