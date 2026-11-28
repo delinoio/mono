@@ -77,6 +77,24 @@ func TestUncovered(t *testing.T) {
 	if got := ids(e.uncovered(queued, runners)); got != "d1,g3,a1" {
 		t.Fatalf("uncovered with an unknown kind = %s", got)
 	}
+
+	t.Run("pool covers oldest across priorities", func(t *testing.T) {
+		newer := req("newer", gh, "pg", "inst-a", 2)
+		newer.Priority = sandrunv1.Priority_PRIORITY_HIGH
+		other := req("other", gh, "pg", "inst-b", 0)
+		other.Priority = sandrunv1.Priority_PRIORITY_NORMAL
+		older := req("older", gh, "pg", "inst-a", 1)
+		older.Priority = sandrunv1.Priority_PRIORITY_NORMAL
+
+		queued := []*Request{newer, other, older}
+		runners := []*Runner{
+			{ID: "r1", Kind: gh, ProfileID: "pg", PoolKey: "inst-a", State: runWaiting},
+		}
+		const want = "newer,other"
+		if got := ids(e.uncovered(queued, runners)); got != want {
+			t.Fatalf("uncovered = %q, want %q", got, want)
+		}
+	})
 }
 
 func TestOldestWarm(t *testing.T) {
