@@ -358,6 +358,9 @@ func (d *devSessionService) ReadDevSessionFile(ctx context.Context, req *connect
 	if off < 0 {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("the offset is outside the file"))
 	}
+	if req.Msg.GetPath() == "" {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("invalid path: is required"))
+	}
 	data, err := guest.readSnapshot(ds, req.Msg)
 	if err != nil {
 		return err
