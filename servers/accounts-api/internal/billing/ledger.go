@@ -237,7 +237,7 @@ type grantTelemetry struct {
 // reconciles an existing grant and skips creation.
 // A webhook caller holds the purchase lock (lockPurchase) before the lock of
 // acct.
-func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, processTime time.Time) (grantID string, telemetry *grantTelemetry, err error) {
+func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, observations *TxObservations, acct *accountState, in grantInput, processTime time.Time) (grantID string, telemetry *grantTelemetry, err error) {
 	if in.Amount < 0 {
 		return "", nil, fmt.Errorf("credit grant amount %d is negative", in.Amount)
 	}
@@ -251,7 +251,7 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		// The pending rows are applied under the lock of the account of the
 		// grant, which is acct for every grant that a webhook resolves.
 		if grantAccountID == acct.ID {
-			if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
+			if err := s.applyPendingAdjustments(ctx, tx, observations, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
 				return "", nil, err
 			}
 		}
@@ -303,7 +303,7 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	}
 	// Approved refunds and chargebacks of this purchase that arrived before
 	// its payment now reduce the new grant, as if they had arrived after it.
-	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
+	if err := s.applyPendingAdjustments(ctx, tx, observations, acct, grantID, in.PaddleTransactionID, accountingTime); err != nil {
 		return "", nil, err
 	}
 	return grantID, &grantTelemetry{

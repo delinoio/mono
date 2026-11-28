@@ -156,7 +156,7 @@ func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome
 		case paddle.IsSubscriptionEvent(ev.EventType):
 			out, err = s.onSubscription(ctx, tx, ev, now)
 		case ev.EventType == paddle.EventAdjustmentCreated, ev.EventType == paddle.EventAdjustmentUpdated:
-			out, err = s.onAdjustment(ctx, tx, ev, now)
+			out, err = s.onAdjustment(ctx, tx, observations, ev, now)
 		default:
 			out.Result = webhookIgnored
 		}
@@ -393,7 +393,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, observa
 			s.logger.WarnContext(ctx, "billing_charge_without_top_up",
 				slog.String("billing_account_id", accountID), slog.String("paddle_transaction_id", txn.ID))
 		}
-		if _, out.Grant, err = s.addGrant(ctx, tx, acct, grantInput{
+		if _, out.Grant, err = s.addGrant(ctx, tx, observations, acct, grantInput{
 			Kind: kind.LedgerKind(), Amount: amount, PaddleTransactionID: txn.ID, ExpireTime: expireTime,
 		}, now); err != nil {
 			return out, err
@@ -409,7 +409,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, observa
 		if amountErr == nil && paid > 0 {
 			granted = min(paid, SubscriptionCreditUSDMicros)
 		}
-		if _, out.Grant, err = s.addGrant(ctx, tx, acct, grantInput{
+		if _, out.Grant, err = s.addGrant(ctx, tx, observations, acct, grantInput{
 			Kind: LedgerSubscriptionCredit, Amount: granted, PaddleTransactionID: txn.ID, ExpireTime: expireTime,
 		}, now); err != nil {
 			return out, err
@@ -587,7 +587,7 @@ func lockPurchase(ctx context.Context, tx pgx.Tx, transactionID string) error {
 // removal first expires the credit that is due when the purchase and account
 // locks are held, so a grant that expired while the adjustment waited for
 // them is not consumed: its expiry is an EXPIRY entry before the REFUND entry.
-func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, ev paddle.Event, now time.Time) (eventOutcome, error) {
+func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, observations *TxObservations, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var adj paddle.Adjustment
 	if err := json.Unmarshal(ev.Data, &adj); err != nil || adj.ID == "" {
 		return eventOutcome{Result: webhookInvalidPayload}, nil
@@ -654,7 +654,7 @@ func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, ev paddle.Event, 
 	// the locks. The reading of applyEvent stays the time of the event record
 	// and of a pending row.
 	now = s.timestamp()
-	applied, err := s.applyAdjustment(ctx, tx, acct, grantID, pendingAdjustment{
+	applied, err := s.applyAdjustment(ctx, tx, observations, acct, grantID, pendingAdjustment{
 		ID: adj.ID, TransactionID: adj.TransactionID, Action: adj.Action, Amount: amount,
 	}, false, now)
 	if err != nil {
@@ -683,7 +683,7 @@ type pendingAdjustment struct {
 // second notification of the same adjustment removes nothing. The caller
 // holds the purchase lock and the lock of acct, and owns tx. It reports
 // whether it applied the adjustment; false means credit_refunds had it.
-func (s *Service) applyAdjustment(ctx context.Context, tx pgx.Tx, acct *accountState, grantID string, adj pendingAdjustment, fromPending bool, now time.Time) (bool, error) {
+func (s *Service) applyAdjustment(ctx context.Context, tx pgx.Tx, observations *TxObservations, acct *accountState, grantID string, adj pendingAdjustment, fromPending bool, now time.Time) (bool, error) {
 	var original, refunded int64
 	if err := tx.QueryRow(ctx, `SELECT original_usd_micros, refunded_usd_micros FROM credit_grants
 		WHERE credit_grant_id = $1 FOR UPDATE`, grantID).Scan(&original, &refunded); err != nil {
@@ -714,7 +714,7 @@ func (s *Service) applyAdjustment(ctx context.Context, tx pgx.Tx, acct *accountS
 		WHERE credit_grant_id = $1`, grantID, amount); err != nil {
 		return false, err
 	}
-	s.logger.InfoContext(ctx, "billing_credit_refunded",
+	attrs := []slog.Attr{
 		slog.String("billing_account_id", acct.ID),
 		slog.String("credit_grant_id", grantID),
 		slog.String("paddle_transaction_id", adj.TransactionID),
@@ -722,7 +722,11 @@ func (s *Service) applyAdjustment(ctx context.Context, tx pgx.Tx, acct *accountS
 		slog.String("action", adj.Action),
 		slog.Int64("amount_usd_micros", amount),
 		slog.Bool("from_pending", fromPending),
-		slog.Int64("balance_after_usd_micros", acct.Balance))
+		slog.Int64("balance_after_usd_micros", acct.Balance),
+	}
+	observations.pending = append(observations.pending, func() {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_credit_refunded", attrs...)
+	})
 	return true, nil
 }
 
@@ -730,7 +734,7 @@ func (s *Service) applyAdjustment(ctx context.Context, tx pgx.Tx, acct *accountS
 // before the credit grant of the purchase, oldest first, and deletes each
 // pending row in the same transaction. The caller holds the purchase lock and
 // the lock of acct.
-func (s *Service) applyPendingAdjustments(ctx context.Context, tx pgx.Tx, acct *accountState, grantID, transactionID string, now time.Time) error {
+func (s *Service) applyPendingAdjustments(ctx context.Context, tx pgx.Tx, observations *TxObservations, acct *accountState, grantID, transactionID string, now time.Time) error {
 	rows, err := tx.Query(ctx, `SELECT paddle_adjustment_id, paddle_transaction_id, action, amount_usd_micros
 		FROM pending_credit_adjustments WHERE paddle_transaction_id = $1
 		ORDER BY create_time, paddle_adjustment_id FOR UPDATE`, transactionID)
@@ -742,7 +746,7 @@ func (s *Service) applyPendingAdjustments(ctx context.Context, tx pgx.Tx, acct *
 		return err
 	}
 	for _, adj := range pending {
-		if _, err := s.applyAdjustment(ctx, tx, acct, grantID, adj, true, now); err != nil {
+		if _, err := s.applyAdjustment(ctx, tx, observations, acct, grantID, adj, true, now); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM pending_credit_adjustments WHERE paddle_adjustment_id = $1`, adj.ID); err != nil {
@@ -869,15 +873,19 @@ func (s *Service) reconcilePurchase(ctx context.Context, transactionID string) e
 		// are held: a grant that expired while this task waited for them must
 		// be expired first and must not be consumed.
 		now := s.timestamp()
-		if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, transactionID, now); err != nil {
+		if err := s.applyPendingAdjustments(ctx, tx, observations, acct, grantID, transactionID, now); err != nil {
 			return err
 		}
-		s.logger.InfoContext(ctx, "billing_pending_adjustments_reconciled",
+		attrs := []slog.Attr{
 			slog.String("billing_account_id", acct.ID),
 			slog.String("credit_grant_id", grantID),
 			slog.String("paddle_transaction_id", transactionID),
 			slog.Int("pending_rows", pending),
-			slog.Int64("balance_after_usd_micros", acct.Balance))
+			slog.Int64("balance_after_usd_micros", acct.Balance),
+		}
+		observations.pending = append(observations.pending, func() {
+			s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_pending_adjustments_reconciled", attrs...)
+		})
 		// A reversal can change the billing status of the linked
 		// organizations, like the webhook that applies one.
 		return s.syncStatuses(ctx, tx, observations, acct.ID, now)
