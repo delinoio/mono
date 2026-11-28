@@ -127,6 +127,10 @@ func ExecProcess(name string, args []string, dir string, env []string, stderr io
 		return nil, err
 	}
 	cmd.Stdout = stdoutWriter
+	// Wait copies stderr until every holder closed it. A tool that keeps
+	// the agent's stderr would otherwise delay Wait past the exit of the
+	// adapter; Kill handles the rest of the process group.
+	cmd.WaitDelay = waitDelay
 	err = cmd.Start()
 	stdoutWriter.Close()
 	if err != nil {
@@ -142,14 +146,28 @@ type execProcess struct {
 	stdin  io.WriteCloser
 	stdout *os.File
 	exited chan struct{}
+
+	killOnce sync.Once
+	mu       sync.Mutex
+	// stopped is closed when the stop that Kill started is complete; it
+	// is nil before Kill.
+	stopped chan struct{}
 }
 
 func (p *execProcess) Stdin() io.WriteCloser { return p.stdin }
 func (p *execProcess) Stdout() io.Reader     { return p.stdout }
 
+// Wait waits for the process. After Kill, it also waits until the rest of
+// the process group ended or got SIGKILL.
 func (p *execProcess) Wait() Exit {
 	err := p.cmd.Wait()
 	close(p.exited)
+	p.mu.Lock()
+	stopped := p.stopped
+	p.mu.Unlock()
+	if stopped != nil {
+		<-stopped
+	}
 	state := p.cmd.ProcessState
 	if state == nil {
 		return Exit{Code: -1, Signal: fmt.Sprint(err)}
@@ -159,23 +177,54 @@ func (p *execProcess) Wait() Exit {
 
 // killGrace is the time between SIGTERM and SIGKILL of the agent process
 // group.
-const killGrace = 5 * time.Second
+var killGrace = 5 * time.Second
+
+// waitDelay bounds the stderr copy after the exit of the adapter.
+const waitDelay = 2 * time.Second
+
+// groupPollInterval is the interval at which Kill checks whether the
+// process group still has processes after the leader exited.
+const groupPollInterval = 50 * time.Millisecond
 
 // Kill sends SIGTERM to the process group and SIGKILL after killGrace when
-// the process still runs. Windows has no SIGTERM for a process group, so the
-// SIGTERM fails there and the SIGKILL ends the process.
+// a process of the group still runs. The exit of the adapter alone does
+// not end the stop: a tool of the agent can ignore SIGTERM. Windows has no
+// SIGTERM for a process group, so the SIGTERM fails there and the SIGKILL
+// ends the process.
 func (p *execProcess) Kill() {
-	if err := procgroup.Signal(p.cmd.Process, syscall.SIGTERM); err != nil {
-		_ = procgroup.Signal(p.cmd.Process, syscall.SIGKILL)
-		return
-	}
-	go func() {
-		select {
-		case <-p.exited:
-		case <-time.After(killGrace):
+	p.killOnce.Do(func() {
+		stopped := make(chan struct{})
+		p.mu.Lock()
+		p.stopped = stopped
+		p.mu.Unlock()
+		if err := procgroup.Signal(p.cmd.Process, syscall.SIGTERM); err != nil {
 			_ = procgroup.Signal(p.cmd.Process, syscall.SIGKILL)
+			close(stopped)
+			return
 		}
-	}()
+		go func() {
+			defer close(stopped)
+			deadline := time.NewTimer(killGrace)
+			defer deadline.Stop()
+			ticker := time.NewTicker(groupPollInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-deadline.C:
+					_ = procgroup.Signal(p.cmd.Process, syscall.SIGKILL)
+					return
+				case <-ticker.C:
+					select {
+					case <-p.exited:
+						if !groupAlive(p.cmd.Process) {
+							return
+						}
+					default:
+					}
+				}
+			}
+		}()
+	})
 }
 
 // drainTimeout bounds the reading of the remaining ACP messages after the
