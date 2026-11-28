@@ -93,6 +93,9 @@ type sandbox struct {
 	createCancel context.CancelFunc
 	// ending is true while the agent itself stops the VM.
 	ending bool
+	// pauseResumeSavePending tracks an unsaved runtime move independently
+	// of whether the control plane acknowledged the record.
+	pauseResumeSavePending bool
 	// vmExitPending is set when a confirmed VM exit could not be recorded
 	// as DELETING. Tick retries the end until the record enters DELETING.
 	vmExitPending bool
@@ -449,6 +452,9 @@ func (m *Manager) updateIf(sb *sandbox, guard func() bool, change func(*Record))
 	}
 	before := sb.rec.State
 	err := m.commitLocked(&sb.rec, change)
+	if err == nil {
+		sb.pauseResumeSavePending = false
+	}
 	entry := sb.rec.Entry(m.epoch)
 	outbox := m.outbox
 	m.mu.Unlock()
@@ -1001,6 +1007,7 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 			}
 			r.State = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
 			r.EndReason = reason
+			sb.pauseResumeSavePending = false
 			sb.vmExitPending = false
 		}); err != nil {
 			return nil, err
@@ -1117,13 +1124,23 @@ func (m *Manager) pauseResume(ctx context.Context, id string, pause bool) (*owns
 	}
 	sb.cmdMu.Lock()
 	defer sb.cmdMu.Unlock()
-	m.mu.Lock()
-	state, vm, guest, entry := sb.rec.State, sb.vm, sb.guest, sb.rec.Entry(m.epoch)
-	m.mu.Unlock()
 	from, to := ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED
 	if !pause {
 		from, to = to, from
 	}
+	m.mu.Lock()
+	state, vm, guest, entry := sb.rec.State, sb.vm, sb.guest, sb.rec.Entry(m.epoch)
+	if state == to && sb.pauseResumeSavePending {
+		defer m.mu.Unlock()
+		if !m.canRetryPauseResumeSaveLocked(sb, m.now()) {
+			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "sandbox is ending or no longer live")
+		}
+		if err := m.saveCurrentRecordLocked(sb); err != nil {
+			return nil, err
+		}
+		return entry, nil
+	}
+	m.mu.Unlock()
 	switch state {
 	case to:
 		return entry, nil
@@ -1140,29 +1157,47 @@ func (m *Manager) pauseResume(ctx context.Context, id string, pause bool) (*owns
 			m.logger.Error("pause failed", "sandbox_id", id, "error", err)
 			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox could not be paused")
 		}
-		updated, err := m.update(sb, func(r *Record) { r.State = to })
-		if err != nil {
-			err = m.undoRuntimeMove(sb, id, from, err)
+	} else {
+		if err := m.rt.Resume(ctx, vm); err != nil {
+			m.logger.Error("resume failed", "sandbox_id", id, "error", err)
+			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox could not be resumed")
 		}
-		return updated, err
+		clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := guest.SetClock(clockCtx, m.now()); err != nil {
+			m.logger.Warn("set guest clock after resume failed", "sandbox_id", id, "error", err)
+		}
+		cancel()
 	}
-	if err := m.rt.Resume(ctx, vm); err != nil {
-		m.logger.Error("resume failed", "sandbox_id", id, "error", err)
-		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox could not be resumed")
-	}
-	clockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	if err := guest.SetClock(clockCtx, m.now()); err != nil {
-		m.logger.Warn("set guest clock after resume failed", "sandbox_id", id, "error", err)
-	}
-	cancel()
 	updated, err := m.update(sb, func(r *Record) {
 		r.State = to
-		r.IdleDeadline = m.now().Add(r.IdleTTL)
+		if !pause {
+			r.IdleDeadline = m.now().Add(r.IdleTTL)
+		}
+		// The revision is already allocated. The record write may still fail.
+		sb.pauseResumeSavePending = true
 	})
 	if err != nil {
 		err = m.undoRuntimeMove(sb, id, from, err)
 	}
 	return updated, err
+}
+
+// canRetryPauseResumeSaveLocked checks that the current record still owns a
+// live sandbox and that no end or device removal has taken precedence.
+func (m *Manager) canRetryPauseResumeSaveLocked(sb *sandbox, now time.Time) bool {
+	return !m.closed && !m.removing && !sb.ending && !sb.vmExitPending &&
+		m.sandboxes[sb.rec.SandboxID] == sb &&
+		sb.rec.endReasonAt(now) == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED
+}
+
+// saveCurrentRecordLocked saves the record as it exists under m.mu, with
+// its current revision and acknowledgement.
+func (m *Manager) saveCurrentRecordLocked(sb *sandbox) error {
+	if err := m.st.SaveSandbox(sb.rec.SandboxID, sb.rec); err != nil {
+		return fmt.Errorf("sandboxes: save record: %w", err)
+	}
+	sb.pauseResumeSavePending = false
+	return nil
 }
 
 // undoRuntimeMove runs after a pause or resume that the runtime accepted but
@@ -1171,8 +1206,8 @@ func (m *Manager) pauseResume(ctx context.Context, id string, pause bool) (*owns
 // the record: it moves the VM back, because a later opposite command would
 // otherwise see the old state as its target, return success and never reach
 // the runtime. When the record already holds the new state, SaveSandbox failed
-// after the change applied; the VM matches the record and a retry returns the
-// current entry, so nothing is undone. It returns updateErr, joined with the
+// after the change applied. The VM matches the record, so nothing is undone
+// and the pending save can retry. It returns updateErr, joined with the
 // error of the undo when the undo fails.
 //
 // The undo calls the runtime directly and uses a fresh bounded context: the
@@ -1226,9 +1261,9 @@ func (sb *sandbox) retryReasonBeforeDeadline() ownsandv1.SandboxEndReason {
 	return ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED
 }
 
-// Tick enforces the TTLs, retries failed creates and cleanup of exited VMs,
-// reports moved idle deadlines at most once per minute and resends
-// unacknowledged updates when resend is true.
+// Tick enforces the TTLs, retries failed creates, cleanup of exited VMs and
+// unsaved pause or resume records, reports moved idle deadlines at most once
+// per minute and resends unacknowledged updates when resend is true.
 func (m *Manager) Tick(ctx context.Context, resend bool) {
 	now := m.now()
 	type expiry struct {
@@ -1292,6 +1327,11 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 				continue
 			}
 			m.logger.Warn("save failed sandbox create; retrying on a later tick", "sandbox_id", sb.rec.SandboxID, "error", err)
+		}
+		if sb.pauseResumeSavePending && m.canRetryPauseResumeSaveLocked(sb, now) {
+			if err := m.saveCurrentRecordLocked(sb); err != nil {
+				m.logger.Warn("retry pause or resume record save failed", "sandbox_id", sb.rec.SandboxID, "revision", sb.rec.Revision, "error", err)
+			}
 		}
 		if sb.idleDirty && now.Sub(sb.lastIdleReport) >= IdleReportInterval {
 			reports = append(reports, idleReport{sb: sb, previous: sb.lastIdleReport})
@@ -1556,7 +1596,10 @@ func (m *Manager) AckSandboxUpdate(ack *ownsandv1.SandboxUpdateAck) {
 		m.dropLocked(ack.GetSandboxId())
 		return
 	}
-	if err := m.st.SaveSandbox(sb.rec.SandboxID, sb.rec); err != nil {
+	if sb.pauseResumeSavePending && !m.canRetryPauseResumeSaveLocked(sb, m.now()) {
+		return
+	}
+	if err := m.saveCurrentRecordLocked(sb); err != nil {
 		m.logger.Warn("save acknowledged record failed", "sandbox_id", sb.rec.SandboxID, "error", err)
 	}
 }
