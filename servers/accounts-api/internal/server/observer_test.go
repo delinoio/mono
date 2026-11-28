@@ -51,6 +51,7 @@ func TestObserverParsesRequestSequences(t *testing.T) {
 	post := func(path string) string {
 		return "POST " + path + " HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
 	}
+	const mixedLineEndings = "\n\r\r\n"
 	for _, tc := range []struct {
 		name   string
 		stream string
@@ -99,8 +100,13 @@ func TestObserverParsesRequestSequences(t *testing.T) {
 		},
 		{
 			"four mixed CR and LF bytes after a POST are skipped",
-			post("/a") + "\r\n\r\n" + get("/b") + "\n\r\r\n" + get("/c"),
+			post("/a") + mixedLineEndings + get("/b"),
 			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", false}},
+		},
+		{
+			"four mixed CR and LF bytes after a GET stop parsing",
+			get("/a") + mixedLineEndings + get("/b"),
+			[]pendingSummary{{"GET", "/a", false}},
 		},
 		{
 			"each POST allows its own four leading bytes",
