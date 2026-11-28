@@ -659,8 +659,11 @@ func TestAuthorizeRelayResourceExhaustedWaitsRetryDelay(t *testing.T) {
 	s := cp.handle(t, cp.client(t, TransportRelay))
 	res, r := runExec(t, s)
 	checkLines(t, res, r, 1)
-	if len(times) != 2 || times[1].Sub(times[0]) < 300*time.Millisecond {
-		t.Fatalf("retry after %v, want at least the retry delay", times[1].Sub(times[0]))
+	if len(times) != 2 {
+		t.Fatalf("recorded %d authorization timestamps, want 2", len(times))
+	}
+	if elapsed := times[1].Sub(times[0]); elapsed < 300*time.Millisecond {
+		t.Fatalf("retry after %v, want at least 300ms", elapsed)
 	}
 }
 
@@ -1330,7 +1333,16 @@ func TestLostRenewalResponseReturnsInstalledGrant(t *testing.T) {
 	res, r := runExec(t, s)
 	checkLines(t, res, r, 3)
 	auths := cp.authRequests()
-	if auths[1].GetAuthorizationId() != auths[2].GetAuthorizationId() || auths[2].ReplacesGrantId == nil || *auths[1].ReplacesGrantId != *auths[2].ReplacesGrantId {
+	if len(auths) < 3 {
+		t.Fatalf("recorded %d authorization requests, want at least 3 for the renewal and its retry", len(auths))
+	}
+	if auths[1].ReplacesGrantId == nil {
+		t.Fatal("authorization request 2 (renewal) is missing replaces_grant_id")
+	}
+	if auths[2].ReplacesGrantId == nil {
+		t.Fatal("authorization request 3 (renewal retry) is missing replaces_grant_id")
+	}
+	if auths[1].GetAuthorizationId() != auths[2].GetAuthorizationId() || *auths[1].ReplacesGrantId != *auths[2].ReplacesGrantId {
 		t.Fatal("the retry of a lost renewal must keep its authorization_id and replaces_grant_id")
 	}
 }
