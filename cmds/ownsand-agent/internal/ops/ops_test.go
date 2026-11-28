@@ -295,6 +295,12 @@ func TestExitEvent(t *testing.T) {
 func TestExecAtMostOnce(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/sh", "-c", "echo run >> count; cat count")
+	// Use the dispatcher clock for admission and force a lowercase hex letter.
+	id, err := uuidv7.FromTime(e.clk.Now(), bytes.NewReader([]byte{9: 0x0a}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ExecId = id.String()
 	out, frames, accepted := e.handle(req, nil)
 	if !out.Finished || !accepted || frames[0].GetExecEvent().GetStarted() == nil {
 		t.Fatalf("outcome %+v accepted %v first %v", out, accepted, frames[0])
