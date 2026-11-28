@@ -173,6 +173,7 @@ type Conn struct {
 	writeWaiters sync.Map // *ownsandv1.DataFrame -> *confirmedWrite
 
 	windowUpdateWait atomic.Pointer[windowUpdateWaitProbe]
+	execSend         atomic.Pointer[execSendProbe]
 }
 
 type windowUpdateWaitProbe struct {
@@ -757,6 +758,9 @@ func (s *Stream) enqueueFrame(ctx context.Context, of outFrame) error {
 	// The token guarantees room, see Conn.enqueueFrame.
 	c.out <- of
 	s.mu.Unlock()
+	if probe := c.execSend.Load(); probe.matches(of.frame) {
+		recordExecSendTime(probe.enqueued)
+	}
 	return nil
 }
 

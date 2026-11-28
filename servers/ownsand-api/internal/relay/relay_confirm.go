@@ -61,6 +61,38 @@ func (s *Stream) confirmResult(err error) error {
 	return nil
 }
 
+type execSendProbe struct {
+	streamID uint64
+	execID   string
+	enqueued chan time.Time
+	sent     chan time.Time
+}
+
+// WatchExecSendForTest observes the queue insertion and successful transport
+// send of one Exec frame. Install the probe before releasing the request body.
+func (c *Conn) WatchExecSendForTest(streamID uint64, execID string) (enqueued, sent <-chan time.Time) {
+	probe := &execSendProbe{
+		streamID: streamID,
+		execID:   execID,
+		enqueued: make(chan time.Time, 1),
+		sent:     make(chan time.Time, 1),
+	}
+	c.execSend.Store(probe)
+	return probe.enqueued, probe.sent
+}
+
+func (p *execSendProbe) matches(f *ownsandv1.DataFrame) bool {
+	return p != nil && f.GetStreamId() == p.streamID &&
+		f.GetExecRequest() != nil && f.GetExecRequest().GetExecId() == p.execID
+}
+
+func recordExecSendTime(ch chan<- time.Time) {
+	select {
+	case ch <- time.Now():
+	default:
+	}
+}
+
 type confirmedWrite struct {
 	stream     *Stream
 	acceptance time.Duration
@@ -71,6 +103,16 @@ type confirmedWrite struct {
 // a confirmed send, it starts the acceptance window as soon as the transport
 // send returns, before reporting the result to the waiting goroutine.
 func (c *Conn) sendMeasured(of outFrame, send func(*ownsandv1.DataFrame) error) error {
+	if probe := c.execSend.Load(); probe.matches(of.frame) {
+		transportSend := send
+		send = func(f *ownsandv1.DataFrame) error {
+			err := transportSend(f)
+			if err == nil {
+				recordExecSendTime(probe.sent)
+			}
+			return err
+		}
+	}
 	v, ok := c.writeWaiters.Load(of.frame)
 	if !ok {
 		return c.sendCounted(of, send)

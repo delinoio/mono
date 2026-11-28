@@ -4,7 +4,12 @@ package api_test
 
 import (
 	"context"
-	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,78 +17,97 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
-// bodyDelay is how long the caller's request body is held back, so that the
-// stream is open and credited at the agent before the writer stalls and the
-// request frame is queued behind the stall.
-const bodyDelay = 1500 * time.Millisecond
+const (
+	relayAcceptanceWindow = time.Second
+	stalledExecPhaseLimit = 5 * time.Second
+)
 
-// acceptanceCall is an Exec call whose request frame is queued behind a
-// blocked connection writer while the outbound queue still has room and the
-// agent has already granted the stream's credit.
+// gatedExecTransport lets the HTTP transport send the headers while the
+// fixture controls when it can read the body.
+type gatedExecTransport struct {
+	base     http.RoundTripper
+	bodyGate <-chan struct{}
+}
+
+func (tr gatedExecTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Body = &gatedExecBody{
+		ReadCloser: r.Body,
+		ctx:        r.Context(),
+		bodyGate:   tr.bodyGate,
+		closed:     make(chan struct{}),
+	}
+	return tr.base.RoundTrip(r)
+}
+
+type gatedExecBody struct {
+	io.ReadCloser
+	ctx      context.Context
+	bodyGate <-chan struct{}
+	closed   chan struct{}
+	close    sync.Once
+}
+
+func (b *gatedExecBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.bodyGate:
+		return b.ReadCloser.Read(p)
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	case <-b.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (b *gatedExecBody) Close() error {
+	b.close.Do(func() { close(b.closed) })
+	return b.ReadCloser.Close()
+}
+
 type acceptanceCall struct {
-	relay   *testenv.FakeRelay
-	execID  string
-	started time.Time
-	// done receives the result of the call and the time it took.
-	done chan acceptanceResult
+	relay         *testenv.FakeRelay
+	execID        string
+	streamID      uint64
+	releaseBody   func()
+	releaseWriter func()
+	enqueued      <-chan time.Time
+	sent          <-chan time.Time
+	done          chan struct{}
+	result        acceptanceResult // Published by closing done.
 }
 
 type acceptanceResult struct {
-	events []*ownsandv1.ExecEvent
-	err    error
-	took   time.Duration
+	events      []*ownsandv1.ExecEvent
+	err         error
+	completedAt time.Time
 }
 
-// startStalledExec starts an Exec call whose request body arrives bodyDelay
-// after the headers. The control plane allocates the stream at the headers
-// and the fake agent grants its credit when it reads the stream open frame.
-// The test then stalls the writer of the agent relay connection (the fake
-// agent stops reading, and large frames of another stream fill the HTTP/2
-// flow control window; the 1024 places of the queue stay free), so the
-// request frame that follows the body is queued but not written. serve is the
-// fake agent's answer to the request frame. The request deadline is
-// requestDeadline, counted from the stream allocation; the acceptance timeout
-// is one second.
+// startStalledExec waits for the agent to see the Exec stream open, then stalls
+// the connection writer in a separate stream's metering callback. It returns
+// with the body and writer gates closed to traffic.
 func startStalledExec(t *testing.T, requestDeadline time.Duration, serve func(s *testenv.RelayStream, f *ownsandv1.DataFrame)) *acceptanceCall {
 	t.Helper()
 	env := testenv.New(t, func(o *app.Options) {
-		o.RelayTiming = &api.RelayTiming{Rotation: 10 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
+		o.RelayTiming = &api.RelayTiming{Rotation: 10 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: relayAcceptanceWindow,
 			RequestDeadline: requestDeadline, GrantAck: time.Second, Signaling: 2 * time.Second}
 	})
 	org, agent, sandboxID := runningSandbox(t, env)
-	c := &acceptanceCall{done: make(chan acceptanceResult, 1)}
+	req := newExec(org.ID, sandboxID)
+	c := &acceptanceCall{execID: req.GetExecId(), done: make(chan struct{})}
 	c.relay = agent.ConnectRelay(serve)
 	c.relay.WaitFrame("supported frame kinds", func(f *ownsandv1.DataFrame) bool { return f.GetSupportedFrameKinds() != nil })
-	stop := keepAlive(c.relay)
-	t.Cleanup(stop)
+	t.Cleanup(keepAlive(c.relay))
 
-	req := newExec(org.ID, sandboxID)
-	c.execID = req.GetExecId()
 	grant, err := authorizeExec(t, org.OwnerClient, req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := delayedRelay(env, org, grant.GetGrantId(), bodyDelay)
-	c.started = time.Now()
-	go func() {
-		es, err := client.Exec(context.Background(), connect.NewRequest(req))
-		if err != nil {
-			c.done <- acceptanceResult{err: err, took: time.Since(c.started)}
-			return
-		}
-		events, err := collectExec(t, es)
-		c.done <- acceptanceResult{events: events, err: err, took: time.Since(c.started)}
-	}()
-	// The stream exists once the agent read its open frame; its credit grant
-	// follows at once.
-	streamOf(c.relay, grant.GetGrantId())
-	time.Sleep(200 * time.Millisecond)
-
 	plane := env.App.Plane
 	g := plane.Grants.Get(grant.GetGrantId())
 	if g == nil {
@@ -93,140 +117,215 @@ func startStalledExec(t *testing.T, requestDeadline time.Duration, serve func(s 
 	if conn == nil {
 		t.Fatal("the agent relay connection is gone")
 	}
-	filler, err := conn.Open(context.Background(), "filler-grant", g.SandboxID)
+	setupCtx, stopSetup := context.WithTimeout(t.Context(), stalledExecPhaseLimit)
+	defer stopSetup()
+	filler, err := conn.Open(setupCtx, "filler-grant", g.SandboxID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.relay.WaitFrame("filler stream open", func(f *ownsandv1.DataFrame) bool {
-		return f.GetRelayStreamOpen() != nil && f.GetStreamId() == filler.ID
-	})
-	time.Sleep(200 * time.Millisecond)
-	c.relay.PauseReads()
-	t.Cleanup(c.relay.ResumeReads)
-	// Random data: Connect compresses a repetitive payload to a few bytes,
-	// which would never fill the flow control window of the agent's stream.
-	data := make([]byte, 512<<10)
-	_, _ = rand.Read(data)
-	for i := 0; i < 12; i++ {
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := filler.Send(sctx, datapath.MustNewFrame(0, "", &ownsandv1.WriteFileRequest{Data: data}))
-		cancel()
-		if err != nil {
-			t.Fatalf("queue a large frame: %v", err)
+
+	bodyGate, writerGate := make(chan struct{}), make(chan struct{})
+	c.releaseBody = sync.OnceFunc(func() { close(bodyGate) })
+	c.releaseWriter = sync.OnceFunc(func() { close(writerGate) })
+	callCtx, cancelCall := context.WithCancel(t.Context())
+	t.Cleanup(func() {
+		cancelCall()
+		c.releaseBody()
+		c.releaseWriter()
+		select {
+		case <-c.done:
+		case <-time.After(stalledExecPhaseLimit):
+			t.Error("the Exec RPC did not stop during fixture cleanup")
 		}
-	}
-	// The writer is blocked, but the outbound queue has room: a small frame
-	// is accepted at once.
-	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	err = filler.Send(sctx, datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{}))
-	cancel()
+	})
+
+	httpClient := &http.Client{Transport: gatedExecTransport{base: env.Server.Client().Transport, bodyGate: bodyGate}}
+	client := ownsandv1connect.NewRelayServiceClient(httpClient, env.Server.URL)
+	rpcReq := connect.NewRequest(req)
+	rpcReq.Header().Set("Authorization", "Bearer "+testenv.UserToken(org.Owner))
+	rpcReq.Header().Set(api.RelayGrantHeader, grant.GetGrantId())
+	go func() {
+		defer close(c.done)
+		stream, err := client.Exec(callCtx, rpcReq)
+		var events []*ownsandv1.ExecEvent
+		if err == nil {
+			events, err = collectExec(t, stream)
+		}
+		c.result = acceptanceResult{events: events, err: err, completedAt: time.Now()}
+	}()
+
+	c.streamID = streamOf(c.relay, grant.GetGrantId())
+	c.enqueued, c.sent = conn.WatchExecSendForTest(c.streamID, c.execID)
+
+	writerEntered := make(chan struct{})
+	err = filler.SendMetered(setupCtx, datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{}), func(int64) {
+		close(writerEntered)
+		<-writerGate
+	})
 	if err != nil {
-		t.Fatalf("the outbound queue is full, want room behind the blocked writer: %v", err)
+		t.Fatalf("queue the filler frame: %v", err)
 	}
-	if left := bodyDelay - time.Since(c.started); left < 300*time.Millisecond {
-		t.Fatalf("the writer stalled only %v before the request body arrived, want the stall in place first", left)
+	select {
+	case <-writerEntered:
+	case <-c.done:
+		t.Fatalf("the Exec RPC completed before the writer entered its gate: %v", c.result.err)
+	case <-time.After(stalledExecPhaseLimit):
+		t.Fatal("timed out waiting for the writer to enter its gate")
 	}
 	return c
 }
 
-// requestReached reports whether the fake agent received the request frame.
-func (c *acceptanceCall) requestReached() bool {
-	for _, f := range c.relay.Frames() {
-		if f.GetExecRequest().GetExecId() == c.execID {
-			return true
+func (c *acceptanceCall) waitPhase(phase string, reached <-chan time.Time) (time.Time, error) {
+	select {
+	case at := <-reached:
+		return at, nil
+	case <-c.done:
+		// The observation may already be available when the RPC completes.
+		select {
+		case at := <-reached:
+			if !at.After(c.result.completedAt) {
+				return at, nil
+			}
+		default:
 		}
-	}
-	return false
-}
-
-// holdWriter keeps the writer blocked until d after the request body arrived
-// and checks that the request frame stayed unwritten meanwhile; it fails the
-// test when the writer was not blocked, because the test would then not cover
-// the queued state.
-func (c *acceptanceCall) holdWriter(t *testing.T, d time.Duration) {
-	t.Helper()
-	select {
-	case r := <-c.done:
-		t.Fatalf("the call ended after %v while the writer was blocked: %v", r.took, r.err)
-	case <-time.After(time.Until(c.started.Add(bodyDelay + d))):
-	}
-	if c.requestReached() {
-		t.Fatal("the request frame reached the agent although its reads were paused")
+		if c.result.err == nil {
+			return time.Time{}, fmt.Errorf("the Exec RPC completed successfully before %s", phase)
+		}
+		return time.Time{}, fmt.Errorf("the Exec RPC completed before %s: %w", phase, c.result.err)
+	case <-time.After(stalledExecPhaseLimit):
+		return time.Time{}, fmt.Errorf("timed out waiting for Exec %s", phase)
 	}
 }
 
-func (c *acceptanceCall) wait(t *testing.T, within time.Duration) acceptanceResult {
+func (c *acceptanceCall) releaseBodyAndWaitForEnqueue(t *testing.T) time.Time {
+	t.Helper()
+	c.releaseBody()
+	queuedAt, err := c.waitPhase("outbound enqueue", c.enqueued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return queuedAt
+}
+
+func (c *acceptanceCall) holdWriter(t *testing.T, queuedAt time.Time, duration time.Duration) {
 	t.Helper()
 	select {
-	case r := <-c.done:
-		return r
-	case <-time.After(within):
-		t.Fatalf("the Exec call is still running %v after the writer was released", within)
+	case <-c.done:
+		t.Fatalf("the Exec RPC completed while the writer was gated: %v", c.result.err)
+	case <-c.sent:
+		t.Fatal("the writer sent the Exec frame while it was gated")
+	case <-time.After(time.Until(queuedAt.Add(duration))):
+	}
+}
+
+func (c *acceptanceCall) waitSent(t *testing.T) time.Time {
+	t.Helper()
+	sentAt, err := c.waitPhase("transport send completion", c.sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sentAt
+}
+
+func (c *acceptanceCall) waitResult(t *testing.T) acceptanceResult {
+	t.Helper()
+	select {
+	case <-c.done:
+		return c.result
+	case <-time.After(stalledExecPhaseLimit):
+		t.Fatal("timed out waiting for the Exec RPC result")
 		return acceptanceResult{}
 	}
 }
 
-// TestRelayAcceptanceStartsAfterTheRequestWasWritten checks that the
-// acceptance timeout counts from the moment the connection writer sent the
-// request frame and not from its insertion into the outbound queue: the
-// frame waits 1.6 s behind a blocked writer (longer than the 1 s acceptance
-// timeout), and the agent's prompt answer after the release is accepted.
-func TestRelayAcceptanceStartsAfterTheRequestWasWritten(t *testing.T) {
-	t.Parallel()
-	c := startStalledExec(t, 20*time.Second, serveExec)
-	c.holdWriter(t, 1600*time.Millisecond)
-	c.relay.ResumeReads()
-	r := c.wait(t, 5*time.Second)
-	if r.err != nil || !hasAccepted(r.events) {
-		t.Fatalf("exec after a long queue wait: %v, events %v; want the accepted request", r.err, r.events)
-	}
+func (c *acceptanceCall) matchesRequest(f *ownsandv1.DataFrame) bool {
+	return f.GetStreamId() == c.streamID && f.GetExecRequest().GetExecId() == c.execID
 }
 
-// TestRelayForwardingDeadlineHoldsBehindBlockedWriter checks that a request
-// frame that the writer cannot send before the request deadline ends the call
-// with deadline_exceeded (not unavailable from the acceptance timeout, which
-// has not started) and that the agent sees the stream close.
-func TestRelayForwardingDeadlineHoldsBehindBlockedWriter(t *testing.T) {
-	t.Parallel()
-	c := startStalledExec(t, bodyDelay+1500*time.Millisecond, serveExec)
-	r := c.wait(t, 5*time.Second)
-	if testenv.Code(r.err) != connect.CodeDeadlineExceeded {
-		t.Fatalf("exec behind a blocked writer: %v after %v, want deadline_exceeded", r.err, r.took)
-	}
-	if r.took < bodyDelay+1400*time.Millisecond {
-		t.Fatalf("the call ended after %v, before the request deadline", r.took)
-	}
-	c.relay.ResumeReads()
-	c.relay.WaitFrame("stream close of the timed out call", func(f *ownsandv1.DataFrame) bool {
-		return f.GetRelayStreamClose() != nil && f.GetStreamId() != 0 && f.GetStreamId() != c.fillerStream()
+func (c *acceptanceCall) waitStreamClose() {
+	c.relay.WaitFrame("close of the Exec stream", func(f *ownsandv1.DataFrame) bool {
+		return f.GetStreamId() == c.streamID && f.GetRelayStreamClose() != nil
 	})
 }
 
-// fillerStream returns the stream_id of the filler stream, the first stream
-// that the test opened on the connection.
-func (c *acceptanceCall) fillerStream() uint64 {
-	for _, f := range c.relay.Frames() {
-		if f.GetRelayStreamOpen().GetGrantId() == "filler-grant" {
-			return f.GetStreamId()
-		}
+func requireStalledExecError(t *testing.T, err error, code connect.Code, message string) {
+	t.Helper()
+	var rpcErr *connect.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code() != code || rpcErr.Message() != message {
+		t.Fatalf("Exec returned %v, want %s with message %q", err, code, message)
 	}
-	return 0
 }
 
-// TestRelayAcceptanceTimeoutAfterWrittenRequest checks that a request that
-// the writer sent but that the agent never accepts still ends with
-// unavailable one acceptance timeout after the write, not after the call
-// started.
+// TestRelayAcceptanceStartsAfterTheRequestWasWritten holds the frame in
+// the outbound queue longer than the acceptance window and then lets the
+// agent accept and complete the request.
+func TestRelayAcceptanceStartsAfterTheRequestWasWritten(t *testing.T) {
+	t.Parallel()
+	c := startStalledExec(t, 20*time.Second, serveExec)
+	queuedAt := c.releaseBodyAndWaitForEnqueue(t)
+	const queueHold = 1600 * time.Millisecond
+	c.holdWriter(t, queuedAt, queueHold)
+	c.releaseWriter()
+	if held := c.waitSent(t).Sub(queuedAt); held < queueHold {
+		t.Fatalf("the writer sent after %v in the queue, want at least %v", held, queueHold)
+	}
+	r := c.waitResult(t)
+	if r.err != nil || len(r.events) == 0 || !hasAccepted(r.events) || r.events[len(r.events)-1].GetExited() == nil {
+		t.Fatalf("Exec after a long queue wait: %v, events %v; want acceptance and completion", r.err, r.events)
+	}
+}
+
+// TestRelayForwardingDeadlineHoldsBehindBlockedWriter keeps the writer gated
+// through the forwarding deadline and checks the close of the same stream.
+func TestRelayForwardingDeadlineHoldsBehindBlockedWriter(t *testing.T) {
+	t.Parallel()
+	c := startStalledExec(t, 3*time.Second, serveExec)
+	c.releaseBodyAndWaitForEnqueue(t)
+	r := c.waitResult(t)
+	requireStalledExecError(t, r.err, connect.CodeDeadlineExceeded, "the request was not forwarded within the request deadline")
+	select {
+	case <-c.sent:
+		t.Fatal("the writer sent the Exec frame before the gate was released")
+	default:
+	}
+	c.releaseWriter()
+	c.waitStreamClose()
+}
+
+// An upload deadline has the same status and stream close as a forwarding
+// deadline. The fixture must report that the call never reached enqueue.
+func TestRelayForwardingFixtureRejectsIncompleteUpload(t *testing.T) {
+	t.Parallel()
+	c := startStalledExec(t, 3*time.Second, serveExec)
+	_, err := c.waitPhase("outbound enqueue", c.enqueued)
+	if err == nil || !strings.HasPrefix(err.Error(), "the Exec RPC completed before outbound enqueue: ") {
+		t.Fatalf("phase check with the body withheld returned %v, want RPC completion before outbound enqueue", err)
+	}
+	if testenv.Code(err) != connect.CodeDeadlineExceeded {
+		t.Fatalf("upload with the body withheld returned %v, want deadline_exceeded", err)
+	}
+	c.releaseWriter()
+	c.waitStreamClose()
+	for _, f := range c.relay.Frames() {
+		if c.matchesRequest(f) {
+			t.Fatalf("the agent received the Exec request of stream %d while the upload was withheld", c.streamID)
+		}
+	}
+}
+
+// TestRelayAcceptanceTimeoutAfterWrittenRequest keeps the agent silent after
+// it receives the request and measures the timeout from transport completion.
 func TestRelayAcceptanceTimeoutAfterWrittenRequest(t *testing.T) {
 	t.Parallel()
-	c := startStalledExec(t, 20*time.Second, func(*testenv.RelayStream, *ownsandv1.DataFrame) {})
-	c.holdWriter(t, 600*time.Millisecond)
-	c.relay.ResumeReads()
-	r := c.wait(t, 5*time.Second)
-	if testenv.Code(r.err) != connect.CodeUnavailable {
-		t.Fatalf("exec without acceptance: %v after %v, want unavailable", r.err, r.took)
-	}
-	if r.took < bodyDelay+1400*time.Millisecond {
-		t.Fatalf("the acceptance timeout ended the call after %v, want the body delay plus about 0.6 s of queue wait plus 1 s", r.took)
+	c := startStalledExec(t, 20*time.Second, nil)
+	queuedAt := c.releaseBodyAndWaitForEnqueue(t)
+	c.holdWriter(t, queuedAt, 600*time.Millisecond)
+	c.releaseWriter()
+	sentAt := c.waitSent(t)
+	c.relay.WaitFrame("Exec request", c.matchesRequest)
+	r := c.waitResult(t)
+	requireStalledExecError(t, r.err, connect.CodeUnavailable, "the agent did not accept the request")
+	if elapsed := r.completedAt.Sub(sentAt); elapsed < relayAcceptanceWindow-200*time.Millisecond || elapsed > relayAcceptanceWindow+750*time.Millisecond {
+		t.Fatalf("the acceptance timeout ended the call %v after transport send completion, want about %v", elapsed, relayAcceptanceWindow)
 	}
 }
