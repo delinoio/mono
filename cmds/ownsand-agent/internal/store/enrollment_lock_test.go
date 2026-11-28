@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -168,38 +169,54 @@ func TestEnrollmentLockExcludesOtherStores(t *testing.T) {
 	lockEnrollment(t, second)()
 }
 
+// enrollmentWaitContext observes the Done call in the polling wait.
+// LockEnrollment reaches that call only after the file lock reports contention.
+type enrollmentWaitContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (c *enrollmentWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
 // TestEnrollmentLockWaitsForRelease checks that a waiting attempt takes the
 // lock once the holder releases it.
 func TestEnrollmentLockWaitsForRelease(t *testing.T) {
 	dir := t.TempDir()
 	first, second := openStore(t, dir), openStore(t, dir)
-	unlock := lockEnrollment(t, first)
+	releaseHolder := lockEnrollment(t, first)
+	defer releaseHolder()
 
-	type result struct {
-		unlock func()
-		err    error
-	}
-	got := make(chan result, 1)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	waitCtx := &enrollmentWaitContext{Context: ctx, waiting: make(chan struct{})}
+	got := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		u, err := second.LockEnrollment(ctx)
-		got <- result{u, err}
+		release, err := second.LockEnrollment(waitCtx)
+		if err == nil {
+			release()
+		}
+		got <- err
 	}()
 	select {
-	case r := <-got:
-		if r.unlock != nil {
-			r.unlock()
+	case <-waitCtx.waiting:
+	case err := <-got:
+		t.Fatalf("contender returned before reaching the polling wait: %v", err)
+	case <-ctx.Done():
+		t.Fatal("contender did not reach the polling wait before the deadline")
+	}
+	releaseHolder()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatalf("contender failed to acquire the lock after release: %v", err)
 		}
-		t.Fatalf("the waiting attempt returned while the lock was held: %v", r.err)
-	case <-time.After(100 * time.Millisecond):
+	case <-ctx.Done():
+		t.Fatal("contender did not acquire and release the lock before the deadline")
 	}
-	unlock()
-	r := <-got
-	if r.err != nil {
-		t.Fatal(r.err)
-	}
-	r.unlock()
 }
 
 // TestEnrollmentLockFileMode checks that the lock file is private where the
