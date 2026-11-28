@@ -10,8 +10,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -175,42 +173,6 @@ func newReadManager(root string, now func() time.Time, logger *slog.Logger) (*re
 // snapshotDirPrefix is the name prefix of the unique snapshot directory of one
 // read manager.
 const snapshotDirPrefix = "snapshots-"
-
-// clearReadRoot removes every earlier snapshot below root.
-//
-// Workaround (Windows only): a snapshot worker of an earlier manager that
-// outlived its close (see readManager.close) can still hold an open handle on
-// a file in its own snapshots-* directory, and Windows refuses to delete a
-// directory tree with an open handle. Failing here would keep the replacement
-// helper from starting. On Windows, a snapshots-* directory that cannot be
-// removed is therefore left in place with a warning: nothing refers to it, so
-// it is unreachable, and the next start removes it once the handle is closed.
-// Remove this tolerance if workers can no longer outlive close, or if the
-// state directory is no longer shared by a replacement in the same process
-// lifetime. Every other removal error still fails the start.
-func clearReadRoot(root string, logger *slog.Logger) error {
-	err := os.RemoveAll(root)
-	if err == nil || runtime.GOOS != "windows" {
-		return err
-	}
-	entries, readErr := os.ReadDir(root)
-	if readErr != nil {
-		return err
-	}
-	for _, entry := range entries {
-		path := filepath.Join(root, entry.Name())
-		rmErr := os.RemoveAll(path)
-		if rmErr == nil {
-			continue
-		}
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), snapshotDirPrefix) {
-			return rmErr
-		}
-		logger.Warn("old read snapshot directory is still in use and stays until the next start",
-			"error", sanitizedError(rmErr))
-	}
-	return nil
-}
 
 // begin registers one call for readID. The first call starts the snapshot.
 func (m *readManager) begin(readID, path string) (*readEntry, error) {

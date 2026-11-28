@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -21,28 +20,35 @@ func TestReadStartupHeldSnapshotLogsNoPath(t *testing.T) {
 	const stateMarker = "private-state"
 	const snapshotMarker = "snapshots-private-old"
 	const fileMarker = "private-held-file"
-	root := filepath.Join(t.TempDir(), stateMarker, "reads")
+	state := filepath.Join(t.TempDir(), stateMarker)
+	root := filepath.Join(state, "reads")
 	old := filepath.Join(root, snapshotMarker)
 	heldPath := filepath.Join(old, fileMarker)
 	held := holdReadStartupFile(t, heldPath)
+	if err := os.Remove(heldPath); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("native removal of file without delete sharing: %v, want ERROR_SHARING_VIOLATION (%d)", err, windows.ERROR_SHARING_VIOLATION)
+	}
+	t.Logf("native deletion conflict: ERROR_SHARING_VIOLATION (%d)", windows.ERROR_SHARING_VIOLATION)
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 
-	first, err := newReadManager(root, time.Now, logger)
+	cfg := Config{StateDir: state, Logger: logger}
+	first, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.dir == old || filepath.Dir(first.dir) != root {
-		t.Fatalf("new snapshot directory %q is not distinct from %q under the same root", first.dir, old)
+	t.Cleanup(func() { _ = first.Close() })
+	if first.reads.dir == old || filepath.Dir(first.reads.dir) != root {
+		t.Fatalf("new snapshot directory %q is not distinct from %q under the same root", first.reads.dir, old)
 	}
-	if info, err := os.Stat(first.dir); err != nil || !info.IsDir() {
+	if info, err := os.Stat(first.reads.dir); err != nil || !info.IsDir() {
 		t.Fatalf("new snapshot directory was not created: %v", err)
 	}
 	if _, err := os.Stat(heldPath); err != nil {
 		t.Fatalf("old snapshot file after startup: %v", err)
 	}
-	if !first.close(time.Second) {
-		t.Fatal("could not close the first read manager")
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	var warning map[string]string
@@ -53,7 +59,7 @@ func TestReadStartupHeldSnapshotLogsNoPath(t *testing.T) {
 	if warning["level"] != "WARN" || warning["msg"] != message {
 		t.Fatalf("unexpected startup warning: %v", warning)
 	}
-	if cause := warning["error"]; cause != windows.ERROR_SHARING_VIOLATION.Error() && cause != windows.ERROR_ACCESS_DENIED.Error() {
+	if cause := warning["error"]; cause != windows.ERROR_SHARING_VIOLATION.Error() {
 		t.Errorf("unexpected removal reason: %q", cause)
 	}
 	if path, ok := warning["path"]; ok {
@@ -69,11 +75,11 @@ func TestReadStartupHeldSnapshotLogsNoPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs.Reset()
-	second, err := newReadManager(root, time.Now, logger)
+	second, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { second.close(time.Second) })
+	t.Cleanup(func() { _ = second.Close() })
 	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old snapshot directory after restarting with the handle closed: %v, want not exist", err)
 	}
@@ -82,17 +88,15 @@ func TestReadStartupHeldSnapshotLogsNoPath(t *testing.T) {
 	}
 }
 
-func TestReadStartupHeldFileOutsideSnapshotFails(t *testing.T) {
+func TestWindowsReadSnapshotCleanupHeldFileOutsideSnapshotFails(t *testing.T) {
 	t.Parallel()
-	root := filepath.Join(t.TempDir(), "reads")
+	state := t.TempDir()
+	root := filepath.Join(state, "reads")
 	holdReadStartupFile(t, filepath.Join(root, "unexpected-file"))
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 
-	_, err := newReadManager(root, time.Now, logger)
-	if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-		t.Fatalf("startup with a held file directly under reads: %v, want a removal error", err)
-	}
+	assertReadStartupCleanupFailure(t, Config{StateDir: state, Logger: logger}, windows.ERROR_SHARING_VIOLATION, "unexpected-file")
 	if logs.Len() != 0 {
 		t.Fatalf("unexpected warning for fatal cleanup error: %s", &logs)
 	}
