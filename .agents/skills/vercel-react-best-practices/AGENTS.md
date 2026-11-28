@@ -511,7 +511,9 @@ function AnimationPlayer({ enabled, setEnabled }: { enabled: boolean; setEnabled
 }
 ```
 
-The `typeof window !== 'undefined'` check prevents bundling this module for SSR, optimizing server bundle size and build speed.
+React runs this effect only on the client, after a render commits. In the browser, the effect evaluates the dynamic `import()` only when the feature is enabled, no frames are loaded, and `window` is available.
+
+A server build can still emit the imported module in an async chunk. To omit the module from server assets, use a client-only boundary that your bundler excludes from the server build or a condition that the bundler can resolve to false at build time. Build for production and search the emitted server JavaScript, including async chunks, for the module or a distinctive string from it.
 
 ### 2.3 Defer Non-Critical Third-Party Libraries
 

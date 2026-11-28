@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "7326b659248d529fc1bd4fb048658e6ae75438bfea28fa1d5fecd19380b4c6f7",
+        "AGENTS.md": "b2b85341bd52973e0e1a55fcbf3a62a6788a482e8ab8ae5931d94e181fee9ca4",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -91,7 +91,7 @@
         "rules/async-suspense-boundaries.md": "de05fedac2eb7ae563b887b5a424464ec3dfaf84e5b7797467ebe2a796ac8afc",
         "rules/bundle-analyzable-paths.md": "62090b5c815fd71bf1133dce754f51abc16a9456d0ccd025fd627de27726e92a",
         "rules/bundle-barrel-imports.md": "e648f6d54525f07a691357040ca5bff6ea3424788a91ff63812adb29622a671b",
-        "rules/bundle-conditional.md": "09c8259c3efb04fc0abb8e412ccbda217c222ae8118516283e571c995fe3a7d4",
+        "rules/bundle-conditional.md": "650089a329e49c0cece1de41c013a6ebaddd22483e28944ec5234fcd7f134c58",
         "rules/bundle-defer-third-party.md": "3dd76efed1f2d2bb0c6d37adaf3618ffc5eb9a83386bed5f8356cf7fd5dc7876",
         "rules/bundle-dynamic-imports.md": "c3a6977b7611d63d9c99516d5f83c938b77e436c17fac57ebdc3a8ca6045aa8d",
         "rules/bundle-preload.md": "ed606ad34f9e5573573a833f498e7b938fd1a445b43e16c5d437c2a071864b5f",
