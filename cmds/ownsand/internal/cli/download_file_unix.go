@@ -8,9 +8,24 @@ import (
 	"context"
 	"io"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+func prepareDownloadReplacement(f *os.File, destination os.FileInfo) error {
+	stage, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	gid := destination.Sys().(*syscall.Stat_t).Gid
+	if stage.Sys().(*syscall.Stat_t).Gid != gid {
+		if err := f.Chown(-1, int(gid)); err != nil {
+			return err
+		}
+	}
+	return f.Chmod(destination.Mode().Perm())
+}
 
 func downloadFileWriter(ctx context.Context, f *os.File) (io.Writer, error) {
 	info, err := f.Stat()
