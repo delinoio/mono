@@ -452,7 +452,7 @@ func TestVirtualizationIntegration(t *testing.T) {
 		e.requireCanceledSnapshot(sb.GetSandboxId(), "vm.state", "disk.img")
 	}
 	e.requireCanceledSnapshot(sb.GetSandboxId(), "disk.img", "")
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || !execSucceeded(ex) {
 		t.Fatalf("source did not resume after cancellation: %q %v", out, ex)
 	}
 	start = time.Now()
@@ -488,7 +488,7 @@ func TestVirtualizationIntegration(t *testing.T) {
 		if fallback.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
 			t.Fatalf("restore path after invalid memory state %v", fallback.GetRestorePath())
 		}
-		if out, ex := e.exec(fallback.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+		if out, ex := e.exec(fallback.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || !execSucceeded(ex) {
 			t.Fatalf("sandbox after invalid memory state %q %v", out, ex)
 		}
 		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: fallback.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {

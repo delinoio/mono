@@ -206,7 +206,7 @@ func TestVirtualizationMacOSIntegration(t *testing.T) {
 		e.requireCanceledSnapshot(sb.GetSandboxId(), "vm.state", images.MacOSDisk)
 	}
 	e.requireCanceledSnapshot(sb.GetSandboxId(), images.MacOSDisk, images.MacOSAuxStorage)
-	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/var/root/marker"); out != "state\n" || !execSucceeded(ex) {
 		t.Fatalf("source did not resume after cancellation: %q %v", out, ex)
 	}
 

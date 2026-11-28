@@ -174,8 +174,8 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 		t.Helper()
 		out, ex := e.exec(sandboxID, "powershell.exe", "-NoProfile", "-Command", "(Get-Disk -Number (Get-Partition -DriveLetter C).DiskNumber).Size")
 		size, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-		if ex == nil || ex.GetExitCode() != 0 || err != nil || size != windowsDiskGiB<<30 {
-			t.Fatalf("sandbox %s disk bytes = %q, want %d", sandboxID, out, windowsDiskGiB<<30)
+		if !execSucceeded(ex) || err != nil || size != windowsDiskGiB<<30 {
+			t.Fatalf("sandbox %s disk bytes = %q, want %d with exit code 0 (terminal event %q)", sandboxID, out, windowsDiskGiB<<30, ex)
 		}
 	}
 	checkDiskSize(sb.GetSandboxId())

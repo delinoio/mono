@@ -241,8 +241,8 @@ func testHyperVIntegration(t *testing.T, diskSizing bool) {
 		t.Helper()
 		out, ex := e.exec(sandboxID, "/bin/cat", "/sys/block/sda/size")
 		sectors, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-		if ex == nil || ex.GetExitCode() != 0 || err != nil || sectors != (2<<30)/512 {
-			t.Fatalf("sandbox %s disk sectors = %q, want %d", sandboxID, out, (2<<30)/512)
+		if !execSucceeded(ex) || err != nil || sectors != (2<<30)/512 {
+			t.Fatalf("sandbox %s disk sectors = %q, want %d with exit code 0 (terminal event %q)", sandboxID, out, (2<<30)/512, ex)
 		}
 	}
 
