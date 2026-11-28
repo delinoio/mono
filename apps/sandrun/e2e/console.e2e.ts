@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
+import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
 // e2e.config.ts): an in-browser fake control plane and a fake signed-in
@@ -848,6 +849,83 @@ describe("setup with an invalid OwnSand link", () => {
       screen.getByRole("heading", "Integrations", { level: 1 }),
     ).toBeVisible();
   });
+});
+
+describe("setup with inactive GitHub installations", () => {
+  const organizationPath = `/orgs/${ACME}`;
+  const workSource = "Connect GitHub or create an agent integration";
+  const runnerProfile = "Create a runner profile";
+
+  for (const [mode, nextAction, destination] of [
+    ["inactive-github", workSource, "integrations"],
+    ["inactive-github-with-profile", workSource, "integrations"],
+    ["active-github-continuation", runnerProfile, "profiles"],
+    ["failed-github-continuation", undefined, undefined],
+    ["failed-github-continuation-with-agent", runnerProfile, "profiles"],
+  ] as const) {
+    test(`shows shared setup guidance for ${mode}`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await browser.evaluate(
+        ({ key, mode }) => {
+          sessionStorage.setItem(key, mode);
+          return null;
+        },
+        { key: SETUP_GUIDANCE_FIXTURE, mode },
+      );
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(organizationPath);
+
+      const checklist = screen.getByRole("region", "Set up SandRun");
+      await expect(
+        screen.getByRole("heading", "Overview", { level: 1 }),
+      ).toBeVisible();
+      if (nextAction !== undefined) {
+        await expect(checklist.getByRole("link", nextAction)).toHaveAttribute(
+          "href",
+          `${organizationPath}/${destination}`,
+        );
+      } else {
+        await expect(checklist).toBeHidden();
+      }
+      await app.screenshot(`setup-${mode}-overview`);
+
+      await screen.getByRole("link", "Runners").tap();
+      await expect(screen.getByText("No runners match")).toBeVisible();
+      if (nextAction !== undefined) {
+        await expect(screen.getByRole("link", nextAction)).toHaveAttribute(
+          "href",
+          `${organizationPath}/${destination}`,
+        );
+      } else {
+        await expect(
+          screen.getByText("Runners start for waiting requests", {
+            exact: false,
+          }),
+        ).toBeVisible();
+      }
+      await app.screenshot(`setup-${mode}-runners`);
+
+      if (mode === "inactive-github") {
+        await screen.getByRole("link", workSource).tap();
+        await expect(browser).toHaveURL(`${organizationPath}/integrations`);
+        const installations = screen.getByRole("list", "GitHub installations");
+        const suspended = installations
+          .getByRole("listitem")
+          .filter({ hasText: "github-first-page · Suspended" });
+        await expect(suspended.getByRole("button", "Unlink")).toBeVisible();
+        await screen.getByRole("button", "Show more").tap();
+        const deleted = installations
+          .getByRole("listitem")
+          .filter({ hasText: "github-second-page · Deleted" });
+        await expect(deleted.getByRole("button", "Unlink")).toBeVisible();
+        await app.screenshot("setup-inactive-github-integrations");
+      }
+    });
+  }
 });
 
 describe("runners", () => {
@@ -1718,10 +1796,13 @@ describe("runner profiles", () => {
       screen,
     }) => {
       await app.open("/");
-      await browser.evaluate((mode) => {
-        sessionStorage.setItem("sandrun-e2e-setup-guidance", mode);
-        return null;
-      }, mode);
+      await browser.evaluate(
+        ({ key, mode }) => {
+          sessionStorage.setItem(key, mode);
+          return null;
+        },
+        { key: SETUP_GUIDANCE_FIXTURE, mode },
+      );
       await screen.getByRole("button", "Sign in with Delino").tap();
       const organizationPath = `/orgs/${organizationId}`;
       await app.open(organizationPath);

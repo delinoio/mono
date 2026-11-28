@@ -47,6 +47,7 @@ import {
 import { AuditAction, AuditService } from "@delino/sandrun-protos/v1/audit_pb";
 import {
   AgentVendor,
+  GitHubInstallationState,
   GuestOs,
   OwnSandLinkState,
   RequestState,
@@ -92,7 +93,10 @@ import { QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { StrictMode } from "react";
 import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
-import { linkedSetupTransport } from "../e2e/setup-guidance-fixture.ts";
+import {
+  linkedSetupTransport,
+  setupWithGitHubInstallations,
+} from "../e2e/setup-guidance-fixture.ts";
 import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -4225,7 +4229,6 @@ describe("setup guidance", () => {
       );
       const client = renderConsole(acmePath, { transport });
       const setupMethods: DescMethodUnary[] = [
-        GitHubService.method.listGitHubInstallations,
         AgentIntegrationService.method.listAgentIntegrations,
         RunnerProfileService.method.listRunnerProfiles,
       ];
@@ -4261,6 +4264,78 @@ describe("setup guidance", () => {
       expect(await screen.findByText("No runners match")).toBeTruthy();
       const emptyAction = await screen.findByRole("link", { name: actionName });
       expect(emptyAction.getAttribute("href")).toBe(href);
+    },
+  );
+
+  test.each([
+    { firstState: GitHubInstallationState.SUSPENDED },
+    { firstState: GitHubInstallationState.DELETED, existingProfile: true },
+    { continuation: GitHubInstallationState.DELETED },
+  ])("offers Integrations for inactive installations (%j)", async (options) => {
+    const transport = setupWithGitHubInstallations(
+      createMockTransport(),
+      options,
+    );
+    renderConsole(acmePath, { transport });
+    const actionName = "Connect GitHub or create an agent integration";
+    const checklist = await screen.findByRole("region", {
+      name: "Set up SandRun",
+    });
+    const action = within(checklist).getByRole("link", { name: actionName });
+    expect(action.closest("li")?.getAttribute("data-done")).toBe("false");
+    expect(action.getAttribute("href")).toBe(`${acmePath}/integrations`);
+
+    await click(screen.getByRole("link", { name: "Runners" }));
+    expect(await screen.findByText("No runners match")).toBeTruthy();
+    const emptyAction = await screen.findByRole("link", { name: actionName });
+    expect(emptyAction.getAttribute("href")).toBe(`${acmePath}/integrations`);
+  });
+
+  test("offers a runner profile when an active installation is on a later page", async () => {
+    const transport = setupWithGitHubInstallations(createMockTransport(), {
+      continuation: GitHubInstallationState.ACTIVE,
+    });
+    renderConsole(acmePath, { transport });
+    const action = await screen.findByRole("link", {
+      name: "Create a runner profile",
+    });
+    expect(action.getAttribute("href")).toBe(`${acmePath}/profiles`);
+  });
+
+  test.each([false, true])(
+    "handles a failed GitHub continuation with an agent integration: %s",
+    async (existingAgentIntegration) => {
+      const transport = setupWithGitHubInstallations(createMockTransport(), {
+        continuation: "fail",
+        existingAgentIntegration,
+      });
+      const client = renderConsole(acmePath, { transport });
+      const methodKey = createConnectQueryKey({
+        schema: GitHubService.method.listGitHubInstallations,
+        cardinality: undefined,
+      });
+      await waitFor(() => {
+        const query = client
+          .getQueryCache()
+          .find({ queryKey: methodKey, exact: false });
+        expect(query?.state.status).toBe("error");
+        expect(query?.state.data).toBeUndefined();
+      });
+
+      if (existingAgentIntegration) {
+        const action = await screen.findByRole("link", {
+          name: "Create a runner profile",
+        });
+        expect(action.getAttribute("href")).toBe(`${acmePath}/profiles`);
+      } else {
+        expect(
+          screen.queryByRole("region", { name: "Set up SandRun" }),
+        ).toBeNull();
+        await click(screen.getByRole("link", { name: "Runners" }));
+        expect(
+          await screen.findByText(/Runners start for waiting requests/),
+        ).toBeTruthy();
+      }
     },
   );
 
