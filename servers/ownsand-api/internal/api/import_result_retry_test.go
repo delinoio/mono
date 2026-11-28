@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -199,33 +200,81 @@ func TestImportResultAbandonedClosesChannelAndRecoversCopy(t *testing.T) {
 	}
 }
 
-// TestImportResultRetryStopsOnReplacedChannel checks that the retry of a
-// result whose channel was replaced stops without closing the replacement
-// channel, and that the replacement's state report records the copy.
+// importResultEventLogged matches a command's event and, when set, its channel
+// ID. The retry events carry the command ID but omit the channel ID.
+func importResultEventLogged(env *testenv.Env, event, commandID, channelID string) bool {
+	for _, line := range strings.Split(env.Logs.String(), "\n") {
+		var rec struct {
+			Message   string `json:"msg"`
+			CommandID string `json:"command_id"`
+			ChannelID string `json:"channel_id"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Message == event &&
+			rec.CommandID == commandID && (channelID == "" || rec.ChannelID == channelID) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestImportResultRetryStopsOnReplacedChannel checks that closing a channel
+// stops its retry and that the replacement's initial state report records the
+// copy.
 func TestImportResultRetryStopsOnReplacedChannel(t *testing.T) {
-	env := testenv.New(t, retryTiming(10*time.Second, 1500*time.Millisecond))
+	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
+	old := env.App.Service.Hub.Live(devB.ID)
+	if old == nil {
+		t.Fatal("no original channel")
+	}
+	var reportsBefore int
+	testenv.Eventually(t, "original state report logged", func() bool {
+		reportsBefore = len(stateReportLogs(t, env, devB.ID))
+		return reportsBefore > 0
+	})
 	importID := withholdImportResult(agentB)
 	cmdID := startWithheldImport(t, org, snapID, devB.ID, agentB, importID)
 	fault := importCopyFault(t, env)
 	fault.on("40001", 1<<30)
 
 	sendImportResult(agentB, cmdID)
-	waitLog(t, env, `"msg":"import_result_apply_retry"`)
+	testenv.Eventually(t, "original import result retry", func() bool {
+		return importResultEventLogged(env, "import_result_apply_retry", cmdID, "")
+	})
+
+	// Keep the fault active until the old handler exits so only the
+	// replacement's state report can insert the copy row.
+	agentB.Close()
+	waitConnClosed(t, old)
+	testenv.Eventually(t, "original import result handler to exit", func() bool {
+		return importResultEventLogged(env, "agent_command_result_apply_failed", cmdID, old.ID)
+	})
+	if n := copyRowCount(t, env, snapID, devB.ID); n != 0 {
+		t.Fatalf("copy rows before replacement = %d, want 0", n)
+	}
+	for _, event := range []string{"import_result_apply_recovered", "import_result_apply_abandoned"} {
+		if importResultEventLogged(env, event, cmdID, "") {
+			t.Fatalf("original import result logged %s", event)
+		}
+	}
+
 	fault.off()
-	reconnect(agentB)
-	testenv.Eventually(t, "copy recovered", func() bool { return copyRowCount(t, env, snapID, devB.ID) == 1 })
-	replacement := env.App.Service.Hub.Get(devB.ID)
-	if replacement == nil {
-		t.Fatal("no replacement channel")
+	agentB.Connect() // Waits for the replacement's initial state report acknowledgement.
+	replacement := env.App.Service.Hub.Live(devB.ID)
+	if replacement == nil || replacement == old {
+		t.Fatal("no live replacement channel")
 	}
-	time.Sleep(2 * time.Second) // a retry loop that outlived its channel would have closed the replacement by now
-	if strings.Contains(env.Logs.String(), `"msg":"import_result_apply_abandoned"`) {
-		t.Fatal("the result was abandoned although its channel closed")
+	var reports []int
+	testenv.Eventually(t, "replacement state report logged", func() bool {
+		reports = stateReportLogs(t, env, devB.ID)
+		return len(reports) > reportsBefore
+	})
+	if n := reports[reportsBefore]; n != 1 {
+		t.Fatalf("copies recovered by replacement = %d, want 1", n)
 	}
-	connStaysOpen(t, replacement)
 	if n := copyRowCount(t, env, snapID, devB.ID); n != 1 {
 		t.Fatalf("copy rows = %d, want 1", n)
 	}
+	connStaysOpen(t, replacement)
 }
