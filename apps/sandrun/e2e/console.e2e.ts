@@ -6,6 +6,7 @@ import {
   INTEGRATION_PERMISSION_FIXTURE,
   integrationOpenings,
 } from "./integration-permission-fixture.ts";
+import { ORGANIZATION_CREATION_FIXTURE } from "./organization-creation-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
@@ -249,6 +250,139 @@ describe("leave organization with delayed caller identity", () => {
     expect(await browser.evaluate(() => window.history.length)).toBe(
       historyLength,
     );
+  });
+});
+
+describe("organization creation", () => {
+  const name = "New testing org";
+
+  test("opens the returned organization while the list continuation is held", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "hold-list");
+      return null;
+    }, ORGANIZATION_CREATION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await screen.getByRole("button", "Create organization").tap();
+    const dialog = screen.getByRole("dialog", "Create an organization");
+    await dialog.getByLabel("Organization name").fill(name);
+    await dialog.getByRole("button", "Create").tap();
+
+    await expect
+      .poll(() =>
+        browser.evaluate(
+          () =>
+            window.sandrunOrganizationCreationFixture!.state
+              .continuationPending,
+        ),
+      )
+      .toBe(true);
+    const id = await browser.evaluate(
+      () => window.sandrunOrganizationCreationFixture!.state.createdId,
+    );
+    expect(id).toMatch(/^[0-9a-f-]+$/);
+    await expect(browser).toHaveURL(`/orgs/${id}`);
+    await expect(dialog).toHaveCount(0);
+    await expect(screen.getByText("Set up SandRun")).toBeVisible();
+
+    const switcher = screen.getByRole("combobox", "Organization");
+    await switcher.tap();
+    const option = screen.getByRole("option", name);
+    await expect(option).toHaveCount(0);
+    await app.screenshot("organization-overview-while-list-is-held");
+    await browser.evaluate(() => {
+      window.sandrunOrganizationCreationFixture!.releaseContinuation();
+      return null;
+    });
+    await expect(option).toBeVisible();
+    await app.screenshot("organization-switcher-after-list-refresh");
+  });
+
+  test("keeps the current route and newer dialog after a late create succeeds", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "hold-create");
+      return null;
+    }, ORGANIZATION_CREATION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    const open = screen.getByRole("button", "Create organization");
+    const dialog = screen.getByRole("dialog", "Create an organization");
+    const input = dialog.getByLabel("Organization name");
+    const submit = dialog.getByRole("button", "Create");
+    await open.tap();
+    await input.fill(name);
+    await submit.tap();
+    await expect
+      .poll(() =>
+        browser.evaluate(
+          () => window.sandrunOrganizationCreationFixture!.state.createPending,
+        ),
+      )
+      .toBe(true);
+
+    await browser.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await open.tap();
+    await input.fill("Newer draft");
+    await browser.evaluate(() => {
+      window.sandrunOrganizationCreationFixture!.releaseCreate();
+      return null;
+    });
+    await expect(
+      browser.locator('ul[aria-label="Your organizations"]'),
+    ).toContainText(name);
+    await expect(browser).toHaveURL("/");
+    await expect(dialog).toBeVisible();
+    await expect(input).toHaveValue("Newer draft");
+    await expect(submit).toBeEnabled();
+    await app.screenshot("newer-dialog-after-late-organization-create");
+  });
+
+  test("shows a create error and allows retry in the same dialog", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "fail-create");
+      return null;
+    }, ORGANIZATION_CREATION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await screen.getByRole("button", "Create organization").tap();
+    const dialog = screen.getByRole("dialog", "Create an organization");
+    const input = dialog.getByLabel("Organization name");
+    const submit = dialog.getByRole("button", "Create");
+    await input.fill(name);
+    await submit.tap();
+
+    await expect(
+      dialog.getByText("Something went wrong. Try again."),
+    ).toBeVisible();
+    await expect(input).toHaveValue(name);
+    await expect(submit).toBeEnabled();
+    await expect(browser).toHaveURL("/");
+    await app.screenshot("organization-create-error-before-retry");
+
+    await submit.tap();
+    await expect(screen.getByText("Set up SandRun")).toBeVisible();
+    const id = await browser.evaluate(
+      () => window.sandrunOrganizationCreationFixture!.state.createdId,
+    );
+    await expect(browser).toHaveURL(`/orgs/${id}`);
+    await expect(dialog).toHaveCount(0);
+    await app.screenshot("organization-overview-after-retry");
   });
 });
 
