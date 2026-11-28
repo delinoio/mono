@@ -535,6 +535,7 @@ describe("credentials", () => {
       expect(error.cause).toBe(reason);
       resolveToken("late-token");
       await h.clock.settle();
+      expect(h.api.fetchedUrls).toHaveLength(0);
       expect(h.api.calls).toHaveLength(0);
       expect(getEventListeners(abort.signal, "abort")).toHaveLength(before);
     });
