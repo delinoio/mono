@@ -485,21 +485,37 @@ describe("runner profile form", () => {
       };
       expect(profileErrors(form, undefined)).toEqual({});
       const profile = profileFromForm(form);
-      expect(() =>
-        toBinary(
-          CreateRunnerProfileRequestSchema,
-          create(CreateRunnerProfileRequestSchema, { profile }),
-        ),
-      ).not.toThrow();
-      expect(() =>
-        toBinary(
-          UpdateRunnerProfileRequestSchema,
-          create(UpdateRunnerProfileRequestSchema, {
-            profile,
-            updateMask: profileUpdateMask(emptyProfileForm(), form),
-          }),
-        ),
-      ).not.toThrow();
+      const createRequest = create(CreateRunnerProfileRequestSchema, {
+        profile,
+      });
+      const updateRequest = create(UpdateRunnerProfileRequestSchema, {
+        profile,
+        updateMask: profileUpdateMask(emptyProfileForm(), form),
+      });
+      const decodedCreate = fromBinary(
+        CreateRunnerProfileRequestSchema,
+        toBinary(CreateRunnerProfileRequestSchema, createRequest),
+      );
+      const decodedUpdate = fromBinary(
+        UpdateRunnerProfileRequestSchema,
+        toBinary(UpdateRunnerProfileRequestSchema, updateRequest),
+      );
+
+      const expectedResources = {
+        vcpuCount: resources.vcpuCount,
+        memoryMib: BigInt(resources.memoryMib),
+        diskGib: BigInt(resources.diskGib),
+      };
+      expect(decodedCreate.profile?.resources).toMatchObject(expectedResources);
+      expect(decodedUpdate.profile?.resources).toMatchObject(expectedResources);
+      expect(decodedUpdate.updateMask?.paths).toEqual([
+        "name",
+        "resources.vcpu_count",
+        "resources.memory_mib",
+        "resources.disk_gib",
+        "idle_ttl",
+        "max_queue_wait",
+      ]);
     },
   );
 
