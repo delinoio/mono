@@ -25,9 +25,14 @@ const bundler = {
   sha256: "3584509319122de69155798e3bf6ab931e1bb9165d80e7536cb53ab6ce7bb6f6",
 };
 
-// Debian portion of Tauri commit 6620118f0fe85472abfdccea8d99fd0ec9447c3f.
+// Linux portion of Tauri commit 6620118f0fe85472abfdccea8d99fd0ec9447c3f.
 // CEF 154 no longer ships standalone ANGLE libraries. Remove this backport
 // when the published CLI pin includes the fix.
+const angleCopyLists = [
+  "src/bundle/linux/debian.rs",
+  "src/bundle/linux/rpm.rs",
+  "src/bundle/linux/appimage/sharun_cef.rs",
+];
 const angleFiles =
   '      // ANGLE support\n      "libEGL.so",\n      "libGLESv2.so",\n';
 
@@ -51,12 +56,14 @@ async function unpackCrate(workDir, { name, version, sha256 }) {
   return join(workDir, packageName);
 }
 
-export async function debianCli() {
+export async function linuxCefCli() {
   const manifest = JSON.parse(
     readFileSync(new URL("./package.json", import.meta.url)),
   );
   if (manifest.devDependencies["@tauri-apps/cli"] !== cli.version) {
-    throw new Error("Review the Debian backport for the new Tauri CLI version");
+    throw new Error(
+      "Review the Linux CEF backport for the new Tauri CLI version",
+    );
   }
   const rustc = execFileSync("rustc", ["-vV"], { encoding: "utf8" });
   const host = /^host: (.+)$/m.exec(rustc)?.[1];
@@ -70,7 +77,7 @@ export async function debianCli() {
   const cacheVersion = createHash("sha256")
     .update(cli.sha256)
     .update(bundler.sha256)
-    .update(angleFiles)
+    .update(JSON.stringify([angleCopyLists, angleFiles]))
     .digest("hex");
   const cacheDir = join(
     cache,
@@ -86,16 +93,20 @@ export async function debianCli() {
   const workDir = mkdtempSync(join(cacheDir, "build-"));
   try {
     console.error(
-      `Building Tauri CLI ${cli.version} with the Debian CEF backport`,
+      `Building Tauri CLI ${cli.version} with the Linux CEF backport`,
     );
     const cliDir = await unpackCrate(workDir, cli);
     const bundlerDir = await unpackCrate(workDir, bundler);
-    const debianSource = join(bundlerDir, "src/bundle/linux/debian.rs");
-    const source = readFileSync(debianSource, "utf8");
-    if (!source.includes(angleFiles)) {
-      throw new Error("Could not locate the pinned Debian ANGLE copy list");
+    for (const copyList of angleCopyLists) {
+      const sourcePath = join(bundlerDir, copyList);
+      const source = readFileSync(sourcePath, "utf8");
+      if (!source.includes(angleFiles)) {
+        throw new Error(
+          `Could not locate the pinned ANGLE copy list in ${copyList}`,
+        );
+      }
+      writeFileSync(sourcePath, source.replace(angleFiles, ""));
     }
-    writeFileSync(debianSource, source.replace(angleFiles, ""));
 
     // Keep the published lockfile and dependency graph. An empty workspace
     // isolates the extracted CLI when the cache is inside a Cargo workspace.
