@@ -27,6 +27,11 @@ describe("development server configuration", () => {
         "must be an origin without a path, query or fragment",
       ],
       [
+        "a path with surrounding nonbreaking spaces",
+        "\u00a0https://api.example.test/path\u00a0",
+        "must be an origin without a path, query or fragment",
+      ],
+      [
         "an empty user-info delimiter",
         "https://@api.test",
         "must use an authority without @, tabs or line breaks",

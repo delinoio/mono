@@ -44,6 +44,15 @@ describe("console configuration plugin", () => {
   );
 
   describe.each(["production", "development"] as const)("%s mode", (mode) => {
+    test.each(["\u00a0https://api.example.test/\u00a0", "\u00a0"])(
+      "initializes with API origin %j",
+      async (value) => {
+        await expect(
+          initConsoleConfig(mode, { PUBLIC_API_ORIGIN: value }),
+        ).resolves.toBeDefined();
+      },
+    );
+
     test.each(["PUBLIC_API_ORIGIN", "PUBLIC_LOGTO_ENDPOINT"] as const)(
       "rejects a malformed authority in %s",
       async (name) => {

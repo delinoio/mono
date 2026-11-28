@@ -73,6 +73,28 @@ describe("configuration", () => {
   const authorityError = "must use an authority without @, tabs or line breaks";
 
   describe.each([false, true])("production=%s", (production) => {
+    test.each([
+      ["\u00a0https://api.example.test/\u00a0", "https://api.example.test"],
+      ["\u00a0", DEFAULT_API_ORIGIN],
+    ])("resolves API origin %j to %s", (value, origin) => {
+      expect(
+        readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production })
+          .apiOrigin,
+      ).toBe(origin);
+    });
+
+    test.each([
+      [
+        "\u00a0https://api.example.test/path\u00a0",
+        "must be an origin without a path, query or fragment",
+      ],
+      ["https://api.exa\u00a0mple.test", "is not a valid URL"],
+    ])("rejects API origin %j", (value, error) => {
+      expect(() =>
+        readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production }),
+      ).toThrow(new Error(`PUBLIC_API_ORIGIN ${error}`));
+    });
+
     test("normalizes a complete Logto registration and requests sandrun:use", () => {
       const config = readConsoleConfig(
         {

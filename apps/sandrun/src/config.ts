@@ -65,11 +65,10 @@ export function resolveOrigin(
   value: string | undefined,
   fallback: string,
 ): string {
-  const raw =
-    value === undefined || /^[\t-\r ]*$/.test(value) ? fallback : value;
+  const input = value?.trim() || fallback;
   let url: URL;
   try {
-    url = new URL(raw);
+    url = new URL(input);
   } catch {
     throw new Error(`${name} is not a valid URL`);
   }
@@ -81,7 +80,7 @@ export function resolveOrigin(
   }
   // URL parsing can remove dot segments and treat backslashes as slashes.
   // Check the written form so a value that hides a path still fails.
-  const authority = /^https?:\/\/([^/?#\\]+)\/?$/i.exec(raw.trim())?.[1];
+  const authority = /^https?:\/\/([^/?#\\]+)\/?$/i.exec(input)?.[1];
   if (url.pathname !== "/" || authority === undefined) {
     throw new Error(
       `${name} must be an origin without a path, query or fragment`,
