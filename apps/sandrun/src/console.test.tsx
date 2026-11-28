@@ -60,6 +60,7 @@ import {
   type ListInvitationsRequest,
   type ListMembersRequest,
   MemberService,
+  type RemoveMemberRequest,
   type RevokeInvitationRequest,
 } from "@delino/sandrun-protos/v1/member_pb";
 import {
@@ -585,6 +586,149 @@ describe("organizations", () => {
         .getByRole("link", { name: "OwnSand console" })
         .getAttribute("href"),
     ).toBe("https://ownsand.delino.io");
+  });
+});
+
+describe("member removal confirmation", () => {
+  const organizationId = MOCK_IDS.acme;
+  const target = {
+    organizationId,
+    userId: "fixture-target",
+    displayName: "Target Member",
+    role: Role.MEMBER,
+  };
+
+  async function openRemoval() {
+    const mock = createMockTransport();
+    const organizationApi = createClient(OrganizationService, mock);
+    const fixture = {
+      role: Role.ADMIN,
+      members: [target],
+      nextPageToken: "",
+      memberReads: 0,
+      organizationReads: 0,
+    };
+    const remove = rs.fn(async (request: RemoveMemberRequest) => {
+      fixture.members = fixture.members.filter(
+        (member) => member.userId !== request.userId,
+      );
+      return {};
+    });
+    const fixtureTransport = createRouterTransport((router) => {
+      router.service(MemberService, {
+        async listMembers({ pageToken }) {
+          fixture.memberReads += 1;
+          if (pageToken)
+            throw new ConnectError("Continuation failed", Code.Internal);
+          return {
+            members: fixture.members,
+            nextPageToken: fixture.nextPageToken,
+          };
+        },
+        removeMember: (request) => remove(request),
+      });
+      router.service(OrganizationService, {
+        async getOrganization(request) {
+          fixture.organizationReads += 1;
+          const { organization } =
+            await organizationApi.getOrganization(request);
+          if (!organization) throw new Error("Missing fixture organization");
+          return {
+            organization: { ...organization, callerRole: fixture.role },
+          };
+        },
+      });
+    });
+    const queryClient = renderConsole(`/orgs/${organizationId}/members`, {
+      transport: {
+        ...mock,
+        unary(method, ...args) {
+          return ["GetOrganization", "ListMembers", "RemoveMember"].includes(
+            method.name,
+          )
+            ? fixtureTransport.unary(method, ...args)
+            : mock.unary(method, ...args);
+        },
+      },
+    });
+    await click(await screen.findByRole("button", { name: "Remove" }));
+    await screen.findByRole("alertdialog", { name: "Remove Target Member?" });
+    return { fixture, queryClient, remove };
+  }
+
+  test.each(["demotion", "absence", "promotion"] as const)(
+    "dismisses the confirmation on %s until the user opens it again",
+    async (change) => {
+      const { fixture, queryClient, remove } = await openRemoval();
+      const oldConfirm = screen.getByRole("button", { name: "Remove member" });
+      switch (change) {
+        case "demotion":
+          fixture.role = Role.MEMBER;
+          break;
+        case "absence":
+          fixture.members = [];
+          break;
+        case "promotion":
+          fixture.members = [{ ...target, role: Role.OWNER }];
+          break;
+      }
+      await refetch(queryClient);
+      await waitFor(() => {
+        expect(
+          screen.queryByRole("button", { name: "Remove", hidden: true }),
+        ).toBeNull();
+        expect(screen.queryByRole("alertdialog")).toBeNull();
+      });
+      await click(oldConfirm);
+      expect(remove).not.toHaveBeenCalled();
+
+      fixture.role = Role.ADMIN;
+      fixture.members = [target];
+      await refetch(queryClient);
+      const open = await screen.findByRole("button", { name: "Remove" });
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(remove).not.toHaveBeenCalled();
+      await click(open);
+      await screen.findByRole("alertdialog", { name: "Remove Target Member?" });
+    },
+  );
+
+  test("waits for the selected member after a partial roster and a failed continuation", async () => {
+    const { fixture, queryClient, remove } = await openRemoval();
+    fixture.members = [];
+    fixture.nextPageToken = "next";
+    await refetch(queryClient);
+    await waitFor(() => {
+      expect(fixture.memberReads).toBe(3);
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", { name: "Remove member" })
+          .disabled,
+      ).toBe(true);
+    });
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+    expect(remove).not.toHaveBeenCalled();
+
+    fixture.members = [{ ...target, displayName: "Renamed Member" }];
+    fixture.nextPageToken = "";
+    await refetch(queryClient);
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Remove Renamed Member?",
+    });
+    const confirm = within(dialog).getByRole<HTMLButtonElement>("button", {
+      name: "Remove member",
+    });
+    expect(confirm.disabled).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+    const { memberReads, organizationReads } = fixture;
+    await click(confirm);
+    await waitFor(() => {
+      expect(fixture.memberReads).toBe(memberReads + 1);
+      expect(fixture.organizationReads).toBe(organizationReads + 1);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    expect(remove).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ organizationId, userId: target.userId }),
+    );
   });
 });
 

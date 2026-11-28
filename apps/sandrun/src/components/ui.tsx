@@ -381,6 +381,7 @@ export function ConfirmDialog({
   title,
   description,
   confirmLabel,
+  confirmDisabled = false,
   onConfirm,
   onOpenChange,
 }: {
@@ -388,6 +389,7 @@ export function ConfirmDialog({
   title: string;
   description: ReactNode;
   confirmLabel: string;
+  confirmDisabled?: boolean;
   onConfirm: (opening: DialogOpening) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -403,7 +405,7 @@ export function ConfirmDialog({
 
   const dialogOpening = useDialogOpening(open);
   const confirm = async () => {
-    if (pending) return;
+    if (pending || confirmDisabled) return;
     const opening = dialogOpening.begin();
     setPending(true);
     setError(undefined);
@@ -436,7 +438,7 @@ export function ConfirmDialog({
           <AlertDialogClose>{t("common.cancel")}</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
-            disabled={pending}
+            disabled={pending || confirmDisabled}
             onClick={confirm}
           >
             {confirmLabel}
