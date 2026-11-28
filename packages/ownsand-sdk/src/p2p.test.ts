@@ -3756,7 +3756,7 @@ describe("peer-to-peer data path", () => {
           frame.payload.case === "fileWriteChunk" &&
           frame.payload.value.offset === 0n
         ) {
-          // Answers the first chunk only: the close arrives between chunks.
+          // Acknowledge the first chunk and leave the second awaiting a result.
           const req = frame.payload.value;
           peer.send({
             streamId: frame.streamId,
@@ -3830,9 +3830,19 @@ describe("peer-to-peer data path", () => {
             }));
             const sandbox = h.client.sandbox(SANDBOX);
             const pending = operations[name]!(sandbox).catch((e) => e);
-            // The session is open and the request is on the channel.
             await h.clock.advance(1_000);
-            expect(rtc.frames.length).toBeGreaterThan(0);
+            if (name === "writeFile") {
+              const chunks = rtc.frames.flatMap(({ payload }) =>
+                payload.case === "fileWriteChunk" ? [payload.value] : [],
+              );
+              expect(chunks.map((chunk) => chunk.offset)).toEqual([
+                0n,
+                1_048_576n,
+              ]);
+              expect(chunks[1]!.writeId).toBe(chunks[0]!.writeId);
+            } else {
+              expect(rtc.frames.length).toBeGreaterThan(0);
+            }
             if (close === "close") {
               sandbox.close();
             } else {
