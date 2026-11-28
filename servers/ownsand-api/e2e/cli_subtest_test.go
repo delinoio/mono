@@ -110,9 +110,7 @@ func TestCLISubtestConfigDirectories(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
-	if err := os.WriteFile(filepath.Join(bins, name), binary, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeExecutable(t, filepath.Join(bins, name), binary, 0o700)
 
 	s := &stack{t: t, bins: bins}
 	var dirs []string
