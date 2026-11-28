@@ -15,6 +15,11 @@ import { ORGANIZATION_CREATION_FIXTURE } from "./organization-creation-fixture.t
 import { MOCK_IDS } from "../src/mock/mock-api.ts";
 import { REQUEST_CANCELLATION_FIXTURE } from "./request-cancellation-fixture.ts";
 import { DISPLAY_NAME_FIXTURE } from "./display-name-fixture.ts";
+import {
+  OWN_SAND_CAPACITY_FIXTURE,
+  REPLACEMENT_DEVICE,
+  REPLACEMENT_ORG,
+} from "./ownsand-capacity-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
@@ -130,6 +135,178 @@ describe("sign-in", () => {
       "href",
       "https://ownsand.delino.io",
     );
+  });
+});
+
+describe("capacity after changing the OwnSand link", () => {
+  for (const result of ["device", "error"] as const) {
+    test(`loads replacement capacity with result: ${result}`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await browser.evaluate((key) => {
+        sessionStorage.setItem(key, "enabled");
+        return null;
+      }, OWN_SAND_CAPACITY_FIXTURE);
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await screen.getByRole("link", "Northwind Labs Member").tap();
+      const pool = screen.getByRole("region", "Device pool");
+      await expect(pool.getByText("northwind-build-box")).toBeVisible();
+      const otherReads = await browser.evaluate(
+        () => window.sandrunOwnSandCapacityFixture!.capacityReads.other,
+      );
+
+      const switcher = screen.getByRole("combobox", "Organization");
+      await switcher.tap();
+      await screen.getByRole("option", "Acme Robotics").tap();
+      await expect(pool.getByText("build-box", { exact: true })).toBeVisible();
+      const integrations = screen.getByRole("link", "Integrations", {
+        exact: true,
+      });
+      const overview = screen.getByRole("link", "Overview", { exact: true });
+      const runners = screen.getByRole("link", "Runners", { exact: true });
+
+      await integrations.tap();
+      await screen.getByRole("button", "Remove link").tap();
+      const confirm = screen.getByRole(
+        "alertdialog",
+        "Remove the OwnSand link?",
+      );
+      await confirm.getByRole("button", "Remove link").tap();
+      await expect(screen.getByRole("button", "Link OwnSand")).toBeVisible();
+      await overview.tap();
+      await expect(pool.getByText("OwnSand link required")).toBeVisible();
+
+      await integrations.tap();
+      await screen.getByRole("button", "Link OwnSand").tap();
+      const link = screen.getByRole("dialog", "Link OwnSand");
+      await link.getByLabel("OwnSand organization ID").fill(REPLACEMENT_ORG);
+      await link.getByLabel("OwnSand API key").fill("osk_capacity_fixture");
+      await link.getByRole("button", "Link", { exact: true }).tap();
+      await expect(link).toBeHidden();
+
+      await overview.tap();
+      await expect(
+        pool.getByRole("status", "Loading the device pool"),
+      ).toBeVisible();
+      await expect(pool.getByText("build-box", { exact: true })).toHaveCount(0);
+      await app.screenshot(`relinked-overview-pending-${result}`);
+      await runners.tap();
+      const table = screen.getByRole("table", "Runners");
+      await expect(table.getByText("0193a000…00d1").first()).toBeVisible();
+      await expect(table.getByText("build-box", { exact: true })).toHaveCount(
+        0,
+      );
+      await app.screenshot(`relinked-runners-pending-${result}`);
+      await overview.tap();
+      await expect(
+        pool.getByRole("status", "Loading the device pool"),
+      ).toBeVisible();
+      await expect
+        .poll(() =>
+          browser.evaluate(
+            () =>
+              window.sandrunOwnSandCapacityFixture!.capacityReads.replacement,
+          ),
+        )
+        .toBeGreaterThan(0);
+      await browser.evaluate((value) => {
+        window.sandrunOwnSandCapacityFixture!.releaseCapacity(value);
+        return null;
+      }, result);
+      await expect(
+        pool.getByRole("link", "Manage devices in OwnSand"),
+      ).toHaveAttribute(
+        "href",
+        `https://ownsand.delino.io/orgs/${REPLACEMENT_ORG}/devices`,
+      );
+
+      if (result === "device") {
+        await expect(
+          pool.getByText(REPLACEMENT_DEVICE, { exact: true }),
+        ).toBeVisible();
+        await app.screenshot("relinked-overview-replacement-pool");
+        await switcher.tap();
+        await screen.getByRole("option", "Northwind Labs").tap();
+        await expect(pool.getByText("northwind-build-box")).toBeVisible();
+        expect(
+          await browser.evaluate(
+            () => window.sandrunOwnSandCapacityFixture!.capacityReads.other,
+          ),
+        ).toBe(otherReads);
+      } else {
+        const retry = pool.getByRole("button", "Try again");
+        await expect(retry).toBeVisible();
+        await expect(pool.getByText("build-box", { exact: true })).toHaveCount(
+          0,
+        );
+        await app.screenshot("relinked-overview-capacity-error");
+        await runners.tap();
+        await expect(table.getByText("0193a000…00d1").first()).toBeVisible();
+        await expect(table.getByText("build-box", { exact: true })).toHaveCount(
+          0,
+        );
+        await overview.tap();
+        const loading = pool.getByRole("status", "Loading the device pool");
+        await expect(loading).toBeVisible();
+        await browser.evaluate(() => {
+          window.sandrunOwnSandCapacityFixture!.releaseCapacity("error");
+          return null;
+        });
+        await expect(retry).toBeVisible();
+        await retry.tap();
+        await expect(loading).toBeVisible();
+        await browser.evaluate(() => {
+          window.sandrunOwnSandCapacityFixture!.releaseCapacity("empty");
+          return null;
+        });
+        await expect(
+          pool.getByText("No devices", { exact: true }),
+        ).toBeVisible();
+        await app.screenshot("relinked-overview-empty-after-retry");
+      }
+    });
+  }
+
+  test("keeps the current capacity after a rejected removal", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "enabled");
+      return null;
+    }, OWN_SAND_CAPACITY_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+    const pool = screen.getByRole("region", "Device pool");
+    await expect(pool.getByText("build-box", { exact: true })).toBeVisible();
+
+    const originalReads = await browser.evaluate(
+      () => window.sandrunOwnSandCapacityFixture!.capacityReads.original,
+    );
+    await browser.evaluate(() => {
+      window.sandrunOwnSandCapacityFixture!.rejectNextRemoval();
+      return null;
+    });
+    await screen.getByRole("link", "Integrations", { exact: true }).tap();
+    await screen.getByRole("button", "Remove link").tap();
+    const confirm = screen.getByRole("alertdialog", "Remove the OwnSand link?");
+    await confirm.getByRole("button", "Remove link").tap();
+    await expect(confirm.getByRole("alert")).toBeVisible();
+    await app.screenshot("rejected-removal");
+    await confirm.getByRole("button", "Cancel").tap();
+
+    await screen.getByRole("link", "Overview", { exact: true }).tap();
+    await expect(pool.getByText("build-box", { exact: true })).toBeVisible();
+    expect(
+      await browser.evaluate(
+        () => window.sandrunOwnSandCapacityFixture!.capacityReads.original,
+      ),
+    ).toBe(originalReads);
   });
 });
 

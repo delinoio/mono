@@ -90,7 +90,7 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
-import { QueryClient } from "@tanstack/react-query";
+import { isCancelledError, QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { StrictMode } from "react";
 import {
@@ -1599,6 +1599,121 @@ describe("OwnSand link", () => {
     });
     await settle(60);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test.each([
+    ["Replace API key", "Replace the API key", "Replace key", "SetOwnSandLink"],
+    [
+      "Remove link",
+      "Remove the OwnSand link?",
+      "Remove link",
+      "RemoveOwnSandLink",
+    ],
+  ] as const)(
+    "%s resets only this organization's capacity and discards a late response",
+    async (opener, title, submit, method) => {
+      const transport = createMockTransport();
+      const organizationId = MOCK_IDS.acme;
+      const queryClient = renderConsole(
+        `/orgs/${organizationId}/integrations`,
+        {
+          transport,
+          staleTime: 10_000,
+        },
+      );
+      const capacity = createQueryOptions(
+        WorkService.method.getCapacity,
+        { organizationId },
+        { transport },
+      );
+      const former = await queryClient.fetchQuery(capacity);
+      expect(former.devices.length).toBeGreaterThan(0);
+      const unaffected = [
+        createQueryOptions(
+          WorkService.method.getCapacity,
+          { organizationId: MOCK_IDS.northwind },
+          { transport },
+        ),
+        createQueryOptions(
+          WorkService.method.getCapacity,
+          { organizationId },
+          { transport: createMockTransport() },
+        ),
+      ];
+      for (const { queryKey } of unaffected) {
+        queryClient.setQueryData(queryKey, former);
+      }
+      const runners = createQueryOptions(
+        WorkService.method.listRunners,
+        { organizationId },
+        { transport },
+      );
+      const runnerList = await queryClient.fetchQuery(runners);
+      let releaseFormerCapacity!: () => void;
+      const formerCapacity = new Promise<typeof former>((resolve) => {
+        releaseFormerCapacity = () => resolve(former);
+      });
+      const pending = queryClient
+        .fetchQuery({
+          ...capacity,
+          staleTime: 0,
+          queryFn: () => formerCapacity,
+        })
+        .catch((error: unknown) => error);
+      expect(queryClient.getQueryState(capacity.queryKey)?.fetchStatus).toBe(
+        "fetching",
+      );
+
+      await click(await screen.findByRole("button", { name: opener }));
+      const role = method === "SetOwnSandLink" ? "dialog" : "alertdialog";
+      const dialog = within(await screen.findByRole(role, { name: title }));
+      if (method === "SetOwnSandLink") {
+        await type(dialog.getByLabelText("OwnSand API key"), "osk_fixture");
+      }
+      await click(dialog.getByRole("button", { name: submit }));
+      await waitFor(() =>
+        expect(screen.queryByRole(role, { name: title })).toBeNull(),
+      );
+
+      expect(queryClient.getQueryData(capacity.queryKey)).toBeUndefined();
+      releaseFormerCapacity();
+      expect(isCancelledError(await pending)).toBe(true);
+      expect(queryClient.getQueryData(capacity.queryKey)).toBeUndefined();
+      for (const { queryKey } of unaffected) {
+        expect(queryClient.getQueryData(queryKey)).toBe(former);
+        expect(queryClient.getQueryState(queryKey)?.isInvalidated).toBe(false);
+      }
+      expect(queryClient.getQueryData(runners.queryKey)).toBe(runnerList);
+      expect(queryClient.getQueryState(runners.queryKey)?.isInvalidated).toBe(
+        false,
+      );
+    },
+  );
+
+  test("a rejected key replacement keeps the cached capacity", async () => {
+    const transport = failingTransport("SetOwnSandLink", Code.PermissionDenied);
+    const organizationId = MOCK_IDS.acme;
+    const queryClient = renderConsole(`/orgs/${organizationId}/integrations`, {
+      transport,
+      staleTime: 10_000,
+    });
+    const { queryKey, ...options } = createQueryOptions(
+      WorkService.method.getCapacity,
+      { organizationId },
+      { transport },
+    );
+    const former = await queryClient.fetchQuery({ queryKey, ...options });
+
+    await click(await screen.findByRole("button", { name: "Replace API key" }));
+    const dialog = within(
+      await screen.findByRole("dialog", { name: "Replace the API key" }),
+    );
+    await type(dialog.getByLabelText("OwnSand API key"), "osk_bad_fixture");
+    await click(dialog.getByRole("button", { name: "Replace key" }));
+
+    expect(await dialog.findByRole("alert")).toBeTruthy();
+    expect(queryClient.getQueryData(queryKey)).toBe(former);
+    expect(queryClient.getQueryState(queryKey)?.isInvalidated).toBe(false);
   });
 
   function renderLinkFixture() {
