@@ -1,6 +1,6 @@
 [package]
 name = "delidev"
-version = "0.0.0"
+version = "0.0.1"
 description = "DeliDev desktop and mobile app"
 edition.workspace = true
 license.workspace = true
