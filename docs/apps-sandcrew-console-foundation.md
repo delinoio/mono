@@ -82,7 +82,7 @@ Members of SandRun organizations who sign in with Logto. `owner` and `admin` mem
 
 - The console sends only the user's Logto access token for `https://sandcrew.api.delino.io` (scope `sandcrew:use`) and never receives credential or secret values.
 - Agent output is rendered as untrusted content: Markdown is rendered without raw HTML, links open with `rel="noopener noreferrer"`, and raw JSON is shown as text.
-- Markdown renderer (recorded decision): the console renders a subset of Markdown itself (`src/markdown.tsx`): paragraphs, headings, fenced code blocks, bullet and numbered lists, block quotes, inline code, bold, italic and links. It builds React elements only and allows only `http`, `https` and `mailto` links; other syntax shows as text. A CommonMark library is a new dependency that needs owner approval and a dependency security review; replace the renderer in the change that adds one.
+- Markdown renderer: `react-markdown` with `remark-gfm` (GitHub Flavored Markdown) in `src/markdown.tsx`. It drops raw HTML (`skipHtml`), keeps only `http`, `https` and `mailto` URLs in links and images, opens links with `rel="noopener noreferrer"` and renders message headings below the page headings.
 - Credential and secret forms use password fields (and a file input for the Codex `auth.json`), clear their values after a save and never show a value again. The console checks the `auth.json` file (a JSON object of at most 64 KiB) and the session secret name rules of the control plane before it sends them.
 - No PostHog autocapture and no session recording. Product analytics are server-side only.
 
@@ -100,7 +100,8 @@ The console sends no logs. Errors appear in the user interface with the Connect 
 
 - Upstream: [`sandcrew-api`](servers-sandcrew-api-foundation.md), Logto, the browser Push API.
 - Links: the SandRun console for organizations and members, `https://accounts.delino.io` for account management.
-- New dependencies (for example, a Markdown renderer) need owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds them.
+- Dependencies: the pins of the [SandRun console](apps-sandrun-console-foundation.md#dependencies-and-integrations), and `react-markdown` `10.1.0` and `remark-gfm` `4.0.1` for the Markdown rendering (owner-approved).
+- New dependencies need owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds them.
 
 ## Change Triggers
 

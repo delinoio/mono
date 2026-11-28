@@ -748,6 +748,26 @@ h2 {
   margin: 12px 0 4px;
 }
 
+/* GitHub Flavored Markdown tables scroll inside the message on a phone. */
+.markdown table {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  padding: 6px 10px;
+  border: 1px solid var(--dui-color-border);
+  text-align: left;
+}
+
+.markdown li:has(> input[type="checkbox"]) {
+  list-style: none;
+}
+
 .resource-link {
   margin: 4px 0;
 }

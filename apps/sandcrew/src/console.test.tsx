@@ -395,11 +395,18 @@ describe("chat view", () => {
     const transcript = await screen.findByRole("region", {
       name: "Transcript",
     });
+    const firstMessage = within(transcript).getAllByRole("article", {
+      name: "Your message",
+    })[0]!;
+    expect(firstMessage.textContent).toContain(
+      "Clone https://github.com/example/uploader",
+    );
+    // GitHub Flavored Markdown links a bare URL.
     expect(
-      within(transcript).getByText(
-        /Clone https:\/\/github.com\/example\/uploader/,
-      ),
-    ).toBeTruthy();
+      within(firstMessage)
+        .getByRole("link", { name: "https://github.com/example/uploader" })
+        .getAttribute("rel"),
+    ).toBe("noopener noreferrer");
     // Thoughts start collapsed.
     expect(
       within(transcript)

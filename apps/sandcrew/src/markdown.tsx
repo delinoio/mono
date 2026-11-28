@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { ReactNode } from "react";
-
-/**
- * A small Markdown renderer for agent and user messages. Agent output is
- * untrusted content, so the renderer builds React elements only: it never
- * renders raw HTML, it allows only http, https and mailto links, and links
- * open in a new tab with `rel="noopener noreferrer"`.
- *
- * It supports the subset that coding agents use most: paragraphs, headings,
- * fenced code blocks, bullet and numbered lists, block quotes, inline code,
- * bold, italic and links. Other syntax shows as plain text. A full
- * CommonMark renderer is a new dependency that needs owner approval and a
- * dependency security review (docs/apps-sandcrew-console-foundation.md).
- */
-export function Markdown({ text }: { text: string }) {
-  return <div className="markdown">{renderBlocks(text)}</div>;
-}
+import type { ComponentProps } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 const SAFE_PROTOCOLS: ReadonlySet<string> = new Set([
   "http:",
@@ -33,161 +19,64 @@ export function safeHref(raw: string): string | undefined {
   }
 }
 
-type Block =
-  | { kind: "code"; lang: string; text: string }
-  | { kind: "heading"; level: number; text: string }
-  | { kind: "list"; ordered: boolean; items: string[] }
-  | { kind: "quote"; text: string }
-  | { kind: "paragraph"; text: string };
-
-/** Splits Markdown text into blocks. */
-export function parseBlocks(text: string): Block[] {
-  const lines = text.replaceAll("\r\n", "\n").split("\n");
-  const blocks: Block[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i]!;
-    const fence = /^\s*(```|~~~)\s*([\w+-]*)\s*$/.exec(line);
-    if (fence) {
-      const body: string[] = [];
-      i++;
-      while (i < lines.length && !lines[i]!.trim().startsWith(fence[1]!)) {
-        body.push(lines[i]!);
-        i++;
-      }
-      i++; // closing fence, or the end of an unclosed block
-      blocks.push({
-        kind: "code",
-        lang: fence[2] ?? "",
-        text: body.join("\n"),
-      });
-      continue;
-    }
-    if (line.trim() === "") {
-      i++;
-      continue;
-    }
-    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
-    if (heading) {
-      blocks.push({
-        kind: "heading",
-        level: heading[1]!.length,
-        text: heading[2]!,
-      });
-      i++;
-      continue;
-    }
-    const bullet = /^\s*[-*+]\s+/;
-    const numbered = /^\s*\d+[.)]\s+/;
-    if (bullet.test(line) || numbered.test(line)) {
-      const ordered = numbered.test(line);
-      const marker = ordered ? numbered : bullet;
-      const items: string[] = [];
-      while (i < lines.length && marker.test(lines[i]!)) {
-        items.push(lines[i]!.replace(marker, ""));
-        i++;
-      }
-      blocks.push({ kind: "list", ordered, items });
-      continue;
-    }
-    if (/^\s*>/.test(line)) {
-      const quoted: string[] = [];
-      while (i < lines.length && /^\s*>/.test(lines[i]!)) {
-        quoted.push(lines[i]!.replace(/^\s*>\s?/, ""));
-        i++;
-      }
-      blocks.push({ kind: "quote", text: quoted.join("\n") });
-      continue;
-    }
-    const paragraph: string[] = [];
-    while (
-      i < lines.length &&
-      lines[i]!.trim() !== "" &&
-      !/^\s*(```|~~~)/.test(lines[i]!) &&
-      !/^#{1,6}\s/.test(lines[i]!) &&
-      !bullet.test(lines[i]!) &&
-      !numbered.test(lines[i]!) &&
-      !/^\s*>/.test(lines[i]!)
-    ) {
-      paragraph.push(lines[i]!);
-      i++;
-    }
-    blocks.push({ kind: "paragraph", text: paragraph.join("\n") });
-  }
-  return blocks;
+/** Opens agent links in a new tab without access to the console window. */
+function ExternalLink({
+  node: _node,
+  ...props
+}: ComponentProps<"a"> & { node?: unknown }) {
+  return <a {...props} target="_blank" rel="noopener noreferrer" />;
 }
 
-function renderBlocks(text: string): ReactNode[] {
-  return parseBlocks(text).map((block, index) => {
-    switch (block.kind) {
-      case "code":
-        return (
-          <pre key={index} className="code-block">
-            <code data-lang={block.lang || undefined}>{block.text}</code>
-          </pre>
-        );
-      case "heading": {
-        // Message headings stay below the page headings.
-        const Tag = block.level <= 2 ? "h3" : "h4";
-        return <Tag key={index}>{renderInline(block.text)}</Tag>;
-      }
-      case "list": {
-        const Tag = block.ordered ? "ol" : "ul";
-        return (
-          <Tag key={index}>
-            {block.items.map((item, itemIndex) => (
-              <li key={itemIndex}>{renderInline(item)}</li>
-            ))}
-          </Tag>
-        );
-      }
-      case "quote":
-        return <blockquote key={index}>{renderBlocks(block.text)}</blockquote>;
-      case "paragraph":
-        return <p key={index}>{renderInline(block.text)}</p>;
-    }
-  });
+/** Message headings stay below the headings of the page. */
+function MessageHeading({
+  node: _node,
+  ...props
+}: ComponentProps<"h3"> & { node?: unknown }) {
+  return <h3 {...props} />;
 }
 
-// Inline code, links, bold and italic, in order of precedence.
-const INLINE =
-  /(`+)([\s\S]*?[^`])\1(?!`)|\[([^\]\n]+)\]\(([^)\s]+)\)|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|\b_([^_\n]+)_\b/g;
+function MessageSubheading({
+  node: _node,
+  ...props
+}: ComponentProps<"h4"> & { node?: unknown }) {
+  return <h4 {...props} />;
+}
 
-/** Renders inline Markdown as React nodes. Line breaks stay line breaks. */
-export function renderInline(text: string): ReactNode[] {
-  const out: ReactNode[] = [];
-  let last = 0;
-  let key = 0;
-  const pushText = (value: string) => {
-    const parts = value.split("\n");
-    parts.forEach((part, index) => {
-      if (index > 0) out.push(<br key={`br${key++}`} />);
-      if (part !== "") out.push(part);
-    });
-  };
-  for (const match of text.matchAll(INLINE)) {
-    pushText(text.slice(last, match.index));
-    last = match.index + match[0].length;
-    const [, , code, label, href, bold1, bold2, italic1, italic2] = match;
-    if (code !== undefined) {
-      out.push(<code key={key++}>{code.trim()}</code>);
-    } else if (label !== undefined && href !== undefined) {
-      const safe = safeHref(href);
-      out.push(
-        safe === undefined ? (
-          match[0]
-        ) : (
-          <a key={key++} href={safe} target="_blank" rel="noopener noreferrer">
-            {label}
-          </a>
-        ),
-      );
-    } else if ((bold1 ?? bold2) !== undefined) {
-      out.push(<strong key={key++}>{bold1 ?? bold2}</strong>);
-    } else {
-      out.push(<em key={key++}>{italic1 ?? italic2}</em>);
-    }
-  }
-  pushText(text.slice(last));
-  return out;
+function CodeBlock({
+  node: _node,
+  ...props
+}: ComponentProps<"pre"> & { node?: unknown }) {
+  return <pre {...props} className="code-block" />;
+}
+
+const COMPONENTS: Components = {
+  a: ExternalLink,
+  h1: MessageHeading,
+  h2: MessageHeading,
+  h3: MessageSubheading,
+  h4: MessageSubheading,
+  h5: MessageSubheading,
+  h6: MessageSubheading,
+  pre: CodeBlock,
+};
+
+/**
+ * Renders a user or agent message as GitHub Flavored Markdown with
+ * `react-markdown` and `remark-gfm`. Agent output is untrusted content:
+ * raw HTML is dropped, links and images keep only http, https and mailto
+ * URLs, and links open with `rel="noopener noreferrer"`.
+ */
+export function Markdown({ text }: { text: string }) {
+  return (
+    <div className="markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        urlTransform={(url) => safeHref(url)}
+        components={COMPONENTS}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
 }

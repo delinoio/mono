@@ -30,7 +30,7 @@ import {
 import { canManageOrganization, visibleSections } from "./components/shell.tsx";
 import { AuthMode, readConsoleConfig, REQUIRED_API_SCOPE } from "./config.ts";
 import { diffLines, DiffLineKind, MAX_DIFF_CELLS } from "./diff.ts";
-import { parseBlocks, safeHref } from "./markdown.tsx";
+import { safeHref } from "./markdown.tsx";
 import { updateSessionPages } from "./pages/session-list.tsx";
 import {
   draftFromSettings,
@@ -389,20 +389,6 @@ describe("markdown", () => {
     expect(safeHref("javascript:alert(1)")).toBeUndefined();
     expect(safeHref("data:text/html,x")).toBeUndefined();
     expect(safeHref("/relative")).toBeUndefined();
-  });
-
-  test("splits blocks", () => {
-    expect(
-      parseBlocks(
-        "# Title\n\ntext\nmore\n\n- a\n- b\n\n```ts\nconst x = 1;\n```\n> quote",
-      ),
-    ).toEqual([
-      { kind: "heading", level: 1, text: "Title" },
-      { kind: "paragraph", text: "text\nmore" },
-      { kind: "list", ordered: false, items: ["a", "b"] },
-      { kind: "code", lang: "ts", text: "const x = 1;" },
-      { kind: "quote", text: "quote" },
-    ]);
   });
 });
 
