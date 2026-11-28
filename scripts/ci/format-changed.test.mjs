@@ -2162,6 +2162,54 @@ test("explicit false CI behaves exactly like unset CI for non-staged runs", (t) 
   assert.equal(comparison.status, 0, comparison.stderr);
 });
 
+function assertNormalAllResult({ status, signal, error, stdout, stderr }) {
+  const diagnostic = [
+    `--all exited with status ${status}, signal ${signal}`,
+    `Spawn error: ${error?.stack ?? error ?? "none"}`,
+    `stdout:\n${stdout ?? ""}`,
+    `stderr:\n${stderr ?? ""}`,
+  ].join("\n");
+  // Status 1 can report unrelated formatting differences in the fixture.
+  assert.ok(status === 0 || status === 1, diagnostic);
+  assert.doesNotMatch(
+    `${stdout ?? ""}${stderr ?? ""}`,
+    /ci_format_error/u,
+    diagnostic,
+  );
+}
+
+test("the --all result assertion rejects abnormal exits and formatter errors", () => {
+  const result = { status: 0, signal: null, stdout: "", stderr: "" };
+  assertNormalAllResult(result);
+  assertNormalAllResult({ ...result, status: 1 });
+  for (const status of [2, 143]) {
+    assert.throws(() => assertNormalAllResult({ ...result, status }), {
+      message: new RegExp(`status ${status}, signal null`, "u"),
+    });
+  }
+  assert.throws(
+    () => assertNormalAllResult({ ...result, status: null, signal: "SIGTERM" }),
+    /status null, signal SIGTERM/u,
+  );
+  assert.throws(
+    () =>
+      assertNormalAllResult({
+        ...result,
+        status: null,
+        error: new Error("spawn failed"),
+        stdout: "captured stdout",
+        stderr: "captured stderr",
+      }),
+    /Spawn error: Error: spawn failed[\s\S]*stdout:\ncaptured stdout\nstderr:\ncaptured stderr/u,
+  );
+  for (const stream of ["stdout", "stderr"]) {
+    assert.throws(
+      () => assertNormalAllResult({ ...result, [stream]: "ci_format_error" }),
+      { message: new RegExp(`${stream}:\nci_format_error`, "u") },
+    );
+  }
+});
+
 // Parent-path breakage: a tracked `a/b.ts` whose parent `a` became a regular
 // file (ENOTDIR), a self-referencing symlink (ELOOP) or a symlink to a
 // directory outside the repository (SYMLINK). Git accepts all of them.
@@ -2255,11 +2303,7 @@ for (const {
           env: f.env,
           encoding: "utf8",
         });
-      // `--all` may exit 1 for unrelated fixture files; 2 is the crash code.
-      const all = run(["--all"]);
-      const allOutput = `--all: ${all.stdout}${all.stderr}`;
-      assert.notEqual(all.status, 2, allOutput);
-      assert.doesNotMatch(allOutput, /ci_format_error/u);
+      assertNormalAllResult(run(["--all"]));
       const staged = run(["--staged", "--write"]);
       const stagedOutput = `--staged --write: ${staged.stdout}${staged.stderr}`;
       assert.equal(staged.status, 2, stagedOutput);
