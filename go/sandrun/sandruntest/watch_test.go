@@ -138,3 +138,56 @@ func TestWatchQueueSendsEachUpdateToOneWatch(t *testing.T) {
 	requireQueueEOF(t, firstWatch)
 	requireQueueEOF(t, secondWatch)
 }
+
+func TestWatchQueueSnapshotProjectsDevSessionRequests(t *testing.T) {
+	t.Parallel()
+	s := New()
+	t.Cleanup(s.Close)
+	s.NewSessionState = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	_, ds := createExecTestSession(t, ctx, s, t.TempDir())
+	_, other := createExecTestSession(t, ctx, s, t.TempDir())
+	org, id := ds.GetOrganizationId(), ds.GetDevSessionId()
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	seed := &sandrunv1.Request{OrganizationId: org, RequestId: "standalone", State: ds.GetState()}
+	s.AddRequest(seed)
+	s.AddRequest(&sandrunv1.Request{OrganizationId: org, RequestId: id, State: ds.GetState()})
+
+	watch, err := client.WatchQueue(ctx, listTestRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = watch.Close() })
+	seen := make(map[string]*sandrunv1.Request)
+	for watch.Receive() && watch.Msg().GetSnapshotComplete() == nil {
+		r := watch.Msg().GetRequest()
+		if r == nil || seen[r.GetRequestId()] != nil {
+			t.Fatalf("unexpected snapshot event %v", watch.Msg())
+		}
+		seen[r.GetRequestId()] = r
+	}
+	if watch.Msg().GetSnapshotComplete() == nil || len(seen) != 2 || seen[other.GetDevSessionId()] != nil ||
+		!proto.Equal(seen[seed.GetRequestId()], seed) {
+		t.Fatalf("unexpected snapshot %v, last event %v, error %v", seen, watch.Msg(), watch.Err())
+	}
+	requireDevSessionWorkRequest(t, seen[id], ds, sandrunv1.Priority_PRIORITY_NORMAL)
+
+	_, err = client.CancelRequest(ctx, listTestRequest(&sandrunv1.CancelRequestRequest{OrganizationId: org, RequestId: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := queueRunner(org, "live")
+	s.SendQueueEvent(update)
+	requireQueueUpdate(t, watch, update)
+
+	reopened, err := client.WatchQueue(ctx, listTestRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	requireQueueUpdate(t, reopened, &sandrunv1.WatchQueueResponse{Event: &sandrunv1.WatchQueueResponse_Request{Request: seed}})
+	if !reopened.Receive() || reopened.Msg().GetSnapshotComplete() == nil {
+		t.Fatalf("got %v (error: %v), want snapshot marker after only the standalone request", reopened.Msg(), reopened.Err())
+	}
+}
