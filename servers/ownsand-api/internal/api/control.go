@@ -587,33 +587,75 @@ func (c *Control) runOfflineSweep(ctx context.Context) {
 		if c.S.DataPath != nil {
 			c.S.DataPath.SweepExpired(ctx)
 		}
-		if !c.held() {
-			continue
-		}
-		// A non-nil slice: pgx binds a nil slice as SQL NULL, which turns
-		// NOT (x = ANY(NULL)) into NULL and matches no row when the channel
-		// registry is empty.
-		live := []string{}
-		for _, conn := range c.S.Hub.All() {
-			live = append(live, conn.DeviceID)
-		}
-		cutoff := c.S.now().Add(-c.S.Timing.HeartbeatTimeout)
-		rows, err := c.S.DB.Pool.Query(ctx, `UPDATE devices SET state = $1 WHERE state = $2 AND (last_seen_time IS NULL OR last_seen_time < $3)
-			AND NOT (device_id::text = ANY($4)) RETURNING device_id::text`,
-			int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE), int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE), cutoff, live)
+		c.sweepOfflineDevices(ctx)
+	}
+}
+
+func (c *Control) sweepOfflineDevices(parent context.Context) {
+	s := c.S
+	if s.Lease == nil {
+		return
+	}
+	var period *lease.Period
+	s.Lease.WhileHeld(func(held *lease.Period) { period = held })
+	if period == nil {
+		return
+	}
+	ctx, cancel := period.Context(parent)
+	defer cancel()
+	if ctx.Err() != nil {
+		return
+	}
+
+	// An empty array excludes no device. pgx encodes a nil slice as NULL.
+	live := []string{}
+	for _, conn := range s.Hub.All() {
+		live = append(live, conn.DeviceID)
+	}
+	cutoff := s.now().Add(-s.Timing.HeartbeatTimeout)
+	online := int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE)
+	offline := int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE)
+	const eligible = `state = $1 AND (last_seen_time IS NULL OR last_seen_time < $2)
+		AND NOT (device_id::text = ANY($3))`
+
+	var updated []string
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// Take device locks in ID order before sharing the lease lock, so
+		// lease release and takeover can proceed while a device row is busy.
+		rows, err := tx.Query(ctx, `SELECT device_id::text FROM devices WHERE `+eligible+`
+			ORDER BY devices.device_id FOR UPDATE`, online, cutoff, live)
 		if err != nil {
-			if ctx.Err() == nil {
-				c.S.Logger.Warn("offline_sweep_failed", slog.Any("error", err))
-			}
-			continue
+			return err
 		}
-		for rows.Next() {
-			var id string
-			if rows.Scan(&id) == nil {
-				c.S.Logger.Info("device_offline", slog.String("device_id", id), slog.String("cause", "not heard from"))
-			}
+		locked, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil || len(locked) == 0 {
+			return err
 		}
-		rows.Close()
+
+		expiry, err := period.LockRow(ctx, tx)
+		if err != nil || expiry.IsZero() {
+			return err
+		}
+		// Check the database clock after both locks. Keep the lease row
+		// locked until commit so another holder cannot take over mid-write.
+		rows, err = tx.Query(ctx, `UPDATE devices SET state = $4 WHERE `+eligible+`
+			AND device_id = ANY($5::text[]::uuid[])
+			AND (SELECT clock_timestamp() < $6::timestamptz)
+			RETURNING device_id::text`, online, cutoff, live, offline, locked, expiry)
+		if err != nil {
+			return err
+		}
+		updated, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		return err
+	})
+	if err != nil {
+		if !errors.Is(err, ctx.Err()) {
+			s.Logger.WarnContext(parent, "offline_sweep_failed", slog.Any("error", err))
+		}
+		return
+	}
+	for _, id := range updated {
+		s.Logger.InfoContext(parent, "device_offline", slog.String("device_id", id), slog.String("cause", "not heard from"))
 	}
 }
 
