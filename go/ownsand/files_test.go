@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
@@ -924,6 +925,102 @@ func TestWriteEmptyFile(t *testing.T) {
 				t.Fatal("empty file not written")
 			}
 		})
+	}
+}
+
+func TestFakeWriteCompletedFinishReplay(t *testing.T) {
+	t.Parallel()
+	agent := newFakeAgent()
+	agent.writeSizeDelta = 1
+	const path = "/w"
+	first := &ownsandv1.WriteFileRequest{WriteId: mustID(t), Path: path, Data: []byte("a")}
+	grantDigest := relaybinding.WriteFileDigest(first)
+	if _, err := agent.write(first, grantDigest); err != nil {
+		t.Fatal(err)
+	}
+	finish := &ownsandv1.WriteFileRequest{
+		WriteId: first.GetWriteId(),
+		Offset:  1,
+		Data:    []byte("b"),
+		Finish:  &ownsandv1.WriteFileFinish{SizeBytes: 2, Mode: 0o644},
+	}
+	initial, err := agent.write(finish, grantDigest)
+	want := &ownsandv1.WriteFileResponse{
+		WriteId: first.GetWriteId(), Offset: 1, Length: 1, Finished: true, SizeBytes: 3,
+	}
+	if err != nil || !proto.Equal(initial, want) {
+		t.Fatalf("finish = (%v, %v), want (%v, nil)", initial, err, want)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		change func(*ownsandv1.WriteFileRequest)
+	}{
+		{"size", func(req *ownsandv1.WriteFileRequest) { req.Finish.SizeBytes = 3 }},
+		{"mode", func(req *ownsandv1.WriteFileRequest) { req.Finish.Mode = 0o600 }},
+		{"offset", func(req *ownsandv1.WriteFileRequest) { req.Offset = 0 }},
+		{"data", func(req *ownsandv1.WriteFileRequest) { req.Data[0] = 'c' }},
+		{"missing finish", func(req *ownsandv1.WriteFileRequest) { req.Finish = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			retry := proto.CloneOf(finish)
+			tc.change(retry)
+			got, err := agent.write(retry, grantDigest)
+			if got != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition {
+				t.Fatalf("changed retry = (%v, %v), want (nil, failed_precondition)", got, err)
+			}
+			if data, _ := agent.file(path); string(data) != "ab" {
+				t.Fatalf("file after changed retry = %q, want ab", data)
+			}
+		})
+	}
+
+	wrongGrant := bytes.Clone(grantDigest)
+	wrongGrant[0] ^= 1
+	noFinish := proto.CloneOf(finish)
+	noFinish.Finish = nil
+	if got, err := agent.write(noFinish, wrongGrant); got != nil || connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("retry with wrong grant = (%v, %v), want (nil, permission_denied)", got, err)
+	}
+
+	agent.setFile(path, []byte("replacement"))
+	replayed, err := agent.write(proto.CloneOf(finish), grantDigest)
+	if err != nil || !proto.Equal(replayed, want) {
+		t.Fatalf("identical retry = (%v, %v), want (%v, nil)", replayed, err, want)
+	}
+	if data, _ := agent.file(path); string(data) != "replacement" {
+		t.Fatalf("file after identical retry = %q, want replacement", data)
+	}
+}
+
+func TestWriteFileRetriesAfterLostFinishReply(t *testing.T) {
+	t.Parallel()
+	cp := newFakeCP(t)
+	cp.relayScript = func(method string, n int) relayAction {
+		if method == "WriteFile" && n == 1 {
+			return relayAction{abortAfter: 1}
+		}
+		return relayAction{}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	const path = "/w"
+	if err := s.WriteFileBytes(context.Background(), path, []byte("ab"), WriteOptions{Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	reqs := cp.agent.writeRequests()
+	if len(reqs) != 2 {
+		t.Fatalf("got %d write requests, want 2", len(reqs))
+	}
+	first := reqs[0]
+	if first.GetWriteId() == "" || first.GetOffset() != 0 || string(first.GetData()) != "ab" ||
+		!proto.Equal(first.GetFinish(), &ownsandv1.WriteFileFinish{SizeBytes: 2, Mode: 0o644}) {
+		t.Fatalf("first request = %v, want a single finishing chunk", first)
+	}
+	if !proto.Equal(reqs[1], first) {
+		t.Fatalf("retry = %v, want %v", reqs[1], first)
+	}
+	if data, _ := cp.agent.file(path); string(data) != "ab" {
+		t.Fatalf("written file = %q, want ab", data)
 	}
 }
 
