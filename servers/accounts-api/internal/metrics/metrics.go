@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -139,6 +140,35 @@ func (m *Metrics) LinkedOrganizations(status string, n int64) {
 // shutdownTimeout bounds the drain of the metrics listener.
 const shutdownTimeout = 5 * time.Second
 
+type acceptErrorListener struct {
+	net.Listener
+	mu       sync.Mutex
+	firstErr error
+}
+
+func (l *acceptErrorListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
+		return conn, err
+	}
+	// Match the temporary-error check in net/http's Accept retry loop.
+	if ne, ok := err.(net.Error); ok && ne.Temporary() {
+		return conn, err
+	}
+	l.mu.Lock()
+	if l.firstErr == nil {
+		l.firstErr = err
+	}
+	l.mu.Unlock()
+	return conn, err
+}
+
+func (l *acceptErrorListener) acceptErr() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.firstErr
+}
+
 // Serve serves handler, the Prometheus exposition of the metrics, on listener
 // until ctx is done. On cancellation it drains active requests and closes any
 // remaining connections if the drain deadline expires. It returns any shutdown
@@ -152,8 +182,9 @@ func Serve(ctx context.Context, listener net.Listener, handler http.Handler, log
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
+	wrapped := &acceptErrorListener{Listener: listener}
 	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(listener) }()
+	go func() { errc <- srv.Serve(wrapped) }()
 	logger.Info("metrics_listener_started", slog.String("addr", listener.Addr().String()))
 	select {
 	case err := <-errc:
@@ -166,8 +197,11 @@ func Serve(ctx context.Context, listener net.Listener, handler http.Handler, log
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = errors.Join(err, srv.Close())
 	}
-	if serveErr := <-errc; !errors.Is(serveErr, http.ErrServerClosed) {
-		err = errors.Join(err, serveErr)
+	serveErr := <-errc
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		// net/http can replace a permanent Accept error with ErrServerClosed
+		// when Shutdown closes the listener before Accept returns.
+		serveErr = wrapped.acceptErr()
 	}
-	return err
+	return errors.Join(err, serveErr)
 }
