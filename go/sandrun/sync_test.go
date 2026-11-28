@@ -373,8 +373,13 @@ func TestSyncFileSelectionAndIncrementalChanges(t *testing.T) {
 			t.Fatalf("ignored file %s was synced", ignored)
 		}
 	}
-	if info, err := os.Stat(filepath.Join(ds.GetWorkspacePath(), "run.sh")); err != nil || info.Mode().Perm()&0o100 == 0 {
-		t.Fatalf("executable bit lost: %v %v", info.Mode(), err)
+	runPath := filepath.Join(ds.GetWorkspacePath(), "run.sh")
+	info, err := os.Stat(runPath)
+	if err != nil {
+		t.Fatalf("stat guest script %q: %v", runPath, err)
+	}
+	if info.Mode().Perm()&0o100 == 0 {
+		t.Fatalf("guest script %q lacks owner execute bit: mode %v", runPath, info.Mode())
 	}
 	if target, err := os.Readlink(filepath.Join(ds.GetWorkspacePath(), "link.go")); err != nil || target != "src/main.go" {
 		t.Fatalf("symbolic link: %q %v", target, err)
