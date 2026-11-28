@@ -938,8 +938,16 @@ func TestLostDeliveriesBeyondPage100(t *testing.T) {
 	eventually(t, "redelivered request", func() bool { return w.requestOfJob(t, 7) != nil })
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func TestLostDeliveriesIncompleteListing(t *testing.T) {
 	t.Parallel()
+	const (
+		responseHeaderTimeout = 3 * time.Second
+		handlerWaitTimeout    = 6 * time.Second
+	)
 	f := githubfake.New(nil)
 	t.Cleanup(f.Server.Close)
 	for _, mode := range []string{"http error", "canceled"} {
@@ -947,13 +955,15 @@ func TestLostDeliveriesIncompleteListing(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			var pages, attempts atomic.Int32
+			pageTwoCanceled := make(chan bool, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodPost {
 					attempts.Add(1)
 					w.WriteHeader(http.StatusAccepted)
 					return
 				}
-				if pages.Add(1) == 1 {
+				page := pages.Add(1)
+				if page == 1 {
 					w.Header().Set("Link", fmt.Sprintf(`<http://%s/app/hook/deliveries?cursor=2>; rel="next"`, r.Host))
 					err := json.NewEncoder(w).Encode([]githubapi.Delivery{{ID: 1, GUID: "unseen", DeliveredAt: time.Now(), StatusCode: 500}})
 					if err != nil {
@@ -961,18 +971,37 @@ func TestLostDeliveriesIncompleteListing(t *testing.T) {
 					}
 					return
 				}
-				if mode == "canceled" {
+				if mode == "canceled" && page == 2 {
+					deadline := time.Now().Add(handlerWaitTimeout)
+					timer := time.NewTimer(time.Until(deadline))
+					defer timer.Stop()
 					cancel()
-					<-r.Context().Done()
+					select {
+					case <-r.Context().Done():
+						pageTwoCanceled <- time.Now().Before(deadline)
+					case <-timer.C:
+						pageTwoCanceled <- false
+						http.Error(w, "request cancellation timed out", http.StatusGatewayTimeout)
+					}
 					return
 				}
 				http.Error(w, "listing failed", http.StatusBadGateway)
 			}))
 			t.Cleanup(upstream.Close)
+			transport := &http.Transport{ResponseHeaderTimeout: responseHeaderTimeout}
+			t.Cleanup(transport.CloseIdleConnections)
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				resp, err := transport.RoundTrip(r)
+				// A client timeout also cancels the server request.
+				if errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("HTTP client timed out waiting %s for GitHub response headers: %v", responseHeaderTimeout, err)
+				}
+				return resp, err
+			})}
 			cfg := f.Config()
 			cfg.APIOrigin = upstream.URL
 			opts := layers.Options{GitHub: github.Options{
-				Client:        githubapi.New(cfg, upstream.Client(), slog.New(slog.DiscardHandler), nil),
+				Client:        githubapi.New(cfg, client, slog.New(slog.DiscardHandler), nil),
 				WebhookSecret: f.WebhookSecret,
 			}}
 			var l layers.Layers
@@ -986,6 +1015,17 @@ func TestLostDeliveriesIncompleteListing(t *testing.T) {
 
 			if n := l.GitHub.RedeliverOnce(ctx); n != 0 || attempts.Load() != 0 || pages.Load() != 2 {
 				t.Errorf("requested %d redeliveries after %d page requests and %d attempts", n, pages.Load(), attempts.Load())
+			}
+			if mode == "canceled" {
+				upstream.Close() // Wait for the page-two handler before reading its result.
+				select {
+				case canceled := <-pageTwoCanceled:
+					if !canceled {
+						t.Errorf("page-two handler timed out after %s waiting for request cancellation", handlerWaitTimeout)
+					}
+				default:
+					t.Error("page-two handler did not report request cancellation")
+				}
 			}
 			if mode == "http error" && !strings.Contains(env.Logs.String(), "github_redelivery_list_failed") {
 				t.Error("the later page failure did not take the listing-error path")
