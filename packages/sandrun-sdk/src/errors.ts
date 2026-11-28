@@ -178,12 +178,11 @@ function redactChain(
   if (message === value.message && !causeChanged && !aggregate?.changed) {
     return value;
   }
-  const options = cause === undefined ? undefined : { cause };
-  const copy = aggregate
-    ? new AggregateError(aggregate.entries, message, options)
-    : new Error(message, options);
-  Object.setPrototypeOf(copy, Object.getPrototypeOf(value));
+  const prototype = Object.getPrototypeOf(value);
   if (aggregate) {
+    const options = cause === undefined ? undefined : { cause };
+    const copy = new AggregateError(aggregate.entries, message, options);
+    Object.setPrototypeOf(copy, prototype);
     Object.defineProperty(copy, "name", {
       configurable: true,
       writable: true,
@@ -197,9 +196,34 @@ function redactChain(
     } catch {
       // Keep the fresh stack if the source stack cannot be read.
     }
-  } else {
-    copy.name = value.name;
+    return copy;
   }
+  if (typeof DOMException === "function" && value instanceof DOMException) {
+    // DOMException getters require internal slots from the constructor.
+    const copy = new DOMException(message, value.name);
+    if (prototype !== DOMException.prototype) {
+      Object.setPrototypeOf(copy, prototype);
+    }
+    if (cause !== undefined) {
+      Object.defineProperty(copy, "cause", {
+        value: cause,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    return copy;
+  }
+  // Define the name before restoring the prototype, which may have a
+  // read-only name or a getter that requires state from the original error.
+  const copy = new Error(message, cause === undefined ? undefined : { cause });
+  Object.defineProperty(copy, "name", {
+    value: value.name,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  Object.setPrototypeOf(copy, prototype);
   return copy;
 }
 

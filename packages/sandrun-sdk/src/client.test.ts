@@ -16,6 +16,7 @@ import {
 import {
   connectCodeOf,
   isRetryableStreamError,
+  redactError,
   SandRunConfigError,
   SandRunError,
 } from "./errors.ts";
@@ -484,6 +485,123 @@ describe("error mapping", () => {
       expect(dial.message).toBe("dial failed with Bearer [redacted]");
       expect(dial.stack).not.toContain(token);
       expect(echo).toBe("original: [redacted]");
+    },
+  );
+
+  test("redacts a native exception in a ConnectError and retains its subclass", () => {
+    class NetworkFailure extends DOMException {}
+    const token = "secret-access-token";
+    const native = new NetworkFailure("network failed", "NetworkError");
+    Object.defineProperty(native, "cause", {
+      value: new SandRunConfigError(`failure with ${token}`),
+    });
+    const original = new ConnectError(
+      `denied ${token}`,
+      Code.PermissionDenied,
+      { "x-sandrun-test": "rejected" },
+      undefined,
+      native,
+    );
+    original.details = [{ type: "example.Failure", value: Uint8Array.of(1) }];
+
+    const error = redactError(original, [token]) as ConnectError;
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.code).toBe(Code.PermissionDenied);
+    expect(error.rawMessage).toBe("denied [redacted]");
+    expect(error.metadata.get("x-sandrun-test")).toBe("rejected");
+    expect(error.details).toBe(original.details);
+    const copy = error.cause as NetworkFailure & Error;
+    expect(copy).toBeInstanceOf(DOMException);
+    expect(copy).toBeInstanceOf(Error);
+    expect(copy).toBeInstanceOf(NetworkFailure);
+    expect(copy.name).toBe("NetworkError");
+    expect(copy.code).toBe(19);
+    expect(copy.message).toBe("network failed");
+    expect(String(copy)).toBe("NetworkError: network failed");
+    expect(copy.stack).toContain("NetworkError: network failed");
+    const cause = copy.cause as SandRunConfigError;
+    expect(cause).toBeInstanceOf(SandRunConfigError);
+    expect(cause).toBeInstanceOf(SandRunError);
+    expect(cause.message).toBe("failure with [redacted]");
+    expect(cause.stack).not.toContain(token);
+    expect(Object.getOwnPropertyDescriptor(copy, "cause")).toEqual({
+      value: cause,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    const clean = new DOMException("clean", "AbortError");
+    expect(redactError(clean, [token])).toBe(clean);
+  });
+
+  test("redacts custom errors with read-only names on their prototypes", () => {
+    class GetterNameError extends Error {
+      #name = "GetterNameError";
+
+      override get name() {
+        return this.#name;
+      }
+    }
+
+    class ReadOnlyNameError extends Error {}
+    Object.defineProperty(ReadOnlyNameError.prototype, "name", {
+      value: "ReadOnlyNameError",
+      writable: false,
+    });
+
+    const token = "secret-access-token";
+    for (const ErrorType of [GetterNameError, ReadOnlyNameError]) {
+      const original = new ErrorType(`request failed with ${token}`, {
+        cause: `nested ${token}`,
+      });
+      const copy = redactError(original, [token]) as Error;
+      expect(copy).toBeInstanceOf(ErrorType);
+      expect(copy.name).toBe(original.name);
+      expect(copy.message).toBe("request failed with [redacted]");
+      expect(copy.cause).toBe("nested [redacted]");
+      expect(copy.stack).not.toContain(token);
+      expect(Object.getOwnPropertyDescriptor(copy, "name")).toEqual({
+        value: original.name,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  });
+
+  test.each([
+    ["AbortError", 20, Code.Canceled],
+    ["TimeoutError", 23, Code.Canceled],
+    ["NetworkError", 19, Code.Unknown],
+  ])(
+    "preserves the Connect code for a redacted %s",
+    async (name, code, connectCode) => {
+      const token = "secret-access-token";
+      const original = new DOMException(`fetch failed with ${token}`, name);
+      const client = new SandRunClient({
+        origin: FAKE_ORIGIN,
+        token,
+        fetch: async () => {
+          throw original;
+        },
+      });
+
+      const error = (await client.organizations
+        .getOrganization({ organizationId: ORG })
+        .catch((failure: unknown) => failure)) as ConnectError;
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(connectCode);
+      expect(error.rawMessage).toBe("fetch failed with [redacted]");
+      if (connectCode === Code.Canceled) {
+        expect(error.cause).toBeUndefined();
+      } else {
+        const cause = error.cause as DOMException;
+        expect(cause).toBeInstanceOf(DOMException);
+        expect(cause.name).toBe(name);
+        expect(cause.code).toBe(code);
+        expect(cause.message).toBe(error.rawMessage);
+        expect(cause.stack).not.toContain(token);
+      }
     },
   );
 
