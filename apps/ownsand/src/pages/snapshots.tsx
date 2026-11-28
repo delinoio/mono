@@ -111,7 +111,7 @@ export function SnapshotsPage() {
                   (s.exportState === SnapshotExportState.NOT_EXPORTED ||
                     s.exportState === SnapshotExportState.EXPORT_FAILED);
                 return (
-                  <li key={s.snapshotId} className="list-row">
+                  <li key={s.snapshotId} className="list-row snapshot-row">
                     <div className="list-main">
                       <span className="list-title">
                         {i18n.rich("snapshots.rowTitle", {

@@ -562,6 +562,15 @@ h1[tabindex="-1"]:focus {
     order: 3;
     width: 100%;
   }
+
+  .snapshot-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .snapshot-row .list-actions {
+    flex-wrap: wrap;
+  }
 }
 
 /* The billing banner of blocked and suspended organizations. */

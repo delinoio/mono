@@ -327,6 +327,35 @@ export function createMockTransport(): Transport {
         // Simulate another caller deleting the template before confirmation.
         await base.unary(method, signal, timeout, header, input, contextValues);
       }
+      if (
+        method.name === "ListSnapshots" &&
+        sessionStorage.getItem("ownsand-e2e-snapshot-export-failed") === "true"
+      ) {
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        const { snapshots } =
+          response.message as unknown as ListSnapshotsResponse;
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            snapshots: snapshots.map((snapshot) =>
+              snapshot.snapshotId === MOCK_IDS.snapshot
+                ? {
+                    ...snapshot,
+                    exportState: SnapshotExportState.EXPORT_FAILED,
+                  }
+                : snapshot,
+            ),
+          },
+        };
+      }
       if (holdTemplateFirstPage && method.name === "ListTemplates") {
         const response = await base.unary(
           method,
