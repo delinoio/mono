@@ -1580,7 +1580,7 @@ func sweepRevocationsNow(env *testenv.Env) int {
 // expiry of the session, and not before, while the channel stays open.
 func TestUnacknowledgedSessionRevocationExpires(t *testing.T) {
 	t.Parallel()
-	env := testenv.New(t)
+	env := testenv.NewWithoutPeriodicRevocationSweep(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
 	agent.SetAckRevocations(false)
