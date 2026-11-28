@@ -158,6 +158,7 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
     const secrets = [secret, token];
     let res;
     try {
+      req.signal.throwIfAborted();
       res = await next(req);
     } catch (error) {
       throw redactError(error, secrets);

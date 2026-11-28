@@ -366,6 +366,18 @@ func (r localContextReader) Read(p []byte) (int, error) {
 	return r.src.Read(p)
 }
 
+type localContextWriter struct {
+	ctx context.Context
+	dst io.Writer
+}
+
+func (w localContextWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.dst.Write(p)
+}
+
 func hashLocalFile(ctx context.Context, src io.Reader) (int64, string, error) {
 	h := sha256.New()
 	size, err := io.Copy(h, localContextReader{ctx: ctx, src: src})

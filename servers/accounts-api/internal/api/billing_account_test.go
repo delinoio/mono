@@ -4,6 +4,8 @@ package api_test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -228,6 +230,107 @@ func TestRoleMatrix(t *testing.T) {
 	}
 }
 
+func TestListBillingAccountsCreationTimePagination(t *testing.T) {
+	t.Parallel()
+	env := testenv.New(t)
+	alice := newPerson(env, "alice")
+	bob := newPerson(env, "bob")
+
+	const (
+		rpc     = "ListBillingAccounts"
+		a       = "01900000-0000-7000-8000-000000000001"
+		b       = "01900000-0001-7000-8000-000000000001"
+		c       = "01900000-0002-7000-8000-000000000001"
+		deleted = "01900000-0003-7000-8000-000000000001"
+		other   = "01900000-0004-7000-8000-000000000001"
+	)
+	earlier := time.Date(2026, time.January, 1, 0, 0, 0, 2000, time.UTC)
+	later := earlier.Add(time.Microsecond)
+	seed := func(id, userID string, created time.Time, deleteTime *time.Time) {
+		t.Helper()
+		if _, err := env.DB.Pool.Exec(ctx(), `WITH account AS (
+			INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time, delete_time)
+			VALUES ($1, 'Account', $2, $2, $3)
+			RETURNING billing_account_id
+		)
+		INSERT INTO billing_account_members (billing_account_id, user_id, role, create_time)
+		SELECT billing_account_id, $4, 'owner', $2 FROM account`, id, created, deleteTime, userID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(a, alice.ID, later, nil)
+	seed(b, alice.ID, earlier, nil)
+	seed(c, alice.ID, earlier, nil)
+	seed(deleted, alice.ID, earlier, &later)
+	seed(other, bob.ID, earlier, nil)
+
+	type cursor struct {
+		RPC   string `json:"r"`
+		Scope string `json:"s"`
+		ID    string `json:"a"`
+		Time  int64  `json:"t,omitempty"`
+	}
+	encode := func(c cursor) string {
+		body, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(body)
+	}
+	list := func(p person, token string) (*connect.Response[accountsv1.ListBillingAccountsResponse], error) {
+		return p.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{
+			PageSize: 1, PageToken: token,
+		}))
+	}
+
+	for _, tc := range []struct {
+		name     string
+		start    string
+		want     []string
+		wantTime int64
+	}{
+		{"fresh", "", []string{b, c, a}, earlier.UnixMicro()},
+		{"legacy", encode(cursor{RPC: rpc, Scope: alice.ID, ID: a}), []string{b, c}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := tc.start
+			if token != "" {
+				_, err := list(bob, token)
+				wantCode(t, err, connect.CodeInvalidArgument)
+			}
+			for i, id := range tc.want {
+				page, err := list(alice, token)
+				if err != nil {
+					t.Fatalf("page %d: %v", i+1, err)
+				}
+				rows := page.Msg.GetBillingAccounts()
+				if len(rows) != 1 || rows[0].GetBillingAccountId() != id {
+					t.Fatalf("page %d: accounts = %v, want only %s", i+1, rows, id)
+				}
+				wantToken := ""
+				if i+1 < len(tc.want) {
+					wantToken = encode(cursor{RPC: rpc, Scope: alice.ID, ID: id, Time: tc.wantTime})
+				}
+				if token = page.Msg.GetNextPageToken(); token != wantToken {
+					t.Fatalf("page %d: token = %q, want %q", i+1, token, wantToken)
+				}
+				if token != "" {
+					_, err := list(bob, token)
+					wantCode(t, err, connect.CodeInvalidArgument)
+				}
+			}
+		})
+	}
+
+	for _, token := range []cursor{
+		{RPC: "ListInvitations", Scope: alice.ID, ID: a, Time: later.UnixMicro()},
+		{RPC: rpc, Scope: alice.ID, ID: "not-a-uuid", Time: later.UnixMicro()},
+	} {
+		_, err := list(alice, encode(token))
+		wantCode(t, err, connect.CodeInvalidArgument)
+	}
+}
+
 func TestCreateGetListBillingAccounts(t *testing.T) {
 	t.Parallel()
 	env := testenv.New(t)
@@ -274,27 +377,32 @@ func TestCreateGetListBillingAccounts(t *testing.T) {
 	// Pages of 2 return every account in creation order.
 	var listed []string
 	token := ""
-	for pages := 0; ; pages++ {
-		if pages > 5 {
-			t.Fatal("pagination does not end")
-		}
+	pageSizes := []int{2, 2, 1}
+	for page, wantSize := range pageSizes {
 		resp, err := alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageSize: 2, PageToken: token}))
 		if err != nil {
-			t.Fatalf("ListBillingAccounts: %v", err)
+			t.Fatalf("ListBillingAccounts(2) page %d: %v", page+1, err)
 		}
-		for _, a := range resp.Msg.GetBillingAccounts() {
+		accounts := resp.Msg.GetBillingAccounts()
+		if len(accounts) != wantSize {
+			t.Fatalf("ListBillingAccounts(2) page %d has %d accounts, want %d", page+1, len(accounts), wantSize)
+		}
+		for _, a := range accounts {
 			if a.GetCallerRole() != roleOwner {
 				t.Fatalf("caller_role = %v", a.GetCallerRole())
 			}
 			listed = append(listed, a.GetBillingAccountId())
 		}
 		token = resp.Msg.GetNextPageToken()
-		if token == "" {
-			break
+		wantToken := page < len(pageSizes)-1
+		if (token != "") != wantToken {
+			t.Fatalf("ListBillingAccounts(2) page %d has next page token = %t, want %t", page+1, token != "", wantToken)
 		}
-		// Another caller cannot use the token.
-		_, err = bob.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageToken: token}))
-		wantCode(t, err, connect.CodeInvalidArgument)
+		if wantToken {
+			// Another caller cannot use the token.
+			_, err = bob.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageToken: token}))
+			wantCode(t, err, connect.CodeInvalidArgument)
+		}
 	}
 	if strings.Join(listed, ",") != strings.Join(ids, ",") {
 		t.Fatalf("listed %v, want %v", listed, ids)
@@ -303,9 +411,31 @@ func TestCreateGetListBillingAccounts(t *testing.T) {
 	wantCode(t, err, connect.CodeInvalidArgument)
 	_, err = alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageToken: "garbage"}))
 	wantCode(t, err, connect.CodeInvalidArgument)
-	resp, err := alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageSize: 500}))
-	if err != nil || len(resp.Msg.GetBillingAccounts()) != 5 || resp.Msg.GetNextPageToken() != "" {
-		t.Fatalf("ListBillingAccounts(500) = %v, %v", resp, err)
+
+	for i := range 196 {
+		ids = append(ids, createAccount(t, alice, fmt.Sprintf("Extra account %d", i)).GetBillingAccountId())
+	}
+	// A request above the cap returns 200 accounts and leaves the last account for the next page.
+	token = ""
+	for page, wantIDs := range [][]string{ids[:200], ids[200:]} {
+		resp, err := alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageSize: 500, PageToken: token}))
+		if err != nil {
+			t.Fatalf("ListBillingAccounts(500) page %d: %v", page+1, err)
+		}
+		accounts := resp.Msg.GetBillingAccounts()
+		if len(accounts) != len(wantIDs) {
+			t.Fatalf("ListBillingAccounts(500) page %d has %d accounts, want %d", page+1, len(accounts), len(wantIDs))
+		}
+		for i, account := range accounts {
+			if gotID := account.GetBillingAccountId(); gotID != wantIDs[i] {
+				t.Fatalf("ListBillingAccounts(500) page %d account %d ID = %q, want %q", page+1, i+1, gotID, wantIDs[i])
+			}
+		}
+		token = resp.Msg.GetNextPageToken()
+		wantToken := page == 0
+		if (token != "") != wantToken {
+			t.Fatalf("ListBillingAccounts(500) page %d has next page token = %t, want %t", page+1, token != "", wantToken)
+		}
 	}
 
 	renamed, err := alice.Client.UpdateBillingAccount(ctx(), connect.NewRequest(&accountsv1.UpdateBillingAccountRequest{BillingAccountId: id, Name: " New name "}))
@@ -558,9 +688,11 @@ func TestInvitationRules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListInvitations page %d: %v", page, err)
 		}
-		for _, inv := range resp.Msg.GetInvitations() {
-			ids = append(ids, inv.GetInvitationId())
+		invitations := resp.Msg.GetInvitations()
+		if len(invitations) != 1 {
+			t.Fatalf("ListInvitations page %d returned %d invitations, want 1", page, len(invitations))
 		}
+		ids = append(ids, invitations[0].GetInvitationId())
 		if token = resp.Msg.GetNextPageToken(); token == "" {
 			break
 		}

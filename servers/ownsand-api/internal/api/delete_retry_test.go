@@ -224,6 +224,7 @@ func TestDeleteSandboxRetryKeepsReplacementCommand(t *testing.T) {
 }
 
 func TestIncrementalDeletingProgressDoesNotRedispatch(t *testing.T) {
+	t.Parallel()
 	env, org, device, agent, id := setupDeleteRetry(t)
 	running := ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
 	deleting := ownsandv1.SandboxState_SANDBOX_STATE_DELETING

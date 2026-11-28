@@ -180,6 +180,9 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 		}
 		res.Files, res.Bytes = 1, wireBytes
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	warning, err := replacePath(staged, dest, os.Rename)
 	if err != nil {
 		return nil, err

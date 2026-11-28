@@ -49,6 +49,7 @@ func (w *stalledCallerWriter) Unwrap() http.ResponseWriter { return w.ResponseWr
 // replies over a separate HTTP/2 connection. In every case the handler
 // resumes after the acceptance window from send completion has expired.
 func TestRelayAcceptanceWhileCallerWriteStalls(t *testing.T) {
+	t.Parallel()
 	const acceptance = time.Second
 	accepted := []proto.Message{
 		&ownsandv1.RequestAccepted{},

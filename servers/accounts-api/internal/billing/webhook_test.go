@@ -1030,11 +1030,13 @@ func TestCustomDataPaymentOnlyAddsCredit(t *testing.T) {
 		t.Fatal("StartSubscription returned no checkout")
 	}
 
-	// A failed renewal that matches only through custom data sends no email.
-	f.webhook(paddle.EventTransactionPaymentFailed, paddletest.Transaction(paddletest.TransactionData{
+	// A failed renewal that matches only through custom data is ignored and sends no email.
+	if got := f.webhookResult(paddle.EventTransactionPaymentFailed, paddletest.Transaction(paddletest.TransactionData{
 		ID: "txn_forged_renew", SubscriptionID: f.paddle.NewID("sub"), Origin: paddle.OriginSubscriptionRecurring,
 		BillingAccountID: acct, PriceID: priceID, SubtotalCents: 1000, Status: "past_due",
-	}))
+	})); got != webhookIgnored {
+		t.Fatalf("unbound failed renewal result = %q, want %q", got, webhookIgnored)
+	}
 	if err := f.s.DeliverNotifications(ctx()); err != nil {
 		t.Fatal(err)
 	}

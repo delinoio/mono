@@ -48,10 +48,14 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
 	}, nil)
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
-	_, memberKey := w.env.NewAPIKey(w.org.ID, w.org.Member)
+	memberKeyID, memberKey := w.env.NewAPIKey(w.org.ID, w.org.Member)
 	memberByKey := w.env.Bearer(memberKey)
 
 	s1 := w.createSession(t, memberByKey, profileID)
+	createdAt := w.env.Clock.Now()
+	if got := keyLastUsed(t, w.env, memberKeyID); got == nil || !got.Equal(createdAt) {
+		t.Fatalf("last use after session creation = %v, want %v", got, createdAt)
+	}
 	if s1.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED || s1.GetOwnerUserId() != w.org.Member || s1.GetWorkspacePath() != "/home/dev/work" ||
 		s1.GetGuestOs() != sandrunv1.GuestOs_GUEST_OS_LINUX || s1.GetRunnerProfileName() != "linux-dev" {
 		t.Fatalf("created %v", s1)
@@ -83,12 +87,19 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 
 	// A member cannot delete the admin's session; the owner deletes theirs
 	// with the personal API key.
+	w.env.Clock.Advance(time.Minute)
 	_, err := memberByKey.DevSession.DeleteDevSession(ctx, connect.NewRequest(&sandrunv1.DeleteDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s2.GetDevSessionId()}))
 	wantCode(t, "member deletes another session", err, connect.CodePermissionDenied)
+	if got := keyLastUsed(t, w.env, memberKeyID); got == nil || !got.Equal(createdAt) {
+		t.Fatalf("last use after denied deletion = %v, want %v", got, createdAt)
+	}
 	del, err := memberByKey.DevSession.DeleteDevSession(ctx, connect.NewRequest(&sandrunv1.DeleteDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s1.GetDevSessionId()}))
 	if err != nil || del.Msg.GetDevSession().GetState() != sandrunv1.RequestState_REQUEST_STATE_ENDED ||
 		del.Msg.GetDevSession().GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED {
 		t.Fatalf("delete: %v %v", del, err)
+	}
+	if got := keyLastUsed(t, w.env, memberKeyID); got == nil || !got.Equal(w.env.Clock.Now()) {
+		t.Fatalf("last use after authorized deletion = %v, want %v", got, w.env.Clock.Now())
 	}
 	if r := w.runner(t, r1.GetRunnerId()); r.GetState() != sandrunv1.RunnerState_RUNNER_STATE_DELETED || r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER {
 		t.Fatalf("deleted runner %v", r)
@@ -150,6 +161,40 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 	profiles, err := memberByKey.DevSession.ListDevSessionProfiles(ctx, connect.NewRequest(&sandrunv1.ListDevSessionProfilesRequest{OrganizationId: w.org.ID}))
 	if err != nil || len(profiles.Msg.GetProfiles()) != 1 || profiles.Msg.GetProfiles()[0].GetWorkspacePath() != "/home/dev/work" {
 		t.Fatalf("profiles %v %v", profiles, err)
+	}
+}
+
+func keyLastUsed(t *testing.T, env *testenv.Env, keyID string) *time.Time {
+	t.Helper()
+	var used *time.Time
+	if err := env.DB.Pool.QueryRow(t.Context(), "SELECT last_used_time FROM api_keys WHERE api_key_id = $1", keyID).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	return used
+}
+
+func TestDevSessionAPIKeyUseWriteFailure(t *testing.T) {
+	t.Parallel()
+	w := newWorkWorld(t, devsession.Timing{})
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	keyID, key := w.env.NewAPIKey(w.org.ID, w.org.Member)
+	_, err := w.env.DB.Pool.Exec(t.Context(), `CREATE FUNCTION fail_last_use() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'test last use write failure'; END; $$;
+		CREATE TRIGGER fail_last_use BEFORE UPDATE OF last_used_time ON api_keys
+		FOR EACH ROW EXECUTE FUNCTION fail_last_use();`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session := w.createSession(t, w.env.Bearer(key), profileID)
+	if got := w.session(t, session.GetDevSessionId()).GetOwnerUserId(); got != w.org.Member {
+		t.Fatalf("persisted session owner = %q, want %q", got, w.org.Member)
+	}
+	if got := keyLastUsed(t, w.env, keyID); got != nil {
+		t.Fatalf("last use after a failed write = %v, want nil", got)
+	}
+	if !strings.Contains(w.env.Logs.String(), "api_key_last_use_write_failed") {
+		t.Fatal("missing last use write failure log")
 	}
 }
 
@@ -521,7 +566,8 @@ func TestDevSessionExec(t *testing.T) {
 		sig := int32(9)
 		return &ownsand.ExecResult{ExecID: execID, Kind: ownsand.ExecResultExited, Signal: &sig}, nil
 	})
-	owner := w.env.User(w.org.Member)
+	ownerKeyID, ownerKey := w.env.NewAPIKey(w.org.ID, w.org.Member)
+	owner := w.env.Bearer(ownerKey)
 	execID := api.NewID()
 	stream, err := owner.DevSession.ExecDevSession(ctx, connect.NewRequest(&sandrunv1.ExecDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
 		ExecId: strings.ToUpper(execID), Command: []string{"make", "test"}, Env: map[string]string{"TOKEN": "SECRET-ENV-VALUE"}, WorkingDirectory: "src"}))
@@ -531,6 +577,10 @@ func TestDevSessionExec(t *testing.T) {
 	events, err := collectExec(t, stream, func() *sandrunv1.DevSessionExecEvent { return stream.Msg().GetEvent() })
 	if err != nil || len(events) != 3 || events[0].GetStarted() == nil || string(events[1].GetStdout().GetData()) != "hello" || events[2].GetExited().GetExitCode() != 3 {
 		t.Fatalf("events %v %v", events, err)
+	}
+	firstUse := w.env.Clock.Now()
+	if got := keyLastUsed(t, w.env, ownerKeyID); got == nil || !got.Equal(firstUse) {
+		t.Fatalf("last use after exec admission = %v, want %v", got, firstUse)
 	}
 	mu.Lock()
 	if got.ExecID != execID || got.WorkingDirectory != "/home/dev/work/src" || got.Env["TOKEN"] != "SECRET-ENV-VALUE" {
@@ -546,6 +596,7 @@ func TestDevSessionExec(t *testing.T) {
 
 	// A long command: the stream ends with OK and no final event before the
 	// limit, with keepalives meanwhile.
+	w.env.Clock.Advance(30 * time.Second)
 	start := time.Now()
 	stream, err = owner.DevSession.ExecDevSession(ctx, connect.NewRequest(&sandrunv1.ExecDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
 		ExecId: rotatedID, Command: []string{"sleep", "100"}}))
@@ -555,6 +606,9 @@ func TestDevSessionExec(t *testing.T) {
 	events, err = collectExec(t, stream, func() *sandrunv1.DevSessionExecEvent { return stream.Msg().GetEvent() })
 	if err != nil || time.Since(start) > 5*time.Second || len(events) < 3 {
 		t.Fatalf("rotated stream %v %v", events, err)
+	}
+	if got := keyLastUsed(t, w.env, ownerKeyID); got == nil || !got.Equal(firstUse) {
+		t.Fatalf("last use after repeated exec = %v, want %v", got, firstUse)
 	}
 	stdout, stderr := events[0].GetStdout(), events[1].GetStderr()
 	if string(stdout.GetData()) != "hello" || string(stderr.GetData()) != "ok" {
@@ -580,10 +634,14 @@ func TestDevSessionExec(t *testing.T) {
 	}
 
 	// Only the owner runs commands, also an organization owner cannot.
-	stream, _ = w.env.User(w.org.Owner).DevSession.ExecDevSession(ctx, connect.NewRequest(&sandrunv1.ExecDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
+	otherKeyID, otherKey := w.env.NewAPIKey(w.org.ID, w.org.Owner)
+	stream, _ = w.env.Bearer(otherKey).DevSession.ExecDevSession(ctx, connect.NewRequest(&sandrunv1.ExecDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId(),
 		ExecId: api.NewID(), Command: []string{"id"}}))
 	_, err = collectExec(t, stream, func() *sandrunv1.DevSessionExecEvent { return nil })
 	wantCode(t, "organization owner execs", err, connect.CodePermissionDenied)
+	if got := keyLastUsed(t, w.env, otherKeyID); got != nil {
+		t.Fatalf("last use after denied exec = %v, want nil", got)
+	}
 	for name, req := range map[string]*sandrunv1.ExecDevSessionRequest{
 		"bad exec id":   {ExecId: "x", Command: []string{"id"}},
 		"empty command": {ExecId: api.NewID()},
@@ -1182,18 +1240,18 @@ func newWorkWorld(t *testing.T, ds devsession.Timing) *workWorld {
 func newWorkWorldWithTiming(t *testing.T, ds devsession.Timing, timing *work.Timing) *workWorld {
 	t.Helper()
 	fake := ownsandfake.New()
-	return newWorkWorldWithOptions(t, ds, timing, fake, fake)
+	return newWorkWorldWithOptions(t, fake, layers.Options{OwnSand: fake, WorkTiming: timing, DevSessionTiming: ds})
 }
 
 func newWorkWorldWithProvider(t *testing.T, ds devsession.Timing, fake *ownsandfake.Fake, provider ownsandclient.Factory) *workWorld {
 	t.Helper()
-	return newWorkWorldWithOptions(t, ds, nil, fake, provider)
+	return newWorkWorldWithOptions(t, fake, layers.Options{OwnSand: provider, DevSessionTiming: ds})
 }
 
-func newWorkWorldWithOptions(t *testing.T, ds devsession.Timing, timing *work.Timing, fake *ownsandfake.Fake, provider ownsandclient.Factory) *workWorld {
+func newWorkWorldWithOptions(t *testing.T, fake *ownsandfake.Fake, opts layers.Options) *workWorld {
 	t.Helper()
 	w := &world{fake: fake, l: &layers.Layers{}}
-	w.env = testenv.New(t, testenv.WithLayerOptions(layers.Options{OwnSand: provider, WorkTiming: timing, DevSessionTiming: ds}, w.l))
+	w.env = testenv.New(t, testenv.WithLayerOptions(opts, w.l))
 	w.org = w.env.NewOrg("alice")
 	ww := &workWorld{world: w, osOrg: api.NewID()}
 	w.fake.AddOrg(ww.osOrg, ownsandKey('a'))

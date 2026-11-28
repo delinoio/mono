@@ -11,11 +11,10 @@ import { enumDesc, fileDesc } from "@bufbuild/protobuf/codegenv2";
  * Describes the file delino/sandcrew/v1/common.proto.
  */
 export const file_delino_sandcrew_v1_common: GenFile = /*@__PURE__*/
-  fileDesc("Ch9kZWxpbm8vc2FuZGNyZXcvdjEvY29tbW9uLnByb3RvEhJkZWxpbm8uc2FuZGNyZXcudjEqaAoLQWdlbnRWZW5kb3ISHAoYQUdFTlRfVkVORE9SX1VOU1BFQ0lGSUVEEAASHAoYQUdFTlRfVkVORE9SX0NMQVVERV9DT0RFEAESHQoZQUdFTlRfVkVORE9SX09QRU5BSV9DT0RFWBACKmEKB0d1ZXN0T3MSGAoUR1VFU1RfT1NfVU5TUEVDSUZJRUQQABISCg5HVUVTVF9PU19MSU5VWBABEhIKDkdVRVNUX09TX01BQ09TEAISFAoQR1VFU1RfT1NfV0lORE9XUxADKk0KBFJvbGUSFAoQUk9MRV9VTlNQRUNJRklFRBAAEg4KClJPTEVfT1dORVIQARIOCgpST0xFX0FETUlOEAISDwoLUk9MRV9NRU1CRVIQAyrOAgoMU2Vzc2lvblN0YXRlEh0KGVNFU1NJT05fU1RBVEVfVU5TUEVDSUZJRUQQABIYChRTRVNTSU9OX1NUQVRFX1FVRVVFRBABEhoKFlNFU1NJT05fU1RBVEVfU1RBUlRJTkcQAhIZChVTRVNTSU9OX1NUQVRFX1JVTk5JTkcQAxIjCh9TRVNTSU9OX1NUQVRFX1dBSVRJTkdfRk9SX0lOUFVUEAQSGQoVU0VTU0lPTl9TVEFURV9QQVVTSU5HEAUSGAoUU0VTU0lPTl9TVEFURV9QQVVTRUQQBhIfChtTRVNTSU9OX1NUQVRFX1JFU1VNRV9RVUVVRUQQBxIaChZTRVNTSU9OX1NUQVRFX1JFU1VNSU5HEAgSHgoaU0VTU0lPTl9TVEFURV9ESVNDT05ORUNURUQQCRIXChNTRVNTSU9OX1NUQVRFX0VOREVEEAoq9AIKEFNlc3Npb25FbmRSZWFzb24SIgoeU0VTU0lPTl9FTkRfUkVBU09OX1VOU1BFQ0lGSUVEEAASIwofU0VTU0lPTl9FTkRfUkVBU09OX1NUQVJUX0ZBSUxFRBABEiQKIFNFU1NJT05fRU5EX1JFQVNPTl9RVUVVRV9FWFBJUkVEEAISIwofU0VTU0lPTl9FTkRfUkVBU09OX0FHRU5UX0VYSVRFRBADEiIKHlNFU1NJT05fRU5EX1JFQVNPTl9ERVZJQ0VfTE9TVBAEEiUKIVNFU1NJT05fRU5EX1JFQVNPTl9SRVNUT1JFX0ZBSUxFRBAFEi8KK1NFU1NJT05fRU5EX1JFQVNPTl9QQVVTRURfUkVURU5USU9OX0VYUElSRUQQBhIpCiVTRVNTSU9OX0VORF9SRUFTT05fQlJJREdFX1VOU1VQUE9SVEVEEAcSJQohU0VTU0lPTl9FTkRfUkVBU09OX0VYRUNVVE9SX0VOREVEEAgqbAoOUGVybWlzc2lvbk1vZGUSHwobUEVSTUlTU0lPTl9NT0RFX1VOU1BFQ0lGSUVEEAASIAocUEVSTUlTU0lPTl9NT0RFX0FVVE9fQVBQUk9WRRABEhcKE1BFUk1JU1NJT05fTU9ERV9BU0sQAipxCg9DcmVkZW50aWFsU2NvcGUSIAocQ1JFREVOVElBTF9TQ09QRV9VTlNQRUNJRklFRBAAEiEKHUNSRURFTlRJQUxfU0NPUEVfT1JHQU5JWkFUSU9OEAESGQoVQ1JFREVOVElBTF9TQ09QRV9VU0VSEAIqvQEKFFZlbmRvckNyZWRlbnRpYWxLaW5kEiYKIlZFTkRPUl9DUkVERU5USUFMX0tJTkRfVU5TUEVDSUZJRUQQABIiCh5WRU5ET1JfQ1JFREVOVElBTF9LSU5EX0FQSV9LRVkQARItCilWRU5ET1JfQ1JFREVOVElBTF9LSU5EX0NMQVVERV9PQVVUSF9UT0tFThACEioKJlZFTkRPUl9DUkVERU5USUFMX0tJTkRfQ09ERVhfQVVUSF9KU09OEAMqkQEKFkNyZWRlbnRpYWxVcGRhdGVTb3VyY2USKAokQ1JFREVOVElBTF9VUERBVEVfU09VUkNFX1VOU1BFQ0lGSUVEEAASIQodQ1JFREVOVElBTF9VUERBVEVfU09VUkNFX1VTRVIQARIqCiZDUkVERU5USUFMX1VQREFURV9TT1VSQ0VfQUdFTlRfUkVGUkVTSBACKs0BChRQcm9maWxlSW5lbGlnaWJpbGl0eRIlCiFQUk9GSUxFX0lORUxJR0lCSUxJVFlfVU5TUEVDSUZJRUQQABIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfSEFTX01BWElNVU1fTElGRVRJTUUQARIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfTkVUV09SS19OT1RfT1VUQk9VTkQQAhIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfR1VFU1RfT1NfVU5TVVBQT1JURUQQAyr+AQoIVG9vbEtpbmQSGQoVVE9PTF9LSU5EX1VOU1BFQ0lGSUVEEAASEgoOVE9PTF9LSU5EX1JFQUQQARISCg5UT09MX0tJTkRfRURJVBACEhQKEFRPT0xfS0lORF9ERUxFVEUQAxISCg5UT09MX0tJTkRfTU9WRRAEEhQKEFRPT0xfS0lORF9TRUFSQ0gQBRIVChFUT09MX0tJTkRfRVhFQ1VURRAGEhMKD1RPT0xfS0lORF9USElOSxAHEhMKD1RPT0xfS0lORF9GRVRDSBAIEhkKFVRPT0xfS0lORF9TV0lUQ0hfTU9ERRAJEhMKD1RPT0xfS0lORF9PVEhFUhAKKq8BCg5Ub29sQ2FsbFN0YXR1cxIgChxUT09MX0NBTExfU1RBVFVTX1VOU1BFQ0lGSUVEEAASHAoYVE9PTF9DQUxMX1NUQVRVU19QRU5ESU5HEAESIAocVE9PTF9DQUxMX1NUQVRVU19JTl9QUk9HUkVTUxACEh4KGlRPT0xfQ0FMTF9TVEFUVVNfQ09NUExFVEVEEAMSGwoXVE9PTF9DQUxMX1NUQVRVU19GQUlMRUQQBCqTAQoRUGxhbkVudHJ5UHJpb3JpdHkSIwofUExBTl9FTlRSWV9QUklPUklUWV9VTlNQRUNJRklFRBAAEhwKGFBMQU5fRU5UUllfUFJJT1JJVFlfSElHSBABEh4KGlBMQU5fRU5UUllfUFJJT1JJVFlfTUVESVVNEAISGwoXUExBTl9FTlRSWV9QUklPUklUWV9MT1cQAyqXAQoPUGxhbkVudHJ5U3RhdHVzEiEKHVBMQU5fRU5UUllfU1RBVFVTX1VOU1BFQ0lGSUVEEAASHQoZUExBTl9FTlRSWV9TVEFUVVNfUEVORElORxABEiEKHVBMQU5fRU5UUllfU1RBVFVTX0lOX1BST0dSRVNTEAISHwobUExBTl9FTlRSWV9TVEFUVVNfQ09NUExFVEVEEAMq4AEKFFBlcm1pc3Npb25PcHRpb25LaW5kEiYKIlBFUk1JU1NJT05fT1BUSU9OX0tJTkRfVU5TUEVDSUZJRUQQABIlCiFQRVJNSVNTSU9OX09QVElPTl9LSU5EX0FMTE9XX09OQ0UQARInCiNQRVJNSVNTSU9OX09QVElPTl9LSU5EX0FMTE9XX0FMV0FZUxACEiYKIlBFUk1JU1NJT05fT1BUSU9OX0tJTkRfUkVKRUNUX09OQ0UQAxIoCiRQRVJNSVNTSU9OX09QVElPTl9LSU5EX1JFSkVDVF9BTFdBWVMQBCp6ChFQZXJtaXNzaW9uT3V0Y29tZRIiCh5QRVJNSVNTSU9OX09VVENPTUVfVU5TUEVDSUZJRUQQABIfChtQRVJNSVNTSU9OX09VVENPTUVfU0VMRUNURUQQARIgChxQRVJNSVNTSU9OX09VVENPTUVfQ0FOQ0VMTEVEEAIqtgEKClN0b3BSZWFzb24SGwoXU1RPUF9SRUFTT05fVU5TUEVDSUZJRUQQABIYChRTVE9QX1JFQVNPTl9FTkRfVFVSThABEhoKFlNUT1BfUkVBU09OX01BWF9UT0tFTlMQAhIhCh1TVE9QX1JFQVNPTl9NQVhfVFVSTl9SRVFVRVNUUxADEhcKE1NUT1BfUkVBU09OX1JFRlVTQUwQBBIZChVTVE9QX1JFQVNPTl9DQU5DRUxMRUQQBSqYAgoUQ29uZmlnT3B0aW9uQ2F0ZWdvcnkSJgoiQ09ORklHX09QVElPTl9DQVRFR09SWV9VTlNQRUNJRklFRBAAEh8KG0NPTkZJR19PUFRJT05fQ0FURUdPUllfTU9ERRABEiAKHENPTkZJR19PUFRJT05fQ0FURUdPUllfTU9ERUwQAhInCiNDT05GSUdfT1BUSU9OX0NBVEVHT1JZX01PREVMX0NPTkZJRxADEiAKHENPTkZJR19PUFRJT05fQ0FURUdPUllfU1BFRUQQBBIoCiRDT05GSUdfT1BUSU9OX0NBVEVHT1JZX1RIT1VHSFRfTEVWRUwQBRIgChxDT05GSUdfT1BUSU9OX0NBVEVHT1JZX09USEVSEAYqrAEKDUFnZW50QWN0aXZpdHkSHgoaQUdFTlRfQUNUSVZJVFlfVU5TUEVDSUZJRUQQABIbChdBR0VOVF9BQ1RJVklUWV9TVEFSVElORxABEhcKE0FHRU5UX0FDVElWSVRZX0lETEUQAhIaChZBR0VOVF9BQ1RJVklUWV9XT1JLSU5HEAMSKQolQUdFTlRfQUNUSVZJVFlfV0FJVElOR19GT1JfUEVSTUlTU0lPThAEKrADCg9CcmlkZ2VFcnJvcktpbmQSIQodQlJJREdFX0VSUk9SX0tJTkRfVU5TUEVDSUZJRUQQABIqCiZCUklER0VfRVJST1JfS0lORF9BR0VOVF9JTlNUQUxMX0ZBSUxFRBABEicKI0JSSURHRV9FUlJPUl9LSU5EX0NIRUNLU1VNX01JU01BVENIEAISKAokQlJJREdFX0VSUk9SX0tJTkRfQUdFTlRfU1RBUlRfRkFJTEVEEAMSKAokQlJJREdFX0VSUk9SX0tJTkRfQ1JFREVOVElBTF9NSVNTSU5HEAQSKAokQlJJREdFX0VSUk9SX0tJTkRfQUNQX1BST1RPQ09MX0VSUk9SEAUSIwofQlJJREdFX0VSUk9SX0tJTkRfSU5QVVRfSU5WQUxJRBAGEiUKIUJSSURHRV9FUlJPUl9LSU5EX09QVElPTl9SRUpFQ1RFRBAHEiwKKEJSSURHRV9FUlJPUl9LSU5EX0VWRU5UX0xPR19XUklURV9GQUlMRUQQCBItCilCUklER0VfRVJST1JfS0lORF9DUkVERU5USUFMX1dBVENIX0ZBSUxFRBAJKpkCChRJbnB1dFJlamVjdGlvblJlYXNvbhImCiJJTlBVVF9SRUpFQ1RJT05fUkVBU09OX1VOU1BFQ0lGSUVEEAASJAogSU5QVVRfUkVKRUNUSU9OX1JFQVNPTl9NQUxGT1JNRUQQARI1CjFJTlBVVF9SRUpFQ1RJT05fUkVBU09OX1VOS05PV05fUEVSTUlTU0lPTl9SRVFVRVNUEAISKQolSU5QVVRfUkVKRUNUSU9OX1JFQVNPTl9VTktOT1dOX09QVElPThADEikKJUlOUFVUX1JFSkVDVElPTl9SRUFTT05fTk9fQUNUSVZFX1RVUk4QBBImCiJJTlBVVF9SRUpFQ1RJT05fUkVBU09OX1VOU1VQUE9SVEVEEAVCP1o9Z2l0aHViLmNvbS9kZWxpbm9pby9tb25vL3Byb3Rvcy9kZWxpbm8vc2FuZGNyZXcvdjE7c2FuZGNyZXd2MWIGcHJvdG8z");
+  fileDesc("Ch9kZWxpbm8vc2FuZGNyZXcvdjEvY29tbW9uLnByb3RvEhJkZWxpbm8uc2FuZGNyZXcudjEqaAoLQWdlbnRWZW5kb3ISHAoYQUdFTlRfVkVORE9SX1VOU1BFQ0lGSUVEEAASHAoYQUdFTlRfVkVORE9SX0NMQVVERV9DT0RFEAESHQoZQUdFTlRfVkVORE9SX09QRU5BSV9DT0RFWBACKmEKB0d1ZXN0T3MSGAoUR1VFU1RfT1NfVU5TUEVDSUZJRUQQABISCg5HVUVTVF9PU19MSU5VWBABEhIKDkdVRVNUX09TX01BQ09TEAISFAoQR1VFU1RfT1NfV0lORE9XUxADKmwKDlBlcm1pc3Npb25Nb2RlEh8KG1BFUk1JU1NJT05fTU9ERV9VTlNQRUNJRklFRBAAEiAKHFBFUk1JU1NJT05fTU9ERV9BVVRPX0FQUFJPVkUQARIXChNQRVJNSVNTSU9OX01PREVfQVNLEAIqvQEKFFZlbmRvckNyZWRlbnRpYWxLaW5kEiYKIlZFTkRPUl9DUkVERU5USUFMX0tJTkRfVU5TUEVDSUZJRUQQABIiCh5WRU5ET1JfQ1JFREVOVElBTF9LSU5EX0FQSV9LRVkQARItCilWRU5ET1JfQ1JFREVOVElBTF9LSU5EX0NMQVVERV9PQVVUSF9UT0tFThACEioKJlZFTkRPUl9DUkVERU5USUFMX0tJTkRfQ09ERVhfQVVUSF9KU09OEAMqTQoEUm9sZRIUChBST0xFX1VOU1BFQ0lGSUVEEAASDgoKUk9MRV9PV05FUhABEg4KClJPTEVfQURNSU4QAhIPCgtST0xFX01FTUJFUhADKs4CCgxTZXNzaW9uU3RhdGUSHQoZU0VTU0lPTl9TVEFURV9VTlNQRUNJRklFRBAAEhgKFFNFU1NJT05fU1RBVEVfUVVFVUVEEAESGgoWU0VTU0lPTl9TVEFURV9TVEFSVElORxACEhkKFVNFU1NJT05fU1RBVEVfUlVOTklORxADEiMKH1NFU1NJT05fU1RBVEVfV0FJVElOR19GT1JfSU5QVVQQBBIZChVTRVNTSU9OX1NUQVRFX1BBVVNJTkcQBRIYChRTRVNTSU9OX1NUQVRFX1BBVVNFRBAGEh8KG1NFU1NJT05fU1RBVEVfUkVTVU1FX1FVRVVFRBAHEhoKFlNFU1NJT05fU1RBVEVfUkVTVU1JTkcQCBIeChpTRVNTSU9OX1NUQVRFX0RJU0NPTk5FQ1RFRBAJEhcKE1NFU1NJT05fU1RBVEVfRU5ERUQQCir0AgoQU2Vzc2lvbkVuZFJlYXNvbhIiCh5TRVNTSU9OX0VORF9SRUFTT05fVU5TUEVDSUZJRUQQABIjCh9TRVNTSU9OX0VORF9SRUFTT05fU1RBUlRfRkFJTEVEEAESJAogU0VTU0lPTl9FTkRfUkVBU09OX1FVRVVFX0VYUElSRUQQAhIjCh9TRVNTSU9OX0VORF9SRUFTT05fQUdFTlRfRVhJVEVEEAMSIgoeU0VTU0lPTl9FTkRfUkVBU09OX0RFVklDRV9MT1NUEAQSJQohU0VTU0lPTl9FTkRfUkVBU09OX1JFU1RPUkVfRkFJTEVEEAUSLworU0VTU0lPTl9FTkRfUkVBU09OX1BBVVNFRF9SRVRFTlRJT05fRVhQSVJFRBAGEikKJVNFU1NJT05fRU5EX1JFQVNPTl9CUklER0VfVU5TVVBQT1JURUQQBxIlCiFTRVNTSU9OX0VORF9SRUFTT05fRVhFQ1VUT1JfRU5ERUQQCCpxCg9DcmVkZW50aWFsU2NvcGUSIAocQ1JFREVOVElBTF9TQ09QRV9VTlNQRUNJRklFRBAAEiEKHUNSRURFTlRJQUxfU0NPUEVfT1JHQU5JWkFUSU9OEAESGQoVQ1JFREVOVElBTF9TQ09QRV9VU0VSEAIqkQEKFkNyZWRlbnRpYWxVcGRhdGVTb3VyY2USKAokQ1JFREVOVElBTF9VUERBVEVfU09VUkNFX1VOU1BFQ0lGSUVEEAASIQodQ1JFREVOVElBTF9VUERBVEVfU09VUkNFX1VTRVIQARIqCiZDUkVERU5USUFMX1VQREFURV9TT1VSQ0VfQUdFTlRfUkVGUkVTSBACKs0BChRQcm9maWxlSW5lbGlnaWJpbGl0eRIlCiFQUk9GSUxFX0lORUxJR0lCSUxJVFlfVU5TUEVDSUZJRUQQABIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfSEFTX01BWElNVU1fTElGRVRJTUUQARIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfTkVUV09SS19OT1RfT1VUQk9VTkQQAhIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfR1VFU1RfT1NfVU5TVVBQT1JURUQQA0I/Wj1naXRodWIuY29tL2RlbGlub2lvL21vbm8vcHJvdG9zL2RlbGluby9zYW5kY3Jldy92MTtzYW5kY3Jld3YxYgZwcm90bzM");
 
 /**
- * The coding-agent vendors that SandCrew runs. Cursor and Devin get values
- * when they are added after the MVP.
+ * Vendor of the coding agent of a session.
  *
  * @generated from enum delino.sandcrew.v1.AgentVendor
  */
@@ -26,11 +25,15 @@ export enum AgentVendor {
   UNSPECIFIED = 0,
 
   /**
+   * Claude Code through its ACP adapter.
+   *
    * @generated from enum value: AGENT_VENDOR_CLAUDE_CODE = 1;
    */
   CLAUDE_CODE = 1,
 
   /**
+   * OpenAI Codex through its ACP adapter.
+   *
    * @generated from enum value: AGENT_VENDOR_OPENAI_CODEX = 2;
    */
   OPENAI_CODEX = 2,
@@ -43,8 +46,7 @@ export const AgentVendorSchema: GenEnum<AgentVendor> = /*@__PURE__*/
   enumDesc(file_delino_sandcrew_v1_common, 0);
 
 /**
- * The guest operating system of a runner profile. A copy of the SandRun
- * values; the SandCrew schemas do not import the SandRun schemas.
+ * Operating system of the session's guest (a copy of the SandRun values).
  *
  * @generated from enum delino.sandcrew.v1.GuestOs
  */
@@ -77,6 +79,78 @@ export const GuestOsSchema: GenEnum<GuestOs> = /*@__PURE__*/
   enumDesc(file_delino_sandcrew_v1_common, 1);
 
 /**
+ * How the bridge answers agent permission requests.
+ *
+ * @generated from enum delino.sandcrew.v1.PermissionMode
+ */
+export enum PermissionMode {
+  /**
+   * @generated from enum value: PERMISSION_MODE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * The vendor's auto-approve mode, and the bridge allows every remaining
+   * request.
+   *
+   * @generated from enum value: PERMISSION_MODE_AUTO_APPROVE = 1;
+   */
+  AUTO_APPROVE = 1,
+
+  /**
+   * The user answers each request.
+   *
+   * @generated from enum value: PERMISSION_MODE_ASK = 2;
+   */
+  ASK = 2,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.PermissionMode.
+ */
+export const PermissionModeSchema: GenEnum<PermissionMode> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 2);
+
+/**
+ * Kind of a vendor credential.
+ *
+ * @generated from enum delino.sandcrew.v1.VendorCredentialKind
+ */
+export enum VendorCredentialKind {
+  /**
+   * @generated from enum value: VENDOR_CREDENTIAL_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * A model API key of the vendor.
+   *
+   * @generated from enum value: VENDOR_CREDENTIAL_KIND_API_KEY = 1;
+   */
+  API_KEY = 1,
+
+  /**
+   * The Claude Code token of `claude setup-token`.
+   *
+   * @generated from enum value: VENDOR_CREDENTIAL_KIND_CLAUDE_OAUTH_TOKEN = 2;
+   */
+  CLAUDE_OAUTH_TOKEN = 2,
+
+  /**
+   * The OpenAI Codex ChatGPT sign-in file `auth.json`.
+   *
+   * @generated from enum value: VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON = 3;
+   */
+  CODEX_AUTH_JSON = 3,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.VendorCredentialKind.
+ */
+export const VendorCredentialKindSchema: GenEnum<VendorCredentialKind> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 3);
+
+/**
  * The caller's SandRun role in an organization.
  *
  * @generated from enum delino.sandcrew.v1.Role
@@ -107,7 +181,7 @@ export enum Role {
  * Describes the enum delino.sandcrew.v1.Role.
  */
 export const RoleSchema: GenEnum<Role> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 2);
+  enumDesc(file_delino_sandcrew_v1_common, 4);
 
 /**
  * The state of a session. Only ENDED is terminal.
@@ -175,7 +249,7 @@ export enum SessionState {
  * Describes the enum delino.sandcrew.v1.SessionState.
  */
 export const SessionStateSchema: GenEnum<SessionState> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 3);
+  enumDesc(file_delino_sandcrew_v1_common, 5);
 
 /**
  * Why a session ended.
@@ -233,39 +307,7 @@ export enum SessionEndReason {
  * Describes the enum delino.sandcrew.v1.SessionEndReason.
  */
 export const SessionEndReasonSchema: GenEnum<SessionEndReason> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 4);
-
-/**
- * How the bridge answers agent permission requests.
- *
- * @generated from enum delino.sandcrew.v1.PermissionMode
- */
-export enum PermissionMode {
-  /**
-   * @generated from enum value: PERMISSION_MODE_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * The bridge answers every permission request with an allow option.
-   *
-   * @generated from enum value: PERMISSION_MODE_AUTO_APPROVE = 1;
-   */
-  AUTO_APPROVE = 1,
-
-  /**
-   * Permission requests appear in the chat for the session owner.
-   *
-   * @generated from enum value: PERMISSION_MODE_ASK = 2;
-   */
-  ASK = 2,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.PermissionMode.
- */
-export const PermissionModeSchema: GenEnum<PermissionMode> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 5);
+  enumDesc(file_delino_sandcrew_v1_common, 6);
 
 /**
  * The owner of a vendor credential.
@@ -293,43 +335,6 @@ export enum CredentialScope {
  * Describes the enum delino.sandcrew.v1.CredentialScope.
  */
 export const CredentialScopeSchema: GenEnum<CredentialScope> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 6);
-
-/**
- * The kind of a vendor credential.
- *
- * @generated from enum delino.sandcrew.v1.VendorCredentialKind
- */
-export enum VendorCredentialKind {
-  /**
-   * @generated from enum value: VENDOR_CREDENTIAL_KIND_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: VENDOR_CREDENTIAL_KIND_API_KEY = 1;
-   */
-  API_KEY = 1,
-
-  /**
-   * The Claude Code token of `claude setup-token`.
-   *
-   * @generated from enum value: VENDOR_CREDENTIAL_KIND_CLAUDE_OAUTH_TOKEN = 2;
-   */
-  CLAUDE_OAUTH_TOKEN = 2,
-
-  /**
-   * The OpenAI Codex ChatGPT sign-in file `auth.json`.
-   *
-   * @generated from enum value: VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON = 3;
-   */
-  CODEX_AUTH_JSON = 3,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.VendorCredentialKind.
- */
-export const VendorCredentialKindSchema: GenEnum<VendorCredentialKind> = /*@__PURE__*/
   enumDesc(file_delino_sandcrew_v1_common, 7);
 
 /**
@@ -400,477 +405,4 @@ export enum ProfileIneligibility {
  */
 export const ProfileIneligibilitySchema: GenEnum<ProfileIneligibility> = /*@__PURE__*/
   enumDesc(file_delino_sandcrew_v1_common, 9);
-
-/**
- * The ACP ToolKind.
- *
- * @generated from enum delino.sandcrew.v1.ToolKind
- */
-export enum ToolKind {
-  /**
-   * @generated from enum value: TOOL_KIND_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: TOOL_KIND_READ = 1;
-   */
-  READ = 1,
-
-  /**
-   * @generated from enum value: TOOL_KIND_EDIT = 2;
-   */
-  EDIT = 2,
-
-  /**
-   * @generated from enum value: TOOL_KIND_DELETE = 3;
-   */
-  DELETE = 3,
-
-  /**
-   * @generated from enum value: TOOL_KIND_MOVE = 4;
-   */
-  MOVE = 4,
-
-  /**
-   * @generated from enum value: TOOL_KIND_SEARCH = 5;
-   */
-  SEARCH = 5,
-
-  /**
-   * @generated from enum value: TOOL_KIND_EXECUTE = 6;
-   */
-  EXECUTE = 6,
-
-  /**
-   * @generated from enum value: TOOL_KIND_THINK = 7;
-   */
-  THINK = 7,
-
-  /**
-   * @generated from enum value: TOOL_KIND_FETCH = 8;
-   */
-  FETCH = 8,
-
-  /**
-   * @generated from enum value: TOOL_KIND_SWITCH_MODE = 9;
-   */
-  SWITCH_MODE = 9,
-
-  /**
-   * @generated from enum value: TOOL_KIND_OTHER = 10;
-   */
-  OTHER = 10,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.ToolKind.
- */
-export const ToolKindSchema: GenEnum<ToolKind> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 10);
-
-/**
- * The ACP ToolCallStatus.
- *
- * @generated from enum delino.sandcrew.v1.ToolCallStatus
- */
-export enum ToolCallStatus {
-  /**
-   * @generated from enum value: TOOL_CALL_STATUS_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: TOOL_CALL_STATUS_PENDING = 1;
-   */
-  PENDING = 1,
-
-  /**
-   * @generated from enum value: TOOL_CALL_STATUS_IN_PROGRESS = 2;
-   */
-  IN_PROGRESS = 2,
-
-  /**
-   * @generated from enum value: TOOL_CALL_STATUS_COMPLETED = 3;
-   */
-  COMPLETED = 3,
-
-  /**
-   * @generated from enum value: TOOL_CALL_STATUS_FAILED = 4;
-   */
-  FAILED = 4,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.ToolCallStatus.
- */
-export const ToolCallStatusSchema: GenEnum<ToolCallStatus> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 11);
-
-/**
- * The ACP plan entry priority.
- *
- * @generated from enum delino.sandcrew.v1.PlanEntryPriority
- */
-export enum PlanEntryPriority {
-  /**
-   * @generated from enum value: PLAN_ENTRY_PRIORITY_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: PLAN_ENTRY_PRIORITY_HIGH = 1;
-   */
-  HIGH = 1,
-
-  /**
-   * @generated from enum value: PLAN_ENTRY_PRIORITY_MEDIUM = 2;
-   */
-  MEDIUM = 2,
-
-  /**
-   * @generated from enum value: PLAN_ENTRY_PRIORITY_LOW = 3;
-   */
-  LOW = 3,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.PlanEntryPriority.
- */
-export const PlanEntryPrioritySchema: GenEnum<PlanEntryPriority> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 12);
-
-/**
- * The ACP plan entry status.
- *
- * @generated from enum delino.sandcrew.v1.PlanEntryStatus
- */
-export enum PlanEntryStatus {
-  /**
-   * @generated from enum value: PLAN_ENTRY_STATUS_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: PLAN_ENTRY_STATUS_PENDING = 1;
-   */
-  PENDING = 1,
-
-  /**
-   * @generated from enum value: PLAN_ENTRY_STATUS_IN_PROGRESS = 2;
-   */
-  IN_PROGRESS = 2,
-
-  /**
-   * @generated from enum value: PLAN_ENTRY_STATUS_COMPLETED = 3;
-   */
-  COMPLETED = 3,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.PlanEntryStatus.
- */
-export const PlanEntryStatusSchema: GenEnum<PlanEntryStatus> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 13);
-
-/**
- * The ACP permission option kind.
- *
- * @generated from enum delino.sandcrew.v1.PermissionOptionKind
- */
-export enum PermissionOptionKind {
-  /**
-   * @generated from enum value: PERMISSION_OPTION_KIND_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: PERMISSION_OPTION_KIND_ALLOW_ONCE = 1;
-   */
-  ALLOW_ONCE = 1,
-
-  /**
-   * @generated from enum value: PERMISSION_OPTION_KIND_ALLOW_ALWAYS = 2;
-   */
-  ALLOW_ALWAYS = 2,
-
-  /**
-   * @generated from enum value: PERMISSION_OPTION_KIND_REJECT_ONCE = 3;
-   */
-  REJECT_ONCE = 3,
-
-  /**
-   * @generated from enum value: PERMISSION_OPTION_KIND_REJECT_ALWAYS = 4;
-   */
-  REJECT_ALWAYS = 4,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.PermissionOptionKind.
- */
-export const PermissionOptionKindSchema: GenEnum<PermissionOptionKind> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 14);
-
-/**
- * The outcome of a permission request.
- *
- * @generated from enum delino.sandcrew.v1.PermissionOutcome
- */
-export enum PermissionOutcome {
-  /**
-   * @generated from enum value: PERMISSION_OUTCOME_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: PERMISSION_OUTCOME_SELECTED = 1;
-   */
-  SELECTED = 1,
-
-  /**
-   * @generated from enum value: PERMISSION_OUTCOME_CANCELLED = 2;
-   */
-  CANCELLED = 2,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.PermissionOutcome.
- */
-export const PermissionOutcomeSchema: GenEnum<PermissionOutcome> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 15);
-
-/**
- * The ACP StopReason of a turn.
- *
- * @generated from enum delino.sandcrew.v1.StopReason
- */
-export enum StopReason {
-  /**
-   * @generated from enum value: STOP_REASON_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: STOP_REASON_END_TURN = 1;
-   */
-  END_TURN = 1,
-
-  /**
-   * @generated from enum value: STOP_REASON_MAX_TOKENS = 2;
-   */
-  MAX_TOKENS = 2,
-
-  /**
-   * @generated from enum value: STOP_REASON_MAX_TURN_REQUESTS = 3;
-   */
-  MAX_TURN_REQUESTS = 3,
-
-  /**
-   * @generated from enum value: STOP_REASON_REFUSAL = 4;
-   */
-  REFUSAL = 4,
-
-  /**
-   * @generated from enum value: STOP_REASON_CANCELLED = 5;
-   */
-  CANCELLED = 5,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.StopReason.
- */
-export const StopReasonSchema: GenEnum<StopReason> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 16);
-
-/**
- * The ACP SessionConfigOptionCategory.
- *
- * @generated from enum delino.sandcrew.v1.ConfigOptionCategory
- */
-export enum ConfigOptionCategory {
-  /**
-   * @generated from enum value: CONFIG_OPTION_CATEGORY_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: CONFIG_OPTION_CATEGORY_MODE = 1;
-   */
-  MODE = 1,
-
-  /**
-   * @generated from enum value: CONFIG_OPTION_CATEGORY_MODEL = 2;
-   */
-  MODEL = 2,
-
-  /**
-   * @generated from enum value: CONFIG_OPTION_CATEGORY_MODEL_CONFIG = 3;
-   */
-  MODEL_CONFIG = 3,
-
-  /**
-   * @generated from enum value: CONFIG_OPTION_CATEGORY_SPEED = 4;
-   */
-  SPEED = 4,
-
-  /**
-   * @generated from enum value: CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL = 5;
-   */
-  THOUGHT_LEVEL = 5,
-
-  /**
-   * @generated from enum value: CONFIG_OPTION_CATEGORY_OTHER = 6;
-   */
-  OTHER = 6,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.ConfigOptionCategory.
- */
-export const ConfigOptionCategorySchema: GenEnum<ConfigOptionCategory> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 17);
-
-/**
- * What the agent of a session does, as the bridge reports it.
- *
- * @generated from enum delino.sandcrew.v1.AgentActivity
- */
-export enum AgentActivity {
-  /**
-   * @generated from enum value: AGENT_ACTIVITY_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: AGENT_ACTIVITY_STARTING = 1;
-   */
-  STARTING = 1,
-
-  /**
-   * @generated from enum value: AGENT_ACTIVITY_IDLE = 2;
-   */
-  IDLE = 2,
-
-  /**
-   * @generated from enum value: AGENT_ACTIVITY_WORKING = 3;
-   */
-  WORKING = 3,
-
-  /**
-   * @generated from enum value: AGENT_ACTIVITY_WAITING_FOR_PERMISSION = 4;
-   */
-  WAITING_FOR_PERMISSION = 4,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.AgentActivity.
- */
-export const AgentActivitySchema: GenEnum<AgentActivity> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 18);
-
-/**
- * The kind of a bridge error.
- *
- * @generated from enum delino.sandcrew.v1.BridgeErrorKind
- */
-export enum BridgeErrorKind {
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED = 1;
-   */
-  AGENT_INSTALL_FAILED = 1,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH = 2;
-   */
-  CHECKSUM_MISMATCH = 2,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_AGENT_START_FAILED = 3;
-   */
-  AGENT_START_FAILED = 3,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_CREDENTIAL_MISSING = 4;
-   */
-  CREDENTIAL_MISSING = 4,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR = 5;
-   */
-  ACP_PROTOCOL_ERROR = 5,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_INPUT_INVALID = 6;
-   */
-  INPUT_INVALID = 6,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_OPTION_REJECTED = 7;
-   */
-  OPTION_REJECTED = 7,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED = 8;
-   */
-  EVENT_LOG_WRITE_FAILED = 8,
-
-  /**
-   * @generated from enum value: BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED = 9;
-   */
-  CREDENTIAL_WATCH_FAILED = 9,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.BridgeErrorKind.
- */
-export const BridgeErrorKindSchema: GenEnum<BridgeErrorKind> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 19);
-
-/**
- * Why the bridge rejected an inbox message.
- *
- * @generated from enum delino.sandcrew.v1.InputRejectionReason
- */
-export enum InputRejectionReason {
-  /**
-   * @generated from enum value: INPUT_REJECTION_REASON_UNSPECIFIED = 0;
-   */
-  UNSPECIFIED = 0,
-
-  /**
-   * @generated from enum value: INPUT_REJECTION_REASON_MALFORMED = 1;
-   */
-  MALFORMED = 1,
-
-  /**
-   * @generated from enum value: INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST = 2;
-   */
-  UNKNOWN_PERMISSION_REQUEST = 2,
-
-  /**
-   * @generated from enum value: INPUT_REJECTION_REASON_UNKNOWN_OPTION = 3;
-   */
-  UNKNOWN_OPTION = 3,
-
-  /**
-   * @generated from enum value: INPUT_REJECTION_REASON_NO_ACTIVE_TURN = 4;
-   */
-  NO_ACTIVE_TURN = 4,
-
-  /**
-   * @generated from enum value: INPUT_REJECTION_REASON_UNSUPPORTED = 5;
-   */
-  UNSUPPORTED = 5,
-}
-
-/**
- * Describes the enum delino.sandcrew.v1.InputRejectionReason.
- */
-export const InputRejectionReasonSchema: GenEnum<InputRejectionReason> = /*@__PURE__*/
-  enumDesc(file_delino_sandcrew_v1_common, 20);
 

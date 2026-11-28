@@ -295,6 +295,12 @@ func TestExitEvent(t *testing.T) {
 func TestExecAtMostOnce(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/sh", "-c", "echo run >> count; cat count")
+	// Use the dispatcher clock for admission and force a lowercase hex letter.
+	id, err := uuidv7.FromTime(e.clk.Now(), bytes.NewReader([]byte{9: 0x0a}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ExecId = id.String()
 	out, frames, accepted := e.handle(req, nil)
 	if !out.Finished || !accepted || frames[0].GetExecEvent().GetStarted() == nil {
 		t.Fatalf("outcome %+v accepted %v first %v", out, accepted, frames[0])
@@ -1393,7 +1399,7 @@ func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
 		t.Fatalf("attach after sweep: %+v", out)
 	}
 
-	// The running exec is still live, and SandboxEnded cancels it.
+	// The running exec is still live, and its handler returns after deletion.
 	if err, _ := e.d.ExecContextErr(running.GetExecId()); err != nil {
 		t.Fatalf("running exec context canceled early: %v", err)
 	}
@@ -1403,6 +1409,47 @@ func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
 	if _, ok := awaitOutcome(rdone, waitBound); !ok {
 		t.Fatalf("exec handler did not return within %v after the sandbox ended", waitBound)
 	}
+
+	t.Run("sandbox-deletion", func(t *testing.T) {
+		var gate *admittedSandboxes
+		e := newEnvWith(t, envOptions{wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+			gate = newAdmittedSandboxes(m)
+			return gate
+		}})
+		// Release the admitted worker before dispatcher cleanup waits for it.
+		t.Cleanup(gate.Release)
+		req := e.execReq("/bin/sh", "-c", "echo done")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan ops.Outcome, 1)
+		go func() {
+			done <- e.d.Handle(ctx, ops.Request{
+				Frame:     datapath.MustNewFrame(1, e.sandbox, req),
+				SandboxID: e.sandbox,
+			}, &sink{})
+		}()
+		switch outcome, early := awaitGate(gate.admitted, done, waitBound); outcome {
+		case gateHandlerReturned:
+			t.Fatalf("exec handler returned before admission: %+v", early)
+		case gateTimedOut:
+			t.Fatalf("exec was not admitted within %v", waitBound)
+		}
+		if err, kept := e.d.ExecContextErr(req.GetExecId()); !kept || err != nil {
+			t.Fatalf("admitted exec context: kept %v, err %v, want a retained exec with a live context", kept, err)
+		}
+
+		if _, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
+			t.Fatal(err)
+		}
+		// Check before release because the worker also cancels its context on exit.
+		if err, kept := e.d.ExecContextErr(req.GetExecId()); !kept || err != context.Canceled {
+			t.Fatalf("exec context after deletion: kept %v, err %v, want a retained exec with context.Canceled", kept, err)
+		}
+		gate.Release()
+		if _, ok := awaitOutcome(done, waitBound); !ok {
+			t.Fatalf("exec handler did not return within %v after admission was released", waitBound)
+		}
+	})
 }
 
 // faultySandboxes gives the dispatcher a guest client whose dialer a test

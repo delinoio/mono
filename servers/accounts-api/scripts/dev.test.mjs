@@ -196,6 +196,10 @@ function startLauncher(t, { port, env = {}, pathPrefix } = {}) {
   childEnv.METRICS_ADDR = "";
   delete childEnv.CORS_ORIGINS;
   delete childEnv.WEB_ORIGIN;
+  // Keep the fixture independent of the host's telemetry configuration.
+  for (const name of Object.keys(childEnv)) {
+    if (name.startsWith("OTEL_")) delete childEnv[name];
+  }
   Object.assign(childEnv, env);
   for (const [name, value] of Object.entries(childEnv)) {
     if (value === undefined) delete childEnv[name];
@@ -256,15 +260,18 @@ function fakeGo(t, script) {
 
 // A fake `go` whose "build" writes a signal-counting program to the -o path.
 // The program mirrors the server's signal contract: the first SIGINT starts a
-// drain that ends after DrainMs with server_shutdown_completed; a second SIGINT
-// ends it at once without that event. Every SIGINT prints a child_sigint event.
+// drain that ends after DrainMs with server_shutdown_completed in timed mode.
+// Hold mode keeps the drain open until the second SIGINT. In either mode, a
+// second SIGINT ends the drain without a completion event.
 const DrainMs = 1500;
 const countingServer = `#!${process.execPath}
+const mode = process.env.FAKE_MODE;
 let sigints = 0;
 process.on("SIGINT", () => {
   sigints += 1;
   console.log(JSON.stringify({ event: "child_sigint", n: sigints }));
   if (sigints > 1) process.exit(2);
+  if (mode === "hold") return;
   setTimeout(() => {
     console.log(JSON.stringify({ event: "server_shutdown_completed" }));
     process.exit(0);
@@ -287,6 +294,24 @@ function fakeGoBuildingCountingServer(t) {
 
 const countEvents = (output, event) =>
   output.split("\n").filter((line) => line.includes(`"${event}"`)).length;
+
+function serverExitError(stdout) {
+  const record = stdout
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line))
+    .find((record) => record.msg === "server_exited");
+  assert.ok(record, `missing server_exited record in stdout: ${stdout}`);
+  return record.error;
+}
+
+const childSigintCounts = (output) =>
+  output
+    .split("\n")
+    // The fragment after the last newline can still be incomplete.
+    .slice(0, -1)
+    .filter((line) => line.includes('"event":"child_sigint"'))
+    .map((line) => JSON.parse(line).n);
 
 test(
   "skips without DATABASE_URL and starts no build",
@@ -367,6 +392,75 @@ const envRecord = (output) =>
   JSON.parse(output.split("\n").find((line) => line.includes('"event":"env"')));
 
 test(
+  "the build and server receive only explicit OpenTelemetry settings",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const inherited = {
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:1",
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://127.0.0.1:1/v1/metrics",
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://127.0.0.1:1/v1/logs",
+      OTEL_EXPORTER_OTLP_HEADERS: "test=generic",
+      OTEL_EXPORTER_OTLP_METRICS_HEADERS: "test=metrics",
+      OTEL_EXPORTER_OTLP_LOGS_HEADERS: "test=logs",
+      OTEL_RESOURCE_ATTRIBUTES: "invalid_fixture_attribute",
+      OTEL_METRIC_EXPORT_INTERVAL: "100",
+      OTEL_SDK_DISABLED: "true",
+    };
+    const names = Object.keys(inherited);
+    for (const [name, value] of Object.entries(inherited)) {
+      const previous = process.env[name];
+      t.after(() => {
+        if (previous === undefined) delete process.env[name];
+        else process.env[name] = previous;
+      });
+      process.env[name] = value;
+    }
+
+    const probe = `#!${process.execPath}
+const names = ${JSON.stringify(names)};
+const present = Object.fromEntries(names.map((name) => [name, Object.hasOwn(process.env, name)]));
+console.log(JSON.stringify({ present, metricsDisabled: process.env.METRICS_ADDR === "" }));
+`;
+    const pathPrefix = fakeGo(
+      t,
+      [
+        'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done',
+        `cat > "$out" <<'PROGRAM'\n${probe}PROGRAM`,
+        'chmod 755 "$out"',
+        '"$out"',
+      ].join("\n"),
+    );
+    const endpoint = "OTEL_EXPORTER_OTLP_ENDPOINT";
+    for (const env of [
+      {},
+      {
+        [endpoint]: "http://127.0.0.1:2",
+        OTEL_EXPORTER_OTLP_LOGS_HEADERS: undefined,
+      },
+    ]) {
+      const run = startLauncher(t, { port: await freePort(), env, pathPrefix });
+      assert.equal((await run.exited).code, 0, run.stderr);
+      const expected = {
+        present: Object.fromEntries(
+          names.map((name) => [name, env[name] !== undefined]),
+        ),
+        metricsDisabled: true,
+      };
+      // The fake build runs the probe once and the launcher runs it again.
+      const records = run.stdout
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(records, [expected, expected]);
+    }
+
+    for (const [name, value] of Object.entries(inherited)) {
+      assert.ok(process.env[name] === value, `parent ${name} changed`);
+    }
+  },
+);
+
+test(
   "development origins are the defaults and explicit values win",
   { skip, timeout: Timeout },
   async (t) => {
@@ -441,6 +535,7 @@ test(
   async (t) => {
     const run = startLauncher(t, {
       port: await freePort(),
+      env: { FAKE_MODE: "timed" },
       pathPrefix: fakeGoBuildingCountingServer(t),
     });
     await waitReady(run);
@@ -465,23 +560,30 @@ test(
   async (t) => {
     const run = startLauncher(t, {
       port: await freePort(),
+      env: { FAKE_MODE: "hold" },
       pathPrefix: fakeGoBuildingCountingServer(t),
     });
     await waitReady(run);
 
-    const started = Date.now();
     process.kill(-run.child.pid, "SIGINT");
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(
+      run,
+      () => {
+        assert.equal(
+          run.child.exitCode ?? run.child.signalCode,
+          null,
+          "launcher exited before the second SIGINT",
+        );
+        return childSigintCounts(run.stdout).includes(1);
+      },
+      "the first child_sigint record",
+    );
     process.kill(-run.child.pid, "SIGINT");
     const { code } = await run.exited;
 
     assert.equal(code, StatusSigint, run.stderr);
-    assert.equal(countEvents(run.stdout, "child_sigint"), 2, run.stdout);
+    assert.deepEqual(childSigintCounts(run.stdout), [1, 2], run.stdout);
     assert.doesNotMatch(run.stdout, /"server_shutdown_completed"/);
-    assert.ok(
-      Date.now() - started < DrainMs,
-      "the second SIGINT did not end the drain early",
-    );
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
   },
 );
@@ -493,6 +595,11 @@ test(
     const port = await freePort();
     const run = startLauncher(t, { port });
     await waitReady(run);
+    const started = JSON.parse(
+      run.stdout.split("\n").find((line) => line.includes('"server_started"')),
+    );
+    assert.equal(started.otlp_metrics_export, false);
+    assert.equal(started.otlp_logs_export, false);
     const health = await fetch(`http://127.0.0.1:${port}/healthz`);
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), { status: "ok" });
@@ -506,6 +613,22 @@ test(
     assert.match(run.stdout, /"server_shutdown_completed"/);
     await assertNoListener(port);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
+  },
+);
+
+test(
+  "an explicitly set malformed OpenTelemetry resource fails startup",
+  { skip, timeout: Timeout * 2 },
+  async (t) => {
+    const port = await freePort();
+    const run = startLauncher(t, {
+      port,
+      env: { OTEL_RESOURCE_ATTRIBUTES: "invalid_fixture_attribute" },
+    });
+    assert.equal((await run.exited).code, 1, run.stderr);
+    assert.match(serverExitError(run.stdout), /missing value/);
+    assert.doesNotMatch(run.stdout, /"server_started"/);
+    await assertNoListener(port);
   },
 );
 
@@ -572,7 +695,12 @@ test(
     const { code } = await run.exited;
 
     assert.equal(code, 1, run.stderr);
-    assert.match(run.stdout, /"server_exited"/);
+    assert.match(
+      serverExitError(run.stdout),
+      new RegExp(
+        `^listen tcp 127\\.0\\.0\\.1:${port}: .*address already in use$`,
+      ),
+    );
     assert.doesNotMatch(run.stdout, /"server_started"/);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
   },
@@ -587,7 +715,10 @@ test(
     const { code } = await run.exited;
 
     assert.equal(code, 1, run.stderr);
-    assert.match(run.stdout, /"server_exited"/);
+    assert.equal(
+      serverExitError(run.stdout),
+      'LOG_LEVEL must be one of debug, info, warn, error; got "bogus"',
+    );
     assert.doesNotMatch(run.stdout, /"server_started"/);
     await assertNoListener(port);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");

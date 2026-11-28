@@ -223,7 +223,7 @@ func waitRelayAdmissionOpen(want relayAdmissionWait, within time.Duration) bool 
 
 // TestRelayAdmissionStreamOpenWait checks the Connect status of a ReadFile
 // waiting for queue capacity or for another open to release the gate.
-func TestRelayAdmissionStreamOpenWait(t *testing.T) {
+func TestRelayAdmissionStreamOpenWait(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test reads the stacks of every goroutine in the
 	// process, so goroutines of a parallel test would change its result.
 	const (

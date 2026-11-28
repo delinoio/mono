@@ -7,7 +7,6 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -18,7 +17,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
-import { declaredReleaseInputs } from "./workspace-packages.mjs";
+import {
+  declaredReleaseInputs,
+  namedWorkspaceAlias,
+  readWorkspacePackages,
+} from "./workspace-packages.mjs";
 import {
   MAIN_PUSH_EVENT,
   MAIN_REF,
@@ -29,6 +32,8 @@ import {
   isScheduledMain,
   main,
   plan,
+  releaseOnlyPackageDirs,
+  taskPackageDirs,
   workspacePackageDirs,
   workspaceRoots,
 } from "./plan.mjs";
@@ -763,10 +768,10 @@ test("workspace cross-check detects an extra single package directory", () => {
   );
 });
 
-test("single workspace packages declare no package tasks", () => {
+test("release-only single workspace packages declare no package tasks", () => {
   // The planner treats only their manifests as workspace inputs, so a
   // package task there would not run when its Go source changes.
-  for (const dir of workspacePackageDirs) {
+  for (const dir of releaseOnlyPackageDirs) {
     const manifest = JSON.parse(
       readFileSync(join(root, dir, "package.json"), "utf8"),
     );
@@ -786,6 +791,44 @@ test("single workspace package manifests select workspace and fixture checks", (
   f.write("cmds/ownsand-agent/main.go", "package main // changed\n");
   result = plan(f.cwd, base, f.commit());
   assert.equal(result.workspace, false);
+});
+
+test("task single workspace packages declare tasks and select workspace checks", async (t) => {
+  for (const dir of taskPackageDirs) {
+    const manifest = JSON.parse(
+      readFileSync(join(root, dir, "package.json"), "utf8"),
+    );
+    assert.equal(manifest.private, true, `${dir} must be private`);
+    assert.ok(manifest.scripts?.test, `${dir} must declare a test script`);
+    // The go-vet, go-test and go-platforms jobs check the Go source of the
+    // root module. A `build` or `lint` script would repeat that work in the
+    // workspace jobs, and a release build there has no consumer.
+    for (const name of ["build", "lint"]) {
+      assert.equal(
+        manifest.scripts?.[name],
+        undefined,
+        `${dir} must not declare a ${name} script`,
+      );
+    }
+    assert.ok(!releaseOnlyPackageDirs.includes(dir));
+  }
+  // Go source and the data files that its Go tests embed both select the Go
+  // checks, because the package tasks run no Go.
+  for (const path of [
+    "cmds/sandcrew-bridge/main.go",
+    "cmds/sandcrew-bridge/internal/pins/pins.json",
+    "cmds/sandcrew-bridge/internal/pins/npm/openai-codex/package-lock.json",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      const base = f.commit();
+      f.write(path, "changed\n");
+      const result = plan(f.cwd, base, f.commit());
+      assert.equal(result.workspace, true);
+      assert.equal(result.go, true);
+    });
+  }
 });
 
 test("workspace glob parser rejects an empty packages block", () => {
@@ -844,6 +887,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "servers/sandrun-api/internal/db/migrations/00001_core.sql",
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
     "servers/ownsand-api/scripts/dev.mjs",
+    ".golangci.yml",
     "cmds/ownsand-agent/images/linux/build-rootfs.sh",
     "cmds/ownsand-agent/images/linux/fetch-kernel-source.sh",
     "cmds/ownsand-agent/images/linux/fetch-kernel.sh",
@@ -888,6 +932,8 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("docs/testdata/example.json");
   f.write("go/example/mytestdata/example.json");
   f.write("go/example/testdata.json");
+  // Only the root golangci-lint configuration is read.
+  f.write("servers/example/.golangci.yml");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
@@ -1032,38 +1078,72 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
   assert.equal(plan(f.cwd, f.base, f.commit()).e2e, false);
 });
 
-test("the e2e workspace packages equal the workspace dependencies of the apps", () => {
-  // The planner runs without installed dependencies, so it lists the packages
-  // that the apps depend on; this test keeps the list in sync with the
-  // manifests.
-  const manifest = (dir) =>
-    JSON.parse(readFileSync(join(root, dir, "package.json"), "utf8"));
-  const packageDirs = new Map();
-  for (const workspaceRoot of workspaceRoots) {
-    for (const entry of readdirSync(join(root, workspaceRoot), {
-      withFileTypes: true,
-    })) {
-      const dir = `${workspaceRoot}/${entry.name}`;
-      if (entry.isDirectory() && existsSync(join(root, dir, "package.json"))) {
-        packageDirs.set(manifest(dir).name, `${dir}/`);
-      }
-    }
-  }
+function assertE2eWorkspacePackages(packages, plannerPackages) {
+  const packageDirs = new Map(
+    packages.map(({ dir, manifest }) => [manifest.name, `${dir}/`]),
+  );
   const expected = new Set();
-  for (const entry of readdirSync(join(root, "apps"), {
-    withFileTypes: true,
-  })) {
-    if (!entry.isDirectory()) continue;
-    const app = manifest(`apps/${entry.name}`);
+  for (const { dir, manifest: app } of packages) {
+    if (!dir.startsWith("apps/")) continue;
     for (const dependencies of [app.dependencies, app.devDependencies]) {
-      for (const [name, range] of Object.entries(dependencies ?? {})) {
-        if (!String(range).startsWith("workspace:")) continue;
+      for (const [key, spec] of Object.entries(dependencies ?? {})) {
+        if (typeof spec !== "string" || !spec.startsWith("workspace:"))
+          continue;
+        const name =
+          namedWorkspaceAlias(spec.slice("workspace:".length)) ?? key;
         assert.ok(packageDirs.has(name), `${name} is not a workspace package`);
         expected.add(packageDirs.get(name));
       }
     }
   }
-  assert.deepEqual([...e2eWorkspacePackages].sort(), [...expected].sort());
+  assert.deepEqual([...plannerPackages].sort(), [...expected].sort());
+}
+
+test("the e2e workspace packages equal the workspace dependencies of the apps", () => {
+  // The planner lists these paths so it can run without installed dependencies.
+  assertE2eWorkspacePackages(readWorkspacePackages(root), e2eWorkspacePackages);
+});
+
+test("the e2e workspace alias comparison uses target directories", () => {
+  const app = {
+    name: "app",
+    dependencies: {
+      "ui-compat": "workspace:delino-ui@*",
+      "runtime-tools": "workspace:*",
+      "registry-package": "npm:other-package@1.0.0",
+    },
+    devDependencies: {
+      "accounts-client": "workspace:@delino/accounts-protos@^",
+      "test-tools": "workspace:^",
+      "registry-range": "^1.0.0",
+    },
+  };
+  const packages = [
+    { dir: "apps/example", manifest: app },
+    { dir: "packages/delino-ui", manifest: { name: "delino-ui" } },
+    { dir: "packages/runtime", manifest: { name: "runtime-tools" } },
+    { dir: "packages/testing", manifest: { name: "test-tools" } },
+    {
+      dir: "protos/delino/accounts",
+      manifest: { name: "@delino/accounts-protos" },
+    },
+  ];
+  const plannerPackages = [
+    "packages/delino-ui/",
+    "packages/runtime/",
+    "packages/testing/",
+    "protos/delino/accounts/",
+  ];
+  assertE2eWorkspacePackages(packages, plannerPackages);
+
+  assert.throws(
+    () => assertE2eWorkspacePackages(packages.slice(0, -1), plannerPackages),
+    /@delino\/accounts-protos is not a workspace package/,
+  );
+  assert.throws(
+    () => assertE2eWorkspacePackages(packages, plannerPackages.slice(1)),
+    { name: "AssertionError", expected: plannerPackages },
+  );
 });
 
 test("workspace package paths and root task inputs select workspace tasks", async (t) => {
@@ -2064,6 +2144,8 @@ test("CI workflow runs each Go check in its own job", () => {
   const vetJob = jobs.get("go-vet");
   assert.match(vetJob, /^\s+run: go vet \.\/\.\.\.$/m);
   assert.match(vetJob, /^\s+cache: false$/m);
+  assert.match(vetJob, /golangci\/golangci-lint-action@[0-9a-f]{40} # v/);
+  assert.match(vetJob, /^\s+skip-cache: true$/m);
   const testJob = jobs.get("go-test");
   assert.match(testJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
   assert.match(testJob, /^\s+cache: false$/m);

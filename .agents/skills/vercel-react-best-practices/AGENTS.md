@@ -852,8 +852,12 @@ const sorted = useMemo(() => [...usernames].sort(), [usernames])
 // string[] - duplicates everything
 usernames={['a','b']} sorted={usernames.toSorted()} // sends 4 strings
 
-// object[] - duplicates array structure only
-users={[{id:1},{id:2}]} sorted={users.toSorted()} // sends 2 arrays + 2 unique objects (not 4)
+// object[] - the two arrays share the same two objects
+function UserList() {
+  const users = [{ id: 2 }, { id: 1 }]
+  const sorted = users.toSorted((a, b) => a.id - b.id)
+  return <ClientList users={users} sorted={sorted} />
+}
 ```
 
 Deduplication works recursively. Impact varies by data type:
@@ -3259,25 +3263,30 @@ function ProjectList({ projects }: { projects: Project[] }) {
 }
 ```
 
-**Simpler pattern for single-value functions:**
+**Simpler pattern for a single value**
 
 ```typescript
-let isLoggedInCache: boolean | null = null
+let hasThemeCookieCache: boolean | null = null
 
-function isLoggedIn(): boolean {
-  if (isLoggedInCache !== null) {
-    return isLoggedInCache
+function hasThemeCookie(): boolean {
+  if (hasThemeCookieCache !== null) {
+    return hasThemeCookieCache
   }
-  
-  isLoggedInCache = document.cookie.includes('auth=')
-  return isLoggedInCache
+
+  hasThemeCookieCache = document.cookie
+    .split(';')
+    .some(entry => entry.trimStart().startsWith('theme='))
+  return hasThemeCookieCache
 }
 
-// Clear cache when auth changes
-function onAuthChange() {
-  isLoggedInCache = null
+function invalidateThemeCookieCache() {
+  hasThemeCookieCache = null
 }
 ```
+
+This example checks for the `theme` preference cookie by its exact, case-sensitive name.
+An empty value counts as present. Call `invalidateThemeCookieCache()` after the cookie changes.
+The next call to `hasThemeCookie()` reads the current cookie string.
 
 Use a Map (not a hook) so it works everywhere: utilities, event handlers, not just React components.
 

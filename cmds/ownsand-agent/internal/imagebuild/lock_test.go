@@ -5,6 +5,7 @@ package imagebuild
 import (
 	"bufio"
 	"context"
+	"debug/macho"
 	"errors"
 	"io"
 	"log/slog"
@@ -158,14 +159,19 @@ func TestLockContenderHelper(t *testing.T) {
 	}
 	if guestOS := ownsandv1.GuestOs(guest); guestOS != ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED {
 		opts := Options{
-			ImagesDir:   dir,
 			GuestOS:     guestOS,
 			ISO:         filepath.Join(dir, "missing.iso"),
 			IPSW:        filepath.Join(dir, "missing.ipsw"),
 			GuestBinary: os.Getenv(lockContenderBinEnv),
-			Logger:      lockTestLogger(),
 		}
-		if err := Build(t.Context(), opts); !errors.Is(err, ErrBuildInProgress) {
+		prepared, err := Prepare(opts)
+		if err != nil {
+			t.Fatalf("prepare build: %v", err)
+		}
+		if prepared.opts.GuestBinary != opts.GuestBinary {
+			t.Fatalf("prepared build uses %q, want the original helper %q", prepared.opts.GuestBinary, opts.GuestBinary)
+		}
+		if err := prepared.Build(t.Context(), dir, lockTestLogger()); !errors.Is(err, ErrBuildInProgress) {
 			t.Fatalf("want ErrBuildInProgress, got %v", err)
 		}
 		return
@@ -191,12 +197,8 @@ func TestLockContenderHelper(t *testing.T) {
 	}
 }
 
-func runLockContender(t *testing.T, dir string, guest ownsandv1.GuestOs) {
+func runLockContender(t *testing.T, dir string, guest ownsandv1.GuestOs, guestBinary string) {
 	t.Helper()
-	var guestBinary string
-	if guest != ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED {
-		guestBinary = fakeGuestBinary(t, guest)
-	}
 	// The caller keeps the holder alive until CombinedOutput stops and reaps
 	// the contender. Releasing the lock first could let a blocked build run.
 	ctx, cancel := context.WithTimeout(t.Context(), lockContenderTimeout)
@@ -220,7 +222,7 @@ func TestBuildLockRefusesASecondProcessBeforeTouchingStaging(t *testing.T) {
 	dir := imageDir(t, t.TempDir(), ownsandv1.GuestOs_GUEST_OS_WINDOWS)
 	h := startLockHolder(t, dir)
 
-	runLockContender(t, dir, ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED)
+	runLockContender(t, dir, ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED, "")
 	if got, err := os.ReadFile(filepath.Join(images.BuildDir(dir), stagingSentinel)); err != nil || string(got) != "staged" {
 		t.Fatalf("the staging directory of the holder was modified: %q %v", got, err)
 	}
@@ -321,12 +323,7 @@ func fakeGuestBinary(t *testing.T, guest ownsandv1.GuestOs) string {
 	name := "ownsand-guest"
 	switch guest {
 	case ownsandv1.GuestOs_GUEST_OS_MACOS:
-		// mach_header_64: magic, cputype arm64, cpusubtype, filetype
-		// execute, ncmds, sizeofcmds, flags, reserved.
-		b = make([]byte, 32)
-		for i, v := range []uint32{0xfeedfacf, 0x0100000c, 0, 2, 0, 0, 0, 0} {
-			b[i*4], b[i*4+1], b[i*4+2], b[i*4+3] = byte(v), byte(v>>8), byte(v>>16), byte(v>>24)
-		}
+		b = machOHeader(macho.CpuArm64, macho.TypeExec)
 	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
 		name += ".exe"
 		// An amd64 executable image that checkWindowsAMD64 accepts.
@@ -341,15 +338,29 @@ func fakeGuestBinary(t *testing.T, guest ownsandv1.GuestOs) string {
 	return path
 }
 
-// TestBuildRefusesWhileAnotherProcessBuilds runs the exported Build against a
-// destination whose lock another process holds, for both guest OSes.
+// TestBuildRefusesWhileAnotherProcessBuilds checks that a prepared build
+// reaches the destination lock with each supported helper format.
 func TestBuildRefusesWhileAnotherProcessBuilds(t *testing.T) {
-	for _, guest := range []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_MACOS, ownsandv1.GuestOs_GUEST_OS_WINDOWS} {
-		t.Run(guest.String(), func(t *testing.T) {
+	macOS := ownsandv1.GuestOs_GUEST_OS_MACOS
+	windows := ownsandv1.GuestOs_GUEST_OS_WINDOWS
+	universal := fatMachO(
+		fatMachOSlice{macho.CpuAmd64, machOHeader(macho.CpuAmd64, macho.TypeExec)},
+		fatMachOSlice{macho.CpuArm64, machOHeader(macho.CpuArm64, macho.TypeExec)},
+	)
+	for _, tc := range []struct {
+		name   string
+		guest  ownsandv1.GuestOs
+		helper string
+	}{
+		{"macOS thin", macOS, fakeGuestBinary(t, macOS)},
+		{"macOS universal", macOS, writeFixture(t, universal)},
+		{"Windows PE", windows, fakeGuestBinary(t, windows)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			imagesDir := t.TempDir()
-			dir := imageDir(t, imagesDir, guest)
+			dir := imageDir(t, imagesDir, tc.guest)
 			startLockHolder(t, dir)
-			runLockContender(t, imagesDir, guest)
+			runLockContender(t, imagesDir, tc.guest, tc.helper)
 			if _, err := os.Stat(filepath.Join(images.BuildDir(dir), stagingSentinel)); err != nil {
 				t.Fatalf("Build touched the staging directory of the holder: %v", err)
 			}

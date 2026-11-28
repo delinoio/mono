@@ -37,6 +37,113 @@ func TestEnumsHaveUnspecifiedZeroValue(t *testing.T) {
 	}
 }
 
+// Every BridgeEvent case round-trips through protobuf JSON as one line.
+func TestBridgeEventCasesRoundTripThroughJSON(t *testing.T) {
+	oneof := (&sandcrewv1.BridgeEvent{}).ProtoReflect().Descriptor().Oneofs().ByName("event")
+	fields := oneof.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		t.Run(string(field.Name()), func(t *testing.T) {
+			event := &sandcrewv1.BridgeEvent{Sequence: 7, LogEndOffset: 99, Time: timestamppb.Now()}
+			message := event.ProtoReflect()
+			value := message.NewField(field)
+			populate(value.Message())
+			message.Set(field, value)
+
+			line, err := protojson.Marshal(event)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if strings.Contains(string(line), "\n") {
+				t.Fatalf("protobuf JSON is not one line: %s", line)
+			}
+			var decoded sandcrewv1.BridgeEvent
+			if err := protojson.Unmarshal(line, &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !proto.Equal(event, &decoded) {
+				t.Fatalf("round trip changed the event:\n got %v\nwant %v", &decoded, event)
+			}
+		})
+	}
+}
+
+// Every BridgeInput case round-trips through protobuf JSON.
+func TestBridgeInputCasesRoundTripThroughJSON(t *testing.T) {
+	oneof := (&sandcrewv1.BridgeInput{}).ProtoReflect().Descriptor().Oneofs().ByName("input")
+	fields := oneof.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		t.Run(string(field.Name()), func(t *testing.T) {
+			input := &sandcrewv1.BridgeInput{InputId: "0190f3c4-0000-7000-8000-000000000000", CreateTime: timestamppb.Now()}
+			message := input.ProtoReflect()
+			value := message.NewField(field)
+			populate(value.Message())
+			message.Set(field, value)
+			data, err := protojson.Marshal(input)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var decoded sandcrewv1.BridgeInput
+			if err := protojson.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !proto.Equal(input, &decoded) {
+				t.Fatalf("round trip changed the input:\n got %v\nwant %v", &decoded, input)
+			}
+		})
+	}
+}
+
+// populate sets the first case of each oneof and every other scalar field of
+// message to a nonzero value, so a round trip covers every field.
+func populate(message protoreflect.Message) {
+	fields := message.Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		if oneof := field.ContainingOneof(); oneof != nil && !oneof.IsSynthetic() && oneof.Fields().Get(0) != field {
+			continue
+		}
+		switch {
+		case field.IsList():
+			list := message.Mutable(field).List()
+			list.Append(sample(list.NewElement(), field))
+		case field.Message() != nil:
+			if field.Message().FullName() == "google.protobuf.Timestamp" {
+				message.Set(field, protoreflect.ValueOfMessage(timestamppb.Now().ProtoReflect()))
+				continue
+			}
+			populate(message.Mutable(field).Message())
+		default:
+			message.Set(field, sample(message.NewField(field), field))
+		}
+	}
+}
+
+func sample(value protoreflect.Value, field protoreflect.FieldDescriptor) protoreflect.Value {
+	switch field.Kind() {
+	case protoreflect.MessageKind:
+		populate(value.Message())
+		return value
+	case protoreflect.StringKind:
+		return protoreflect.ValueOfString("value-" + string(field.Name()))
+	case protoreflect.BoolKind:
+		return protoreflect.ValueOfBool(true)
+	case protoreflect.EnumKind:
+		return protoreflect.ValueOfEnum(1)
+	case protoreflect.Int32Kind:
+		return protoreflect.ValueOfInt32(3)
+	case protoreflect.Int64Kind:
+		return protoreflect.ValueOfInt64(5)
+	case protoreflect.Uint32Kind:
+		return protoreflect.ValueOfUint32(11)
+	case protoreflect.Uint64Kind:
+		return protoreflect.ValueOfUint64(13)
+	default:
+		panic("unsupported kind " + field.Kind().String())
+	}
+}
+
 // services returns every service of the package.
 func services(t *testing.T) []protoreflect.ServiceDescriptor {
 	t.Helper()
@@ -127,26 +234,6 @@ func TestResponsesCarryNoValues(t *testing.T) {
 	}
 }
 
-// bridgeEventCases are the documented BridgeEvent cases in order.
-var bridgeEventCases = []string{
-	"hello", "input_accepted", "input_rejected", "user_message_chunk", "agent_message_chunk",
-	"agent_thought_chunk", "tool_call", "tool_call_update", "plan", "permission_request",
-	"permission_response", "turn_ended", "mode_changed", "config_options", "session_state",
-	"bridge_error", "agent_exited", "credential_update", "unknown_update",
-}
-
-func TestBridgeEventCases(t *testing.T) {
-	oneof := (&sandcrewv1.BridgeEvent{}).ProtoReflect().Descriptor().Oneofs().ByName("event")
-	if oneof.Fields().Len() != len(bridgeEventCases) {
-		t.Fatalf("event has %d cases, want %d", oneof.Fields().Len(), len(bridgeEventCases))
-	}
-	for i, name := range bridgeEventCases {
-		if got := oneof.Fields().Get(i).Name(); string(got) != name {
-			t.Errorf("case %d is %q, want %q", i, got, name)
-		}
-	}
-}
-
 // TranscriptEvent has every BridgeEvent case except credential_update, with
 // the same field numbers and messages.
 func TestTranscriptEventHasNoCredentialUpdate(t *testing.T) {
@@ -178,186 +265,38 @@ func TestTranscriptEventHasNoCredentialUpdate(t *testing.T) {
 	}
 }
 
-// One event of each BridgeEvent case.
-func sampleBridgeEvents() []*sandcrewv1.BridgeEvent {
-	text := &sandcrewv1.ContentBlock{Block: &sandcrewv1.ContentBlock_Text{Text: "hello"}}
-	events := []*sandcrewv1.BridgeEvent{
-		{Event: &sandcrewv1.BridgeEvent_Hello{Hello: &sandcrewv1.BridgeHello{
-			BridgeVersion:     "1.0.0",
-			ProtocolVersion:   &sandcrewv1.ProtocolVersion{Major: 1},
-			Vendor:            sandcrewv1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE,
-			GuestOs:           sandcrewv1.GuestOs_GUEST_OS_LINUX,
-			AgentCapabilities: &sandcrewv1.AgentCapabilities{LoadSession: true},
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_InputAccepted{InputAccepted: &sandcrewv1.InputAccepted{InputId: "i1"}}},
-		{Event: &sandcrewv1.BridgeEvent_InputRejected{InputRejected: &sandcrewv1.InputRejected{
-			InputId: "i2", Reason: sandcrewv1.InputRejectionReason_INPUT_REJECTION_REASON_UNKNOWN_OPTION,
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_UserMessageChunk{UserMessageChunk: &sandcrewv1.ContentChunk{Content: text}}},
-		{Event: &sandcrewv1.BridgeEvent_AgentMessageChunk{AgentMessageChunk: &sandcrewv1.ContentChunk{Content: text}}},
-		{Event: &sandcrewv1.BridgeEvent_AgentThoughtChunk{AgentThoughtChunk: &sandcrewv1.ContentChunk{Content: text}}},
-		{Event: &sandcrewv1.BridgeEvent_ToolCall{ToolCall: &sandcrewv1.ToolCall{
-			ToolCallId: "t1",
-			Title:      "Edit main.go",
-			Kind:       sandcrewv1.ToolKind_TOOL_KIND_EDIT,
-			Status:     sandcrewv1.ToolCallStatus_TOOL_CALL_STATUS_PENDING,
-			Content: []*sandcrewv1.ToolCallContent{{Content: &sandcrewv1.ToolCallContent_Diff{Diff: &sandcrewv1.Diff{
-				Path: "main.go", OldText: proto.String("a"), NewText: "b",
-			}}}},
-			Locations: []*sandcrewv1.ToolCallLocation{{Path: "main.go", Line: proto.Uint32(3)}},
-			RawInput:  `{"path":"main.go"}`,
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_ToolCallUpdate{ToolCallUpdate: &sandcrewv1.ToolCallUpdate{
-			ToolCallId: "t1",
-			Status:     sandcrewv1.ToolCallStatus_TOOL_CALL_STATUS_COMPLETED.Enum(),
-			Content:    &sandcrewv1.ToolCallContentList{},
-			RawOutput:  proto.String(`{"ok":true}`),
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_Plan{Plan: &sandcrewv1.Plan{Entries: []*sandcrewv1.PlanEntry{{
-			Content:  "Write tests",
-			Priority: sandcrewv1.PlanEntryPriority_PLAN_ENTRY_PRIORITY_HIGH,
-			Status:   sandcrewv1.PlanEntryStatus_PLAN_ENTRY_STATUS_IN_PROGRESS,
-		}}}}},
-		{Event: &sandcrewv1.BridgeEvent_PermissionRequest{PermissionRequest: &sandcrewv1.PermissionRequest{
-			PermissionRequestId: "p1",
-			ToolCallId:          "t1",
-			Options: []*sandcrewv1.PermissionOption{{
-				OptionId: "allow", Name: "Allow", Kind: sandcrewv1.PermissionOptionKind_PERMISSION_OPTION_KIND_ALLOW_ONCE,
-			}},
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_PermissionResponse{PermissionResponse: &sandcrewv1.PermissionResponse{
-			PermissionRequestId: "p1",
-			Outcome:             sandcrewv1.PermissionOutcome_PERMISSION_OUTCOME_SELECTED,
-			OptionId:            "allow",
-			AutoApproved:        true,
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_TurnEnded{TurnEnded: &sandcrewv1.TurnEnded{
-			StopReason: sandcrewv1.StopReason_STOP_REASON_END_TURN,
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_ModeChanged{ModeChanged: &sandcrewv1.ModeChanged{
-			CurrentModeId:  "code",
-			AvailableModes: []*sandcrewv1.SessionMode{{ModeId: "code", Name: "Code"}},
-			PermissionMode: sandcrewv1.PermissionMode_PERMISSION_MODE_ASK,
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_ConfigOptions{ConfigOptions: &sandcrewv1.ConfigOptions{Options: []*sandcrewv1.ConfigOption{{
-			ConfigOptionId: "model",
-			Name:           "Model",
-			Category:       sandcrewv1.ConfigOptionCategory_CONFIG_OPTION_CATEGORY_MODEL,
-			CurrentValueId: "m1",
-			Values:         []*sandcrewv1.ConfigOptionValue{{ValueId: "m1", Name: "Model 1"}},
-		}}}}},
-		{Event: &sandcrewv1.BridgeEvent_SessionState{SessionState: &sandcrewv1.AgentSessionState{
-			State: sandcrewv1.AgentActivity_AGENT_ACTIVITY_WORKING,
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_BridgeError{BridgeError: &sandcrewv1.BridgeError{
-			Kind: sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_OPTION_REJECTED, Message: "rejected",
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_AgentExited{AgentExited: &sandcrewv1.AgentExited{
-			Status: &sandcrewv1.AgentExited_ExitCode{ExitCode: 0},
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_CredentialUpdate{CredentialUpdate: &sandcrewv1.CredentialUpdate{
-			Kind: sandcrewv1.VendorCredentialKind_VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON, Revision: 2,
-		}}},
-		{Event: &sandcrewv1.BridgeEvent_UnknownUpdate{UnknownUpdate: &sandcrewv1.UnknownUpdate{
-			SessionUpdate: "usage_update", RawJson: `{"sessionUpdate":"usage_update"}`,
-		}}},
-	}
-	for i, event := range events {
-		event.Sequence = uint64(i + 1)
-		event.LogEndOffset = uint64(100 * (i + 1))
-		event.Time = timestamppb.Now()
-	}
-	return events
-}
-
-// Every BridgeEvent case round-trips through protobuf JSON, the encoding of
-// the event lines.
-func TestBridgeEventsRoundTripThroughJSON(t *testing.T) {
-	events := sampleBridgeEvents()
-	cases := map[string]bool{}
-	for _, event := range events {
-		name := string(event.ProtoReflect().WhichOneof(event.ProtoReflect().Descriptor().Oneofs().ByName("event")).Name())
-		cases[name] = true
-		line, err := protojson.Marshal(event)
-		if err != nil {
-			t.Fatalf("%s: marshal: %v", name, err)
-		}
-		if strings.Contains(string(line), "\n") {
-			t.Errorf("%s: the JSON line contains a line break", name)
-		}
-		var got sandcrewv1.BridgeEvent
-		if err := protojson.Unmarshal(line, &got); err != nil {
-			t.Fatalf("%s: unmarshal: %v", name, err)
-		}
-		if !proto.Equal(&got, event) {
-			t.Errorf("%s: round trip changed the event: %s", name, line)
-		}
-	}
-	for _, name := range bridgeEventCases {
-		if !cases[name] {
-			t.Errorf("no sample for case %q", name)
-		}
-	}
-}
-
 // Every BridgeEvent case except credential_update has a TranscriptEvent case
 // with the same wire encoding.
-func TestBridgeEventsConvertToTranscriptEvents(t *testing.T) {
-	for _, event := range sampleBridgeEvents() {
-		if event.GetCredentialUpdate() != nil {
+func TestBridgeEventCasesConvertToTranscriptEvents(t *testing.T) {
+	oneof := (&sandcrewv1.BridgeEvent{}).ProtoReflect().Descriptor().Oneofs().ByName("event")
+	fields := oneof.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		if field.Name() == "credential_update" {
 			continue
 		}
-		wire, err := proto.Marshal(event)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var transcript sandcrewv1.TranscriptEvent
-		// Unknown fields keep the log_end_offset and time numbers of
-		// BridgeEvent, so compare only the event case.
-		if err := proto.Unmarshal(wire, &transcript); err != nil {
-			t.Fatal(err)
-		}
-		bridgeCase := event.ProtoReflect().WhichOneof(event.ProtoReflect().Descriptor().Oneofs().ByName("event"))
-		transcriptCase := transcript.ProtoReflect().WhichOneof(transcript.ProtoReflect().Descriptor().Oneofs().ByName("event"))
-		if transcriptCase == nil || transcriptCase.Name() != bridgeCase.Name() {
-			t.Errorf("case %s did not convert", bridgeCase.Name())
-			continue
-		}
-		if !proto.Equal(
-			event.ProtoReflect().Get(bridgeCase).Message().Interface(),
-			transcript.ProtoReflect().Get(transcriptCase).Message().Interface(),
-		) {
-			t.Errorf("case %s changed during conversion", bridgeCase.Name())
-		}
-	}
-}
-
-// Every BridgeInput case round-trips through protobuf JSON.
-func TestBridgeInputsRoundTripThroughJSON(t *testing.T) {
-	inputs := []*sandcrewv1.BridgeInput{
-		{Input: &sandcrewv1.BridgeInput_Prompt{Prompt: &sandcrewv1.PromptInput{Text: "hi", AttachmentPath: proto.String(".sandcrew/previous-session.md")}}},
-		{Input: &sandcrewv1.BridgeInput_PermissionAnswer{PermissionAnswer: &sandcrewv1.PermissionAnswerInput{PermissionRequestId: "p1", OptionId: "allow"}}},
-		{Input: &sandcrewv1.BridgeInput_CancelTurn{CancelTurn: &sandcrewv1.CancelTurnInput{}}},
-		{Input: &sandcrewv1.BridgeInput_SetMode{SetMode: &sandcrewv1.SetModeInput{Mode: &sandcrewv1.SetModeInput_PermissionMode{PermissionMode: sandcrewv1.PermissionMode_PERMISSION_MODE_ASK}}}},
-		{Input: &sandcrewv1.BridgeInput_SetConfigOption{SetConfigOption: &sandcrewv1.SetConfigOptionInput{ConfigOptionId: "model", ValueId: "m1"}}},
-	}
-	oneof := (&sandcrewv1.BridgeInput{}).ProtoReflect().Descriptor().Oneofs().ByName("input")
-	if oneof.Fields().Len() != len(inputs) {
-		t.Fatalf("input has %d cases, samples cover %d", oneof.Fields().Len(), len(inputs))
-	}
-	for _, input := range inputs {
-		input.InputId = "0190a8f4-0000-7000-8000-000000000000"
-		input.CreateTime = timestamppb.Now()
-		line, err := protojson.Marshal(input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var got sandcrewv1.BridgeInput
-		if err := protojson.Unmarshal(line, &got); err != nil {
-			t.Fatal(err)
-		}
-		if !proto.Equal(&got, input) {
-			t.Errorf("round trip changed the input: %s", line)
-		}
+		t.Run(string(field.Name()), func(t *testing.T) {
+			event := &sandcrewv1.BridgeEvent{Sequence: 7, Time: timestamppb.Now()}
+			message := event.ProtoReflect()
+			value := message.NewField(field)
+			populate(value.Message())
+			message.Set(field, value)
+			wire, err := proto.Marshal(event)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var transcript sandcrewv1.TranscriptEvent
+			if err := proto.Unmarshal(wire, &transcript); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			transcriptMessage := transcript.ProtoReflect()
+			got := transcriptMessage.WhichOneof(transcriptMessage.Descriptor().Oneofs().ByName("event"))
+			if got == nil || got.Name() != field.Name() {
+				t.Fatalf("case %s did not convert", field.Name())
+			}
+			if !proto.Equal(message.Get(field).Message().Interface(), transcriptMessage.Get(got).Message().Interface()) {
+				t.Fatalf("case %s changed during conversion", field.Name())
+			}
+		})
 	}
 }

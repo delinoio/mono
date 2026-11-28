@@ -9,18 +9,156 @@ import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1";
 
-// One event that the bridge writes as a protobuf JSON line to the stdout of
-// its exec and to its guest event log.
+// The bridge schema: the messages that the guest bridge
+// (cmds/sandcrew-bridge) and the control plane (servers/sandcrew-api)
+// exchange as protobuf JSON. The bridge writes one BridgeEvent per line to
+// its stdout and its guest event log, the control plane writes one
+// BridgeInput per inbox file and one BridgeStartConfig as `start.json`. The
+// owning contracts are docs/protos-sandcrew-api-contract.md#bridge-schema
+// and docs/cmds-sandcrew-bridge-foundation.md. The schema follows the values
+// of the Agent Client Protocol (ACP) without depending on it.
+
+// Kind of a tool call (ACP ToolKind).
+enum ToolKind {
+  TOOL_KIND_UNSPECIFIED = 0;
+  TOOL_KIND_READ = 1;
+  TOOL_KIND_EDIT = 2;
+  TOOL_KIND_DELETE = 3;
+  TOOL_KIND_MOVE = 4;
+  TOOL_KIND_SEARCH = 5;
+  TOOL_KIND_EXECUTE = 6;
+  TOOL_KIND_THINK = 7;
+  TOOL_KIND_FETCH = 8;
+  TOOL_KIND_SWITCH_MODE = 9;
+  TOOL_KIND_OTHER = 10;
+}
+
+// Status of a tool call (ACP ToolCallStatus).
+enum ToolCallStatus {
+  TOOL_CALL_STATUS_UNSPECIFIED = 0;
+  TOOL_CALL_STATUS_PENDING = 1;
+  TOOL_CALL_STATUS_IN_PROGRESS = 2;
+  TOOL_CALL_STATUS_COMPLETED = 3;
+  TOOL_CALL_STATUS_FAILED = 4;
+}
+
+// Priority of a plan entry (ACP PlanEntryPriority).
+enum PlanEntryPriority {
+  PLAN_ENTRY_PRIORITY_UNSPECIFIED = 0;
+  PLAN_ENTRY_PRIORITY_HIGH = 1;
+  PLAN_ENTRY_PRIORITY_MEDIUM = 2;
+  PLAN_ENTRY_PRIORITY_LOW = 3;
+}
+
+// Status of a plan entry (ACP PlanEntryStatus).
+enum PlanEntryStatus {
+  PLAN_ENTRY_STATUS_UNSPECIFIED = 0;
+  PLAN_ENTRY_STATUS_PENDING = 1;
+  PLAN_ENTRY_STATUS_IN_PROGRESS = 2;
+  PLAN_ENTRY_STATUS_COMPLETED = 3;
+}
+
+// Kind of a permission option (ACP PermissionOptionKind).
+enum PermissionOptionKind {
+  PERMISSION_OPTION_KIND_UNSPECIFIED = 0;
+  PERMISSION_OPTION_KIND_ALLOW_ONCE = 1;
+  PERMISSION_OPTION_KIND_ALLOW_ALWAYS = 2;
+  PERMISSION_OPTION_KIND_REJECT_ONCE = 3;
+  PERMISSION_OPTION_KIND_REJECT_ALWAYS = 4;
+}
+
+// Outcome of a permission request.
+enum PermissionOutcome {
+  PERMISSION_OUTCOME_UNSPECIFIED = 0;
+  // An option was selected; PermissionResponse.option_id names it.
+  PERMISSION_OUTCOME_SELECTED = 1;
+  // The turn was cancelled before an answer.
+  PERMISSION_OUTCOME_CANCELLED = 2;
+}
+
+// Why a turn ended (ACP StopReason).
+enum StopReason {
+  STOP_REASON_UNSPECIFIED = 0;
+  STOP_REASON_END_TURN = 1;
+  STOP_REASON_MAX_TOKENS = 2;
+  STOP_REASON_MAX_TURN_REQUESTS = 3;
+  STOP_REASON_REFUSAL = 4;
+  STOP_REASON_CANCELLED = 5;
+}
+
+// Category of an agent configuration option (ACP
+// SessionConfigOptionCategory).
+enum ConfigOptionCategory {
+  CONFIG_OPTION_CATEGORY_UNSPECIFIED = 0;
+  CONFIG_OPTION_CATEGORY_MODE = 1;
+  CONFIG_OPTION_CATEGORY_MODEL = 2;
+  CONFIG_OPTION_CATEGORY_MODEL_CONFIG = 3;
+  CONFIG_OPTION_CATEGORY_SPEED = 4;
+  CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL = 5;
+  CONFIG_OPTION_CATEGORY_OTHER = 6;
+}
+
+// What the agent of a session does.
+enum AgentActivity {
+  AGENT_ACTIVITY_UNSPECIFIED = 0;
+  // The bridge installs or starts the agent.
+  AGENT_ACTIVITY_STARTING = 1;
+  // No turn runs; the agent waits for a prompt.
+  AGENT_ACTIVITY_IDLE = 2;
+  // A turn runs.
+  AGENT_ACTIVITY_WORKING = 3;
+  // A turn waits for the answer to an ASK-mode permission request.
+  AGENT_ACTIVITY_WAITING_FOR_PERMISSION = 4;
+}
+
+// Kind of a bridge error.
+enum BridgeErrorKind {
+  BRIDGE_ERROR_KIND_UNSPECIFIED = 0;
+  // A pinned agent component could not be downloaded or installed.
+  BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED = 1;
+  // A downloaded archive or package did not match its pinned digest.
+  BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH = 2;
+  // The agent process or its ACP session did not start.
+  BRIDGE_ERROR_KIND_AGENT_START_FAILED = 3;
+  // The credential of the selected vendor is missing.
+  BRIDGE_ERROR_KIND_CREDENTIAL_MISSING = 4;
+  // The agent sent a JSON-RPC error or a malformed message.
+  BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR = 5;
+  // An input could not be applied.
+  BRIDGE_ERROR_KIND_INPUT_INVALID = 6;
+  // The agent rejected a mode or a configuration option value.
+  BRIDGE_ERROR_KIND_OPTION_REJECTED = 7;
+  // The guest event log could not be appended.
+  BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED = 8;
+  // The bridge could not watch a credential file.
+  BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED = 9;
+}
+
+// Why the bridge rejected an inbox input.
+enum InputRejectionReason {
+  INPUT_REJECTION_REASON_UNSPECIFIED = 0;
+  // The file is too large or does not parse as a BridgeInput.
+  INPUT_REJECTION_REASON_MALFORMED = 1;
+  // No pending permission request has the ID.
+  INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST = 2;
+  // The pending permission request has no option with the ID.
+  INPUT_REJECTION_REASON_UNKNOWN_OPTION = 3;
+  // A cancel request arrived when no turn runs.
+  INPUT_REJECTION_REASON_NO_ACTIVE_TURN = 4;
+  // The input case is unknown or the agent does not support it.
+  INPUT_REJECTION_REASON_UNSUPPORTED = 5;
+}
+
+// One event of the bridge.
 message BridgeEvent {
-  // Starts at 1 and increases by 1 for each event of the session that the
-  // guest event log holds. A credential_update event repeats the sequence of
-  // the last logged event.
+  // Starts at 1 and increases by 1 for each event that the guest event log
+  // holds. A credential_update repeats the sequence of the last logged
+  // event.
   uint64 sequence = 1;
-  // The byte offset in the guest event log after the line of this event.
+  // Byte offset in the guest event log after the line of this event.
   uint64 log_end_offset = 2;
   google.protobuf.Timestamp time = 3;
   oneof event {
-    // Always the first event of a bridge process.
     BridgeHello hello = 10;
     InputAccepted input_accepted = 11;
     InputRejected input_rejected = 12;
@@ -37,78 +175,126 @@ message BridgeEvent {
     ConfigOptions config_options = 23;
     AgentSessionState session_state = 24;
     BridgeError bridge_error = 25;
-    // The last event of a bridge process when the agent ends.
     AgentExited agent_exited = 26;
-    // Written only to stdout, never to the guest event log, never stored and
-    // never logged.
     CredentialUpdate credential_update = 27;
     UnknownUpdate unknown_update = 28;
+    AgentReady agent_ready = 29;
   }
 }
 
-// A version of the bridge event and input schema.
+// Version of the bridge event and input schema.
 message ProtocolVersion {
   uint32 major = 1;
   uint32 minor = 2;
 }
 
-// The ACP capabilities of the agent.
+// Optional ACP capabilities that the agent advertises.
 message AgentCapabilities {
+  // ACP `session/load`.
   bool load_session = 1;
+  // ACP `session/resume`.
   bool resume_session = 2;
 }
 
+// The first event of every bridge process.
 message BridgeHello {
   string bridge_version = 1;
   ProtocolVersion protocol_version = 2;
   AgentVendor vendor = 3;
+  // The pinned version of the agent CLI.
   string agent_version = 4;
+  // The pinned version of the ACP adapter.
   string adapter_version = 5;
   GuestOs guest_os = 6;
-  AgentCapabilities agent_capabilities = 7;
-  // True when the bridge wraps a headless CLI mode instead of ACP.
-  bool wrapped_headless = 8;
+  // True when a bridge adapter wraps a headless CLI instead of ACP.
+  bool wrapped_headless = 7;
 }
 
-// The bridge read an inbox message and applied or queued it.
+// The agent started and its ACP session exists.
+message AgentReady {
+  AgentCapabilities agent_capabilities = 1;
+  // The ACP session ID that the agent assigned.
+  string agent_session_id = 2;
+  // The name and version that the agent reports, when it reports them.
+  string agent_name = 3;
+  string agent_reported_version = 4;
+}
+
 message InputAccepted {
   string input_id = 1;
 }
 
-// The bridge read an inbox message and rejected it.
 message InputRejected {
   string input_id = 1;
   InputRejectionReason reason = 2;
 }
 
-// A link to a resource that the agent can read.
+// One chunk of a user message, an agent message or an agent thought.
+message ContentChunk {
+  ContentBlock content = 1;
+}
+
+// One ACP content block.
+message ContentBlock {
+  oneof block {
+    string text = 1;
+    ResourceLink resource_link = 2;
+    // The original JSON of a content block without a mapped case (for
+    // example an image).
+    string unsupported = 3;
+  }
+}
+
 message ResourceLink {
   string uri = 1;
   string name = 2;
   string title = 3;
-  string mime_type = 4;
-  optional int64 size_bytes = 5;
+  string description = 4;
+  string mime_type = 5;
+  optional int64 size = 6;
 }
 
-// An ACP content block that the schema has no case for.
-message UnsupportedContent {
-  // The original ACP JSON.
-  string raw_json = 1;
+message ToolCall {
+  string tool_call_id = 1;
+  string title = 2;
+  ToolKind kind = 3;
+  ToolCallStatus status = 4;
+  repeated ToolCallContent content = 5;
+  repeated ToolCallLocation locations = 6;
+  // The original JSON of the tool input.
+  string raw_input = 7;
+  // The original JSON of the tool output.
+  string raw_output = 8;
 }
 
-// An ACP content block.
-message ContentBlock {
-  oneof block {
-    // Markdown text.
-    string text = 1;
-    ResourceLink resource_link = 2;
-    UnsupportedContent unsupported = 3;
+// The changed fields of a tool call. Unset fields keep their value.
+message ToolCallUpdate {
+  string tool_call_id = 1;
+  optional string title = 2;
+  optional ToolKind kind = 3;
+  optional ToolCallStatus status = 4;
+  // When set, replaces the content of the tool call.
+  ToolCallContentList content = 5;
+  // When set, replaces the locations of the tool call.
+  ToolCallLocationList locations = 6;
+  optional string raw_input = 7;
+  optional string raw_output = 8;
+}
+
+message ToolCallContentList {
+  repeated ToolCallContent items = 1;
+}
+
+message ToolCallLocationList {
+  repeated ToolCallLocation items = 1;
+}
+
+message ToolCallContent {
+  oneof content {
+    ContentBlock block = 1;
+    Diff diff = 2;
+    Terminal terminal = 3;
   }
-}
-
-// A part of a user message, an agent message or an agent thought.
-message ContentChunk {
-  ContentBlock content = 1;
 }
 
 // A file change of a tool call.
@@ -119,59 +305,19 @@ message Diff {
   string new_text = 3;
 }
 
-// A terminal of a tool call.
+// A terminal of the agent that a tool call shows.
 message Terminal {
   string terminal_id = 1;
 }
 
-// One content item of a tool call.
-message ToolCallContent {
-  oneof content {
-    ContentBlock block = 1;
-    Diff diff = 2;
-    Terminal terminal = 3;
-  }
-}
-
-// A file location that a tool call works on.
 message ToolCallLocation {
   string path = 1;
   optional uint32 line = 2;
 }
 
-message ToolCall {
-  string tool_call_id = 1;
-  string title = 2;
-  ToolKind kind = 3;
-  ToolCallStatus status = 4;
-  repeated ToolCallContent content = 5;
-  repeated ToolCallLocation locations = 6;
-  // JSON text. Agent data: only the session owner reads it.
-  string raw_input = 7;
-}
-
-// The complete content of a tool call update, which replaces the content.
-message ToolCallContentList {
-  repeated ToolCallContent items = 1;
-}
-
-// The complete locations of a tool call update, which replace the locations.
-message ToolCallLocationList {
-  repeated ToolCallLocation items = 1;
-}
-
-// The changed fields of a tool call. Unset fields keep their value.
-message ToolCallUpdate {
-  string tool_call_id = 1;
-  optional string title = 2;
-  optional ToolKind kind = 3;
-  optional ToolCallStatus status = 4;
-  ToolCallContentList content = 5;
-  ToolCallLocationList locations = 6;
-  // JSON text. Agent data: only the session owner reads it.
-  optional string raw_input = 7;
-  // JSON text. Agent data: only the session owner reads it.
-  optional string raw_output = 8;
+// The plan of the agent. Replaces the previous plan.
+message Plan {
+  repeated PlanEntry entries = 1;
 }
 
 message PlanEntry {
@@ -180,9 +326,13 @@ message PlanEntry {
   PlanEntryStatus status = 3;
 }
 
-// The plan of the agent. It replaces the previous plan.
-message Plan {
-  repeated PlanEntry entries = 1;
+message PermissionRequest {
+  // The bridge assigns a UUID v7 to each request.
+  string permission_request_id = 1;
+  string tool_call_id = 2;
+  repeated PermissionOption options = 3;
+  // The tool call details that the agent sent with the request.
+  ToolCallUpdate tool_call = 4;
 }
 
 message PermissionOption {
@@ -191,18 +341,9 @@ message PermissionOption {
   PermissionOptionKind kind = 3;
 }
 
-// The agent asks for permission to run a tool call.
-message PermissionRequest {
-  string permission_request_id = 1;
-  string tool_call_id = 2;
-  repeated PermissionOption options = 3;
-}
-
-// The answer to a permission request.
 message PermissionResponse {
   string permission_request_id = 1;
   PermissionOutcome outcome = 2;
-  // Set when the outcome is SELECTED.
   string option_id = 3;
   // True when the bridge answered in AUTO_APPROVE.
   bool auto_approved = 4;
@@ -212,38 +353,35 @@ message TurnEnded {
   StopReason stop_reason = 1;
 }
 
-// A mode that the agent advertises.
-message SessionMode {
-  string mode_id = 1;
-  string name = 2;
-  string description = 3;
-}
-
 message ModeChanged {
   string current_mode_id = 1;
   repeated SessionMode available_modes = 2;
   PermissionMode permission_mode = 3;
 }
 
-// One value of a configuration option.
-message ConfigOptionValue {
-  string value_id = 1;
+message SessionMode {
+  string mode_id = 1;
   string name = 2;
   string description = 3;
 }
 
-// A session configuration option that the agent advertises, for example the
-// model.
+message ConfigOptions {
+  repeated ConfigOption options = 1;
+}
+
 message ConfigOption {
   string config_option_id = 1;
   string name = 2;
-  ConfigOptionCategory category = 3;
-  string current_value_id = 4;
-  repeated ConfigOptionValue values = 5;
+  string description = 3;
+  ConfigOptionCategory category = 4;
+  string current_value_id = 5;
+  repeated ConfigOptionValue values = 6;
 }
 
-message ConfigOptions {
-  repeated ConfigOption options = 1;
+message ConfigOptionValue {
+  string value_id = 1;
+  string name = 2;
+  string description = 3;
 }
 
 message AgentSessionState {
@@ -252,34 +390,36 @@ message AgentSessionState {
 
 message BridgeError {
   BridgeErrorKind kind = 1;
-  // Never contains secrets, prompts or agent output.
+  // A message without secrets, prompts or agent output.
   string message = 2;
 }
 
+// The agent process ended.
 message AgentExited {
-  oneof status {
+  oneof result {
     int32 exit_code = 1;
+    // The name of the signal that ended the process.
     string signal = 2;
   }
 }
 
-// The agent changed its credential file. It carries no credential content.
+// A credential file changed in the guest. Carries no credential content.
 message CredentialUpdate {
   VendorCredentialKind kind = 1;
   uint64 revision = 2;
 }
 
-// An ACP session update without a case in BridgeEvent.
+// An ACP session update without a mapped case.
 message UnknownUpdate {
   // The ACP `sessionUpdate` value.
   string session_update = 1;
-  // The original ACP update. Agent data: only the session owner reads it.
+  // The original JSON of the update.
   string raw_json = 2;
 }
 
-// One input that the control plane writes as a file into the guest inbox.
+// One input of the control plane, written as one inbox file.
 message BridgeInput {
-  // UUID v7.
+  // UUID v7; also the inbox file name.
   string input_id = 1;
   google.protobuf.Timestamp create_time = 2;
   oneof input {
@@ -293,7 +433,8 @@ message BridgeInput {
 
 message PromptInput {
   string text = 1;
-  // A guest path, for the previous transcript file.
+  // A guest path that the prompt text mentions (the previous transcript
+  // file). The bridge does not read it.
   optional string attachment_path = 2;
 }
 
@@ -305,13 +446,32 @@ message PermissionAnswerInput {
 message CancelTurnInput {}
 
 message SetModeInput {
-  oneof mode {
+  oneof target {
+    // An agent mode ID.
     string mode_id = 1;
     PermissionMode permission_mode = 2;
   }
 }
 
 message SetConfigOptionInput {
+  string config_option_id = 1;
+  string value_id = 2;
+}
+
+// The start configuration that the control plane writes as `start.json`.
+message BridgeStartConfig {
+  string session_id = 1;
+  AgentVendor vendor = 2;
+  // The kind of the vendor credential that the session uses.
+  VendorCredentialKind credential_kind = 3;
+  PermissionMode permission_mode = 4;
+  // The agent mode to apply at start; empty keeps the agent's default.
+  string mode_id = 5;
+  // Configuration option values to apply at start.
+  repeated ConfigOptionSelection config_options = 6;
+}
+
+message ConfigOptionSelection {
   string config_option_id = 1;
   string value_id = 2;
 }

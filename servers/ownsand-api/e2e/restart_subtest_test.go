@@ -46,9 +46,7 @@ func copyRestartStandIn(t *testing.T, dir, name string) {
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
-	if err := os.WriteFile(filepath.Join(dir, name), binary, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeExecutable(t, filepath.Join(dir, name), binary, 0o700)
 }
 
 func TestLifecycleHyperVRestartDiagnostics(t *testing.T) {

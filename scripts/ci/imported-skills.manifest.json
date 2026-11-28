@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "fa8cb8c56426313d31907622fb01e3d2ce6d2ab72d7d9ca6b5a12b32cb93ac8c",
+        "AGENTS.md": "c42a33ad21ef35144e8cecfbb636c4bad1a3859d59981af51bee7643f059de50",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -100,7 +100,7 @@
         "rules/client-passive-event-listeners.md": "1f35016f9053de69e884ee9be00654e37979c2ca85f5e57764dc2626ff7acb4b",
         "rules/client-swr-dedup.md": "d6cfd65bdbaa1e9344ddf952e82d5db8fbb61175cb1e5b2a962c1984d9c950e4",
         "rules/js-batch-dom-css.md": "480b891b9eaf96e929dc1e964274a4828e3a78009b7d00ccd965a0d425215959",
-        "rules/js-cache-function-results.md": "3daaa11d24f4295cb6be8bc6f407f2ce83cc7b5bd1f0e68891ea8ab835721dc7",
+        "rules/js-cache-function-results.md": "206042d693a7d9ba319bf97c392907c8503497232a1cf5dda03fc458940a81eb",
         "rules/js-cache-property-access.md": "73e47431e74878a927061bf0ddc7cd91a7556cb35d2573f3421e82300d9ae311",
         "rules/js-cache-storage.md": "6cb4b8d78c0829c5f05f4609207a2a14aeca8622936173e40475f750879e98e5",
         "rules/js-combine-iterations.md": "71add08aeeb43091d4ff4c0b2842cce8b4bdef8ad3e732cc034bb5a84827e746",
@@ -143,7 +143,7 @@
         "rules/server-auth-actions.md": "a2ca8aa102839251c7971ec784560fab943c20b36fe6f80365d4110c13260c23",
         "rules/server-cache-lru.md": "1924b64561841923b88a657085097a0aeba3e0ba2d5470b9f5c15cc10d6ae70f",
         "rules/server-cache-react.md": "fddeea6c870bb3da4134b61d54b7d09b83d2603f929b7547cd3dc1dc269edd5c",
-        "rules/server-dedup-props.md": "c2747424cdac46be62f835f245a0aa887b0090b416d28e2ac8676702645eeb37",
+        "rules/server-dedup-props.md": "a1f30415a43718e0ad6b1a37a562399eb9d5bd722b5a37b9960da468d5a98e41",
         "rules/server-hoist-static-io.md": "05df30b52f67a2765b5da4ee5bd6a846476568006737a45ffdb6a33bde67f251",
         "rules/server-no-shared-module-state.md": "4d869bf1cd2f1632e5ca4c0e64b1cf0e71c5f5a0f940bc8a22174d205e735ed7",
         "rules/server-parallel-fetching.md": "569a2e9fc04f9606686cd75c5894ef8781b502786a7fffe241396846c7733472",

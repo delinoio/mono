@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
+import {
+  PermissionOptionKind,
+  PermissionOutcome,
+  ToolCallStatus,
+} from "@delino/sandcrew-protos/v1/bridge_pb";
 import type {
   ContentBlock,
   Diff,
   PermissionOption,
   ToolCallContent,
 } from "@delino/sandcrew-protos/v1/bridge_pb";
-import {
-  PermissionOptionKind,
-  PermissionOutcome,
-  ToolCallStatus,
-} from "@delino/sandcrew-protos/v1/common_pb";
 import { BadgeVariant } from "delino-ui/badge";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import {
@@ -97,10 +97,7 @@ export function ContentBlockView({ block }: { block: ContentBlock }) {
     case "unsupported":
       return (
         <Disclosure label={t("chat.unsupportedContent")}>
-          <RawJson
-            label={t("chat.originalContent")}
-            json={block.block.value.rawJson}
-          />
+          <RawJson label={t("chat.originalContent")} json={block.block.value} />
         </Disclosure>
       );
     case undefined:

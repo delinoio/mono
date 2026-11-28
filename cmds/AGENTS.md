@@ -28,7 +28,7 @@
 
 - Keep `cmds/ownsand-agent/release-manifest/` and `cmds/ownsand-agent/internal/releasekeys/` limited to standard-library imports and repository packages that import only the standard library: the release signing step runs the tool next to the release signing key. Follow the [agent contract](../docs/cmds-ownsand-agent-foundation.md#agent-updates).
 
-- When Go code in this domain changes, run `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l` from the repository root and confirm that it prints no path, then run `go vet ./...` and `go test ./...` from the repository root before finishing.
+- When Go code in this domain changes, run `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l` from the repository root and confirm that it prints no path, then run `go vet ./...`, `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run` and `go test ./...` from the repository root before finishing.
 
 ## Licensing
 
@@ -45,5 +45,5 @@
 - `cmds/ownsand-guest/` and `cmds/ownsand-agent/`: [project index](../docs/project-ownsand.md) and [device agent foundation contract](../docs/cmds-ownsand-agent-foundation.md)
 - `cmds/ownsand/`: [project index](../docs/project-ownsand.md) and [CLI foundation contract](../docs/cmds-ownsand-cli-foundation.md)
 - `cmds/sandrun/`: [project index](../docs/project-sandrun.md) and [CLI foundation contract](../docs/cmds-sandrun-cli-foundation.md)
-- `cmds/sandcrew-bridge/` (planned, Apache-2.0): [project index](../docs/project-sandcrew.md) and [guest bridge foundation contract](../docs/cmds-sandcrew-bridge-foundation.md)
+- `cmds/sandcrew-bridge/` (Apache-2.0): [project index](../docs/project-sandcrew.md) and [guest bridge foundation contract](../docs/cmds-sandcrew-bridge-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

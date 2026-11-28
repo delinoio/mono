@@ -41,6 +41,9 @@ func TestCLISubtestFailures(t *testing.T) {
 		t.Run("sibling", func(t *testing.T) { t.Log(marker) })
 		return
 	}
+	// Only the outer run is parallel: the subprocess branch above calls t.Setenv,
+	// which panics in a test that called t.Parallel.
+	t.Parallel()
 
 	bins := t.TempDir()
 	missing := exec.Command(filepath.Join(bins, "ownsand"), "fixture").Run()
@@ -107,9 +110,7 @@ func TestCLISubtestConfigDirectories(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
-	if err := os.WriteFile(filepath.Join(bins, name), binary, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeExecutable(t, filepath.Join(bins, name), binary, 0o700)
 
 	s := &stack{t: t, bins: bins}
 	var dirs []string

@@ -283,59 +283,6 @@ func (x *Session) GetResumeWaitExpired() bool {
 	return false
 }
 
-// A configuration option value for a new session.
-type ConfigOptionSelection struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	ConfigOptionId string                 `protobuf:"bytes,1,opt,name=config_option_id,json=configOptionId,proto3" json:"config_option_id,omitempty"`
-	ValueId        string                 `protobuf:"bytes,2,opt,name=value_id,json=valueId,proto3" json:"value_id,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
-}
-
-func (x *ConfigOptionSelection) Reset() {
-	*x = ConfigOptionSelection{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[2]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ConfigOptionSelection) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ConfigOptionSelection) ProtoMessage() {}
-
-func (x *ConfigOptionSelection) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[2]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ConfigOptionSelection.ProtoReflect.Descriptor instead.
-func (*ConfigOptionSelection) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{2}
-}
-
-func (x *ConfigOptionSelection) GetConfigOptionId() string {
-	if x != nil {
-		return x.ConfigOptionId
-	}
-	return ""
-}
-
-func (x *ConfigOptionSelection) GetValueId() string {
-	if x != nil {
-		return x.ValueId
-	}
-	return ""
-}
-
 // One stored transcript event: a BridgeEvent without the credential_update
 // case. The field numbers of the cases equal those of BridgeEvent.
 type TranscriptEvent struct {
@@ -362,6 +309,7 @@ type TranscriptEvent struct {
 	//	*TranscriptEvent_BridgeError
 	//	*TranscriptEvent_AgentExited
 	//	*TranscriptEvent_UnknownUpdate
+	//	*TranscriptEvent_AgentReady
 	Event         isTranscriptEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -369,7 +317,7 @@ type TranscriptEvent struct {
 
 func (x *TranscriptEvent) Reset() {
 	*x = TranscriptEvent{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[3]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -381,7 +329,7 @@ func (x *TranscriptEvent) String() string {
 func (*TranscriptEvent) ProtoMessage() {}
 
 func (x *TranscriptEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[3]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -394,7 +342,7 @@ func (x *TranscriptEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TranscriptEvent.ProtoReflect.Descriptor instead.
 func (*TranscriptEvent) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{3}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *TranscriptEvent) GetSequence() uint64 {
@@ -580,6 +528,15 @@ func (x *TranscriptEvent) GetUnknownUpdate() *UnknownUpdate {
 	return nil
 }
 
+func (x *TranscriptEvent) GetAgentReady() *AgentReady {
+	if x != nil {
+		if x, ok := x.Event.(*TranscriptEvent_AgentReady); ok {
+			return x.AgentReady
+		}
+	}
+	return nil
+}
+
 type isTranscriptEvent_Event interface {
 	isTranscriptEvent_Event()
 }
@@ -656,6 +613,10 @@ type TranscriptEvent_UnknownUpdate struct {
 	UnknownUpdate *UnknownUpdate `protobuf:"bytes,28,opt,name=unknown_update,json=unknownUpdate,proto3,oneof"`
 }
 
+type TranscriptEvent_AgentReady struct {
+	AgentReady *AgentReady `protobuf:"bytes,29,opt,name=agent_ready,json=agentReady,proto3,oneof"`
+}
+
 func (*TranscriptEvent_Hello) isTranscriptEvent_Event() {}
 
 func (*TranscriptEvent_InputAccepted) isTranscriptEvent_Event() {}
@@ -692,6 +653,8 @@ func (*TranscriptEvent_AgentExited) isTranscriptEvent_Event() {}
 
 func (*TranscriptEvent_UnknownUpdate) isTranscriptEvent_Event() {}
 
+func (*TranscriptEvent_AgentReady) isTranscriptEvent_Event() {}
+
 type CreateSessionRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId  string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
@@ -712,7 +675,7 @@ type CreateSessionRequest struct {
 
 func (x *CreateSessionRequest) Reset() {
 	*x = CreateSessionRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[4]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -724,7 +687,7 @@ func (x *CreateSessionRequest) String() string {
 func (*CreateSessionRequest) ProtoMessage() {}
 
 func (x *CreateSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[4]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -737,7 +700,7 @@ func (x *CreateSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSessionRequest.ProtoReflect.Descriptor instead.
 func (*CreateSessionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{4}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *CreateSessionRequest) GetOrganizationId() string {
@@ -805,7 +768,7 @@ type CreateSessionResponse struct {
 
 func (x *CreateSessionResponse) Reset() {
 	*x = CreateSessionResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[5]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -817,7 +780,7 @@ func (x *CreateSessionResponse) String() string {
 func (*CreateSessionResponse) ProtoMessage() {}
 
 func (x *CreateSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[5]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -830,7 +793,7 @@ func (x *CreateSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSessionResponse.ProtoReflect.Descriptor instead.
 func (*CreateSessionResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{5}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *CreateSessionResponse) GetSession() *Session {
@@ -852,7 +815,7 @@ type RestartSessionFromTranscriptRequest struct {
 
 func (x *RestartSessionFromTranscriptRequest) Reset() {
 	*x = RestartSessionFromTranscriptRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[6]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -864,7 +827,7 @@ func (x *RestartSessionFromTranscriptRequest) String() string {
 func (*RestartSessionFromTranscriptRequest) ProtoMessage() {}
 
 func (x *RestartSessionFromTranscriptRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[6]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -877,7 +840,7 @@ func (x *RestartSessionFromTranscriptRequest) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use RestartSessionFromTranscriptRequest.ProtoReflect.Descriptor instead.
 func (*RestartSessionFromTranscriptRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{6}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *RestartSessionFromTranscriptRequest) GetOrganizationId() string {
@@ -910,7 +873,7 @@ type RestartSessionFromTranscriptResponse struct {
 
 func (x *RestartSessionFromTranscriptResponse) Reset() {
 	*x = RestartSessionFromTranscriptResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[7]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -922,7 +885,7 @@ func (x *RestartSessionFromTranscriptResponse) String() string {
 func (*RestartSessionFromTranscriptResponse) ProtoMessage() {}
 
 func (x *RestartSessionFromTranscriptResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[7]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -935,7 +898,7 @@ func (x *RestartSessionFromTranscriptResponse) ProtoReflect() protoreflect.Messa
 
 // Deprecated: Use RestartSessionFromTranscriptResponse.ProtoReflect.Descriptor instead.
 func (*RestartSessionFromTranscriptResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{7}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RestartSessionFromTranscriptResponse) GetSession() *Session {
@@ -955,7 +918,7 @@ type GetSessionRequest struct {
 
 func (x *GetSessionRequest) Reset() {
 	*x = GetSessionRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[8]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -967,7 +930,7 @@ func (x *GetSessionRequest) String() string {
 func (*GetSessionRequest) ProtoMessage() {}
 
 func (x *GetSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[8]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -980,7 +943,7 @@ func (x *GetSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSessionRequest.ProtoReflect.Descriptor instead.
 func (*GetSessionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{8}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetSessionRequest) GetOrganizationId() string {
@@ -1006,7 +969,7 @@ type GetSessionResponse struct {
 
 func (x *GetSessionResponse) Reset() {
 	*x = GetSessionResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[9]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1018,7 +981,7 @@ func (x *GetSessionResponse) String() string {
 func (*GetSessionResponse) ProtoMessage() {}
 
 func (x *GetSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[9]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1031,7 +994,7 @@ func (x *GetSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSessionResponse.ProtoReflect.Descriptor instead.
 func (*GetSessionResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{9}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GetSessionResponse) GetSession() *Session {
@@ -1061,7 +1024,7 @@ type ListSessionsRequest struct {
 
 func (x *ListSessionsRequest) Reset() {
 	*x = ListSessionsRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[10]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1073,7 +1036,7 @@ func (x *ListSessionsRequest) String() string {
 func (*ListSessionsRequest) ProtoMessage() {}
 
 func (x *ListSessionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[10]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1086,7 +1049,7 @@ func (x *ListSessionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionsRequest.ProtoReflect.Descriptor instead.
 func (*ListSessionsRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{10}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListSessionsRequest) GetOrganizationId() string {
@@ -1177,7 +1140,7 @@ type ListSessionsResponse struct {
 
 func (x *ListSessionsResponse) Reset() {
 	*x = ListSessionsResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[11]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1189,7 +1152,7 @@ func (x *ListSessionsResponse) String() string {
 func (*ListSessionsResponse) ProtoMessage() {}
 
 func (x *ListSessionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[11]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1202,7 +1165,7 @@ func (x *ListSessionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionsResponse.ProtoReflect.Descriptor instead.
 func (*ListSessionsResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{11}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListSessionsResponse) GetSessions() []*Session {
@@ -1229,7 +1192,7 @@ type DeleteSessionRequest struct {
 
 func (x *DeleteSessionRequest) Reset() {
 	*x = DeleteSessionRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[12]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1241,7 +1204,7 @@ func (x *DeleteSessionRequest) String() string {
 func (*DeleteSessionRequest) ProtoMessage() {}
 
 func (x *DeleteSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[12]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1254,7 +1217,7 @@ func (x *DeleteSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSessionRequest.ProtoReflect.Descriptor instead.
 func (*DeleteSessionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{12}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *DeleteSessionRequest) GetOrganizationId() string {
@@ -1279,7 +1242,7 @@ type DeleteSessionResponse struct {
 
 func (x *DeleteSessionResponse) Reset() {
 	*x = DeleteSessionResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[13]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1291,7 +1254,7 @@ func (x *DeleteSessionResponse) String() string {
 func (*DeleteSessionResponse) ProtoMessage() {}
 
 func (x *DeleteSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[13]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1304,7 +1267,7 @@ func (x *DeleteSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSessionResponse.ProtoReflect.Descriptor instead.
 func (*DeleteSessionResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{13}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{12}
 }
 
 type SendMessageRequest struct {
@@ -1320,7 +1283,7 @@ type SendMessageRequest struct {
 
 func (x *SendMessageRequest) Reset() {
 	*x = SendMessageRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[14]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1332,7 +1295,7 @@ func (x *SendMessageRequest) String() string {
 func (*SendMessageRequest) ProtoMessage() {}
 
 func (x *SendMessageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[14]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1345,7 +1308,7 @@ func (x *SendMessageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendMessageRequest.ProtoReflect.Descriptor instead.
 func (*SendMessageRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{14}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *SendMessageRequest) GetOrganizationId() string {
@@ -1385,7 +1348,7 @@ type SendMessageResponse struct {
 
 func (x *SendMessageResponse) Reset() {
 	*x = SendMessageResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[15]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1397,7 +1360,7 @@ func (x *SendMessageResponse) String() string {
 func (*SendMessageResponse) ProtoMessage() {}
 
 func (x *SendMessageResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[15]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1410,7 +1373,7 @@ func (x *SendMessageResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendMessageResponse.ProtoReflect.Descriptor instead.
 func (*SendMessageResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{15}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *SendMessageResponse) GetSession() *Session {
@@ -1430,7 +1393,7 @@ type ResumeSessionRequest struct {
 
 func (x *ResumeSessionRequest) Reset() {
 	*x = ResumeSessionRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[16]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1442,7 +1405,7 @@ func (x *ResumeSessionRequest) String() string {
 func (*ResumeSessionRequest) ProtoMessage() {}
 
 func (x *ResumeSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[16]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1455,7 +1418,7 @@ func (x *ResumeSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeSessionRequest.ProtoReflect.Descriptor instead.
 func (*ResumeSessionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{16}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ResumeSessionRequest) GetOrganizationId() string {
@@ -1481,7 +1444,7 @@ type ResumeSessionResponse struct {
 
 func (x *ResumeSessionResponse) Reset() {
 	*x = ResumeSessionResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[17]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1493,7 +1456,7 @@ func (x *ResumeSessionResponse) String() string {
 func (*ResumeSessionResponse) ProtoMessage() {}
 
 func (x *ResumeSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[17]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1506,7 +1469,7 @@ func (x *ResumeSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeSessionResponse.ProtoReflect.Descriptor instead.
 func (*ResumeSessionResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{17}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ResumeSessionResponse) GetSession() *Session {
@@ -1528,7 +1491,7 @@ type AnswerPermissionRequest struct {
 
 func (x *AnswerPermissionRequest) Reset() {
 	*x = AnswerPermissionRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[18]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1540,7 +1503,7 @@ func (x *AnswerPermissionRequest) String() string {
 func (*AnswerPermissionRequest) ProtoMessage() {}
 
 func (x *AnswerPermissionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[18]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1553,7 +1516,7 @@ func (x *AnswerPermissionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnswerPermissionRequest.ProtoReflect.Descriptor instead.
 func (*AnswerPermissionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{18}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *AnswerPermissionRequest) GetOrganizationId() string {
@@ -1593,7 +1556,7 @@ type AnswerPermissionResponse struct {
 
 func (x *AnswerPermissionResponse) Reset() {
 	*x = AnswerPermissionResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[19]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1605,7 +1568,7 @@ func (x *AnswerPermissionResponse) String() string {
 func (*AnswerPermissionResponse) ProtoMessage() {}
 
 func (x *AnswerPermissionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[19]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1618,7 +1581,7 @@ func (x *AnswerPermissionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnswerPermissionResponse.ProtoReflect.Descriptor instead.
 func (*AnswerPermissionResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{19}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *AnswerPermissionResponse) GetSession() *Session {
@@ -1640,7 +1603,7 @@ type CancelTurnRequest struct {
 
 func (x *CancelTurnRequest) Reset() {
 	*x = CancelTurnRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[20]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1652,7 +1615,7 @@ func (x *CancelTurnRequest) String() string {
 func (*CancelTurnRequest) ProtoMessage() {}
 
 func (x *CancelTurnRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[20]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1665,7 +1628,7 @@ func (x *CancelTurnRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelTurnRequest.ProtoReflect.Descriptor instead.
 func (*CancelTurnRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{20}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *CancelTurnRequest) GetOrganizationId() string {
@@ -1698,7 +1661,7 @@ type CancelTurnResponse struct {
 
 func (x *CancelTurnResponse) Reset() {
 	*x = CancelTurnResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[21]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1710,7 +1673,7 @@ func (x *CancelTurnResponse) String() string {
 func (*CancelTurnResponse) ProtoMessage() {}
 
 func (x *CancelTurnResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[21]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1723,7 +1686,7 @@ func (x *CancelTurnResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelTurnResponse.ProtoReflect.Descriptor instead.
 func (*CancelTurnResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{21}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CancelTurnResponse) GetSession() *Session {
@@ -1750,7 +1713,7 @@ type SetSessionModeRequest struct {
 
 func (x *SetSessionModeRequest) Reset() {
 	*x = SetSessionModeRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[22]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1762,7 +1725,7 @@ func (x *SetSessionModeRequest) String() string {
 func (*SetSessionModeRequest) ProtoMessage() {}
 
 func (x *SetSessionModeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[22]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1775,7 +1738,7 @@ func (x *SetSessionModeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetSessionModeRequest.ProtoReflect.Descriptor instead.
 func (*SetSessionModeRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{22}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SetSessionModeRequest) GetOrganizationId() string {
@@ -1850,7 +1813,7 @@ type SetSessionModeResponse struct {
 
 func (x *SetSessionModeResponse) Reset() {
 	*x = SetSessionModeResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[23]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1862,7 +1825,7 @@ func (x *SetSessionModeResponse) String() string {
 func (*SetSessionModeResponse) ProtoMessage() {}
 
 func (x *SetSessionModeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[23]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1875,7 +1838,7 @@ func (x *SetSessionModeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetSessionModeResponse.ProtoReflect.Descriptor instead.
 func (*SetSessionModeResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{23}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *SetSessionModeResponse) GetSession() *Session {
@@ -1899,7 +1862,7 @@ type SetSessionConfigOptionRequest struct {
 
 func (x *SetSessionConfigOptionRequest) Reset() {
 	*x = SetSessionConfigOptionRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[24]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1911,7 +1874,7 @@ func (x *SetSessionConfigOptionRequest) String() string {
 func (*SetSessionConfigOptionRequest) ProtoMessage() {}
 
 func (x *SetSessionConfigOptionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[24]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1924,7 +1887,7 @@ func (x *SetSessionConfigOptionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetSessionConfigOptionRequest.ProtoReflect.Descriptor instead.
 func (*SetSessionConfigOptionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{24}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *SetSessionConfigOptionRequest) GetOrganizationId() string {
@@ -1971,7 +1934,7 @@ type SetSessionConfigOptionResponse struct {
 
 func (x *SetSessionConfigOptionResponse) Reset() {
 	*x = SetSessionConfigOptionResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[25]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1983,7 +1946,7 @@ func (x *SetSessionConfigOptionResponse) String() string {
 func (*SetSessionConfigOptionResponse) ProtoMessage() {}
 
 func (x *SetSessionConfigOptionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[25]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1996,7 +1959,7 @@ func (x *SetSessionConfigOptionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetSessionConfigOptionResponse.ProtoReflect.Descriptor instead.
 func (*SetSessionConfigOptionResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{25}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *SetSessionConfigOptionResponse) GetSession() *Session {
@@ -2016,7 +1979,7 @@ type GetAgentOptionsRequest struct {
 
 func (x *GetAgentOptionsRequest) Reset() {
 	*x = GetAgentOptionsRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[26]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2028,7 +1991,7 @@ func (x *GetAgentOptionsRequest) String() string {
 func (*GetAgentOptionsRequest) ProtoMessage() {}
 
 func (x *GetAgentOptionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[26]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2041,7 +2004,7 @@ func (x *GetAgentOptionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAgentOptionsRequest.ProtoReflect.Descriptor instead.
 func (*GetAgentOptionsRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{26}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *GetAgentOptionsRequest) GetOrganizationId() string {
@@ -2070,7 +2033,7 @@ type GetAgentOptionsResponse struct {
 
 func (x *GetAgentOptionsResponse) Reset() {
 	*x = GetAgentOptionsResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[27]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2082,7 +2045,7 @@ func (x *GetAgentOptionsResponse) String() string {
 func (*GetAgentOptionsResponse) ProtoMessage() {}
 
 func (x *GetAgentOptionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[27]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2095,7 +2058,7 @@ func (x *GetAgentOptionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAgentOptionsResponse.ProtoReflect.Descriptor instead.
 func (*GetAgentOptionsResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{27}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *GetAgentOptionsResponse) GetAvailableModes() []*SessionMode {
@@ -2126,7 +2089,7 @@ type ListSessionEventsRequest struct {
 
 func (x *ListSessionEventsRequest) Reset() {
 	*x = ListSessionEventsRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[28]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2138,7 +2101,7 @@ func (x *ListSessionEventsRequest) String() string {
 func (*ListSessionEventsRequest) ProtoMessage() {}
 
 func (x *ListSessionEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[28]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2151,7 +2114,7 @@ func (x *ListSessionEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionEventsRequest.ProtoReflect.Descriptor instead.
 func (*ListSessionEventsRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{28}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ListSessionEventsRequest) GetOrganizationId() string {
@@ -2194,7 +2157,7 @@ type ListSessionEventsResponse struct {
 
 func (x *ListSessionEventsResponse) Reset() {
 	*x = ListSessionEventsResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[29]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2206,7 +2169,7 @@ func (x *ListSessionEventsResponse) String() string {
 func (*ListSessionEventsResponse) ProtoMessage() {}
 
 func (x *ListSessionEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[29]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2219,7 +2182,7 @@ func (x *ListSessionEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionEventsResponse.ProtoReflect.Descriptor instead.
 func (*ListSessionEventsResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{29}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ListSessionEventsResponse) GetEvents() []*TranscriptEvent {
@@ -2248,7 +2211,7 @@ type WatchSessionRequest struct {
 
 func (x *WatchSessionRequest) Reset() {
 	*x = WatchSessionRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[30]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2260,7 +2223,7 @@ func (x *WatchSessionRequest) String() string {
 func (*WatchSessionRequest) ProtoMessage() {}
 
 func (x *WatchSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[30]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2273,7 +2236,7 @@ func (x *WatchSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchSessionRequest.ProtoReflect.Descriptor instead.
 func (*WatchSessionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{30}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *WatchSessionRequest) GetOrganizationId() string {
@@ -2306,7 +2269,7 @@ type Keepalive struct {
 
 func (x *Keepalive) Reset() {
 	*x = Keepalive{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[31]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2318,7 +2281,7 @@ func (x *Keepalive) String() string {
 func (*Keepalive) ProtoMessage() {}
 
 func (x *Keepalive) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[31]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2331,7 +2294,7 @@ func (x *Keepalive) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Keepalive.ProtoReflect.Descriptor instead.
 func (*Keepalive) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{31}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{30}
 }
 
 // Every stored event after the requested sequence was sent.
@@ -2343,7 +2306,7 @@ type CaughtUp struct {
 
 func (x *CaughtUp) Reset() {
 	*x = CaughtUp{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[32]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2355,7 +2318,7 @@ func (x *CaughtUp) String() string {
 func (*CaughtUp) ProtoMessage() {}
 
 func (x *CaughtUp) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[32]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2368,7 +2331,7 @@ func (x *CaughtUp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CaughtUp.ProtoReflect.Descriptor instead.
 func (*CaughtUp) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{32}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{31}
 }
 
 type WatchSessionResponse struct {
@@ -2386,7 +2349,7 @@ type WatchSessionResponse struct {
 
 func (x *WatchSessionResponse) Reset() {
 	*x = WatchSessionResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[33]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2398,7 +2361,7 @@ func (x *WatchSessionResponse) String() string {
 func (*WatchSessionResponse) ProtoMessage() {}
 
 func (x *WatchSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[33]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2411,7 +2374,7 @@ func (x *WatchSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchSessionResponse.ProtoReflect.Descriptor instead.
 func (*WatchSessionResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{33}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *WatchSessionResponse) GetEvent() isWatchSessionResponse_Event {
@@ -2495,7 +2458,7 @@ type WatchSessionsRequest struct {
 
 func (x *WatchSessionsRequest) Reset() {
 	*x = WatchSessionsRequest{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[34]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2507,7 +2470,7 @@ func (x *WatchSessionsRequest) String() string {
 func (*WatchSessionsRequest) ProtoMessage() {}
 
 func (x *WatchSessionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[34]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2520,7 +2483,7 @@ func (x *WatchSessionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchSessionsRequest.ProtoReflect.Descriptor instead.
 func (*WatchSessionsRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{34}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *WatchSessionsRequest) GetOrganizationId() string {
@@ -2540,7 +2503,7 @@ type SessionDeleted struct {
 
 func (x *SessionDeleted) Reset() {
 	*x = SessionDeleted{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[35]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2552,7 +2515,7 @@ func (x *SessionDeleted) String() string {
 func (*SessionDeleted) ProtoMessage() {}
 
 func (x *SessionDeleted) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[35]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2565,7 +2528,7 @@ func (x *SessionDeleted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionDeleted.ProtoReflect.Descriptor instead.
 func (*SessionDeleted) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{35}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *SessionDeleted) GetSessionId() string {
@@ -2589,7 +2552,7 @@ type WatchSessionsResponse struct {
 
 func (x *WatchSessionsResponse) Reset() {
 	*x = WatchSessionsResponse{}
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[36]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2601,7 +2564,7 @@ func (x *WatchSessionsResponse) String() string {
 func (*WatchSessionsResponse) ProtoMessage() {}
 
 func (x *WatchSessionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[36]
+	mi := &file_delino_sandcrew_v1_session_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2614,7 +2577,7 @@ func (x *WatchSessionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchSessionsResponse.ProtoReflect.Descriptor instead.
 func (*WatchSessionsResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{36}
+	return file_delino_sandcrew_v1_session_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *WatchSessionsResponse) GetEvent() isWatchSessionsResponse_Event {
@@ -2707,10 +2670,7 @@ const file_delino_sandcrew_v1_session_proto_rawDesc = "" +
 	"\x17scheduled_deletion_time\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\x15scheduledDeletionTime\x12.\n" +
 	"\x13previous_session_id\x18\x10 \x01(\tR\x11previousSessionId\x123\n" +
 	"\x05agent\x18\x11 \x01(\v2\x1d.delino.sandcrew.v1.AgentInfoR\x05agent\x12.\n" +
-	"\x13resume_wait_expired\x18\x12 \x01(\bR\x11resumeWaitExpired\"\\\n" +
-	"\x15ConfigOptionSelection\x12(\n" +
-	"\x10config_option_id\x18\x01 \x01(\tR\x0econfigOptionId\x12\x19\n" +
-	"\bvalue_id\x18\x02 \x01(\tR\avalueId\"\xb2\v\n" +
+	"\x13resume_wait_expired\x18\x12 \x01(\bR\x11resumeWaitExpired\"\xf5\v\n" +
 	"\x0fTranscriptEvent\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12.\n" +
 	"\x04time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x04time\x127\n" +
@@ -2733,7 +2693,9 @@ const file_delino_sandcrew_v1_session_proto_rawDesc = "" +
 	"\rsession_state\x18\x18 \x01(\v2%.delino.sandcrew.v1.AgentSessionStateH\x00R\fsessionState\x12D\n" +
 	"\fbridge_error\x18\x19 \x01(\v2\x1f.delino.sandcrew.v1.BridgeErrorH\x00R\vbridgeError\x12D\n" +
 	"\fagent_exited\x18\x1a \x01(\v2\x1f.delino.sandcrew.v1.AgentExitedH\x00R\vagentExited\x12J\n" +
-	"\x0eunknown_update\x18\x1c \x01(\v2!.delino.sandcrew.v1.UnknownUpdateH\x00R\runknownUpdateB\a\n" +
+	"\x0eunknown_update\x18\x1c \x01(\v2!.delino.sandcrew.v1.UnknownUpdateH\x00R\runknownUpdate\x12A\n" +
+	"\vagent_ready\x18\x1d \x01(\v2\x1e.delino.sandcrew.v1.AgentReadyH\x00R\n" +
+	"agentReadyB\a\n" +
 	"\x05eventJ\x04\b\x1b\x10\x1cR\x11credential_update\"\xf8\x02\n" +
 	"\x14CreateSessionRequest\x12'\n" +
 	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x127\n" +
@@ -2895,164 +2857,166 @@ func file_delino_sandcrew_v1_session_proto_rawDescGZIP() []byte {
 	return file_delino_sandcrew_v1_session_proto_rawDescData
 }
 
-var file_delino_sandcrew_v1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_delino_sandcrew_v1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_delino_sandcrew_v1_session_proto_goTypes = []any{
 	(*AgentInfo)(nil),                            // 0: delino.sandcrew.v1.AgentInfo
 	(*Session)(nil),                              // 1: delino.sandcrew.v1.Session
-	(*ConfigOptionSelection)(nil),                // 2: delino.sandcrew.v1.ConfigOptionSelection
-	(*TranscriptEvent)(nil),                      // 3: delino.sandcrew.v1.TranscriptEvent
-	(*CreateSessionRequest)(nil),                 // 4: delino.sandcrew.v1.CreateSessionRequest
-	(*CreateSessionResponse)(nil),                // 5: delino.sandcrew.v1.CreateSessionResponse
-	(*RestartSessionFromTranscriptRequest)(nil),  // 6: delino.sandcrew.v1.RestartSessionFromTranscriptRequest
-	(*RestartSessionFromTranscriptResponse)(nil), // 7: delino.sandcrew.v1.RestartSessionFromTranscriptResponse
-	(*GetSessionRequest)(nil),                    // 8: delino.sandcrew.v1.GetSessionRequest
-	(*GetSessionResponse)(nil),                   // 9: delino.sandcrew.v1.GetSessionResponse
-	(*ListSessionsRequest)(nil),                  // 10: delino.sandcrew.v1.ListSessionsRequest
-	(*ListSessionsResponse)(nil),                 // 11: delino.sandcrew.v1.ListSessionsResponse
-	(*DeleteSessionRequest)(nil),                 // 12: delino.sandcrew.v1.DeleteSessionRequest
-	(*DeleteSessionResponse)(nil),                // 13: delino.sandcrew.v1.DeleteSessionResponse
-	(*SendMessageRequest)(nil),                   // 14: delino.sandcrew.v1.SendMessageRequest
-	(*SendMessageResponse)(nil),                  // 15: delino.sandcrew.v1.SendMessageResponse
-	(*ResumeSessionRequest)(nil),                 // 16: delino.sandcrew.v1.ResumeSessionRequest
-	(*ResumeSessionResponse)(nil),                // 17: delino.sandcrew.v1.ResumeSessionResponse
-	(*AnswerPermissionRequest)(nil),              // 18: delino.sandcrew.v1.AnswerPermissionRequest
-	(*AnswerPermissionResponse)(nil),             // 19: delino.sandcrew.v1.AnswerPermissionResponse
-	(*CancelTurnRequest)(nil),                    // 20: delino.sandcrew.v1.CancelTurnRequest
-	(*CancelTurnResponse)(nil),                   // 21: delino.sandcrew.v1.CancelTurnResponse
-	(*SetSessionModeRequest)(nil),                // 22: delino.sandcrew.v1.SetSessionModeRequest
-	(*SetSessionModeResponse)(nil),               // 23: delino.sandcrew.v1.SetSessionModeResponse
-	(*SetSessionConfigOptionRequest)(nil),        // 24: delino.sandcrew.v1.SetSessionConfigOptionRequest
-	(*SetSessionConfigOptionResponse)(nil),       // 25: delino.sandcrew.v1.SetSessionConfigOptionResponse
-	(*GetAgentOptionsRequest)(nil),               // 26: delino.sandcrew.v1.GetAgentOptionsRequest
-	(*GetAgentOptionsResponse)(nil),              // 27: delino.sandcrew.v1.GetAgentOptionsResponse
-	(*ListSessionEventsRequest)(nil),             // 28: delino.sandcrew.v1.ListSessionEventsRequest
-	(*ListSessionEventsResponse)(nil),            // 29: delino.sandcrew.v1.ListSessionEventsResponse
-	(*WatchSessionRequest)(nil),                  // 30: delino.sandcrew.v1.WatchSessionRequest
-	(*Keepalive)(nil),                            // 31: delino.sandcrew.v1.Keepalive
-	(*CaughtUp)(nil),                             // 32: delino.sandcrew.v1.CaughtUp
-	(*WatchSessionResponse)(nil),                 // 33: delino.sandcrew.v1.WatchSessionResponse
-	(*WatchSessionsRequest)(nil),                 // 34: delino.sandcrew.v1.WatchSessionsRequest
-	(*SessionDeleted)(nil),                       // 35: delino.sandcrew.v1.SessionDeleted
-	(*WatchSessionsResponse)(nil),                // 36: delino.sandcrew.v1.WatchSessionsResponse
-	(*SessionMode)(nil),                          // 37: delino.sandcrew.v1.SessionMode
-	(*ConfigOption)(nil),                         // 38: delino.sandcrew.v1.ConfigOption
-	(AgentVendor)(0),                             // 39: delino.sandcrew.v1.AgentVendor
-	(GuestOs)(0),                                 // 40: delino.sandcrew.v1.GuestOs
-	(SessionState)(0),                            // 41: delino.sandcrew.v1.SessionState
-	(SessionEndReason)(0),                        // 42: delino.sandcrew.v1.SessionEndReason
-	(PermissionMode)(0),                          // 43: delino.sandcrew.v1.PermissionMode
-	(*timestamppb.Timestamp)(nil),                // 44: google.protobuf.Timestamp
-	(*BridgeHello)(nil),                          // 45: delino.sandcrew.v1.BridgeHello
-	(*InputAccepted)(nil),                        // 46: delino.sandcrew.v1.InputAccepted
-	(*InputRejected)(nil),                        // 47: delino.sandcrew.v1.InputRejected
-	(*ContentChunk)(nil),                         // 48: delino.sandcrew.v1.ContentChunk
-	(*ToolCall)(nil),                             // 49: delino.sandcrew.v1.ToolCall
-	(*ToolCallUpdate)(nil),                       // 50: delino.sandcrew.v1.ToolCallUpdate
-	(*Plan)(nil),                                 // 51: delino.sandcrew.v1.Plan
-	(*PermissionRequest)(nil),                    // 52: delino.sandcrew.v1.PermissionRequest
-	(*PermissionResponse)(nil),                   // 53: delino.sandcrew.v1.PermissionResponse
-	(*TurnEnded)(nil),                            // 54: delino.sandcrew.v1.TurnEnded
-	(*ModeChanged)(nil),                          // 55: delino.sandcrew.v1.ModeChanged
-	(*ConfigOptions)(nil),                        // 56: delino.sandcrew.v1.ConfigOptions
-	(*AgentSessionState)(nil),                    // 57: delino.sandcrew.v1.AgentSessionState
-	(*BridgeError)(nil),                          // 58: delino.sandcrew.v1.BridgeError
-	(*AgentExited)(nil),                          // 59: delino.sandcrew.v1.AgentExited
-	(*UnknownUpdate)(nil),                        // 60: delino.sandcrew.v1.UnknownUpdate
+	(*TranscriptEvent)(nil),                      // 2: delino.sandcrew.v1.TranscriptEvent
+	(*CreateSessionRequest)(nil),                 // 3: delino.sandcrew.v1.CreateSessionRequest
+	(*CreateSessionResponse)(nil),                // 4: delino.sandcrew.v1.CreateSessionResponse
+	(*RestartSessionFromTranscriptRequest)(nil),  // 5: delino.sandcrew.v1.RestartSessionFromTranscriptRequest
+	(*RestartSessionFromTranscriptResponse)(nil), // 6: delino.sandcrew.v1.RestartSessionFromTranscriptResponse
+	(*GetSessionRequest)(nil),                    // 7: delino.sandcrew.v1.GetSessionRequest
+	(*GetSessionResponse)(nil),                   // 8: delino.sandcrew.v1.GetSessionResponse
+	(*ListSessionsRequest)(nil),                  // 9: delino.sandcrew.v1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),                 // 10: delino.sandcrew.v1.ListSessionsResponse
+	(*DeleteSessionRequest)(nil),                 // 11: delino.sandcrew.v1.DeleteSessionRequest
+	(*DeleteSessionResponse)(nil),                // 12: delino.sandcrew.v1.DeleteSessionResponse
+	(*SendMessageRequest)(nil),                   // 13: delino.sandcrew.v1.SendMessageRequest
+	(*SendMessageResponse)(nil),                  // 14: delino.sandcrew.v1.SendMessageResponse
+	(*ResumeSessionRequest)(nil),                 // 15: delino.sandcrew.v1.ResumeSessionRequest
+	(*ResumeSessionResponse)(nil),                // 16: delino.sandcrew.v1.ResumeSessionResponse
+	(*AnswerPermissionRequest)(nil),              // 17: delino.sandcrew.v1.AnswerPermissionRequest
+	(*AnswerPermissionResponse)(nil),             // 18: delino.sandcrew.v1.AnswerPermissionResponse
+	(*CancelTurnRequest)(nil),                    // 19: delino.sandcrew.v1.CancelTurnRequest
+	(*CancelTurnResponse)(nil),                   // 20: delino.sandcrew.v1.CancelTurnResponse
+	(*SetSessionModeRequest)(nil),                // 21: delino.sandcrew.v1.SetSessionModeRequest
+	(*SetSessionModeResponse)(nil),               // 22: delino.sandcrew.v1.SetSessionModeResponse
+	(*SetSessionConfigOptionRequest)(nil),        // 23: delino.sandcrew.v1.SetSessionConfigOptionRequest
+	(*SetSessionConfigOptionResponse)(nil),       // 24: delino.sandcrew.v1.SetSessionConfigOptionResponse
+	(*GetAgentOptionsRequest)(nil),               // 25: delino.sandcrew.v1.GetAgentOptionsRequest
+	(*GetAgentOptionsResponse)(nil),              // 26: delino.sandcrew.v1.GetAgentOptionsResponse
+	(*ListSessionEventsRequest)(nil),             // 27: delino.sandcrew.v1.ListSessionEventsRequest
+	(*ListSessionEventsResponse)(nil),            // 28: delino.sandcrew.v1.ListSessionEventsResponse
+	(*WatchSessionRequest)(nil),                  // 29: delino.sandcrew.v1.WatchSessionRequest
+	(*Keepalive)(nil),                            // 30: delino.sandcrew.v1.Keepalive
+	(*CaughtUp)(nil),                             // 31: delino.sandcrew.v1.CaughtUp
+	(*WatchSessionResponse)(nil),                 // 32: delino.sandcrew.v1.WatchSessionResponse
+	(*WatchSessionsRequest)(nil),                 // 33: delino.sandcrew.v1.WatchSessionsRequest
+	(*SessionDeleted)(nil),                       // 34: delino.sandcrew.v1.SessionDeleted
+	(*WatchSessionsResponse)(nil),                // 35: delino.sandcrew.v1.WatchSessionsResponse
+	(*SessionMode)(nil),                          // 36: delino.sandcrew.v1.SessionMode
+	(*ConfigOption)(nil),                         // 37: delino.sandcrew.v1.ConfigOption
+	(AgentVendor)(0),                             // 38: delino.sandcrew.v1.AgentVendor
+	(GuestOs)(0),                                 // 39: delino.sandcrew.v1.GuestOs
+	(SessionState)(0),                            // 40: delino.sandcrew.v1.SessionState
+	(SessionEndReason)(0),                        // 41: delino.sandcrew.v1.SessionEndReason
+	(PermissionMode)(0),                          // 42: delino.sandcrew.v1.PermissionMode
+	(*timestamppb.Timestamp)(nil),                // 43: google.protobuf.Timestamp
+	(*BridgeHello)(nil),                          // 44: delino.sandcrew.v1.BridgeHello
+	(*InputAccepted)(nil),                        // 45: delino.sandcrew.v1.InputAccepted
+	(*InputRejected)(nil),                        // 46: delino.sandcrew.v1.InputRejected
+	(*ContentChunk)(nil),                         // 47: delino.sandcrew.v1.ContentChunk
+	(*ToolCall)(nil),                             // 48: delino.sandcrew.v1.ToolCall
+	(*ToolCallUpdate)(nil),                       // 49: delino.sandcrew.v1.ToolCallUpdate
+	(*Plan)(nil),                                 // 50: delino.sandcrew.v1.Plan
+	(*PermissionRequest)(nil),                    // 51: delino.sandcrew.v1.PermissionRequest
+	(*PermissionResponse)(nil),                   // 52: delino.sandcrew.v1.PermissionResponse
+	(*TurnEnded)(nil),                            // 53: delino.sandcrew.v1.TurnEnded
+	(*ModeChanged)(nil),                          // 54: delino.sandcrew.v1.ModeChanged
+	(*ConfigOptions)(nil),                        // 55: delino.sandcrew.v1.ConfigOptions
+	(*AgentSessionState)(nil),                    // 56: delino.sandcrew.v1.AgentSessionState
+	(*BridgeError)(nil),                          // 57: delino.sandcrew.v1.BridgeError
+	(*AgentExited)(nil),                          // 58: delino.sandcrew.v1.AgentExited
+	(*UnknownUpdate)(nil),                        // 59: delino.sandcrew.v1.UnknownUpdate
+	(*AgentReady)(nil),                           // 60: delino.sandcrew.v1.AgentReady
+	(*ConfigOptionSelection)(nil),                // 61: delino.sandcrew.v1.ConfigOptionSelection
 }
 var file_delino_sandcrew_v1_session_proto_depIdxs = []int32{
-	37, // 0: delino.sandcrew.v1.AgentInfo.available_modes:type_name -> delino.sandcrew.v1.SessionMode
-	38, // 1: delino.sandcrew.v1.AgentInfo.config_options:type_name -> delino.sandcrew.v1.ConfigOption
-	39, // 2: delino.sandcrew.v1.Session.vendor:type_name -> delino.sandcrew.v1.AgentVendor
-	40, // 3: delino.sandcrew.v1.Session.guest_os:type_name -> delino.sandcrew.v1.GuestOs
-	41, // 4: delino.sandcrew.v1.Session.state:type_name -> delino.sandcrew.v1.SessionState
-	42, // 5: delino.sandcrew.v1.Session.end_reason:type_name -> delino.sandcrew.v1.SessionEndReason
-	43, // 6: delino.sandcrew.v1.Session.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
-	44, // 7: delino.sandcrew.v1.Session.created_at:type_name -> google.protobuf.Timestamp
-	44, // 8: delino.sandcrew.v1.Session.started_at:type_name -> google.protobuf.Timestamp
-	44, // 9: delino.sandcrew.v1.Session.paused_at:type_name -> google.protobuf.Timestamp
-	44, // 10: delino.sandcrew.v1.Session.ended_at:type_name -> google.protobuf.Timestamp
-	44, // 11: delino.sandcrew.v1.Session.scheduled_deletion_time:type_name -> google.protobuf.Timestamp
+	36, // 0: delino.sandcrew.v1.AgentInfo.available_modes:type_name -> delino.sandcrew.v1.SessionMode
+	37, // 1: delino.sandcrew.v1.AgentInfo.config_options:type_name -> delino.sandcrew.v1.ConfigOption
+	38, // 2: delino.sandcrew.v1.Session.vendor:type_name -> delino.sandcrew.v1.AgentVendor
+	39, // 3: delino.sandcrew.v1.Session.guest_os:type_name -> delino.sandcrew.v1.GuestOs
+	40, // 4: delino.sandcrew.v1.Session.state:type_name -> delino.sandcrew.v1.SessionState
+	41, // 5: delino.sandcrew.v1.Session.end_reason:type_name -> delino.sandcrew.v1.SessionEndReason
+	42, // 6: delino.sandcrew.v1.Session.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
+	43, // 7: delino.sandcrew.v1.Session.created_at:type_name -> google.protobuf.Timestamp
+	43, // 8: delino.sandcrew.v1.Session.started_at:type_name -> google.protobuf.Timestamp
+	43, // 9: delino.sandcrew.v1.Session.paused_at:type_name -> google.protobuf.Timestamp
+	43, // 10: delino.sandcrew.v1.Session.ended_at:type_name -> google.protobuf.Timestamp
+	43, // 11: delino.sandcrew.v1.Session.scheduled_deletion_time:type_name -> google.protobuf.Timestamp
 	0,  // 12: delino.sandcrew.v1.Session.agent:type_name -> delino.sandcrew.v1.AgentInfo
-	44, // 13: delino.sandcrew.v1.TranscriptEvent.time:type_name -> google.protobuf.Timestamp
-	45, // 14: delino.sandcrew.v1.TranscriptEvent.hello:type_name -> delino.sandcrew.v1.BridgeHello
-	46, // 15: delino.sandcrew.v1.TranscriptEvent.input_accepted:type_name -> delino.sandcrew.v1.InputAccepted
-	47, // 16: delino.sandcrew.v1.TranscriptEvent.input_rejected:type_name -> delino.sandcrew.v1.InputRejected
-	48, // 17: delino.sandcrew.v1.TranscriptEvent.user_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
-	48, // 18: delino.sandcrew.v1.TranscriptEvent.agent_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
-	48, // 19: delino.sandcrew.v1.TranscriptEvent.agent_thought_chunk:type_name -> delino.sandcrew.v1.ContentChunk
-	49, // 20: delino.sandcrew.v1.TranscriptEvent.tool_call:type_name -> delino.sandcrew.v1.ToolCall
-	50, // 21: delino.sandcrew.v1.TranscriptEvent.tool_call_update:type_name -> delino.sandcrew.v1.ToolCallUpdate
-	51, // 22: delino.sandcrew.v1.TranscriptEvent.plan:type_name -> delino.sandcrew.v1.Plan
-	52, // 23: delino.sandcrew.v1.TranscriptEvent.permission_request:type_name -> delino.sandcrew.v1.PermissionRequest
-	53, // 24: delino.sandcrew.v1.TranscriptEvent.permission_response:type_name -> delino.sandcrew.v1.PermissionResponse
-	54, // 25: delino.sandcrew.v1.TranscriptEvent.turn_ended:type_name -> delino.sandcrew.v1.TurnEnded
-	55, // 26: delino.sandcrew.v1.TranscriptEvent.mode_changed:type_name -> delino.sandcrew.v1.ModeChanged
-	56, // 27: delino.sandcrew.v1.TranscriptEvent.config_options:type_name -> delino.sandcrew.v1.ConfigOptions
-	57, // 28: delino.sandcrew.v1.TranscriptEvent.session_state:type_name -> delino.sandcrew.v1.AgentSessionState
-	58, // 29: delino.sandcrew.v1.TranscriptEvent.bridge_error:type_name -> delino.sandcrew.v1.BridgeError
-	59, // 30: delino.sandcrew.v1.TranscriptEvent.agent_exited:type_name -> delino.sandcrew.v1.AgentExited
-	60, // 31: delino.sandcrew.v1.TranscriptEvent.unknown_update:type_name -> delino.sandcrew.v1.UnknownUpdate
-	39, // 32: delino.sandcrew.v1.CreateSessionRequest.vendor:type_name -> delino.sandcrew.v1.AgentVendor
-	2,  // 33: delino.sandcrew.v1.CreateSessionRequest.config_options:type_name -> delino.sandcrew.v1.ConfigOptionSelection
-	1,  // 34: delino.sandcrew.v1.CreateSessionResponse.session:type_name -> delino.sandcrew.v1.Session
-	1,  // 35: delino.sandcrew.v1.RestartSessionFromTranscriptResponse.session:type_name -> delino.sandcrew.v1.Session
-	1,  // 36: delino.sandcrew.v1.GetSessionResponse.session:type_name -> delino.sandcrew.v1.Session
-	39, // 37: delino.sandcrew.v1.ListSessionsRequest.vendors:type_name -> delino.sandcrew.v1.AgentVendor
-	41, // 38: delino.sandcrew.v1.ListSessionsRequest.states:type_name -> delino.sandcrew.v1.SessionState
-	1,  // 39: delino.sandcrew.v1.ListSessionsResponse.sessions:type_name -> delino.sandcrew.v1.Session
-	1,  // 40: delino.sandcrew.v1.SendMessageResponse.session:type_name -> delino.sandcrew.v1.Session
-	1,  // 41: delino.sandcrew.v1.ResumeSessionResponse.session:type_name -> delino.sandcrew.v1.Session
-	1,  // 42: delino.sandcrew.v1.AnswerPermissionResponse.session:type_name -> delino.sandcrew.v1.Session
-	1,  // 43: delino.sandcrew.v1.CancelTurnResponse.session:type_name -> delino.sandcrew.v1.Session
-	43, // 44: delino.sandcrew.v1.SetSessionModeRequest.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
-	1,  // 45: delino.sandcrew.v1.SetSessionModeResponse.session:type_name -> delino.sandcrew.v1.Session
-	1,  // 46: delino.sandcrew.v1.SetSessionConfigOptionResponse.session:type_name -> delino.sandcrew.v1.Session
-	39, // 47: delino.sandcrew.v1.GetAgentOptionsRequest.vendor:type_name -> delino.sandcrew.v1.AgentVendor
-	37, // 48: delino.sandcrew.v1.GetAgentOptionsResponse.available_modes:type_name -> delino.sandcrew.v1.SessionMode
-	38, // 49: delino.sandcrew.v1.GetAgentOptionsResponse.config_options:type_name -> delino.sandcrew.v1.ConfigOption
-	3,  // 50: delino.sandcrew.v1.ListSessionEventsResponse.events:type_name -> delino.sandcrew.v1.TranscriptEvent
-	31, // 51: delino.sandcrew.v1.WatchSessionResponse.keepalive:type_name -> delino.sandcrew.v1.Keepalive
-	3,  // 52: delino.sandcrew.v1.WatchSessionResponse.transcript_event:type_name -> delino.sandcrew.v1.TranscriptEvent
-	1,  // 53: delino.sandcrew.v1.WatchSessionResponse.session:type_name -> delino.sandcrew.v1.Session
-	32, // 54: delino.sandcrew.v1.WatchSessionResponse.caught_up:type_name -> delino.sandcrew.v1.CaughtUp
-	31, // 55: delino.sandcrew.v1.WatchSessionsResponse.keepalive:type_name -> delino.sandcrew.v1.Keepalive
-	1,  // 56: delino.sandcrew.v1.WatchSessionsResponse.session:type_name -> delino.sandcrew.v1.Session
-	35, // 57: delino.sandcrew.v1.WatchSessionsResponse.session_deleted:type_name -> delino.sandcrew.v1.SessionDeleted
-	4,  // 58: delino.sandcrew.v1.SessionService.CreateSession:input_type -> delino.sandcrew.v1.CreateSessionRequest
-	6,  // 59: delino.sandcrew.v1.SessionService.RestartSessionFromTranscript:input_type -> delino.sandcrew.v1.RestartSessionFromTranscriptRequest
-	8,  // 60: delino.sandcrew.v1.SessionService.GetSession:input_type -> delino.sandcrew.v1.GetSessionRequest
-	10, // 61: delino.sandcrew.v1.SessionService.ListSessions:input_type -> delino.sandcrew.v1.ListSessionsRequest
-	12, // 62: delino.sandcrew.v1.SessionService.DeleteSession:input_type -> delino.sandcrew.v1.DeleteSessionRequest
-	14, // 63: delino.sandcrew.v1.SessionService.SendMessage:input_type -> delino.sandcrew.v1.SendMessageRequest
-	16, // 64: delino.sandcrew.v1.SessionService.ResumeSession:input_type -> delino.sandcrew.v1.ResumeSessionRequest
-	18, // 65: delino.sandcrew.v1.SessionService.AnswerPermission:input_type -> delino.sandcrew.v1.AnswerPermissionRequest
-	20, // 66: delino.sandcrew.v1.SessionService.CancelTurn:input_type -> delino.sandcrew.v1.CancelTurnRequest
-	22, // 67: delino.sandcrew.v1.SessionService.SetSessionMode:input_type -> delino.sandcrew.v1.SetSessionModeRequest
-	24, // 68: delino.sandcrew.v1.SessionService.SetSessionConfigOption:input_type -> delino.sandcrew.v1.SetSessionConfigOptionRequest
-	26, // 69: delino.sandcrew.v1.SessionService.GetAgentOptions:input_type -> delino.sandcrew.v1.GetAgentOptionsRequest
-	28, // 70: delino.sandcrew.v1.SessionService.ListSessionEvents:input_type -> delino.sandcrew.v1.ListSessionEventsRequest
-	30, // 71: delino.sandcrew.v1.SessionService.WatchSession:input_type -> delino.sandcrew.v1.WatchSessionRequest
-	34, // 72: delino.sandcrew.v1.SessionService.WatchSessions:input_type -> delino.sandcrew.v1.WatchSessionsRequest
-	5,  // 73: delino.sandcrew.v1.SessionService.CreateSession:output_type -> delino.sandcrew.v1.CreateSessionResponse
-	7,  // 74: delino.sandcrew.v1.SessionService.RestartSessionFromTranscript:output_type -> delino.sandcrew.v1.RestartSessionFromTranscriptResponse
-	9,  // 75: delino.sandcrew.v1.SessionService.GetSession:output_type -> delino.sandcrew.v1.GetSessionResponse
-	11, // 76: delino.sandcrew.v1.SessionService.ListSessions:output_type -> delino.sandcrew.v1.ListSessionsResponse
-	13, // 77: delino.sandcrew.v1.SessionService.DeleteSession:output_type -> delino.sandcrew.v1.DeleteSessionResponse
-	15, // 78: delino.sandcrew.v1.SessionService.SendMessage:output_type -> delino.sandcrew.v1.SendMessageResponse
-	17, // 79: delino.sandcrew.v1.SessionService.ResumeSession:output_type -> delino.sandcrew.v1.ResumeSessionResponse
-	19, // 80: delino.sandcrew.v1.SessionService.AnswerPermission:output_type -> delino.sandcrew.v1.AnswerPermissionResponse
-	21, // 81: delino.sandcrew.v1.SessionService.CancelTurn:output_type -> delino.sandcrew.v1.CancelTurnResponse
-	23, // 82: delino.sandcrew.v1.SessionService.SetSessionMode:output_type -> delino.sandcrew.v1.SetSessionModeResponse
-	25, // 83: delino.sandcrew.v1.SessionService.SetSessionConfigOption:output_type -> delino.sandcrew.v1.SetSessionConfigOptionResponse
-	27, // 84: delino.sandcrew.v1.SessionService.GetAgentOptions:output_type -> delino.sandcrew.v1.GetAgentOptionsResponse
-	29, // 85: delino.sandcrew.v1.SessionService.ListSessionEvents:output_type -> delino.sandcrew.v1.ListSessionEventsResponse
-	33, // 86: delino.sandcrew.v1.SessionService.WatchSession:output_type -> delino.sandcrew.v1.WatchSessionResponse
-	36, // 87: delino.sandcrew.v1.SessionService.WatchSessions:output_type -> delino.sandcrew.v1.WatchSessionsResponse
-	73, // [73:88] is the sub-list for method output_type
-	58, // [58:73] is the sub-list for method input_type
-	58, // [58:58] is the sub-list for extension type_name
-	58, // [58:58] is the sub-list for extension extendee
-	0,  // [0:58] is the sub-list for field type_name
+	43, // 13: delino.sandcrew.v1.TranscriptEvent.time:type_name -> google.protobuf.Timestamp
+	44, // 14: delino.sandcrew.v1.TranscriptEvent.hello:type_name -> delino.sandcrew.v1.BridgeHello
+	45, // 15: delino.sandcrew.v1.TranscriptEvent.input_accepted:type_name -> delino.sandcrew.v1.InputAccepted
+	46, // 16: delino.sandcrew.v1.TranscriptEvent.input_rejected:type_name -> delino.sandcrew.v1.InputRejected
+	47, // 17: delino.sandcrew.v1.TranscriptEvent.user_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
+	47, // 18: delino.sandcrew.v1.TranscriptEvent.agent_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
+	47, // 19: delino.sandcrew.v1.TranscriptEvent.agent_thought_chunk:type_name -> delino.sandcrew.v1.ContentChunk
+	48, // 20: delino.sandcrew.v1.TranscriptEvent.tool_call:type_name -> delino.sandcrew.v1.ToolCall
+	49, // 21: delino.sandcrew.v1.TranscriptEvent.tool_call_update:type_name -> delino.sandcrew.v1.ToolCallUpdate
+	50, // 22: delino.sandcrew.v1.TranscriptEvent.plan:type_name -> delino.sandcrew.v1.Plan
+	51, // 23: delino.sandcrew.v1.TranscriptEvent.permission_request:type_name -> delino.sandcrew.v1.PermissionRequest
+	52, // 24: delino.sandcrew.v1.TranscriptEvent.permission_response:type_name -> delino.sandcrew.v1.PermissionResponse
+	53, // 25: delino.sandcrew.v1.TranscriptEvent.turn_ended:type_name -> delino.sandcrew.v1.TurnEnded
+	54, // 26: delino.sandcrew.v1.TranscriptEvent.mode_changed:type_name -> delino.sandcrew.v1.ModeChanged
+	55, // 27: delino.sandcrew.v1.TranscriptEvent.config_options:type_name -> delino.sandcrew.v1.ConfigOptions
+	56, // 28: delino.sandcrew.v1.TranscriptEvent.session_state:type_name -> delino.sandcrew.v1.AgentSessionState
+	57, // 29: delino.sandcrew.v1.TranscriptEvent.bridge_error:type_name -> delino.sandcrew.v1.BridgeError
+	58, // 30: delino.sandcrew.v1.TranscriptEvent.agent_exited:type_name -> delino.sandcrew.v1.AgentExited
+	59, // 31: delino.sandcrew.v1.TranscriptEvent.unknown_update:type_name -> delino.sandcrew.v1.UnknownUpdate
+	60, // 32: delino.sandcrew.v1.TranscriptEvent.agent_ready:type_name -> delino.sandcrew.v1.AgentReady
+	38, // 33: delino.sandcrew.v1.CreateSessionRequest.vendor:type_name -> delino.sandcrew.v1.AgentVendor
+	61, // 34: delino.sandcrew.v1.CreateSessionRequest.config_options:type_name -> delino.sandcrew.v1.ConfigOptionSelection
+	1,  // 35: delino.sandcrew.v1.CreateSessionResponse.session:type_name -> delino.sandcrew.v1.Session
+	1,  // 36: delino.sandcrew.v1.RestartSessionFromTranscriptResponse.session:type_name -> delino.sandcrew.v1.Session
+	1,  // 37: delino.sandcrew.v1.GetSessionResponse.session:type_name -> delino.sandcrew.v1.Session
+	38, // 38: delino.sandcrew.v1.ListSessionsRequest.vendors:type_name -> delino.sandcrew.v1.AgentVendor
+	40, // 39: delino.sandcrew.v1.ListSessionsRequest.states:type_name -> delino.sandcrew.v1.SessionState
+	1,  // 40: delino.sandcrew.v1.ListSessionsResponse.sessions:type_name -> delino.sandcrew.v1.Session
+	1,  // 41: delino.sandcrew.v1.SendMessageResponse.session:type_name -> delino.sandcrew.v1.Session
+	1,  // 42: delino.sandcrew.v1.ResumeSessionResponse.session:type_name -> delino.sandcrew.v1.Session
+	1,  // 43: delino.sandcrew.v1.AnswerPermissionResponse.session:type_name -> delino.sandcrew.v1.Session
+	1,  // 44: delino.sandcrew.v1.CancelTurnResponse.session:type_name -> delino.sandcrew.v1.Session
+	42, // 45: delino.sandcrew.v1.SetSessionModeRequest.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
+	1,  // 46: delino.sandcrew.v1.SetSessionModeResponse.session:type_name -> delino.sandcrew.v1.Session
+	1,  // 47: delino.sandcrew.v1.SetSessionConfigOptionResponse.session:type_name -> delino.sandcrew.v1.Session
+	38, // 48: delino.sandcrew.v1.GetAgentOptionsRequest.vendor:type_name -> delino.sandcrew.v1.AgentVendor
+	36, // 49: delino.sandcrew.v1.GetAgentOptionsResponse.available_modes:type_name -> delino.sandcrew.v1.SessionMode
+	37, // 50: delino.sandcrew.v1.GetAgentOptionsResponse.config_options:type_name -> delino.sandcrew.v1.ConfigOption
+	2,  // 51: delino.sandcrew.v1.ListSessionEventsResponse.events:type_name -> delino.sandcrew.v1.TranscriptEvent
+	30, // 52: delino.sandcrew.v1.WatchSessionResponse.keepalive:type_name -> delino.sandcrew.v1.Keepalive
+	2,  // 53: delino.sandcrew.v1.WatchSessionResponse.transcript_event:type_name -> delino.sandcrew.v1.TranscriptEvent
+	1,  // 54: delino.sandcrew.v1.WatchSessionResponse.session:type_name -> delino.sandcrew.v1.Session
+	31, // 55: delino.sandcrew.v1.WatchSessionResponse.caught_up:type_name -> delino.sandcrew.v1.CaughtUp
+	30, // 56: delino.sandcrew.v1.WatchSessionsResponse.keepalive:type_name -> delino.sandcrew.v1.Keepalive
+	1,  // 57: delino.sandcrew.v1.WatchSessionsResponse.session:type_name -> delino.sandcrew.v1.Session
+	34, // 58: delino.sandcrew.v1.WatchSessionsResponse.session_deleted:type_name -> delino.sandcrew.v1.SessionDeleted
+	3,  // 59: delino.sandcrew.v1.SessionService.CreateSession:input_type -> delino.sandcrew.v1.CreateSessionRequest
+	5,  // 60: delino.sandcrew.v1.SessionService.RestartSessionFromTranscript:input_type -> delino.sandcrew.v1.RestartSessionFromTranscriptRequest
+	7,  // 61: delino.sandcrew.v1.SessionService.GetSession:input_type -> delino.sandcrew.v1.GetSessionRequest
+	9,  // 62: delino.sandcrew.v1.SessionService.ListSessions:input_type -> delino.sandcrew.v1.ListSessionsRequest
+	11, // 63: delino.sandcrew.v1.SessionService.DeleteSession:input_type -> delino.sandcrew.v1.DeleteSessionRequest
+	13, // 64: delino.sandcrew.v1.SessionService.SendMessage:input_type -> delino.sandcrew.v1.SendMessageRequest
+	15, // 65: delino.sandcrew.v1.SessionService.ResumeSession:input_type -> delino.sandcrew.v1.ResumeSessionRequest
+	17, // 66: delino.sandcrew.v1.SessionService.AnswerPermission:input_type -> delino.sandcrew.v1.AnswerPermissionRequest
+	19, // 67: delino.sandcrew.v1.SessionService.CancelTurn:input_type -> delino.sandcrew.v1.CancelTurnRequest
+	21, // 68: delino.sandcrew.v1.SessionService.SetSessionMode:input_type -> delino.sandcrew.v1.SetSessionModeRequest
+	23, // 69: delino.sandcrew.v1.SessionService.SetSessionConfigOption:input_type -> delino.sandcrew.v1.SetSessionConfigOptionRequest
+	25, // 70: delino.sandcrew.v1.SessionService.GetAgentOptions:input_type -> delino.sandcrew.v1.GetAgentOptionsRequest
+	27, // 71: delino.sandcrew.v1.SessionService.ListSessionEvents:input_type -> delino.sandcrew.v1.ListSessionEventsRequest
+	29, // 72: delino.sandcrew.v1.SessionService.WatchSession:input_type -> delino.sandcrew.v1.WatchSessionRequest
+	33, // 73: delino.sandcrew.v1.SessionService.WatchSessions:input_type -> delino.sandcrew.v1.WatchSessionsRequest
+	4,  // 74: delino.sandcrew.v1.SessionService.CreateSession:output_type -> delino.sandcrew.v1.CreateSessionResponse
+	6,  // 75: delino.sandcrew.v1.SessionService.RestartSessionFromTranscript:output_type -> delino.sandcrew.v1.RestartSessionFromTranscriptResponse
+	8,  // 76: delino.sandcrew.v1.SessionService.GetSession:output_type -> delino.sandcrew.v1.GetSessionResponse
+	10, // 77: delino.sandcrew.v1.SessionService.ListSessions:output_type -> delino.sandcrew.v1.ListSessionsResponse
+	12, // 78: delino.sandcrew.v1.SessionService.DeleteSession:output_type -> delino.sandcrew.v1.DeleteSessionResponse
+	14, // 79: delino.sandcrew.v1.SessionService.SendMessage:output_type -> delino.sandcrew.v1.SendMessageResponse
+	16, // 80: delino.sandcrew.v1.SessionService.ResumeSession:output_type -> delino.sandcrew.v1.ResumeSessionResponse
+	18, // 81: delino.sandcrew.v1.SessionService.AnswerPermission:output_type -> delino.sandcrew.v1.AnswerPermissionResponse
+	20, // 82: delino.sandcrew.v1.SessionService.CancelTurn:output_type -> delino.sandcrew.v1.CancelTurnResponse
+	22, // 83: delino.sandcrew.v1.SessionService.SetSessionMode:output_type -> delino.sandcrew.v1.SetSessionModeResponse
+	24, // 84: delino.sandcrew.v1.SessionService.SetSessionConfigOption:output_type -> delino.sandcrew.v1.SetSessionConfigOptionResponse
+	26, // 85: delino.sandcrew.v1.SessionService.GetAgentOptions:output_type -> delino.sandcrew.v1.GetAgentOptionsResponse
+	28, // 86: delino.sandcrew.v1.SessionService.ListSessionEvents:output_type -> delino.sandcrew.v1.ListSessionEventsResponse
+	32, // 87: delino.sandcrew.v1.SessionService.WatchSession:output_type -> delino.sandcrew.v1.WatchSessionResponse
+	35, // 88: delino.sandcrew.v1.SessionService.WatchSessions:output_type -> delino.sandcrew.v1.WatchSessionsResponse
+	74, // [74:89] is the sub-list for method output_type
+	59, // [59:74] is the sub-list for method input_type
+	59, // [59:59] is the sub-list for extension type_name
+	59, // [59:59] is the sub-list for extension extendee
+	0,  // [0:59] is the sub-list for field type_name
 }
 
 func init() { file_delino_sandcrew_v1_session_proto_init() }
@@ -3062,7 +3026,7 @@ func file_delino_sandcrew_v1_session_proto_init() {
 	}
 	file_delino_sandcrew_v1_bridge_proto_init()
 	file_delino_sandcrew_v1_common_proto_init()
-	file_delino_sandcrew_v1_session_proto_msgTypes[3].OneofWrappers = []any{
+	file_delino_sandcrew_v1_session_proto_msgTypes[2].OneofWrappers = []any{
 		(*TranscriptEvent_Hello)(nil),
 		(*TranscriptEvent_InputAccepted)(nil),
 		(*TranscriptEvent_InputRejected)(nil),
@@ -3081,22 +3045,23 @@ func file_delino_sandcrew_v1_session_proto_init() {
 		(*TranscriptEvent_BridgeError)(nil),
 		(*TranscriptEvent_AgentExited)(nil),
 		(*TranscriptEvent_UnknownUpdate)(nil),
+		(*TranscriptEvent_AgentReady)(nil),
 	}
-	file_delino_sandcrew_v1_session_proto_msgTypes[10].OneofWrappers = []any{
+	file_delino_sandcrew_v1_session_proto_msgTypes[9].OneofWrappers = []any{
 		(*ListSessionsRequest_OwnerUserId)(nil),
 		(*ListSessionsRequest_OwnedByCaller)(nil),
 	}
-	file_delino_sandcrew_v1_session_proto_msgTypes[22].OneofWrappers = []any{
+	file_delino_sandcrew_v1_session_proto_msgTypes[21].OneofWrappers = []any{
 		(*SetSessionModeRequest_ModeId)(nil),
 		(*SetSessionModeRequest_PermissionMode)(nil),
 	}
-	file_delino_sandcrew_v1_session_proto_msgTypes[33].OneofWrappers = []any{
+	file_delino_sandcrew_v1_session_proto_msgTypes[32].OneofWrappers = []any{
 		(*WatchSessionResponse_Keepalive)(nil),
 		(*WatchSessionResponse_TranscriptEvent)(nil),
 		(*WatchSessionResponse_Session)(nil),
 		(*WatchSessionResponse_CaughtUp)(nil),
 	}
-	file_delino_sandcrew_v1_session_proto_msgTypes[36].OneofWrappers = []any{
+	file_delino_sandcrew_v1_session_proto_msgTypes[35].OneofWrappers = []any{
 		(*WatchSessionsResponse_Keepalive)(nil),
 		(*WatchSessionsResponse_Session)(nil),
 		(*WatchSessionsResponse_SessionDeleted)(nil),
@@ -3107,7 +3072,7 @@ func file_delino_sandcrew_v1_session_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_sandcrew_v1_session_proto_rawDesc), len(file_delino_sandcrew_v1_session_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   37,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

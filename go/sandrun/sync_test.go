@@ -3859,7 +3859,7 @@ func TestExtractHardLinkLimits(t *testing.T) {
 	if err := root.WriteFile("source", []byte("too large"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err = extractor.copyFile(root, st, "source", "copy")
+	err = extractor.copyFile(t.Context(), root, st, "source", "copy")
 	if !errors.As(err, &limit) || !slices.Equal(limit.Paths, []PathSize{{Path: "copy", Size: 9}}) || st.bytes != 4 {
 		t.Fatalf("fallback per-file limit: error = %v, bytes = %d", err, st.bytes)
 	}

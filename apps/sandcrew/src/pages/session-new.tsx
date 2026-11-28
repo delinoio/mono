@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { ConfigOptionCategory } from "@delino/sandcrew-protos/v1/bridge_pb";
 import {
   AgentVendor,
-  ConfigOptionCategory,
   CredentialScope,
 } from "@delino/sandcrew-protos/v1/common_pb";
 import { SessionService } from "@delino/sandcrew-protos/v1/session_pb";

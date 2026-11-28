@@ -431,7 +431,9 @@ func (d *Dispatcher) forwardExec(ctx context.Context, op *execOp, req *ownsandv1
 				StdoutOffset: so, StderrOffset: se,
 			})
 		}
-		done, err := d.runGuestExec(ctx, guest.Serve(ctx), first, op)
+		done, err := d.runGuestExec(ctx, func(ctx context.Context) guestStream {
+			return guest.Serve(ctx)
+		}, first, op)
 		if done {
 			logger.Info("exec ended in the guest")
 			return
@@ -454,11 +456,14 @@ func (d *Dispatcher) forwardExec(ctx context.Context, op *execOp, req *ownsandv1
 type guestStream interface {
 	Send(*ownsandv1.ServeRequest) error
 	Receive() (*ownsandv1.ServeResponse, error)
-	CloseRequest() error
 	CloseResponse() error
 }
 
-func (d *Dispatcher) runGuestExec(ctx context.Context, s guestStream, first *ownsandv1.DataFrame, op *execOp) (bool, error) {
+func (d *Dispatcher) runGuestExec(ctx context.Context, open func(context.Context) guestStream, first *ownsandv1.DataFrame, op *execOp) (bool, error) {
+	// Release this stream's request-close callback when the attempt ends.
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s := open(attemptCtx)
 	defer s.CloseResponse()
 	if err := s.Send(&ownsandv1.ServeRequest{Frame: first}); err != nil {
 		if !errors.Is(err, io.EOF) {

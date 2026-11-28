@@ -37,19 +37,33 @@ function report(event) {
 // output binary. The descendant records signals but stays alive so a
 // successful exit of its parent leaves a process for the supervisor to stop.
 async function runFixture(phase, args) {
+  const deadline = performance.now() + options.timeout;
+  const checkStop = () => {
+    // A canceled build must fail so the launcher does not start the server.
+    if (
+      existsSync(process.env.FIXTURE_STOP_FILE) ||
+      performance.now() >= deadline
+    ) {
+      process.exit(1);
+    }
+  };
+  checkStop();
+
+  const buildServer = () =>
+    writeFileSync(args[args.indexOf("-o") + 1], fakeServer, { mode: 0o755 });
+  if (phase === "build" && process.env.FIXTURE_PHASE === "server") {
+    buildServer();
+    return;
+  }
+
+  // Poll while starting up as well as while waiting for the test's signals.
+  setInterval(checkStop, 20);
   if (phase === "descendant") {
     for (const signal of signals) {
       process.on(signal, () => report({ event: "descendant_signal", signal }));
     }
     process.send("ready");
     setInterval(() => {}, 1000);
-    return;
-  }
-
-  const buildServer = () =>
-    writeFileSync(args[args.indexOf("-o") + 1], fakeServer, { mode: 0o755 });
-  if (phase === "build" && process.env.FIXTURE_PHASE === "server") {
-    buildServer();
     return;
   }
 
@@ -128,19 +142,34 @@ function isRunning(pid) {
   return state !== "" && !state.startsWith("Z");
 }
 
-function killIfPresent(pid) {
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch (error) {
-    if (error.code !== "ESRCH") throw error;
-  }
-}
-
 function startLauncher(t, phase, stop) {
   const dir = mkdtempSync(join(tmpdir(), "sandrun-api-forced-stop-"));
   const buildTmp = join(dir, "builds");
   const exitFile = join(dir, "exit");
   const releaseGraceFile = join(dir, "release-grace");
+  const stopFile = join(dir, "stop");
+  let run;
+  t.after(async () => {
+    try {
+      if (run && !run.outputClosed) {
+        writeFileSync(stopFile, "");
+        await waitFor(
+          run,
+          () => run.outputClosed,
+          "the launcher to exit and its output pipes to close",
+          10_000,
+        );
+      }
+    } finally {
+      if (run && !run.outputClosed) {
+        // A cleanup failure must not leave the test runner waiting on handles.
+        run.task.stdout.destroy();
+        run.task.stderr.destroy();
+        run.task.unref();
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   mkdirSync(buildTmp);
   writeFileSync(
     join(dir, "go"),
@@ -157,6 +186,7 @@ function startLauncher(t, phase, stop) {
     FIXTURE_PHASE: phase,
     FIXTURE_STOP: stop,
     FIXTURE_EXIT: exitFile,
+    FIXTURE_STOP_FILE: stopFile,
   };
   if (phase === "server" && stop === "ignore-term") {
     env.FIXTURE_RELEASE_GRACE = releaseGraceFile;
@@ -169,7 +199,7 @@ function startLauncher(t, phase, stop) {
     stdio: ["ignore", "pipe", "pipe"],
     env,
   });
-  const run = {
+  run = {
     task,
     buildTmp,
     exitFile,
@@ -179,20 +209,8 @@ function startLauncher(t, phase, stop) {
     exit: null,
     outputClosed: false,
   };
-  const targets = new Set([-task.pid]);
-  t.after(() => {
-    for (const target of targets) killIfPresent(target);
-    rmSync(dir, { recursive: true, force: true });
-  });
   createInterface({ input: task.stdout }).on("line", (line) => {
-    const record = JSON.parse(line);
-    run.records.push(record);
-    if (record.event === "ready") {
-      const group = Number(ps("pgid", record.pid));
-      if (group > 1) targets.add(-group);
-      targets.add(record.pid);
-      if (record.descendant) targets.add(record.descendant);
-    }
+    run.records.push(JSON.parse(line));
   });
   task.stderr.setEncoding("utf8").on("data", (chunk) => (run.stderr += chunk));
   // "close" can wait for pipes that a surviving phase inherited.
@@ -200,8 +218,14 @@ function startLauncher(t, phase, stop) {
     run.exit = { code, signal };
     return run.exit;
   });
-  run.closed = once(task, "close").then(() => {
-    run.outputClosed = true;
+  run.exited.catch((error) => {
+    run.stderr += String(error) + "\n";
+  });
+  run.closed = new Promise((resolve) => {
+    task.once("close", () => {
+      run.outputClosed = true;
+      resolve();
+    });
   });
   return run;
 }
@@ -251,6 +275,24 @@ async function assertPortsReleased(ports) {
 if (process.argv[2] === "--fixture") {
   await runFixture(process.argv[3], process.argv.slice(4));
 } else {
+  test(
+    "teardown stops a waiting server and its descendant",
+    options,
+    async (t) => {
+      const run = startLauncher(t, "server", "wait");
+      const active = await ready(run);
+      assert.ok(isRunning(active.pid) && isRunning(active.descendant));
+      assert.equal(run.outputClosed, false);
+
+      t.after(async () => {
+        assert.deepEqual(run.exit, { code: 1, signal: null });
+        assert.equal(run.outputClosed, true);
+        assert.ok(!isRunning(active.pid) && !isRunning(active.descendant));
+        await assertPortsReleased(active.ports);
+      });
+    },
+  );
+
   for (const [phase, stop] of [
     ["build", "exit"],
     ["server", "exit"],

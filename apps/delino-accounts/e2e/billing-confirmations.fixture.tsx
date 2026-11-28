@@ -5,6 +5,10 @@ import {
   type BillingAccountRole,
   BillingAccountService,
 } from "@delino/accounts-protos/v1/billing_account_pb";
+import {
+  CreditService,
+  type Subscription,
+} from "@delino/accounts-protos/v1/credit_pb";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { createConnectQueryKey } from "@connectrpc/connect-query";
 import { createRoot } from "react-dom/client";
@@ -26,7 +30,13 @@ const accountQueryKey = createConnectQueryKey({
   input: { billingAccountId: ACCOUNT_ID },
   cardinality: "finite",
 });
+const subscriptionQueryKey = createConnectQueryKey({
+  schema: CreditService.method.getSubscription,
+  input: { billingAccountId: ACCOUNT_ID },
+  cardinality: "finite",
+});
 queryClient.setQueryDefaults(accountQueryKey, { retry: false });
+queryClient.setQueryDefaults(subscriptionQueryKey, { retry: false });
 api.userId = new URLSearchParams(location.search).has("owner") ? OWNER : ADMIN;
 
 const fixture = {
@@ -43,6 +53,17 @@ const fixture = {
       new ConnectError("down", Code.Unavailable),
     );
     return queryClient.refetchQueries({ queryKey: accountQueryKey });
+  },
+  setSubscription(next: Pick<Subscription, "status" | "cancelAtPeriodEnd">) {
+    Object.assign(api.accounts.get(ACCOUNT_ID)!.subscription, next);
+    return queryClient.refetchQueries({ queryKey: subscriptionQueryKey });
+  },
+  failSubscriptionRefresh() {
+    api.failNext.set(
+      "GetSubscription",
+      new ConnectError("down", Code.Unavailable),
+    );
+    return queryClient.refetchQueries({ queryKey: subscriptionQueryKey });
   },
   actionRequests(method: string) {
     return api.calls

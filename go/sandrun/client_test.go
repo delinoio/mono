@@ -13,9 +13,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/go/sandrun/sandruntest"
@@ -576,17 +578,13 @@ func TestWaitDevSession(t *testing.T) {
 		t.Fatalf("wait = %v %v", ds.GetState(), err)
 	}
 
-	srv.PromoteAfterGets = 0
-	res, _ = c.DevSessions().CreateDevSession(ctx, connect.NewRequest(&sandrunv1.CreateDevSessionRequest{OrganizationId: org, RunnerProfileId: prof.GetRunnerProfileId()}))
-	id = res.Msg.GetDevSession().GetDevSessionId()
-	wctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancel()
-	ds, err = c.WaitDevSession(wctx, WaitDevSessionParams{OrganizationID: org, DevSessionID: id})
-	if !errors.Is(err, context.DeadlineExceeded) || ds.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
-		t.Fatalf("wait past deadline = %v %v", ds.GetState(), err)
-	}
-
 	// A terminal session ends the wait.
+	srv.PromoteAfterGets = 0
+	res, err = c.DevSessions().CreateDevSession(ctx, connect.NewRequest(&sandrunv1.CreateDevSessionRequest{OrganizationId: org, RunnerProfileId: prof.GetRunnerProfileId()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id = res.Msg.GetDevSession().GetDevSessionId()
 	srv.SetSessionState(id, sandrunv1.RequestState_REQUEST_STATE_EXPIRED)
 	ds, err = c.WaitDevSession(ctx, WaitDevSessionParams{OrganizationID: org, DevSessionID: id})
 	if err != nil || ds.GetState() != sandrunv1.RequestState_REQUEST_STATE_EXPIRED {
@@ -594,5 +592,61 @@ func TestWaitDevSession(t *testing.T) {
 	}
 	if !IsTerminalState(sandrunv1.RequestState_REQUEST_STATE_FAILED) || IsTerminalState(sandrunv1.RequestState_REQUEST_STATE_RUNNING) {
 		t.Fatal("IsTerminalState")
+	}
+}
+
+type waitDevSessionClientStub struct {
+	sandrunv1connect.DevSessionServiceClient
+	get func(context.Context) (*connect.Response[sandrunv1.GetDevSessionResponse], error)
+}
+
+func (s waitDevSessionClientStub) GetDevSession(ctx context.Context, _ *connect.Request[sandrunv1.GetDevSessionRequest]) (*connect.Response[sandrunv1.GetDevSessionResponse], error) {
+	return s.get(ctx)
+}
+
+func TestWaitDevSessionDeadline(t *testing.T) {
+	const (
+		sessionID = "session"
+		queued    = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+	)
+	for _, tt := range []struct {
+		name        string
+		wantSession *sandrunv1.DevSession
+	}{
+		{"after successful poll", &sandrunv1.DevSession{DevSessionId: sessionID, State: queued}},
+		{"during first poll", nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+
+				polls := 0
+				c := &Client{devSessions: waitDevSessionClientStub{
+					get: func(ctx context.Context) (*connect.Response[sandrunv1.GetDevSessionResponse], error) {
+						polls++
+						if polls > 1 {
+							t.Fatalf("unexpected poll %d", polls)
+						}
+						if tt.wantSession == nil {
+							<-ctx.Done()
+							return nil, ctx.Err()
+						}
+						return connect.NewResponse(&sandrunv1.GetDevSessionResponse{
+							DevSession: &sandrunv1.DevSession{DevSessionId: sessionID, State: queued},
+						}), nil
+					},
+				}}
+				session, err := c.WaitDevSession(ctx, WaitDevSessionParams{
+					OrganizationID: "org",
+					DevSessionID:   sessionID,
+					Interval:       2 * time.Second,
+				})
+				if !errors.Is(err, context.DeadlineExceeded) || !proto.Equal(session, tt.wantSession) || polls != 1 {
+					t.Errorf("wait = (%v, %v) after %d polls, want (%v, %v) after one poll",
+						session, err, polls, tt.wantSession, context.DeadlineExceeded)
+				}
+			})
+		})
 	}
 }

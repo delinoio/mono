@@ -884,6 +884,7 @@ func organizationLinkLogs(t *testing.T, logs string) []organizationLinkLog {
 }
 
 func TestLinkOrganizationLogsCommittedChanges(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -934,6 +935,7 @@ func TestLinkOrganizationLogsCommittedChanges(t *testing.T) {
 }
 
 func TestLinkOrganizationDoesNotLogRolledBackChanges(t *testing.T) {
+	t.Parallel()
 	const auditTrigger = `CREATE TRIGGER fail_link_change BEFORE INSERT ON billing_audit_events
 		FOR EACH ROW WHEN (NEW.kind = '%s') EXECUTE FUNCTION fail_link_change()`
 	const commitTrigger = `CREATE CONSTRAINT TRIGGER fail_link_change AFTER INSERT ON billing_audit_events
@@ -1051,7 +1053,7 @@ func TestListManageableBillingAccounts(t *testing.T) {
 		}
 	}
 	if strings.Join(got, ",") != strings.Join(ids, ",") {
-		t.Fatalf("accounts = %v, want %v (in ID order, without the viewer account)", got, ids)
+		t.Fatalf("accounts = %v, want %v (in creation order, without the viewer account)", got, ids)
 	}
 
 	// The last page has no continuation token, so the page token checks use

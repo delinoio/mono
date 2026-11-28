@@ -1,0 +1,7 @@
+{
+  "name": "sandcrew-codex-agent",
+  "private": true,
+  "dependencies": {
+    "@agentclientprotocol/codex-acp": "2.12.1"
+  }
+}

@@ -6,22 +6,50 @@ package delino.sandcrew.v1;
 
 option go_package = "github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1";
 
-// The coding-agent vendors that SandCrew runs. Cursor and Devin get values
-// when they are added after the MVP.
+// Common enums of the SandCrew API and the bridge schema. The owning
+// contract is docs/protos-sandcrew-api-contract.md. The schemas do not
+// import SandRun or OwnSand schemas; they copy the values they need.
+
+// Vendor of the coding agent of a session.
 enum AgentVendor {
   AGENT_VENDOR_UNSPECIFIED = 0;
+  // Claude Code through its ACP adapter.
   AGENT_VENDOR_CLAUDE_CODE = 1;
+  // OpenAI Codex through its ACP adapter.
   AGENT_VENDOR_OPENAI_CODEX = 2;
 }
 
-// The guest operating system of a runner profile. A copy of the SandRun
-// values; the SandCrew schemas do not import the SandRun schemas.
+// Operating system of the session's guest (a copy of the SandRun values).
 enum GuestOs {
   GUEST_OS_UNSPECIFIED = 0;
   GUEST_OS_LINUX = 1;
   GUEST_OS_MACOS = 2;
   GUEST_OS_WINDOWS = 3;
 }
+
+// How the bridge answers agent permission requests.
+enum PermissionMode {
+  PERMISSION_MODE_UNSPECIFIED = 0;
+  // The vendor's auto-approve mode, and the bridge allows every remaining
+  // request.
+  PERMISSION_MODE_AUTO_APPROVE = 1;
+  // The user answers each request.
+  PERMISSION_MODE_ASK = 2;
+}
+
+// Kind of a vendor credential.
+enum VendorCredentialKind {
+  VENDOR_CREDENTIAL_KIND_UNSPECIFIED = 0;
+  // A model API key of the vendor.
+  VENDOR_CREDENTIAL_KIND_API_KEY = 1;
+  // The Claude Code token of `claude setup-token`.
+  VENDOR_CREDENTIAL_KIND_CLAUDE_OAUTH_TOKEN = 2;
+  // The OpenAI Codex ChatGPT sign-in file `auth.json`.
+  VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON = 3;
+}
+
+// Enums of the Connect API only. They are here because more than one Connect
+// API file uses them.
 
 // The caller's SandRun role in an organization.
 enum Role {
@@ -30,7 +58,6 @@ enum Role {
   ROLE_ADMIN = 2;
   ROLE_MEMBER = 3;
 }
-
 // The state of a session. Only ENDED is terminal.
 enum SessionState {
   SESSION_STATE_UNSPECIFIED = 0;
@@ -45,7 +72,6 @@ enum SessionState {
   SESSION_STATE_DISCONNECTED = 9;
   SESSION_STATE_ENDED = 10;
 }
-
 // Why a session ended.
 enum SessionEndReason {
   SESSION_END_REASON_UNSPECIFIED = 0;
@@ -58,33 +84,12 @@ enum SessionEndReason {
   SESSION_END_REASON_BRIDGE_UNSUPPORTED = 7;
   SESSION_END_REASON_EXECUTOR_ENDED = 8;
 }
-
-// How the bridge answers agent permission requests.
-enum PermissionMode {
-  PERMISSION_MODE_UNSPECIFIED = 0;
-  // The bridge answers every permission request with an allow option.
-  PERMISSION_MODE_AUTO_APPROVE = 1;
-  // Permission requests appear in the chat for the session owner.
-  PERMISSION_MODE_ASK = 2;
-}
-
 // The owner of a vendor credential.
 enum CredentialScope {
   CREDENTIAL_SCOPE_UNSPECIFIED = 0;
   CREDENTIAL_SCOPE_ORGANIZATION = 1;
   CREDENTIAL_SCOPE_USER = 2;
 }
-
-// The kind of a vendor credential.
-enum VendorCredentialKind {
-  VENDOR_CREDENTIAL_KIND_UNSPECIFIED = 0;
-  VENDOR_CREDENTIAL_KIND_API_KEY = 1;
-  // The Claude Code token of `claude setup-token`.
-  VENDOR_CREDENTIAL_KIND_CLAUDE_OAUTH_TOKEN = 2;
-  // The OpenAI Codex ChatGPT sign-in file `auth.json`.
-  VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON = 3;
-}
-
 // Who set the stored value of a vendor credential.
 enum CredentialUpdateSource {
   CREDENTIAL_UPDATE_SOURCE_UNSPECIFIED = 0;
@@ -92,7 +97,6 @@ enum CredentialUpdateSource {
   // The agent refreshed the credential in a session.
   CREDENTIAL_UPDATE_SOURCE_AGENT_REFRESH = 2;
 }
-
 // Why SandCrew cannot use a SandRun DEV_SESSION runner profile.
 enum ProfileIneligibility {
   PROFILE_INELIGIBILITY_UNSPECIFIED = 0;
@@ -102,114 +106,4 @@ enum ProfileIneligibility {
   PROFILE_INELIGIBILITY_NETWORK_NOT_OUTBOUND = 2;
   // SandCrew does not support the guest OS of the profile.
   PROFILE_INELIGIBILITY_GUEST_OS_UNSUPPORTED = 3;
-}
-
-// The ACP ToolKind.
-enum ToolKind {
-  TOOL_KIND_UNSPECIFIED = 0;
-  TOOL_KIND_READ = 1;
-  TOOL_KIND_EDIT = 2;
-  TOOL_KIND_DELETE = 3;
-  TOOL_KIND_MOVE = 4;
-  TOOL_KIND_SEARCH = 5;
-  TOOL_KIND_EXECUTE = 6;
-  TOOL_KIND_THINK = 7;
-  TOOL_KIND_FETCH = 8;
-  TOOL_KIND_SWITCH_MODE = 9;
-  TOOL_KIND_OTHER = 10;
-}
-
-// The ACP ToolCallStatus.
-enum ToolCallStatus {
-  TOOL_CALL_STATUS_UNSPECIFIED = 0;
-  TOOL_CALL_STATUS_PENDING = 1;
-  TOOL_CALL_STATUS_IN_PROGRESS = 2;
-  TOOL_CALL_STATUS_COMPLETED = 3;
-  TOOL_CALL_STATUS_FAILED = 4;
-}
-
-// The ACP plan entry priority.
-enum PlanEntryPriority {
-  PLAN_ENTRY_PRIORITY_UNSPECIFIED = 0;
-  PLAN_ENTRY_PRIORITY_HIGH = 1;
-  PLAN_ENTRY_PRIORITY_MEDIUM = 2;
-  PLAN_ENTRY_PRIORITY_LOW = 3;
-}
-
-// The ACP plan entry status.
-enum PlanEntryStatus {
-  PLAN_ENTRY_STATUS_UNSPECIFIED = 0;
-  PLAN_ENTRY_STATUS_PENDING = 1;
-  PLAN_ENTRY_STATUS_IN_PROGRESS = 2;
-  PLAN_ENTRY_STATUS_COMPLETED = 3;
-}
-
-// The ACP permission option kind.
-enum PermissionOptionKind {
-  PERMISSION_OPTION_KIND_UNSPECIFIED = 0;
-  PERMISSION_OPTION_KIND_ALLOW_ONCE = 1;
-  PERMISSION_OPTION_KIND_ALLOW_ALWAYS = 2;
-  PERMISSION_OPTION_KIND_REJECT_ONCE = 3;
-  PERMISSION_OPTION_KIND_REJECT_ALWAYS = 4;
-}
-
-// The outcome of a permission request.
-enum PermissionOutcome {
-  PERMISSION_OUTCOME_UNSPECIFIED = 0;
-  PERMISSION_OUTCOME_SELECTED = 1;
-  PERMISSION_OUTCOME_CANCELLED = 2;
-}
-
-// The ACP StopReason of a turn.
-enum StopReason {
-  STOP_REASON_UNSPECIFIED = 0;
-  STOP_REASON_END_TURN = 1;
-  STOP_REASON_MAX_TOKENS = 2;
-  STOP_REASON_MAX_TURN_REQUESTS = 3;
-  STOP_REASON_REFUSAL = 4;
-  STOP_REASON_CANCELLED = 5;
-}
-
-// The ACP SessionConfigOptionCategory.
-enum ConfigOptionCategory {
-  CONFIG_OPTION_CATEGORY_UNSPECIFIED = 0;
-  CONFIG_OPTION_CATEGORY_MODE = 1;
-  CONFIG_OPTION_CATEGORY_MODEL = 2;
-  CONFIG_OPTION_CATEGORY_MODEL_CONFIG = 3;
-  CONFIG_OPTION_CATEGORY_SPEED = 4;
-  CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL = 5;
-  CONFIG_OPTION_CATEGORY_OTHER = 6;
-}
-
-// What the agent of a session does, as the bridge reports it.
-enum AgentActivity {
-  AGENT_ACTIVITY_UNSPECIFIED = 0;
-  AGENT_ACTIVITY_STARTING = 1;
-  AGENT_ACTIVITY_IDLE = 2;
-  AGENT_ACTIVITY_WORKING = 3;
-  AGENT_ACTIVITY_WAITING_FOR_PERMISSION = 4;
-}
-
-// The kind of a bridge error.
-enum BridgeErrorKind {
-  BRIDGE_ERROR_KIND_UNSPECIFIED = 0;
-  BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED = 1;
-  BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH = 2;
-  BRIDGE_ERROR_KIND_AGENT_START_FAILED = 3;
-  BRIDGE_ERROR_KIND_CREDENTIAL_MISSING = 4;
-  BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR = 5;
-  BRIDGE_ERROR_KIND_INPUT_INVALID = 6;
-  BRIDGE_ERROR_KIND_OPTION_REJECTED = 7;
-  BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED = 8;
-  BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED = 9;
-}
-
-// Why the bridge rejected an inbox message.
-enum InputRejectionReason {
-  INPUT_REJECTION_REASON_UNSPECIFIED = 0;
-  INPUT_REJECTION_REASON_MALFORMED = 1;
-  INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST = 2;
-  INPUT_REJECTION_REASON_UNKNOWN_OPTION = 3;
-  INPUT_REJECTION_REASON_NO_ACTIVE_TURN = 4;
-  INPUT_REJECTION_REASON_UNSUPPORTED = 5;
 }

@@ -140,7 +140,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 	regular := map[string]bool{}
 	fileNames := map[string][]archiveFileName{}
 	directoryNames := archiveDirectoryNames{}
-	tr := tar.NewReader(r)
+	tr := tar.NewReader(localContextReader{ctx: ctx, src: r})
 	for {
 		if err := ctx.Err(); err != nil {
 			return st, err
@@ -184,7 +184,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 				if err := directoryNames.mkdirAll(root, filepath.Dir(name), archiveParent, 0o755); err != nil {
 					return err
 				}
-				return writeEntry(root, name, mode, tr, hdr.Size)
+				return writeEntry(ctx, root, name, mode, tr, hdr.Size)
 			}); err != nil {
 				return st, err
 			}
@@ -235,7 +235,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			}
 			_ = root.Remove(name)
 			if err := e.link(root, target, name); err != nil {
-				if err := e.copyFile(root, st, target, name); err != nil {
+				if err := e.copyFile(ctx, root, st, target, name); err != nil {
 					return st, err
 				}
 			}
@@ -510,15 +510,24 @@ func normalizedArchiveName(name string) string {
 
 // writeEntry writes one regular file in an existing directory inside root,
 // replacing an existing entry of the same name.
-func writeEntry(root *os.Root, name string, mode fs.FileMode, r io.Reader, size int64) error {
+func writeEntry(ctx context.Context, root *os.Root, name string, mode fs.FileMode, r io.Reader, size int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	_ = root.Remove(name)
 	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode|0o600)
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(f, io.LimitReader(r, size))
+	// Expose only Read and Write so io.Copy checks the context on both
+	// sides of each bounded chunk, including when a read returns data
+	// after cancellation.
+	n, err := io.Copy(localContextWriter{ctx: ctx, dst: f}, io.LimitReader(localContextReader{ctx: ctx, src: r}, size))
 	if cerr := f.Close(); err == nil {
 		err = cerr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 	if err == nil && n != size {
 		err = io.ErrUnexpectedEOF
@@ -540,7 +549,10 @@ func (e archiveExtractor) writeFile(st *extractStats, name string, size int64, w
 	return nil
 }
 
-func (e archiveExtractor) copyFile(root *os.Root, st *extractStats, from, to string) error {
+func (e archiveExtractor) copyFile(ctx context.Context, root *os.Root, st *extractStats, from, to string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	src, err := root.Open(from)
 	if err != nil {
 		return err
@@ -551,7 +563,7 @@ func (e archiveExtractor) copyFile(root *os.Root, st *extractStats, from, to str
 		return err
 	}
 	return e.writeFile(st, to, info.Size(), func() error {
-		return writeEntry(root, to, info.Mode().Perm(), src, info.Size())
+		return writeEntry(ctx, root, to, info.Mode().Perm(), src, info.Size())
 	})
 }
 

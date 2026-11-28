@@ -13,9 +13,11 @@
 package imagebuild
 
 import (
+	"cmp"
 	"context"
 	"debug/macho"
 	"debug/pe"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -238,8 +241,52 @@ func readExecutable[T any](path, platform string, parse func(io.ReaderAt) (T, er
 	return executable, nil
 }
 
+// readDarwinARM64 opens thin Mach-O files and selects arm64 from FAT_MAGIC
+// universal files. The caller checks the selected file's CPU and type.
+func readDarwinARM64(r io.ReaderAt) (*macho.File, error) {
+	var magic [4]byte
+	if _, err := r.ReadAt(magic[:], 0); err != nil || binary.BigEndian.Uint32(magic[:]) != macho.MagicFat {
+		return macho.NewFile(r)
+	}
+
+	fat, err := macho.NewFatFile(r)
+	if err != nil {
+		return nil, err
+	}
+
+	// NewFatFile parses slices within their declared ranges. Check that the
+	// ranges also fit the container and that each entry names its own slice.
+	slices.SortFunc(fat.Arches, func(a, b macho.FatArch) int {
+		return cmp.Compare(a.Offset, b.Offset)
+	})
+	previousEnd := 8 + 20*int64(len(fat.Arches)) // fat_header and fat_arch entries
+	var arm64 *macho.File
+	for _, arch := range fat.Arches {
+		start := int64(arch.Offset)
+		end := start + int64(arch.Size)
+		if start < previousEnd || arch.Align >= 32 || start%(1<<arch.Align) != 0 {
+			return nil, fmt.Errorf("invalid offset or alignment for universal Mach-O slice at %#x", start)
+		}
+		var lastByte [1]byte
+		if _, err := r.ReadAt(lastByte[:], end-1); err != nil {
+			return nil, fmt.Errorf("read end of universal Mach-O slice at %#x: %w", start, err)
+		}
+		if arch.Cpu != arch.File.Cpu || arch.SubCpu != arch.File.SubCpu {
+			return nil, fmt.Errorf("universal Mach-O entry for %v does not match its embedded Mach-O header", arch.Cpu)
+		}
+		if arch.Cpu == macho.CpuArm64 {
+			arm64 = arch.File
+		}
+		previousEnd = end
+	}
+	if arm64 == nil {
+		return nil, errors.New("universal Mach-O has no arm64 slice; macOS guests need arm64 (GOOS=darwin GOARCH=arm64)")
+	}
+	return arm64, nil
+}
+
 func checkDarwinARM64(path string) error {
-	f, err := readExecutable(path, "macOS", macho.NewFile)
+	f, err := readExecutable(path, "macOS", readDarwinARM64)
 	if err != nil {
 		return err
 	}

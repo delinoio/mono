@@ -6,7 +6,7 @@
 
 import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
-import type { AgentExited, AgentSessionState, BridgeError, BridgeHello, ConfigOption, ConfigOptions, ContentChunk, InputAccepted, InputRejected, ModeChanged, PermissionRequest, PermissionResponse, Plan, SessionMode, ToolCall, ToolCallUpdate, TurnEnded, UnknownUpdate } from "./bridge_pb.ts";
+import type { AgentExited, AgentReady, AgentSessionState, BridgeError, BridgeHello, ConfigOption, ConfigOptions, ConfigOptionSelection, ContentChunk, InputAccepted, InputRejected, ModeChanged, PermissionRequest, PermissionResponse, Plan, SessionMode, ToolCall, ToolCallUpdate, TurnEnded, UnknownUpdate } from "./bridge_pb.ts";
 import { file_delino_sandcrew_v1_bridge } from "./bridge_pb.ts";
 import type { AgentVendor, GuestOs, PermissionMode, SessionEndReason, SessionState } from "./common_pb.ts";
 import { file_delino_sandcrew_v1_common } from "./common_pb.ts";
@@ -18,7 +18,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file delino/sandcrew/v1/session.proto.
  */
 export const file_delino_sandcrew_v1_session: GenFile = /*@__PURE__*/
-  fileDesc("CiBkZWxpbm8vc2FuZGNyZXcvdjEvc2Vzc2lvbi5wcm90bxISZGVsaW5vLnNhbmRjcmV3LnYxIq8BCglBZ2VudEluZm8SFQoNYWdlbnRfdmVyc2lvbhgBIAEoCRIXCg9jdXJyZW50X21vZGVfaWQYAiABKAkSOAoPYXZhaWxhYmxlX21vZGVzGAMgAygLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25Nb2RlEjgKDmNvbmZpZ19vcHRpb25zGAQgAygLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbmZpZ09wdGlvbiLhBQoHU2Vzc2lvbhISCgpzZXNzaW9uX2lkGAEgASgJEhcKD29yZ2FuaXphdGlvbl9pZBgCIAEoCRIVCg1vd25lcl91c2VyX2lkGAMgASgJEg0KBWxhYmVsGAQgASgJEi8KBnZlbmRvchgFIAEoDjIfLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudFZlbmRvchIZChFydW5uZXJfcHJvZmlsZV9pZBgGIAEoCRItCghndWVzdF9vcxgHIAEoDjIbLmRlbGluby5zYW5kY3Jldy52MS5HdWVzdE9zEi8KBXN0YXRlGAggASgOMiAuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25TdGF0ZRI4CgplbmRfcmVhc29uGAkgASgOMiQuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25FbmRSZWFzb24SOwoPcGVybWlzc2lvbl9tb2RlGAogASgOMiIuZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25Nb2RlEi4KCmNyZWF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnN0YXJ0ZWRfYXQYDCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi0KCXBhdXNlZF9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLAoIZW5kZWRfYXQYDiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjsKF3NjaGVkdWxlZF9kZWxldGlvbl90aW1lGA8gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIbChNwcmV2aW91c19zZXNzaW9uX2lkGBAgASgJEiwKBWFnZW50GBEgASgLMh0uZGVsaW5vLnNhbmRjcmV3LnYxLkFnZW50SW5mbxIbChNyZXN1bWVfd2FpdF9leHBpcmVkGBIgASgIIkMKFUNvbmZpZ09wdGlvblNlbGVjdGlvbhIYChBjb25maWdfb3B0aW9uX2lkGAEgASgJEhAKCHZhbHVlX2lkGAIgASgJIqAJCg9UcmFuc2NyaXB0RXZlbnQSEAoIc2VxdWVuY2UYASABKAQSKAoEdGltZRgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASMAoFaGVsbG8YCiABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuQnJpZGdlSGVsbG9IABI7Cg5pbnB1dF9hY2NlcHRlZBgLIAEoCzIhLmRlbGluby5zYW5kY3Jldy52MS5JbnB1dEFjY2VwdGVkSAASOwoOaW5wdXRfcmVqZWN0ZWQYDCABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuSW5wdXRSZWplY3RlZEgAEj4KEnVzZXJfbWVzc2FnZV9jaHVuaxgNIAEoCzIgLmRlbGluby5zYW5kY3Jldy52MS5Db250ZW50Q2h1bmtIABI/ChNhZ2VudF9tZXNzYWdlX2NodW5rGA4gASgLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbnRlbnRDaHVua0gAEj8KE2FnZW50X3Rob3VnaHRfY2h1bmsYDyABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuQ29udGVudENodW5rSAASMQoJdG9vbF9jYWxsGBAgASgLMhwuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsSAASPgoQdG9vbF9jYWxsX3VwZGF0ZRgRIAEoCzIiLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbFVwZGF0ZUgAEigKBHBsYW4YEiABKAsyGC5kZWxpbm8uc2FuZGNyZXcudjEuUGxhbkgAEkMKEnBlcm1pc3Npb25fcmVxdWVzdBgTIAEoCzIlLmRlbGluby5zYW5kY3Jldy52MS5QZXJtaXNzaW9uUmVxdWVzdEgAEkUKE3Blcm1pc3Npb25fcmVzcG9uc2UYFCABKAsyJi5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvblJlc3BvbnNlSAASMwoKdHVybl9lbmRlZBgVIAEoCzIdLmRlbGluby5zYW5kY3Jldy52MS5UdXJuRW5kZWRIABI3Cgxtb2RlX2NoYW5nZWQYFiABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuTW9kZUNoYW5nZWRIABI7Cg5jb25maWdfb3B0aW9ucxgXIAEoCzIhLmRlbGluby5zYW5kY3Jldy52MS5Db25maWdPcHRpb25zSAASPgoNc2Vzc2lvbl9zdGF0ZRgYIAEoCzIlLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudFNlc3Npb25TdGF0ZUgAEjcKDGJyaWRnZV9lcnJvchgZIAEoCzIfLmRlbGluby5zYW5kY3Jldy52MS5CcmlkZ2VFcnJvckgAEjcKDGFnZW50X2V4aXRlZBgaIAEoCzIfLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudEV4aXRlZEgAEjsKDnVua25vd25fdXBkYXRlGBwgASgLMiEuZGVsaW5vLnNhbmRjcmV3LnYxLlVua25vd25VcGRhdGVIAEIHCgVldmVudEoECBsQHFIRY3JlZGVudGlhbF91cGRhdGUikQIKFENyZWF0ZVNlc3Npb25SZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRIvCgZ2ZW5kb3IYAiABKA4yHy5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRWZW5kb3ISGQoRcnVubmVyX3Byb2ZpbGVfaWQYAyABKAkSFQoNZmlyc3RfbWVzc2FnZRgEIAEoCRINCgVsYWJlbBgFIAEoCRIaChJzZXNzaW9uX3NlY3JldF9pZHMYBiADKAkSDwoHbW9kZV9pZBgHIAEoCRJBCg5jb25maWdfb3B0aW9ucxgIIAMoCzIpLmRlbGluby5zYW5kY3Jldy52MS5Db25maWdPcHRpb25TZWxlY3Rpb24iRQoVQ3JlYXRlU2Vzc2lvblJlc3BvbnNlEiwKB3Nlc3Npb24YASABKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbiJpCiNSZXN0YXJ0U2Vzc2lvbkZyb21UcmFuc2NyaXB0UmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIVCg1maXJzdF9tZXNzYWdlGAMgASgJIlQKJFJlc3RhcnRTZXNzaW9uRnJvbVRyYW5zY3JpcHRSZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24iQAoRR2V0U2Vzc2lvblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkiQgoSR2V0U2Vzc2lvblJlc3BvbnNlEiwKB3Nlc3Npb24YASABKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbiL2AQoTTGlzdFNlc3Npb25zUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJcGFnZV9zaXplGAIgASgFEhIKCnBhZ2VfdG9rZW4YAyABKAkSFwoNb3duZXJfdXNlcl9pZBgEIAEoCUgAEhkKD293bmVkX2J5X2NhbGxlchgFIAEoCEgAEjAKB3ZlbmRvcnMYBiADKA4yHy5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRWZW5kb3ISMAoGc3RhdGVzGAcgAygOMiAuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25TdGF0ZUIHCgVvd25lciJeChRMaXN0U2Vzc2lvbnNSZXNwb25zZRItCghzZXNzaW9ucxgBIAMoCzIbLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uEhcKD25leHRfcGFnZV90b2tlbhgCIAEoCSJDChREZWxldGVTZXNzaW9uUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCSIXChVEZWxldGVTZXNzaW9uUmVzcG9uc2UiagoSU2VuZE1lc3NhZ2VSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJEhkKEWNsaWVudF9tZXNzYWdlX2lkGAMgASgJEgwKBHRleHQYBCABKAkiQwoTU2VuZE1lc3NhZ2VSZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24iQwoUUmVzdW1lU2Vzc2lvblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkiRQoVUmVzdW1lU2Vzc2lvblJlc3BvbnNlEiwKB3Nlc3Npb24YASABKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbiJ4ChdBbnN3ZXJQZXJtaXNzaW9uUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIdChVwZXJtaXNzaW9uX3JlcXVlc3RfaWQYAyABKAkSEQoJb3B0aW9uX2lkGAQgASgJIkgKGEFuc3dlclBlcm1pc3Npb25SZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24iWwoRQ2FuY2VsVHVyblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSGQoRY2xpZW50X21lc3NhZ2VfaWQYAyABKAkiQgoSQ2FuY2VsVHVyblJlc3BvbnNlEiwKB3Nlc3Npb24YASABKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbiK5AQoVU2V0U2Vzc2lvbk1vZGVSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJEhkKEWNsaWVudF9tZXNzYWdlX2lkGAMgASgJEhEKB21vZGVfaWQYBCABKAlIABI9Cg9wZXJtaXNzaW9uX21vZGUYBSABKA4yIi5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvbk1vZGVIAEIGCgRtb2RlIkYKFlNldFNlc3Npb25Nb2RlUmVzcG9uc2USLAoHc2Vzc2lvbhgBIAEoCzIbLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uIpMBCh1TZXRTZXNzaW9uQ29uZmlnT3B0aW9uUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIZChFjbGllbnRfbWVzc2FnZV9pZBgDIAEoCRIYChBjb25maWdfb3B0aW9uX2lkGAQgASgJEhAKCHZhbHVlX2lkGAUgASgJIk4KHlNldFNlc3Npb25Db25maWdPcHRpb25SZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24iYgoWR2V0QWdlbnRPcHRpb25zUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSLwoGdmVuZG9yGAIgASgOMh8uZGVsaW5vLnNhbmRjcmV3LnYxLkFnZW50VmVuZG9yIo0BChdHZXRBZ2VudE9wdGlvbnNSZXNwb25zZRI4Cg9hdmFpbGFibGVfbW9kZXMYASADKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbk1vZGUSOAoOY29uZmlnX29wdGlvbnMYAiADKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuQ29uZmlnT3B0aW9uInIKGExpc3RTZXNzaW9uRXZlbnRzUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIWCg5hZnRlcl9zZXF1ZW5jZRgDIAEoBBIRCglwYWdlX3NpemUYBCABKAUiZwoZTGlzdFNlc3Npb25FdmVudHNSZXNwb25zZRIzCgZldmVudHMYASADKAsyIy5kZWxpbm8uc2FuZGNyZXcudjEuVHJhbnNjcmlwdEV2ZW50EhUKDW5leHRfc2VxdWVuY2UYAiABKAQiWgoTV2F0Y2hTZXNzaW9uUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIWCg5hZnRlcl9zZXF1ZW5jZRgDIAEoBCILCglLZWVwYWxpdmUiCgoIQ2F1Z2h0VXAi9wEKFFdhdGNoU2Vzc2lvblJlc3BvbnNlEjIKCWtlZXBhbGl2ZRgBIAEoCzIdLmRlbGluby5zYW5kY3Jldy52MS5LZWVwYWxpdmVIABI/ChB0cmFuc2NyaXB0X2V2ZW50GAIgASgLMiMuZGVsaW5vLnNhbmRjcmV3LnYxLlRyYW5zY3JpcHRFdmVudEgAEi4KB3Nlc3Npb24YAyABKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbkgAEjEKCWNhdWdodF91cBgEIAEoCzIcLmRlbGluby5zYW5kY3Jldy52MS5DYXVnaHRVcEgAQgcKBWV2ZW50Ii8KFFdhdGNoU2Vzc2lvbnNSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCSIkCg5TZXNzaW9uRGVsZXRlZBISCgpzZXNzaW9uX2lkGAEgASgJIsMBChVXYXRjaFNlc3Npb25zUmVzcG9uc2USMgoJa2VlcGFsaXZlGAEgASgLMh0uZGVsaW5vLnNhbmRjcmV3LnYxLktlZXBhbGl2ZUgAEi4KB3Nlc3Npb24YAiABKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbkgAEj0KD3Nlc3Npb25fZGVsZXRlZBgDIAEoCzIiLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uRGVsZXRlZEgAQgcKBWV2ZW50MtcMCg5TZXNzaW9uU2VydmljZRJkCg1DcmVhdGVTZXNzaW9uEiguZGVsaW5vLnNhbmRjcmV3LnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0GikuZGVsaW5vLnNhbmRjcmV3LnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZRKRAQocUmVzdGFydFNlc3Npb25Gcm9tVHJhbnNjcmlwdBI3LmRlbGluby5zYW5kY3Jldy52MS5SZXN0YXJ0U2Vzc2lvbkZyb21UcmFuc2NyaXB0UmVxdWVzdBo4LmRlbGluby5zYW5kY3Jldy52MS5SZXN0YXJ0U2Vzc2lvbkZyb21UcmFuc2NyaXB0UmVzcG9uc2USWwoKR2V0U2Vzc2lvbhIlLmRlbGluby5zYW5kY3Jldy52MS5HZXRTZXNzaW9uUmVxdWVzdBomLmRlbGluby5zYW5kY3Jldy52MS5HZXRTZXNzaW9uUmVzcG9uc2USYQoMTGlzdFNlc3Npb25zEicuZGVsaW5vLnNhbmRjcmV3LnYxLkxpc3RTZXNzaW9uc1JlcXVlc3QaKC5kZWxpbm8uc2FuZGNyZXcudjEuTGlzdFNlc3Npb25zUmVzcG9uc2USZAoNRGVsZXRlU2Vzc2lvbhIoLmRlbGluby5zYW5kY3Jldy52MS5EZWxldGVTZXNzaW9uUmVxdWVzdBopLmRlbGluby5zYW5kY3Jldy52MS5EZWxldGVTZXNzaW9uUmVzcG9uc2USXgoLU2VuZE1lc3NhZ2USJi5kZWxpbm8uc2FuZGNyZXcudjEuU2VuZE1lc3NhZ2VSZXF1ZXN0GicuZGVsaW5vLnNhbmRjcmV3LnYxLlNlbmRNZXNzYWdlUmVzcG9uc2USZAoNUmVzdW1lU2Vzc2lvbhIoLmRlbGluby5zYW5kY3Jldy52MS5SZXN1bWVTZXNzaW9uUmVxdWVzdBopLmRlbGluby5zYW5kY3Jldy52MS5SZXN1bWVTZXNzaW9uUmVzcG9uc2USbQoQQW5zd2VyUGVybWlzc2lvbhIrLmRlbGluby5zYW5kY3Jldy52MS5BbnN3ZXJQZXJtaXNzaW9uUmVxdWVzdBosLmRlbGluby5zYW5kY3Jldy52MS5BbnN3ZXJQZXJtaXNzaW9uUmVzcG9uc2USWwoKQ2FuY2VsVHVybhIlLmRlbGluby5zYW5kY3Jldy52MS5DYW5jZWxUdXJuUmVxdWVzdBomLmRlbGluby5zYW5kY3Jldy52MS5DYW5jZWxUdXJuUmVzcG9uc2USZwoOU2V0U2Vzc2lvbk1vZGUSKS5kZWxpbm8uc2FuZGNyZXcudjEuU2V0U2Vzc2lvbk1vZGVSZXF1ZXN0GiouZGVsaW5vLnNhbmRjcmV3LnYxLlNldFNlc3Npb25Nb2RlUmVzcG9uc2USfwoWU2V0U2Vzc2lvbkNvbmZpZ09wdGlvbhIxLmRlbGluby5zYW5kY3Jldy52MS5TZXRTZXNzaW9uQ29uZmlnT3B0aW9uUmVxdWVzdBoyLmRlbGluby5zYW5kY3Jldy52MS5TZXRTZXNzaW9uQ29uZmlnT3B0aW9uUmVzcG9uc2USagoPR2V0QWdlbnRPcHRpb25zEiouZGVsaW5vLnNhbmRjcmV3LnYxLkdldEFnZW50T3B0aW9uc1JlcXVlc3QaKy5kZWxpbm8uc2FuZGNyZXcudjEuR2V0QWdlbnRPcHRpb25zUmVzcG9uc2UScAoRTGlzdFNlc3Npb25FdmVudHMSLC5kZWxpbm8uc2FuZGNyZXcudjEuTGlzdFNlc3Npb25FdmVudHNSZXF1ZXN0Gi0uZGVsaW5vLnNhbmRjcmV3LnYxLkxpc3RTZXNzaW9uRXZlbnRzUmVzcG9uc2USYwoMV2F0Y2hTZXNzaW9uEicuZGVsaW5vLnNhbmRjcmV3LnYxLldhdGNoU2Vzc2lvblJlcXVlc3QaKC5kZWxpbm8uc2FuZGNyZXcudjEuV2F0Y2hTZXNzaW9uUmVzcG9uc2UwARJmCg1XYXRjaFNlc3Npb25zEiguZGVsaW5vLnNhbmRjcmV3LnYxLldhdGNoU2Vzc2lvbnNSZXF1ZXN0GikuZGVsaW5vLnNhbmRjcmV3LnYxLldhdGNoU2Vzc2lvbnNSZXNwb25zZTABQj9aPWdpdGh1Yi5jb20vZGVsaW5vaW8vbW9uby9wcm90b3MvZGVsaW5vL3NhbmRjcmV3L3YxO3NhbmRjcmV3djFiBnByb3RvMw", [file_delino_sandcrew_v1_bridge, file_delino_sandcrew_v1_common, file_google_protobuf_timestamp]);
+  fileDesc("CiBkZWxpbm8vc2FuZGNyZXcvdjEvc2Vzc2lvbi5wcm90bxISZGVsaW5vLnNhbmRjcmV3LnYxIq8BCglBZ2VudEluZm8SFQoNYWdlbnRfdmVyc2lvbhgBIAEoCRIXCg9jdXJyZW50X21vZGVfaWQYAiABKAkSOAoPYXZhaWxhYmxlX21vZGVzGAMgAygLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25Nb2RlEjgKDmNvbmZpZ19vcHRpb25zGAQgAygLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbmZpZ09wdGlvbiLhBQoHU2Vzc2lvbhISCgpzZXNzaW9uX2lkGAEgASgJEhcKD29yZ2FuaXphdGlvbl9pZBgCIAEoCRIVCg1vd25lcl91c2VyX2lkGAMgASgJEg0KBWxhYmVsGAQgASgJEi8KBnZlbmRvchgFIAEoDjIfLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudFZlbmRvchIZChFydW5uZXJfcHJvZmlsZV9pZBgGIAEoCRItCghndWVzdF9vcxgHIAEoDjIbLmRlbGluby5zYW5kY3Jldy52MS5HdWVzdE9zEi8KBXN0YXRlGAggASgOMiAuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25TdGF0ZRI4CgplbmRfcmVhc29uGAkgASgOMiQuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25FbmRSZWFzb24SOwoPcGVybWlzc2lvbl9tb2RlGAogASgOMiIuZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25Nb2RlEi4KCmNyZWF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnN0YXJ0ZWRfYXQYDCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi0KCXBhdXNlZF9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLAoIZW5kZWRfYXQYDiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjsKF3NjaGVkdWxlZF9kZWxldGlvbl90aW1lGA8gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIbChNwcmV2aW91c19zZXNzaW9uX2lkGBAgASgJEiwKBWFnZW50GBEgASgLMh0uZGVsaW5vLnNhbmRjcmV3LnYxLkFnZW50SW5mbxIbChNyZXN1bWVfd2FpdF9leHBpcmVkGBIgASgIItcJCg9UcmFuc2NyaXB0RXZlbnQSEAoIc2VxdWVuY2UYASABKAQSKAoEdGltZRgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASMAoFaGVsbG8YCiABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuQnJpZGdlSGVsbG9IABI7Cg5pbnB1dF9hY2NlcHRlZBgLIAEoCzIhLmRlbGluby5zYW5kY3Jldy52MS5JbnB1dEFjY2VwdGVkSAASOwoOaW5wdXRfcmVqZWN0ZWQYDCABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuSW5wdXRSZWplY3RlZEgAEj4KEnVzZXJfbWVzc2FnZV9jaHVuaxgNIAEoCzIgLmRlbGluby5zYW5kY3Jldy52MS5Db250ZW50Q2h1bmtIABI/ChNhZ2VudF9tZXNzYWdlX2NodW5rGA4gASgLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbnRlbnRDaHVua0gAEj8KE2FnZW50X3Rob3VnaHRfY2h1bmsYDyABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuQ29udGVudENodW5rSAASMQoJdG9vbF9jYWxsGBAgASgLMhwuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsSAASPgoQdG9vbF9jYWxsX3VwZGF0ZRgRIAEoCzIiLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbFVwZGF0ZUgAEigKBHBsYW4YEiABKAsyGC5kZWxpbm8uc2FuZGNyZXcudjEuUGxhbkgAEkMKEnBlcm1pc3Npb25fcmVxdWVzdBgTIAEoCzIlLmRlbGluby5zYW5kY3Jldy52MS5QZXJtaXNzaW9uUmVxdWVzdEgAEkUKE3Blcm1pc3Npb25fcmVzcG9uc2UYFCABKAsyJi5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvblJlc3BvbnNlSAASMwoKdHVybl9lbmRlZBgVIAEoCzIdLmRlbGluby5zYW5kY3Jldy52MS5UdXJuRW5kZWRIABI3Cgxtb2RlX2NoYW5nZWQYFiABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuTW9kZUNoYW5nZWRIABI7Cg5jb25maWdfb3B0aW9ucxgXIAEoCzIhLmRlbGluby5zYW5kY3Jldy52MS5Db25maWdPcHRpb25zSAASPgoNc2Vzc2lvbl9zdGF0ZRgYIAEoCzIlLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudFNlc3Npb25TdGF0ZUgAEjcKDGJyaWRnZV9lcnJvchgZIAEoCzIfLmRlbGluby5zYW5kY3Jldy52MS5CcmlkZ2VFcnJvckgAEjcKDGFnZW50X2V4aXRlZBgaIAEoCzIfLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudEV4aXRlZEgAEjsKDnVua25vd25fdXBkYXRlGBwgASgLMiEuZGVsaW5vLnNhbmRjcmV3LnYxLlVua25vd25VcGRhdGVIABI1CgthZ2VudF9yZWFkeRgdIAEoCzIeLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudFJlYWR5SABCBwoFZXZlbnRKBAgbEBxSEWNyZWRlbnRpYWxfdXBkYXRlIpECChRDcmVhdGVTZXNzaW9uUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSLwoGdmVuZG9yGAIgASgOMh8uZGVsaW5vLnNhbmRjcmV3LnYxLkFnZW50VmVuZG9yEhkKEXJ1bm5lcl9wcm9maWxlX2lkGAMgASgJEhUKDWZpcnN0X21lc3NhZ2UYBCABKAkSDQoFbGFiZWwYBSABKAkSGgoSc2Vzc2lvbl9zZWNyZXRfaWRzGAYgAygJEg8KB21vZGVfaWQYByABKAkSQQoOY29uZmlnX29wdGlvbnMYCCADKAsyKS5kZWxpbm8uc2FuZGNyZXcudjEuQ29uZmlnT3B0aW9uU2VsZWN0aW9uIkUKFUNyZWF0ZVNlc3Npb25SZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24iaQojUmVzdGFydFNlc3Npb25Gcm9tVHJhbnNjcmlwdFJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSFQoNZmlyc3RfbWVzc2FnZRgDIAEoCSJUCiRSZXN0YXJ0U2Vzc2lvbkZyb21UcmFuc2NyaXB0UmVzcG9uc2USLAoHc2Vzc2lvbhgBIAEoCzIbLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uIkAKEUdldFNlc3Npb25SZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJIkIKEkdldFNlc3Npb25SZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24i9gEKE0xpc3RTZXNzaW9uc1JlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhEKCXBhZ2Vfc2l6ZRgCIAEoBRISCgpwYWdlX3Rva2VuGAMgASgJEhcKDW93bmVyX3VzZXJfaWQYBCABKAlIABIZCg9vd25lZF9ieV9jYWxsZXIYBSABKAhIABIwCgd2ZW5kb3JzGAYgAygOMh8uZGVsaW5vLnNhbmRjcmV3LnYxLkFnZW50VmVuZG9yEjAKBnN0YXRlcxgHIAMoDjIgLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uU3RhdGVCBwoFb3duZXIiXgoUTGlzdFNlc3Npb25zUmVzcG9uc2USLQoIc2Vzc2lvbnMYASADKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbhIXCg9uZXh0X3BhZ2VfdG9rZW4YAiABKAkiQwoURGVsZXRlU2Vzc2lvblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkiFwoVRGVsZXRlU2Vzc2lvblJlc3BvbnNlImoKElNlbmRNZXNzYWdlUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIZChFjbGllbnRfbWVzc2FnZV9pZBgDIAEoCRIMCgR0ZXh0GAQgASgJIkMKE1NlbmRNZXNzYWdlUmVzcG9uc2USLAoHc2Vzc2lvbhgBIAEoCzIbLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uIkMKFFJlc3VtZVNlc3Npb25SZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJIkUKFVJlc3VtZVNlc3Npb25SZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24ieAoXQW5zd2VyUGVybWlzc2lvblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSHQoVcGVybWlzc2lvbl9yZXF1ZXN0X2lkGAMgASgJEhEKCW9wdGlvbl9pZBgEIAEoCSJIChhBbnN3ZXJQZXJtaXNzaW9uUmVzcG9uc2USLAoHc2Vzc2lvbhgBIAEoCzIbLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uIlsKEUNhbmNlbFR1cm5SZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJEhkKEWNsaWVudF9tZXNzYWdlX2lkGAMgASgJIkIKEkNhbmNlbFR1cm5SZXNwb25zZRIsCgdzZXNzaW9uGAEgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb24iuQEKFVNldFNlc3Npb25Nb2RlUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIZChFjbGllbnRfbWVzc2FnZV9pZBgDIAEoCRIRCgdtb2RlX2lkGAQgASgJSAASPQoPcGVybWlzc2lvbl9tb2RlGAUgASgOMiIuZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25Nb2RlSABCBgoEbW9kZSJGChZTZXRTZXNzaW9uTW9kZVJlc3BvbnNlEiwKB3Nlc3Npb24YASABKAsyGy5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbiKTAQodU2V0U2Vzc2lvbkNvbmZpZ09wdGlvblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSGQoRY2xpZW50X21lc3NhZ2VfaWQYAyABKAkSGAoQY29uZmlnX29wdGlvbl9pZBgEIAEoCRIQCgh2YWx1ZV9pZBgFIAEoCSJOCh5TZXRTZXNzaW9uQ29uZmlnT3B0aW9uUmVzcG9uc2USLAoHc2Vzc2lvbhgBIAEoCzIbLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uImIKFkdldEFnZW50T3B0aW9uc1JlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEi8KBnZlbmRvchgCIAEoDjIfLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudFZlbmRvciKNAQoXR2V0QWdlbnRPcHRpb25zUmVzcG9uc2USOAoPYXZhaWxhYmxlX21vZGVzGAEgAygLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25Nb2RlEjgKDmNvbmZpZ19vcHRpb25zGAIgAygLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbmZpZ09wdGlvbiJyChhMaXN0U2Vzc2lvbkV2ZW50c1JlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSFgoOYWZ0ZXJfc2VxdWVuY2UYAyABKAQSEQoJcGFnZV9zaXplGAQgASgFImcKGUxpc3RTZXNzaW9uRXZlbnRzUmVzcG9uc2USMwoGZXZlbnRzGAEgAygLMiMuZGVsaW5vLnNhbmRjcmV3LnYxLlRyYW5zY3JpcHRFdmVudBIVCg1uZXh0X3NlcXVlbmNlGAIgASgEIloKE1dhdGNoU2Vzc2lvblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSFgoOYWZ0ZXJfc2VxdWVuY2UYAyABKAQiCwoJS2VlcGFsaXZlIgoKCENhdWdodFVwIvcBChRXYXRjaFNlc3Npb25SZXNwb25zZRIyCglrZWVwYWxpdmUYASABKAsyHS5kZWxpbm8uc2FuZGNyZXcudjEuS2VlcGFsaXZlSAASPwoQdHJhbnNjcmlwdF9ldmVudBgCIAEoCzIjLmRlbGluby5zYW5kY3Jldy52MS5UcmFuc2NyaXB0RXZlbnRIABIuCgdzZXNzaW9uGAMgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25IABIxCgljYXVnaHRfdXAYBCABKAsyHC5kZWxpbm8uc2FuZGNyZXcudjEuQ2F1Z2h0VXBIAEIHCgVldmVudCIvChRXYXRjaFNlc3Npb25zUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkiJAoOU2Vzc2lvbkRlbGV0ZWQSEgoKc2Vzc2lvbl9pZBgBIAEoCSLDAQoVV2F0Y2hTZXNzaW9uc1Jlc3BvbnNlEjIKCWtlZXBhbGl2ZRgBIAEoCzIdLmRlbGluby5zYW5kY3Jldy52MS5LZWVwYWxpdmVIABIuCgdzZXNzaW9uGAIgASgLMhsuZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25IABI9Cg9zZXNzaW9uX2RlbGV0ZWQYAyABKAsyIi5kZWxpbm8uc2FuZGNyZXcudjEuU2Vzc2lvbkRlbGV0ZWRIAEIHCgVldmVudDLXDAoOU2Vzc2lvblNlcnZpY2USZAoNQ3JlYXRlU2Vzc2lvbhIoLmRlbGluby5zYW5kY3Jldy52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdBopLmRlbGluby5zYW5kY3Jldy52MS5DcmVhdGVTZXNzaW9uUmVzcG9uc2USkQEKHFJlc3RhcnRTZXNzaW9uRnJvbVRyYW5zY3JpcHQSNy5kZWxpbm8uc2FuZGNyZXcudjEuUmVzdGFydFNlc3Npb25Gcm9tVHJhbnNjcmlwdFJlcXVlc3QaOC5kZWxpbm8uc2FuZGNyZXcudjEuUmVzdGFydFNlc3Npb25Gcm9tVHJhbnNjcmlwdFJlc3BvbnNlElsKCkdldFNlc3Npb24SJS5kZWxpbm8uc2FuZGNyZXcudjEuR2V0U2Vzc2lvblJlcXVlc3QaJi5kZWxpbm8uc2FuZGNyZXcudjEuR2V0U2Vzc2lvblJlc3BvbnNlEmEKDExpc3RTZXNzaW9ucxInLmRlbGluby5zYW5kY3Jldy52MS5MaXN0U2Vzc2lvbnNSZXF1ZXN0GiguZGVsaW5vLnNhbmRjcmV3LnYxLkxpc3RTZXNzaW9uc1Jlc3BvbnNlEmQKDURlbGV0ZVNlc3Npb24SKC5kZWxpbm8uc2FuZGNyZXcudjEuRGVsZXRlU2Vzc2lvblJlcXVlc3QaKS5kZWxpbm8uc2FuZGNyZXcudjEuRGVsZXRlU2Vzc2lvblJlc3BvbnNlEl4KC1NlbmRNZXNzYWdlEiYuZGVsaW5vLnNhbmRjcmV3LnYxLlNlbmRNZXNzYWdlUmVxdWVzdBonLmRlbGluby5zYW5kY3Jldy52MS5TZW5kTWVzc2FnZVJlc3BvbnNlEmQKDVJlc3VtZVNlc3Npb24SKC5kZWxpbm8uc2FuZGNyZXcudjEuUmVzdW1lU2Vzc2lvblJlcXVlc3QaKS5kZWxpbm8uc2FuZGNyZXcudjEuUmVzdW1lU2Vzc2lvblJlc3BvbnNlEm0KEEFuc3dlclBlcm1pc3Npb24SKy5kZWxpbm8uc2FuZGNyZXcudjEuQW5zd2VyUGVybWlzc2lvblJlcXVlc3QaLC5kZWxpbm8uc2FuZGNyZXcudjEuQW5zd2VyUGVybWlzc2lvblJlc3BvbnNlElsKCkNhbmNlbFR1cm4SJS5kZWxpbm8uc2FuZGNyZXcudjEuQ2FuY2VsVHVyblJlcXVlc3QaJi5kZWxpbm8uc2FuZGNyZXcudjEuQ2FuY2VsVHVyblJlc3BvbnNlEmcKDlNldFNlc3Npb25Nb2RlEikuZGVsaW5vLnNhbmRjcmV3LnYxLlNldFNlc3Npb25Nb2RlUmVxdWVzdBoqLmRlbGluby5zYW5kY3Jldy52MS5TZXRTZXNzaW9uTW9kZVJlc3BvbnNlEn8KFlNldFNlc3Npb25Db25maWdPcHRpb24SMS5kZWxpbm8uc2FuZGNyZXcudjEuU2V0U2Vzc2lvbkNvbmZpZ09wdGlvblJlcXVlc3QaMi5kZWxpbm8uc2FuZGNyZXcudjEuU2V0U2Vzc2lvbkNvbmZpZ09wdGlvblJlc3BvbnNlEmoKD0dldEFnZW50T3B0aW9ucxIqLmRlbGluby5zYW5kY3Jldy52MS5HZXRBZ2VudE9wdGlvbnNSZXF1ZXN0GisuZGVsaW5vLnNhbmRjcmV3LnYxLkdldEFnZW50T3B0aW9uc1Jlc3BvbnNlEnAKEUxpc3RTZXNzaW9uRXZlbnRzEiwuZGVsaW5vLnNhbmRjcmV3LnYxLkxpc3RTZXNzaW9uRXZlbnRzUmVxdWVzdBotLmRlbGluby5zYW5kY3Jldy52MS5MaXN0U2Vzc2lvbkV2ZW50c1Jlc3BvbnNlEmMKDFdhdGNoU2Vzc2lvbhInLmRlbGluby5zYW5kY3Jldy52MS5XYXRjaFNlc3Npb25SZXF1ZXN0GiguZGVsaW5vLnNhbmRjcmV3LnYxLldhdGNoU2Vzc2lvblJlc3BvbnNlMAESZgoNV2F0Y2hTZXNzaW9ucxIoLmRlbGluby5zYW5kY3Jldy52MS5XYXRjaFNlc3Npb25zUmVxdWVzdBopLmRlbGluby5zYW5kY3Jldy52MS5XYXRjaFNlc3Npb25zUmVzcG9uc2UwAUI/Wj1naXRodWIuY29tL2RlbGlub2lvL21vbm8vcHJvdG9zL2RlbGluby9zYW5kY3Jldy92MTtzYW5kY3Jld3YxYgZwcm90bzM", [file_delino_sandcrew_v1_bridge, file_delino_sandcrew_v1_common, file_google_protobuf_timestamp]);
 
 /**
  * What the agent of a session advertised in its latest events.
@@ -175,30 +175,6 @@ export const SessionSchema: GenMessage<Session> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_session, 1);
 
 /**
- * A configuration option value for a new session.
- *
- * @generated from message delino.sandcrew.v1.ConfigOptionSelection
- */
-export type ConfigOptionSelection = Message<"delino.sandcrew.v1.ConfigOptionSelection"> & {
-  /**
-   * @generated from field: string config_option_id = 1;
-   */
-  configOptionId: string;
-
-  /**
-   * @generated from field: string value_id = 2;
-   */
-  valueId: string;
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ConfigOptionSelection.
- * Use `create(ConfigOptionSelectionSchema)` to create a new message.
- */
-export const ConfigOptionSelectionSchema: GenMessage<ConfigOptionSelection> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 2);
-
-/**
  * One stored transcript event: a BridgeEvent without the credential_update
  * case. The field numbers of the cases equal those of BridgeEvent.
  *
@@ -326,6 +302,12 @@ export type TranscriptEvent = Message<"delino.sandcrew.v1.TranscriptEvent"> & {
      */
     value: UnknownUpdate;
     case: "unknownUpdate";
+  } | {
+    /**
+     * @generated from field: delino.sandcrew.v1.AgentReady agent_ready = 29;
+     */
+    value: AgentReady;
+    case: "agentReady";
   } | { case: undefined; value?: undefined };
 };
 
@@ -334,7 +316,7 @@ export type TranscriptEvent = Message<"delino.sandcrew.v1.TranscriptEvent"> & {
  * Use `create(TranscriptEventSchema)` to create a new message.
  */
 export const TranscriptEventSchema: GenMessage<TranscriptEvent> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 3);
+  messageDesc(file_delino_sandcrew_v1_session, 2);
 
 /**
  * @generated from message delino.sandcrew.v1.CreateSessionRequest
@@ -394,7 +376,7 @@ export type CreateSessionRequest = Message<"delino.sandcrew.v1.CreateSessionRequ
  * Use `create(CreateSessionRequestSchema)` to create a new message.
  */
 export const CreateSessionRequestSchema: GenMessage<CreateSessionRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 4);
+  messageDesc(file_delino_sandcrew_v1_session, 3);
 
 /**
  * @generated from message delino.sandcrew.v1.CreateSessionResponse
@@ -411,7 +393,7 @@ export type CreateSessionResponse = Message<"delino.sandcrew.v1.CreateSessionRes
  * Use `create(CreateSessionResponseSchema)` to create a new message.
  */
 export const CreateSessionResponseSchema: GenMessage<CreateSessionResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 5);
+  messageDesc(file_delino_sandcrew_v1_session, 4);
 
 /**
  * @generated from message delino.sandcrew.v1.RestartSessionFromTranscriptRequest
@@ -440,7 +422,7 @@ export type RestartSessionFromTranscriptRequest = Message<"delino.sandcrew.v1.Re
  * Use `create(RestartSessionFromTranscriptRequestSchema)` to create a new message.
  */
 export const RestartSessionFromTranscriptRequestSchema: GenMessage<RestartSessionFromTranscriptRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 6);
+  messageDesc(file_delino_sandcrew_v1_session, 5);
 
 /**
  * @generated from message delino.sandcrew.v1.RestartSessionFromTranscriptResponse
@@ -457,7 +439,7 @@ export type RestartSessionFromTranscriptResponse = Message<"delino.sandcrew.v1.R
  * Use `create(RestartSessionFromTranscriptResponseSchema)` to create a new message.
  */
 export const RestartSessionFromTranscriptResponseSchema: GenMessage<RestartSessionFromTranscriptResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 7);
+  messageDesc(file_delino_sandcrew_v1_session, 6);
 
 /**
  * @generated from message delino.sandcrew.v1.GetSessionRequest
@@ -479,7 +461,7 @@ export type GetSessionRequest = Message<"delino.sandcrew.v1.GetSessionRequest"> 
  * Use `create(GetSessionRequestSchema)` to create a new message.
  */
 export const GetSessionRequestSchema: GenMessage<GetSessionRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 8);
+  messageDesc(file_delino_sandcrew_v1_session, 7);
 
 /**
  * @generated from message delino.sandcrew.v1.GetSessionResponse
@@ -496,7 +478,7 @@ export type GetSessionResponse = Message<"delino.sandcrew.v1.GetSessionResponse"
  * Use `create(GetSessionResponseSchema)` to create a new message.
  */
 export const GetSessionResponseSchema: GenMessage<GetSessionResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 9);
+  messageDesc(file_delino_sandcrew_v1_session, 8);
 
 /**
  * @generated from message delino.sandcrew.v1.ListSessionsRequest
@@ -554,7 +536,7 @@ export type ListSessionsRequest = Message<"delino.sandcrew.v1.ListSessionsReques
  * Use `create(ListSessionsRequestSchema)` to create a new message.
  */
 export const ListSessionsRequestSchema: GenMessage<ListSessionsRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 10);
+  messageDesc(file_delino_sandcrew_v1_session, 9);
 
 /**
  * @generated from message delino.sandcrew.v1.ListSessionsResponse
@@ -578,7 +560,7 @@ export type ListSessionsResponse = Message<"delino.sandcrew.v1.ListSessionsRespo
  * Use `create(ListSessionsResponseSchema)` to create a new message.
  */
 export const ListSessionsResponseSchema: GenMessage<ListSessionsResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 11);
+  messageDesc(file_delino_sandcrew_v1_session, 10);
 
 /**
  * @generated from message delino.sandcrew.v1.DeleteSessionRequest
@@ -600,7 +582,7 @@ export type DeleteSessionRequest = Message<"delino.sandcrew.v1.DeleteSessionRequ
  * Use `create(DeleteSessionRequestSchema)` to create a new message.
  */
 export const DeleteSessionRequestSchema: GenMessage<DeleteSessionRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 12);
+  messageDesc(file_delino_sandcrew_v1_session, 11);
 
 /**
  * @generated from message delino.sandcrew.v1.DeleteSessionResponse
@@ -613,7 +595,7 @@ export type DeleteSessionResponse = Message<"delino.sandcrew.v1.DeleteSessionRes
  * Use `create(DeleteSessionResponseSchema)` to create a new message.
  */
 export const DeleteSessionResponseSchema: GenMessage<DeleteSessionResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 13);
+  messageDesc(file_delino_sandcrew_v1_session, 12);
 
 /**
  * @generated from message delino.sandcrew.v1.SendMessageRequest
@@ -647,7 +629,7 @@ export type SendMessageRequest = Message<"delino.sandcrew.v1.SendMessageRequest"
  * Use `create(SendMessageRequestSchema)` to create a new message.
  */
 export const SendMessageRequestSchema: GenMessage<SendMessageRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 14);
+  messageDesc(file_delino_sandcrew_v1_session, 13);
 
 /**
  * @generated from message delino.sandcrew.v1.SendMessageResponse
@@ -664,7 +646,7 @@ export type SendMessageResponse = Message<"delino.sandcrew.v1.SendMessageRespons
  * Use `create(SendMessageResponseSchema)` to create a new message.
  */
 export const SendMessageResponseSchema: GenMessage<SendMessageResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 15);
+  messageDesc(file_delino_sandcrew_v1_session, 14);
 
 /**
  * @generated from message delino.sandcrew.v1.ResumeSessionRequest
@@ -686,7 +668,7 @@ export type ResumeSessionRequest = Message<"delino.sandcrew.v1.ResumeSessionRequ
  * Use `create(ResumeSessionRequestSchema)` to create a new message.
  */
 export const ResumeSessionRequestSchema: GenMessage<ResumeSessionRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 16);
+  messageDesc(file_delino_sandcrew_v1_session, 15);
 
 /**
  * @generated from message delino.sandcrew.v1.ResumeSessionResponse
@@ -703,7 +685,7 @@ export type ResumeSessionResponse = Message<"delino.sandcrew.v1.ResumeSessionRes
  * Use `create(ResumeSessionResponseSchema)` to create a new message.
  */
 export const ResumeSessionResponseSchema: GenMessage<ResumeSessionResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 17);
+  messageDesc(file_delino_sandcrew_v1_session, 16);
 
 /**
  * @generated from message delino.sandcrew.v1.AnswerPermissionRequest
@@ -735,7 +717,7 @@ export type AnswerPermissionRequest = Message<"delino.sandcrew.v1.AnswerPermissi
  * Use `create(AnswerPermissionRequestSchema)` to create a new message.
  */
 export const AnswerPermissionRequestSchema: GenMessage<AnswerPermissionRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 18);
+  messageDesc(file_delino_sandcrew_v1_session, 17);
 
 /**
  * @generated from message delino.sandcrew.v1.AnswerPermissionResponse
@@ -752,7 +734,7 @@ export type AnswerPermissionResponse = Message<"delino.sandcrew.v1.AnswerPermiss
  * Use `create(AnswerPermissionResponseSchema)` to create a new message.
  */
 export const AnswerPermissionResponseSchema: GenMessage<AnswerPermissionResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 19);
+  messageDesc(file_delino_sandcrew_v1_session, 18);
 
 /**
  * @generated from message delino.sandcrew.v1.CancelTurnRequest
@@ -781,7 +763,7 @@ export type CancelTurnRequest = Message<"delino.sandcrew.v1.CancelTurnRequest"> 
  * Use `create(CancelTurnRequestSchema)` to create a new message.
  */
 export const CancelTurnRequestSchema: GenMessage<CancelTurnRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 20);
+  messageDesc(file_delino_sandcrew_v1_session, 19);
 
 /**
  * @generated from message delino.sandcrew.v1.CancelTurnResponse
@@ -798,7 +780,7 @@ export type CancelTurnResponse = Message<"delino.sandcrew.v1.CancelTurnResponse"
  * Use `create(CancelTurnResponseSchema)` to create a new message.
  */
 export const CancelTurnResponseSchema: GenMessage<CancelTurnResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 21);
+  messageDesc(file_delino_sandcrew_v1_session, 20);
 
 /**
  * @generated from message delino.sandcrew.v1.SetSessionModeRequest
@@ -846,7 +828,7 @@ export type SetSessionModeRequest = Message<"delino.sandcrew.v1.SetSessionModeRe
  * Use `create(SetSessionModeRequestSchema)` to create a new message.
  */
 export const SetSessionModeRequestSchema: GenMessage<SetSessionModeRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 22);
+  messageDesc(file_delino_sandcrew_v1_session, 21);
 
 /**
  * @generated from message delino.sandcrew.v1.SetSessionModeResponse
@@ -863,7 +845,7 @@ export type SetSessionModeResponse = Message<"delino.sandcrew.v1.SetSessionModeR
  * Use `create(SetSessionModeResponseSchema)` to create a new message.
  */
 export const SetSessionModeResponseSchema: GenMessage<SetSessionModeResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 23);
+  messageDesc(file_delino_sandcrew_v1_session, 22);
 
 /**
  * @generated from message delino.sandcrew.v1.SetSessionConfigOptionRequest
@@ -902,7 +884,7 @@ export type SetSessionConfigOptionRequest = Message<"delino.sandcrew.v1.SetSessi
  * Use `create(SetSessionConfigOptionRequestSchema)` to create a new message.
  */
 export const SetSessionConfigOptionRequestSchema: GenMessage<SetSessionConfigOptionRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 24);
+  messageDesc(file_delino_sandcrew_v1_session, 23);
 
 /**
  * @generated from message delino.sandcrew.v1.SetSessionConfigOptionResponse
@@ -919,7 +901,7 @@ export type SetSessionConfigOptionResponse = Message<"delino.sandcrew.v1.SetSess
  * Use `create(SetSessionConfigOptionResponseSchema)` to create a new message.
  */
 export const SetSessionConfigOptionResponseSchema: GenMessage<SetSessionConfigOptionResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 25);
+  messageDesc(file_delino_sandcrew_v1_session, 24);
 
 /**
  * @generated from message delino.sandcrew.v1.GetAgentOptionsRequest
@@ -941,7 +923,7 @@ export type GetAgentOptionsRequest = Message<"delino.sandcrew.v1.GetAgentOptions
  * Use `create(GetAgentOptionsRequestSchema)` to create a new message.
  */
 export const GetAgentOptionsRequestSchema: GenMessage<GetAgentOptionsRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 26);
+  messageDesc(file_delino_sandcrew_v1_session, 25);
 
 /**
  * @generated from message delino.sandcrew.v1.GetAgentOptionsResponse
@@ -967,7 +949,7 @@ export type GetAgentOptionsResponse = Message<"delino.sandcrew.v1.GetAgentOption
  * Use `create(GetAgentOptionsResponseSchema)` to create a new message.
  */
 export const GetAgentOptionsResponseSchema: GenMessage<GetAgentOptionsResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 27);
+  messageDesc(file_delino_sandcrew_v1_session, 26);
 
 /**
  * @generated from message delino.sandcrew.v1.ListSessionEventsRequest
@@ -1003,7 +985,7 @@ export type ListSessionEventsRequest = Message<"delino.sandcrew.v1.ListSessionEv
  * Use `create(ListSessionEventsRequestSchema)` to create a new message.
  */
 export const ListSessionEventsRequestSchema: GenMessage<ListSessionEventsRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 28);
+  messageDesc(file_delino_sandcrew_v1_session, 27);
 
 /**
  * @generated from message delino.sandcrew.v1.ListSessionEventsResponse
@@ -1028,7 +1010,7 @@ export type ListSessionEventsResponse = Message<"delino.sandcrew.v1.ListSessionE
  * Use `create(ListSessionEventsResponseSchema)` to create a new message.
  */
 export const ListSessionEventsResponseSchema: GenMessage<ListSessionEventsResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 29);
+  messageDesc(file_delino_sandcrew_v1_session, 28);
 
 /**
  * @generated from message delino.sandcrew.v1.WatchSessionRequest
@@ -1057,7 +1039,7 @@ export type WatchSessionRequest = Message<"delino.sandcrew.v1.WatchSessionReques
  * Use `create(WatchSessionRequestSchema)` to create a new message.
  */
 export const WatchSessionRequestSchema: GenMessage<WatchSessionRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 30);
+  messageDesc(file_delino_sandcrew_v1_session, 29);
 
 /**
  * Sent at least every 30 seconds while nothing else is sent.
@@ -1072,7 +1054,7 @@ export type Keepalive = Message<"delino.sandcrew.v1.Keepalive"> & {
  * Use `create(KeepaliveSchema)` to create a new message.
  */
 export const KeepaliveSchema: GenMessage<Keepalive> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 31);
+  messageDesc(file_delino_sandcrew_v1_session, 30);
 
 /**
  * Every stored event after the requested sequence was sent.
@@ -1087,7 +1069,7 @@ export type CaughtUp = Message<"delino.sandcrew.v1.CaughtUp"> & {
  * Use `create(CaughtUpSchema)` to create a new message.
  */
 export const CaughtUpSchema: GenMessage<CaughtUp> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 32);
+  messageDesc(file_delino_sandcrew_v1_session, 31);
 
 /**
  * @generated from message delino.sandcrew.v1.WatchSessionResponse
@@ -1130,7 +1112,7 @@ export type WatchSessionResponse = Message<"delino.sandcrew.v1.WatchSessionRespo
  * Use `create(WatchSessionResponseSchema)` to create a new message.
  */
 export const WatchSessionResponseSchema: GenMessage<WatchSessionResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 33);
+  messageDesc(file_delino_sandcrew_v1_session, 32);
 
 /**
  * @generated from message delino.sandcrew.v1.WatchSessionsRequest
@@ -1147,7 +1129,7 @@ export type WatchSessionsRequest = Message<"delino.sandcrew.v1.WatchSessionsRequ
  * Use `create(WatchSessionsRequestSchema)` to create a new message.
  */
 export const WatchSessionsRequestSchema: GenMessage<WatchSessionsRequest> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 34);
+  messageDesc(file_delino_sandcrew_v1_session, 33);
 
 /**
  * A session that its owner deleted.
@@ -1166,7 +1148,7 @@ export type SessionDeleted = Message<"delino.sandcrew.v1.SessionDeleted"> & {
  * Use `create(SessionDeletedSchema)` to create a new message.
  */
 export const SessionDeletedSchema: GenMessage<SessionDeleted> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 35);
+  messageDesc(file_delino_sandcrew_v1_session, 34);
 
 /**
  * @generated from message delino.sandcrew.v1.WatchSessionsResponse
@@ -1203,7 +1185,7 @@ export type WatchSessionsResponse = Message<"delino.sandcrew.v1.WatchSessionsRes
  * Use `create(WatchSessionsResponseSchema)` to create a new message.
  */
 export const WatchSessionsResponseSchema: GenMessage<WatchSessionsResponse> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_session, 36);
+  messageDesc(file_delino_sandcrew_v1_session, 35);
 
 /**
  * SessionService creates agent sessions, sends input to them and streams

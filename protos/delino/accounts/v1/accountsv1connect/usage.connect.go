@@ -104,8 +104,11 @@ type UsageServiceClient interface {
 	// a link succeeds and changes nothing. Usage of earlier windows stays
 	// attributed to the former billing account.
 	UnlinkOrganization(context.Context, *connect.Request[v1.UnlinkOrganizationRequest]) (*connect.Response[v1.UnlinkOrganizationResponse], error)
-	// List the billing accounts in which a user is owner or admin, ordered by
-	// billing_account_id, for the link flow of the calling service.
+	// List the billing accounts in which a user is owner or admin. New
+	// traversals sort by ascending create_time, then by ascending
+	// billing_account_id. Older ID-only tokens continue in ascending
+	// billing_account_id order. Restart from the first page after a rollback
+	// to a release that ignores the creation time in a token.
 	ListManageableBillingAccounts(context.Context, *connect.Request[v1.ListManageableBillingAccountsRequest]) (*connect.Response[v1.ListManageableBillingAccountsResponse], error)
 	// Read the billing of one linked organization: the billing account, its
 	// balance, the status and the usage of the current UTC calendar month. An
@@ -245,8 +248,11 @@ type UsageServiceHandler interface {
 	// a link succeeds and changes nothing. Usage of earlier windows stays
 	// attributed to the former billing account.
 	UnlinkOrganization(context.Context, *connect.Request[v1.UnlinkOrganizationRequest]) (*connect.Response[v1.UnlinkOrganizationResponse], error)
-	// List the billing accounts in which a user is owner or admin, ordered by
-	// billing_account_id, for the link flow of the calling service.
+	// List the billing accounts in which a user is owner or admin. New
+	// traversals sort by ascending create_time, then by ascending
+	// billing_account_id. Older ID-only tokens continue in ascending
+	// billing_account_id order. Restart from the first page after a rollback
+	// to a release that ignores the creation time in a token.
 	ListManageableBillingAccounts(context.Context, *connect.Request[v1.ListManageableBillingAccountsRequest]) (*connect.Response[v1.ListManageableBillingAccountsResponse], error)
 	// Read the billing of one linked organization: the billing account, its
 	// balance, the status and the usage of the current UTC calendar month. An

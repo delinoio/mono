@@ -1446,6 +1446,147 @@ func TestCanceledSnapshotRestoreStartsNoHelper(t *testing.T) {
 	}
 }
 
+type errFuncContext struct {
+	context.Context
+	errFunc func() error
+}
+
+func (c errFuncContext) Err() error { return c.errFunc() }
+
+func TestFailedCreateSocketDirectoryCleanup(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("the process runtime uses filesystem sockets on macOS")
+	}
+	for _, scenario := range []struct {
+		name   string
+		cancel bool
+	}{
+		{name: "canceled restore", cancel: true},
+		{name: "helper launch failure"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Run("immediate cleanup", func(t *testing.T) {
+				testFailedCreateSocketDirectoryCleanup(t, scenario.cancel, false)
+			})
+			t.Run("retry cleanup", func(t *testing.T) {
+				if os.Geteuid() == 0 {
+					t.Skip("socket directory removal must run without root privileges")
+				}
+				testFailedCreateSocketDirectoryCleanup(t, scenario.cancel, true)
+			})
+		})
+	}
+}
+
+func testFailedCreateSocketDirectoryCleanup(t *testing.T, cancelRestore, blockRemoval bool) {
+	t.Helper()
+	vmsDir := t.TempDir()
+	rt := newRuntimeWithVMsDir(t, vmsDir)
+	closeRuntimeOnCleanup(t, rt)
+	spec := vmruntime.Spec{
+		SandboxID: "sb",
+		Dir:       filepath.Join(vmsDir, "sb"),
+		GuestOS:   hostGuestOS,
+		BaseImage: hostBaseImage,
+		Snapshot:  snapshotSource(t, 0),
+	}
+	missingHelper := filepath.Join(vmsDir, "missing-guest-helper")
+	if !cancelRestore {
+		// The constructor checks the binary. Use a missing path at launch time.
+		rt.guestBinary = missingHelper
+	}
+
+	socketBase, err := os.MkdirTemp("", "pt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(socketBase, 0o700); err != nil {
+			t.Error(err)
+		}
+		if err := os.RemoveAll(socketBase); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Setenv("TMPDIR", socketBase)
+
+	ctx := t.Context()
+	record := filepath.Join(spec.Dir, socketDirFile)
+	var socketDir string
+	restoreCtx := errFuncContext{Context: ctx, errFunc: func() error {
+		path, err := recordedSocketDir(spec.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if path == "" {
+			return ctx.Err()
+		}
+		socketDir = path
+		if blockRemoval {
+			// Withhold write access to the parent so RemoveAll cannot unlink
+			// the socket directory even when the directory is empty.
+			if err := os.Chmod(socketBase, 0o500); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if cancelRestore {
+			return context.Canceled
+		}
+		return ctx.Err()
+	}}
+	_, err = rt.Create(restoreCtx, spec)
+	if socketDir == "" {
+		t.Fatalf("Create did not record a socket directory: %v", err)
+	}
+	if cancelRestore {
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Create error = %v; want context.Canceled", err)
+		}
+		if lines := helperProcessesOf(t, spec.Dir); len(lines) != 0 {
+			t.Errorf("helper processes after the canceled restore: %v", lines)
+		}
+	} else {
+		// The macOS supervisor sends the helper's launch error as text.
+		want := fmt.Sprintf("guest supervisor startup: fork/exec %s: %s", missingHelper, syscall.ENOENT)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("Create error = %v; want %q", err, want)
+		}
+	}
+	if errors.Is(err, os.ErrPermission) != blockRemoval {
+		t.Fatalf("Create error = %v; want cleanup permission error: %t", err, blockRemoval)
+	}
+	if _, err := rt.lookup(spec.SandboxID); err == nil {
+		t.Fatal("sandbox is tracked after failed Create")
+	}
+
+	fresh := newRuntimeWithVMsDir(t, vmsDir)
+	if blockRemoval {
+		assertRetained := func(operation string) {
+			t.Helper()
+			if data, err := os.ReadFile(record); err != nil || string(data) != socketDir {
+				t.Fatalf("socket record after failed %s = %q, %v; want %q", operation, data, err, socketDir)
+			}
+			mustExist(t, socketDir)
+		}
+		assertRetained("Create")
+		if err := fresh.Delete(ctx, spec.SandboxID); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("Delete error = %v; want a permission error", err)
+		}
+		assertRetained("Delete")
+		if err := os.Chmod(socketBase, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := fresh.Delete(ctx, spec.SandboxID); err != nil {
+			t.Fatalf("Delete after restoring access: %v", err)
+		}
+	}
+	mustNotExist(t, socketDir)
+	mustNotExist(t, spec.Dir)
+	if err := fresh.Delete(ctx, spec.SandboxID); err != nil {
+		t.Fatalf("idempotent Delete: %v", err)
+	}
+}
+
 // TestSnapshotRestoreStartsAndWaitsForGuest checks that an uncanceled restore
 // copies the snapshot disk, starts the helper and returns when it is ready.
 func TestSnapshotRestoreStartsAndWaitsForGuest(t *testing.T) {

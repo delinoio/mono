@@ -1901,7 +1901,8 @@ describe("long names", () => {
       await expect(browser).toHaveURL(/\/orgs\/[0-9a-f-]+\/sandboxes$/);
 
       await screen.getByRole("combobox", "Organization").tap();
-      await expect(screen.getByRole("listbox")).toBeVisible();
+      const listbox = screen.getByRole("listbox");
+      await expect(listbox).toBeVisible();
       const m = await browser.evaluate(() => {
         const popup = document.querySelector(".dui-select-content");
         const box = popup?.getBoundingClientRect();
@@ -1913,13 +1914,75 @@ describe("long names", () => {
       });
       expect(m.left).toBeGreaterThanOrEqual(0);
       expect(m.right).toBeLessThanOrEqual(m.viewportWidth);
-      // The whole name stays readable: it wraps instead of being cut off.
-      await expect(screen.getByRole("option", LONG_NAME)).toBeVisible();
+      await expect(
+        screen.getByRole("option", LONG_NAME, { exact: true }),
+      ).toBeVisible();
+      const { lines, textFits } = await measureOrganizationOption(
+        browser,
+        LONG_NAME,
+      );
+      expect(lines, `${width}px: the option name wraps`).toBeGreaterThan(1);
+      expect(textFits, `${width}px: the full option name fits`).toBe(true);
       await app.screenshot(`organization-popup-long-option-${width}`);
       await browser.keyboard.press("Escape");
+      await expect(listbox).toBeHidden();
     }
   });
 });
+
+function measureOrganizationOption(browser: Browser, name: string) {
+  return browser.evaluate((name) => {
+    const popup = document.querySelector<HTMLElement>(".dui-select-content");
+    const label = Array.from(
+      popup?.querySelectorAll<HTMLElement>(".dui-select-option > span") ?? [],
+    ).find((element) => element.textContent === name);
+    if (!popup || !label) return { lines: 0, textFits: false };
+
+    label.closest('[role="option"]')?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior: "instant",
+    });
+    const range = document.createRange();
+    range.selectNodeContents(label);
+    const rects = Array.from(range.getClientRects()).filter(
+      (rect) => rect.width > 0 && rect.height > 0,
+    );
+    const lines = new Set(rects.map((rect) => Math.round(rect.top))).size;
+
+    // Range rectangles include text beyond an overflow clip.
+    for (
+      let element: HTMLElement | null = label;
+      element;
+      element = element.parentElement
+    ) {
+      const { overflowX, overflowY } = getComputedStyle(element);
+      const clipX = element === popup || overflowX !== "visible";
+      const clipY = element === popup || overflowY !== "visible";
+      if (clipX || clipY) {
+        const box = element.getBoundingClientRect();
+        const left = box.left + element.clientLeft;
+        const top = box.top + element.clientTop;
+        const right = left + element.clientWidth;
+        const bottom = top + element.clientHeight;
+        // Client dimensions round to integer CSS pixels.
+        const tolerance = 1;
+        const fits = rects.every(
+          (rect) =>
+            (!clipX ||
+              (rect.left >= left - tolerance &&
+                rect.right <= right + tolerance)) &&
+            (!clipY ||
+              (rect.top >= top - tolerance &&
+                rect.bottom <= bottom + tolerance)),
+        );
+        if (!fits) return { lines, textFits: false };
+      }
+      if (element === popup) break;
+    }
+    return { lines, textFits: rects.length > 0 };
+  }, name);
+}
 
 interface DialogMetrics {
   panelScrollWidth: number;

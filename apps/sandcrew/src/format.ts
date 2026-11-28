@@ -2,20 +2,22 @@
 import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
-  AgentVendor,
   BridgeErrorKind,
-  GuestOs,
   InputRejectionReason,
-  PermissionMode,
   PlanEntryPriority,
   PlanEntryStatus,
+  StopReason,
+  ToolCallStatus,
+  ToolKind,
+} from "@delino/sandcrew-protos/v1/bridge_pb";
+import {
+  AgentVendor,
+  GuestOs,
+  PermissionMode,
   ProfileIneligibility,
   Role,
   SessionEndReason,
   SessionState,
-  StopReason,
-  ToolCallStatus,
-  ToolKind,
   VendorCredentialKind,
 } from "@delino/sandcrew-protos/v1/common_pb";
 import type { Localizer, MessageKey, Translate } from "./i18n.ts";

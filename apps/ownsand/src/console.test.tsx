@@ -8,7 +8,8 @@ import {
   rs,
   test,
 } from "@rstest/core";
-import { create } from "@bufbuild/protobuf";
+import { create as createMessage, isMessage } from "@bufbuild/protobuf";
+import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { StrictMode } from "react";
 import {
   act,
@@ -30,7 +31,9 @@ import {
   BaseImage,
   type DeviceLimitsInput,
   type Resources,
+  Role,
   SandboxState,
+  SnapshotState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import {
@@ -38,13 +41,20 @@ import {
   type LinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
-import type { AcceptInvitationRequest } from "@delino/ownsand-protos/v1/member_pb";
+import type {
+  AcceptInvitationRequest,
+  RemoveMemberRequest,
+} from "@delino/ownsand-protos/v1/member_pb";
 import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
+  type GetOrganizationResponse,
   ListOrganizationsResponseSchema,
   OrganizationService,
 } from "@delino/ownsand-protos/v1/organization_pb";
-import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
+import {
+  ListSnapshotsResponseSchema,
+  SnapshotSchema,
+} from "@delino/ownsand-protos/v1/snapshot_pb";
 import { focusManager, QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { Console } from "./App.tsx";
@@ -52,7 +62,6 @@ import { createQueryClient, invalidateServices } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { shortIdText } from "./components/ui.tsx";
-import { formatTime } from "./format.ts";
 import { pendingInvitation } from "./invitation.ts";
 import { RouteId, RouterProvider, useRouter } from "./router.tsx";
 import {
@@ -92,6 +101,16 @@ import {
 
 /** The seeded Acme invitation, which the mock user cannot accept: already a member. */
 const MOCK_ACME_INVITATION_SECRET = "osi_7f3a_unused";
+
+/**
+ * The timeout of a test that renders a list of more than one page. The
+ * 5-second default is too short for such a list in happy-dom on a busy CI
+ * runner; paged-lists.test.tsx uses the same value.
+ */
+const LONG_LIST_TEST_TIMEOUT_MS = 60_000;
+
+/** Waits for a row of such a list longer than the 1-second findBy default. */
+const LONG_LIST_WAIT = { timeout: 20_000 };
 
 const config = {
   apiOrigin: "https://api.test",
@@ -163,12 +182,16 @@ afterEach(() => {
   cleanup();
   // The toaster and its screen reader announcers are module state outside
   // the rendered tree: a toast or an announcement of one test must not
-  // appear in the document of the next one.
+  // appear in the document of the next one. The UI SDK writes an
+  // announcement 100 ms after the toast, so a test that ends sooner leaves a
+  // pending write. Remove the live regions instead of clearing them: that
+  // write then goes to a detached region, and the next announcement creates
+  // a new one.
   toast.dismiss();
   for (const announcer of document.querySelectorAll(
     "[data-ui-sdk-announcer]",
   )) {
-    announcer.textContent = "";
+    announcer.remove();
   }
 });
 
@@ -275,7 +298,7 @@ describe("organizations", () => {
         );
         return {
           ...res,
-          message: create(ListOrganizationsResponseSchema, {
+          message: createMessage(ListOrganizationsResponseSchema, {
             organizations: real.organizations.filter((o) =>
               pages[page - 1]!.includes(o.organizationId),
             ),
@@ -1939,18 +1962,21 @@ function holdingTransport(hold: (method: string, call: number) => boolean) {
 
 describe("device limits", () => {
   test("saves an explicit zero with the strict RPC", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
     const disk = await screen.findByLabelText("Disk limit (GiB)");
     await settle();
-    await act(async () => {
-      fireEvent.input(disk, { target: { value: "0" } });
-      fireEvent.blur(disk);
-    });
-    await settle();
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
-    });
-    await settle(60);
+    expect((disk as HTMLInputElement).value).toBe("500");
+    await commit(disk, "0");
+    await save();
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0]?.diskGib).toBe(0n);
     expect(
       (await screen.findAllByText("The device limits are saved.")).length,
     ).toBeGreaterThan(0);
@@ -2484,33 +2510,55 @@ describe("sandbox create form resources", () => {
   });
 
   test("labels ready snapshots of the same period with distinct ids and their creation time", async () => {
-    // Snapshots that the mock creates back to back have UUID v7 ids with the
-    // same time prefix; the option label must still tell them apart.
-    const transport = createMockTransport();
-    const snapshots = createClient(SnapshotService, transport);
-    const made = [];
-    for (let i = 0; i < 2; i++) {
-      const res = await snapshots.createSnapshot({
+    const createdAt = new Date("2024-12-07T07:24:00.384Z");
+    const createTime = timestampFromDate(createdAt);
+    const snapshots = [
+      "0193a001-0000-7000-8000-000000001234",
+      "0193a001-0000-7000-8000-000000005678",
+    ].map((snapshotId) =>
+      createMessage(SnapshotSchema, {
+        snapshotId,
         organizationId: MOCK_IDS.acme,
-        sandboxId: MOCK_IDS.runningSandbox,
-      });
-      made.push(res.snapshot!);
-    }
+        state: SnapshotState.READY,
+        createTime,
+      }),
+    );
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        const response = await mock.unary(method, ...rest);
+        if (
+          method.name === "ListSnapshots" &&
+          isMessage(response.message, ListSnapshotsResponseSchema)
+        ) {
+          response.message.snapshots.push(...snapshots);
+        }
+        return response;
+      },
+    };
+
     const dialog = await openForm(transport);
     await act(async () => {
       fireEvent.click(within(dialog).getByRole("combobox", { name: "Source" }));
     });
-    const options = (await screen.findAllByRole("option")).filter((o) =>
-      (o.textContent ?? "").startsWith("Snapshot "),
+
+    const time = createdAt.toLocaleString("en", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+    await screen.findByRole("option", {
+      name: `Snapshot 0193a001…1234 · ${time}`,
+    });
+    await screen.findByRole("option", {
+      name: `Snapshot 0193a001…5678 · ${time}`,
+    });
+    expect(
+      screen.getByRole("option", { name: /^Snapshot 0193a000…00b1 · / }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("option", { name: /^Snapshot / })).toHaveLength(
+      3,
     );
-    const texts = options.map((o) => o.textContent);
-    expect(options).toHaveLength(3);
-    expect(new Set(texts).size).toBe(3);
-    for (const snapshot of made) {
-      expect(texts).toContain(
-        `Snapshot ${shortIdText(snapshot.snapshotId)} · ${formatTime(snapshot.createTime)}`,
-      );
-    }
   });
 
   test("creates a sandbox from the chosen snapshot option", async () => {
@@ -2622,17 +2670,25 @@ describe("sandbox create form resources", () => {
     });
     await settle();
     expect(memory.value).toBe("1,257");
-    // The plus button of the Memory field adds one more whole number.
     const plus = memory
       .closest('[data-slot="number-input-group"]')!
       .querySelector('[data-slot="number-input-increment"]')!;
+    const primaryMouse = {
+      button: 0,
+      isPrimary: true,
+      pointerId: 1,
+      pointerType: "mouse",
+    };
     await act(async () => {
-      fireEvent.pointerDown(plus, { button: 0 });
-      fireEvent.pointerUp(plus, { button: 0 });
-      fireEvent.click(plus);
+      fireEvent.pointerDown(plus, { ...primaryMouse, buttons: 1 });
+      fireEvent.pointerUp(plus, { ...primaryMouse, buttons: 0 });
+    });
+    // Let React apply the controlled value before the click handler reads it.
+    await act(async () => {
+      fireEvent.click(plus, { detail: 1 });
     });
     await settle();
-    expect(memory.value).toMatch(/^1,25[89]$/);
+    expect(memory.value).toBe("1,258");
   });
 });
 
@@ -2926,37 +2982,47 @@ describe("invitations", () => {
     expect(trigger.textContent).toContain("Contoso Research");
   });
 
-  test("lists organizations past the first page of the mock and refreshes them after a membership change", async () => {
-    const mock = createMockTransport();
-    const client = createClient(OrganizationService, mock);
-    // 2 seeded organizations and 200 more fill the first page and leave a
-    // second one.
-    for (let i = 0; i < 200; i++) {
-      await client.createOrganization({ name: `Extra ${i}` });
-    }
-    const { transport, state } = listOrganizationsProbe(mock);
-    renderConsole("/", { transport, queryClient: createQueryClient() });
-    expect(await screen.findByRole("link", { name: /Extra 199/ })).toBeTruthy();
-    expect(state.tokens).toHaveLength(2);
-    expect(state.tokens[0]).toBe("");
-    expect(state.tokens[1]).not.toBe("");
-    // Joining Contoso refreshes the shared list from the first page.
-    await joinContosoFromOrganizations();
-    await settle(100);
-    expect(window.location.pathname).toBe(
-      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
-    );
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("combobox", { name: "Organization" }),
+  test(
+    "lists organizations past the first page of the mock and refreshes them after a membership change",
+    async () => {
+      const mock = createMockTransport();
+      const client = createClient(OrganizationService, mock);
+      // 2 seeded organizations and 200 more fill the first page and leave a
+      // second one.
+      for (let i = 0; i < 200; i++) {
+        await client.createOrganization({ name: `Extra ${i}` });
+      }
+      const { transport, state } = listOrganizationsProbe(mock);
+      renderConsole("/", { transport, queryClient: createQueryClient() });
+      expect(
+        await screen.findByRole("link", { name: /Extra 199/ }, LONG_LIST_WAIT),
+      ).toBeTruthy();
+      expect(state.tokens).toHaveLength(2);
+      expect(state.tokens[0]).toBe("");
+      expect(state.tokens[1]).not.toBe("");
+      // Joining Contoso refreshes the shared list from the first page.
+      await joinContosoFromOrganizations();
+      await settle(100);
+      expect(window.location.pathname).toBe(
+        `/orgs/${MOCK_IDS.contoso}/sandboxes`,
       );
-    });
-    expect(
-      await screen.findByRole("option", { name: "Contoso Research" }),
-    ).toBeTruthy();
-    expect(screen.getByRole("option", { name: "Extra 199" })).toBeTruthy();
-    expect(state.tokens.length).toBeGreaterThan(2);
-  });
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("combobox", { name: "Organization" }),
+        );
+      });
+      expect(
+        await screen.findByRole(
+          "option",
+          { name: "Contoso Research" },
+          LONG_LIST_WAIT,
+        ),
+      ).toBeTruthy();
+      expect(screen.getByRole("option", { name: "Extra 199" })).toBeTruthy();
+      expect(state.tokens.length).toBeGreaterThan(2);
+    },
+    LONG_LIST_TEST_TIMEOUT_MS,
+  );
 
   test("refreshes the organizations when an earlier accept succeeds after the user left the page", async () => {
     const { transport, release } = delayedAcceptTransport();
@@ -3896,6 +3962,95 @@ describe("leaving and deleting an organization", () => {
     return dialog;
   };
 
+  test.each([Role.MEMBER, Role.ADMIN])(
+    "dismisses Leave when the caller with role %s becomes the owner",
+    async (initialRole) => {
+      const organizationId = MOCK_IDS.northwind;
+      const path = `/orgs/${organizationId}/members`;
+      const mock = createMockTransport();
+      const queryClient = createQueryClient();
+      let callerRole = initialRole;
+      const removals: Pick<RemoveMemberRequest, "organizationId" | "userId">[] =
+        [];
+      const refreshPaths: string[] = [];
+      const transport: Transport = {
+        ...mock,
+        async unary(method, ...args) {
+          if (method.name === "RemoveMember") {
+            const { organizationId, userId } = args[3] as RemoveMemberRequest;
+            removals.push({ organizationId, userId });
+          }
+          if (method.name === "ListOrganizations" && removals.length > 0) {
+            refreshPaths.push(window.location.pathname);
+          }
+          const response = await mock.unary(method, ...args);
+          if (method.name !== "GetOrganization") return response;
+          const { organization } = response.message as GetOrganizationResponse;
+          if (organization?.organizationId !== organizationId) return response;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              organization: { ...organization, callerRole },
+            },
+          };
+        },
+      };
+      const refetchRole = async (role: Role) => {
+        callerRole = role;
+        await act(async () => {
+          await queryClient.refetchQueries({
+            queryKey: createConnectQueryKey({
+              schema: OrganizationService.method.getOrganization,
+              input: { organizationId },
+              cardinality: "finite",
+            }),
+          });
+        });
+      };
+
+      renderConsole(path, { transport, queryClient });
+      const leave = { name: "Leave organization" };
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("button", leave));
+      });
+      await screen.findByRole("alertdialog", {
+        name: "Leave this organization?",
+      });
+
+      await refetchRole(Role.OWNER);
+      await screen.findByText("· Owner");
+      await waitFor(() => {
+        expect(
+          screen.queryByRole("alertdialog", {
+            name: "Leave this organization?",
+          }),
+        ).toBeNull();
+        expect(screen.queryByRole("button", leave)).toBeNull();
+      });
+      expect(
+        screen.getByRole("heading", { name: "Members", level: 1 }),
+      ).toBeTruthy();
+      expect(window.location.pathname).toBe(path);
+      expect(removals).toEqual([]);
+
+      await refetchRole(Role.ADMIN);
+      const opener = await screen.findByRole("button", leave);
+      expect(
+        screen.queryByRole("alertdialog", { name: "Leave this organization?" }),
+      ).toBeNull();
+      await act(async () => fireEvent.click(opener));
+      await confirmIn("Leave organization");
+
+      await waitFor(() => expect(refreshPaths).toContain("/"));
+      expect(refreshPaths.every((refreshPath) => refreshPath === "/")).toBe(
+        true,
+      );
+      expect(window.location.pathname).toBe("/");
+      expect(removals).toEqual([{ organizationId, userId: MOCK_USER }]);
+    },
+  );
+
   test("leaving as a member never shows the not-found notice and ends at /", async () => {
     renderConsole(`/orgs/${MOCK_IDS.northwind}/members`, {
       transport: slowTransport(),
@@ -4367,12 +4522,15 @@ describe("a failed refetch of loaded data", () => {
       transport,
       queryClient,
     });
-    await screen.findByText(/ci-runner/);
+    const key = await screen.findByText(/ci-runner/);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
     });
     await settle(60);
-    const input = screen.getByRole("textbox", { name: "Name" });
+    const dialog = screen.getByRole("dialog");
+    const input = within(dialog).getByRole<HTMLInputElement>("textbox", {
+      name: "Name",
+    });
     await act(async () => {
       fireEvent.input(input, { target: { value: "deploy-bot" } });
     });
@@ -4388,25 +4546,71 @@ describe("a failed refetch of loaded data", () => {
       0,
     );
     expect(document.querySelector(".sidenav")).toBe(nav);
-    expect(screen.getByText(/ci-runner/)).toBeTruthy();
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByText(/ci-runner/)).toBe(key);
+    expect(screen.getByRole("dialog")).toBe(dialog);
     expect(screen.getByRole("textbox", { name: "Name" })).toBe(input);
-    expect((input as HTMLInputElement).value).toBe("deploy-bot");
+    expect(input.value).toBe("deploy-bot");
 
-    // Try again succeeds once the failure is gone, and removes the notice.
     state.code = undefined;
-    const retry = screen.getAllByRole("button", {
-      name: "Try again",
-      hidden: true,
-    })[0]!;
-    await act(async () => {
-      fireEvent.click(retry);
-    });
-    await settle(60);
     await refetchAll(queryClient);
     expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+    expect(document.querySelector(".sidenav")).toBe(nav);
+    expect(screen.getByText(/ci-runner/)).toBe(key);
+    expect(screen.getByRole("dialog")).toBe(dialog);
     expect(screen.getByRole("textbox", { name: "Name" })).toBe(input);
-    expect((input as HTMLInputElement).value).toBe("deploy-bot");
+    expect(input.value).toBe("deploy-bot");
+  });
+
+  test("Try again in the API keys refresh notice requests the list again", async () => {
+    const method = ApiKeyService.method.listApiKeys;
+    const { transport, calls } = holdMockTransport([method.name]);
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        // Keep the loaded page fresh across focus, reconnect and mount.
+        queries: { retry: false, staleTime: Infinity, refetchInterval: false },
+      },
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+      transport,
+      queryClient,
+    });
+    await waitFor(() => expect(calls[method.name]).toHaveLength(1));
+    const keyRequests = calls[method.name]!;
+    await act(async () => keyRequests[0]!.settle());
+    await screen.findByText(/ci-runner/);
+
+    const refetch = queryClient.refetchQueries({
+      queryKey: createConnectQueryKey({
+        schema: method,
+        cardinality: "infinite",
+      }),
+    });
+    await waitFor(() => expect(keyRequests).toHaveLength(2));
+    await act(async () => {
+      keyRequests[1]!.settle(
+        new ConnectError("the refresh failed", Code.Unavailable),
+      );
+      await refetch;
+    });
+
+    const main = within(screen.getByRole("main"));
+    const notice = await main.findByRole("alert");
+    expect(within(notice).getByText(REFRESH_NOTICE)).toBeTruthy();
+    const retry = within(notice).getByRole<HTMLButtonElement>("button", {
+      name: "Try again",
+    });
+    expect(retry.disabled).toBe(false);
+
+    const requestsBeforeRetry = keyRequests.length;
+    await act(async () => fireEvent.click(retry));
+    await waitFor(() =>
+      expect(keyRequests).toHaveLength(requestsBeforeRetry + 1),
+    );
+    expect(notice.isConnected).toBe(true);
+
+    await act(async () => keyRequests[requestsBeforeRetry]!.settle());
+    await waitFor(() => expect(main.queryByText(REFRESH_NOTICE)).toBeNull());
+    expect(notice.isConnected).toBe(false);
   });
 
   const pages = [
@@ -4426,7 +4630,8 @@ describe("a failed refetch of loaded data", () => {
       name: "snapshots",
       path: "snapshots",
       method: "ListSnapshots",
-      text: "Templates",
+      listName: "Snapshots",
+      text: shortIdText(MOCK_IDS.snapshot),
     },
     {
       name: "devices",
@@ -4444,7 +4649,8 @@ describe("a failed refetch of loaded data", () => {
       name: "members",
       path: "members",
       method: "ListMembers",
-      text: "Invitations",
+      listName: "Members",
+      text: "Jun Park",
     },
     {
       name: "enrollment tokens",
@@ -4474,7 +4680,14 @@ describe("a failed refetch of loaded data", () => {
         transport,
         queryClient,
       });
-      await screen.findAllByText(page.text, { exact: false });
+      const queryPageContent = () => {
+        if (!page.listName) {
+          return screen.queryAllByText(page.text, { exact: false });
+        }
+        const list = screen.queryByRole("list", { name: page.listName });
+        return list ? within(list).queryAllByText(page.text) : [];
+      };
+      await waitFor(() => expect(queryPageContent().length).toBeGreaterThan(0));
       await settle(60);
 
       state.code = Code.Unavailable;
@@ -4483,9 +4696,7 @@ describe("a failed refetch of loaded data", () => {
       expect(
         (await screen.findAllByText(REFRESH_NOTICE)).length,
       ).toBeGreaterThan(0);
-      expect(
-        screen.getAllByText(page.text, { exact: false }).length,
-      ).toBeGreaterThan(0);
+      expect(queryPageContent().length).toBeGreaterThan(0);
       expect(
         screen.getByRole("navigation", { name: "Organization" }),
       ).toBeTruthy();
@@ -4501,6 +4712,9 @@ describe("a failed refetch of loaded data", () => {
         ).length,
       ).toBeGreaterThan(0);
       expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+      if (page.listName) {
+        expect(queryPageContent()).toHaveLength(0);
+      }
     });
   }
 

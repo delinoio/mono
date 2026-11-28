@@ -43,7 +43,7 @@ func filesUnder(t *testing.T, root string) []string {
 
 func newCloseTestServer(t *testing.T, dir string) *Server {
 	t.Helper()
-	srv, err := New(Config{StateDir: dir})
+	srv, err := newAfterRelease(Config{StateDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func newCloseTestServer(t *testing.T, dir string) *Server {
 // A worker that is paused before it creates its snapshot file must not create
 // one in the state directory of a replacement helper, after the first server
 // was closed and its lock released.
-func TestReadWorkerCannotCreateAfterClose(t *testing.T) {
+func TestReadWorkerCannotCreateAfterClose(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (readCloseGrace)
 	// that other tests read.
 	setReadCloseGrace(t, 50*time.Millisecond)
@@ -171,7 +171,7 @@ func TestReadCloseWaitsForWorkerWithinGrace(t *testing.T) {
 
 // A late cleanup of an old worker must keep the snapshot of the same read_id
 // in the replacement helper.
-func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) {
+func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (readCloseGrace)
 	// that other tests read.
 	setReadCloseGrace(t, 50*time.Millisecond)
@@ -224,7 +224,7 @@ func TestReadLateCleanupKeepsReplacementSnapshot(t *testing.T) {
 	}
 }
 
-func TestReadShutdownHandsOffWhileSnapshotIOBlocked(t *testing.T) {
+func TestReadShutdownHandsOffWhileSnapshotIOBlocked(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (readCloseGrace)
 	// that other tests read.
 	for _, phase := range []string{"create", "created", "failed preparation", "expiry", "admission retry"} {

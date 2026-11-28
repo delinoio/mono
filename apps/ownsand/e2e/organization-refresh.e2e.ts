@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
+import { Role } from "@delino/ownsand-protos/v1/common_pb";
+import { MOCK_IDS, MOCK_USER } from "../src/mock/mock-api.ts";
 
 const PREFIX = "ownsand-e2e-organization-refresh";
 type Step = "list" | "mutation";
@@ -147,4 +149,68 @@ describe("organization list refresh after gaining membership", () => {
       );
     },
   );
+});
+
+describe("Leave confirmation after a role refresh", () => {
+  test("dismisses on promotion to owner and requires a new opening", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const path = `/orgs/${MOCK_IDS.northwind}/members`;
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Northwind Labs Member").tap();
+    await screen.getByRole("link", "Members").tap();
+    const navigation = screen.getByRole("navigation", "Organization");
+    const opener = screen.getByRole("button", "Leave organization");
+    const dialog = screen.getByRole("alertdialog", "Leave this organization?");
+    await opener.tap();
+    await expect(dialog).toBeVisible();
+
+    const refreshRole = (role: Role) =>
+      browser.evaluate(async (role) => {
+        sessionStorage.setItem("ownsand-e2e-leave-role", String(role));
+        const now = Date.now;
+        // Treat the organization query as stale for this visibility event.
+        Date.now = () => now() + 11_000;
+        try {
+          window.dispatchEvent(new Event("visibilitychange"));
+          await Promise.resolve();
+        } finally {
+          Date.now = now;
+        }
+        return null;
+      }, role);
+    const removals = () =>
+      browser.evaluate(() =>
+        (
+          JSON.parse(
+            sessionStorage.getItem("ownsand-e2e-leave-requests") ?? "[]",
+          ) as string[]
+        ).map((request) => JSON.parse(request)),
+      );
+
+    await refreshRole(Role.OWNER);
+    await expect(dialog).toHaveCount(0);
+    await expect(navigation.getByText("· Owner")).toBeVisible();
+    await expect(opener).toHaveCount(0);
+    await expect(browser).toHaveURL(path);
+    expect(await removals()).toEqual([]);
+
+    await refreshRole(Role.MEMBER);
+    await expect(opener).toBeVisible();
+    await expect(dialog).toHaveCount(0);
+    expect(await removals()).toEqual([]);
+
+    await opener.tap();
+    await dialog.getByRole("button", "Leave organization").tap();
+    await expect(browser).toHaveURL("/");
+    await expect(
+      screen.getByRole("heading", "Organizations", { level: 1 }),
+    ).toBeVisible();
+    expect(await removals()).toEqual([
+      { organizationId: MOCK_IDS.northwind, userId: MOCK_USER },
+    ]);
+  });
 });

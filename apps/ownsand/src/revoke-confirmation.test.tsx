@@ -30,11 +30,14 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   // The toaster and its announcers are module state outside the rendered tree.
+  // Remove the live regions: the UI SDK writes an announcement 100 ms after
+  // the toast, and a cleared region would receive a pending write in the next
+  // test.
   toast.dismiss();
   for (const announcer of document.querySelectorAll(
     "[data-ui-sdk-announcer]",
   )) {
-    announcer.textContent = "";
+    announcer.remove();
   }
 });
 

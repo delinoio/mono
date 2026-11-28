@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"debug/macho"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -38,6 +39,10 @@ func TestImageBuildInputPreflight(t *testing.T) {
 	binary.LittleEndian.PutUint32(mach[4:], 0x01000007)
 	binary.LittleEndian.PutUint32(mach[12:], 2)
 	wrongMac := write("wrong-macos", mach)
+	fatHeader := make([]byte, 8)
+	binary.BigEndian.PutUint32(fatHeader[0:], macho.MagicFat)
+	binary.BigEndian.PutUint32(fatHeader[4:], 1)
+	truncatedMac := write("truncated-universal-macos", fatHeader)
 
 	cases := []struct {
 		name string
@@ -48,6 +53,7 @@ func TestImageBuildInputPreflight(t *testing.T) {
 		{"missing ISO", []string{"--os", "windows", "--guest-binary", missing}, exitUsage, "needs --iso"},
 		{"Windows format", []string{"--os", "windows", "--iso", iso, "--guest-binary", text}, exitUsage, "is not a Windows executable"},
 		{"macOS format", []string{"--os", "macos", "--guest-binary", text}, exitUsage, "is not a macOS executable"},
+		{"truncated universal macOS helper", []string{"--os", "macos", "--guest-binary", truncatedMac}, exitUsage, "invalid fat_arch header"},
 		{"Windows architecture", []string{"--os", "windows", "--iso", iso, "--guest-binary", wrongWindows}, exitUsage, "Windows guests need GOOS=windows GOARCH=amd64"},
 		{"macOS architecture", []string{"--os", "macos", "--guest-binary", wrongMac}, exitUsage, "macOS guests need arm64"},
 		{"missing Windows helper", []string{"--os", "windows", "--iso", iso, "--guest-binary", missing}, exitError, "open " + missing},

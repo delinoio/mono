@@ -24,15 +24,684 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// One event that the bridge writes as a protobuf JSON line to the stdout of
-// its exec and to its guest event log.
+// Kind of a tool call (ACP ToolKind).
+type ToolKind int32
+
+const (
+	ToolKind_TOOL_KIND_UNSPECIFIED ToolKind = 0
+	ToolKind_TOOL_KIND_READ        ToolKind = 1
+	ToolKind_TOOL_KIND_EDIT        ToolKind = 2
+	ToolKind_TOOL_KIND_DELETE      ToolKind = 3
+	ToolKind_TOOL_KIND_MOVE        ToolKind = 4
+	ToolKind_TOOL_KIND_SEARCH      ToolKind = 5
+	ToolKind_TOOL_KIND_EXECUTE     ToolKind = 6
+	ToolKind_TOOL_KIND_THINK       ToolKind = 7
+	ToolKind_TOOL_KIND_FETCH       ToolKind = 8
+	ToolKind_TOOL_KIND_SWITCH_MODE ToolKind = 9
+	ToolKind_TOOL_KIND_OTHER       ToolKind = 10
+)
+
+// Enum value maps for ToolKind.
+var (
+	ToolKind_name = map[int32]string{
+		0:  "TOOL_KIND_UNSPECIFIED",
+		1:  "TOOL_KIND_READ",
+		2:  "TOOL_KIND_EDIT",
+		3:  "TOOL_KIND_DELETE",
+		4:  "TOOL_KIND_MOVE",
+		5:  "TOOL_KIND_SEARCH",
+		6:  "TOOL_KIND_EXECUTE",
+		7:  "TOOL_KIND_THINK",
+		8:  "TOOL_KIND_FETCH",
+		9:  "TOOL_KIND_SWITCH_MODE",
+		10: "TOOL_KIND_OTHER",
+	}
+	ToolKind_value = map[string]int32{
+		"TOOL_KIND_UNSPECIFIED": 0,
+		"TOOL_KIND_READ":        1,
+		"TOOL_KIND_EDIT":        2,
+		"TOOL_KIND_DELETE":      3,
+		"TOOL_KIND_MOVE":        4,
+		"TOOL_KIND_SEARCH":      5,
+		"TOOL_KIND_EXECUTE":     6,
+		"TOOL_KIND_THINK":       7,
+		"TOOL_KIND_FETCH":       8,
+		"TOOL_KIND_SWITCH_MODE": 9,
+		"TOOL_KIND_OTHER":       10,
+	}
+)
+
+func (x ToolKind) Enum() *ToolKind {
+	p := new(ToolKind)
+	*p = x
+	return p
+}
+
+func (x ToolKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ToolKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[0].Descriptor()
+}
+
+func (ToolKind) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[0]
+}
+
+func (x ToolKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ToolKind.Descriptor instead.
+func (ToolKind) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{0}
+}
+
+// Status of a tool call (ACP ToolCallStatus).
+type ToolCallStatus int32
+
+const (
+	ToolCallStatus_TOOL_CALL_STATUS_UNSPECIFIED ToolCallStatus = 0
+	ToolCallStatus_TOOL_CALL_STATUS_PENDING     ToolCallStatus = 1
+	ToolCallStatus_TOOL_CALL_STATUS_IN_PROGRESS ToolCallStatus = 2
+	ToolCallStatus_TOOL_CALL_STATUS_COMPLETED   ToolCallStatus = 3
+	ToolCallStatus_TOOL_CALL_STATUS_FAILED      ToolCallStatus = 4
+)
+
+// Enum value maps for ToolCallStatus.
+var (
+	ToolCallStatus_name = map[int32]string{
+		0: "TOOL_CALL_STATUS_UNSPECIFIED",
+		1: "TOOL_CALL_STATUS_PENDING",
+		2: "TOOL_CALL_STATUS_IN_PROGRESS",
+		3: "TOOL_CALL_STATUS_COMPLETED",
+		4: "TOOL_CALL_STATUS_FAILED",
+	}
+	ToolCallStatus_value = map[string]int32{
+		"TOOL_CALL_STATUS_UNSPECIFIED": 0,
+		"TOOL_CALL_STATUS_PENDING":     1,
+		"TOOL_CALL_STATUS_IN_PROGRESS": 2,
+		"TOOL_CALL_STATUS_COMPLETED":   3,
+		"TOOL_CALL_STATUS_FAILED":      4,
+	}
+)
+
+func (x ToolCallStatus) Enum() *ToolCallStatus {
+	p := new(ToolCallStatus)
+	*p = x
+	return p
+}
+
+func (x ToolCallStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ToolCallStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[1].Descriptor()
+}
+
+func (ToolCallStatus) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[1]
+}
+
+func (x ToolCallStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ToolCallStatus.Descriptor instead.
+func (ToolCallStatus) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{1}
+}
+
+// Priority of a plan entry (ACP PlanEntryPriority).
+type PlanEntryPriority int32
+
+const (
+	PlanEntryPriority_PLAN_ENTRY_PRIORITY_UNSPECIFIED PlanEntryPriority = 0
+	PlanEntryPriority_PLAN_ENTRY_PRIORITY_HIGH        PlanEntryPriority = 1
+	PlanEntryPriority_PLAN_ENTRY_PRIORITY_MEDIUM      PlanEntryPriority = 2
+	PlanEntryPriority_PLAN_ENTRY_PRIORITY_LOW         PlanEntryPriority = 3
+)
+
+// Enum value maps for PlanEntryPriority.
+var (
+	PlanEntryPriority_name = map[int32]string{
+		0: "PLAN_ENTRY_PRIORITY_UNSPECIFIED",
+		1: "PLAN_ENTRY_PRIORITY_HIGH",
+		2: "PLAN_ENTRY_PRIORITY_MEDIUM",
+		3: "PLAN_ENTRY_PRIORITY_LOW",
+	}
+	PlanEntryPriority_value = map[string]int32{
+		"PLAN_ENTRY_PRIORITY_UNSPECIFIED": 0,
+		"PLAN_ENTRY_PRIORITY_HIGH":        1,
+		"PLAN_ENTRY_PRIORITY_MEDIUM":      2,
+		"PLAN_ENTRY_PRIORITY_LOW":         3,
+	}
+)
+
+func (x PlanEntryPriority) Enum() *PlanEntryPriority {
+	p := new(PlanEntryPriority)
+	*p = x
+	return p
+}
+
+func (x PlanEntryPriority) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PlanEntryPriority) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[2].Descriptor()
+}
+
+func (PlanEntryPriority) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[2]
+}
+
+func (x PlanEntryPriority) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PlanEntryPriority.Descriptor instead.
+func (PlanEntryPriority) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{2}
+}
+
+// Status of a plan entry (ACP PlanEntryStatus).
+type PlanEntryStatus int32
+
+const (
+	PlanEntryStatus_PLAN_ENTRY_STATUS_UNSPECIFIED PlanEntryStatus = 0
+	PlanEntryStatus_PLAN_ENTRY_STATUS_PENDING     PlanEntryStatus = 1
+	PlanEntryStatus_PLAN_ENTRY_STATUS_IN_PROGRESS PlanEntryStatus = 2
+	PlanEntryStatus_PLAN_ENTRY_STATUS_COMPLETED   PlanEntryStatus = 3
+)
+
+// Enum value maps for PlanEntryStatus.
+var (
+	PlanEntryStatus_name = map[int32]string{
+		0: "PLAN_ENTRY_STATUS_UNSPECIFIED",
+		1: "PLAN_ENTRY_STATUS_PENDING",
+		2: "PLAN_ENTRY_STATUS_IN_PROGRESS",
+		3: "PLAN_ENTRY_STATUS_COMPLETED",
+	}
+	PlanEntryStatus_value = map[string]int32{
+		"PLAN_ENTRY_STATUS_UNSPECIFIED": 0,
+		"PLAN_ENTRY_STATUS_PENDING":     1,
+		"PLAN_ENTRY_STATUS_IN_PROGRESS": 2,
+		"PLAN_ENTRY_STATUS_COMPLETED":   3,
+	}
+)
+
+func (x PlanEntryStatus) Enum() *PlanEntryStatus {
+	p := new(PlanEntryStatus)
+	*p = x
+	return p
+}
+
+func (x PlanEntryStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PlanEntryStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[3].Descriptor()
+}
+
+func (PlanEntryStatus) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[3]
+}
+
+func (x PlanEntryStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PlanEntryStatus.Descriptor instead.
+func (PlanEntryStatus) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{3}
+}
+
+// Kind of a permission option (ACP PermissionOptionKind).
+type PermissionOptionKind int32
+
+const (
+	PermissionOptionKind_PERMISSION_OPTION_KIND_UNSPECIFIED   PermissionOptionKind = 0
+	PermissionOptionKind_PERMISSION_OPTION_KIND_ALLOW_ONCE    PermissionOptionKind = 1
+	PermissionOptionKind_PERMISSION_OPTION_KIND_ALLOW_ALWAYS  PermissionOptionKind = 2
+	PermissionOptionKind_PERMISSION_OPTION_KIND_REJECT_ONCE   PermissionOptionKind = 3
+	PermissionOptionKind_PERMISSION_OPTION_KIND_REJECT_ALWAYS PermissionOptionKind = 4
+)
+
+// Enum value maps for PermissionOptionKind.
+var (
+	PermissionOptionKind_name = map[int32]string{
+		0: "PERMISSION_OPTION_KIND_UNSPECIFIED",
+		1: "PERMISSION_OPTION_KIND_ALLOW_ONCE",
+		2: "PERMISSION_OPTION_KIND_ALLOW_ALWAYS",
+		3: "PERMISSION_OPTION_KIND_REJECT_ONCE",
+		4: "PERMISSION_OPTION_KIND_REJECT_ALWAYS",
+	}
+	PermissionOptionKind_value = map[string]int32{
+		"PERMISSION_OPTION_KIND_UNSPECIFIED":   0,
+		"PERMISSION_OPTION_KIND_ALLOW_ONCE":    1,
+		"PERMISSION_OPTION_KIND_ALLOW_ALWAYS":  2,
+		"PERMISSION_OPTION_KIND_REJECT_ONCE":   3,
+		"PERMISSION_OPTION_KIND_REJECT_ALWAYS": 4,
+	}
+)
+
+func (x PermissionOptionKind) Enum() *PermissionOptionKind {
+	p := new(PermissionOptionKind)
+	*p = x
+	return p
+}
+
+func (x PermissionOptionKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PermissionOptionKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[4].Descriptor()
+}
+
+func (PermissionOptionKind) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[4]
+}
+
+func (x PermissionOptionKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PermissionOptionKind.Descriptor instead.
+func (PermissionOptionKind) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{4}
+}
+
+// Outcome of a permission request.
+type PermissionOutcome int32
+
+const (
+	PermissionOutcome_PERMISSION_OUTCOME_UNSPECIFIED PermissionOutcome = 0
+	// An option was selected; PermissionResponse.option_id names it.
+	PermissionOutcome_PERMISSION_OUTCOME_SELECTED PermissionOutcome = 1
+	// The turn was cancelled before an answer.
+	PermissionOutcome_PERMISSION_OUTCOME_CANCELLED PermissionOutcome = 2
+)
+
+// Enum value maps for PermissionOutcome.
+var (
+	PermissionOutcome_name = map[int32]string{
+		0: "PERMISSION_OUTCOME_UNSPECIFIED",
+		1: "PERMISSION_OUTCOME_SELECTED",
+		2: "PERMISSION_OUTCOME_CANCELLED",
+	}
+	PermissionOutcome_value = map[string]int32{
+		"PERMISSION_OUTCOME_UNSPECIFIED": 0,
+		"PERMISSION_OUTCOME_SELECTED":    1,
+		"PERMISSION_OUTCOME_CANCELLED":   2,
+	}
+)
+
+func (x PermissionOutcome) Enum() *PermissionOutcome {
+	p := new(PermissionOutcome)
+	*p = x
+	return p
+}
+
+func (x PermissionOutcome) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PermissionOutcome) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[5].Descriptor()
+}
+
+func (PermissionOutcome) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[5]
+}
+
+func (x PermissionOutcome) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PermissionOutcome.Descriptor instead.
+func (PermissionOutcome) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{5}
+}
+
+// Why a turn ended (ACP StopReason).
+type StopReason int32
+
+const (
+	StopReason_STOP_REASON_UNSPECIFIED       StopReason = 0
+	StopReason_STOP_REASON_END_TURN          StopReason = 1
+	StopReason_STOP_REASON_MAX_TOKENS        StopReason = 2
+	StopReason_STOP_REASON_MAX_TURN_REQUESTS StopReason = 3
+	StopReason_STOP_REASON_REFUSAL           StopReason = 4
+	StopReason_STOP_REASON_CANCELLED         StopReason = 5
+)
+
+// Enum value maps for StopReason.
+var (
+	StopReason_name = map[int32]string{
+		0: "STOP_REASON_UNSPECIFIED",
+		1: "STOP_REASON_END_TURN",
+		2: "STOP_REASON_MAX_TOKENS",
+		3: "STOP_REASON_MAX_TURN_REQUESTS",
+		4: "STOP_REASON_REFUSAL",
+		5: "STOP_REASON_CANCELLED",
+	}
+	StopReason_value = map[string]int32{
+		"STOP_REASON_UNSPECIFIED":       0,
+		"STOP_REASON_END_TURN":          1,
+		"STOP_REASON_MAX_TOKENS":        2,
+		"STOP_REASON_MAX_TURN_REQUESTS": 3,
+		"STOP_REASON_REFUSAL":           4,
+		"STOP_REASON_CANCELLED":         5,
+	}
+)
+
+func (x StopReason) Enum() *StopReason {
+	p := new(StopReason)
+	*p = x
+	return p
+}
+
+func (x StopReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (StopReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[6].Descriptor()
+}
+
+func (StopReason) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[6]
+}
+
+func (x StopReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use StopReason.Descriptor instead.
+func (StopReason) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{6}
+}
+
+// Category of an agent configuration option (ACP
+// SessionConfigOptionCategory).
+type ConfigOptionCategory int32
+
+const (
+	ConfigOptionCategory_CONFIG_OPTION_CATEGORY_UNSPECIFIED   ConfigOptionCategory = 0
+	ConfigOptionCategory_CONFIG_OPTION_CATEGORY_MODE          ConfigOptionCategory = 1
+	ConfigOptionCategory_CONFIG_OPTION_CATEGORY_MODEL         ConfigOptionCategory = 2
+	ConfigOptionCategory_CONFIG_OPTION_CATEGORY_MODEL_CONFIG  ConfigOptionCategory = 3
+	ConfigOptionCategory_CONFIG_OPTION_CATEGORY_SPEED         ConfigOptionCategory = 4
+	ConfigOptionCategory_CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL ConfigOptionCategory = 5
+	ConfigOptionCategory_CONFIG_OPTION_CATEGORY_OTHER         ConfigOptionCategory = 6
+)
+
+// Enum value maps for ConfigOptionCategory.
+var (
+	ConfigOptionCategory_name = map[int32]string{
+		0: "CONFIG_OPTION_CATEGORY_UNSPECIFIED",
+		1: "CONFIG_OPTION_CATEGORY_MODE",
+		2: "CONFIG_OPTION_CATEGORY_MODEL",
+		3: "CONFIG_OPTION_CATEGORY_MODEL_CONFIG",
+		4: "CONFIG_OPTION_CATEGORY_SPEED",
+		5: "CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL",
+		6: "CONFIG_OPTION_CATEGORY_OTHER",
+	}
+	ConfigOptionCategory_value = map[string]int32{
+		"CONFIG_OPTION_CATEGORY_UNSPECIFIED":   0,
+		"CONFIG_OPTION_CATEGORY_MODE":          1,
+		"CONFIG_OPTION_CATEGORY_MODEL":         2,
+		"CONFIG_OPTION_CATEGORY_MODEL_CONFIG":  3,
+		"CONFIG_OPTION_CATEGORY_SPEED":         4,
+		"CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL": 5,
+		"CONFIG_OPTION_CATEGORY_OTHER":         6,
+	}
+)
+
+func (x ConfigOptionCategory) Enum() *ConfigOptionCategory {
+	p := new(ConfigOptionCategory)
+	*p = x
+	return p
+}
+
+func (x ConfigOptionCategory) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ConfigOptionCategory) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[7].Descriptor()
+}
+
+func (ConfigOptionCategory) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[7]
+}
+
+func (x ConfigOptionCategory) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ConfigOptionCategory.Descriptor instead.
+func (ConfigOptionCategory) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{7}
+}
+
+// What the agent of a session does.
+type AgentActivity int32
+
+const (
+	AgentActivity_AGENT_ACTIVITY_UNSPECIFIED AgentActivity = 0
+	// The bridge installs or starts the agent.
+	AgentActivity_AGENT_ACTIVITY_STARTING AgentActivity = 1
+	// No turn runs; the agent waits for a prompt.
+	AgentActivity_AGENT_ACTIVITY_IDLE AgentActivity = 2
+	// A turn runs.
+	AgentActivity_AGENT_ACTIVITY_WORKING AgentActivity = 3
+	// A turn waits for the answer to an ASK-mode permission request.
+	AgentActivity_AGENT_ACTIVITY_WAITING_FOR_PERMISSION AgentActivity = 4
+)
+
+// Enum value maps for AgentActivity.
+var (
+	AgentActivity_name = map[int32]string{
+		0: "AGENT_ACTIVITY_UNSPECIFIED",
+		1: "AGENT_ACTIVITY_STARTING",
+		2: "AGENT_ACTIVITY_IDLE",
+		3: "AGENT_ACTIVITY_WORKING",
+		4: "AGENT_ACTIVITY_WAITING_FOR_PERMISSION",
+	}
+	AgentActivity_value = map[string]int32{
+		"AGENT_ACTIVITY_UNSPECIFIED":            0,
+		"AGENT_ACTIVITY_STARTING":               1,
+		"AGENT_ACTIVITY_IDLE":                   2,
+		"AGENT_ACTIVITY_WORKING":                3,
+		"AGENT_ACTIVITY_WAITING_FOR_PERMISSION": 4,
+	}
+)
+
+func (x AgentActivity) Enum() *AgentActivity {
+	p := new(AgentActivity)
+	*p = x
+	return p
+}
+
+func (x AgentActivity) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (AgentActivity) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[8].Descriptor()
+}
+
+func (AgentActivity) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[8]
+}
+
+func (x AgentActivity) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use AgentActivity.Descriptor instead.
+func (AgentActivity) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{8}
+}
+
+// Kind of a bridge error.
+type BridgeErrorKind int32
+
+const (
+	BridgeErrorKind_BRIDGE_ERROR_KIND_UNSPECIFIED BridgeErrorKind = 0
+	// A pinned agent component could not be downloaded or installed.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED BridgeErrorKind = 1
+	// A downloaded archive or package did not match its pinned digest.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH BridgeErrorKind = 2
+	// The agent process or its ACP session did not start.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_AGENT_START_FAILED BridgeErrorKind = 3
+	// The credential of the selected vendor is missing.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_CREDENTIAL_MISSING BridgeErrorKind = 4
+	// The agent sent a JSON-RPC error or a malformed message.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR BridgeErrorKind = 5
+	// An input could not be applied.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_INPUT_INVALID BridgeErrorKind = 6
+	// The agent rejected a mode or a configuration option value.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_OPTION_REJECTED BridgeErrorKind = 7
+	// The guest event log could not be appended.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED BridgeErrorKind = 8
+	// The bridge could not watch a credential file.
+	BridgeErrorKind_BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED BridgeErrorKind = 9
+)
+
+// Enum value maps for BridgeErrorKind.
+var (
+	BridgeErrorKind_name = map[int32]string{
+		0: "BRIDGE_ERROR_KIND_UNSPECIFIED",
+		1: "BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED",
+		2: "BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH",
+		3: "BRIDGE_ERROR_KIND_AGENT_START_FAILED",
+		4: "BRIDGE_ERROR_KIND_CREDENTIAL_MISSING",
+		5: "BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR",
+		6: "BRIDGE_ERROR_KIND_INPUT_INVALID",
+		7: "BRIDGE_ERROR_KIND_OPTION_REJECTED",
+		8: "BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED",
+		9: "BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED",
+	}
+	BridgeErrorKind_value = map[string]int32{
+		"BRIDGE_ERROR_KIND_UNSPECIFIED":             0,
+		"BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED":    1,
+		"BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH":       2,
+		"BRIDGE_ERROR_KIND_AGENT_START_FAILED":      3,
+		"BRIDGE_ERROR_KIND_CREDENTIAL_MISSING":      4,
+		"BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR":      5,
+		"BRIDGE_ERROR_KIND_INPUT_INVALID":           6,
+		"BRIDGE_ERROR_KIND_OPTION_REJECTED":         7,
+		"BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED":  8,
+		"BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED": 9,
+	}
+)
+
+func (x BridgeErrorKind) Enum() *BridgeErrorKind {
+	p := new(BridgeErrorKind)
+	*p = x
+	return p
+}
+
+func (x BridgeErrorKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (BridgeErrorKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[9].Descriptor()
+}
+
+func (BridgeErrorKind) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[9]
+}
+
+func (x BridgeErrorKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use BridgeErrorKind.Descriptor instead.
+func (BridgeErrorKind) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{9}
+}
+
+// Why the bridge rejected an inbox input.
+type InputRejectionReason int32
+
+const (
+	InputRejectionReason_INPUT_REJECTION_REASON_UNSPECIFIED InputRejectionReason = 0
+	// The file is too large or does not parse as a BridgeInput.
+	InputRejectionReason_INPUT_REJECTION_REASON_MALFORMED InputRejectionReason = 1
+	// No pending permission request has the ID.
+	InputRejectionReason_INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST InputRejectionReason = 2
+	// The pending permission request has no option with the ID.
+	InputRejectionReason_INPUT_REJECTION_REASON_UNKNOWN_OPTION InputRejectionReason = 3
+	// A cancel request arrived when no turn runs.
+	InputRejectionReason_INPUT_REJECTION_REASON_NO_ACTIVE_TURN InputRejectionReason = 4
+	// The input case is unknown or the agent does not support it.
+	InputRejectionReason_INPUT_REJECTION_REASON_UNSUPPORTED InputRejectionReason = 5
+)
+
+// Enum value maps for InputRejectionReason.
+var (
+	InputRejectionReason_name = map[int32]string{
+		0: "INPUT_REJECTION_REASON_UNSPECIFIED",
+		1: "INPUT_REJECTION_REASON_MALFORMED",
+		2: "INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST",
+		3: "INPUT_REJECTION_REASON_UNKNOWN_OPTION",
+		4: "INPUT_REJECTION_REASON_NO_ACTIVE_TURN",
+		5: "INPUT_REJECTION_REASON_UNSUPPORTED",
+	}
+	InputRejectionReason_value = map[string]int32{
+		"INPUT_REJECTION_REASON_UNSPECIFIED":                0,
+		"INPUT_REJECTION_REASON_MALFORMED":                  1,
+		"INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST": 2,
+		"INPUT_REJECTION_REASON_UNKNOWN_OPTION":             3,
+		"INPUT_REJECTION_REASON_NO_ACTIVE_TURN":             4,
+		"INPUT_REJECTION_REASON_UNSUPPORTED":                5,
+	}
+)
+
+func (x InputRejectionReason) Enum() *InputRejectionReason {
+	p := new(InputRejectionReason)
+	*p = x
+	return p
+}
+
+func (x InputRejectionReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (InputRejectionReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_bridge_proto_enumTypes[10].Descriptor()
+}
+
+func (InputRejectionReason) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_bridge_proto_enumTypes[10]
+}
+
+func (x InputRejectionReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use InputRejectionReason.Descriptor instead.
+func (InputRejectionReason) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{10}
+}
+
+// One event of the bridge.
 type BridgeEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Starts at 1 and increases by 1 for each event of the session that the
-	// guest event log holds. A credential_update event repeats the sequence of
-	// the last logged event.
+	// Starts at 1 and increases by 1 for each event that the guest event log
+	// holds. A credential_update repeats the sequence of the last logged
+	// event.
 	Sequence uint64 `protobuf:"varint,1,opt,name=sequence,proto3" json:"sequence,omitempty"`
-	// The byte offset in the guest event log after the line of this event.
+	// Byte offset in the guest event log after the line of this event.
 	LogEndOffset uint64                 `protobuf:"varint,2,opt,name=log_end_offset,json=logEndOffset,proto3" json:"log_end_offset,omitempty"`
 	Time         *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=time,proto3" json:"time,omitempty"`
 	// Types that are valid to be assigned to Event:
@@ -56,6 +725,7 @@ type BridgeEvent struct {
 	//	*BridgeEvent_AgentExited
 	//	*BridgeEvent_CredentialUpdate
 	//	*BridgeEvent_UnknownUpdate
+	//	*BridgeEvent_AgentReady
 	Event         isBridgeEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -290,12 +960,20 @@ func (x *BridgeEvent) GetUnknownUpdate() *UnknownUpdate {
 	return nil
 }
 
+func (x *BridgeEvent) GetAgentReady() *AgentReady {
+	if x != nil {
+		if x, ok := x.Event.(*BridgeEvent_AgentReady); ok {
+			return x.AgentReady
+		}
+	}
+	return nil
+}
+
 type isBridgeEvent_Event interface {
 	isBridgeEvent_Event()
 }
 
 type BridgeEvent_Hello struct {
-	// Always the first event of a bridge process.
 	Hello *BridgeHello `protobuf:"bytes,10,opt,name=hello,proto3,oneof"`
 }
 
@@ -360,18 +1038,19 @@ type BridgeEvent_BridgeError struct {
 }
 
 type BridgeEvent_AgentExited struct {
-	// The last event of a bridge process when the agent ends.
 	AgentExited *AgentExited `protobuf:"bytes,26,opt,name=agent_exited,json=agentExited,proto3,oneof"`
 }
 
 type BridgeEvent_CredentialUpdate struct {
-	// Written only to stdout, never to the guest event log, never stored and
-	// never logged.
 	CredentialUpdate *CredentialUpdate `protobuf:"bytes,27,opt,name=credential_update,json=credentialUpdate,proto3,oneof"`
 }
 
 type BridgeEvent_UnknownUpdate struct {
 	UnknownUpdate *UnknownUpdate `protobuf:"bytes,28,opt,name=unknown_update,json=unknownUpdate,proto3,oneof"`
+}
+
+type BridgeEvent_AgentReady struct {
+	AgentReady *AgentReady `protobuf:"bytes,29,opt,name=agent_ready,json=agentReady,proto3,oneof"`
 }
 
 func (*BridgeEvent_Hello) isBridgeEvent_Event() {}
@@ -412,7 +1091,9 @@ func (*BridgeEvent_CredentialUpdate) isBridgeEvent_Event() {}
 
 func (*BridgeEvent_UnknownUpdate) isBridgeEvent_Event() {}
 
-// A version of the bridge event and input schema.
+func (*BridgeEvent_AgentReady) isBridgeEvent_Event() {}
+
+// Version of the bridge event and input schema.
 type ProtocolVersion struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Major         uint32                 `protobuf:"varint,1,opt,name=major,proto3" json:"major,omitempty"`
@@ -465,11 +1146,13 @@ func (x *ProtocolVersion) GetMinor() uint32 {
 	return 0
 }
 
-// The ACP capabilities of the agent.
+// Optional ACP capabilities that the agent advertises.
 type AgentCapabilities struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	LoadSession   bool                   `protobuf:"varint,1,opt,name=load_session,json=loadSession,proto3" json:"load_session,omitempty"`
-	ResumeSession bool                   `protobuf:"varint,2,opt,name=resume_session,json=resumeSession,proto3" json:"resume_session,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ACP `session/load`.
+	LoadSession bool `protobuf:"varint,1,opt,name=load_session,json=loadSession,proto3" json:"load_session,omitempty"`
+	// ACP `session/resume`.
+	ResumeSession bool `protobuf:"varint,2,opt,name=resume_session,json=resumeSession,proto3" json:"resume_session,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -518,17 +1201,19 @@ func (x *AgentCapabilities) GetResumeSession() bool {
 	return false
 }
 
+// The first event of every bridge process.
 type BridgeHello struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	BridgeVersion     string                 `protobuf:"bytes,1,opt,name=bridge_version,json=bridgeVersion,proto3" json:"bridge_version,omitempty"`
-	ProtocolVersion   *ProtocolVersion       `protobuf:"bytes,2,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
-	Vendor            AgentVendor            `protobuf:"varint,3,opt,name=vendor,proto3,enum=delino.sandcrew.v1.AgentVendor" json:"vendor,omitempty"`
-	AgentVersion      string                 `protobuf:"bytes,4,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
-	AdapterVersion    string                 `protobuf:"bytes,5,opt,name=adapter_version,json=adapterVersion,proto3" json:"adapter_version,omitempty"`
-	GuestOs           GuestOs                `protobuf:"varint,6,opt,name=guest_os,json=guestOs,proto3,enum=delino.sandcrew.v1.GuestOs" json:"guest_os,omitempty"`
-	AgentCapabilities *AgentCapabilities     `protobuf:"bytes,7,opt,name=agent_capabilities,json=agentCapabilities,proto3" json:"agent_capabilities,omitempty"`
-	// True when the bridge wraps a headless CLI mode instead of ACP.
-	WrappedHeadless bool `protobuf:"varint,8,opt,name=wrapped_headless,json=wrappedHeadless,proto3" json:"wrapped_headless,omitempty"`
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	BridgeVersion   string                 `protobuf:"bytes,1,opt,name=bridge_version,json=bridgeVersion,proto3" json:"bridge_version,omitempty"`
+	ProtocolVersion *ProtocolVersion       `protobuf:"bytes,2,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	Vendor          AgentVendor            `protobuf:"varint,3,opt,name=vendor,proto3,enum=delino.sandcrew.v1.AgentVendor" json:"vendor,omitempty"`
+	// The pinned version of the agent CLI.
+	AgentVersion string `protobuf:"bytes,4,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
+	// The pinned version of the ACP adapter.
+	AdapterVersion string  `protobuf:"bytes,5,opt,name=adapter_version,json=adapterVersion,proto3" json:"adapter_version,omitempty"`
+	GuestOs        GuestOs `protobuf:"varint,6,opt,name=guest_os,json=guestOs,proto3,enum=delino.sandcrew.v1.GuestOs" json:"guest_os,omitempty"`
+	// True when a bridge adapter wraps a headless CLI instead of ACP.
+	WrappedHeadless bool `protobuf:"varint,7,opt,name=wrapped_headless,json=wrappedHeadless,proto3" json:"wrapped_headless,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -605,13 +1290,6 @@ func (x *BridgeHello) GetGuestOs() GuestOs {
 	return GuestOs_GUEST_OS_UNSPECIFIED
 }
 
-func (x *BridgeHello) GetAgentCapabilities() *AgentCapabilities {
-	if x != nil {
-		return x.AgentCapabilities
-	}
-	return nil
-}
-
 func (x *BridgeHello) GetWrappedHeadless() bool {
 	if x != nil {
 		return x.WrappedHeadless
@@ -619,7 +1297,77 @@ func (x *BridgeHello) GetWrappedHeadless() bool {
 	return false
 }
 
-// The bridge read an inbox message and applied or queued it.
+// The agent started and its ACP session exists.
+type AgentReady struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	AgentCapabilities *AgentCapabilities     `protobuf:"bytes,1,opt,name=agent_capabilities,json=agentCapabilities,proto3" json:"agent_capabilities,omitempty"`
+	// The ACP session ID that the agent assigned.
+	AgentSessionId string `protobuf:"bytes,2,opt,name=agent_session_id,json=agentSessionId,proto3" json:"agent_session_id,omitempty"`
+	// The name and version that the agent reports, when it reports them.
+	AgentName            string `protobuf:"bytes,3,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
+	AgentReportedVersion string `protobuf:"bytes,4,opt,name=agent_reported_version,json=agentReportedVersion,proto3" json:"agent_reported_version,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *AgentReady) Reset() {
+	*x = AgentReady{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentReady) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentReady) ProtoMessage() {}
+
+func (x *AgentReady) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentReady.ProtoReflect.Descriptor instead.
+func (*AgentReady) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *AgentReady) GetAgentCapabilities() *AgentCapabilities {
+	if x != nil {
+		return x.AgentCapabilities
+	}
+	return nil
+}
+
+func (x *AgentReady) GetAgentSessionId() string {
+	if x != nil {
+		return x.AgentSessionId
+	}
+	return ""
+}
+
+func (x *AgentReady) GetAgentName() string {
+	if x != nil {
+		return x.AgentName
+	}
+	return ""
+}
+
+func (x *AgentReady) GetAgentReportedVersion() string {
+	if x != nil {
+		return x.AgentReportedVersion
+	}
+	return ""
+}
+
 type InputAccepted struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InputId       string                 `protobuf:"bytes,1,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
@@ -629,7 +1377,7 @@ type InputAccepted struct {
 
 func (x *InputAccepted) Reset() {
 	*x = InputAccepted{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[4]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -641,7 +1389,7 @@ func (x *InputAccepted) String() string {
 func (*InputAccepted) ProtoMessage() {}
 
 func (x *InputAccepted) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[4]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -654,7 +1402,7 @@ func (x *InputAccepted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputAccepted.ProtoReflect.Descriptor instead.
 func (*InputAccepted) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{4}
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *InputAccepted) GetInputId() string {
@@ -664,7 +1412,6 @@ func (x *InputAccepted) GetInputId() string {
 	return ""
 }
 
-// The bridge read an inbox message and rejected it.
 type InputRejected struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InputId       string                 `protobuf:"bytes,1,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
@@ -675,7 +1422,7 @@ type InputRejected struct {
 
 func (x *InputRejected) Reset() {
 	*x = InputRejected{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[5]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -687,7 +1434,7 @@ func (x *InputRejected) String() string {
 func (*InputRejected) ProtoMessage() {}
 
 func (x *InputRejected) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[5]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -700,7 +1447,7 @@ func (x *InputRejected) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputRejected.ProtoReflect.Descriptor instead.
 func (*InputRejected) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{5}
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *InputRejected) GetInputId() string {
@@ -717,106 +1464,28 @@ func (x *InputRejected) GetReason() InputRejectionReason {
 	return InputRejectionReason_INPUT_REJECTION_REASON_UNSPECIFIED
 }
 
-// A link to a resource that the agent can read.
-type ResourceLink struct {
+// One chunk of a user message, an agent message or an agent thought.
+type ContentChunk struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Uri           string                 `protobuf:"bytes,1,opt,name=uri,proto3" json:"uri,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Title         string                 `protobuf:"bytes,3,opt,name=title,proto3" json:"title,omitempty"`
-	MimeType      string                 `protobuf:"bytes,4,opt,name=mime_type,json=mimeType,proto3" json:"mime_type,omitempty"`
-	SizeBytes     *int64                 `protobuf:"varint,5,opt,name=size_bytes,json=sizeBytes,proto3,oneof" json:"size_bytes,omitempty"`
+	Content       *ContentBlock          `protobuf:"bytes,1,opt,name=content,proto3" json:"content,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ResourceLink) Reset() {
-	*x = ResourceLink{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[6]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ResourceLink) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ResourceLink) ProtoMessage() {}
-
-func (x *ResourceLink) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[6]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ResourceLink.ProtoReflect.Descriptor instead.
-func (*ResourceLink) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{6}
-}
-
-func (x *ResourceLink) GetUri() string {
-	if x != nil {
-		return x.Uri
-	}
-	return ""
-}
-
-func (x *ResourceLink) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *ResourceLink) GetTitle() string {
-	if x != nil {
-		return x.Title
-	}
-	return ""
-}
-
-func (x *ResourceLink) GetMimeType() string {
-	if x != nil {
-		return x.MimeType
-	}
-	return ""
-}
-
-func (x *ResourceLink) GetSizeBytes() int64 {
-	if x != nil && x.SizeBytes != nil {
-		return *x.SizeBytes
-	}
-	return 0
-}
-
-// An ACP content block that the schema has no case for.
-type UnsupportedContent struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The original ACP JSON.
-	RawJson       string `protobuf:"bytes,1,opt,name=raw_json,json=rawJson,proto3" json:"raw_json,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *UnsupportedContent) Reset() {
-	*x = UnsupportedContent{}
+func (x *ContentChunk) Reset() {
+	*x = ContentChunk{}
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *UnsupportedContent) String() string {
+func (x *ContentChunk) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*UnsupportedContent) ProtoMessage() {}
+func (*ContentChunk) ProtoMessage() {}
 
-func (x *UnsupportedContent) ProtoReflect() protoreflect.Message {
+func (x *ContentChunk) ProtoReflect() protoreflect.Message {
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -828,19 +1497,19 @@ func (x *UnsupportedContent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use UnsupportedContent.ProtoReflect.Descriptor instead.
-func (*UnsupportedContent) Descriptor() ([]byte, []int) {
+// Deprecated: Use ContentChunk.ProtoReflect.Descriptor instead.
+func (*ContentChunk) Descriptor() ([]byte, []int) {
 	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{7}
 }
 
-func (x *UnsupportedContent) GetRawJson() string {
+func (x *ContentChunk) GetContent() *ContentBlock {
 	if x != nil {
-		return x.RawJson
+		return x.Content
 	}
-	return ""
+	return nil
 }
 
-// An ACP content block.
+// One ACP content block.
 type ContentBlock struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Block:
@@ -908,13 +1577,13 @@ func (x *ContentBlock) GetResourceLink() *ResourceLink {
 	return nil
 }
 
-func (x *ContentBlock) GetUnsupported() *UnsupportedContent {
+func (x *ContentBlock) GetUnsupported() string {
 	if x != nil {
 		if x, ok := x.Block.(*ContentBlock_Unsupported); ok {
 			return x.Unsupported
 		}
 	}
-	return nil
+	return ""
 }
 
 type isContentBlock_Block interface {
@@ -922,7 +1591,6 @@ type isContentBlock_Block interface {
 }
 
 type ContentBlock_Text struct {
-	// Markdown text.
 	Text string `protobuf:"bytes,1,opt,name=text,proto3,oneof"`
 }
 
@@ -931,7 +1599,9 @@ type ContentBlock_ResourceLink struct {
 }
 
 type ContentBlock_Unsupported struct {
-	Unsupported *UnsupportedContent `protobuf:"bytes,3,opt,name=unsupported,proto3,oneof"`
+	// The original JSON of a content block without a mapped case (for
+	// example an image).
+	Unsupported string `protobuf:"bytes,3,opt,name=unsupported,proto3,oneof"`
 }
 
 func (*ContentBlock_Text) isContentBlock_Block() {}
@@ -940,28 +1610,32 @@ func (*ContentBlock_ResourceLink) isContentBlock_Block() {}
 
 func (*ContentBlock_Unsupported) isContentBlock_Block() {}
 
-// A part of a user message, an agent message or an agent thought.
-type ContentChunk struct {
+type ResourceLink struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Content       *ContentBlock          `protobuf:"bytes,1,opt,name=content,proto3" json:"content,omitempty"`
+	Uri           string                 `protobuf:"bytes,1,opt,name=uri,proto3" json:"uri,omitempty"`
+	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Title         string                 `protobuf:"bytes,3,opt,name=title,proto3" json:"title,omitempty"`
+	Description   string                 `protobuf:"bytes,4,opt,name=description,proto3" json:"description,omitempty"`
+	MimeType      string                 `protobuf:"bytes,5,opt,name=mime_type,json=mimeType,proto3" json:"mime_type,omitempty"`
+	Size          *int64                 `protobuf:"varint,6,opt,name=size,proto3,oneof" json:"size,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ContentChunk) Reset() {
-	*x = ContentChunk{}
+func (x *ResourceLink) Reset() {
+	*x = ResourceLink{}
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *ContentChunk) String() string {
+func (x *ResourceLink) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*ContentChunk) ProtoMessage() {}
+func (*ResourceLink) ProtoMessage() {}
 
-func (x *ContentChunk) ProtoReflect() protoreflect.Message {
+func (x *ResourceLink) ProtoReflect() protoreflect.Message {
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -973,273 +1647,49 @@ func (x *ContentChunk) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use ContentChunk.ProtoReflect.Descriptor instead.
-func (*ContentChunk) Descriptor() ([]byte, []int) {
+// Deprecated: Use ResourceLink.ProtoReflect.Descriptor instead.
+func (*ResourceLink) Descriptor() ([]byte, []int) {
 	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{9}
 }
 
-func (x *ContentChunk) GetContent() *ContentBlock {
+func (x *ResourceLink) GetUri() string {
 	if x != nil {
-		return x.Content
-	}
-	return nil
-}
-
-// A file change of a tool call.
-type Diff struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Path  string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	// Unset for a new file.
-	OldText       *string `protobuf:"bytes,2,opt,name=old_text,json=oldText,proto3,oneof" json:"old_text,omitempty"`
-	NewText       string  `protobuf:"bytes,3,opt,name=new_text,json=newText,proto3" json:"new_text,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Diff) Reset() {
-	*x = Diff{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[10]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Diff) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Diff) ProtoMessage() {}
-
-func (x *Diff) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[10]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Diff.ProtoReflect.Descriptor instead.
-func (*Diff) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *Diff) GetPath() string {
-	if x != nil {
-		return x.Path
+		return x.Uri
 	}
 	return ""
 }
 
-func (x *Diff) GetOldText() string {
-	if x != nil && x.OldText != nil {
-		return *x.OldText
+func (x *ResourceLink) GetName() string {
+	if x != nil {
+		return x.Name
 	}
 	return ""
 }
 
-func (x *Diff) GetNewText() string {
+func (x *ResourceLink) GetTitle() string {
 	if x != nil {
-		return x.NewText
+		return x.Title
 	}
 	return ""
 }
 
-// A terminal of a tool call.
-type Terminal struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TerminalId    string                 `protobuf:"bytes,1,opt,name=terminal_id,json=terminalId,proto3" json:"terminal_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Terminal) Reset() {
-	*x = Terminal{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[11]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Terminal) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Terminal) ProtoMessage() {}
-
-func (x *Terminal) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[11]
+func (x *ResourceLink) GetDescription() string {
 	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Terminal.ProtoReflect.Descriptor instead.
-func (*Terminal) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{11}
-}
-
-func (x *Terminal) GetTerminalId() string {
-	if x != nil {
-		return x.TerminalId
+		return x.Description
 	}
 	return ""
 }
 
-// One content item of a tool call.
-type ToolCallContent struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Types that are valid to be assigned to Content:
-	//
-	//	*ToolCallContent_Block
-	//	*ToolCallContent_Diff
-	//	*ToolCallContent_Terminal
-	Content       isToolCallContent_Content `protobuf_oneof:"content"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ToolCallContent) Reset() {
-	*x = ToolCallContent{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[12]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ToolCallContent) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ToolCallContent) ProtoMessage() {}
-
-func (x *ToolCallContent) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[12]
+func (x *ResourceLink) GetMimeType() string {
 	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ToolCallContent.ProtoReflect.Descriptor instead.
-func (*ToolCallContent) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{12}
-}
-
-func (x *ToolCallContent) GetContent() isToolCallContent_Content {
-	if x != nil {
-		return x.Content
-	}
-	return nil
-}
-
-func (x *ToolCallContent) GetBlock() *ContentBlock {
-	if x != nil {
-		if x, ok := x.Content.(*ToolCallContent_Block); ok {
-			return x.Block
-		}
-	}
-	return nil
-}
-
-func (x *ToolCallContent) GetDiff() *Diff {
-	if x != nil {
-		if x, ok := x.Content.(*ToolCallContent_Diff); ok {
-			return x.Diff
-		}
-	}
-	return nil
-}
-
-func (x *ToolCallContent) GetTerminal() *Terminal {
-	if x != nil {
-		if x, ok := x.Content.(*ToolCallContent_Terminal); ok {
-			return x.Terminal
-		}
-	}
-	return nil
-}
-
-type isToolCallContent_Content interface {
-	isToolCallContent_Content()
-}
-
-type ToolCallContent_Block struct {
-	Block *ContentBlock `protobuf:"bytes,1,opt,name=block,proto3,oneof"`
-}
-
-type ToolCallContent_Diff struct {
-	Diff *Diff `protobuf:"bytes,2,opt,name=diff,proto3,oneof"`
-}
-
-type ToolCallContent_Terminal struct {
-	Terminal *Terminal `protobuf:"bytes,3,opt,name=terminal,proto3,oneof"`
-}
-
-func (*ToolCallContent_Block) isToolCallContent_Content() {}
-
-func (*ToolCallContent_Diff) isToolCallContent_Content() {}
-
-func (*ToolCallContent_Terminal) isToolCallContent_Content() {}
-
-// A file location that a tool call works on.
-type ToolCallLocation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	Line          *uint32                `protobuf:"varint,2,opt,name=line,proto3,oneof" json:"line,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ToolCallLocation) Reset() {
-	*x = ToolCallLocation{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[13]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ToolCallLocation) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ToolCallLocation) ProtoMessage() {}
-
-func (x *ToolCallLocation) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[13]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ToolCallLocation.ProtoReflect.Descriptor instead.
-func (*ToolCallLocation) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{13}
-}
-
-func (x *ToolCallLocation) GetPath() string {
-	if x != nil {
-		return x.Path
+		return x.MimeType
 	}
 	return ""
 }
 
-func (x *ToolCallLocation) GetLine() uint32 {
-	if x != nil && x.Line != nil {
-		return *x.Line
+func (x *ResourceLink) GetSize() int64 {
+	if x != nil && x.Size != nil {
+		return *x.Size
 	}
 	return 0
 }
@@ -1252,15 +1702,17 @@ type ToolCall struct {
 	Status     ToolCallStatus         `protobuf:"varint,4,opt,name=status,proto3,enum=delino.sandcrew.v1.ToolCallStatus" json:"status,omitempty"`
 	Content    []*ToolCallContent     `protobuf:"bytes,5,rep,name=content,proto3" json:"content,omitempty"`
 	Locations  []*ToolCallLocation    `protobuf:"bytes,6,rep,name=locations,proto3" json:"locations,omitempty"`
-	// JSON text. Agent data: only the session owner reads it.
-	RawInput      string `protobuf:"bytes,7,opt,name=raw_input,json=rawInput,proto3" json:"raw_input,omitempty"`
+	// The original JSON of the tool input.
+	RawInput string `protobuf:"bytes,7,opt,name=raw_input,json=rawInput,proto3" json:"raw_input,omitempty"`
+	// The original JSON of the tool output.
+	RawOutput     string `protobuf:"bytes,8,opt,name=raw_output,json=rawOutput,proto3" json:"raw_output,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ToolCall) Reset() {
 	*x = ToolCall{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[14]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1272,7 +1724,7 @@ func (x *ToolCall) String() string {
 func (*ToolCall) ProtoMessage() {}
 
 func (x *ToolCall) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[14]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1285,7 +1737,7 @@ func (x *ToolCall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCall.ProtoReflect.Descriptor instead.
 func (*ToolCall) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{14}
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ToolCall) GetToolCallId() string {
@@ -1337,94 +1789,11 @@ func (x *ToolCall) GetRawInput() string {
 	return ""
 }
 
-// The complete content of a tool call update, which replaces the content.
-type ToolCallContentList struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Items         []*ToolCallContent     `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ToolCallContentList) Reset() {
-	*x = ToolCallContentList{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[15]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ToolCallContentList) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ToolCallContentList) ProtoMessage() {}
-
-func (x *ToolCallContentList) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[15]
+func (x *ToolCall) GetRawOutput() string {
 	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
+		return x.RawOutput
 	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ToolCallContentList.ProtoReflect.Descriptor instead.
-func (*ToolCallContentList) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{15}
-}
-
-func (x *ToolCallContentList) GetItems() []*ToolCallContent {
-	if x != nil {
-		return x.Items
-	}
-	return nil
-}
-
-// The complete locations of a tool call update, which replace the locations.
-type ToolCallLocationList struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Items         []*ToolCallLocation    `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ToolCallLocationList) Reset() {
-	*x = ToolCallLocationList{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[16]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ToolCallLocationList) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ToolCallLocationList) ProtoMessage() {}
-
-func (x *ToolCallLocationList) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[16]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ToolCallLocationList.ProtoReflect.Descriptor instead.
-func (*ToolCallLocationList) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{16}
-}
-
-func (x *ToolCallLocationList) GetItems() []*ToolCallLocation {
-	if x != nil {
-		return x.Items
-	}
-	return nil
+	return ""
 }
 
 // The changed fields of a tool call. Unset fields keep their value.
@@ -1434,19 +1803,19 @@ type ToolCallUpdate struct {
 	Title      *string                `protobuf:"bytes,2,opt,name=title,proto3,oneof" json:"title,omitempty"`
 	Kind       *ToolKind              `protobuf:"varint,3,opt,name=kind,proto3,enum=delino.sandcrew.v1.ToolKind,oneof" json:"kind,omitempty"`
 	Status     *ToolCallStatus        `protobuf:"varint,4,opt,name=status,proto3,enum=delino.sandcrew.v1.ToolCallStatus,oneof" json:"status,omitempty"`
-	Content    *ToolCallContentList   `protobuf:"bytes,5,opt,name=content,proto3" json:"content,omitempty"`
-	Locations  *ToolCallLocationList  `protobuf:"bytes,6,opt,name=locations,proto3" json:"locations,omitempty"`
-	// JSON text. Agent data: only the session owner reads it.
-	RawInput *string `protobuf:"bytes,7,opt,name=raw_input,json=rawInput,proto3,oneof" json:"raw_input,omitempty"`
-	// JSON text. Agent data: only the session owner reads it.
-	RawOutput     *string `protobuf:"bytes,8,opt,name=raw_output,json=rawOutput,proto3,oneof" json:"raw_output,omitempty"`
+	// When set, replaces the content of the tool call.
+	Content *ToolCallContentList `protobuf:"bytes,5,opt,name=content,proto3" json:"content,omitempty"`
+	// When set, replaces the locations of the tool call.
+	Locations     *ToolCallLocationList `protobuf:"bytes,6,opt,name=locations,proto3" json:"locations,omitempty"`
+	RawInput      *string               `protobuf:"bytes,7,opt,name=raw_input,json=rawInput,proto3,oneof" json:"raw_input,omitempty"`
+	RawOutput     *string               `protobuf:"bytes,8,opt,name=raw_output,json=rawOutput,proto3,oneof" json:"raw_output,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ToolCallUpdate) Reset() {
 	*x = ToolCallUpdate{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[17]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1458,7 +1827,7 @@ func (x *ToolCallUpdate) String() string {
 func (*ToolCallUpdate) ProtoMessage() {}
 
 func (x *ToolCallUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[17]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1471,7 +1840,7 @@ func (x *ToolCallUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCallUpdate.ProtoReflect.Descriptor instead.
 func (*ToolCallUpdate) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{17}
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ToolCallUpdate) GetToolCallId() string {
@@ -1530,6 +1899,396 @@ func (x *ToolCallUpdate) GetRawOutput() string {
 	return ""
 }
 
+type ToolCallContentList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Items         []*ToolCallContent     `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ToolCallContentList) Reset() {
+	*x = ToolCallContentList{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ToolCallContentList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ToolCallContentList) ProtoMessage() {}
+
+func (x *ToolCallContentList) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ToolCallContentList.ProtoReflect.Descriptor instead.
+func (*ToolCallContentList) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *ToolCallContentList) GetItems() []*ToolCallContent {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+type ToolCallLocationList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Items         []*ToolCallLocation    `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ToolCallLocationList) Reset() {
+	*x = ToolCallLocationList{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ToolCallLocationList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ToolCallLocationList) ProtoMessage() {}
+
+func (x *ToolCallLocationList) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ToolCallLocationList.ProtoReflect.Descriptor instead.
+func (*ToolCallLocationList) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ToolCallLocationList) GetItems() []*ToolCallLocation {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+type ToolCallContent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Content:
+	//
+	//	*ToolCallContent_Block
+	//	*ToolCallContent_Diff
+	//	*ToolCallContent_Terminal
+	Content       isToolCallContent_Content `protobuf_oneof:"content"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ToolCallContent) Reset() {
+	*x = ToolCallContent{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ToolCallContent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ToolCallContent) ProtoMessage() {}
+
+func (x *ToolCallContent) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ToolCallContent.ProtoReflect.Descriptor instead.
+func (*ToolCallContent) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ToolCallContent) GetContent() isToolCallContent_Content {
+	if x != nil {
+		return x.Content
+	}
+	return nil
+}
+
+func (x *ToolCallContent) GetBlock() *ContentBlock {
+	if x != nil {
+		if x, ok := x.Content.(*ToolCallContent_Block); ok {
+			return x.Block
+		}
+	}
+	return nil
+}
+
+func (x *ToolCallContent) GetDiff() *Diff {
+	if x != nil {
+		if x, ok := x.Content.(*ToolCallContent_Diff); ok {
+			return x.Diff
+		}
+	}
+	return nil
+}
+
+func (x *ToolCallContent) GetTerminal() *Terminal {
+	if x != nil {
+		if x, ok := x.Content.(*ToolCallContent_Terminal); ok {
+			return x.Terminal
+		}
+	}
+	return nil
+}
+
+type isToolCallContent_Content interface {
+	isToolCallContent_Content()
+}
+
+type ToolCallContent_Block struct {
+	Block *ContentBlock `protobuf:"bytes,1,opt,name=block,proto3,oneof"`
+}
+
+type ToolCallContent_Diff struct {
+	Diff *Diff `protobuf:"bytes,2,opt,name=diff,proto3,oneof"`
+}
+
+type ToolCallContent_Terminal struct {
+	Terminal *Terminal `protobuf:"bytes,3,opt,name=terminal,proto3,oneof"`
+}
+
+func (*ToolCallContent_Block) isToolCallContent_Content() {}
+
+func (*ToolCallContent_Diff) isToolCallContent_Content() {}
+
+func (*ToolCallContent_Terminal) isToolCallContent_Content() {}
+
+// A file change of a tool call.
+type Diff struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Path  string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	// Unset for a new file.
+	OldText       *string `protobuf:"bytes,2,opt,name=old_text,json=oldText,proto3,oneof" json:"old_text,omitempty"`
+	NewText       string  `protobuf:"bytes,3,opt,name=new_text,json=newText,proto3" json:"new_text,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Diff) Reset() {
+	*x = Diff{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Diff) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Diff) ProtoMessage() {}
+
+func (x *Diff) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Diff.ProtoReflect.Descriptor instead.
+func (*Diff) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *Diff) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *Diff) GetOldText() string {
+	if x != nil && x.OldText != nil {
+		return *x.OldText
+	}
+	return ""
+}
+
+func (x *Diff) GetNewText() string {
+	if x != nil {
+		return x.NewText
+	}
+	return ""
+}
+
+// A terminal of the agent that a tool call shows.
+type Terminal struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TerminalId    string                 `protobuf:"bytes,1,opt,name=terminal_id,json=terminalId,proto3" json:"terminal_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Terminal) Reset() {
+	*x = Terminal{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Terminal) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Terminal) ProtoMessage() {}
+
+func (x *Terminal) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Terminal.ProtoReflect.Descriptor instead.
+func (*Terminal) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *Terminal) GetTerminalId() string {
+	if x != nil {
+		return x.TerminalId
+	}
+	return ""
+}
+
+type ToolCallLocation struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	Line          *uint32                `protobuf:"varint,2,opt,name=line,proto3,oneof" json:"line,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ToolCallLocation) Reset() {
+	*x = ToolCallLocation{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ToolCallLocation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ToolCallLocation) ProtoMessage() {}
+
+func (x *ToolCallLocation) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ToolCallLocation.ProtoReflect.Descriptor instead.
+func (*ToolCallLocation) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ToolCallLocation) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *ToolCallLocation) GetLine() uint32 {
+	if x != nil && x.Line != nil {
+		return *x.Line
+	}
+	return 0
+}
+
+// The plan of the agent. Replaces the previous plan.
+type Plan struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Entries       []*PlanEntry           `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Plan) Reset() {
+	*x = Plan{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Plan) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Plan) ProtoMessage() {}
+
+func (x *Plan) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Plan.ProtoReflect.Descriptor instead.
+func (*Plan) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *Plan) GetEntries() []*PlanEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
 type PlanEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Content       string                 `protobuf:"bytes,1,opt,name=content,proto3" json:"content,omitempty"`
@@ -1541,7 +2300,7 @@ type PlanEntry struct {
 
 func (x *PlanEntry) Reset() {
 	*x = PlanEntry{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[18]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1553,7 +2312,7 @@ func (x *PlanEntry) String() string {
 func (*PlanEntry) ProtoMessage() {}
 
 func (x *PlanEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[18]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1566,7 +2325,7 @@ func (x *PlanEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanEntry.ProtoReflect.Descriptor instead.
 func (*PlanEntry) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{18}
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *PlanEntry) GetContent() string {
@@ -1590,124 +2349,21 @@ func (x *PlanEntry) GetStatus() PlanEntryStatus {
 	return PlanEntryStatus_PLAN_ENTRY_STATUS_UNSPECIFIED
 }
 
-// The plan of the agent. It replaces the previous plan.
-type Plan struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Entries       []*PlanEntry           `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Plan) Reset() {
-	*x = Plan{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[19]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Plan) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Plan) ProtoMessage() {}
-
-func (x *Plan) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[19]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Plan.ProtoReflect.Descriptor instead.
-func (*Plan) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{19}
-}
-
-func (x *Plan) GetEntries() []*PlanEntry {
-	if x != nil {
-		return x.Entries
-	}
-	return nil
-}
-
-type PermissionOption struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	OptionId      string                 `protobuf:"bytes,1,opt,name=option_id,json=optionId,proto3" json:"option_id,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Kind          PermissionOptionKind   `protobuf:"varint,3,opt,name=kind,proto3,enum=delino.sandcrew.v1.PermissionOptionKind" json:"kind,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *PermissionOption) Reset() {
-	*x = PermissionOption{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[20]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PermissionOption) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PermissionOption) ProtoMessage() {}
-
-func (x *PermissionOption) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[20]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PermissionOption.ProtoReflect.Descriptor instead.
-func (*PermissionOption) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{20}
-}
-
-func (x *PermissionOption) GetOptionId() string {
-	if x != nil {
-		return x.OptionId
-	}
-	return ""
-}
-
-func (x *PermissionOption) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *PermissionOption) GetKind() PermissionOptionKind {
-	if x != nil {
-		return x.Kind
-	}
-	return PermissionOptionKind_PERMISSION_OPTION_KIND_UNSPECIFIED
-}
-
-// The agent asks for permission to run a tool call.
 type PermissionRequest struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	PermissionRequestId string                 `protobuf:"bytes,1,opt,name=permission_request_id,json=permissionRequestId,proto3" json:"permission_request_id,omitempty"`
-	ToolCallId          string                 `protobuf:"bytes,2,opt,name=tool_call_id,json=toolCallId,proto3" json:"tool_call_id,omitempty"`
-	Options             []*PermissionOption    `protobuf:"bytes,3,rep,name=options,proto3" json:"options,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The bridge assigns a UUID v7 to each request.
+	PermissionRequestId string              `protobuf:"bytes,1,opt,name=permission_request_id,json=permissionRequestId,proto3" json:"permission_request_id,omitempty"`
+	ToolCallId          string              `protobuf:"bytes,2,opt,name=tool_call_id,json=toolCallId,proto3" json:"tool_call_id,omitempty"`
+	Options             []*PermissionOption `protobuf:"bytes,3,rep,name=options,proto3" json:"options,omitempty"`
+	// The tool call details that the agent sent with the request.
+	ToolCall      *ToolCallUpdate `protobuf:"bytes,4,opt,name=tool_call,json=toolCall,proto3" json:"tool_call,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PermissionRequest) Reset() {
 	*x = PermissionRequest{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[21]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1719,7 +2375,7 @@ func (x *PermissionRequest) String() string {
 func (*PermissionRequest) ProtoMessage() {}
 
 func (x *PermissionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[21]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1732,7 +2388,7 @@ func (x *PermissionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionRequest.ProtoReflect.Descriptor instead.
 func (*PermissionRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{21}
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *PermissionRequest) GetPermissionRequestId() string {
@@ -1756,13 +2412,78 @@ func (x *PermissionRequest) GetOptions() []*PermissionOption {
 	return nil
 }
 
-// The answer to a permission request.
+func (x *PermissionRequest) GetToolCall() *ToolCallUpdate {
+	if x != nil {
+		return x.ToolCall
+	}
+	return nil
+}
+
+type PermissionOption struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	OptionId      string                 `protobuf:"bytes,1,opt,name=option_id,json=optionId,proto3" json:"option_id,omitempty"`
+	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Kind          PermissionOptionKind   `protobuf:"varint,3,opt,name=kind,proto3,enum=delino.sandcrew.v1.PermissionOptionKind" json:"kind,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PermissionOption) Reset() {
+	*x = PermissionOption{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PermissionOption) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PermissionOption) ProtoMessage() {}
+
+func (x *PermissionOption) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PermissionOption.ProtoReflect.Descriptor instead.
+func (*PermissionOption) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *PermissionOption) GetOptionId() string {
+	if x != nil {
+		return x.OptionId
+	}
+	return ""
+}
+
+func (x *PermissionOption) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PermissionOption) GetKind() PermissionOptionKind {
+	if x != nil {
+		return x.Kind
+	}
+	return PermissionOptionKind_PERMISSION_OPTION_KIND_UNSPECIFIED
+}
+
 type PermissionResponse struct {
 	state               protoimpl.MessageState `protogen:"open.v1"`
 	PermissionRequestId string                 `protobuf:"bytes,1,opt,name=permission_request_id,json=permissionRequestId,proto3" json:"permission_request_id,omitempty"`
 	Outcome             PermissionOutcome      `protobuf:"varint,2,opt,name=outcome,proto3,enum=delino.sandcrew.v1.PermissionOutcome" json:"outcome,omitempty"`
-	// Set when the outcome is SELECTED.
-	OptionId string `protobuf:"bytes,3,opt,name=option_id,json=optionId,proto3" json:"option_id,omitempty"`
+	OptionId            string                 `protobuf:"bytes,3,opt,name=option_id,json=optionId,proto3" json:"option_id,omitempty"`
 	// True when the bridge answered in AUTO_APPROVE.
 	AutoApproved  bool `protobuf:"varint,4,opt,name=auto_approved,json=autoApproved,proto3" json:"auto_approved,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -1871,67 +2592,6 @@ func (x *TurnEnded) GetStopReason() StopReason {
 	return StopReason_STOP_REASON_UNSPECIFIED
 }
 
-// A mode that the agent advertises.
-type SessionMode struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ModeId        string                 `protobuf:"bytes,1,opt,name=mode_id,json=modeId,proto3" json:"mode_id,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Description   string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *SessionMode) Reset() {
-	*x = SessionMode{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[24]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *SessionMode) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*SessionMode) ProtoMessage() {}
-
-func (x *SessionMode) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[24]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use SessionMode.ProtoReflect.Descriptor instead.
-func (*SessionMode) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{24}
-}
-
-func (x *SessionMode) GetModeId() string {
-	if x != nil {
-		return x.ModeId
-	}
-	return ""
-}
-
-func (x *SessionMode) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *SessionMode) GetDescription() string {
-	if x != nil {
-		return x.Description
-	}
-	return ""
-}
-
 type ModeChanged struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	CurrentModeId  string                 `protobuf:"bytes,1,opt,name=current_mode_id,json=currentModeId,proto3" json:"current_mode_id,omitempty"`
@@ -1943,7 +2603,7 @@ type ModeChanged struct {
 
 func (x *ModeChanged) Reset() {
 	*x = ModeChanged{}
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[25]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1955,7 +2615,7 @@ func (x *ModeChanged) String() string {
 func (*ModeChanged) ProtoMessage() {}
 
 func (x *ModeChanged) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[25]
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1968,7 +2628,7 @@ func (x *ModeChanged) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModeChanged.ProtoReflect.Descriptor instead.
 func (*ModeChanged) Descriptor() ([]byte, []int) {
-	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{25}
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ModeChanged) GetCurrentModeId() string {
@@ -1992,30 +2652,87 @@ func (x *ModeChanged) GetPermissionMode() PermissionMode {
 	return PermissionMode_PERMISSION_MODE_UNSPECIFIED
 }
 
-// One value of a configuration option.
-type ConfigOptionValue struct {
+type SessionMode struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	ValueId       string                 `protobuf:"bytes,1,opt,name=value_id,json=valueId,proto3" json:"value_id,omitempty"`
+	ModeId        string                 `protobuf:"bytes,1,opt,name=mode_id,json=modeId,proto3" json:"mode_id,omitempty"`
 	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	Description   string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ConfigOptionValue) Reset() {
-	*x = ConfigOptionValue{}
+func (x *SessionMode) Reset() {
+	*x = SessionMode{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionMode) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionMode) ProtoMessage() {}
+
+func (x *SessionMode) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionMode.ProtoReflect.Descriptor instead.
+func (*SessionMode) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *SessionMode) GetModeId() string {
+	if x != nil {
+		return x.ModeId
+	}
+	return ""
+}
+
+func (x *SessionMode) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SessionMode) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+type ConfigOptions struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Options       []*ConfigOption        `protobuf:"bytes,1,rep,name=options,proto3" json:"options,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfigOptions) Reset() {
+	*x = ConfigOptions{}
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *ConfigOptionValue) String() string {
+func (x *ConfigOptions) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*ConfigOptionValue) ProtoMessage() {}
+func (*ConfigOptions) ProtoMessage() {}
 
-func (x *ConfigOptionValue) ProtoReflect() protoreflect.Message {
+func (x *ConfigOptions) ProtoReflect() protoreflect.Message {
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2027,41 +2744,26 @@ func (x *ConfigOptionValue) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use ConfigOptionValue.ProtoReflect.Descriptor instead.
-func (*ConfigOptionValue) Descriptor() ([]byte, []int) {
+// Deprecated: Use ConfigOptions.ProtoReflect.Descriptor instead.
+func (*ConfigOptions) Descriptor() ([]byte, []int) {
 	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{26}
 }
 
-func (x *ConfigOptionValue) GetValueId() string {
+func (x *ConfigOptions) GetOptions() []*ConfigOption {
 	if x != nil {
-		return x.ValueId
+		return x.Options
 	}
-	return ""
+	return nil
 }
 
-func (x *ConfigOptionValue) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *ConfigOptionValue) GetDescription() string {
-	if x != nil {
-		return x.Description
-	}
-	return ""
-}
-
-// A session configuration option that the agent advertises, for example the
-// model.
 type ConfigOption struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	ConfigOptionId string                 `protobuf:"bytes,1,opt,name=config_option_id,json=configOptionId,proto3" json:"config_option_id,omitempty"`
 	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Category       ConfigOptionCategory   `protobuf:"varint,3,opt,name=category,proto3,enum=delino.sandcrew.v1.ConfigOptionCategory" json:"category,omitempty"`
-	CurrentValueId string                 `protobuf:"bytes,4,opt,name=current_value_id,json=currentValueId,proto3" json:"current_value_id,omitempty"`
-	Values         []*ConfigOptionValue   `protobuf:"bytes,5,rep,name=values,proto3" json:"values,omitempty"`
+	Description    string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
+	Category       ConfigOptionCategory   `protobuf:"varint,4,opt,name=category,proto3,enum=delino.sandcrew.v1.ConfigOptionCategory" json:"category,omitempty"`
+	CurrentValueId string                 `protobuf:"bytes,5,opt,name=current_value_id,json=currentValueId,proto3" json:"current_value_id,omitempty"`
+	Values         []*ConfigOptionValue   `protobuf:"bytes,6,rep,name=values,proto3" json:"values,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -2110,6 +2812,13 @@ func (x *ConfigOption) GetName() string {
 	return ""
 }
 
+func (x *ConfigOption) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
 func (x *ConfigOption) GetCategory() ConfigOptionCategory {
 	if x != nil {
 		return x.Category
@@ -2131,27 +2840,29 @@ func (x *ConfigOption) GetValues() []*ConfigOptionValue {
 	return nil
 }
 
-type ConfigOptions struct {
+type ConfigOptionValue struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Options       []*ConfigOption        `protobuf:"bytes,1,rep,name=options,proto3" json:"options,omitempty"`
+	ValueId       string                 `protobuf:"bytes,1,opt,name=value_id,json=valueId,proto3" json:"value_id,omitempty"`
+	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Description   string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ConfigOptions) Reset() {
-	*x = ConfigOptions{}
+func (x *ConfigOptionValue) Reset() {
+	*x = ConfigOptionValue{}
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *ConfigOptions) String() string {
+func (x *ConfigOptionValue) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*ConfigOptions) ProtoMessage() {}
+func (*ConfigOptionValue) ProtoMessage() {}
 
-func (x *ConfigOptions) ProtoReflect() protoreflect.Message {
+func (x *ConfigOptionValue) ProtoReflect() protoreflect.Message {
 	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2163,16 +2874,30 @@ func (x *ConfigOptions) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use ConfigOptions.ProtoReflect.Descriptor instead.
-func (*ConfigOptions) Descriptor() ([]byte, []int) {
+// Deprecated: Use ConfigOptionValue.ProtoReflect.Descriptor instead.
+func (*ConfigOptionValue) Descriptor() ([]byte, []int) {
 	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{28}
 }
 
-func (x *ConfigOptions) GetOptions() []*ConfigOption {
+func (x *ConfigOptionValue) GetValueId() string {
 	if x != nil {
-		return x.Options
+		return x.ValueId
 	}
-	return nil
+	return ""
+}
+
+func (x *ConfigOptionValue) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ConfigOptionValue) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
 }
 
 type AgentSessionState struct {
@@ -2222,7 +2947,7 @@ func (x *AgentSessionState) GetState() AgentActivity {
 type BridgeError struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Kind  BridgeErrorKind        `protobuf:"varint,1,opt,name=kind,proto3,enum=delino.sandcrew.v1.BridgeErrorKind" json:"kind,omitempty"`
-	// Never contains secrets, prompts or agent output.
+	// A message without secrets, prompts or agent output.
 	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2272,13 +2997,14 @@ func (x *BridgeError) GetMessage() string {
 	return ""
 }
 
+// The agent process ended.
 type AgentExited struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Types that are valid to be assigned to Status:
+	// Types that are valid to be assigned to Result:
 	//
 	//	*AgentExited_ExitCode
 	//	*AgentExited_Signal
-	Status        isAgentExited_Status `protobuf_oneof:"status"`
+	Result        isAgentExited_Result `protobuf_oneof:"result"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2313,16 +3039,16 @@ func (*AgentExited) Descriptor() ([]byte, []int) {
 	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{31}
 }
 
-func (x *AgentExited) GetStatus() isAgentExited_Status {
+func (x *AgentExited) GetResult() isAgentExited_Result {
 	if x != nil {
-		return x.Status
+		return x.Result
 	}
 	return nil
 }
 
 func (x *AgentExited) GetExitCode() int32 {
 	if x != nil {
-		if x, ok := x.Status.(*AgentExited_ExitCode); ok {
+		if x, ok := x.Result.(*AgentExited_ExitCode); ok {
 			return x.ExitCode
 		}
 	}
@@ -2331,15 +3057,15 @@ func (x *AgentExited) GetExitCode() int32 {
 
 func (x *AgentExited) GetSignal() string {
 	if x != nil {
-		if x, ok := x.Status.(*AgentExited_Signal); ok {
+		if x, ok := x.Result.(*AgentExited_Signal); ok {
 			return x.Signal
 		}
 	}
 	return ""
 }
 
-type isAgentExited_Status interface {
-	isAgentExited_Status()
+type isAgentExited_Result interface {
+	isAgentExited_Result()
 }
 
 type AgentExited_ExitCode struct {
@@ -2347,14 +3073,15 @@ type AgentExited_ExitCode struct {
 }
 
 type AgentExited_Signal struct {
+	// The name of the signal that ended the process.
 	Signal string `protobuf:"bytes,2,opt,name=signal,proto3,oneof"`
 }
 
-func (*AgentExited_ExitCode) isAgentExited_Status() {}
+func (*AgentExited_ExitCode) isAgentExited_Result() {}
 
-func (*AgentExited_Signal) isAgentExited_Status() {}
+func (*AgentExited_Signal) isAgentExited_Result() {}
 
-// The agent changed its credential file. It carries no credential content.
+// A credential file changed in the guest. Carries no credential content.
 type CredentialUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Kind          VendorCredentialKind   `protobuf:"varint,1,opt,name=kind,proto3,enum=delino.sandcrew.v1.VendorCredentialKind" json:"kind,omitempty"`
@@ -2407,12 +3134,12 @@ func (x *CredentialUpdate) GetRevision() uint64 {
 	return 0
 }
 
-// An ACP session update without a case in BridgeEvent.
+// An ACP session update without a mapped case.
 type UnknownUpdate struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The ACP `sessionUpdate` value.
 	SessionUpdate string `protobuf:"bytes,1,opt,name=session_update,json=sessionUpdate,proto3" json:"session_update,omitempty"`
-	// The original ACP update. Agent data: only the session owner reads it.
+	// The original JSON of the update.
 	RawJson       string `protobuf:"bytes,2,opt,name=raw_json,json=rawJson,proto3" json:"raw_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2462,10 +3189,10 @@ func (x *UnknownUpdate) GetRawJson() string {
 	return ""
 }
 
-// One input that the control plane writes as a file into the guest inbox.
+// One input of the control plane, written as one inbox file.
 type BridgeInput struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// UUID v7.
+	// UUID v7; also the inbox file name.
 	InputId    string                 `protobuf:"bytes,1,opt,name=input_id,json=inputId,proto3" json:"input_id,omitempty"`
 	CreateTime *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=create_time,json=createTime,proto3" json:"create_time,omitempty"`
 	// Types that are valid to be assigned to Input:
@@ -2613,7 +3340,8 @@ func (*BridgeInput_SetConfigOption) isBridgeInput_Input() {}
 type PromptInput struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Text  string                 `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"`
-	// A guest path, for the previous transcript file.
+	// A guest path that the prompt text mentions (the previous transcript
+	// file). The bridge does not read it.
 	AttachmentPath *string `protobuf:"bytes,2,opt,name=attachment_path,json=attachmentPath,proto3,oneof" json:"attachment_path,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -2753,11 +3481,11 @@ func (*CancelTurnInput) Descriptor() ([]byte, []int) {
 
 type SetModeInput struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Types that are valid to be assigned to Mode:
+	// Types that are valid to be assigned to Target:
 	//
 	//	*SetModeInput_ModeId
 	//	*SetModeInput_PermissionMode
-	Mode          isSetModeInput_Mode `protobuf_oneof:"mode"`
+	Target        isSetModeInput_Target `protobuf_oneof:"target"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2792,16 +3520,16 @@ func (*SetModeInput) Descriptor() ([]byte, []int) {
 	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{38}
 }
 
-func (x *SetModeInput) GetMode() isSetModeInput_Mode {
+func (x *SetModeInput) GetTarget() isSetModeInput_Target {
 	if x != nil {
-		return x.Mode
+		return x.Target
 	}
 	return nil
 }
 
 func (x *SetModeInput) GetModeId() string {
 	if x != nil {
-		if x, ok := x.Mode.(*SetModeInput_ModeId); ok {
+		if x, ok := x.Target.(*SetModeInput_ModeId); ok {
 			return x.ModeId
 		}
 	}
@@ -2810,18 +3538,19 @@ func (x *SetModeInput) GetModeId() string {
 
 func (x *SetModeInput) GetPermissionMode() PermissionMode {
 	if x != nil {
-		if x, ok := x.Mode.(*SetModeInput_PermissionMode); ok {
+		if x, ok := x.Target.(*SetModeInput_PermissionMode); ok {
 			return x.PermissionMode
 		}
 	}
 	return PermissionMode_PERMISSION_MODE_UNSPECIFIED
 }
 
-type isSetModeInput_Mode interface {
-	isSetModeInput_Mode()
+type isSetModeInput_Target interface {
+	isSetModeInput_Target()
 }
 
 type SetModeInput_ModeId struct {
+	// An agent mode ID.
 	ModeId string `protobuf:"bytes,1,opt,name=mode_id,json=modeId,proto3,oneof"`
 }
 
@@ -2829,9 +3558,9 @@ type SetModeInput_PermissionMode struct {
 	PermissionMode PermissionMode `protobuf:"varint,2,opt,name=permission_mode,json=permissionMode,proto3,enum=delino.sandcrew.v1.PermissionMode,oneof"`
 }
 
-func (*SetModeInput_ModeId) isSetModeInput_Mode() {}
+func (*SetModeInput_ModeId) isSetModeInput_Target() {}
 
-func (*SetModeInput_PermissionMode) isSetModeInput_Mode() {}
+func (*SetModeInput_PermissionMode) isSetModeInput_Target() {}
 
 type SetConfigOptionInput struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -2885,11 +3614,151 @@ func (x *SetConfigOptionInput) GetValueId() string {
 	return ""
 }
 
+// The start configuration that the control plane writes as `start.json`.
+type BridgeStartConfig struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Vendor    AgentVendor            `protobuf:"varint,2,opt,name=vendor,proto3,enum=delino.sandcrew.v1.AgentVendor" json:"vendor,omitempty"`
+	// The kind of the vendor credential that the session uses.
+	CredentialKind VendorCredentialKind `protobuf:"varint,3,opt,name=credential_kind,json=credentialKind,proto3,enum=delino.sandcrew.v1.VendorCredentialKind" json:"credential_kind,omitempty"`
+	PermissionMode PermissionMode       `protobuf:"varint,4,opt,name=permission_mode,json=permissionMode,proto3,enum=delino.sandcrew.v1.PermissionMode" json:"permission_mode,omitempty"`
+	// The agent mode to apply at start; empty keeps the agent's default.
+	ModeId string `protobuf:"bytes,5,opt,name=mode_id,json=modeId,proto3" json:"mode_id,omitempty"`
+	// Configuration option values to apply at start.
+	ConfigOptions []*ConfigOptionSelection `protobuf:"bytes,6,rep,name=config_options,json=configOptions,proto3" json:"config_options,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BridgeStartConfig) Reset() {
+	*x = BridgeStartConfig{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BridgeStartConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BridgeStartConfig) ProtoMessage() {}
+
+func (x *BridgeStartConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BridgeStartConfig.ProtoReflect.Descriptor instead.
+func (*BridgeStartConfig) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *BridgeStartConfig) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *BridgeStartConfig) GetVendor() AgentVendor {
+	if x != nil {
+		return x.Vendor
+	}
+	return AgentVendor_AGENT_VENDOR_UNSPECIFIED
+}
+
+func (x *BridgeStartConfig) GetCredentialKind() VendorCredentialKind {
+	if x != nil {
+		return x.CredentialKind
+	}
+	return VendorCredentialKind_VENDOR_CREDENTIAL_KIND_UNSPECIFIED
+}
+
+func (x *BridgeStartConfig) GetPermissionMode() PermissionMode {
+	if x != nil {
+		return x.PermissionMode
+	}
+	return PermissionMode_PERMISSION_MODE_UNSPECIFIED
+}
+
+func (x *BridgeStartConfig) GetModeId() string {
+	if x != nil {
+		return x.ModeId
+	}
+	return ""
+}
+
+func (x *BridgeStartConfig) GetConfigOptions() []*ConfigOptionSelection {
+	if x != nil {
+		return x.ConfigOptions
+	}
+	return nil
+}
+
+type ConfigOptionSelection struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ConfigOptionId string                 `protobuf:"bytes,1,opt,name=config_option_id,json=configOptionId,proto3" json:"config_option_id,omitempty"`
+	ValueId        string                 `protobuf:"bytes,2,opt,name=value_id,json=valueId,proto3" json:"value_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ConfigOptionSelection) Reset() {
+	*x = ConfigOptionSelection{}
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfigOptionSelection) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfigOptionSelection) ProtoMessage() {}
+
+func (x *ConfigOptionSelection) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandcrew_v1_bridge_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfigOptionSelection.ProtoReflect.Descriptor instead.
+func (*ConfigOptionSelection) Descriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_bridge_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *ConfigOptionSelection) GetConfigOptionId() string {
+	if x != nil {
+		return x.ConfigOptionId
+	}
+	return ""
+}
+
+func (x *ConfigOptionSelection) GetValueId() string {
+	if x != nil {
+		return x.ValueId
+	}
+	return ""
+}
+
 var File_delino_sandcrew_v1_bridge_proto protoreflect.FileDescriptor
 
 const file_delino_sandcrew_v1_bridge_proto_rawDesc = "" +
 	"\n" +
-	"\x1fdelino/sandcrew/v1/bridge.proto\x12\x12delino.sandcrew.v1\x1a\x1fdelino/sandcrew/v1/common.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x90\f\n" +
+	"\x1fdelino/sandcrew/v1/bridge.proto\x12\x12delino.sandcrew.v1\x1a\x1fdelino/sandcrew/v1/common.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd3\f\n" +
 	"\vBridgeEvent\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12$\n" +
 	"\x0elog_end_offset\x18\x02 \x01(\x04R\flogEndOffset\x12.\n" +
@@ -2914,62 +3783,51 @@ const file_delino_sandcrew_v1_bridge_proto_rawDesc = "" +
 	"\fbridge_error\x18\x19 \x01(\v2\x1f.delino.sandcrew.v1.BridgeErrorH\x00R\vbridgeError\x12D\n" +
 	"\fagent_exited\x18\x1a \x01(\v2\x1f.delino.sandcrew.v1.AgentExitedH\x00R\vagentExited\x12S\n" +
 	"\x11credential_update\x18\x1b \x01(\v2$.delino.sandcrew.v1.CredentialUpdateH\x00R\x10credentialUpdate\x12J\n" +
-	"\x0eunknown_update\x18\x1c \x01(\v2!.delino.sandcrew.v1.UnknownUpdateH\x00R\runknownUpdateB\a\n" +
+	"\x0eunknown_update\x18\x1c \x01(\v2!.delino.sandcrew.v1.UnknownUpdateH\x00R\runknownUpdate\x12A\n" +
+	"\vagent_ready\x18\x1d \x01(\v2\x1e.delino.sandcrew.v1.AgentReadyH\x00R\n" +
+	"agentReadyB\a\n" +
 	"\x05event\"=\n" +
 	"\x0fProtocolVersion\x12\x14\n" +
 	"\x05major\x18\x01 \x01(\rR\x05major\x12\x14\n" +
 	"\x05minor\x18\x02 \x01(\rR\x05minor\"]\n" +
 	"\x11AgentCapabilities\x12!\n" +
 	"\fload_session\x18\x01 \x01(\bR\vloadSession\x12%\n" +
-	"\x0eresume_session\x18\x02 \x01(\bR\rresumeSession\"\xc4\x03\n" +
+	"\x0eresume_session\x18\x02 \x01(\bR\rresumeSession\"\xee\x02\n" +
 	"\vBridgeHello\x12%\n" +
 	"\x0ebridge_version\x18\x01 \x01(\tR\rbridgeVersion\x12N\n" +
 	"\x10protocol_version\x18\x02 \x01(\v2#.delino.sandcrew.v1.ProtocolVersionR\x0fprotocolVersion\x127\n" +
 	"\x06vendor\x18\x03 \x01(\x0e2\x1f.delino.sandcrew.v1.AgentVendorR\x06vendor\x12#\n" +
 	"\ragent_version\x18\x04 \x01(\tR\fagentVersion\x12'\n" +
 	"\x0fadapter_version\x18\x05 \x01(\tR\x0eadapterVersion\x126\n" +
-	"\bguest_os\x18\x06 \x01(\x0e2\x1b.delino.sandcrew.v1.GuestOsR\aguestOs\x12T\n" +
-	"\x12agent_capabilities\x18\a \x01(\v2%.delino.sandcrew.v1.AgentCapabilitiesR\x11agentCapabilities\x12)\n" +
-	"\x10wrapped_headless\x18\b \x01(\bR\x0fwrappedHeadless\"*\n" +
+	"\bguest_os\x18\x06 \x01(\x0e2\x1b.delino.sandcrew.v1.GuestOsR\aguestOs\x12)\n" +
+	"\x10wrapped_headless\x18\a \x01(\bR\x0fwrappedHeadless\"\xe1\x01\n" +
+	"\n" +
+	"AgentReady\x12T\n" +
+	"\x12agent_capabilities\x18\x01 \x01(\v2%.delino.sandcrew.v1.AgentCapabilitiesR\x11agentCapabilities\x12(\n" +
+	"\x10agent_session_id\x18\x02 \x01(\tR\x0eagentSessionId\x12\x1d\n" +
+	"\n" +
+	"agent_name\x18\x03 \x01(\tR\tagentName\x124\n" +
+	"\x16agent_reported_version\x18\x04 \x01(\tR\x14agentReportedVersion\"*\n" +
 	"\rInputAccepted\x12\x19\n" +
 	"\binput_id\x18\x01 \x01(\tR\ainputId\"l\n" +
 	"\rInputRejected\x12\x19\n" +
 	"\binput_id\x18\x01 \x01(\tR\ainputId\x12@\n" +
-	"\x06reason\x18\x02 \x01(\x0e2(.delino.sandcrew.v1.InputRejectionReasonR\x06reason\"\x9a\x01\n" +
+	"\x06reason\x18\x02 \x01(\x0e2(.delino.sandcrew.v1.InputRejectionReasonR\x06reason\"J\n" +
+	"\fContentChunk\x12:\n" +
+	"\acontent\x18\x01 \x01(\v2 .delino.sandcrew.v1.ContentBlockR\acontent\"\x9a\x01\n" +
+	"\fContentBlock\x12\x14\n" +
+	"\x04text\x18\x01 \x01(\tH\x00R\x04text\x12G\n" +
+	"\rresource_link\x18\x02 \x01(\v2 .delino.sandcrew.v1.ResourceLinkH\x00R\fresourceLink\x12\"\n" +
+	"\vunsupported\x18\x03 \x01(\tH\x00R\vunsupportedB\a\n" +
+	"\x05block\"\xab\x01\n" +
 	"\fResourceLink\x12\x10\n" +
 	"\x03uri\x18\x01 \x01(\tR\x03uri\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
-	"\x05title\x18\x03 \x01(\tR\x05title\x12\x1b\n" +
-	"\tmime_type\x18\x04 \x01(\tR\bmimeType\x12\"\n" +
-	"\n" +
-	"size_bytes\x18\x05 \x01(\x03H\x00R\tsizeBytes\x88\x01\x01B\r\n" +
-	"\v_size_bytes\"/\n" +
-	"\x12UnsupportedContent\x12\x19\n" +
-	"\braw_json\x18\x01 \x01(\tR\arawJson\"\xc2\x01\n" +
-	"\fContentBlock\x12\x14\n" +
-	"\x04text\x18\x01 \x01(\tH\x00R\x04text\x12G\n" +
-	"\rresource_link\x18\x02 \x01(\v2 .delino.sandcrew.v1.ResourceLinkH\x00R\fresourceLink\x12J\n" +
-	"\vunsupported\x18\x03 \x01(\v2&.delino.sandcrew.v1.UnsupportedContentH\x00R\vunsupportedB\a\n" +
-	"\x05block\"J\n" +
-	"\fContentChunk\x12:\n" +
-	"\acontent\x18\x01 \x01(\v2 .delino.sandcrew.v1.ContentBlockR\acontent\"b\n" +
-	"\x04Diff\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1e\n" +
-	"\bold_text\x18\x02 \x01(\tH\x00R\aoldText\x88\x01\x01\x12\x19\n" +
-	"\bnew_text\x18\x03 \x01(\tR\anewTextB\v\n" +
-	"\t_old_text\"+\n" +
-	"\bTerminal\x12\x1f\n" +
-	"\vterminal_id\x18\x01 \x01(\tR\n" +
-	"terminalId\"\xc2\x01\n" +
-	"\x0fToolCallContent\x128\n" +
-	"\x05block\x18\x01 \x01(\v2 .delino.sandcrew.v1.ContentBlockH\x00R\x05block\x12.\n" +
-	"\x04diff\x18\x02 \x01(\v2\x18.delino.sandcrew.v1.DiffH\x00R\x04diff\x12:\n" +
-	"\bterminal\x18\x03 \x01(\v2\x1c.delino.sandcrew.v1.TerminalH\x00R\bterminalB\t\n" +
-	"\acontent\"H\n" +
-	"\x10ToolCallLocation\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\x12\x17\n" +
-	"\x04line\x18\x02 \x01(\rH\x00R\x04line\x88\x01\x01B\a\n" +
-	"\x05_line\"\xd0\x02\n" +
+	"\x05title\x18\x03 \x01(\tR\x05title\x12 \n" +
+	"\vdescription\x18\x04 \x01(\tR\vdescription\x12\x1b\n" +
+	"\tmime_type\x18\x05 \x01(\tR\bmimeType\x12\x17\n" +
+	"\x04size\x18\x06 \x01(\x03H\x00R\x04size\x88\x01\x01B\a\n" +
+	"\x05_size\"\xef\x02\n" +
 	"\bToolCall\x12 \n" +
 	"\ftool_call_id\x18\x01 \x01(\tR\n" +
 	"toolCallId\x12\x14\n" +
@@ -2978,11 +3836,9 @@ const file_delino_sandcrew_v1_bridge_proto_rawDesc = "" +
 	"\x06status\x18\x04 \x01(\x0e2\".delino.sandcrew.v1.ToolCallStatusR\x06status\x12=\n" +
 	"\acontent\x18\x05 \x03(\v2#.delino.sandcrew.v1.ToolCallContentR\acontent\x12B\n" +
 	"\tlocations\x18\x06 \x03(\v2$.delino.sandcrew.v1.ToolCallLocationR\tlocations\x12\x1b\n" +
-	"\traw_input\x18\a \x01(\tR\brawInput\"P\n" +
-	"\x13ToolCallContentList\x129\n" +
-	"\x05items\x18\x01 \x03(\v2#.delino.sandcrew.v1.ToolCallContentR\x05items\"R\n" +
-	"\x14ToolCallLocationList\x12:\n" +
-	"\x05items\x18\x01 \x03(\v2$.delino.sandcrew.v1.ToolCallLocationR\x05items\"\xd1\x03\n" +
+	"\traw_input\x18\a \x01(\tR\brawInput\x12\x1d\n" +
+	"\n" +
+	"raw_output\x18\b \x01(\tR\trawOutput\"\xd1\x03\n" +
 	"\x0eToolCallUpdate\x12 \n" +
 	"\ftool_call_id\x18\x01 \x01(\tR\n" +
 	"toolCallId\x12\x19\n" +
@@ -2999,22 +3855,44 @@ const file_delino_sandcrew_v1_bridge_proto_rawDesc = "" +
 	"\a_statusB\f\n" +
 	"\n" +
 	"_raw_inputB\r\n" +
-	"\v_raw_output\"\xa5\x01\n" +
+	"\v_raw_output\"P\n" +
+	"\x13ToolCallContentList\x129\n" +
+	"\x05items\x18\x01 \x03(\v2#.delino.sandcrew.v1.ToolCallContentR\x05items\"R\n" +
+	"\x14ToolCallLocationList\x12:\n" +
+	"\x05items\x18\x01 \x03(\v2$.delino.sandcrew.v1.ToolCallLocationR\x05items\"\xc2\x01\n" +
+	"\x0fToolCallContent\x128\n" +
+	"\x05block\x18\x01 \x01(\v2 .delino.sandcrew.v1.ContentBlockH\x00R\x05block\x12.\n" +
+	"\x04diff\x18\x02 \x01(\v2\x18.delino.sandcrew.v1.DiffH\x00R\x04diff\x12:\n" +
+	"\bterminal\x18\x03 \x01(\v2\x1c.delino.sandcrew.v1.TerminalH\x00R\bterminalB\t\n" +
+	"\acontent\"b\n" +
+	"\x04Diff\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1e\n" +
+	"\bold_text\x18\x02 \x01(\tH\x00R\aoldText\x88\x01\x01\x12\x19\n" +
+	"\bnew_text\x18\x03 \x01(\tR\anewTextB\v\n" +
+	"\t_old_text\"+\n" +
+	"\bTerminal\x12\x1f\n" +
+	"\vterminal_id\x18\x01 \x01(\tR\n" +
+	"terminalId\"H\n" +
+	"\x10ToolCallLocation\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x17\n" +
+	"\x04line\x18\x02 \x01(\rH\x00R\x04line\x88\x01\x01B\a\n" +
+	"\x05_line\"?\n" +
+	"\x04Plan\x127\n" +
+	"\aentries\x18\x01 \x03(\v2\x1d.delino.sandcrew.v1.PlanEntryR\aentries\"\xa5\x01\n" +
 	"\tPlanEntry\x12\x18\n" +
 	"\acontent\x18\x01 \x01(\tR\acontent\x12A\n" +
 	"\bpriority\x18\x02 \x01(\x0e2%.delino.sandcrew.v1.PlanEntryPriorityR\bpriority\x12;\n" +
-	"\x06status\x18\x03 \x01(\x0e2#.delino.sandcrew.v1.PlanEntryStatusR\x06status\"?\n" +
-	"\x04Plan\x127\n" +
-	"\aentries\x18\x01 \x03(\v2\x1d.delino.sandcrew.v1.PlanEntryR\aentries\"\x81\x01\n" +
-	"\x10PermissionOption\x12\x1b\n" +
-	"\toption_id\x18\x01 \x01(\tR\boptionId\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\x12<\n" +
-	"\x04kind\x18\x03 \x01(\x0e2(.delino.sandcrew.v1.PermissionOptionKindR\x04kind\"\xa9\x01\n" +
+	"\x06status\x18\x03 \x01(\x0e2#.delino.sandcrew.v1.PlanEntryStatusR\x06status\"\xea\x01\n" +
 	"\x11PermissionRequest\x122\n" +
 	"\x15permission_request_id\x18\x01 \x01(\tR\x13permissionRequestId\x12 \n" +
 	"\ftool_call_id\x18\x02 \x01(\tR\n" +
 	"toolCallId\x12>\n" +
-	"\aoptions\x18\x03 \x03(\v2$.delino.sandcrew.v1.PermissionOptionR\aoptions\"\xcb\x01\n" +
+	"\aoptions\x18\x03 \x03(\v2$.delino.sandcrew.v1.PermissionOptionR\aoptions\x12?\n" +
+	"\ttool_call\x18\x04 \x01(\v2\".delino.sandcrew.v1.ToolCallUpdateR\btoolCall\"\x81\x01\n" +
+	"\x10PermissionOption\x12\x1b\n" +
+	"\toption_id\x18\x01 \x01(\tR\boptionId\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12<\n" +
+	"\x04kind\x18\x03 \x01(\x0e2(.delino.sandcrew.v1.PermissionOptionKindR\x04kind\"\xcb\x01\n" +
 	"\x12PermissionResponse\x122\n" +
 	"\x15permission_request_id\x18\x01 \x01(\tR\x13permissionRequestId\x12?\n" +
 	"\aoutcome\x18\x02 \x01(\x0e2%.delino.sandcrew.v1.PermissionOutcomeR\aoutcome\x12\x1b\n" +
@@ -3022,27 +3900,28 @@ const file_delino_sandcrew_v1_bridge_proto_rawDesc = "" +
 	"\rauto_approved\x18\x04 \x01(\bR\fautoApproved\"L\n" +
 	"\tTurnEnded\x12?\n" +
 	"\vstop_reason\x18\x01 \x01(\x0e2\x1e.delino.sandcrew.v1.StopReasonR\n" +
-	"stopReason\"\\\n" +
-	"\vSessionMode\x12\x17\n" +
-	"\amode_id\x18\x01 \x01(\tR\x06modeId\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
-	"\vdescription\x18\x03 \x01(\tR\vdescription\"\xcc\x01\n" +
+	"stopReason\"\xcc\x01\n" +
 	"\vModeChanged\x12&\n" +
 	"\x0fcurrent_mode_id\x18\x01 \x01(\tR\rcurrentModeId\x12H\n" +
 	"\x0favailable_modes\x18\x02 \x03(\v2\x1f.delino.sandcrew.v1.SessionModeR\x0eavailableModes\x12K\n" +
-	"\x0fpermission_mode\x18\x03 \x01(\x0e2\".delino.sandcrew.v1.PermissionModeR\x0epermissionMode\"d\n" +
+	"\x0fpermission_mode\x18\x03 \x01(\x0e2\".delino.sandcrew.v1.PermissionModeR\x0epermissionMode\"\\\n" +
+	"\vSessionMode\x12\x17\n" +
+	"\amode_id\x18\x01 \x01(\tR\x06modeId\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\"K\n" +
+	"\rConfigOptions\x12:\n" +
+	"\aoptions\x18\x01 \x03(\v2 .delino.sandcrew.v1.ConfigOptionR\aoptions\"\x9d\x02\n" +
+	"\fConfigOption\x12(\n" +
+	"\x10config_option_id\x18\x01 \x01(\tR\x0econfigOptionId\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\x12D\n" +
+	"\bcategory\x18\x04 \x01(\x0e2(.delino.sandcrew.v1.ConfigOptionCategoryR\bcategory\x12(\n" +
+	"\x10current_value_id\x18\x05 \x01(\tR\x0ecurrentValueId\x12=\n" +
+	"\x06values\x18\x06 \x03(\v2%.delino.sandcrew.v1.ConfigOptionValueR\x06values\"d\n" +
 	"\x11ConfigOptionValue\x12\x19\n" +
 	"\bvalue_id\x18\x01 \x01(\tR\avalueId\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
-	"\vdescription\x18\x03 \x01(\tR\vdescription\"\xfb\x01\n" +
-	"\fConfigOption\x12(\n" +
-	"\x10config_option_id\x18\x01 \x01(\tR\x0econfigOptionId\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\x12D\n" +
-	"\bcategory\x18\x03 \x01(\x0e2(.delino.sandcrew.v1.ConfigOptionCategoryR\bcategory\x12(\n" +
-	"\x10current_value_id\x18\x04 \x01(\tR\x0ecurrentValueId\x12=\n" +
-	"\x06values\x18\x05 \x03(\v2%.delino.sandcrew.v1.ConfigOptionValueR\x06values\"K\n" +
-	"\rConfigOptions\x12:\n" +
-	"\aoptions\x18\x01 \x03(\v2 .delino.sandcrew.v1.ConfigOptionR\aoptions\"L\n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\"L\n" +
 	"\x11AgentSessionState\x127\n" +
 	"\x05state\x18\x01 \x01(\x0e2!.delino.sandcrew.v1.AgentActivityR\x05state\"`\n" +
 	"\vBridgeError\x127\n" +
@@ -3051,7 +3930,7 @@ const file_delino_sandcrew_v1_bridge_proto_rawDesc = "" +
 	"\vAgentExited\x12\x1d\n" +
 	"\texit_code\x18\x01 \x01(\x05H\x00R\bexitCode\x12\x18\n" +
 	"\x06signal\x18\x02 \x01(\tH\x00R\x06signalB\b\n" +
-	"\x06status\"l\n" +
+	"\x06result\"l\n" +
 	"\x10CredentialUpdate\x12<\n" +
 	"\x04kind\x18\x01 \x01(\x0e2(.delino.sandcrew.v1.VendorCredentialKindR\x04kind\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\x04R\brevision\"Q\n" +
@@ -3077,14 +3956,104 @@ const file_delino_sandcrew_v1_bridge_proto_rawDesc = "" +
 	"\x15PermissionAnswerInput\x122\n" +
 	"\x15permission_request_id\x18\x01 \x01(\tR\x13permissionRequestId\x12\x1b\n" +
 	"\toption_id\x18\x02 \x01(\tR\boptionId\"\x11\n" +
-	"\x0fCancelTurnInput\"\x80\x01\n" +
+	"\x0fCancelTurnInput\"\x82\x01\n" +
 	"\fSetModeInput\x12\x19\n" +
 	"\amode_id\x18\x01 \x01(\tH\x00R\x06modeId\x12M\n" +
-	"\x0fpermission_mode\x18\x02 \x01(\x0e2\".delino.sandcrew.v1.PermissionModeH\x00R\x0epermissionModeB\x06\n" +
-	"\x04mode\"[\n" +
+	"\x0fpermission_mode\x18\x02 \x01(\x0e2\".delino.sandcrew.v1.PermissionModeH\x00R\x0epermissionModeB\b\n" +
+	"\x06target\"[\n" +
 	"\x14SetConfigOptionInput\x12(\n" +
 	"\x10config_option_id\x18\x01 \x01(\tR\x0econfigOptionId\x12\x19\n" +
-	"\bvalue_id\x18\x02 \x01(\tR\avalueIdB?Z=github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1b\x06proto3"
+	"\bvalue_id\x18\x02 \x01(\tR\avalueId\"\xf6\x02\n" +
+	"\x11BridgeStartConfig\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x127\n" +
+	"\x06vendor\x18\x02 \x01(\x0e2\x1f.delino.sandcrew.v1.AgentVendorR\x06vendor\x12Q\n" +
+	"\x0fcredential_kind\x18\x03 \x01(\x0e2(.delino.sandcrew.v1.VendorCredentialKindR\x0ecredentialKind\x12K\n" +
+	"\x0fpermission_mode\x18\x04 \x01(\x0e2\".delino.sandcrew.v1.PermissionModeR\x0epermissionMode\x12\x17\n" +
+	"\amode_id\x18\x05 \x01(\tR\x06modeId\x12P\n" +
+	"\x0econfig_options\x18\x06 \x03(\v2).delino.sandcrew.v1.ConfigOptionSelectionR\rconfigOptions\"\\\n" +
+	"\x15ConfigOptionSelection\x12(\n" +
+	"\x10config_option_id\x18\x01 \x01(\tR\x0econfigOptionId\x12\x19\n" +
+	"\bvalue_id\x18\x02 \x01(\tR\avalueId*\xfe\x01\n" +
+	"\bToolKind\x12\x19\n" +
+	"\x15TOOL_KIND_UNSPECIFIED\x10\x00\x12\x12\n" +
+	"\x0eTOOL_KIND_READ\x10\x01\x12\x12\n" +
+	"\x0eTOOL_KIND_EDIT\x10\x02\x12\x14\n" +
+	"\x10TOOL_KIND_DELETE\x10\x03\x12\x12\n" +
+	"\x0eTOOL_KIND_MOVE\x10\x04\x12\x14\n" +
+	"\x10TOOL_KIND_SEARCH\x10\x05\x12\x15\n" +
+	"\x11TOOL_KIND_EXECUTE\x10\x06\x12\x13\n" +
+	"\x0fTOOL_KIND_THINK\x10\a\x12\x13\n" +
+	"\x0fTOOL_KIND_FETCH\x10\b\x12\x19\n" +
+	"\x15TOOL_KIND_SWITCH_MODE\x10\t\x12\x13\n" +
+	"\x0fTOOL_KIND_OTHER\x10\n" +
+	"*\xaf\x01\n" +
+	"\x0eToolCallStatus\x12 \n" +
+	"\x1cTOOL_CALL_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18TOOL_CALL_STATUS_PENDING\x10\x01\x12 \n" +
+	"\x1cTOOL_CALL_STATUS_IN_PROGRESS\x10\x02\x12\x1e\n" +
+	"\x1aTOOL_CALL_STATUS_COMPLETED\x10\x03\x12\x1b\n" +
+	"\x17TOOL_CALL_STATUS_FAILED\x10\x04*\x93\x01\n" +
+	"\x11PlanEntryPriority\x12#\n" +
+	"\x1fPLAN_ENTRY_PRIORITY_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18PLAN_ENTRY_PRIORITY_HIGH\x10\x01\x12\x1e\n" +
+	"\x1aPLAN_ENTRY_PRIORITY_MEDIUM\x10\x02\x12\x1b\n" +
+	"\x17PLAN_ENTRY_PRIORITY_LOW\x10\x03*\x97\x01\n" +
+	"\x0fPlanEntryStatus\x12!\n" +
+	"\x1dPLAN_ENTRY_STATUS_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19PLAN_ENTRY_STATUS_PENDING\x10\x01\x12!\n" +
+	"\x1dPLAN_ENTRY_STATUS_IN_PROGRESS\x10\x02\x12\x1f\n" +
+	"\x1bPLAN_ENTRY_STATUS_COMPLETED\x10\x03*\xe0\x01\n" +
+	"\x14PermissionOptionKind\x12&\n" +
+	"\"PERMISSION_OPTION_KIND_UNSPECIFIED\x10\x00\x12%\n" +
+	"!PERMISSION_OPTION_KIND_ALLOW_ONCE\x10\x01\x12'\n" +
+	"#PERMISSION_OPTION_KIND_ALLOW_ALWAYS\x10\x02\x12&\n" +
+	"\"PERMISSION_OPTION_KIND_REJECT_ONCE\x10\x03\x12(\n" +
+	"$PERMISSION_OPTION_KIND_REJECT_ALWAYS\x10\x04*z\n" +
+	"\x11PermissionOutcome\x12\"\n" +
+	"\x1ePERMISSION_OUTCOME_UNSPECIFIED\x10\x00\x12\x1f\n" +
+	"\x1bPERMISSION_OUTCOME_SELECTED\x10\x01\x12 \n" +
+	"\x1cPERMISSION_OUTCOME_CANCELLED\x10\x02*\xb6\x01\n" +
+	"\n" +
+	"StopReason\x12\x1b\n" +
+	"\x17STOP_REASON_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14STOP_REASON_END_TURN\x10\x01\x12\x1a\n" +
+	"\x16STOP_REASON_MAX_TOKENS\x10\x02\x12!\n" +
+	"\x1dSTOP_REASON_MAX_TURN_REQUESTS\x10\x03\x12\x17\n" +
+	"\x13STOP_REASON_REFUSAL\x10\x04\x12\x19\n" +
+	"\x15STOP_REASON_CANCELLED\x10\x05*\x98\x02\n" +
+	"\x14ConfigOptionCategory\x12&\n" +
+	"\"CONFIG_OPTION_CATEGORY_UNSPECIFIED\x10\x00\x12\x1f\n" +
+	"\x1bCONFIG_OPTION_CATEGORY_MODE\x10\x01\x12 \n" +
+	"\x1cCONFIG_OPTION_CATEGORY_MODEL\x10\x02\x12'\n" +
+	"#CONFIG_OPTION_CATEGORY_MODEL_CONFIG\x10\x03\x12 \n" +
+	"\x1cCONFIG_OPTION_CATEGORY_SPEED\x10\x04\x12(\n" +
+	"$CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL\x10\x05\x12 \n" +
+	"\x1cCONFIG_OPTION_CATEGORY_OTHER\x10\x06*\xac\x01\n" +
+	"\rAgentActivity\x12\x1e\n" +
+	"\x1aAGENT_ACTIVITY_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17AGENT_ACTIVITY_STARTING\x10\x01\x12\x17\n" +
+	"\x13AGENT_ACTIVITY_IDLE\x10\x02\x12\x1a\n" +
+	"\x16AGENT_ACTIVITY_WORKING\x10\x03\x12)\n" +
+	"%AGENT_ACTIVITY_WAITING_FOR_PERMISSION\x10\x04*\xb0\x03\n" +
+	"\x0fBridgeErrorKind\x12!\n" +
+	"\x1dBRIDGE_ERROR_KIND_UNSPECIFIED\x10\x00\x12*\n" +
+	"&BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED\x10\x01\x12'\n" +
+	"#BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH\x10\x02\x12(\n" +
+	"$BRIDGE_ERROR_KIND_AGENT_START_FAILED\x10\x03\x12(\n" +
+	"$BRIDGE_ERROR_KIND_CREDENTIAL_MISSING\x10\x04\x12(\n" +
+	"$BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR\x10\x05\x12#\n" +
+	"\x1fBRIDGE_ERROR_KIND_INPUT_INVALID\x10\x06\x12%\n" +
+	"!BRIDGE_ERROR_KIND_OPTION_REJECTED\x10\a\x12,\n" +
+	"(BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED\x10\b\x12-\n" +
+	")BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED\x10\t*\x99\x02\n" +
+	"\x14InputRejectionReason\x12&\n" +
+	"\"INPUT_REJECTION_REASON_UNSPECIFIED\x10\x00\x12$\n" +
+	" INPUT_REJECTION_REASON_MALFORMED\x10\x01\x125\n" +
+	"1INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST\x10\x02\x12)\n" +
+	"%INPUT_REJECTION_REASON_UNKNOWN_OPTION\x10\x03\x12)\n" +
+	"%INPUT_REJECTION_REASON_NO_ACTIVE_TURN\x10\x04\x12&\n" +
+	"\"INPUT_REJECTION_REASON_UNSUPPORTED\x10\x05B?Z=github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1b\x06proto3"
 
 var (
 	file_delino_sandcrew_v1_bridge_proto_rawDescOnce sync.Once
@@ -3098,134 +4067,142 @@ func file_delino_sandcrew_v1_bridge_proto_rawDescGZIP() []byte {
 	return file_delino_sandcrew_v1_bridge_proto_rawDescData
 }
 
-var file_delino_sandcrew_v1_bridge_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
+var file_delino_sandcrew_v1_bridge_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
+var file_delino_sandcrew_v1_bridge_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
 var file_delino_sandcrew_v1_bridge_proto_goTypes = []any{
-	(*BridgeEvent)(nil),           // 0: delino.sandcrew.v1.BridgeEvent
-	(*ProtocolVersion)(nil),       // 1: delino.sandcrew.v1.ProtocolVersion
-	(*AgentCapabilities)(nil),     // 2: delino.sandcrew.v1.AgentCapabilities
-	(*BridgeHello)(nil),           // 3: delino.sandcrew.v1.BridgeHello
-	(*InputAccepted)(nil),         // 4: delino.sandcrew.v1.InputAccepted
-	(*InputRejected)(nil),         // 5: delino.sandcrew.v1.InputRejected
-	(*ResourceLink)(nil),          // 6: delino.sandcrew.v1.ResourceLink
-	(*UnsupportedContent)(nil),    // 7: delino.sandcrew.v1.UnsupportedContent
-	(*ContentBlock)(nil),          // 8: delino.sandcrew.v1.ContentBlock
-	(*ContentChunk)(nil),          // 9: delino.sandcrew.v1.ContentChunk
-	(*Diff)(nil),                  // 10: delino.sandcrew.v1.Diff
-	(*Terminal)(nil),              // 11: delino.sandcrew.v1.Terminal
-	(*ToolCallContent)(nil),       // 12: delino.sandcrew.v1.ToolCallContent
-	(*ToolCallLocation)(nil),      // 13: delino.sandcrew.v1.ToolCallLocation
-	(*ToolCall)(nil),              // 14: delino.sandcrew.v1.ToolCall
-	(*ToolCallContentList)(nil),   // 15: delino.sandcrew.v1.ToolCallContentList
-	(*ToolCallLocationList)(nil),  // 16: delino.sandcrew.v1.ToolCallLocationList
-	(*ToolCallUpdate)(nil),        // 17: delino.sandcrew.v1.ToolCallUpdate
-	(*PlanEntry)(nil),             // 18: delino.sandcrew.v1.PlanEntry
-	(*Plan)(nil),                  // 19: delino.sandcrew.v1.Plan
-	(*PermissionOption)(nil),      // 20: delino.sandcrew.v1.PermissionOption
-	(*PermissionRequest)(nil),     // 21: delino.sandcrew.v1.PermissionRequest
-	(*PermissionResponse)(nil),    // 22: delino.sandcrew.v1.PermissionResponse
-	(*TurnEnded)(nil),             // 23: delino.sandcrew.v1.TurnEnded
-	(*SessionMode)(nil),           // 24: delino.sandcrew.v1.SessionMode
-	(*ModeChanged)(nil),           // 25: delino.sandcrew.v1.ModeChanged
-	(*ConfigOptionValue)(nil),     // 26: delino.sandcrew.v1.ConfigOptionValue
-	(*ConfigOption)(nil),          // 27: delino.sandcrew.v1.ConfigOption
-	(*ConfigOptions)(nil),         // 28: delino.sandcrew.v1.ConfigOptions
-	(*AgentSessionState)(nil),     // 29: delino.sandcrew.v1.AgentSessionState
-	(*BridgeError)(nil),           // 30: delino.sandcrew.v1.BridgeError
-	(*AgentExited)(nil),           // 31: delino.sandcrew.v1.AgentExited
-	(*CredentialUpdate)(nil),      // 32: delino.sandcrew.v1.CredentialUpdate
-	(*UnknownUpdate)(nil),         // 33: delino.sandcrew.v1.UnknownUpdate
-	(*BridgeInput)(nil),           // 34: delino.sandcrew.v1.BridgeInput
-	(*PromptInput)(nil),           // 35: delino.sandcrew.v1.PromptInput
-	(*PermissionAnswerInput)(nil), // 36: delino.sandcrew.v1.PermissionAnswerInput
-	(*CancelTurnInput)(nil),       // 37: delino.sandcrew.v1.CancelTurnInput
-	(*SetModeInput)(nil),          // 38: delino.sandcrew.v1.SetModeInput
-	(*SetConfigOptionInput)(nil),  // 39: delino.sandcrew.v1.SetConfigOptionInput
-	(*timestamppb.Timestamp)(nil), // 40: google.protobuf.Timestamp
-	(AgentVendor)(0),              // 41: delino.sandcrew.v1.AgentVendor
-	(GuestOs)(0),                  // 42: delino.sandcrew.v1.GuestOs
-	(InputRejectionReason)(0),     // 43: delino.sandcrew.v1.InputRejectionReason
-	(ToolKind)(0),                 // 44: delino.sandcrew.v1.ToolKind
-	(ToolCallStatus)(0),           // 45: delino.sandcrew.v1.ToolCallStatus
-	(PlanEntryPriority)(0),        // 46: delino.sandcrew.v1.PlanEntryPriority
-	(PlanEntryStatus)(0),          // 47: delino.sandcrew.v1.PlanEntryStatus
-	(PermissionOptionKind)(0),     // 48: delino.sandcrew.v1.PermissionOptionKind
-	(PermissionOutcome)(0),        // 49: delino.sandcrew.v1.PermissionOutcome
-	(StopReason)(0),               // 50: delino.sandcrew.v1.StopReason
-	(PermissionMode)(0),           // 51: delino.sandcrew.v1.PermissionMode
-	(ConfigOptionCategory)(0),     // 52: delino.sandcrew.v1.ConfigOptionCategory
-	(AgentActivity)(0),            // 53: delino.sandcrew.v1.AgentActivity
-	(BridgeErrorKind)(0),          // 54: delino.sandcrew.v1.BridgeErrorKind
-	(VendorCredentialKind)(0),     // 55: delino.sandcrew.v1.VendorCredentialKind
+	(ToolKind)(0),                 // 0: delino.sandcrew.v1.ToolKind
+	(ToolCallStatus)(0),           // 1: delino.sandcrew.v1.ToolCallStatus
+	(PlanEntryPriority)(0),        // 2: delino.sandcrew.v1.PlanEntryPriority
+	(PlanEntryStatus)(0),          // 3: delino.sandcrew.v1.PlanEntryStatus
+	(PermissionOptionKind)(0),     // 4: delino.sandcrew.v1.PermissionOptionKind
+	(PermissionOutcome)(0),        // 5: delino.sandcrew.v1.PermissionOutcome
+	(StopReason)(0),               // 6: delino.sandcrew.v1.StopReason
+	(ConfigOptionCategory)(0),     // 7: delino.sandcrew.v1.ConfigOptionCategory
+	(AgentActivity)(0),            // 8: delino.sandcrew.v1.AgentActivity
+	(BridgeErrorKind)(0),          // 9: delino.sandcrew.v1.BridgeErrorKind
+	(InputRejectionReason)(0),     // 10: delino.sandcrew.v1.InputRejectionReason
+	(*BridgeEvent)(nil),           // 11: delino.sandcrew.v1.BridgeEvent
+	(*ProtocolVersion)(nil),       // 12: delino.sandcrew.v1.ProtocolVersion
+	(*AgentCapabilities)(nil),     // 13: delino.sandcrew.v1.AgentCapabilities
+	(*BridgeHello)(nil),           // 14: delino.sandcrew.v1.BridgeHello
+	(*AgentReady)(nil),            // 15: delino.sandcrew.v1.AgentReady
+	(*InputAccepted)(nil),         // 16: delino.sandcrew.v1.InputAccepted
+	(*InputRejected)(nil),         // 17: delino.sandcrew.v1.InputRejected
+	(*ContentChunk)(nil),          // 18: delino.sandcrew.v1.ContentChunk
+	(*ContentBlock)(nil),          // 19: delino.sandcrew.v1.ContentBlock
+	(*ResourceLink)(nil),          // 20: delino.sandcrew.v1.ResourceLink
+	(*ToolCall)(nil),              // 21: delino.sandcrew.v1.ToolCall
+	(*ToolCallUpdate)(nil),        // 22: delino.sandcrew.v1.ToolCallUpdate
+	(*ToolCallContentList)(nil),   // 23: delino.sandcrew.v1.ToolCallContentList
+	(*ToolCallLocationList)(nil),  // 24: delino.sandcrew.v1.ToolCallLocationList
+	(*ToolCallContent)(nil),       // 25: delino.sandcrew.v1.ToolCallContent
+	(*Diff)(nil),                  // 26: delino.sandcrew.v1.Diff
+	(*Terminal)(nil),              // 27: delino.sandcrew.v1.Terminal
+	(*ToolCallLocation)(nil),      // 28: delino.sandcrew.v1.ToolCallLocation
+	(*Plan)(nil),                  // 29: delino.sandcrew.v1.Plan
+	(*PlanEntry)(nil),             // 30: delino.sandcrew.v1.PlanEntry
+	(*PermissionRequest)(nil),     // 31: delino.sandcrew.v1.PermissionRequest
+	(*PermissionOption)(nil),      // 32: delino.sandcrew.v1.PermissionOption
+	(*PermissionResponse)(nil),    // 33: delino.sandcrew.v1.PermissionResponse
+	(*TurnEnded)(nil),             // 34: delino.sandcrew.v1.TurnEnded
+	(*ModeChanged)(nil),           // 35: delino.sandcrew.v1.ModeChanged
+	(*SessionMode)(nil),           // 36: delino.sandcrew.v1.SessionMode
+	(*ConfigOptions)(nil),         // 37: delino.sandcrew.v1.ConfigOptions
+	(*ConfigOption)(nil),          // 38: delino.sandcrew.v1.ConfigOption
+	(*ConfigOptionValue)(nil),     // 39: delino.sandcrew.v1.ConfigOptionValue
+	(*AgentSessionState)(nil),     // 40: delino.sandcrew.v1.AgentSessionState
+	(*BridgeError)(nil),           // 41: delino.sandcrew.v1.BridgeError
+	(*AgentExited)(nil),           // 42: delino.sandcrew.v1.AgentExited
+	(*CredentialUpdate)(nil),      // 43: delino.sandcrew.v1.CredentialUpdate
+	(*UnknownUpdate)(nil),         // 44: delino.sandcrew.v1.UnknownUpdate
+	(*BridgeInput)(nil),           // 45: delino.sandcrew.v1.BridgeInput
+	(*PromptInput)(nil),           // 46: delino.sandcrew.v1.PromptInput
+	(*PermissionAnswerInput)(nil), // 47: delino.sandcrew.v1.PermissionAnswerInput
+	(*CancelTurnInput)(nil),       // 48: delino.sandcrew.v1.CancelTurnInput
+	(*SetModeInput)(nil),          // 49: delino.sandcrew.v1.SetModeInput
+	(*SetConfigOptionInput)(nil),  // 50: delino.sandcrew.v1.SetConfigOptionInput
+	(*BridgeStartConfig)(nil),     // 51: delino.sandcrew.v1.BridgeStartConfig
+	(*ConfigOptionSelection)(nil), // 52: delino.sandcrew.v1.ConfigOptionSelection
+	(*timestamppb.Timestamp)(nil), // 53: google.protobuf.Timestamp
+	(AgentVendor)(0),              // 54: delino.sandcrew.v1.AgentVendor
+	(GuestOs)(0),                  // 55: delino.sandcrew.v1.GuestOs
+	(PermissionMode)(0),           // 56: delino.sandcrew.v1.PermissionMode
+	(VendorCredentialKind)(0),     // 57: delino.sandcrew.v1.VendorCredentialKind
 }
 var file_delino_sandcrew_v1_bridge_proto_depIdxs = []int32{
-	40, // 0: delino.sandcrew.v1.BridgeEvent.time:type_name -> google.protobuf.Timestamp
-	3,  // 1: delino.sandcrew.v1.BridgeEvent.hello:type_name -> delino.sandcrew.v1.BridgeHello
-	4,  // 2: delino.sandcrew.v1.BridgeEvent.input_accepted:type_name -> delino.sandcrew.v1.InputAccepted
-	5,  // 3: delino.sandcrew.v1.BridgeEvent.input_rejected:type_name -> delino.sandcrew.v1.InputRejected
-	9,  // 4: delino.sandcrew.v1.BridgeEvent.user_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
-	9,  // 5: delino.sandcrew.v1.BridgeEvent.agent_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
-	9,  // 6: delino.sandcrew.v1.BridgeEvent.agent_thought_chunk:type_name -> delino.sandcrew.v1.ContentChunk
-	14, // 7: delino.sandcrew.v1.BridgeEvent.tool_call:type_name -> delino.sandcrew.v1.ToolCall
-	17, // 8: delino.sandcrew.v1.BridgeEvent.tool_call_update:type_name -> delino.sandcrew.v1.ToolCallUpdate
-	19, // 9: delino.sandcrew.v1.BridgeEvent.plan:type_name -> delino.sandcrew.v1.Plan
-	21, // 10: delino.sandcrew.v1.BridgeEvent.permission_request:type_name -> delino.sandcrew.v1.PermissionRequest
-	22, // 11: delino.sandcrew.v1.BridgeEvent.permission_response:type_name -> delino.sandcrew.v1.PermissionResponse
-	23, // 12: delino.sandcrew.v1.BridgeEvent.turn_ended:type_name -> delino.sandcrew.v1.TurnEnded
-	25, // 13: delino.sandcrew.v1.BridgeEvent.mode_changed:type_name -> delino.sandcrew.v1.ModeChanged
-	28, // 14: delino.sandcrew.v1.BridgeEvent.config_options:type_name -> delino.sandcrew.v1.ConfigOptions
-	29, // 15: delino.sandcrew.v1.BridgeEvent.session_state:type_name -> delino.sandcrew.v1.AgentSessionState
-	30, // 16: delino.sandcrew.v1.BridgeEvent.bridge_error:type_name -> delino.sandcrew.v1.BridgeError
-	31, // 17: delino.sandcrew.v1.BridgeEvent.agent_exited:type_name -> delino.sandcrew.v1.AgentExited
-	32, // 18: delino.sandcrew.v1.BridgeEvent.credential_update:type_name -> delino.sandcrew.v1.CredentialUpdate
-	33, // 19: delino.sandcrew.v1.BridgeEvent.unknown_update:type_name -> delino.sandcrew.v1.UnknownUpdate
-	1,  // 20: delino.sandcrew.v1.BridgeHello.protocol_version:type_name -> delino.sandcrew.v1.ProtocolVersion
-	41, // 21: delino.sandcrew.v1.BridgeHello.vendor:type_name -> delino.sandcrew.v1.AgentVendor
-	42, // 22: delino.sandcrew.v1.BridgeHello.guest_os:type_name -> delino.sandcrew.v1.GuestOs
-	2,  // 23: delino.sandcrew.v1.BridgeHello.agent_capabilities:type_name -> delino.sandcrew.v1.AgentCapabilities
-	43, // 24: delino.sandcrew.v1.InputRejected.reason:type_name -> delino.sandcrew.v1.InputRejectionReason
-	6,  // 25: delino.sandcrew.v1.ContentBlock.resource_link:type_name -> delino.sandcrew.v1.ResourceLink
-	7,  // 26: delino.sandcrew.v1.ContentBlock.unsupported:type_name -> delino.sandcrew.v1.UnsupportedContent
-	8,  // 27: delino.sandcrew.v1.ContentChunk.content:type_name -> delino.sandcrew.v1.ContentBlock
-	8,  // 28: delino.sandcrew.v1.ToolCallContent.block:type_name -> delino.sandcrew.v1.ContentBlock
-	10, // 29: delino.sandcrew.v1.ToolCallContent.diff:type_name -> delino.sandcrew.v1.Diff
-	11, // 30: delino.sandcrew.v1.ToolCallContent.terminal:type_name -> delino.sandcrew.v1.Terminal
-	44, // 31: delino.sandcrew.v1.ToolCall.kind:type_name -> delino.sandcrew.v1.ToolKind
-	45, // 32: delino.sandcrew.v1.ToolCall.status:type_name -> delino.sandcrew.v1.ToolCallStatus
-	12, // 33: delino.sandcrew.v1.ToolCall.content:type_name -> delino.sandcrew.v1.ToolCallContent
-	13, // 34: delino.sandcrew.v1.ToolCall.locations:type_name -> delino.sandcrew.v1.ToolCallLocation
-	12, // 35: delino.sandcrew.v1.ToolCallContentList.items:type_name -> delino.sandcrew.v1.ToolCallContent
-	13, // 36: delino.sandcrew.v1.ToolCallLocationList.items:type_name -> delino.sandcrew.v1.ToolCallLocation
-	44, // 37: delino.sandcrew.v1.ToolCallUpdate.kind:type_name -> delino.sandcrew.v1.ToolKind
-	45, // 38: delino.sandcrew.v1.ToolCallUpdate.status:type_name -> delino.sandcrew.v1.ToolCallStatus
-	15, // 39: delino.sandcrew.v1.ToolCallUpdate.content:type_name -> delino.sandcrew.v1.ToolCallContentList
-	16, // 40: delino.sandcrew.v1.ToolCallUpdate.locations:type_name -> delino.sandcrew.v1.ToolCallLocationList
-	46, // 41: delino.sandcrew.v1.PlanEntry.priority:type_name -> delino.sandcrew.v1.PlanEntryPriority
-	47, // 42: delino.sandcrew.v1.PlanEntry.status:type_name -> delino.sandcrew.v1.PlanEntryStatus
-	18, // 43: delino.sandcrew.v1.Plan.entries:type_name -> delino.sandcrew.v1.PlanEntry
-	48, // 44: delino.sandcrew.v1.PermissionOption.kind:type_name -> delino.sandcrew.v1.PermissionOptionKind
-	20, // 45: delino.sandcrew.v1.PermissionRequest.options:type_name -> delino.sandcrew.v1.PermissionOption
-	49, // 46: delino.sandcrew.v1.PermissionResponse.outcome:type_name -> delino.sandcrew.v1.PermissionOutcome
-	50, // 47: delino.sandcrew.v1.TurnEnded.stop_reason:type_name -> delino.sandcrew.v1.StopReason
-	24, // 48: delino.sandcrew.v1.ModeChanged.available_modes:type_name -> delino.sandcrew.v1.SessionMode
-	51, // 49: delino.sandcrew.v1.ModeChanged.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
-	52, // 50: delino.sandcrew.v1.ConfigOption.category:type_name -> delino.sandcrew.v1.ConfigOptionCategory
-	26, // 51: delino.sandcrew.v1.ConfigOption.values:type_name -> delino.sandcrew.v1.ConfigOptionValue
-	27, // 52: delino.sandcrew.v1.ConfigOptions.options:type_name -> delino.sandcrew.v1.ConfigOption
-	53, // 53: delino.sandcrew.v1.AgentSessionState.state:type_name -> delino.sandcrew.v1.AgentActivity
-	54, // 54: delino.sandcrew.v1.BridgeError.kind:type_name -> delino.sandcrew.v1.BridgeErrorKind
-	55, // 55: delino.sandcrew.v1.CredentialUpdate.kind:type_name -> delino.sandcrew.v1.VendorCredentialKind
-	40, // 56: delino.sandcrew.v1.BridgeInput.create_time:type_name -> google.protobuf.Timestamp
-	35, // 57: delino.sandcrew.v1.BridgeInput.prompt:type_name -> delino.sandcrew.v1.PromptInput
-	36, // 58: delino.sandcrew.v1.BridgeInput.permission_answer:type_name -> delino.sandcrew.v1.PermissionAnswerInput
-	37, // 59: delino.sandcrew.v1.BridgeInput.cancel_turn:type_name -> delino.sandcrew.v1.CancelTurnInput
-	38, // 60: delino.sandcrew.v1.BridgeInput.set_mode:type_name -> delino.sandcrew.v1.SetModeInput
-	39, // 61: delino.sandcrew.v1.BridgeInput.set_config_option:type_name -> delino.sandcrew.v1.SetConfigOptionInput
-	51, // 62: delino.sandcrew.v1.SetModeInput.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
-	63, // [63:63] is the sub-list for method output_type
-	63, // [63:63] is the sub-list for method input_type
-	63, // [63:63] is the sub-list for extension type_name
-	63, // [63:63] is the sub-list for extension extendee
-	0,  // [0:63] is the sub-list for field type_name
+	53, // 0: delino.sandcrew.v1.BridgeEvent.time:type_name -> google.protobuf.Timestamp
+	14, // 1: delino.sandcrew.v1.BridgeEvent.hello:type_name -> delino.sandcrew.v1.BridgeHello
+	16, // 2: delino.sandcrew.v1.BridgeEvent.input_accepted:type_name -> delino.sandcrew.v1.InputAccepted
+	17, // 3: delino.sandcrew.v1.BridgeEvent.input_rejected:type_name -> delino.sandcrew.v1.InputRejected
+	18, // 4: delino.sandcrew.v1.BridgeEvent.user_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
+	18, // 5: delino.sandcrew.v1.BridgeEvent.agent_message_chunk:type_name -> delino.sandcrew.v1.ContentChunk
+	18, // 6: delino.sandcrew.v1.BridgeEvent.agent_thought_chunk:type_name -> delino.sandcrew.v1.ContentChunk
+	21, // 7: delino.sandcrew.v1.BridgeEvent.tool_call:type_name -> delino.sandcrew.v1.ToolCall
+	22, // 8: delino.sandcrew.v1.BridgeEvent.tool_call_update:type_name -> delino.sandcrew.v1.ToolCallUpdate
+	29, // 9: delino.sandcrew.v1.BridgeEvent.plan:type_name -> delino.sandcrew.v1.Plan
+	31, // 10: delino.sandcrew.v1.BridgeEvent.permission_request:type_name -> delino.sandcrew.v1.PermissionRequest
+	33, // 11: delino.sandcrew.v1.BridgeEvent.permission_response:type_name -> delino.sandcrew.v1.PermissionResponse
+	34, // 12: delino.sandcrew.v1.BridgeEvent.turn_ended:type_name -> delino.sandcrew.v1.TurnEnded
+	35, // 13: delino.sandcrew.v1.BridgeEvent.mode_changed:type_name -> delino.sandcrew.v1.ModeChanged
+	37, // 14: delino.sandcrew.v1.BridgeEvent.config_options:type_name -> delino.sandcrew.v1.ConfigOptions
+	40, // 15: delino.sandcrew.v1.BridgeEvent.session_state:type_name -> delino.sandcrew.v1.AgentSessionState
+	41, // 16: delino.sandcrew.v1.BridgeEvent.bridge_error:type_name -> delino.sandcrew.v1.BridgeError
+	42, // 17: delino.sandcrew.v1.BridgeEvent.agent_exited:type_name -> delino.sandcrew.v1.AgentExited
+	43, // 18: delino.sandcrew.v1.BridgeEvent.credential_update:type_name -> delino.sandcrew.v1.CredentialUpdate
+	44, // 19: delino.sandcrew.v1.BridgeEvent.unknown_update:type_name -> delino.sandcrew.v1.UnknownUpdate
+	15, // 20: delino.sandcrew.v1.BridgeEvent.agent_ready:type_name -> delino.sandcrew.v1.AgentReady
+	12, // 21: delino.sandcrew.v1.BridgeHello.protocol_version:type_name -> delino.sandcrew.v1.ProtocolVersion
+	54, // 22: delino.sandcrew.v1.BridgeHello.vendor:type_name -> delino.sandcrew.v1.AgentVendor
+	55, // 23: delino.sandcrew.v1.BridgeHello.guest_os:type_name -> delino.sandcrew.v1.GuestOs
+	13, // 24: delino.sandcrew.v1.AgentReady.agent_capabilities:type_name -> delino.sandcrew.v1.AgentCapabilities
+	10, // 25: delino.sandcrew.v1.InputRejected.reason:type_name -> delino.sandcrew.v1.InputRejectionReason
+	19, // 26: delino.sandcrew.v1.ContentChunk.content:type_name -> delino.sandcrew.v1.ContentBlock
+	20, // 27: delino.sandcrew.v1.ContentBlock.resource_link:type_name -> delino.sandcrew.v1.ResourceLink
+	0,  // 28: delino.sandcrew.v1.ToolCall.kind:type_name -> delino.sandcrew.v1.ToolKind
+	1,  // 29: delino.sandcrew.v1.ToolCall.status:type_name -> delino.sandcrew.v1.ToolCallStatus
+	25, // 30: delino.sandcrew.v1.ToolCall.content:type_name -> delino.sandcrew.v1.ToolCallContent
+	28, // 31: delino.sandcrew.v1.ToolCall.locations:type_name -> delino.sandcrew.v1.ToolCallLocation
+	0,  // 32: delino.sandcrew.v1.ToolCallUpdate.kind:type_name -> delino.sandcrew.v1.ToolKind
+	1,  // 33: delino.sandcrew.v1.ToolCallUpdate.status:type_name -> delino.sandcrew.v1.ToolCallStatus
+	23, // 34: delino.sandcrew.v1.ToolCallUpdate.content:type_name -> delino.sandcrew.v1.ToolCallContentList
+	24, // 35: delino.sandcrew.v1.ToolCallUpdate.locations:type_name -> delino.sandcrew.v1.ToolCallLocationList
+	25, // 36: delino.sandcrew.v1.ToolCallContentList.items:type_name -> delino.sandcrew.v1.ToolCallContent
+	28, // 37: delino.sandcrew.v1.ToolCallLocationList.items:type_name -> delino.sandcrew.v1.ToolCallLocation
+	19, // 38: delino.sandcrew.v1.ToolCallContent.block:type_name -> delino.sandcrew.v1.ContentBlock
+	26, // 39: delino.sandcrew.v1.ToolCallContent.diff:type_name -> delino.sandcrew.v1.Diff
+	27, // 40: delino.sandcrew.v1.ToolCallContent.terminal:type_name -> delino.sandcrew.v1.Terminal
+	30, // 41: delino.sandcrew.v1.Plan.entries:type_name -> delino.sandcrew.v1.PlanEntry
+	2,  // 42: delino.sandcrew.v1.PlanEntry.priority:type_name -> delino.sandcrew.v1.PlanEntryPriority
+	3,  // 43: delino.sandcrew.v1.PlanEntry.status:type_name -> delino.sandcrew.v1.PlanEntryStatus
+	32, // 44: delino.sandcrew.v1.PermissionRequest.options:type_name -> delino.sandcrew.v1.PermissionOption
+	22, // 45: delino.sandcrew.v1.PermissionRequest.tool_call:type_name -> delino.sandcrew.v1.ToolCallUpdate
+	4,  // 46: delino.sandcrew.v1.PermissionOption.kind:type_name -> delino.sandcrew.v1.PermissionOptionKind
+	5,  // 47: delino.sandcrew.v1.PermissionResponse.outcome:type_name -> delino.sandcrew.v1.PermissionOutcome
+	6,  // 48: delino.sandcrew.v1.TurnEnded.stop_reason:type_name -> delino.sandcrew.v1.StopReason
+	36, // 49: delino.sandcrew.v1.ModeChanged.available_modes:type_name -> delino.sandcrew.v1.SessionMode
+	56, // 50: delino.sandcrew.v1.ModeChanged.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
+	38, // 51: delino.sandcrew.v1.ConfigOptions.options:type_name -> delino.sandcrew.v1.ConfigOption
+	7,  // 52: delino.sandcrew.v1.ConfigOption.category:type_name -> delino.sandcrew.v1.ConfigOptionCategory
+	39, // 53: delino.sandcrew.v1.ConfigOption.values:type_name -> delino.sandcrew.v1.ConfigOptionValue
+	8,  // 54: delino.sandcrew.v1.AgentSessionState.state:type_name -> delino.sandcrew.v1.AgentActivity
+	9,  // 55: delino.sandcrew.v1.BridgeError.kind:type_name -> delino.sandcrew.v1.BridgeErrorKind
+	57, // 56: delino.sandcrew.v1.CredentialUpdate.kind:type_name -> delino.sandcrew.v1.VendorCredentialKind
+	53, // 57: delino.sandcrew.v1.BridgeInput.create_time:type_name -> google.protobuf.Timestamp
+	46, // 58: delino.sandcrew.v1.BridgeInput.prompt:type_name -> delino.sandcrew.v1.PromptInput
+	47, // 59: delino.sandcrew.v1.BridgeInput.permission_answer:type_name -> delino.sandcrew.v1.PermissionAnswerInput
+	48, // 60: delino.sandcrew.v1.BridgeInput.cancel_turn:type_name -> delino.sandcrew.v1.CancelTurnInput
+	49, // 61: delino.sandcrew.v1.BridgeInput.set_mode:type_name -> delino.sandcrew.v1.SetModeInput
+	50, // 62: delino.sandcrew.v1.BridgeInput.set_config_option:type_name -> delino.sandcrew.v1.SetConfigOptionInput
+	56, // 63: delino.sandcrew.v1.SetModeInput.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
+	54, // 64: delino.sandcrew.v1.BridgeStartConfig.vendor:type_name -> delino.sandcrew.v1.AgentVendor
+	57, // 65: delino.sandcrew.v1.BridgeStartConfig.credential_kind:type_name -> delino.sandcrew.v1.VendorCredentialKind
+	56, // 66: delino.sandcrew.v1.BridgeStartConfig.permission_mode:type_name -> delino.sandcrew.v1.PermissionMode
+	52, // 67: delino.sandcrew.v1.BridgeStartConfig.config_options:type_name -> delino.sandcrew.v1.ConfigOptionSelection
+	68, // [68:68] is the sub-list for method output_type
+	68, // [68:68] is the sub-list for method input_type
+	68, // [68:68] is the sub-list for extension type_name
+	68, // [68:68] is the sub-list for extension extendee
+	0,  // [0:68] is the sub-list for field type_name
 }
 
 func init() { file_delino_sandcrew_v1_bridge_proto_init() }
@@ -3254,20 +4231,21 @@ func file_delino_sandcrew_v1_bridge_proto_init() {
 		(*BridgeEvent_AgentExited)(nil),
 		(*BridgeEvent_CredentialUpdate)(nil),
 		(*BridgeEvent_UnknownUpdate)(nil),
+		(*BridgeEvent_AgentReady)(nil),
 	}
-	file_delino_sandcrew_v1_bridge_proto_msgTypes[6].OneofWrappers = []any{}
 	file_delino_sandcrew_v1_bridge_proto_msgTypes[8].OneofWrappers = []any{
 		(*ContentBlock_Text)(nil),
 		(*ContentBlock_ResourceLink)(nil),
 		(*ContentBlock_Unsupported)(nil),
 	}
-	file_delino_sandcrew_v1_bridge_proto_msgTypes[10].OneofWrappers = []any{}
-	file_delino_sandcrew_v1_bridge_proto_msgTypes[12].OneofWrappers = []any{
+	file_delino_sandcrew_v1_bridge_proto_msgTypes[9].OneofWrappers = []any{}
+	file_delino_sandcrew_v1_bridge_proto_msgTypes[11].OneofWrappers = []any{}
+	file_delino_sandcrew_v1_bridge_proto_msgTypes[14].OneofWrappers = []any{
 		(*ToolCallContent_Block)(nil),
 		(*ToolCallContent_Diff)(nil),
 		(*ToolCallContent_Terminal)(nil),
 	}
-	file_delino_sandcrew_v1_bridge_proto_msgTypes[13].OneofWrappers = []any{}
+	file_delino_sandcrew_v1_bridge_proto_msgTypes[15].OneofWrappers = []any{}
 	file_delino_sandcrew_v1_bridge_proto_msgTypes[17].OneofWrappers = []any{}
 	file_delino_sandcrew_v1_bridge_proto_msgTypes[31].OneofWrappers = []any{
 		(*AgentExited_ExitCode)(nil),
@@ -3290,13 +4268,14 @@ func file_delino_sandcrew_v1_bridge_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_sandcrew_v1_bridge_proto_rawDesc), len(file_delino_sandcrew_v1_bridge_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   40,
+			NumEnums:      11,
+			NumMessages:   42,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_delino_sandcrew_v1_bridge_proto_goTypes,
 		DependencyIndexes: file_delino_sandcrew_v1_bridge_proto_depIdxs,
+		EnumInfos:         file_delino_sandcrew_v1_bridge_proto_enumTypes,
 		MessageInfos:      file_delino_sandcrew_v1_bridge_proto_msgTypes,
 	}.Build()
 	File_delino_sandcrew_v1_bridge_proto = out.File

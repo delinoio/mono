@@ -93,12 +93,6 @@ message Session {
   bool resume_wait_expired = 18;
 }
 
-// A configuration option value for a new session.
-message ConfigOptionSelection {
-  string config_option_id = 1;
-  string value_id = 2;
-}
-
 // One stored transcript event: a BridgeEvent without the credential_update
 // case. The field numbers of the cases equal those of BridgeEvent.
 message TranscriptEvent {
@@ -126,6 +120,7 @@ message TranscriptEvent {
     BridgeError bridge_error = 25;
     AgentExited agent_exited = 26;
     UnknownUpdate unknown_update = 28;
+    AgentReady agent_ready = 29;
   }
 }
 

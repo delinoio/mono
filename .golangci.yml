@@ -1,0 +1,27 @@
+version: "2"
+
+# golangci-lint checks only that the top-level tests of the slowest Go test
+# packages call t.Parallel(). Go starts parallel top-level tests only after
+# every serial top-level test of the package has finished, so one serial test
+# delays all the others. A test that must stay serial puts
+# `//nolint:paralleltest // <reason>` on its `func` line.
+linters:
+  default: none
+  enable:
+    - paralleltest
+  settings:
+    paralleltest:
+      # Subtests may stay serial; their parent's t.Parallel() is what lets
+      # the test run next to the other top-level tests.
+      ignore-missing-subtests: true
+  exclusions:
+    rules:
+      # Report paralleltest only in these packages (not their subpackages).
+      # Add a package here when its tests become parallel.
+      - path-except: ^(cmds/ownsand-agent/internal/dataplane|cmds/ownsand-guest/guest|go/ownsand|servers/accounts-api/internal/api|servers/accounts-api/internal/billing|servers/ownsand-api/e2e|servers/ownsand-api/internal/api|servers/ownsand-api/internal/billing|servers/sandrun-api/internal/github|servers/sandrun-api/internal/layers)/[^/]+_test\.go$
+        linters:
+          - paralleltest
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -5,13 +5,13 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import {
   AgentActivity,
   BridgeErrorKind,
-  PermissionMode,
   PermissionOptionKind,
   PermissionOutcome,
   StopReason,
   ToolCallStatus,
   ToolKind,
-} from "@delino/sandcrew-protos/v1/common_pb";
+} from "@delino/sandcrew-protos/v1/bridge_pb";
+import { PermissionMode } from "@delino/sandcrew-protos/v1/common_pb";
 import { OrganizationSettingsSchema } from "@delino/sandcrew-protos/v1/organization_pb";
 import {
   type ListSessionsResponse,
@@ -343,13 +343,14 @@ describe("transcript", () => {
         { case: "turnEnded", value: { stopReason: StopReason.CANCELLED } },
         {
           case: "agentExited",
-          value: { status: { case: "signal", value: "SIGKILL" } },
+          value: { result: { case: "signal", value: "SIGKILL" } },
         },
         {
           case: "unknownUpdate",
           value: { sessionUpdate: "usage_update", rawJson: "{}" },
         },
         { case: "hello", value: {} },
+        { case: "agentReady", value: {} },
       ),
     );
     expect(t.currentModeId).toBe("plan");
@@ -365,7 +366,7 @@ describe("transcript", () => {
       ChatItemKind.Unknown,
     ]);
     expect(t.items[0]).toMatchObject({ modeName: "Plan" });
-    expect(t.lastSequence).toBe(9n);
+    expect(t.lastSequence).toBe(10n);
   });
 
   test("merges events once, in sequence order", () => {

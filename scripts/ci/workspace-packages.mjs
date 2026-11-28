@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Workspace package discovery and release input paths that the change planner
-// (`plan.mjs`) and the deploy planner (`deploy-plan.mjs`) share. This module
-// imports neither of them, so both can import it without a module cycle.
+// Workspace package discovery, named alias parsing, and release input paths
+// shared by the CI and deploy planners and their tests.
 import {
   existsSync,
   lstatSync,
@@ -18,16 +17,30 @@ import { isAbsolute, join, posix, relative, sep } from "node:path";
 // plan.test.mjs cross-checks them.
 export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
 
-// Single workspace packages outside the workspace roots: the release-only Go
-// command packages under `cmds/`. Their manifests declare no package tasks
-// and exist so that Changesets versions them and `deploy.yml` releases them
-// (see the deployment workflow contract), so only the manifest, not the Go
-// source, is a workspace input. plan.test.mjs checks that they declare no
-// scripts and that `pnpm-workspace.yaml` lists exactly these directories.
-export const workspacePackageDirs = [
+// Release-only single workspace packages: Go command packages under `cmds/`
+// whose manifests declare no package tasks and exist so that Changesets
+// versions them and `deploy.yml` releases them (see the deployment workflow
+// contract), so only the manifest, not the Go source, is a workspace input.
+// plan.test.mjs checks that they declare no scripts.
+export const releaseOnlyPackageDirs = [
   "cmds/ownsand",
   "cmds/ownsand-agent",
   "cmds/sandrun",
+];
+
+// Task single workspace packages: Go command packages under `cmds/` whose
+// manifests declare package tasks (for example the tests of the SandCrew guest
+// bridge build script). The Go source is checked by the Go jobs, not by
+// package tasks; plan.test.mjs checks that they declare no `build` or `lint`
+// script. Every path inside them is a workspace input, like a package under a
+// workspace root.
+export const taskPackageDirs = ["cmds/sandcrew-bridge"];
+
+// Single workspace packages outside the workspace roots. plan.test.mjs checks
+// that `pnpm-workspace.yaml` lists exactly these directories.
+export const workspacePackageDirs = [
+  ...releaseOnlyPackageDirs,
+  ...taskPackageDirs,
 ];
 
 // Reads the manifest of every workspace package under `repoRoot`.
@@ -57,6 +70,13 @@ export function readWorkspacePackages(
     }
   }
   return packages;
+}
+
+// Reads the package name from the target portion of a named workspace alias,
+// for example `@scope/package` from `@scope/package@*`.
+export function namedWorkspaceAlias(target) {
+  if (target.startsWith("./") || target.startsWith("../")) return undefined;
+  return /^(@?[^@]+)@/.exec(target)?.[1];
 }
 
 // Control characters and backslashes break the tab- and line-separated

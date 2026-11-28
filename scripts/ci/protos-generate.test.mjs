@@ -248,7 +248,7 @@ function assertPreserved(f, result, diagnostic) {
   assert.notEqual(run.status, 0, run.stdout);
   assert.match(run.stderr, diagnostic);
   assert.deepEqual(bindings(f.repo), before);
-  assert.equal(before.size, 3 + 6 * tsPackages.length);
+  assert.equal(before.size, 27);
   assert.deepEqual(readdirSync(f.scratch), []);
 }
 

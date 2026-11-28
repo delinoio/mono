@@ -378,9 +378,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	// sandbox after the helper started and cleans it up.
 	if spec.Snapshot != nil {
 		if err := ctx.Err(); err != nil {
-			fsutil.RemoveAll(dir)
-			removeSocketDir(v)
-			return nil, fmt.Errorf("processrt: restore snapshot canceled before the helper started: %w", err)
+			return nil, errors.Join(
+				fmt.Errorf("processrt: restore snapshot canceled before the helper started: %w", err),
+				r.removeSandbox(v),
+			)
 		}
 	}
 	cmd := exec.Command(r.guestBinary,
@@ -394,9 +395,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	cmd.Stderr = os.Stderr
 	helper, wait, err := startHelper(cmd, r.logger.With("sandbox_id", v.id))
 	if err != nil {
-		fsutil.RemoveAll(dir)
-		removeSocketDir(v)
-		return nil, fmt.Errorf("processrt: start guest helper: %w", err)
+		return nil, errors.Join(
+			fmt.Errorf("processrt: start guest helper: %w", err),
+			r.removeSandbox(v),
+		)
 	}
 	v.helper = helper
 	go func() {
@@ -769,9 +771,9 @@ func (r *Runtime) removeUntracked(sandboxID string) error {
 	return nil
 }
 
-// removeSandbox removes the files of a sandbox whose helper was reaped,
-// including its socket directory, and then stops tracking it. Remove the
-// socket directory first to preserve its on-disk record for a retry if that
+// removeSandbox removes the files of a sandbox whose helper never started or
+// was reaped. It stops tracking the sandbox if it was tracked. The socket
+// directory goes first so its on-disk record remains available for a retry if
 // removal fails.
 func (r *Runtime) removeSandbox(v *vm) error {
 	if err := removeSocketDir(v); err != nil {

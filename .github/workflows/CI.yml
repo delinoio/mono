@@ -200,6 +200,15 @@ jobs:
           restore-keys: ${{ steps.go-cache-key.outputs.prefix }}
       - name: Vet Go module
         run: go vet ./...
+      - name: Lint Go module
+        # .golangci.yml enables only paralleltest, which requires the
+        # top-level tests of the slowest test packages to call t.Parallel().
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+          # The go-test job owns the Go cache, which the step above restored.
+          # The action's own cache would save an entry from every pull request.
+          skip-cache: true
       - name: Record validation result
         if: always()
         env:
@@ -209,7 +218,7 @@ jobs:
         run: |
           {
             echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
-            echo 'Commands in the root Go module: go vet ./...'
+            echo 'Commands in the root Go module: go vet ./...; golangci-lint run (v2.15.0, .golangci.yml)'
             echo "Result: $RESULT"
           } >> "$GITHUB_STEP_SUMMARY"
   go-test:

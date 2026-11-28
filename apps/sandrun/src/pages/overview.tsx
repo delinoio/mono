@@ -40,6 +40,7 @@ import {
   waitingInQueueOrder,
 } from "../queue.ts";
 import { Link, orgPath, RouteId } from "../router.tsx";
+import { useQueueWaitClock } from "../use-queue-wait-clock.ts";
 
 const RUNNER_ORDER = [
   RunnerState.CREATING,
@@ -57,9 +58,6 @@ const LIVE_TEXT = {
   [LiveState.Disconnected]: "overview.live.disconnected",
 } as const satisfies Record<LiveState, MessageKey>;
 
-/** How often the waiting time of queued requests is redrawn. */
-const CLOCK_TICK_MS = 15_000;
-
 /**
  * Route `overview`: the live queue from `WatchQueue` (reconnects with the
  * SDK helper), runners by state and the device pool from `GetCapacity`.
@@ -76,11 +74,7 @@ export function OverviewPage() {
   );
   const [streamError, setStreamError] = useState<unknown>();
   const [attempt, setAttempt] = useState(0);
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
-    return () => clearInterval(timer);
-  }, []);
+  const now = useQueueWaitClock();
   useEffect(() => {
     const abort = new AbortController();
     const work = createClient(WorkService, transport);

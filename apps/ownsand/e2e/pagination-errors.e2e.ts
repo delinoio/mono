@@ -690,6 +690,79 @@ describe("terminal full refresh errors", () => {
   );
 });
 
+describe("ownership transfer roster refresh", () => {
+  refreshTest(
+    "requires a new confirmation when the selected member leaves the roster",
+    async ({ app, browser, refresh, screen }) => {
+      await refresh.open("settings", "ListMembers", "TransferOwnership");
+      const picker = screen.getByRole("combobox", "New owner");
+      const transfer = screen.getByRole("button", "Transfer", { exact: true });
+      const dialog = screen.getByRole("alertdialog");
+      const refreshRoster = (excludeJun: boolean) =>
+        browser.evaluate(async (exclude) => {
+          if (exclude) {
+            sessionStorage.setItem(
+              "ownsand-e2e-excluded-member",
+              "user-admin-jun",
+            );
+          } else {
+            sessionStorage.removeItem("ownsand-e2e-excluded-member");
+          }
+          // Advance staleness for the same-route refetch.
+          const now = Date.now;
+          Date.now = () => now() + 11_000;
+          try {
+            window.dispatchEvent(new Event("visibilitychange"));
+            await Promise.resolve();
+          } finally {
+            Date.now = now;
+          }
+          return true;
+        }, excludeJun);
+      const requests = () =>
+        browser.evaluate(() =>
+          JSON.parse(
+            sessionStorage.getItem("ownsand-e2e-mutation-calls") ?? "[]",
+          ),
+        );
+
+      await picker.tap();
+      await screen.getByRole("option", "Jun Park").tap();
+      await transfer.tap();
+      await expect(dialog).toHaveText(/Make Jun Park the owner\?/);
+
+      await refreshRoster(true);
+      await expect(dialog).toBeHidden();
+      await expect(picker).toHaveText("Choose a member");
+      await expect(transfer).toBeDisabled();
+      expect(await requests()).toEqual([]);
+      await app.screenshot("ownership-transfer-target-removed");
+
+      await refreshRoster(false);
+      await expect(dialog).toBeHidden();
+      await expect(picker).toHaveText("Choose a member");
+      await expect(transfer).toBeDisabled();
+      await picker.tap();
+      await expect(screen.getByRole("option", "Jun Park")).toBeVisible();
+      await screen.getByRole("option", "user-member-ada").tap();
+      await transfer.tap();
+      await expect(dialog).toHaveText(/Make user-member-ada the owner\?/);
+      await dialog.getByRole("button", "Transfer ownership").tap();
+      await expect.poll(requests).toEqual(["TransferOwnership"]);
+      expect(
+        await browser.evaluate(() =>
+          (
+            JSON.parse(
+              sessionStorage.getItem("ownsand-e2e-resource-mutation-inputs") ??
+                "[]",
+            ) as string[]
+          ).map((request) => JSON.parse(request)),
+        ),
+      ).toEqual([{ organizationId: ACME, userId: "user-member-ada" }]);
+    },
+  );
+});
+
 describe("device inventory pagination", () => {
   paginationTest(
     "opens, places on and filters by a device beyond the first page",

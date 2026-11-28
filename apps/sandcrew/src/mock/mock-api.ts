@@ -13,27 +13,27 @@ import {
   type ConfigOption,
   type SessionMode,
   SessionModeSchema,
-} from "@delino/sandcrew-protos/v1/bridge_pb";
-import {
   AgentActivity,
-  AgentVendor,
   BridgeErrorKind,
   ConfigOptionCategory,
-  CredentialScope,
-  CredentialUpdateSource,
-  GuestOs,
-  PermissionMode,
   PermissionOptionKind,
   PermissionOutcome,
   PlanEntryPriority,
   PlanEntryStatus,
+  StopReason,
+  ToolCallStatus,
+  ToolKind,
+} from "@delino/sandcrew-protos/v1/bridge_pb";
+import {
+  AgentVendor,
+  CredentialScope,
+  CredentialUpdateSource,
+  GuestOs,
+  PermissionMode,
   ProfileIneligibility,
   Role,
   SessionEndReason,
   SessionState,
-  StopReason,
-  ToolCallStatus,
-  ToolKind,
   VendorCredentialKind,
 } from "@delino/sandcrew-protos/v1/common_pb";
 import {
@@ -429,7 +429,6 @@ export function createMockTransport(
       agentVersion: "2.1.0",
       adapterVersion: "0.9.0",
       guestOs: GuestOs.LINUX,
-      agentCapabilities: { loadSession: true, resumeSession: true },
     },
   });
 
@@ -685,7 +684,7 @@ export function createMockTransport(
       { case: "turnEnded", value: { stopReason: StopReason.END_TURN } },
       {
         case: "agentExited",
-        value: { status: { case: "exitCode", value: 1 } },
+        value: { result: { case: "exitCode", value: 1 } },
       },
     ],
   );

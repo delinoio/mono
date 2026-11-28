@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+import {
+  AgentActivity,
+  BridgeErrorKind,
+  InputRejectionReason,
+  StopReason,
+  ToolCallStatus,
+  ToolKind,
+} from "@delino/sandcrew-protos/v1/bridge_pb";
 import type {
   ConfigOption,
   ContentBlock,
@@ -9,15 +17,7 @@ import type {
   ToolCallContent,
   ToolCallLocation,
 } from "@delino/sandcrew-protos/v1/bridge_pb";
-import {
-  AgentActivity,
-  BridgeErrorKind,
-  InputRejectionReason,
-  PermissionMode,
-  StopReason,
-  ToolCallStatus,
-  ToolKind,
-} from "@delino/sandcrew-protos/v1/common_pb";
+import { PermissionMode } from "@delino/sandcrew-protos/v1/common_pb";
 import type { TranscriptEvent } from "@delino/sandcrew-protos/v1/session_pb";
 
 /** The kinds of chat items that the chat view renders. */
@@ -386,11 +386,11 @@ export function buildTranscript(
           kind: ChatItemKind.AgentExited,
           key,
           exitCode:
-            e.value.status.case === "exitCode"
-              ? e.value.status.value
+            e.value.result.case === "exitCode"
+              ? e.value.result.value
               : undefined,
           signal:
-            e.value.status.case === "signal" ? e.value.status.value : undefined,
+            e.value.result.case === "signal" ? e.value.result.value : undefined,
         });
         break;
       case "unknownUpdate":
@@ -402,9 +402,10 @@ export function buildTranscript(
         });
         break;
       case "hello":
+      case "agentReady":
       case "inputAccepted":
       case undefined:
-        // hello and input_accepted carry no chat content. An unknown case
+        // hello, agent_ready and input_accepted carry no chat content. An unknown case
         // of a newer protocol minor keeps its sequence and shows nothing.
         break;
     }

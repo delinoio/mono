@@ -7,13 +7,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io/fs"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -473,24 +473,24 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		return connect.NewResponse(proto.CloneOf(completed.response)), nil
 	}
 	end := m.GetOffset() + chunkSize
-	switch {
-	case m.GetOffset() == int64(len(w.data)):
-		w.data = append(w.data, m.GetData()...)
-	case end <= int64(len(w.data)) && bytes.Equal(w.data[m.GetOffset():end], m.GetData()):
-		// A retried chunk.
-	default:
-		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("chunk at offset %d does not continue the write at %d", m.GetOffset(), len(w.data)))
+	if err := w.stageChunk(m.GetOffset(), m.GetData()); err != nil {
+		return nil, err
 	}
 	res := &sandrunv1.WriteDevSessionFileResponse{WriteId: m.GetWriteId(), Offset: m.GetOffset(), Length: chunkSize}
 	if m.GetFinal() {
-		if end != int64(len(w.data)) {
-			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("the final chunk does not end the file"))
+		var data []byte
+		switch {
+		case len(w.ranges) == 0 && end == 0:
+		case len(w.ranges) == 1 && w.ranges[0].offset == 0 && w.ranges[0].end() == end:
+			data = w.ranges[0].data
+		default:
+			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("written ranges do not cover exactly the final file"))
 		}
 		mode := fs.FileMode(m.GetMode()).Perm()
 		if mode == 0 {
 			mode = 0o644
 		}
-		tmp, err := stageWrite(w.path, w.data, mode)
+		tmp, err := stageWrite(w.path, data, mode)
 		if err != nil {
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		}
@@ -499,13 +499,13 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		}
 		res.Finished = true
-		res.SizeBytes = int64(len(w.data))
+		res.SizeBytes = end
 		w.completed = &completedWrite{
 			mode:     m.GetMode(),
 			digest:   sha256.Sum256(m.GetData()),
 			response: proto.CloneOf(res),
 		}
-		w.data = nil
+		w.ranges = nil
 	}
 	return connect.NewResponse(res), nil
 }
@@ -535,8 +535,54 @@ type writeKey struct {
 
 type pendingWrite struct {
 	path      string
-	data      []byte
+	ranges    []writeRange // Sorted by offset, with touching ranges merged.
 	completed *completedWrite
+}
+
+type writeRange struct {
+	offset int64
+	data   []byte
+}
+
+func (r writeRange) end() int64 {
+	return r.offset + int64(len(r.data))
+}
+
+// stageChunk checks every overlap before changing the staged bytes.
+func (w *pendingWrite) stageChunk(offset int64, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	end := offset + int64(len(data))
+	first := sort.Search(len(w.ranges), func(i int) bool { return w.ranges[i].end() >= offset })
+	next := first
+	for next < len(w.ranges) && w.ranges[next].offset <= end {
+		r := w.ranges[next]
+		lo, hi := max(offset, r.offset), min(end, r.end())
+		if lo < hi && !bytes.Equal(data[lo-offset:hi-offset], r.data[lo-r.offset:hi-r.offset]) {
+			return connect.NewError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
+		}
+		next++
+	}
+
+	if first == next {
+		w.ranges = slices.Insert(w.ranges, first, writeRange{offset: offset, data: slices.Clone(data)})
+		return nil
+	}
+	merged := writeRange{offset: offset}
+	if head := w.ranges[first]; head.offset <= offset {
+		if head.end() >= end {
+			return nil
+		}
+		// Reuse the buffer when a chunk extends the range on the right.
+		merged = head
+	}
+	merged.data = append(merged.data, data[merged.end()-offset:]...)
+	if tail := w.ranges[next-1]; tail.end() > end {
+		merged.data = append(merged.data, tail.data[end-tail.offset:]...)
+	}
+	w.ranges = slices.Replace(w.ranges, first, next, merged)
+	return nil
 }
 
 type completedWrite struct {

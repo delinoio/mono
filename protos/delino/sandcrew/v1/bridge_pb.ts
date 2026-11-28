@@ -4,9 +4,9 @@
 // @generated from file delino/sandcrew/v1/bridge.proto (package delino.sandcrew.v1, syntax proto3)
 /* eslint-disable */
 
-import type { GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
-import { fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
-import type { AgentActivity, AgentVendor, BridgeErrorKind, ConfigOptionCategory, GuestOs, InputRejectionReason, PermissionMode, PermissionOptionKind, PermissionOutcome, PlanEntryPriority, PlanEntryStatus, StopReason, ToolCallStatus, ToolKind, VendorCredentialKind } from "./common_pb.ts";
+import type { GenEnum, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
+import { enumDesc, fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
+import type { AgentVendor, GuestOs, PermissionMode, VendorCredentialKind } from "./common_pb.ts";
 import { file_delino_sandcrew_v1_common } from "./common_pb.ts";
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
@@ -16,26 +16,25 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file delino/sandcrew/v1/bridge.proto.
  */
 export const file_delino_sandcrew_v1_bridge: GenFile = /*@__PURE__*/
-  fileDesc("Ch9kZWxpbm8vc2FuZGNyZXcvdjEvYnJpZGdlLnByb3RvEhJkZWxpbm8uc2FuZGNyZXcudjEi3gkKC0JyaWRnZUV2ZW50EhAKCHNlcXVlbmNlGAEgASgEEhYKDmxvZ19lbmRfb2Zmc2V0GAIgASgEEigKBHRpbWUYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjAKBWhlbGxvGAogASgLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLkJyaWRnZUhlbGxvSAASOwoOaW5wdXRfYWNjZXB0ZWQYCyABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuSW5wdXRBY2NlcHRlZEgAEjsKDmlucHV0X3JlamVjdGVkGAwgASgLMiEuZGVsaW5vLnNhbmRjcmV3LnYxLklucHV0UmVqZWN0ZWRIABI+ChJ1c2VyX21lc3NhZ2VfY2h1bmsYDSABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuQ29udGVudENodW5rSAASPwoTYWdlbnRfbWVzc2FnZV9jaHVuaxgOIAEoCzIgLmRlbGluby5zYW5kY3Jldy52MS5Db250ZW50Q2h1bmtIABI/ChNhZ2VudF90aG91Z2h0X2NodW5rGA8gASgLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbnRlbnRDaHVua0gAEjEKCXRvb2xfY2FsbBgQIAEoCzIcLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbEgAEj4KEHRvb2xfY2FsbF91cGRhdGUYESABKAsyIi5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbENhbGxVcGRhdGVIABIoCgRwbGFuGBIgASgLMhguZGVsaW5vLnNhbmRjcmV3LnYxLlBsYW5IABJDChJwZXJtaXNzaW9uX3JlcXVlc3QYEyABKAsyJS5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvblJlcXVlc3RIABJFChNwZXJtaXNzaW9uX3Jlc3BvbnNlGBQgASgLMiYuZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25SZXNwb25zZUgAEjMKCnR1cm5fZW5kZWQYFSABKAsyHS5kZWxpbm8uc2FuZGNyZXcudjEuVHVybkVuZGVkSAASNwoMbW9kZV9jaGFuZ2VkGBYgASgLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLk1vZGVDaGFuZ2VkSAASOwoOY29uZmlnX29wdGlvbnMYFyABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuQ29uZmlnT3B0aW9uc0gAEj4KDXNlc3Npb25fc3RhdGUYGCABKAsyJS5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRTZXNzaW9uU3RhdGVIABI3CgxicmlkZ2VfZXJyb3IYGSABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuQnJpZGdlRXJyb3JIABI3CgxhZ2VudF9leGl0ZWQYGiABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRFeGl0ZWRIABJBChFjcmVkZW50aWFsX3VwZGF0ZRgbIAEoCzIkLmRlbGluby5zYW5kY3Jldy52MS5DcmVkZW50aWFsVXBkYXRlSAASOwoOdW5rbm93bl91cGRhdGUYHCABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuVW5rbm93blVwZGF0ZUgAQgcKBWV2ZW50Ii8KD1Byb3RvY29sVmVyc2lvbhINCgVtYWpvchgBIAEoDRINCgVtaW5vchgCIAEoDSJBChFBZ2VudENhcGFiaWxpdGllcxIUCgxsb2FkX3Nlc3Npb24YASABKAgSFgoOcmVzdW1lX3Nlc3Npb24YAiABKAgi0QIKC0JyaWRnZUhlbGxvEhYKDmJyaWRnZV92ZXJzaW9uGAEgASgJEj0KEHByb3RvY29sX3ZlcnNpb24YAiABKAsyIy5kZWxpbm8uc2FuZGNyZXcudjEuUHJvdG9jb2xWZXJzaW9uEi8KBnZlbmRvchgDIAEoDjIfLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudFZlbmRvchIVCg1hZ2VudF92ZXJzaW9uGAQgASgJEhcKD2FkYXB0ZXJfdmVyc2lvbhgFIAEoCRItCghndWVzdF9vcxgGIAEoDjIbLmRlbGluby5zYW5kY3Jldy52MS5HdWVzdE9zEkEKEmFnZW50X2NhcGFiaWxpdGllcxgHIAEoCzIlLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudENhcGFiaWxpdGllcxIYChB3cmFwcGVkX2hlYWRsZXNzGAggASgIIiEKDUlucHV0QWNjZXB0ZWQSEAoIaW5wdXRfaWQYASABKAkiWwoNSW5wdXRSZWplY3RlZBIQCghpbnB1dF9pZBgBIAEoCRI4CgZyZWFzb24YAiABKA4yKC5kZWxpbm8uc2FuZGNyZXcudjEuSW5wdXRSZWplY3Rpb25SZWFzb24icwoMUmVzb3VyY2VMaW5rEgsKA3VyaRgBIAEoCRIMCgRuYW1lGAIgASgJEg0KBXRpdGxlGAMgASgJEhEKCW1pbWVfdHlwZRgEIAEoCRIXCgpzaXplX2J5dGVzGAUgASgDSACIAQFCDQoLX3NpemVfYnl0ZXMiJgoSVW5zdXBwb3J0ZWRDb250ZW50EhAKCHJhd19qc29uGAEgASgJIqEBCgxDb250ZW50QmxvY2sSDgoEdGV4dBgBIAEoCUgAEjkKDXJlc291cmNlX2xpbmsYAiABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuUmVzb3VyY2VMaW5rSAASPQoLdW5zdXBwb3J0ZWQYAyABKAsyJi5kZWxpbm8uc2FuZGNyZXcudjEuVW5zdXBwb3J0ZWRDb250ZW50SABCBwoFYmxvY2siQQoMQ29udGVudENodW5rEjEKB2NvbnRlbnQYASABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuQ29udGVudEJsb2NrIkoKBERpZmYSDAoEcGF0aBgBIAEoCRIVCghvbGRfdGV4dBgCIAEoCUgAiAEBEhAKCG5ld190ZXh0GAMgASgJQgsKCV9vbGRfdGV4dCIfCghUZXJtaW5hbBITCgt0ZXJtaW5hbF9pZBgBIAEoCSKrAQoPVG9vbENhbGxDb250ZW50EjEKBWJsb2NrGAEgASgLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbnRlbnRCbG9ja0gAEigKBGRpZmYYAiABKAsyGC5kZWxpbm8uc2FuZGNyZXcudjEuRGlmZkgAEjAKCHRlcm1pbmFsGAMgASgLMhwuZGVsaW5vLnNhbmRjcmV3LnYxLlRlcm1pbmFsSABCCQoHY29udGVudCI8ChBUb29sQ2FsbExvY2F0aW9uEgwKBHBhdGgYASABKAkSEQoEbGluZRgCIAEoDUgAiAEBQgcKBV9saW5lIpECCghUb29sQ2FsbBIUCgx0b29sX2NhbGxfaWQYASABKAkSDQoFdGl0bGUYAiABKAkSKgoEa2luZBgDIAEoDjIcLmRlbGluby5zYW5kY3Jldy52MS5Ub29sS2luZBIyCgZzdGF0dXMYBCABKA4yIi5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbENhbGxTdGF0dXMSNAoHY29udGVudBgFIAMoCzIjLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbENvbnRlbnQSNwoJbG9jYXRpb25zGAYgAygLMiQuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsTG9jYXRpb24SEQoJcmF3X2lucHV0GAcgASgJIkkKE1Rvb2xDYWxsQ29udGVudExpc3QSMgoFaXRlbXMYASADKAsyIy5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbENhbGxDb250ZW50IksKFFRvb2xDYWxsTG9jYXRpb25MaXN0EjMKBWl0ZW1zGAEgAygLMiQuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsTG9jYXRpb24ihwMKDlRvb2xDYWxsVXBkYXRlEhQKDHRvb2xfY2FsbF9pZBgBIAEoCRISCgV0aXRsZRgCIAEoCUgAiAEBEi8KBGtpbmQYAyABKA4yHC5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbEtpbmRIAYgBARI3CgZzdGF0dXMYBCABKA4yIi5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbENhbGxTdGF0dXNIAogBARI4Cgdjb250ZW50GAUgASgLMicuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsQ29udGVudExpc3QSOwoJbG9jYXRpb25zGAYgASgLMiguZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsTG9jYXRpb25MaXN0EhYKCXJhd19pbnB1dBgHIAEoCUgDiAEBEhcKCnJhd19vdXRwdXQYCCABKAlIBIgBAUIICgZfdGl0bGVCBwoFX2tpbmRCCQoHX3N0YXR1c0IMCgpfcmF3X2lucHV0Qg0KC19yYXdfb3V0cHV0IooBCglQbGFuRW50cnkSDwoHY29udGVudBgBIAEoCRI3Cghwcmlvcml0eRgCIAEoDjIlLmRlbGluby5zYW5kY3Jldy52MS5QbGFuRW50cnlQcmlvcml0eRIzCgZzdGF0dXMYAyABKA4yIy5kZWxpbm8uc2FuZGNyZXcudjEuUGxhbkVudHJ5U3RhdHVzIjYKBFBsYW4SLgoHZW50cmllcxgBIAMoCzIdLmRlbGluby5zYW5kY3Jldy52MS5QbGFuRW50cnkiawoQUGVybWlzc2lvbk9wdGlvbhIRCglvcHRpb25faWQYASABKAkSDAoEbmFtZRgCIAEoCRI2CgRraW5kGAMgASgOMiguZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25PcHRpb25LaW5kIn8KEVBlcm1pc3Npb25SZXF1ZXN0Eh0KFXBlcm1pc3Npb25fcmVxdWVzdF9pZBgBIAEoCRIUCgx0b29sX2NhbGxfaWQYAiABKAkSNQoHb3B0aW9ucxgDIAMoCzIkLmRlbGluby5zYW5kY3Jldy52MS5QZXJtaXNzaW9uT3B0aW9uIpUBChJQZXJtaXNzaW9uUmVzcG9uc2USHQoVcGVybWlzc2lvbl9yZXF1ZXN0X2lkGAEgASgJEjYKB291dGNvbWUYAiABKA4yJS5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvbk91dGNvbWUSEQoJb3B0aW9uX2lkGAMgASgJEhUKDWF1dG9fYXBwcm92ZWQYBCABKAgiQAoJVHVybkVuZGVkEjMKC3N0b3BfcmVhc29uGAEgASgOMh4uZGVsaW5vLnNhbmRjcmV3LnYxLlN0b3BSZWFzb24iQQoLU2Vzc2lvbk1vZGUSDwoHbW9kZV9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJIp0BCgtNb2RlQ2hhbmdlZBIXCg9jdXJyZW50X21vZGVfaWQYASABKAkSOAoPYXZhaWxhYmxlX21vZGVzGAIgAygLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLlNlc3Npb25Nb2RlEjsKD3Blcm1pc3Npb25fbW9kZRgDIAEoDjIiLmRlbGluby5zYW5kY3Jldy52MS5QZXJtaXNzaW9uTW9kZSJIChFDb25maWdPcHRpb25WYWx1ZRIQCgh2YWx1ZV9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJIsMBCgxDb25maWdPcHRpb24SGAoQY29uZmlnX29wdGlvbl9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEjoKCGNhdGVnb3J5GAMgASgOMiguZGVsaW5vLnNhbmRjcmV3LnYxLkNvbmZpZ09wdGlvbkNhdGVnb3J5EhgKEGN1cnJlbnRfdmFsdWVfaWQYBCABKAkSNQoGdmFsdWVzGAUgAygLMiUuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbmZpZ09wdGlvblZhbHVlIkIKDUNvbmZpZ09wdGlvbnMSMQoHb3B0aW9ucxgBIAMoCzIgLmRlbGluby5zYW5kY3Jldy52MS5Db25maWdPcHRpb24iRQoRQWdlbnRTZXNzaW9uU3RhdGUSMAoFc3RhdGUYASABKA4yIS5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRBY3Rpdml0eSJRCgtCcmlkZ2VFcnJvchIxCgRraW5kGAEgASgOMiMuZGVsaW5vLnNhbmRjcmV3LnYxLkJyaWRnZUVycm9yS2luZBIPCgdtZXNzYWdlGAIgASgJIj4KC0FnZW50RXhpdGVkEhMKCWV4aXRfY29kZRgBIAEoBUgAEhAKBnNpZ25hbBgCIAEoCUgAQggKBnN0YXR1cyJcChBDcmVkZW50aWFsVXBkYXRlEjYKBGtpbmQYASABKA4yKC5kZWxpbm8uc2FuZGNyZXcudjEuVmVuZG9yQ3JlZGVudGlhbEtpbmQSEAoIcmV2aXNpb24YAiABKAQiOQoNVW5rbm93blVwZGF0ZRIWCg5zZXNzaW9uX3VwZGF0ZRgBIAEoCRIQCghyYXdfanNvbhgCIAEoCSKNAwoLQnJpZGdlSW5wdXQSEAoIaW5wdXRfaWQYASABKAkSLwoLY3JlYXRlX3RpbWUYAiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjEKBnByb21wdBgKIAEoCzIfLmRlbGluby5zYW5kY3Jldy52MS5Qcm9tcHRJbnB1dEgAEkYKEXBlcm1pc3Npb25fYW5zd2VyGAsgASgLMikuZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25BbnN3ZXJJbnB1dEgAEjoKC2NhbmNlbF90dXJuGAwgASgLMiMuZGVsaW5vLnNhbmRjcmV3LnYxLkNhbmNlbFR1cm5JbnB1dEgAEjQKCHNldF9tb2RlGA0gASgLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLlNldE1vZGVJbnB1dEgAEkUKEXNldF9jb25maWdfb3B0aW9uGA4gASgLMiguZGVsaW5vLnNhbmRjcmV3LnYxLlNldENvbmZpZ09wdGlvbklucHV0SABCBwoFaW5wdXQiTQoLUHJvbXB0SW5wdXQSDAoEdGV4dBgBIAEoCRIcCg9hdHRhY2htZW50X3BhdGgYAiABKAlIAIgBAUISChBfYXR0YWNobWVudF9wYXRoIkkKFVBlcm1pc3Npb25BbnN3ZXJJbnB1dBIdChVwZXJtaXNzaW9uX3JlcXVlc3RfaWQYASABKAkSEQoJb3B0aW9uX2lkGAIgASgJIhEKD0NhbmNlbFR1cm5JbnB1dCJoCgxTZXRNb2RlSW5wdXQSEQoHbW9kZV9pZBgBIAEoCUgAEj0KD3Blcm1pc3Npb25fbW9kZRgCIAEoDjIiLmRlbGluby5zYW5kY3Jldy52MS5QZXJtaXNzaW9uTW9kZUgAQgYKBG1vZGUiQgoUU2V0Q29uZmlnT3B0aW9uSW5wdXQSGAoQY29uZmlnX29wdGlvbl9pZBgBIAEoCRIQCgh2YWx1ZV9pZBgCIAEoCUI/Wj1naXRodWIuY29tL2RlbGlub2lvL21vbm8vcHJvdG9zL2RlbGluby9zYW5kY3Jldy92MTtzYW5kY3Jld3YxYgZwcm90bzM", [file_delino_sandcrew_v1_common, file_google_protobuf_timestamp]);
+  fileDesc("Ch9kZWxpbm8vc2FuZGNyZXcvdjEvYnJpZGdlLnByb3RvEhJkZWxpbm8uc2FuZGNyZXcudjEilQoKC0JyaWRnZUV2ZW50EhAKCHNlcXVlbmNlGAEgASgEEhYKDmxvZ19lbmRfb2Zmc2V0GAIgASgEEigKBHRpbWUYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjAKBWhlbGxvGAogASgLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLkJyaWRnZUhlbGxvSAASOwoOaW5wdXRfYWNjZXB0ZWQYCyABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuSW5wdXRBY2NlcHRlZEgAEjsKDmlucHV0X3JlamVjdGVkGAwgASgLMiEuZGVsaW5vLnNhbmRjcmV3LnYxLklucHV0UmVqZWN0ZWRIABI+ChJ1c2VyX21lc3NhZ2VfY2h1bmsYDSABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuQ29udGVudENodW5rSAASPwoTYWdlbnRfbWVzc2FnZV9jaHVuaxgOIAEoCzIgLmRlbGluby5zYW5kY3Jldy52MS5Db250ZW50Q2h1bmtIABI/ChNhZ2VudF90aG91Z2h0X2NodW5rGA8gASgLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbnRlbnRDaHVua0gAEjEKCXRvb2xfY2FsbBgQIAEoCzIcLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbEgAEj4KEHRvb2xfY2FsbF91cGRhdGUYESABKAsyIi5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbENhbGxVcGRhdGVIABIoCgRwbGFuGBIgASgLMhguZGVsaW5vLnNhbmRjcmV3LnYxLlBsYW5IABJDChJwZXJtaXNzaW9uX3JlcXVlc3QYEyABKAsyJS5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvblJlcXVlc3RIABJFChNwZXJtaXNzaW9uX3Jlc3BvbnNlGBQgASgLMiYuZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25SZXNwb25zZUgAEjMKCnR1cm5fZW5kZWQYFSABKAsyHS5kZWxpbm8uc2FuZGNyZXcudjEuVHVybkVuZGVkSAASNwoMbW9kZV9jaGFuZ2VkGBYgASgLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLk1vZGVDaGFuZ2VkSAASOwoOY29uZmlnX29wdGlvbnMYFyABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuQ29uZmlnT3B0aW9uc0gAEj4KDXNlc3Npb25fc3RhdGUYGCABKAsyJS5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRTZXNzaW9uU3RhdGVIABI3CgxicmlkZ2VfZXJyb3IYGSABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuQnJpZGdlRXJyb3JIABI3CgxhZ2VudF9leGl0ZWQYGiABKAsyHy5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRFeGl0ZWRIABJBChFjcmVkZW50aWFsX3VwZGF0ZRgbIAEoCzIkLmRlbGluby5zYW5kY3Jldy52MS5DcmVkZW50aWFsVXBkYXRlSAASOwoOdW5rbm93bl91cGRhdGUYHCABKAsyIS5kZWxpbm8uc2FuZGNyZXcudjEuVW5rbm93blVwZGF0ZUgAEjUKC2FnZW50X3JlYWR5GB0gASgLMh4uZGVsaW5vLnNhbmRjcmV3LnYxLkFnZW50UmVhZHlIAEIHCgVldmVudCIvCg9Qcm90b2NvbFZlcnNpb24SDQoFbWFqb3IYASABKA0SDQoFbWlub3IYAiABKA0iQQoRQWdlbnRDYXBhYmlsaXRpZXMSFAoMbG9hZF9zZXNzaW9uGAEgASgIEhYKDnJlc3VtZV9zZXNzaW9uGAIgASgIIo4CCgtCcmlkZ2VIZWxsbxIWCg5icmlkZ2VfdmVyc2lvbhgBIAEoCRI9ChBwcm90b2NvbF92ZXJzaW9uGAIgASgLMiMuZGVsaW5vLnNhbmRjcmV3LnYxLlByb3RvY29sVmVyc2lvbhIvCgZ2ZW5kb3IYAyABKA4yHy5kZWxpbm8uc2FuZGNyZXcudjEuQWdlbnRWZW5kb3ISFQoNYWdlbnRfdmVyc2lvbhgEIAEoCRIXCg9hZGFwdGVyX3ZlcnNpb24YBSABKAkSLQoIZ3Vlc3Rfb3MYBiABKA4yGy5kZWxpbm8uc2FuZGNyZXcudjEuR3Vlc3RPcxIYChB3cmFwcGVkX2hlYWRsZXNzGAcgASgIIp0BCgpBZ2VudFJlYWR5EkEKEmFnZW50X2NhcGFiaWxpdGllcxgBIAEoCzIlLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudENhcGFiaWxpdGllcxIYChBhZ2VudF9zZXNzaW9uX2lkGAIgASgJEhIKCmFnZW50X25hbWUYAyABKAkSHgoWYWdlbnRfcmVwb3J0ZWRfdmVyc2lvbhgEIAEoCSIhCg1JbnB1dEFjY2VwdGVkEhAKCGlucHV0X2lkGAEgASgJIlsKDUlucHV0UmVqZWN0ZWQSEAoIaW5wdXRfaWQYASABKAkSOAoGcmVhc29uGAIgASgOMiguZGVsaW5vLnNhbmRjcmV3LnYxLklucHV0UmVqZWN0aW9uUmVhc29uIkEKDENvbnRlbnRDaHVuaxIxCgdjb250ZW50GAEgASgLMiAuZGVsaW5vLnNhbmRjcmV3LnYxLkNvbnRlbnRCbG9jayJ5CgxDb250ZW50QmxvY2sSDgoEdGV4dBgBIAEoCUgAEjkKDXJlc291cmNlX2xpbmsYAiABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuUmVzb3VyY2VMaW5rSAASFQoLdW5zdXBwb3J0ZWQYAyABKAlIAEIHCgVibG9jayJ8CgxSZXNvdXJjZUxpbmsSCwoDdXJpGAEgASgJEgwKBG5hbWUYAiABKAkSDQoFdGl0bGUYAyABKAkSEwoLZGVzY3JpcHRpb24YBCABKAkSEQoJbWltZV90eXBlGAUgASgJEhEKBHNpemUYBiABKANIAIgBAUIHCgVfc2l6ZSKlAgoIVG9vbENhbGwSFAoMdG9vbF9jYWxsX2lkGAEgASgJEg0KBXRpdGxlGAIgASgJEioKBGtpbmQYAyABKA4yHC5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbEtpbmQSMgoGc3RhdHVzGAQgASgOMiIuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsU3RhdHVzEjQKB2NvbnRlbnQYBSADKAsyIy5kZWxpbm8uc2FuZGNyZXcudjEuVG9vbENhbGxDb250ZW50EjcKCWxvY2F0aW9ucxgGIAMoCzIkLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbExvY2F0aW9uEhEKCXJhd19pbnB1dBgHIAEoCRISCgpyYXdfb3V0cHV0GAggASgJIocDCg5Ub29sQ2FsbFVwZGF0ZRIUCgx0b29sX2NhbGxfaWQYASABKAkSEgoFdGl0bGUYAiABKAlIAIgBARIvCgRraW5kGAMgASgOMhwuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xLaW5kSAGIAQESNwoGc3RhdHVzGAQgASgOMiIuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsU3RhdHVzSAKIAQESOAoHY29udGVudBgFIAEoCzInLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbENvbnRlbnRMaXN0EjsKCWxvY2F0aW9ucxgGIAEoCzIoLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbExvY2F0aW9uTGlzdBIWCglyYXdfaW5wdXQYByABKAlIA4gBARIXCgpyYXdfb3V0cHV0GAggASgJSASIAQFCCAoGX3RpdGxlQgcKBV9raW5kQgkKB19zdGF0dXNCDAoKX3Jhd19pbnB1dEINCgtfcmF3X291dHB1dCJJChNUb29sQ2FsbENvbnRlbnRMaXN0EjIKBWl0ZW1zGAEgAygLMiMuZGVsaW5vLnNhbmRjcmV3LnYxLlRvb2xDYWxsQ29udGVudCJLChRUb29sQ2FsbExvY2F0aW9uTGlzdBIzCgVpdGVtcxgBIAMoCzIkLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbExvY2F0aW9uIqsBCg9Ub29sQ2FsbENvbnRlbnQSMQoFYmxvY2sYASABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuQ29udGVudEJsb2NrSAASKAoEZGlmZhgCIAEoCzIYLmRlbGluby5zYW5kY3Jldy52MS5EaWZmSAASMAoIdGVybWluYWwYAyABKAsyHC5kZWxpbm8uc2FuZGNyZXcudjEuVGVybWluYWxIAEIJCgdjb250ZW50IkoKBERpZmYSDAoEcGF0aBgBIAEoCRIVCghvbGRfdGV4dBgCIAEoCUgAiAEBEhAKCG5ld190ZXh0GAMgASgJQgsKCV9vbGRfdGV4dCIfCghUZXJtaW5hbBITCgt0ZXJtaW5hbF9pZBgBIAEoCSI8ChBUb29sQ2FsbExvY2F0aW9uEgwKBHBhdGgYASABKAkSEQoEbGluZRgCIAEoDUgAiAEBQgcKBV9saW5lIjYKBFBsYW4SLgoHZW50cmllcxgBIAMoCzIdLmRlbGluby5zYW5kY3Jldy52MS5QbGFuRW50cnkiigEKCVBsYW5FbnRyeRIPCgdjb250ZW50GAEgASgJEjcKCHByaW9yaXR5GAIgASgOMiUuZGVsaW5vLnNhbmRjcmV3LnYxLlBsYW5FbnRyeVByaW9yaXR5EjMKBnN0YXR1cxgDIAEoDjIjLmRlbGluby5zYW5kY3Jldy52MS5QbGFuRW50cnlTdGF0dXMitgEKEVBlcm1pc3Npb25SZXF1ZXN0Eh0KFXBlcm1pc3Npb25fcmVxdWVzdF9pZBgBIAEoCRIUCgx0b29sX2NhbGxfaWQYAiABKAkSNQoHb3B0aW9ucxgDIAMoCzIkLmRlbGluby5zYW5kY3Jldy52MS5QZXJtaXNzaW9uT3B0aW9uEjUKCXRvb2xfY2FsbBgEIAEoCzIiLmRlbGluby5zYW5kY3Jldy52MS5Ub29sQ2FsbFVwZGF0ZSJrChBQZXJtaXNzaW9uT3B0aW9uEhEKCW9wdGlvbl9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEjYKBGtpbmQYAyABKA4yKC5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvbk9wdGlvbktpbmQilQEKElBlcm1pc3Npb25SZXNwb25zZRIdChVwZXJtaXNzaW9uX3JlcXVlc3RfaWQYASABKAkSNgoHb3V0Y29tZRgCIAEoDjIlLmRlbGluby5zYW5kY3Jldy52MS5QZXJtaXNzaW9uT3V0Y29tZRIRCglvcHRpb25faWQYAyABKAkSFQoNYXV0b19hcHByb3ZlZBgEIAEoCCJACglUdXJuRW5kZWQSMwoLc3RvcF9yZWFzb24YASABKA4yHi5kZWxpbm8uc2FuZGNyZXcudjEuU3RvcFJlYXNvbiKdAQoLTW9kZUNoYW5nZWQSFwoPY3VycmVudF9tb2RlX2lkGAEgASgJEjgKD2F2YWlsYWJsZV9tb2RlcxgCIAMoCzIfLmRlbGluby5zYW5kY3Jldy52MS5TZXNzaW9uTW9kZRI7Cg9wZXJtaXNzaW9uX21vZGUYAyABKA4yIi5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvbk1vZGUiQQoLU2Vzc2lvbk1vZGUSDwoHbW9kZV9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJIkIKDUNvbmZpZ09wdGlvbnMSMQoHb3B0aW9ucxgBIAMoCzIgLmRlbGluby5zYW5kY3Jldy52MS5Db25maWdPcHRpb24i2AEKDENvbmZpZ09wdGlvbhIYChBjb25maWdfb3B0aW9uX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSOgoIY2F0ZWdvcnkYBCABKA4yKC5kZWxpbm8uc2FuZGNyZXcudjEuQ29uZmlnT3B0aW9uQ2F0ZWdvcnkSGAoQY3VycmVudF92YWx1ZV9pZBgFIAEoCRI1CgZ2YWx1ZXMYBiADKAsyJS5kZWxpbm8uc2FuZGNyZXcudjEuQ29uZmlnT3B0aW9uVmFsdWUiSAoRQ29uZmlnT3B0aW9uVmFsdWUSEAoIdmFsdWVfaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCSJFChFBZ2VudFNlc3Npb25TdGF0ZRIwCgVzdGF0ZRgBIAEoDjIhLmRlbGluby5zYW5kY3Jldy52MS5BZ2VudEFjdGl2aXR5IlEKC0JyaWRnZUVycm9yEjEKBGtpbmQYASABKA4yIy5kZWxpbm8uc2FuZGNyZXcudjEuQnJpZGdlRXJyb3JLaW5kEg8KB21lc3NhZ2UYAiABKAkiPgoLQWdlbnRFeGl0ZWQSEwoJZXhpdF9jb2RlGAEgASgFSAASEAoGc2lnbmFsGAIgASgJSABCCAoGcmVzdWx0IlwKEENyZWRlbnRpYWxVcGRhdGUSNgoEa2luZBgBIAEoDjIoLmRlbGluby5zYW5kY3Jldy52MS5WZW5kb3JDcmVkZW50aWFsS2luZBIQCghyZXZpc2lvbhgCIAEoBCI5Cg1Vbmtub3duVXBkYXRlEhYKDnNlc3Npb25fdXBkYXRlGAEgASgJEhAKCHJhd19qc29uGAIgASgJIo0DCgtCcmlkZ2VJbnB1dBIQCghpbnB1dF9pZBgBIAEoCRIvCgtjcmVhdGVfdGltZRgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASMQoGcHJvbXB0GAogASgLMh8uZGVsaW5vLnNhbmRjcmV3LnYxLlByb21wdElucHV0SAASRgoRcGVybWlzc2lvbl9hbnN3ZXIYCyABKAsyKS5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvbkFuc3dlcklucHV0SAASOgoLY2FuY2VsX3R1cm4YDCABKAsyIy5kZWxpbm8uc2FuZGNyZXcudjEuQ2FuY2VsVHVybklucHV0SAASNAoIc2V0X21vZGUYDSABKAsyIC5kZWxpbm8uc2FuZGNyZXcudjEuU2V0TW9kZUlucHV0SAASRQoRc2V0X2NvbmZpZ19vcHRpb24YDiABKAsyKC5kZWxpbm8uc2FuZGNyZXcudjEuU2V0Q29uZmlnT3B0aW9uSW5wdXRIAEIHCgVpbnB1dCJNCgtQcm9tcHRJbnB1dBIMCgR0ZXh0GAEgASgJEhwKD2F0dGFjaG1lbnRfcGF0aBgCIAEoCUgAiAEBQhIKEF9hdHRhY2htZW50X3BhdGgiSQoVUGVybWlzc2lvbkFuc3dlcklucHV0Eh0KFXBlcm1pc3Npb25fcmVxdWVzdF9pZBgBIAEoCRIRCglvcHRpb25faWQYAiABKAkiEQoPQ2FuY2VsVHVybklucHV0ImoKDFNldE1vZGVJbnB1dBIRCgdtb2RlX2lkGAEgASgJSAASPQoPcGVybWlzc2lvbl9tb2RlGAIgASgOMiIuZGVsaW5vLnNhbmRjcmV3LnYxLlBlcm1pc3Npb25Nb2RlSABCCAoGdGFyZ2V0IkIKFFNldENvbmZpZ09wdGlvbklucHV0EhgKEGNvbmZpZ19vcHRpb25faWQYASABKAkSEAoIdmFsdWVfaWQYAiABKAkirAIKEUJyaWRnZVN0YXJ0Q29uZmlnEhIKCnNlc3Npb25faWQYASABKAkSLwoGdmVuZG9yGAIgASgOMh8uZGVsaW5vLnNhbmRjcmV3LnYxLkFnZW50VmVuZG9yEkEKD2NyZWRlbnRpYWxfa2luZBgDIAEoDjIoLmRlbGluby5zYW5kY3Jldy52MS5WZW5kb3JDcmVkZW50aWFsS2luZBI7Cg9wZXJtaXNzaW9uX21vZGUYBCABKA4yIi5kZWxpbm8uc2FuZGNyZXcudjEuUGVybWlzc2lvbk1vZGUSDwoHbW9kZV9pZBgFIAEoCRJBCg5jb25maWdfb3B0aW9ucxgGIAMoCzIpLmRlbGluby5zYW5kY3Jldy52MS5Db25maWdPcHRpb25TZWxlY3Rpb24iQwoVQ29uZmlnT3B0aW9uU2VsZWN0aW9uEhgKEGNvbmZpZ19vcHRpb25faWQYASABKAkSEAoIdmFsdWVfaWQYAiABKAkq/gEKCFRvb2xLaW5kEhkKFVRPT0xfS0lORF9VTlNQRUNJRklFRBAAEhIKDlRPT0xfS0lORF9SRUFEEAESEgoOVE9PTF9LSU5EX0VESVQQAhIUChBUT09MX0tJTkRfREVMRVRFEAMSEgoOVE9PTF9LSU5EX01PVkUQBBIUChBUT09MX0tJTkRfU0VBUkNIEAUSFQoRVE9PTF9LSU5EX0VYRUNVVEUQBhITCg9UT09MX0tJTkRfVEhJTksQBxITCg9UT09MX0tJTkRfRkVUQ0gQCBIZChVUT09MX0tJTkRfU1dJVENIX01PREUQCRITCg9UT09MX0tJTkRfT1RIRVIQCiqvAQoOVG9vbENhbGxTdGF0dXMSIAocVE9PTF9DQUxMX1NUQVRVU19VTlNQRUNJRklFRBAAEhwKGFRPT0xfQ0FMTF9TVEFUVVNfUEVORElORxABEiAKHFRPT0xfQ0FMTF9TVEFUVVNfSU5fUFJPR1JFU1MQAhIeChpUT09MX0NBTExfU1RBVFVTX0NPTVBMRVRFRBADEhsKF1RPT0xfQ0FMTF9TVEFUVVNfRkFJTEVEEAQqkwEKEVBsYW5FbnRyeVByaW9yaXR5EiMKH1BMQU5fRU5UUllfUFJJT1JJVFlfVU5TUEVDSUZJRUQQABIcChhQTEFOX0VOVFJZX1BSSU9SSVRZX0hJR0gQARIeChpQTEFOX0VOVFJZX1BSSU9SSVRZX01FRElVTRACEhsKF1BMQU5fRU5UUllfUFJJT1JJVFlfTE9XEAMqlwEKD1BsYW5FbnRyeVN0YXR1cxIhCh1QTEFOX0VOVFJZX1NUQVRVU19VTlNQRUNJRklFRBAAEh0KGVBMQU5fRU5UUllfU1RBVFVTX1BFTkRJTkcQARIhCh1QTEFOX0VOVFJZX1NUQVRVU19JTl9QUk9HUkVTUxACEh8KG1BMQU5fRU5UUllfU1RBVFVTX0NPTVBMRVRFRBADKuABChRQZXJtaXNzaW9uT3B0aW9uS2luZBImCiJQRVJNSVNTSU9OX09QVElPTl9LSU5EX1VOU1BFQ0lGSUVEEAASJQohUEVSTUlTU0lPTl9PUFRJT05fS0lORF9BTExPV19PTkNFEAESJwojUEVSTUlTU0lPTl9PUFRJT05fS0lORF9BTExPV19BTFdBWVMQAhImCiJQRVJNSVNTSU9OX09QVElPTl9LSU5EX1JFSkVDVF9PTkNFEAMSKAokUEVSTUlTU0lPTl9PUFRJT05fS0lORF9SRUpFQ1RfQUxXQVlTEAQqegoRUGVybWlzc2lvbk91dGNvbWUSIgoeUEVSTUlTU0lPTl9PVVRDT01FX1VOU1BFQ0lGSUVEEAASHwobUEVSTUlTU0lPTl9PVVRDT01FX1NFTEVDVEVEEAESIAocUEVSTUlTU0lPTl9PVVRDT01FX0NBTkNFTExFRBACKrYBCgpTdG9wUmVhc29uEhsKF1NUT1BfUkVBU09OX1VOU1BFQ0lGSUVEEAASGAoUU1RPUF9SRUFTT05fRU5EX1RVUk4QARIaChZTVE9QX1JFQVNPTl9NQVhfVE9LRU5TEAISIQodU1RPUF9SRUFTT05fTUFYX1RVUk5fUkVRVUVTVFMQAxIXChNTVE9QX1JFQVNPTl9SRUZVU0FMEAQSGQoVU1RPUF9SRUFTT05fQ0FOQ0VMTEVEEAUqmAIKFENvbmZpZ09wdGlvbkNhdGVnb3J5EiYKIkNPTkZJR19PUFRJT05fQ0FURUdPUllfVU5TUEVDSUZJRUQQABIfChtDT05GSUdfT1BUSU9OX0NBVEVHT1JZX01PREUQARIgChxDT05GSUdfT1BUSU9OX0NBVEVHT1JZX01PREVMEAISJwojQ09ORklHX09QVElPTl9DQVRFR09SWV9NT0RFTF9DT05GSUcQAxIgChxDT05GSUdfT1BUSU9OX0NBVEVHT1JZX1NQRUVEEAQSKAokQ09ORklHX09QVElPTl9DQVRFR09SWV9USE9VR0hUX0xFVkVMEAUSIAocQ09ORklHX09QVElPTl9DQVRFR09SWV9PVEhFUhAGKqwBCg1BZ2VudEFjdGl2aXR5Eh4KGkFHRU5UX0FDVElWSVRZX1VOU1BFQ0lGSUVEEAASGwoXQUdFTlRfQUNUSVZJVFlfU1RBUlRJTkcQARIXChNBR0VOVF9BQ1RJVklUWV9JRExFEAISGgoWQUdFTlRfQUNUSVZJVFlfV09SS0lORxADEikKJUFHRU5UX0FDVElWSVRZX1dBSVRJTkdfRk9SX1BFUk1JU1NJT04QBCqwAwoPQnJpZGdlRXJyb3JLaW5kEiEKHUJSSURHRV9FUlJPUl9LSU5EX1VOU1BFQ0lGSUVEEAASKgomQlJJREdFX0VSUk9SX0tJTkRfQUdFTlRfSU5TVEFMTF9GQUlMRUQQARInCiNCUklER0VfRVJST1JfS0lORF9DSEVDS1NVTV9NSVNNQVRDSBACEigKJEJSSURHRV9FUlJPUl9LSU5EX0FHRU5UX1NUQVJUX0ZBSUxFRBADEigKJEJSSURHRV9FUlJPUl9LSU5EX0NSRURFTlRJQUxfTUlTU0lORxAEEigKJEJSSURHRV9FUlJPUl9LSU5EX0FDUF9QUk9UT0NPTF9FUlJPUhAFEiMKH0JSSURHRV9FUlJPUl9LSU5EX0lOUFVUX0lOVkFMSUQQBhIlCiFCUklER0VfRVJST1JfS0lORF9PUFRJT05fUkVKRUNURUQQBxIsCihCUklER0VfRVJST1JfS0lORF9FVkVOVF9MT0dfV1JJVEVfRkFJTEVEEAgSLQopQlJJREdFX0VSUk9SX0tJTkRfQ1JFREVOVElBTF9XQVRDSF9GQUlMRUQQCSqZAgoUSW5wdXRSZWplY3Rpb25SZWFzb24SJgoiSU5QVVRfUkVKRUNUSU9OX1JFQVNPTl9VTlNQRUNJRklFRBAAEiQKIElOUFVUX1JFSkVDVElPTl9SRUFTT05fTUFMRk9STUVEEAESNQoxSU5QVVRfUkVKRUNUSU9OX1JFQVNPTl9VTktOT1dOX1BFUk1JU1NJT05fUkVRVUVTVBACEikKJUlOUFVUX1JFSkVDVElPTl9SRUFTT05fVU5LTk9XTl9PUFRJT04QAxIpCiVJTlBVVF9SRUpFQ1RJT05fUkVBU09OX05PX0FDVElWRV9UVVJOEAQSJgoiSU5QVVRfUkVKRUNUSU9OX1JFQVNPTl9VTlNVUFBPUlRFRBAFQj9aPWdpdGh1Yi5jb20vZGVsaW5vaW8vbW9uby9wcm90b3MvZGVsaW5vL3NhbmRjcmV3L3YxO3NhbmRjcmV3djFiBnByb3RvMw", [file_delino_sandcrew_v1_common, file_google_protobuf_timestamp]);
 
 /**
- * One event that the bridge writes as a protobuf JSON line to the stdout of
- * its exec and to its guest event log.
+ * One event of the bridge.
  *
  * @generated from message delino.sandcrew.v1.BridgeEvent
  */
 export type BridgeEvent = Message<"delino.sandcrew.v1.BridgeEvent"> & {
   /**
-   * Starts at 1 and increases by 1 for each event of the session that the
-   * guest event log holds. A credential_update event repeats the sequence of
-   * the last logged event.
+   * Starts at 1 and increases by 1 for each event that the guest event log
+   * holds. A credential_update repeats the sequence of the last logged
+   * event.
    *
    * @generated from field: uint64 sequence = 1;
    */
   sequence: bigint;
 
   /**
-   * The byte offset in the guest event log after the line of this event.
+   * Byte offset in the guest event log after the line of this event.
    *
    * @generated from field: uint64 log_end_offset = 2;
    */
@@ -51,8 +50,6 @@ export type BridgeEvent = Message<"delino.sandcrew.v1.BridgeEvent"> & {
    */
   event: {
     /**
-     * Always the first event of a bridge process.
-     *
      * @generated from field: delino.sandcrew.v1.BridgeHello hello = 10;
      */
     value: BridgeHello;
@@ -149,17 +146,12 @@ export type BridgeEvent = Message<"delino.sandcrew.v1.BridgeEvent"> & {
     case: "bridgeError";
   } | {
     /**
-     * The last event of a bridge process when the agent ends.
-     *
      * @generated from field: delino.sandcrew.v1.AgentExited agent_exited = 26;
      */
     value: AgentExited;
     case: "agentExited";
   } | {
     /**
-     * Written only to stdout, never to the guest event log, never stored and
-     * never logged.
-     *
      * @generated from field: delino.sandcrew.v1.CredentialUpdate credential_update = 27;
      */
     value: CredentialUpdate;
@@ -170,6 +162,12 @@ export type BridgeEvent = Message<"delino.sandcrew.v1.BridgeEvent"> & {
      */
     value: UnknownUpdate;
     case: "unknownUpdate";
+  } | {
+    /**
+     * @generated from field: delino.sandcrew.v1.AgentReady agent_ready = 29;
+     */
+    value: AgentReady;
+    case: "agentReady";
   } | { case: undefined; value?: undefined };
 };
 
@@ -181,7 +179,7 @@ export const BridgeEventSchema: GenMessage<BridgeEvent> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 0);
 
 /**
- * A version of the bridge event and input schema.
+ * Version of the bridge event and input schema.
  *
  * @generated from message delino.sandcrew.v1.ProtocolVersion
  */
@@ -205,17 +203,21 @@ export const ProtocolVersionSchema: GenMessage<ProtocolVersion> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 1);
 
 /**
- * The ACP capabilities of the agent.
+ * Optional ACP capabilities that the agent advertises.
  *
  * @generated from message delino.sandcrew.v1.AgentCapabilities
  */
 export type AgentCapabilities = Message<"delino.sandcrew.v1.AgentCapabilities"> & {
   /**
+   * ACP `session/load`.
+   *
    * @generated from field: bool load_session = 1;
    */
   loadSession: boolean;
 
   /**
+   * ACP `session/resume`.
+   *
    * @generated from field: bool resume_session = 2;
    */
   resumeSession: boolean;
@@ -229,6 +231,8 @@ export const AgentCapabilitiesSchema: GenMessage<AgentCapabilities> = /*@__PURE_
   messageDesc(file_delino_sandcrew_v1_bridge, 2);
 
 /**
+ * The first event of every bridge process.
+ *
  * @generated from message delino.sandcrew.v1.BridgeHello
  */
 export type BridgeHello = Message<"delino.sandcrew.v1.BridgeHello"> & {
@@ -248,11 +252,15 @@ export type BridgeHello = Message<"delino.sandcrew.v1.BridgeHello"> & {
   vendor: AgentVendor;
 
   /**
+   * The pinned version of the agent CLI.
+   *
    * @generated from field: string agent_version = 4;
    */
   agentVersion: string;
 
   /**
+   * The pinned version of the ACP adapter.
+   *
    * @generated from field: string adapter_version = 5;
    */
   adapterVersion: string;
@@ -263,14 +271,9 @@ export type BridgeHello = Message<"delino.sandcrew.v1.BridgeHello"> & {
   guestOs: GuestOs;
 
   /**
-   * @generated from field: delino.sandcrew.v1.AgentCapabilities agent_capabilities = 7;
-   */
-  agentCapabilities?: AgentCapabilities | undefined;
-
-  /**
-   * True when the bridge wraps a headless CLI mode instead of ACP.
+   * True when a bridge adapter wraps a headless CLI instead of ACP.
    *
-   * @generated from field: bool wrapped_headless = 8;
+   * @generated from field: bool wrapped_headless = 7;
    */
   wrappedHeadless: boolean;
 };
@@ -283,8 +286,44 @@ export const BridgeHelloSchema: GenMessage<BridgeHello> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 3);
 
 /**
- * The bridge read an inbox message and applied or queued it.
+ * The agent started and its ACP session exists.
  *
+ * @generated from message delino.sandcrew.v1.AgentReady
+ */
+export type AgentReady = Message<"delino.sandcrew.v1.AgentReady"> & {
+  /**
+   * @generated from field: delino.sandcrew.v1.AgentCapabilities agent_capabilities = 1;
+   */
+  agentCapabilities?: AgentCapabilities | undefined;
+
+  /**
+   * The ACP session ID that the agent assigned.
+   *
+   * @generated from field: string agent_session_id = 2;
+   */
+  agentSessionId: string;
+
+  /**
+   * The name and version that the agent reports, when it reports them.
+   *
+   * @generated from field: string agent_name = 3;
+   */
+  agentName: string;
+
+  /**
+   * @generated from field: string agent_reported_version = 4;
+   */
+  agentReportedVersion: string;
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.AgentReady.
+ * Use `create(AgentReadySchema)` to create a new message.
+ */
+export const AgentReadySchema: GenMessage<AgentReady> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 4);
+
+/**
  * @generated from message delino.sandcrew.v1.InputAccepted
  */
 export type InputAccepted = Message<"delino.sandcrew.v1.InputAccepted"> & {
@@ -299,11 +338,9 @@ export type InputAccepted = Message<"delino.sandcrew.v1.InputAccepted"> & {
  * Use `create(InputAcceptedSchema)` to create a new message.
  */
 export const InputAcceptedSchema: GenMessage<InputAccepted> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 4);
+  messageDesc(file_delino_sandcrew_v1_bridge, 5);
 
 /**
- * The bridge read an inbox message and rejected it.
- *
  * @generated from message delino.sandcrew.v1.InputRejected
  */
 export type InputRejected = Message<"delino.sandcrew.v1.InputRejected"> & {
@@ -323,11 +360,68 @@ export type InputRejected = Message<"delino.sandcrew.v1.InputRejected"> & {
  * Use `create(InputRejectedSchema)` to create a new message.
  */
 export const InputRejectedSchema: GenMessage<InputRejected> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 5);
+  messageDesc(file_delino_sandcrew_v1_bridge, 6);
 
 /**
- * A link to a resource that the agent can read.
+ * One chunk of a user message, an agent message or an agent thought.
  *
+ * @generated from message delino.sandcrew.v1.ContentChunk
+ */
+export type ContentChunk = Message<"delino.sandcrew.v1.ContentChunk"> & {
+  /**
+   * @generated from field: delino.sandcrew.v1.ContentBlock content = 1;
+   */
+  content?: ContentBlock | undefined;
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ContentChunk.
+ * Use `create(ContentChunkSchema)` to create a new message.
+ */
+export const ContentChunkSchema: GenMessage<ContentChunk> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 7);
+
+/**
+ * One ACP content block.
+ *
+ * @generated from message delino.sandcrew.v1.ContentBlock
+ */
+export type ContentBlock = Message<"delino.sandcrew.v1.ContentBlock"> & {
+  /**
+   * @generated from oneof delino.sandcrew.v1.ContentBlock.block
+   */
+  block: {
+    /**
+     * @generated from field: string text = 1;
+     */
+    value: string;
+    case: "text";
+  } | {
+    /**
+     * @generated from field: delino.sandcrew.v1.ResourceLink resource_link = 2;
+     */
+    value: ResourceLink;
+    case: "resourceLink";
+  } | {
+    /**
+     * The original JSON of a content block without a mapped case (for
+     * example an image).
+     *
+     * @generated from field: string unsupported = 3;
+     */
+    value: string;
+    case: "unsupported";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ContentBlock.
+ * Use `create(ContentBlockSchema)` to create a new message.
+ */
+export const ContentBlockSchema: GenMessage<ContentBlock> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 8);
+
+/**
  * @generated from message delino.sandcrew.v1.ResourceLink
  */
 export type ResourceLink = Message<"delino.sandcrew.v1.ResourceLink"> & {
@@ -347,14 +441,19 @@ export type ResourceLink = Message<"delino.sandcrew.v1.ResourceLink"> & {
   title: string;
 
   /**
-   * @generated from field: string mime_type = 4;
+   * @generated from field: string description = 4;
+   */
+  description: string;
+
+  /**
+   * @generated from field: string mime_type = 5;
    */
   mimeType: string;
 
   /**
-   * @generated from field: optional int64 size_bytes = 5;
+   * @generated from field: optional int64 size = 6;
    */
-  sizeBytes?: bigint | undefined;
+  size?: bigint | undefined;
 };
 
 /**
@@ -362,197 +461,7 @@ export type ResourceLink = Message<"delino.sandcrew.v1.ResourceLink"> & {
  * Use `create(ResourceLinkSchema)` to create a new message.
  */
 export const ResourceLinkSchema: GenMessage<ResourceLink> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 6);
-
-/**
- * An ACP content block that the schema has no case for.
- *
- * @generated from message delino.sandcrew.v1.UnsupportedContent
- */
-export type UnsupportedContent = Message<"delino.sandcrew.v1.UnsupportedContent"> & {
-  /**
-   * The original ACP JSON.
-   *
-   * @generated from field: string raw_json = 1;
-   */
-  rawJson: string;
-};
-
-/**
- * Describes the message delino.sandcrew.v1.UnsupportedContent.
- * Use `create(UnsupportedContentSchema)` to create a new message.
- */
-export const UnsupportedContentSchema: GenMessage<UnsupportedContent> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 7);
-
-/**
- * An ACP content block.
- *
- * @generated from message delino.sandcrew.v1.ContentBlock
- */
-export type ContentBlock = Message<"delino.sandcrew.v1.ContentBlock"> & {
-  /**
-   * @generated from oneof delino.sandcrew.v1.ContentBlock.block
-   */
-  block: {
-    /**
-     * Markdown text.
-     *
-     * @generated from field: string text = 1;
-     */
-    value: string;
-    case: "text";
-  } | {
-    /**
-     * @generated from field: delino.sandcrew.v1.ResourceLink resource_link = 2;
-     */
-    value: ResourceLink;
-    case: "resourceLink";
-  } | {
-    /**
-     * @generated from field: delino.sandcrew.v1.UnsupportedContent unsupported = 3;
-     */
-    value: UnsupportedContent;
-    case: "unsupported";
-  } | { case: undefined; value?: undefined };
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ContentBlock.
- * Use `create(ContentBlockSchema)` to create a new message.
- */
-export const ContentBlockSchema: GenMessage<ContentBlock> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 8);
-
-/**
- * A part of a user message, an agent message or an agent thought.
- *
- * @generated from message delino.sandcrew.v1.ContentChunk
- */
-export type ContentChunk = Message<"delino.sandcrew.v1.ContentChunk"> & {
-  /**
-   * @generated from field: delino.sandcrew.v1.ContentBlock content = 1;
-   */
-  content?: ContentBlock | undefined;
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ContentChunk.
- * Use `create(ContentChunkSchema)` to create a new message.
- */
-export const ContentChunkSchema: GenMessage<ContentChunk> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 9);
-
-/**
- * A file change of a tool call.
- *
- * @generated from message delino.sandcrew.v1.Diff
- */
-export type Diff = Message<"delino.sandcrew.v1.Diff"> & {
-  /**
-   * @generated from field: string path = 1;
-   */
-  path: string;
-
-  /**
-   * Unset for a new file.
-   *
-   * @generated from field: optional string old_text = 2;
-   */
-  oldText?: string | undefined;
-
-  /**
-   * @generated from field: string new_text = 3;
-   */
-  newText: string;
-};
-
-/**
- * Describes the message delino.sandcrew.v1.Diff.
- * Use `create(DiffSchema)` to create a new message.
- */
-export const DiffSchema: GenMessage<Diff> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 10);
-
-/**
- * A terminal of a tool call.
- *
- * @generated from message delino.sandcrew.v1.Terminal
- */
-export type Terminal = Message<"delino.sandcrew.v1.Terminal"> & {
-  /**
-   * @generated from field: string terminal_id = 1;
-   */
-  terminalId: string;
-};
-
-/**
- * Describes the message delino.sandcrew.v1.Terminal.
- * Use `create(TerminalSchema)` to create a new message.
- */
-export const TerminalSchema: GenMessage<Terminal> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 11);
-
-/**
- * One content item of a tool call.
- *
- * @generated from message delino.sandcrew.v1.ToolCallContent
- */
-export type ToolCallContent = Message<"delino.sandcrew.v1.ToolCallContent"> & {
-  /**
-   * @generated from oneof delino.sandcrew.v1.ToolCallContent.content
-   */
-  content: {
-    /**
-     * @generated from field: delino.sandcrew.v1.ContentBlock block = 1;
-     */
-    value: ContentBlock;
-    case: "block";
-  } | {
-    /**
-     * @generated from field: delino.sandcrew.v1.Diff diff = 2;
-     */
-    value: Diff;
-    case: "diff";
-  } | {
-    /**
-     * @generated from field: delino.sandcrew.v1.Terminal terminal = 3;
-     */
-    value: Terminal;
-    case: "terminal";
-  } | { case: undefined; value?: undefined };
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ToolCallContent.
- * Use `create(ToolCallContentSchema)` to create a new message.
- */
-export const ToolCallContentSchema: GenMessage<ToolCallContent> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 12);
-
-/**
- * A file location that a tool call works on.
- *
- * @generated from message delino.sandcrew.v1.ToolCallLocation
- */
-export type ToolCallLocation = Message<"delino.sandcrew.v1.ToolCallLocation"> & {
-  /**
-   * @generated from field: string path = 1;
-   */
-  path: string;
-
-  /**
-   * @generated from field: optional uint32 line = 2;
-   */
-  line?: number | undefined;
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ToolCallLocation.
- * Use `create(ToolCallLocationSchema)` to create a new message.
- */
-export const ToolCallLocationSchema: GenMessage<ToolCallLocation> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 13);
 
 /**
  * @generated from message delino.sandcrew.v1.ToolCall
@@ -589,11 +498,18 @@ export type ToolCall = Message<"delino.sandcrew.v1.ToolCall"> & {
   locations: ToolCallLocation[];
 
   /**
-   * JSON text. Agent data: only the session owner reads it.
+   * The original JSON of the tool input.
    *
    * @generated from field: string raw_input = 7;
    */
   rawInput: string;
+
+  /**
+   * The original JSON of the tool output.
+   *
+   * @generated from field: string raw_output = 8;
+   */
+  rawOutput: string;
 };
 
 /**
@@ -601,45 +517,7 @@ export type ToolCall = Message<"delino.sandcrew.v1.ToolCall"> & {
  * Use `create(ToolCallSchema)` to create a new message.
  */
 export const ToolCallSchema: GenMessage<ToolCall> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 14);
-
-/**
- * The complete content of a tool call update, which replaces the content.
- *
- * @generated from message delino.sandcrew.v1.ToolCallContentList
- */
-export type ToolCallContentList = Message<"delino.sandcrew.v1.ToolCallContentList"> & {
-  /**
-   * @generated from field: repeated delino.sandcrew.v1.ToolCallContent items = 1;
-   */
-  items: ToolCallContent[];
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ToolCallContentList.
- * Use `create(ToolCallContentListSchema)` to create a new message.
- */
-export const ToolCallContentListSchema: GenMessage<ToolCallContentList> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 15);
-
-/**
- * The complete locations of a tool call update, which replace the locations.
- *
- * @generated from message delino.sandcrew.v1.ToolCallLocationList
- */
-export type ToolCallLocationList = Message<"delino.sandcrew.v1.ToolCallLocationList"> & {
-  /**
-   * @generated from field: repeated delino.sandcrew.v1.ToolCallLocation items = 1;
-   */
-  items: ToolCallLocation[];
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ToolCallLocationList.
- * Use `create(ToolCallLocationListSchema)` to create a new message.
- */
-export const ToolCallLocationListSchema: GenMessage<ToolCallLocationList> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 16);
+  messageDesc(file_delino_sandcrew_v1_bridge, 10);
 
 /**
  * The changed fields of a tool call. Unset fields keep their value.
@@ -668,25 +546,25 @@ export type ToolCallUpdate = Message<"delino.sandcrew.v1.ToolCallUpdate"> & {
   status?: ToolCallStatus | undefined;
 
   /**
+   * When set, replaces the content of the tool call.
+   *
    * @generated from field: delino.sandcrew.v1.ToolCallContentList content = 5;
    */
   content?: ToolCallContentList | undefined;
 
   /**
+   * When set, replaces the locations of the tool call.
+   *
    * @generated from field: delino.sandcrew.v1.ToolCallLocationList locations = 6;
    */
   locations?: ToolCallLocationList | undefined;
 
   /**
-   * JSON text. Agent data: only the session owner reads it.
-   *
    * @generated from field: optional string raw_input = 7;
    */
   rawInput?: string | undefined;
 
   /**
-   * JSON text. Agent data: only the session owner reads it.
-   *
    * @generated from field: optional string raw_output = 8;
    */
   rawOutput?: string | undefined;
@@ -697,7 +575,167 @@ export type ToolCallUpdate = Message<"delino.sandcrew.v1.ToolCallUpdate"> & {
  * Use `create(ToolCallUpdateSchema)` to create a new message.
  */
 export const ToolCallUpdateSchema: GenMessage<ToolCallUpdate> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 11);
+
+/**
+ * @generated from message delino.sandcrew.v1.ToolCallContentList
+ */
+export type ToolCallContentList = Message<"delino.sandcrew.v1.ToolCallContentList"> & {
+  /**
+   * @generated from field: repeated delino.sandcrew.v1.ToolCallContent items = 1;
+   */
+  items: ToolCallContent[];
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ToolCallContentList.
+ * Use `create(ToolCallContentListSchema)` to create a new message.
+ */
+export const ToolCallContentListSchema: GenMessage<ToolCallContentList> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 12);
+
+/**
+ * @generated from message delino.sandcrew.v1.ToolCallLocationList
+ */
+export type ToolCallLocationList = Message<"delino.sandcrew.v1.ToolCallLocationList"> & {
+  /**
+   * @generated from field: repeated delino.sandcrew.v1.ToolCallLocation items = 1;
+   */
+  items: ToolCallLocation[];
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ToolCallLocationList.
+ * Use `create(ToolCallLocationListSchema)` to create a new message.
+ */
+export const ToolCallLocationListSchema: GenMessage<ToolCallLocationList> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 13);
+
+/**
+ * @generated from message delino.sandcrew.v1.ToolCallContent
+ */
+export type ToolCallContent = Message<"delino.sandcrew.v1.ToolCallContent"> & {
+  /**
+   * @generated from oneof delino.sandcrew.v1.ToolCallContent.content
+   */
+  content: {
+    /**
+     * @generated from field: delino.sandcrew.v1.ContentBlock block = 1;
+     */
+    value: ContentBlock;
+    case: "block";
+  } | {
+    /**
+     * @generated from field: delino.sandcrew.v1.Diff diff = 2;
+     */
+    value: Diff;
+    case: "diff";
+  } | {
+    /**
+     * @generated from field: delino.sandcrew.v1.Terminal terminal = 3;
+     */
+    value: Terminal;
+    case: "terminal";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ToolCallContent.
+ * Use `create(ToolCallContentSchema)` to create a new message.
+ */
+export const ToolCallContentSchema: GenMessage<ToolCallContent> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 14);
+
+/**
+ * A file change of a tool call.
+ *
+ * @generated from message delino.sandcrew.v1.Diff
+ */
+export type Diff = Message<"delino.sandcrew.v1.Diff"> & {
+  /**
+   * @generated from field: string path = 1;
+   */
+  path: string;
+
+  /**
+   * Unset for a new file.
+   *
+   * @generated from field: optional string old_text = 2;
+   */
+  oldText?: string | undefined;
+
+  /**
+   * @generated from field: string new_text = 3;
+   */
+  newText: string;
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.Diff.
+ * Use `create(DiffSchema)` to create a new message.
+ */
+export const DiffSchema: GenMessage<Diff> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 15);
+
+/**
+ * A terminal of the agent that a tool call shows.
+ *
+ * @generated from message delino.sandcrew.v1.Terminal
+ */
+export type Terminal = Message<"delino.sandcrew.v1.Terminal"> & {
+  /**
+   * @generated from field: string terminal_id = 1;
+   */
+  terminalId: string;
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.Terminal.
+ * Use `create(TerminalSchema)` to create a new message.
+ */
+export const TerminalSchema: GenMessage<Terminal> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 16);
+
+/**
+ * @generated from message delino.sandcrew.v1.ToolCallLocation
+ */
+export type ToolCallLocation = Message<"delino.sandcrew.v1.ToolCallLocation"> & {
+  /**
+   * @generated from field: string path = 1;
+   */
+  path: string;
+
+  /**
+   * @generated from field: optional uint32 line = 2;
+   */
+  line?: number | undefined;
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ToolCallLocation.
+ * Use `create(ToolCallLocationSchema)` to create a new message.
+ */
+export const ToolCallLocationSchema: GenMessage<ToolCallLocation> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 17);
+
+/**
+ * The plan of the agent. Replaces the previous plan.
+ *
+ * @generated from message delino.sandcrew.v1.Plan
+ */
+export type Plan = Message<"delino.sandcrew.v1.Plan"> & {
+  /**
+   * @generated from field: repeated delino.sandcrew.v1.PlanEntry entries = 1;
+   */
+  entries: PlanEntry[];
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.Plan.
+ * Use `create(PlanSchema)` to create a new message.
+ */
+export const PlanSchema: GenMessage<Plan> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 18);
 
 /**
  * @generated from message delino.sandcrew.v1.PlanEntry
@@ -724,26 +762,43 @@ export type PlanEntry = Message<"delino.sandcrew.v1.PlanEntry"> & {
  * Use `create(PlanEntrySchema)` to create a new message.
  */
 export const PlanEntrySchema: GenMessage<PlanEntry> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 18);
+  messageDesc(file_delino_sandcrew_v1_bridge, 19);
 
 /**
- * The plan of the agent. It replaces the previous plan.
- *
- * @generated from message delino.sandcrew.v1.Plan
+ * @generated from message delino.sandcrew.v1.PermissionRequest
  */
-export type Plan = Message<"delino.sandcrew.v1.Plan"> & {
+export type PermissionRequest = Message<"delino.sandcrew.v1.PermissionRequest"> & {
   /**
-   * @generated from field: repeated delino.sandcrew.v1.PlanEntry entries = 1;
+   * The bridge assigns a UUID v7 to each request.
+   *
+   * @generated from field: string permission_request_id = 1;
    */
-  entries: PlanEntry[];
+  permissionRequestId: string;
+
+  /**
+   * @generated from field: string tool_call_id = 2;
+   */
+  toolCallId: string;
+
+  /**
+   * @generated from field: repeated delino.sandcrew.v1.PermissionOption options = 3;
+   */
+  options: PermissionOption[];
+
+  /**
+   * The tool call details that the agent sent with the request.
+   *
+   * @generated from field: delino.sandcrew.v1.ToolCallUpdate tool_call = 4;
+   */
+  toolCall?: ToolCallUpdate | undefined;
 };
 
 /**
- * Describes the message delino.sandcrew.v1.Plan.
- * Use `create(PlanSchema)` to create a new message.
+ * Describes the message delino.sandcrew.v1.PermissionRequest.
+ * Use `create(PermissionRequestSchema)` to create a new message.
  */
-export const PlanSchema: GenMessage<Plan> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 19);
+export const PermissionRequestSchema: GenMessage<PermissionRequest> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 20);
 
 /**
  * @generated from message delino.sandcrew.v1.PermissionOption
@@ -770,40 +825,9 @@ export type PermissionOption = Message<"delino.sandcrew.v1.PermissionOption"> & 
  * Use `create(PermissionOptionSchema)` to create a new message.
  */
 export const PermissionOptionSchema: GenMessage<PermissionOption> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 20);
-
-/**
- * The agent asks for permission to run a tool call.
- *
- * @generated from message delino.sandcrew.v1.PermissionRequest
- */
-export type PermissionRequest = Message<"delino.sandcrew.v1.PermissionRequest"> & {
-  /**
-   * @generated from field: string permission_request_id = 1;
-   */
-  permissionRequestId: string;
-
-  /**
-   * @generated from field: string tool_call_id = 2;
-   */
-  toolCallId: string;
-
-  /**
-   * @generated from field: repeated delino.sandcrew.v1.PermissionOption options = 3;
-   */
-  options: PermissionOption[];
-};
-
-/**
- * Describes the message delino.sandcrew.v1.PermissionRequest.
- * Use `create(PermissionRequestSchema)` to create a new message.
- */
-export const PermissionRequestSchema: GenMessage<PermissionRequest> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 21);
 
 /**
- * The answer to a permission request.
- *
  * @generated from message delino.sandcrew.v1.PermissionResponse
  */
 export type PermissionResponse = Message<"delino.sandcrew.v1.PermissionResponse"> & {
@@ -818,8 +842,6 @@ export type PermissionResponse = Message<"delino.sandcrew.v1.PermissionResponse"
   outcome: PermissionOutcome;
 
   /**
-   * Set when the outcome is SELECTED.
-   *
    * @generated from field: string option_id = 3;
    */
   optionId: string;
@@ -857,35 +879,6 @@ export const TurnEndedSchema: GenMessage<TurnEnded> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 23);
 
 /**
- * A mode that the agent advertises.
- *
- * @generated from message delino.sandcrew.v1.SessionMode
- */
-export type SessionMode = Message<"delino.sandcrew.v1.SessionMode"> & {
-  /**
-   * @generated from field: string mode_id = 1;
-   */
-  modeId: string;
-
-  /**
-   * @generated from field: string name = 2;
-   */
-  name: string;
-
-  /**
-   * @generated from field: string description = 3;
-   */
-  description: string;
-};
-
-/**
- * Describes the message delino.sandcrew.v1.SessionMode.
- * Use `create(SessionModeSchema)` to create a new message.
- */
-export const SessionModeSchema: GenMessage<SessionMode> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 24);
-
-/**
  * @generated from message delino.sandcrew.v1.ModeChanged
  */
 export type ModeChanged = Message<"delino.sandcrew.v1.ModeChanged"> & {
@@ -910,11 +903,95 @@ export type ModeChanged = Message<"delino.sandcrew.v1.ModeChanged"> & {
  * Use `create(ModeChangedSchema)` to create a new message.
  */
 export const ModeChangedSchema: GenMessage<ModeChanged> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 24);
+
+/**
+ * @generated from message delino.sandcrew.v1.SessionMode
+ */
+export type SessionMode = Message<"delino.sandcrew.v1.SessionMode"> & {
+  /**
+   * @generated from field: string mode_id = 1;
+   */
+  modeId: string;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string description = 3;
+   */
+  description: string;
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.SessionMode.
+ * Use `create(SessionModeSchema)` to create a new message.
+ */
+export const SessionModeSchema: GenMessage<SessionMode> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 25);
 
 /**
- * One value of a configuration option.
- *
+ * @generated from message delino.sandcrew.v1.ConfigOptions
+ */
+export type ConfigOptions = Message<"delino.sandcrew.v1.ConfigOptions"> & {
+  /**
+   * @generated from field: repeated delino.sandcrew.v1.ConfigOption options = 1;
+   */
+  options: ConfigOption[];
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ConfigOptions.
+ * Use `create(ConfigOptionsSchema)` to create a new message.
+ */
+export const ConfigOptionsSchema: GenMessage<ConfigOptions> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 26);
+
+/**
+ * @generated from message delino.sandcrew.v1.ConfigOption
+ */
+export type ConfigOption = Message<"delino.sandcrew.v1.ConfigOption"> & {
+  /**
+   * @generated from field: string config_option_id = 1;
+   */
+  configOptionId: string;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string description = 3;
+   */
+  description: string;
+
+  /**
+   * @generated from field: delino.sandcrew.v1.ConfigOptionCategory category = 4;
+   */
+  category: ConfigOptionCategory;
+
+  /**
+   * @generated from field: string current_value_id = 5;
+   */
+  currentValueId: string;
+
+  /**
+   * @generated from field: repeated delino.sandcrew.v1.ConfigOptionValue values = 6;
+   */
+  values: ConfigOptionValue[];
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ConfigOption.
+ * Use `create(ConfigOptionSchema)` to create a new message.
+ */
+export const ConfigOptionSchema: GenMessage<ConfigOption> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 27);
+
+/**
  * @generated from message delino.sandcrew.v1.ConfigOptionValue
  */
 export type ConfigOptionValue = Message<"delino.sandcrew.v1.ConfigOptionValue"> & {
@@ -939,63 +1016,6 @@ export type ConfigOptionValue = Message<"delino.sandcrew.v1.ConfigOptionValue"> 
  * Use `create(ConfigOptionValueSchema)` to create a new message.
  */
 export const ConfigOptionValueSchema: GenMessage<ConfigOptionValue> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 26);
-
-/**
- * A session configuration option that the agent advertises, for example the
- * model.
- *
- * @generated from message delino.sandcrew.v1.ConfigOption
- */
-export type ConfigOption = Message<"delino.sandcrew.v1.ConfigOption"> & {
-  /**
-   * @generated from field: string config_option_id = 1;
-   */
-  configOptionId: string;
-
-  /**
-   * @generated from field: string name = 2;
-   */
-  name: string;
-
-  /**
-   * @generated from field: delino.sandcrew.v1.ConfigOptionCategory category = 3;
-   */
-  category: ConfigOptionCategory;
-
-  /**
-   * @generated from field: string current_value_id = 4;
-   */
-  currentValueId: string;
-
-  /**
-   * @generated from field: repeated delino.sandcrew.v1.ConfigOptionValue values = 5;
-   */
-  values: ConfigOptionValue[];
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ConfigOption.
- * Use `create(ConfigOptionSchema)` to create a new message.
- */
-export const ConfigOptionSchema: GenMessage<ConfigOption> = /*@__PURE__*/
-  messageDesc(file_delino_sandcrew_v1_bridge, 27);
-
-/**
- * @generated from message delino.sandcrew.v1.ConfigOptions
- */
-export type ConfigOptions = Message<"delino.sandcrew.v1.ConfigOptions"> & {
-  /**
-   * @generated from field: repeated delino.sandcrew.v1.ConfigOption options = 1;
-   */
-  options: ConfigOption[];
-};
-
-/**
- * Describes the message delino.sandcrew.v1.ConfigOptions.
- * Use `create(ConfigOptionsSchema)` to create a new message.
- */
-export const ConfigOptionsSchema: GenMessage<ConfigOptions> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 28);
 
 /**
@@ -1025,7 +1045,7 @@ export type BridgeError = Message<"delino.sandcrew.v1.BridgeError"> & {
   kind: BridgeErrorKind;
 
   /**
-   * Never contains secrets, prompts or agent output.
+   * A message without secrets, prompts or agent output.
    *
    * @generated from field: string message = 2;
    */
@@ -1040,13 +1060,15 @@ export const BridgeErrorSchema: GenMessage<BridgeError> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 30);
 
 /**
+ * The agent process ended.
+ *
  * @generated from message delino.sandcrew.v1.AgentExited
  */
 export type AgentExited = Message<"delino.sandcrew.v1.AgentExited"> & {
   /**
-   * @generated from oneof delino.sandcrew.v1.AgentExited.status
+   * @generated from oneof delino.sandcrew.v1.AgentExited.result
    */
-  status: {
+  result: {
     /**
      * @generated from field: int32 exit_code = 1;
      */
@@ -1054,6 +1076,8 @@ export type AgentExited = Message<"delino.sandcrew.v1.AgentExited"> & {
     case: "exitCode";
   } | {
     /**
+     * The name of the signal that ended the process.
+     *
      * @generated from field: string signal = 2;
      */
     value: string;
@@ -1069,7 +1093,7 @@ export const AgentExitedSchema: GenMessage<AgentExited> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 31);
 
 /**
- * The agent changed its credential file. It carries no credential content.
+ * A credential file changed in the guest. Carries no credential content.
  *
  * @generated from message delino.sandcrew.v1.CredentialUpdate
  */
@@ -1093,7 +1117,7 @@ export const CredentialUpdateSchema: GenMessage<CredentialUpdate> = /*@__PURE__*
   messageDesc(file_delino_sandcrew_v1_bridge, 32);
 
 /**
- * An ACP session update without a case in BridgeEvent.
+ * An ACP session update without a mapped case.
  *
  * @generated from message delino.sandcrew.v1.UnknownUpdate
  */
@@ -1106,7 +1130,7 @@ export type UnknownUpdate = Message<"delino.sandcrew.v1.UnknownUpdate"> & {
   sessionUpdate: string;
 
   /**
-   * The original ACP update. Agent data: only the session owner reads it.
+   * The original JSON of the update.
    *
    * @generated from field: string raw_json = 2;
    */
@@ -1121,13 +1145,13 @@ export const UnknownUpdateSchema: GenMessage<UnknownUpdate> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 33);
 
 /**
- * One input that the control plane writes as a file into the guest inbox.
+ * One input of the control plane, written as one inbox file.
  *
  * @generated from message delino.sandcrew.v1.BridgeInput
  */
 export type BridgeInput = Message<"delino.sandcrew.v1.BridgeInput"> & {
   /**
-   * UUID v7.
+   * UUID v7; also the inbox file name.
    *
    * @generated from field: string input_id = 1;
    */
@@ -1191,7 +1215,8 @@ export type PromptInput = Message<"delino.sandcrew.v1.PromptInput"> & {
   text: string;
 
   /**
-   * A guest path, for the previous transcript file.
+   * A guest path that the prompt text mentions (the previous transcript
+   * file). The bridge does not read it.
    *
    * @generated from field: optional string attachment_path = 2;
    */
@@ -1245,10 +1270,12 @@ export const CancelTurnInputSchema: GenMessage<CancelTurnInput> = /*@__PURE__*/
  */
 export type SetModeInput = Message<"delino.sandcrew.v1.SetModeInput"> & {
   /**
-   * @generated from oneof delino.sandcrew.v1.SetModeInput.mode
+   * @generated from oneof delino.sandcrew.v1.SetModeInput.target
    */
-  mode: {
+  target: {
     /**
+     * An agent mode ID.
+     *
      * @generated from field: string mode_id = 1;
      */
     value: string;
@@ -1290,4 +1317,590 @@ export type SetConfigOptionInput = Message<"delino.sandcrew.v1.SetConfigOptionIn
  */
 export const SetConfigOptionInputSchema: GenMessage<SetConfigOptionInput> = /*@__PURE__*/
   messageDesc(file_delino_sandcrew_v1_bridge, 39);
+
+/**
+ * The start configuration that the control plane writes as `start.json`.
+ *
+ * @generated from message delino.sandcrew.v1.BridgeStartConfig
+ */
+export type BridgeStartConfig = Message<"delino.sandcrew.v1.BridgeStartConfig"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: delino.sandcrew.v1.AgentVendor vendor = 2;
+   */
+  vendor: AgentVendor;
+
+  /**
+   * The kind of the vendor credential that the session uses.
+   *
+   * @generated from field: delino.sandcrew.v1.VendorCredentialKind credential_kind = 3;
+   */
+  credentialKind: VendorCredentialKind;
+
+  /**
+   * @generated from field: delino.sandcrew.v1.PermissionMode permission_mode = 4;
+   */
+  permissionMode: PermissionMode;
+
+  /**
+   * The agent mode to apply at start; empty keeps the agent's default.
+   *
+   * @generated from field: string mode_id = 5;
+   */
+  modeId: string;
+
+  /**
+   * Configuration option values to apply at start.
+   *
+   * @generated from field: repeated delino.sandcrew.v1.ConfigOptionSelection config_options = 6;
+   */
+  configOptions: ConfigOptionSelection[];
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.BridgeStartConfig.
+ * Use `create(BridgeStartConfigSchema)` to create a new message.
+ */
+export const BridgeStartConfigSchema: GenMessage<BridgeStartConfig> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 40);
+
+/**
+ * @generated from message delino.sandcrew.v1.ConfigOptionSelection
+ */
+export type ConfigOptionSelection = Message<"delino.sandcrew.v1.ConfigOptionSelection"> & {
+  /**
+   * @generated from field: string config_option_id = 1;
+   */
+  configOptionId: string;
+
+  /**
+   * @generated from field: string value_id = 2;
+   */
+  valueId: string;
+};
+
+/**
+ * Describes the message delino.sandcrew.v1.ConfigOptionSelection.
+ * Use `create(ConfigOptionSelectionSchema)` to create a new message.
+ */
+export const ConfigOptionSelectionSchema: GenMessage<ConfigOptionSelection> = /*@__PURE__*/
+  messageDesc(file_delino_sandcrew_v1_bridge, 41);
+
+/**
+ * Kind of a tool call (ACP ToolKind).
+ *
+ * @generated from enum delino.sandcrew.v1.ToolKind
+ */
+export enum ToolKind {
+  /**
+   * @generated from enum value: TOOL_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: TOOL_KIND_READ = 1;
+   */
+  READ = 1,
+
+  /**
+   * @generated from enum value: TOOL_KIND_EDIT = 2;
+   */
+  EDIT = 2,
+
+  /**
+   * @generated from enum value: TOOL_KIND_DELETE = 3;
+   */
+  DELETE = 3,
+
+  /**
+   * @generated from enum value: TOOL_KIND_MOVE = 4;
+   */
+  MOVE = 4,
+
+  /**
+   * @generated from enum value: TOOL_KIND_SEARCH = 5;
+   */
+  SEARCH = 5,
+
+  /**
+   * @generated from enum value: TOOL_KIND_EXECUTE = 6;
+   */
+  EXECUTE = 6,
+
+  /**
+   * @generated from enum value: TOOL_KIND_THINK = 7;
+   */
+  THINK = 7,
+
+  /**
+   * @generated from enum value: TOOL_KIND_FETCH = 8;
+   */
+  FETCH = 8,
+
+  /**
+   * @generated from enum value: TOOL_KIND_SWITCH_MODE = 9;
+   */
+  SWITCH_MODE = 9,
+
+  /**
+   * @generated from enum value: TOOL_KIND_OTHER = 10;
+   */
+  OTHER = 10,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.ToolKind.
+ */
+export const ToolKindSchema: GenEnum<ToolKind> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 0);
+
+/**
+ * Status of a tool call (ACP ToolCallStatus).
+ *
+ * @generated from enum delino.sandcrew.v1.ToolCallStatus
+ */
+export enum ToolCallStatus {
+  /**
+   * @generated from enum value: TOOL_CALL_STATUS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: TOOL_CALL_STATUS_PENDING = 1;
+   */
+  PENDING = 1,
+
+  /**
+   * @generated from enum value: TOOL_CALL_STATUS_IN_PROGRESS = 2;
+   */
+  IN_PROGRESS = 2,
+
+  /**
+   * @generated from enum value: TOOL_CALL_STATUS_COMPLETED = 3;
+   */
+  COMPLETED = 3,
+
+  /**
+   * @generated from enum value: TOOL_CALL_STATUS_FAILED = 4;
+   */
+  FAILED = 4,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.ToolCallStatus.
+ */
+export const ToolCallStatusSchema: GenEnum<ToolCallStatus> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 1);
+
+/**
+ * Priority of a plan entry (ACP PlanEntryPriority).
+ *
+ * @generated from enum delino.sandcrew.v1.PlanEntryPriority
+ */
+export enum PlanEntryPriority {
+  /**
+   * @generated from enum value: PLAN_ENTRY_PRIORITY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PLAN_ENTRY_PRIORITY_HIGH = 1;
+   */
+  HIGH = 1,
+
+  /**
+   * @generated from enum value: PLAN_ENTRY_PRIORITY_MEDIUM = 2;
+   */
+  MEDIUM = 2,
+
+  /**
+   * @generated from enum value: PLAN_ENTRY_PRIORITY_LOW = 3;
+   */
+  LOW = 3,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.PlanEntryPriority.
+ */
+export const PlanEntryPrioritySchema: GenEnum<PlanEntryPriority> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 2);
+
+/**
+ * Status of a plan entry (ACP PlanEntryStatus).
+ *
+ * @generated from enum delino.sandcrew.v1.PlanEntryStatus
+ */
+export enum PlanEntryStatus {
+  /**
+   * @generated from enum value: PLAN_ENTRY_STATUS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PLAN_ENTRY_STATUS_PENDING = 1;
+   */
+  PENDING = 1,
+
+  /**
+   * @generated from enum value: PLAN_ENTRY_STATUS_IN_PROGRESS = 2;
+   */
+  IN_PROGRESS = 2,
+
+  /**
+   * @generated from enum value: PLAN_ENTRY_STATUS_COMPLETED = 3;
+   */
+  COMPLETED = 3,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.PlanEntryStatus.
+ */
+export const PlanEntryStatusSchema: GenEnum<PlanEntryStatus> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 3);
+
+/**
+ * Kind of a permission option (ACP PermissionOptionKind).
+ *
+ * @generated from enum delino.sandcrew.v1.PermissionOptionKind
+ */
+export enum PermissionOptionKind {
+  /**
+   * @generated from enum value: PERMISSION_OPTION_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PERMISSION_OPTION_KIND_ALLOW_ONCE = 1;
+   */
+  ALLOW_ONCE = 1,
+
+  /**
+   * @generated from enum value: PERMISSION_OPTION_KIND_ALLOW_ALWAYS = 2;
+   */
+  ALLOW_ALWAYS = 2,
+
+  /**
+   * @generated from enum value: PERMISSION_OPTION_KIND_REJECT_ONCE = 3;
+   */
+  REJECT_ONCE = 3,
+
+  /**
+   * @generated from enum value: PERMISSION_OPTION_KIND_REJECT_ALWAYS = 4;
+   */
+  REJECT_ALWAYS = 4,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.PermissionOptionKind.
+ */
+export const PermissionOptionKindSchema: GenEnum<PermissionOptionKind> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 4);
+
+/**
+ * Outcome of a permission request.
+ *
+ * @generated from enum delino.sandcrew.v1.PermissionOutcome
+ */
+export enum PermissionOutcome {
+  /**
+   * @generated from enum value: PERMISSION_OUTCOME_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * An option was selected; PermissionResponse.option_id names it.
+   *
+   * @generated from enum value: PERMISSION_OUTCOME_SELECTED = 1;
+   */
+  SELECTED = 1,
+
+  /**
+   * The turn was cancelled before an answer.
+   *
+   * @generated from enum value: PERMISSION_OUTCOME_CANCELLED = 2;
+   */
+  CANCELLED = 2,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.PermissionOutcome.
+ */
+export const PermissionOutcomeSchema: GenEnum<PermissionOutcome> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 5);
+
+/**
+ * Why a turn ended (ACP StopReason).
+ *
+ * @generated from enum delino.sandcrew.v1.StopReason
+ */
+export enum StopReason {
+  /**
+   * @generated from enum value: STOP_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: STOP_REASON_END_TURN = 1;
+   */
+  END_TURN = 1,
+
+  /**
+   * @generated from enum value: STOP_REASON_MAX_TOKENS = 2;
+   */
+  MAX_TOKENS = 2,
+
+  /**
+   * @generated from enum value: STOP_REASON_MAX_TURN_REQUESTS = 3;
+   */
+  MAX_TURN_REQUESTS = 3,
+
+  /**
+   * @generated from enum value: STOP_REASON_REFUSAL = 4;
+   */
+  REFUSAL = 4,
+
+  /**
+   * @generated from enum value: STOP_REASON_CANCELLED = 5;
+   */
+  CANCELLED = 5,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.StopReason.
+ */
+export const StopReasonSchema: GenEnum<StopReason> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 6);
+
+/**
+ * Category of an agent configuration option (ACP
+ * SessionConfigOptionCategory).
+ *
+ * @generated from enum delino.sandcrew.v1.ConfigOptionCategory
+ */
+export enum ConfigOptionCategory {
+  /**
+   * @generated from enum value: CONFIG_OPTION_CATEGORY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: CONFIG_OPTION_CATEGORY_MODE = 1;
+   */
+  MODE = 1,
+
+  /**
+   * @generated from enum value: CONFIG_OPTION_CATEGORY_MODEL = 2;
+   */
+  MODEL = 2,
+
+  /**
+   * @generated from enum value: CONFIG_OPTION_CATEGORY_MODEL_CONFIG = 3;
+   */
+  MODEL_CONFIG = 3,
+
+  /**
+   * @generated from enum value: CONFIG_OPTION_CATEGORY_SPEED = 4;
+   */
+  SPEED = 4,
+
+  /**
+   * @generated from enum value: CONFIG_OPTION_CATEGORY_THOUGHT_LEVEL = 5;
+   */
+  THOUGHT_LEVEL = 5,
+
+  /**
+   * @generated from enum value: CONFIG_OPTION_CATEGORY_OTHER = 6;
+   */
+  OTHER = 6,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.ConfigOptionCategory.
+ */
+export const ConfigOptionCategorySchema: GenEnum<ConfigOptionCategory> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 7);
+
+/**
+ * What the agent of a session does.
+ *
+ * @generated from enum delino.sandcrew.v1.AgentActivity
+ */
+export enum AgentActivity {
+  /**
+   * @generated from enum value: AGENT_ACTIVITY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * The bridge installs or starts the agent.
+   *
+   * @generated from enum value: AGENT_ACTIVITY_STARTING = 1;
+   */
+  STARTING = 1,
+
+  /**
+   * No turn runs; the agent waits for a prompt.
+   *
+   * @generated from enum value: AGENT_ACTIVITY_IDLE = 2;
+   */
+  IDLE = 2,
+
+  /**
+   * A turn runs.
+   *
+   * @generated from enum value: AGENT_ACTIVITY_WORKING = 3;
+   */
+  WORKING = 3,
+
+  /**
+   * A turn waits for the answer to an ASK-mode permission request.
+   *
+   * @generated from enum value: AGENT_ACTIVITY_WAITING_FOR_PERMISSION = 4;
+   */
+  WAITING_FOR_PERMISSION = 4,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.AgentActivity.
+ */
+export const AgentActivitySchema: GenEnum<AgentActivity> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 8);
+
+/**
+ * Kind of a bridge error.
+ *
+ * @generated from enum delino.sandcrew.v1.BridgeErrorKind
+ */
+export enum BridgeErrorKind {
+  /**
+   * @generated from enum value: BRIDGE_ERROR_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * A pinned agent component could not be downloaded or installed.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED = 1;
+   */
+  AGENT_INSTALL_FAILED = 1,
+
+  /**
+   * A downloaded archive or package did not match its pinned digest.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_CHECKSUM_MISMATCH = 2;
+   */
+  CHECKSUM_MISMATCH = 2,
+
+  /**
+   * The agent process or its ACP session did not start.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_AGENT_START_FAILED = 3;
+   */
+  AGENT_START_FAILED = 3,
+
+  /**
+   * The credential of the selected vendor is missing.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_CREDENTIAL_MISSING = 4;
+   */
+  CREDENTIAL_MISSING = 4,
+
+  /**
+   * The agent sent a JSON-RPC error or a malformed message.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_ACP_PROTOCOL_ERROR = 5;
+   */
+  ACP_PROTOCOL_ERROR = 5,
+
+  /**
+   * An input could not be applied.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_INPUT_INVALID = 6;
+   */
+  INPUT_INVALID = 6,
+
+  /**
+   * The agent rejected a mode or a configuration option value.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_OPTION_REJECTED = 7;
+   */
+  OPTION_REJECTED = 7,
+
+  /**
+   * The guest event log could not be appended.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_EVENT_LOG_WRITE_FAILED = 8;
+   */
+  EVENT_LOG_WRITE_FAILED = 8,
+
+  /**
+   * The bridge could not watch a credential file.
+   *
+   * @generated from enum value: BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED = 9;
+   */
+  CREDENTIAL_WATCH_FAILED = 9,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.BridgeErrorKind.
+ */
+export const BridgeErrorKindSchema: GenEnum<BridgeErrorKind> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 9);
+
+/**
+ * Why the bridge rejected an inbox input.
+ *
+ * @generated from enum delino.sandcrew.v1.InputRejectionReason
+ */
+export enum InputRejectionReason {
+  /**
+   * @generated from enum value: INPUT_REJECTION_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * The file is too large or does not parse as a BridgeInput.
+   *
+   * @generated from enum value: INPUT_REJECTION_REASON_MALFORMED = 1;
+   */
+  MALFORMED = 1,
+
+  /**
+   * No pending permission request has the ID.
+   *
+   * @generated from enum value: INPUT_REJECTION_REASON_UNKNOWN_PERMISSION_REQUEST = 2;
+   */
+  UNKNOWN_PERMISSION_REQUEST = 2,
+
+  /**
+   * The pending permission request has no option with the ID.
+   *
+   * @generated from enum value: INPUT_REJECTION_REASON_UNKNOWN_OPTION = 3;
+   */
+  UNKNOWN_OPTION = 3,
+
+  /**
+   * A cancel request arrived when no turn runs.
+   *
+   * @generated from enum value: INPUT_REJECTION_REASON_NO_ACTIVE_TURN = 4;
+   */
+  NO_ACTIVE_TURN = 4,
+
+  /**
+   * The input case is unknown or the agent does not support it.
+   *
+   * @generated from enum value: INPUT_REJECTION_REASON_UNSUPPORTED = 5;
+   */
+  UNSUPPORTED = 5,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.InputRejectionReason.
+ */
+export const InputRejectionReasonSchema: GenEnum<InputRejectionReason> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_bridge, 10);
 

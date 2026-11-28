@@ -136,9 +136,7 @@ func TestFindModuleRootIncludesStderr(t *testing.T) {
 	// A fake go command that fails and prints a reason to stderr.
 	bin := t.TempDir()
 	script := "#!/bin/sh\necho 'simulated broken GOROOT' >&2\nexit 3\n"
-	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeExecutable(t, filepath.Join(bin, "go"), []byte(script), 0o755)
 	t.Setenv("PATH", bin)
 	_, err := findModuleRoot()
 	if err == nil || !strings.Contains(err.Error(), "go env GOMOD") || !strings.Contains(err.Error(), "simulated broken GOROOT") {
