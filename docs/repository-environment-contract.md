@@ -18,14 +18,15 @@ Package `dev` scripts that read configuration run their development command thro
 node ../../scripts/dev/with-infisical.mjs --path=/<folder> -- <command> [args...]
 ```
 
-| Package           | Directory              | `dev` command after `--`                               | Infisical folder        |
-| ----------------- | ---------------------- | ------------------------------------------------------ | ----------------------- |
-| `accounts-api`    | `servers/accounts-api` | `node scripts/dev.mjs`                                 | `/servers/accounts-api` |
-| `ownsand-api`     | `servers/ownsand-api`  | `node scripts/dev.mjs`                                 | `/servers/ownsand-api`  |
-| `sandrun-api`     | `servers/sandrun-api`  | `node scripts/dev.mjs`                                 | `/servers/sandrun-api`  |
-| `delino-accounts` | `apps/delino-accounts` | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/delino-accounts` |
-| `ownsand-console` | `apps/ownsand`         | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/ownsand`         |
-| `sandrun-console` | `apps/sandrun`         | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/sandrun`         |
+| Package            | Directory              | `dev` command after `--`                               | Infisical folder        |
+| ------------------ | ---------------------- | ------------------------------------------------------ | ----------------------- |
+| `accounts-api`     | `servers/accounts-api` | `node scripts/dev.mjs`                                 | `/servers/accounts-api` |
+| `ownsand-api`      | `servers/ownsand-api`  | `node scripts/dev.mjs`                                 | `/servers/ownsand-api`  |
+| `sandrun-api`      | `servers/sandrun-api`  | `node scripts/dev.mjs`                                 | `/servers/sandrun-api`  |
+| `delino-accounts`  | `apps/delino-accounts` | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/delino-accounts` |
+| `ownsand-console`  | `apps/ownsand`         | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/ownsand`         |
+| `sandrun-console`  | `apps/sandrun`         | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/sandrun`         |
+| `sandcrew-console` | `apps/sandcrew`        | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/sandcrew`        |
 
 The Infisical folder of a package is its directory relative to the repository root, with a leading `/`. The folder tree therefore mirrors the repository layout: `/servers/` holds server folders and `/apps/` holds frontend folders. The folder follows the directory, not the package name; for example, `ownsand-console` lives in `apps/ownsand` and uses `/apps/ownsand`. When a package directory moves or is renamed, move its Infisical folder and update `--path` in the same change.
 
@@ -75,19 +76,20 @@ Billing adds configuration to three packages, and all of it is implemented. Thei
 
 ## Process boundaries
 
-Use explicit argument arrays and `shell: false` for child processes. Document any required platform shim. Forward termination signals and wait for owned child processes to exit. Documentation servers must declare a fixed loopback port and fail on conflicts. Application development servers follow the same rule: `delino-docs` uses `127.0.0.1:13500`, `delino-site` uses `127.0.0.1:13600`, `delino-accounts` uses `127.0.0.1:13100`, `accounts-api` uses `127.0.0.1:18100`, `ownsand-api` uses `127.0.0.1:18300` for HTTP and `127.0.0.1:13478` for STUN over UDP, `sandrun-api` uses `127.0.0.1:18400` for HTTP and `127.0.0.1:19400` for metrics, the `delidev` frontend uses `127.0.0.1:13200`, the OwnSand web console (`ownsand-console`) uses `127.0.0.1:13300` and the SandRun web console (`sandrun-console`) uses `127.0.0.1:13400` by default. The `delidev` frontend binds to the address in `TAURI_DEV_HOST` instead of the loopback address when the Tauri CLI sets it for a physical Android or iOS device, according to the [delidev contract](apps-delidev-foundation.md#build-and-test). End-to-end suites start their own development server on a free loopback port, according to the [e2e contract](repository-e2e-contract.md#app-under-test). The fixed ports of the frontend apps in [Frontend development URLs](#frontend-development-urls) apply to their `dev:app` scripts and to `preview`.
+Use explicit argument arrays and `shell: false` for child processes. Document any required platform shim. Forward termination signals and wait for owned child processes to exit. Documentation servers must declare a fixed loopback port and fail on conflicts. Application development servers follow the same rule: `delino-docs` uses `127.0.0.1:13500`, `delino-site` uses `127.0.0.1:13600`, `delino-accounts` uses `127.0.0.1:13100`, `accounts-api` uses `127.0.0.1:18100`, `ownsand-api` uses `127.0.0.1:18300` for HTTP and `127.0.0.1:13478` for STUN over UDP, `sandrun-api` uses `127.0.0.1:18400` for HTTP and `127.0.0.1:19400` for metrics, the `delidev` frontend uses `127.0.0.1:13200`, the OwnSand web console (`ownsand-console`) uses `127.0.0.1:13300`, the SandRun web console (`sandrun-console`) uses `127.0.0.1:13400` and the SandCrew web console (`sandcrew-console`) uses `127.0.0.1:13700` by default. The `delidev` frontend binds to the address in `TAURI_DEV_HOST` instead of the loopback address when the Tauri CLI sets it for a physical Android or iOS device, according to the [delidev contract](apps-delidev-foundation.md#build-and-test). End-to-end suites start their own development server on a free loopback port, according to the [e2e contract](repository-e2e-contract.md#app-under-test). The fixed ports of the frontend apps in [Frontend development URLs](#frontend-development-urls) apply to their `dev:app` scripts and to `preview`.
 
 ### Frontend development URLs
 
-The purpose is that developers open each app by a name and never need to remember its port. The `dev` script of `delino-accounts`, `ownsand-console`, `sandrun-console`, `delino-docs` and `delino-site` is `portless run --prefix=`, which runs [portless](https://github.com/vercel-labs/portless); each app pins the devDependency `portless` `0.18.1`. portless starts the app's `dev:app` script, which holds the real development server command, on a free loopback port from 4000 to 4999. It passes that port in `PORT`, sets `HOST=127.0.0.1` and `PORTLESS_URL`, and serves the app through a local reverse proxy at a stable name:
+The purpose is that developers open each app by a name and never need to remember its port. The `dev` script of `delino-accounts`, `ownsand-console`, `sandrun-console`, `sandcrew-console`, `delino-docs` and `delino-site` is `portless run --prefix=`, which runs [portless](https://github.com/vercel-labs/portless); each app pins the devDependency `portless` `0.18.1`. portless starts the app's `dev:app` script, which holds the real development server command, on a free loopback port from 4000 to 4999. It passes that port in `PORT`, sets `HOST=127.0.0.1` and `PORTLESS_URL`, and serves the app through a local reverse proxy at a stable name:
 
-| App               | portless name     | URL with the default proxy          | `dev:app` and `PORTLESS=0` |
-| ----------------- | ----------------- | ----------------------------------- | -------------------------- |
-| `delino-accounts` | `accounts.delino` | `https://accounts.delino.localhost` | `http://127.0.0.1:13100`   |
-| `ownsand-console` | `ownsand.delino`  | `https://ownsand.delino.localhost`  | `http://127.0.0.1:13300`   |
-| `sandrun-console` | `sandrun.delino`  | `https://sandrun.delino.localhost`  | `http://127.0.0.1:13400`   |
-| `delino-docs`     | `docs.delino`     | `https://docs.delino.localhost`     | `http://127.0.0.1:13500`   |
-| `delino-site`     | `delino`          | `https://delino.localhost`          | `http://127.0.0.1:13600`   |
+| App                | portless name     | URL with the default proxy          | `dev:app` and `PORTLESS=0` |
+| ------------------ | ----------------- | ----------------------------------- | -------------------------- |
+| `delino-accounts`  | `accounts.delino` | `https://accounts.delino.localhost` | `http://127.0.0.1:13100`   |
+| `ownsand-console`  | `ownsand.delino`  | `https://ownsand.delino.localhost`  | `http://127.0.0.1:13300`   |
+| `sandrun-console`  | `sandrun.delino`  | `https://sandrun.delino.localhost`  | `http://127.0.0.1:13400`   |
+| `sandcrew-console` | `sandcrew.delino` | `https://sandcrew.delino.localhost` | `http://127.0.0.1:13700`   |
+| `delino-docs`      | `docs.delino`     | `https://docs.delino.localhost`     | `http://127.0.0.1:13500`   |
+| `delino-site`      | `delino`          | `https://delino.localhost`          | `http://127.0.0.1:13600`   |
 
 - Each app's `package.json` sets the name and the script in its `portless` key. Do not use a root `portless.json` or a root `portless` script: root `pnpm dev` runs `turbo run dev` after the proxy preflight below, and Turbo runs `portless` in each app package.
 - The URL is the same in every checkout. In a linked Git worktree, portless adds the last `/` segment of the branch to the name by default (for example `https://fix-ui.docs.delino.localhost`). The empty `--prefix=` turns off this label, because a URL that changes with the branch must be looked up again. `package.json` cannot carry a comment, so this contract records the reason. The portless configuration has no field for it.

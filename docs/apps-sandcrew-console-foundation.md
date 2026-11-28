@@ -2,7 +2,7 @@
 
 ## Scope
 
-This contract owns the SandCrew web console, component `sandcrew-console`, of [`sandcrew`](project-sandcrew.md) at `apps/sandcrew/` (`planned`, workspace package `sandcrew-console`). The console is served at `https://sandcrew.delino.io`. Members of SandRun organizations use it to create agent sessions, chat with the agent, and manage their vendor credentials, session secrets and notifications; `owner` and `admin` members also configure SandCrew for the organization.
+This contract owns the SandCrew web console, component `sandcrew-console`, of [`sandcrew`](project-sandcrew.md) at `apps/sandcrew/` (workspace package `sandcrew-console`). The console is served at `https://sandcrew.delino.io`. Members of SandRun organizations use it to create agent sessions, chat with the agent, and manage their vendor credentials, session secrets and notifications; `owner` and `admin` members also configure SandCrew for the organization.
 
 ## Runtime and Language
 
@@ -11,7 +11,11 @@ This contract owns the SandCrew web console, component `sandcrew-console`, of [`
 - Server state: React Query with `@connectrpc/connect-query` and the TypeScript bindings of `@delino/sandcrew-protos`.
 - UI components: [`delino-ui`](packages-delino-ui-foundation.md) with light and dark themes.
 - Service worker: one service worker at the site root, only for Web Push. It caches nothing.
-- Development port (recorded when the path is created): `127.0.0.1:13700` for `dev:app`, behind the portless name `sandcrew.delino` (`https://sandcrew.delino.localhost`).
+- Development port: `127.0.0.1:13700` for `dev:app`, behind the portless name `sandcrew.delino` (`https://sandcrew.delino.localhost`), according to the [environment contract](repository-environment-contract.md#frontend-development-urls).
+- The console calls the control plane only through its absolute origin. It reads the origin from `PUBLIC_API_ORIGIN` and uses `https://sandcrew.api.delino.io` when the value is not set.
+- Authentication: a Logto single-page application (`@logto/react`) with the API resource `https://sandcrew.api.delino.io` and the scope `sandcrew:use`, which the console always requests. The auth bridge, the sign-in callback, the unreadable sign-in session guard and the `Unauthenticated` recovery follow the [SandRun console](apps-sandrun-console-foundation.md#interfaces-and-contracts).
+- Build-time variables (all public, listed in `apps/sandcrew/.env.example`): `PUBLIC_API_ORIGIN`, `PUBLIC_LOGTO_ENDPOINT`, `PUBLIC_LOGTO_APP_ID`, `PUBLIC_LOGTO_SCOPES` and `PUBLIC_SANDCREW_MOCK_API` (`true` or `false`). `rsbuild.config.ts` validates them with the origin rules of the SandRun console and fails the build or development server on an invalid value. The Turbo `dev` task passes them through `passThroughEnv`, and the `build` task declares them as `env`.
+- Mock API (recorded decision): `PUBLIC_SANDCREW_MOCK_API=true` runs the console against an in-browser fake control plane (`src/mock/mock-api.ts`, a Connect router transport) and a fake signed-in user whose session lives in `sessionStorage`. It seeds an organization of each role (an `owner` organization with sessions in every state, an `admin` organization at the SandRun session limit and a `member` organization without an allowed runner profile), runner profiles with each `ProfileIneligibility`, a profile ID that SandRun deleted, credentials and a session secret, and a transcript with every event kind. It simulates agent turns, permission requests, pause and resume, and the streams. It applies the [authorization rules](servers-sandcrew-api-foundation.md#authorization) and the ranges of the control plane. Production builds reject the flag, and the minifier removes the separate mock module from builds with the flag disabled. The mock serves the development server, the unit tests and the end-to-end suite.
 
 ## Users and Operators
 
@@ -31,7 +35,7 @@ Members of SandRun organizations who sign in with Logto. `owner` and `admin` mem
 | `SETTINGS_ORG`      | `/orgs/:organizationId/settings/organization` | Organization vendor credentials, allowed runner profiles, pause delay and paused-session retention (`owner` and `admin` only). |
 | `SIGN_IN_CALLBACK`  | `/callback`                                   | Logto sign-in callback.                                                                                                        |
 
-- The organization picker lists the organizations from `OrganizationService.ListOrganizations`. It links to the SandRun console (`https://sandrun.delino.io`) to create organizations and manage members. SandCrew has no member pages. Account management links to `https://accounts.delino.io`.
+- The organization picker lists the organizations from `OrganizationService.ListOrganizations`, the last used organization first. It links to the SandRun console (`https://sandrun.delino.io`) to create organizations and manage members. SandCrew has no member pages. Account management links to `https://accounts.delino.io`.
 
 ### Session list
 
@@ -59,13 +63,13 @@ Members of SandRun organizations who sign in with Logto. `owner` and `admin` mem
 ### Settings
 
 - User settings: vendor credentials per vendor (API key, Claude Code token from `claude setup-token`, or the Codex `auth.json` file), session secrets (name and value), and Web Push. Values are write-only: the page shows only kinds, names and times.
-- Web Push: a "Turn on notifications on this browser" button. The browser permission prompt appears only after the click. The console registers the service worker, subscribes with the VAPID public key of `GetWebPushConfig` and calls `RegisterPushSubscription`. The page lists the user's subscriptions and can delete them.
+- Web Push: a "Turn on notifications on this browser" button. The browser permission prompt appears only after the click. The console registers the service worker, subscribes with the VAPID public key of `GetWebPushConfig` and calls `RegisterPushSubscription` with a browser name such as "Firefox on Linux" as the label. The page lists the user's subscriptions and can delete them. A browser without the Push API shows that it does not support notifications, and a browser that blocks notifications for the site shows how to allow them instead of the button.
 - Organization settings (`owner` and `admin`): organization vendor credentials, allowed runner profiles (profiles that are not selectable are shown disabled with their reason), pause delay and paused-session retention (with "Unlimited").
-- Notification click: opens the chat view of the session.
+- Notification click: opens the chat view of the session from the `organization_id` and `session_id` of the [push payload](servers-sandcrew-api-foundation.md#notifications), or focuses a window that shows it.
 
 ### States and accessibility
 
-- Every view has empty, loading, error and permission states. A `not_found` for an organization that the user no longer belongs to returns to the organization picker.
+- Every view has empty, loading, error and permission states. A `not_found` for an organization that the user no longer belongs to returns to the organization picker, which explains that the user no longer has access. An organization route whose organization is not in the caller's list does the same.
 - English only. The layout works down to 320 px wide.
 - Follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it.
 
@@ -78,6 +82,8 @@ Members of SandRun organizations who sign in with Logto. `owner` and `admin` mem
 
 - The console sends only the user's Logto access token for `https://sandcrew.api.delino.io` (scope `sandcrew:use`) and never receives credential or secret values.
 - Agent output is rendered as untrusted content: Markdown is rendered without raw HTML, links open with `rel="noopener noreferrer"`, and raw JSON is shown as text.
+- Markdown renderer (recorded decision): the console renders a subset of Markdown itself (`src/markdown.tsx`): paragraphs, headings, fenced code blocks, bullet and numbered lists, block quotes, inline code, bold, italic and links. It builds React elements only and allows only `http`, `https` and `mailto` links; other syntax shows as text. A CommonMark library is a new dependency that needs owner approval and a dependency security review; replace the renderer in the change that adds one.
+- Credential and secret forms use password fields (and a file input for the Codex `auth.json`), clear their values after a save and never show a value again. The console checks the `auth.json` file (a JSON object of at most 64 KiB) and the session secret name rules of the control plane before it sends them.
 - No PostHog autocapture and no session recording. Product analytics are server-side only.
 
 ## Logging
@@ -87,7 +93,8 @@ The console sends no logs. Errors appear in the user interface with the Connect 
 ## Build and Test
 
 - `pnpm exec turbo run build lint typecheck test --filter=sandcrew-console` and `pnpm test` from the repository root, with unit tests for the session list, the new-session form, the chat view (every event kind, permission buttons, cancel, mode switch), the settings and the Web Push opt-in.
-- Browser end-to-end tests in `apps/sandcrew/e2e/` according to the [e2e contract](repository-e2e-contract.md), against a fake `sandcrew-api`: the session list, the new-session form, the chat view, the settings, and the empty, loading, error and permission states.
+- Package scripts: `dev` (portless, started as `node node_modules/portless/dist/cli.js run --prefix=` through `scripts/dev/with-infisical.mjs` with the Infisical folder `/apps/sandcrew`), `dev:app` (`rsbuild dev`), `build`, `preview`, `lint` and `typecheck` (`tsc --noEmit`), `test` (`rstest run` with `happy-dom`) and `test:e2e` (`e2e run`).
+- Browser end-to-end tests in `apps/sandcrew/e2e/` according to the [e2e contract](repository-e2e-contract.md), against the development server with the mock API: the session list, the new-session form, the chat view, the settings, the Web Push opt-in, and the empty, loading, error and permission states. For the loading states, a test stores a response delay for the mock in `sessionStorage` (`sandcrew.mock-response-delay-ms`), which only mock builds read. The app command uses Node to run the Rsbuild CLI with `dev --no-env --mode development`, `NODE_ENV=production` and a padded `PUBLIC_SANDCREW_MOCK_API=true` value. Headless Chromium blocks notifications and has no push service, so the opt-in test replaces only the permission prompt and `PushManager.subscribe` in the page; the service worker registration is real. The suite does not test a deployed control plane, Logto or a push service.
 
 ## Dependencies and Integrations
 

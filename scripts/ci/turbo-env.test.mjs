@@ -150,6 +150,15 @@ const expectedPassThroughEnv = {
     "PUBLIC_LOGTO_SCOPES",
     "PUBLIC_SANDRUN_MOCK_API",
   ],
+  "sandcrew-console#dev": [
+    "PORTLESS",
+    "PORTLESS_*",
+    "PUBLIC_API_ORIGIN",
+    "PUBLIC_LOGTO_APP_ID",
+    "PUBLIC_LOGTO_ENDPOINT",
+    "PUBLIC_LOGTO_SCOPES",
+    "PUBLIC_SANDCREW_MOCK_API",
+  ],
 };
 
 // Workspace directories named by the patterns of `pnpm-workspace.yaml`.

@@ -337,10 +337,10 @@ jobs:
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_static_sites == 'true' }}
     runs-on: ubuntu-latest
     # The job uploads and waits for each Pages site in sequence. Allow 10
-    # minutes per site (5 sites) plus 15 minutes for setup, plan checks,
+    # minutes per site (6 sites) plus 15 minutes for setup, plan checks,
     # uploads and final reporting. The overhead matches the macOS signing budget.
     # scripts/ci/deploy-pages-budget.test.mjs checks the minimum.
-    timeout-minutes: 65
+    timeout-minutes: 75
     environment: static-sites
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
