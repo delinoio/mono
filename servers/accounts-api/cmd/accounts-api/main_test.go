@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,6 +58,44 @@ func (l *closeNotifyingListener) Close() error {
 		l.closeOnce.Do(func() { close(l.closed) })
 	}
 	return err
+}
+
+// readLimitedListener caps reads and records their sizes for tests that open
+// one client connection.
+type readLimitedListener struct {
+	net.Listener
+	maxReadSize int
+	mu          sync.Mutex
+	sizes       []int
+}
+
+func (l *readLimitedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &readLimitedConn{Conn: conn, listener: l}, nil
+}
+
+func (l *readLimitedListener) readSizes() []int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.sizes)
+}
+
+type readLimitedConn struct {
+	net.Conn
+	listener *readLimitedListener
+}
+
+func (c *readLimitedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p[:min(len(p), c.listener.maxReadSize)])
+	if n > 0 {
+		c.listener.mu.Lock()
+		c.listener.sizes = append(c.listener.sizes, n)
+		c.listener.mu.Unlock()
+	}
+	return n, err
 }
 
 // noStop stands in for the signal-registration stop function in tests that
@@ -779,6 +818,11 @@ func startRequestLogServer(t *testing.T) (string, *syncBuffer) {
 // client disconnect waits on it instead of sleeping.
 func startRequestLogServerWithClosed(t *testing.T) (string, *syncBuffer, <-chan struct{}) {
 	t.Helper()
+	return startRequestLogServerOnListener(t, newTestListener(t))
+}
+
+func startRequestLogServerOnListener(t *testing.T, listener net.Listener) (string, *syncBuffer, <-chan struct{}) {
+	t.Helper()
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	srv := newServer(server.NewHandler(logger), logger)
@@ -795,7 +839,6 @@ func startRequestLogServerWithClosed(t *testing.T) (string, *syncBuffer, <-chan 
 		}
 	}
 
-	listener := newTestListener(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx, noStop, srv, listener, logger, time.Second) }()
