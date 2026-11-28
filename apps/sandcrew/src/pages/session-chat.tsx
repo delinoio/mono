@@ -494,7 +494,9 @@ function Composer({
         text: message,
       });
       unconfirmed.current = undefined;
-      setText("");
+      // The textarea stays editable while the message sends; keep a newer
+      // draft and clear only the text that was sent.
+      setText((current) => (current === text ? "" : current));
     } catch {
       // The composer shows the mutation error and keeps the text.
     }

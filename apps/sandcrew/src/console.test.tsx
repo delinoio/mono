@@ -634,6 +634,29 @@ describe("chat view", () => {
     expect(sent[2]!.clientMessageId).not.toBe(sent[0]!.clientMessageId);
   });
 
+  test("keeps a draft typed while a message is sending", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transport: Transport = {
+      ...base,
+      async unary(method, ...rest) {
+        if (method.name === "SendMessage") await held;
+        return base.unary(method, ...rest);
+      },
+    };
+    renderConsole(chatPath, { transport });
+    const message = await screen.findByRole("textbox", { name: "Message" });
+    await type(message, "Explain the fix");
+    await click(screen.getByRole("button", { name: "Send" }));
+    await type(message, "And add a test");
+    await act(async () => release());
+    await settle();
+    expect((message as HTMLTextAreaElement).value).toBe("And add a test");
+  });
+
   test("stops a turn that waits for a permission answer", async () => {
     const { transport, calls } = recording(
       createMockTransport({ agentStepMs: 5 }),
