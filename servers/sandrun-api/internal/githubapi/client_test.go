@@ -228,8 +228,8 @@ func TestRunners(t *testing.T) {
 	if err != nil || found == nil || found.ID != jit.Runner.ID {
 		t.Fatalf("find = %v, %v", found, err)
 	}
-	if found, _ := c.FindRunner(ctx, 1, "acme", "sandrun-r2"); found != nil {
-		t.Fatal("found a missing runner")
+	if found, err := c.FindRunner(ctx, 1, "acme", "sandrun-r2"); err != nil || found != nil {
+		t.Fatalf("find sandrun-r2: runner = %v, error = %v, want both nil", found, err)
 	}
 	f.SetBusy("sandrun-r1", true)
 	if err := c.DeleteRunner(ctx, 1, "acme", jit.Runner.ID); !errors.Is(err, githubapi.ErrRunnerRefused) {
