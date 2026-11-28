@@ -253,6 +253,11 @@ func stdout(off int64, s string) *ownsandv1.ExecEvent {
 	return &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: off, Data: []byte(s)}}}
 }
 
+const (
+	execFailureDiagnostic = "program missing\nline two\t日本語"
+	execDeniedDiagnostic  = "request denied\r\nline two"
+)
+
 // Exec runs scripted commands: command[0] selects the result.
 func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecRequest], s *connect.ServerStream[ownsandv1.ExecResponse]) error {
 	if r.Header().Get("Ownsand-Relay-Grant-Id") == "" {
@@ -262,7 +267,10 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 	h.f.execIDs = append(h.f.execIDs, r.Msg.GetExecId())
 	h.f.mu.Unlock()
 	cmd := r.Msg.GetCommand()
-	if cmd[0] == "denied" {
+	switch cmd[0] {
+	case "denied-control":
+		return connect.NewError(connect.CodePermissionDenied, errors.New(execDeniedDiagnostic))
+	case "denied":
 		return connect.NewError(connect.CodePermissionDenied, errors.New("digest mismatch"))
 	}
 	events := []*ownsandv1.ExecEvent{
@@ -282,6 +290,8 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 		events = append(events, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_Signal{Signal: 9}}}})
 	case "timeout":
 		events = append(events, exited(143, true))
+	case "fail-control":
+		events = append(events, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Failed{Failed: &ownsandv1.ExecFailed{Reason: ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND, Message: execFailureDiagnostic}}})
 	case "fail":
 		events = append(events, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Failed{Failed: &ownsandv1.ExecFailed{Reason: ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND, Message: "not found"}}})
 	case "ended":
