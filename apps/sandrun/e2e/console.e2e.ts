@@ -2432,6 +2432,58 @@ function measureProfileWorkspace(profileName: string) {
 }
 
 describe("runner profiles", () => {
+  test("validates template IDs and saves a corrected Windows profile", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+    await screen.getByRole("button", "Create runner profile").tap();
+    const create = screen.getByRole("dialog", "Create a runner profile");
+    await create.getByLabel("Name").tap();
+    await browser.keyboard.type("template-id-check");
+    await create.getByRole("combobox", "Source").tap();
+    await screen.getByRole("option", "OwnSand template", { exact: true }).tap();
+    const createTemplate = create.getByLabel("Template ID");
+    await createTemplate.tap();
+    await browser.keyboard.type("not-a-uuid");
+    await create.getByRole("button", "Create profile").tap();
+    const invalid = "Enter a valid UUID v7 for the template ID.";
+    await expect(create.getByText(invalid)).toBeVisible();
+    await expect(createTemplate).toHaveAttribute("aria-invalid", "true");
+    await browser.keyboard.press("Escape");
+    await expect(create).toBeHidden();
+    await expect(
+      screen.getByText("template-id-check · GitHub job · Linux"),
+    ).toBeHidden();
+
+    const windows = screen
+      .getByRole("listitem")
+      .filter({ hasText: "windows-dev ·" });
+    const openEdit = windows.getByRole("button", "Edit");
+    await openEdit.tap();
+    const edit = screen.getByRole("dialog", "Edit windows-dev");
+    const editTemplate = edit.getByLabel("Template ID");
+    const save = edit.getByRole("button", "Save changes");
+    await editTemplate.tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("0193a000-0000-7000-4000-0000000000c9");
+    await save.tap();
+    await expect(edit.getByText(invalid)).toBeVisible();
+    await expect(editTemplate).toHaveAttribute("aria-invalid", "true");
+    await editTemplate.tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type(" 0193A000-0000-7000-8000-0000000000C9 ");
+    await save.tap();
+    await expect(edit).toBeHidden();
+    await openEdit.tap();
+    await expect(editTemplate).toHaveValue(
+      "0193a000-0000-7000-8000-0000000000c9",
+    );
+  });
+
   for (const { organizationId, mode, nextAction, scenario } of [
     {
       organizationId: NORTHWIND,

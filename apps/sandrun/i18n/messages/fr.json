@@ -415,6 +415,7 @@
   "profiles.form.guestOsNotVerified": "Sélectionnez un système d’exploitation invité que SandRun a vérifié pour OpenAI Codex.",
   "profiles.form.guestOsUnsupported": "Le fournisseur de cette intégration ne prend pas en charge ce système d’exploitation invité.",
   "profiles.form.templateRequired": "Saisissez l’identifiant d’un modèle OwnSand pour ce système d’exploitation invité.",
+  "profiles.form.templateInvalid": "Saisissez un UUID v7 valide pour l’identifiant du modèle.",
   "profiles.form.vcpuRequired": "Saisissez au moins 1 vCPU.",
   "profiles.form.vcpuRange": "Saisissez un nombre entier de vCPU compris entre 1 et {max}.",
   "profiles.form.memoryRequired": "Saisissez la quantité de mémoire en Mio.",

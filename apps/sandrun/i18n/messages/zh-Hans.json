@@ -415,6 +415,7 @@
   "profiles.form.guestOsNotVerified": "请选择 SandRun 已验证可运行 OpenAI Codex 的客户机操作系统。",
   "profiles.form.guestOsUnsupported": "此集成的供应商不支持在该客户机操作系统上运行。",
   "profiles.form.templateRequired": "请输入适用于此客户机操作系统的 OwnSand 模板 ID。",
+  "profiles.form.templateInvalid": "请输入有效的 UUID v7 作为模板 ID。",
   "profiles.form.vcpuRequired": "请输入至少 1 个 vCPU。",
   "profiles.form.vcpuRange": "请输入 1 至 {max} 之间的整数作为 vCPU 数量。",
   "profiles.form.memoryRequired": "请输入内存大小（MiB）。",
