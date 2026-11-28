@@ -10,7 +10,6 @@ import {
 import {
   act,
   cleanup,
-  configure,
   fireEvent,
   screen,
   waitFor,
@@ -122,12 +121,6 @@ async function changeRoleAndRefetch(
   setMemberRole(api, userId, role);
   await refetchOnVisibilityChange();
 }
-
-// The UI SDK repeats each field error and toast in a hidden live region
-// ([data-ui-sdk-announcer]) 100 ms later. Text queries ignore that region, so
-// that a check of a visible message does not find a second copy when a slow
-// test reaches it after the 100 ms.
-configure({ defaultIgnore: "script, style, [data-ui-sdk-announcer]" });
 
 beforeEach(() => {
   window.sessionStorage.clear();
