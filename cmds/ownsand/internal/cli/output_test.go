@@ -304,21 +304,25 @@ func TestTextListNextPageHintWriteErrorExitsWithError(t *testing.T) {
 	}
 }
 
-// TestPrintTableReturnsEveryWriteError checks that the error of any write of
-// the table reaches the caller: a row write that flushes early as well as the
-// final flush.
+func TestTextListShortWriteSuppressesNextPageHint(t *testing.T) {
+	r := newRunner(t)
+	stdout := outputWriterFunc(func(p []byte) (int, error) { return len(p) - 1, nil })
+	var stderr bytes.Buffer
+	if code := r.runWriters(stdout, &stderr, "api-key", "list", "--no-color"); code != ExitError {
+		t.Errorf("exit %d, want %d", code, ExitError)
+	}
+	if got := stderr.String(); !strings.Contains(got, io.ErrShortWrite.Error()) || strings.Contains(got, "More results") {
+		t.Errorf("stderr %q, want the short write error only", got)
+	}
+}
+
 func TestPrintTableReturnsEveryWriteError(t *testing.T) {
 	headers := []string{"ID", "NAME"}
-	// A row without a tab ends the column block, so the tabwriter flushes
-	// inside the write of that row and writes the block before it.
 	rows := [][]string{{"1", "one"}, {"only one cell"}, {"2", "two"}, {"3", "three"}}
 	a := &app{}
 	ok := &failingWriter{failAfter: -1}
 	if err := a.printTable(ok, headers, rows); err != nil {
 		t.Fatal(err)
-	}
-	if ok.writes < 2 {
-		t.Fatalf("the table needs %d writes, want an early flush and a final flush", ok.writes)
 	}
 	for n := 0; n < ok.writes; n++ {
 		w := &failingWriter{failAfter: n, err: errDiskFull}
@@ -326,10 +330,66 @@ func TestPrintTableReturnsEveryWriteError(t *testing.T) {
 			t.Errorf("fail at write %d: err %v, want %v", n+1, err, errDiskFull)
 		}
 	}
-	// A table without a single-cell row writes only in the final flush.
-	flushOnly := &failingWriter{failAfter: 0, err: errDiskFull}
-	if err := a.printTable(flushOnly, headers, [][]string{{"1", "one"}}); !errors.Is(err, errDiskFull) {
-		t.Errorf("flush error: %v", err)
+	for _, tc := range []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"short write", nil, io.ErrShortWrite},
+		{"short write with error", errDiskFull, errDiskFull},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writes := 0
+			w := outputWriterFunc(func(p []byte) (int, error) {
+				writes++
+				if writes == 1 {
+					return len(p) - 1, tc.err
+				}
+				return 0, errors.New("unexpected later write")
+			})
+			if err := a.printTable(w, headers, rows); !errors.Is(err, tc.want) || writes != 1 {
+				t.Errorf("printTable made %d writes and returned %v, want 1 write and %v", writes, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPrintTableAlignment(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers []string
+		rows    [][]string
+		want    string
+	}{
+		{
+			name:    "wide and combining characters",
+			headers: []string{"NAME", "ROLE"},
+			rows:    [][]string{{"abcd", "owner"}, {"漢字", "owner"}, {"a\u0301bcd", "owner"}, {"ＡＢ", "owner"}},
+			want:    "NAME  ROLE\nabcd  owner\n漢字  owner\na\u0301bcd  owner\nＡＢ  owner\n",
+		},
+		{
+			name:    "ragged ASCII rows",
+			headers: []string{"ID", "NAME", "ROLE"},
+			rows:    [][]string{{"1", "one", "owner"}, {"22", "two"}, {"333", "three", "admin"}, {"solo"}, {"4444", "four", ""}},
+			want:    "ID   NAME  ROLE\n1    one   owner\n22   two\n333  three  admin\nsolo\n4444  four  \n",
+		},
+		{
+			name:    "escaped headers and rows",
+			headers: []string{"A\tB", "STATUS"},
+			rows:    [][]string{{"漢\n字", "first"}, {"e\u0301", "second"}},
+			want:    "A\\tB    STATUS\n漢\\n字  first\ne\u0301       second\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			a := &app{}
+			if err := a.printTable(&out, tc.headers, tc.rows); err != nil {
+				t.Fatal(err)
+			}
+			if got := out.String(); got != tc.want {
+				t.Errorf("table = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

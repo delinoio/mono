@@ -12,11 +12,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"text/tabwriter"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/text/width"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -246,38 +246,79 @@ func ts(t *timestamppb.Timestamp) string {
 	return t.AsTime().UTC().Format(time.RFC3339)
 }
 
-// printTable prints a table in text mode and returns the first error of w.
-// The tabwriter buffers its output, and a write can flush early, so an error
-// can come from a row write as well as from the final flush.
+// displayWidth counts terminal cells in escaped text.
+func displayWidth(s string) int {
+	cells := 0
+	for _, r := range s {
+		if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
+			continue
+		}
+		switch width.LookupRune(r).Kind() {
+		case width.EastAsianWide, width.EastAsianFullwidth:
+			cells += 2
+		default:
+			cells++
+		}
+	}
+	return cells
+}
+
+// printTable aligns escaped cells in text mode and returns the first write error.
 func (a *app) printTable(w io.Writer, headers []string, rows [][]string) error {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	for i, h := range headers {
+	type cell struct {
+		text  string
+		width int
+		gap   int
+	}
+	table := make([][]cell, len(rows)+1)
+	columnCount := 0
+	for i := range table {
+		row := headers
 		if i > 0 {
-			if _, err := fmt.Fprint(tw, "\t"); err != nil {
-				return err
+			row = rows[i-1]
+		}
+		cells := make([]cell, len(row))
+		for j, value := range row {
+			escaped := safeText(value)
+			cells[j] = cell{text: escaped, width: displayWidth(escaped)}
+		}
+		table[i] = cells
+		columnCount = max(columnCount, len(cells))
+	}
+
+	// As with tabwriter, consecutive rows share a column width up to a row
+	// where that column is the last cell or is missing.
+	const minGap = 2
+	for col := 0; col+1 < columnCount; col++ {
+		for start := 0; start < len(table); {
+			end, widest := start, 0
+			for end < len(table) && col+1 < len(table[end]) {
+				widest = max(widest, table[end][col].width)
+				end++
 			}
+			for _, row := range table[start:end] {
+				row[col].gap = widest - row[col].width + minGap
+			}
+			start = end + 1
 		}
-		// Color codes would break the column widths, so the header uses
-		// bold only on the whole line below.
-		if _, err := fmt.Fprint(tw, safeText(h)); err != nil {
+	}
+
+	for _, row := range table {
+		var line strings.Builder
+		for _, c := range row {
+			line.WriteString(c.text)
+			line.WriteString(strings.Repeat(" ", c.gap))
+		}
+		line.WriteByte('\n')
+		n, err := io.WriteString(w, line.String())
+		if err != nil {
 			return err
 		}
-	}
-	if _, err := fmt.Fprintln(tw); err != nil {
-		return err
-	}
-	for _, r := range rows {
-		// Escape each cell before the join: a tab or a newline in a cell
-		// would otherwise add a column or a row.
-		cells := make([]string, len(r))
-		for i, c := range r {
-			cells[i] = safeText(c)
-		}
-		if _, err := fmt.Fprintln(tw, strings.Join(cells, "\t")); err != nil {
-			return err
+		if n != line.Len() {
+			return io.ErrShortWrite
 		}
 	}
-	return tw.Flush()
+	return nil
 }
 
 // printList prints a list response: JSON as the whole message, text as a
