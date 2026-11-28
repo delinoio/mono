@@ -59,8 +59,14 @@ func TestAckAdmissionDeadline(t *testing.T) {
 			// The authorization ID is released: the same request reserves a
 			// fresh grant instead of returning the expired one.
 			fresh, existing, err := r.Reserve(req("a", "u", "op"), newID)
-			if err != nil || existing || fresh.ID == g.ID {
-				t.Fatalf("reserve after the expiry: err=%v existing=%v same=%v", err, existing, fresh.ID == g.ID)
+			if err != nil {
+				t.Fatalf("reserve authorization %q after expiry: %v", g.AuthorizationID, err)
+			}
+			if fresh == nil {
+				t.Fatalf("reserve authorization %q after expiry returned a nil grant", g.AuthorizationID)
+			}
+			if existing || fresh.ID == g.ID {
+				t.Fatalf("reserve authorization %q after expiry returned grant %q (existing=%v), want a new grant different from %q", g.AuthorizationID, fresh.ID, existing, g.ID)
 			}
 		})
 	}
