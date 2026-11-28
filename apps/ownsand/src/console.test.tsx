@@ -4396,12 +4396,15 @@ describe("a failed refetch of loaded data", () => {
       transport,
       queryClient,
     });
-    await screen.findByText(/ci-runner/);
+    const key = await screen.findByText(/ci-runner/);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
     });
     await settle(60);
-    const input = screen.getByRole("textbox", { name: "Name" });
+    const dialog = screen.getByRole("dialog");
+    const input = within(dialog).getByRole<HTMLInputElement>("textbox", {
+      name: "Name",
+    });
     await act(async () => {
       fireEvent.input(input, { target: { value: "deploy-bot" } });
     });
@@ -4417,25 +4420,71 @@ describe("a failed refetch of loaded data", () => {
       0,
     );
     expect(document.querySelector(".sidenav")).toBe(nav);
-    expect(screen.getByText(/ci-runner/)).toBeTruthy();
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByText(/ci-runner/)).toBe(key);
+    expect(screen.getByRole("dialog")).toBe(dialog);
     expect(screen.getByRole("textbox", { name: "Name" })).toBe(input);
-    expect((input as HTMLInputElement).value).toBe("deploy-bot");
+    expect(input.value).toBe("deploy-bot");
 
-    // Try again succeeds once the failure is gone, and removes the notice.
     state.code = undefined;
-    const retry = screen.getAllByRole("button", {
-      name: "Try again",
-      hidden: true,
-    })[0]!;
-    await act(async () => {
-      fireEvent.click(retry);
-    });
-    await settle(60);
     await refetchAll(queryClient);
     expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+    expect(document.querySelector(".sidenav")).toBe(nav);
+    expect(screen.getByText(/ci-runner/)).toBe(key);
+    expect(screen.getByRole("dialog")).toBe(dialog);
     expect(screen.getByRole("textbox", { name: "Name" })).toBe(input);
-    expect((input as HTMLInputElement).value).toBe("deploy-bot");
+    expect(input.value).toBe("deploy-bot");
+  });
+
+  test("Try again in the API keys refresh notice requests the list again", async () => {
+    const method = ApiKeyService.method.listApiKeys;
+    const { transport, calls } = holdMockTransport([method.name]);
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        // Keep the loaded page fresh across focus, reconnect and mount.
+        queries: { retry: false, staleTime: Infinity, refetchInterval: false },
+      },
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+      transport,
+      queryClient,
+    });
+    await waitFor(() => expect(calls[method.name]).toHaveLength(1));
+    const keyRequests = calls[method.name]!;
+    await act(async () => keyRequests[0]!.settle());
+    await screen.findByText(/ci-runner/);
+
+    const refetch = queryClient.refetchQueries({
+      queryKey: createConnectQueryKey({
+        schema: method,
+        cardinality: "infinite",
+      }),
+    });
+    await waitFor(() => expect(keyRequests).toHaveLength(2));
+    await act(async () => {
+      keyRequests[1]!.settle(
+        new ConnectError("the refresh failed", Code.Unavailable),
+      );
+      await refetch;
+    });
+
+    const main = within(screen.getByRole("main"));
+    const notice = await main.findByRole("alert");
+    expect(within(notice).getByText(REFRESH_NOTICE)).toBeTruthy();
+    const retry = within(notice).getByRole<HTMLButtonElement>("button", {
+      name: "Try again",
+    });
+    expect(retry.disabled).toBe(false);
+
+    const requestsBeforeRetry = keyRequests.length;
+    await act(async () => fireEvent.click(retry));
+    await waitFor(() =>
+      expect(keyRequests).toHaveLength(requestsBeforeRetry + 1),
+    );
+    expect(notice.isConnected).toBe(true);
+
+    await act(async () => keyRequests[requestsBeforeRetry]!.settle());
+    await waitFor(() => expect(main.queryByText(REFRESH_NOTICE)).toBeNull());
+    expect(notice.isConnected).toBe(false);
   });
 
   const pages = [
