@@ -3,8 +3,8 @@
 package guest
 
 import (
+	"crypto/rand"
 	"os"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -35,36 +35,25 @@ func mkdirWriteReservation(path string) error {
 	return nil
 }
 
-func prepareStagingPermissions(path string, identity fileIdentity) error {
-	name, err := windows.UTF16PtrFromString(extendedPath(path))
+func createWriteSeed(path, parent string) (*os.File, error) {
+	// Create the seed in the destination directory so NTFS assigns its normal
+	// inherited DACL. The caller holds the empty seed open without sharing
+	// until its identity is recorded and the staging link exists. Closing the
+	// handle removes the temporary source name and keeps the hard links.
+	source := siblingPath(parent, ".ownsand-seed-"+rand.Text()+".tmp")
+	name, err := windows.UTF16PtrFromString(extendedPath(source))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	handle, err := windows.CreateFile(name, windows.WRITE_DAC,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
-		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.DELETE, 0, nil,
+		windows.CREATE_NEW, windows.FILE_FLAG_DELETE_ON_CLOSE, 0)
 	if err != nil {
-		return err
+		return nil, &os.PathError{Op: "create", Path: source, Err: err}
 	}
-	defer windows.CloseHandle(handle)
-	current, err := identityOfHandle(syscall.Handle(handle))
-	if err != nil {
-		return err
+	seed := os.NewFile(uintptr(handle), source)
+	if err := os.Link(source, path); err != nil {
+		seed.Close()
+		return nil, err
 	}
-	if current != identity {
-		return os.ErrNotExist
-	}
-	// A hard link shares the seed's ACL. Reset it at the staging name so the
-	// file inherits from the destination directory as a directly created
-	// staging file would.
-	descriptor, err := windows.SecurityDescriptorFromString("D:")
-	if err != nil {
-		return err
-	}
-	dacl, _, err := descriptor.DACL()
-	if err != nil {
-		return err
-	}
-	return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	return seed, nil
 }

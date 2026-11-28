@@ -49,7 +49,11 @@ func (m *writeManager) createStaging(e *writeEntry, parent string) (err error) {
 	e.reservation = &writeReservation{Dir: dir, Identity: identity}
 
 	saved, linked := false, false
+	var seed *os.File
 	defer func() {
+		if seed != nil {
+			seed.Close()
+		}
 		if err == nil {
 			return
 		}
@@ -76,17 +80,13 @@ func (m *writeManager) createStaging(e *writeEntry, parent string) (err error) {
 		return err
 	}
 	saved = true
-	seed, err := os.OpenFile(e.reservation.file(), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	seed, err = createWriteSeed(e.reservation.file(), parent)
 	if err != nil {
 		return err
 	}
-	identity, identityErr := identityOfFile(seed)
-	closeErr := seed.Close()
-	if identityErr != nil {
-		return identityErr
-	}
-	if closeErr != nil {
-		return closeErr
+	identity, err = identityOfFile(seed)
+	if err != nil {
+		return err
 	}
 	e.identity = &identity
 	// Commit the file identity before creating the staging name. Linking
@@ -100,7 +100,9 @@ func (m *writeManager) createStaging(e *writeEntry, parent string) (err error) {
 	}
 
 	linked = true
-	if err := prepareStagingPermissions(e.tmp, *e.identity); err != nil {
+	err = seed.Close()
+	seed = nil
+	if err != nil {
 		return err
 	}
 	e.file, err = os.OpenFile(e.tmp, stagingReopenFlags, 0)
