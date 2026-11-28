@@ -2,22 +2,45 @@
 import "delino-ui/styles.css";
 import "../src/index.css";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Console } from "../src/App.tsx";
 import { AuthContextProvider, type Auth } from "../src/auth.tsx";
 import { CONSOLE_CONFIG } from "../src/build-config.ts";
-import { createMockTransport, MOCK_IDS } from "../src/mock/mock-api.ts";
+import {
+  createMockTransport,
+  MOCK_IDS,
+  MOCK_USER,
+} from "../src/mock/mock-api.ts";
 
-const callerIsMember = new URLSearchParams(location.search).has("member");
-const callerId = callerIsMember ? "user-member-ada" : "user-admin-jun";
+const params = new URLSearchParams(location.search);
+const callerId = params.has("owner")
+  ? MOCK_USER
+  : params.has("member")
+    ? "user-member-ada"
+    : "user-admin-jun";
 const mock = createMockTransport({ userId: callerId });
 const mutationLogKey = "ownsand-e2e-member-mutations";
+const leaveRequestsKey = "ownsand-e2e-leave-requests";
+const leaveRefreshPathKey = "ownsand-e2e-leave-refresh-path";
 sessionStorage.setItem(mutationLogKey, "[]");
+sessionStorage.setItem(leaveRequestsKey, "[]");
+sessionStorage.removeItem(leaveRefreshPathKey);
 const memberMutations: string[] = [];
+const leaveRequests: { organizationId?: string; userId?: string }[] = [];
+const organizationRefresh = new Promise<void>((resolve) => {
+  window.addEventListener(
+    "ownsand-e2e-release-leave-refresh",
+    () => resolve(),
+    {
+      once: true,
+    },
+  );
+});
 const transport: typeof mock = {
   ...mock,
-  unary(method, ...rest) {
+  async unary(method, ...rest) {
     if (
       method.parent.typeName === MemberService.typeName &&
       method.name !== MemberService.method.listMembers.name &&
@@ -25,6 +48,20 @@ const transport: typeof mock = {
     ) {
       memberMutations.push(method.name);
       sessionStorage.setItem(mutationLogKey, JSON.stringify(memberMutations));
+      if (method.name === MemberService.method.removeMember.name) {
+        const { organizationId, userId } =
+          rest[3] as (typeof leaveRequests)[number];
+        leaveRequests.push({ organizationId, userId });
+        sessionStorage.setItem(leaveRequestsKey, JSON.stringify(leaveRequests));
+      }
+    }
+    if (
+      method.parent.typeName === OrganizationService.typeName &&
+      method.name === OrganizationService.method.listOrganizations.name &&
+      leaveRequests.length > 0
+    ) {
+      sessionStorage.setItem(leaveRefreshPathKey, location.pathname);
+      await organizationRefresh;
     }
     return mock.unary(method, ...rest);
   },
@@ -41,7 +78,9 @@ const signedIn: Auth = {
 };
 
 function MemberIdentityFixture() {
-  const [userId, setUserId] = useState<string>();
+  const [userId, setUserId] = useState(
+    params.has("owner") ? callerId : params.has("empty") ? "" : undefined,
+  );
 
   useEffect(() => {
     const resolveCaller = () => setUserId(callerId);
