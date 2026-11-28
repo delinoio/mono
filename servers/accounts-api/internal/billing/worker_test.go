@@ -3,9 +3,11 @@
 package billing
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -17,6 +19,20 @@ import (
 	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
 	"github.com/delinoio/mono/servers/internal/telemetry"
 )
+
+func TestRunWorkerSkipsPreCanceledStartup(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	service := New(Config{Logger: logger})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	service.RunWorker(ctx, time.Second)
+
+	if logs.Len() != 0 {
+		t.Errorf("worker logs after canceled startup = %q, want no logs", logs.String())
+	}
+}
 
 func TestRunOnceRefreshesMetricsWithDueNotifications(t *testing.T) {
 	f := newFixture(t)
