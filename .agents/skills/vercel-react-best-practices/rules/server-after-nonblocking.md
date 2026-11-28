@@ -7,7 +7,9 @@ tags: server, async, logging, analytics, side-effects
 
 ## Use after() for Non-Blocking Operations
 
-Use Next.js's `after()` to schedule work that should execute after a response is sent. This prevents logging, analytics, and other side effects from blocking the response.
+Use Next.js's `after()` to defer side effects until after the response is sent or the prerender finishes.
+
+Calling `after()` alone preserves the route's rendering mode. For a static page, Next.js runs the callback at build time and whenever it revalidates the page. Serving a cached page without revalidation skips the callback.
 
 **Incorrect (blocks response):**
 
@@ -57,7 +59,7 @@ The response is sent immediately while logging happens in the background. Await 
 
 **Common use cases:**
 
-- Analytics tracking
+- Per-request analytics on a path that observes every request you want to count
 - Audit logging
 - Sending notifications
 - Cache invalidation
