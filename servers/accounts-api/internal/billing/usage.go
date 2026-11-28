@@ -168,10 +168,10 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 		return UsageResult{}, false, err
 	}
 	var res UsageResult
-	var queued bool
+	var deduction DeductionResult
 	var dup *storedReport
 	err = s.InObservedTx(ctx, func(tx pgx.Tx, observations *TxObservations) error {
-		res, queued, dup = UsageResult{}, false, nil
+		res, deduction, dup = UsageResult{}, DeductionResult{}, nil
 		now := s.timestamp()
 		if attributed {
 			if _, err := lockAccount(ctx, tx, link.AccountID); err != nil {
@@ -254,7 +254,7 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 			return err
 		}
 		res = UsageResult{BillingAccountID: link.AccountID, LedgerEntryID: d.LedgerEntryID}
-		queued = d.AutoTopUpQueued
+		deduction = d
 		return nil
 	})
 	if err != nil {
@@ -263,6 +263,14 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 	if dup != nil {
 		s.duplicate(ctx, r, *dup)
 		return dup.result(), false, nil
+	}
+	if queued := deduction.queuedTopUp; queued != nil {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_auto_top_up_queued",
+			slog.String("billing_account_id", queued.accountID),
+			slog.String("top_up_id", queued.id),
+			slog.Int64("amount_usd_micros", queued.amount),
+			slog.Int64("balance_usd_micros", queued.balance),
+			slog.Int64("month_to_date_usd_micros", queued.monthToDate))
 	}
 	result := UsageCharged
 	if res.Unattributed {
@@ -279,7 +287,7 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 		slog.String("result", result),
 		slog.String("billing_account_id", res.BillingAccountID),
 		slog.String("ledger_entry_id", res.LedgerEntryID))
-	return res, queued, nil
+	return res, deduction.AutoTopUpQueued, nil
 }
 
 // duplicate counts and logs a repeated key, and logs a mismatch when the

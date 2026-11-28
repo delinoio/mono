@@ -357,6 +357,7 @@ type DeductionResult struct {
 	// AutoTopUpQueued reports that the deduction queued an automatic
 	// top-up. The caller calls Wake after its transaction commits.
 	AutoTopUpQueued bool
+	queuedTopUp     *queuedAutoTopUp
 }
 
 // Deduct deducts a usage amount from the billing account in tx: it consumes
@@ -398,7 +399,9 @@ func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, observations *TxObserva
 	if err := s.syncStatuses(ctx, tx, observations, acct.ID, now); err != nil {
 		return DeductionResult{}, err
 	}
-	return DeductionResult{LedgerEntryID: id, BalanceAfterUSDMicros: acct.Balance, AutoTopUpQueued: queued}, nil
+	return DeductionResult{
+		LedgerEntryID: id, BalanceAfterUSDMicros: acct.Balance, AutoTopUpQueued: queued != nil, queuedTopUp: queued,
+	}, nil
 }
 
 // afterIncrease re-arms the low-balance alert once the balance reaches the
@@ -415,37 +418,37 @@ func (s *Service) afterIncrease(ctx context.Context, tx pgx.Tx, acct *accountSta
 // the balance below the threshold queues an automatic top-up; with it off,
 // the first decrease below the alert threshold queues one low-balance email
 // until the balance reaches the threshold again.
-func (s *Service) afterDecrease(ctx context.Context, tx pgx.Tx, acct *accountState, before int64, now time.Time, usage bool) (bool, error) {
+func (s *Service) afterDecrease(ctx context.Context, tx pgx.Tx, acct *accountState, before int64, now time.Time, usage bool) (*queuedAutoTopUp, error) {
 	if acct.Deleted || acct.Balance >= before {
-		return false, nil
+		return nil, nil
 	}
 	settings, err := loadSettings(ctx, tx, acct.ID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if settings.AutoEnabled {
 		if !usage || acct.Balance >= settings.AutoThreshold {
-			return false, nil
+			return nil, nil
 		}
 		return s.queueAutoTopUp(ctx, tx, acct, settings, now)
 	}
 	if settings.LowBalanceAlerted || acct.Balance >= settings.LowBalanceThreshold {
-		return false, nil
+		return nil, nil
 	}
 	if err := ensureSettings(ctx, tx, acct.ID, now); err != nil {
-		return false, err
+		return nil, err
 	}
 	var count int64
 	if err := tx.QueryRow(ctx, `UPDATE credit_settings SET low_balance_alerted = true,
 			low_balance_alert_count = low_balance_alert_count + 1, update_time = $2
 		WHERE billing_account_id = $1 RETURNING low_balance_alert_count`, acct.ID, now).Scan(&count); err != nil {
-		return false, err
+		return nil, err
 	}
 	s.logger.InfoContext(ctx, "billing_low_balance",
 		slog.String("billing_account_id", acct.ID),
 		slog.Int64("balance_usd_micros", acct.Balance),
 		slog.Int64("threshold_usd_micros", settings.LowBalanceThreshold))
-	return false, s.enqueue(ctx, tx, acct.ID, NotifyLowBalance, fmt.Sprintf("low_balance/%s/%d", acct.ID, count),
+	return nil, s.enqueue(ctx, tx, acct.ID, NotifyLowBalance, fmt.Sprintf("low_balance/%s/%d", acct.ID, count),
 		map[string]string{
 			notifyDetailBalance:   fmt.Sprint(acct.Balance),
 			notifyDetailThreshold: fmt.Sprint(settings.LowBalanceThreshold),
