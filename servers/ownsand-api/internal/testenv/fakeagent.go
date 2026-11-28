@@ -472,15 +472,28 @@ func (a *FakeAgent) DefaultAnswer(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentC
 		a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SignedUrlRequest{SignedUrlRequest: &ownsandv1.SignedUrlRequest{
 			RequestId: reqID, SnapshotId: c.ExportSnapshot.GetSnapshotId(), Operation: ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_UPLOAD, PartNumbers: []int32{1, 2},
 		}}})
-		grant := a.WaitFor("signed url grant", func(env *ownsandv1.AgentEnvelope) bool { return env.GetSignedUrlGrant().GetRequestId() == reqID }).GetSignedUrlGrant()
+		env, err := a.waitForEnvelope(0, "signed URL grant", func(env *ownsandv1.AgentEnvelope) bool {
+			grant := env.GetSignedUrlGrant()
+			return grant != nil && grant.GetRequestId() == reqID
+		}, nil)
+		if err != nil {
+			return &ownsandv1.AgentCommandResult{Error: &ownsandv1.ErrorDetail{
+				Code: ownsandv1.ErrorCode_ERROR_CODE_DEADLINE_EXCEEDED, Message: "timed out waiting for signed URL grant",
+			}}
+		}
+		grant := env.GetSignedUrlGrant()
 		if grant.GetError() != nil {
 			return &ownsandv1.AgentCommandResult{Error: grant.GetError()}
 		}
 		var parts []*ownsandv1.SnapshotPart
 		for _, u := range grant.GetPartUrls() {
+			if err := a.uploadPart(u.GetUrl(), 1<<20); err != nil {
+				return &ownsandv1.AgentCommandResult{Error: &ownsandv1.ErrorDetail{
+					Code: ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, Message: "failed to parse snapshot part upload URL",
+				}}
+			}
 			sum := sha256.Sum256([]byte(u.GetUrl()))
 			parts = append(parts, &ownsandv1.SnapshotPart{PartNumber: u.GetPartNumber(), SizeBytes: 1 << 20, Sha256: sum[:]})
-			a.uploadPart(u.GetUrl(), 1<<20)
 		}
 		return &ownsandv1.AgentCommandResult{Result: &ownsandv1.AgentCommandResult_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotResult{Parts: parts, SizeBytes: 2 << 20}}}
 	case *ownsandv1.AgentCommand_ImportSnapshot:
@@ -514,14 +527,19 @@ func (a *FakeAgent) WaitFor(what string, match func(*ownsandv1.AgentEnvelope) bo
 	return a.waitFrom(0, what, match, nil)
 }
 
-// waitFrom is WaitFor over the envelopes from index from on, so that a wait
-// of one connection ignores the envelopes of an earlier stream. When abort is
-// closed, the wait scans the envelopes that were received before it and then
-// fails the test without waiting for the deadline: the read loop appends an
-// envelope before it closes the channel that it hands out as abort, so no
-// matching envelope can arrive later.
 func (a *FakeAgent) waitFrom(from int, what string, match func(*ownsandv1.AgentEnvelope) bool, abort <-chan struct{}) *ownsandv1.AgentEnvelope {
 	a.T.Helper()
+	env, err := a.waitForEnvelope(from, what, match, abort)
+	if err != nil {
+		a.T.Fatalf("%v", err)
+	}
+	return env
+}
+
+// waitForEnvelope scans from index from so a wait can ignore earlier streams.
+// When abort closes, it scans once more before returning an error. The read
+// loop records all envelopes from the stream before closing abort.
+func (a *FakeAgent) waitForEnvelope(from int, what string, match func(*ownsandv1.AgentEnvelope) bool, abort <-chan struct{}) (*ownsandv1.AgentEnvelope, error) {
 	deadline := time.After(10 * time.Second)
 	seen := from
 	aborted := false
@@ -533,20 +551,18 @@ func (a *FakeAgent) waitFrom(from int, what string, match func(*ownsandv1.AgentE
 		for _, env := range envs {
 			seen++
 			if match(env) {
-				return env
+				return env, nil
 			}
 		}
 		if aborted {
-			a.T.Fatalf("the channel closed while waiting for %s", what)
-			return nil
+			return nil, fmt.Errorf("the channel closed while waiting for %s", what)
 		}
 		select {
 		case <-ch:
 		case <-abort:
 			aborted = true
 		case <-deadline:
-			a.T.Fatalf("timed out waiting for %s", what)
-			return nil
+			return nil, fmt.Errorf("timed out waiting for %s: %w", what, context.DeadlineExceeded)
 		}
 	}
 }
@@ -584,14 +600,15 @@ func Eventually(t testing.TB, what string, cond func() bool) {
 // in-memory upload URL (memory://PUT/<key>?expires=<unix>), as the real agent
 // uploads the part, so the export verifier finds the reported part. A control
 // plane whose object store is not an in-memory store gets no object.
-func (a *FakeAgent) uploadPart(signedURL string, size int64) {
+func (a *FakeAgent) uploadPart(signedURL string, size int64) error {
 	store, ok := a.Env.opts.Objects.(interface{ PutSized(key string, size int64) })
 	if !ok {
-		return
+		return nil
 	}
 	u, err := url.Parse(signedURL)
 	if err != nil {
-		a.T.Fatalf("fake agent: parse upload URL: %v", err)
+		return err
 	}
 	store.PutSized(strings.TrimPrefix(u.Path, "/"), size)
+	return nil
 }
