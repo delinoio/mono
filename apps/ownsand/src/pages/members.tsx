@@ -76,7 +76,7 @@ export function MembersPage() {
   const leave = useMutation(MemberService.method.removeMember);
   const [removing, setRemoving] = useState<Member>();
   const [leaving, setLeaving] = useState(false);
-  const canLeave = can(role, Permission.LeaveOrganization);
+  const canLeave = !!userId && can(role, Permission.LeaveOrganization);
 
   if (!canLeave && leaving) {
     setLeaving(false);
@@ -205,7 +205,7 @@ export function MembersPage() {
           if (!canLeave) return;
           await leave.mutateAsync({
             organizationId,
-            userId: userId ?? "",
+            userId,
           });
           // Only the opening that asked to leave redirects; after a
           // dismissal the user stays on the page they went to.
