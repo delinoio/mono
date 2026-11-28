@@ -578,6 +578,8 @@ export default function RootLayout({ children }) {
 
 Use `next/dynamic` to lazy-load large components not needed on initial render.
 
+In the App Router, `next/dynamic` with `ssr: false` must be in the client module graph. Add `'use client'` before the imports so a Server Component can import this module directly.
+
 **Incorrect: Monaco bundles with main chunk ~300KB**
 
 ```tsx
@@ -591,6 +593,8 @@ function CodePanel({ code }: { code: string }) {
 **Correct: Monaco loads on demand**
 
 ```tsx
+'use client'
+
 import dynamic from 'next/dynamic'
 
 const MonacoEditor = dynamic(
