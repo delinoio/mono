@@ -145,6 +145,74 @@ func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
 	)
 }
 
+func TestExecJSONGroupsMalformedUTF8AcrossChunks(t *testing.T) {
+	for _, kind := range []sandrun.ExecEventKind{sandrun.ExecEventStdout, sandrun.ExecEventStderr} {
+		for _, tc := range []struct {
+			name    string
+			chunks  []string
+			offsets []int64
+			texts   []string
+		}{
+			{"one chunk", []string{"\xff\xfez"}, []int64{0}, []string{"�z"}},
+			{"split run", []string{"\xff", "\xfez"}, []int64{0, 2}, []string{"�", "z"}},
+			{"no new text", []string{"\xff", "\xfe", "z"}, []int64{0, 2}, []string{"�", "z"}},
+			{"literal replacement", []string{"\xff\xef", "\xbf", "\xbd", "\xfe"}, []int64{0, 1, 4}, []string{"�", "�", "�"}},
+			{"invalidated prefix", []string{"\xff\xe2", "\x82", "z"}, []int64{0, 3}, []string{"�", "z"}},
+		} {
+			t.Run(kind.String()+"/"+tc.name, func(t *testing.T) {
+				var output bytes.Buffer
+				w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
+				var offset int64
+				for _, chunk := range tc.chunks {
+					if err := w.event(sandrun.ExecEvent{Kind: kind, Offset: offset, Data: []byte(chunk)}); err != nil {
+						t.Fatal(err)
+					}
+					offset += int64(len(chunk))
+				}
+				var want []execJSONLine
+				for i, data := range tc.texts {
+					want = append(want, execJSONLine{Event: kind.String(), Offset: tc.offsets[i], Data: data})
+				}
+				checkExecJSONLines(t, output.String(), want...)
+			})
+		}
+	}
+}
+
+func TestExecJSONMalformedUTF8ResetsOnlyAffectedStream(t *testing.T) {
+	stdout, stderr := sandrun.ExecEventStdout, sandrun.ExecEventStderr
+	var output bytes.Buffer
+	w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
+	for _, ev := range []sandrun.ExecEvent{
+		{Kind: stdout, Offset: 0, Data: []byte("\xff")},
+		{Kind: stderr, Offset: 0, Data: []byte("\xff")},
+		{Kind: stdout, Offset: 1, Data: []byte("\xfe")},
+		{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 2, To: 4}},
+		{Kind: stdout, Offset: 4, Data: []byte("\xfe")},
+		{Kind: stderr, Offset: 1, Data: []byte("\xfez")},
+		{Kind: stdout, Offset: 6, Data: []byte("\xfe")},
+	} {
+		if err := w.event(ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.Kind == sandrun.ExecEventOutputTruncated && (w.stdout.invalidRun || !w.stderr.invalidRun) {
+			t.Fatal("truncation must reset the malformed run for stdout only")
+		}
+	}
+	checkExecJSONLines(t, output.String(),
+		execJSONLine{Event: "stdout", Offset: 0, Data: "�"},
+		execJSONLine{Event: "stderr", Offset: 0, Data: "�"},
+		execJSONLine{
+			Event:         "output_truncated",
+			MissingStdout: &execJSONRange{From: new(int64(2)), To: new(int64(4))},
+			MissingStderr: &execJSONRange{From: new(int64(0)), To: new(int64(0))},
+		},
+		execJSONLine{Event: "stdout", Offset: 4, Data: "�"},
+		execJSONLine{Event: "stderr", Offset: 2, Data: "z"},
+		execJSONLine{Event: "stdout", Offset: 6, Data: "�"},
+	)
+}
+
 func TestExecJSONWritesDistinctTruncationRanges(t *testing.T) {
 	var output bytes.Buffer
 	w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
@@ -170,7 +238,7 @@ func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
 	}{
 		{event: "exited"},
 		{event: "stream_error", err: &sandrun.ExecStreamError{
-			ExecID: "exec", StdoutOffset: 2, StderrOffset: 2, Err: errors.New("stream broke"),
+			ExecID: "exec", StdoutOffset: 3, StderrOffset: 2, Err: errors.New("stream broke"),
 		}},
 	} {
 		t.Run(tc.event, func(t *testing.T) {
@@ -178,14 +246,14 @@ func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
 			a := &app{fmt: FormatJSON, env: Env{Stdout: &output}, logger: slog.Default()}
 			w := execWriter{a: a}
 			for _, ev := range []sandrun.ExecEvent{
-				{Kind: sandrun.ExecEventStdout, ExecID: "exec", Data: []byte("\xe2\x82")},
+				{Kind: sandrun.ExecEventStdout, ExecID: "exec", Data: []byte("\xff\xe2\x82")},
 				{Kind: sandrun.ExecEventStderr, ExecID: "exec", Data: []byte("x\xe2")},
 			} {
 				if err := w.event(ev); err != nil {
 					t.Fatal(err)
 				}
 			}
-			res := &sandrun.ExecResult{Kind: sandrun.ExecResultExited, ExecID: "exec", StdoutOffset: 2, StderrOffset: 2}
+			res := &sandrun.ExecResult{Kind: sandrun.ExecResultExited, ExecID: "exec", StdoutOffset: 3, StderrOffset: 2}
 			err := a.finishExec(context.Background(), "session", &w, res, tc.err)
 			if tc.err != nil {
 				var exit *exitError
@@ -196,8 +264,9 @@ func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkExecJSONLines(t, output.String(),
-				execJSONLine{Event: "stderr", Offset: 0, Data: "x"},
 				execJSONLine{Event: "stdout", Offset: 0, Data: "�"},
+				execJSONLine{Event: "stderr", Offset: 0, Data: "x"},
+				execJSONLine{Event: "stdout", Offset: 1, Data: "�"},
 				execJSONLine{Event: "stderr", Offset: 1, Data: "�"},
 				execJSONLine{Event: tc.event},
 			)
