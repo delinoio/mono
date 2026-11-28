@@ -46,6 +46,11 @@ type blockedClaim struct {
 	canceled chan struct{}
 }
 
+type liveClaim struct {
+	workerID string
+	request  Request
+}
+
 // Fake is the fake Cursor API.
 type Fake struct {
 	Server *httptest.Server
@@ -55,8 +60,8 @@ type Fake struct {
 	mu sync.Mutex
 	// pending are the unclaimed requests in the queue, in order.
 	pending []Request
-	// claims maps a request ID to the worker ID of its live claim.
-	claims map[string]string
+	// claims maps a request ID to its live claim.
+	claims map[string]liveClaim
 	// connected are the worker IDs whose worker is connected.
 	connected map[string]bool
 	// Failed and Released record the fail messages and releases by request.
@@ -79,7 +84,7 @@ type Fake struct {
 
 // New starts a fake for a pool with one service account key.
 func New(t testing.TB, key, pool string) *Fake {
-	f := &Fake{Key: key, Pool: pool, claims: map[string]string{}, connected: map[string]bool{}, failed: map[string]string{},
+	f := &Fake{Key: key, Pool: pool, claims: map[string]liveClaim{}, connected: map[string]bool{}, failed: map[string]string{},
 		failAttempts: map[string]int{}, releaseAttempts: map[string]int{}, released: map[string]int{}, claimsN: map[string]int{}, streams: map[int]chan string{}}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(func() {
@@ -165,8 +170,8 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such request"})
 			return
 		}
+		f.claims[body.ID] = liveClaim{workerID: body.WorkerID, request: f.pending[idx]}
 		f.pending = append(f.pending[:idx], f.pending[idx+1:]...)
-		f.claims[body.ID] = body.WorkerID
 		f.claimsN[body.ID]++
 		f.broadcastLocked("claimed", map[string]string{"id": body.ID})
 		writeJSON(w, http.StatusOK, map[string]string{"id": body.ID, "workerId": body.WorkerID})
@@ -185,14 +190,18 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
 		}
-		worker, ok := f.claims[id]
+		claim, ok := f.claims[id]
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no live claim"})
 			return
 		}
+		worker := claim.workerID
 		switch action {
 		case "release":
 			delete(f.claims, id)
+			if !f.connected[worker] {
+				f.pending = append(f.pending, claim.request)
+			}
 			f.released[id]++
 			writeJSON(w, http.StatusOK, map[string]string{"id": id, "workerId": worker})
 		case "fail":
@@ -365,8 +374,8 @@ func (f *Fake) WatchCalls() (lists []ListCall, claims, streams []string) {
 func (f *Fake) Claim(id string) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	w, ok := f.claims[id]
-	return w, ok
+	claim, ok := f.claims[id]
+	return claim.workerID, ok
 }
 
 // ClaimCount returns how often a request was claimed.
@@ -418,8 +427,8 @@ func (f *Fake) Disconnect(workerID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.connected, workerID)
-	for id, w := range f.claims {
-		if w == workerID {
+	for id, claim := range f.claims {
+		if claim.workerID == workerID {
 			delete(f.claims, id)
 		}
 	}
