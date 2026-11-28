@@ -4,6 +4,7 @@ package github_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -191,10 +192,11 @@ func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
 			}
 			runnerID := starting[0].GetRunnerId()
 			runnerName := "sandrun-" + runnerID
+			deleteError := connect.NewWireError(connect.CodeUnavailable, errors.New("injected sandbox deletion failure"))
 			w.os.Update(w.osOrg, func(o *ownsandfake.Org) {
 				o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("fixture has no spare capacity"))
 				o.FileError = errors.New("injected JIT file write failure")
-				o.DeleteError = connect.NewWireError(connect.CodeUnavailable, errors.New("injected sandbox deletion failure"))
+				o.DeleteError = deleteError
 			})
 			var mu sync.Mutex
 			var deletedIDs []int64
@@ -261,18 +263,40 @@ func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("OwnSand did not receive a deletion after GitHub recovery")
 			}
-			if _, pending, removed = readCleanup(); !pending || !removed || w.os.Active(w.osOrg) != 1 {
+			// The hook runs before the fake reads DeleteError. Wait for the
+			// driver to log the result before allowing the next delete to succeed.
+			eventually(t, "OwnSand sandbox deletion failure for runner "+runnerID, func() bool {
+				for line := range strings.SplitSeq(w.env.Logs.String(), "\n") {
+					var entry struct {
+						Message  string `json:"msg"`
+						RunnerID string `json:"runner_id"`
+						Error    string `json:"error"`
+					}
+					if json.Unmarshal([]byte(line), &entry) == nil &&
+						entry.Message == "runner_sandbox_cleanup_failed" && entry.RunnerID == runnerID &&
+						strings.Contains(entry.Error, deleteError.Error()) {
+						return true
+					}
+				}
+				return false
+			})
+			_, registered = w.gh.RunnerByName(runnerName)
+			if _, pending, removed = readCleanup(); !pending || !removed || registered || w.os.Active(w.osOrg) != 1 {
 				t.Fatal("failed OwnSand deletion did not retain the sandbox and completed registration removal")
 			}
 
-			calls := w.gh.Calls("delete_runner")
+			githubDeletes := w.gh.Calls("delete_runner")
+			failedDeleteCalls := w.os.Calls("DeleteSandbox")
 			w.os.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
 			eventually(t, "cleanup mark cleared and sandbox deleted", func() bool {
 				_, pending, removed := readCleanup()
 				return !pending && removed && w.os.Active(w.osOrg) == 0
 			})
-			if got := w.gh.Calls("delete_runner"); got != calls {
-				t.Fatalf("GitHub deletions = %d, want %d after the registration was removed", got, calls)
+			if got := w.os.Calls("DeleteSandbox"); got < 2 || got <= failedDeleteCalls {
+				t.Fatalf("OwnSand deletions = %d, want a retry after %d calls with the error active", got, failedDeleteCalls)
+			}
+			if got := w.gh.Calls("delete_runner"); got != githubDeletes {
+				t.Fatalf("GitHub deletions = %d, want %d after the registration was removed", got, githubDeletes)
 			}
 			mu.Lock()
 			for _, id := range deletedIDs {
