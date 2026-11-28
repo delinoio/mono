@@ -294,13 +294,13 @@ func TestValidateCanceledLeaderDoesNotAbortSharedRefresh(t *testing.T) {
 
 // unknownKeyToken returns a token that is signed with a key that the key set
 // does not contain.
-func unknownKeyToken(t *testing.T, iss *authtest.Issuer) string {
+func unknownKeyToken(t *testing.T, iss *authtest.Issuer, kid string) string {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts := (&jose.SignerOptions{}).WithType("at+jwt").WithHeader(jose.HeaderKey("kid"), "rotated-key")
+	opts := (&jose.SignerOptions{}).WithType("at+jwt").WithHeader(jose.HeaderKey("kid"), kid)
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -331,7 +331,7 @@ func TestValidateUsesCachedKeyDuringUnrelatedRefresh(t *testing.T) {
 	// Past the cooldown, a token with an unknown key ID starts a refresh.
 	clock.advance(2 * time.Minute)
 	jwks.stall()
-	rotated := startValidate(context.Background(), v, unknownKeyToken(t, iss))
+	firstUnknown := startValidate(context.Background(), v, unknownKeyToken(t, iss, "unknown-key-1"))
 	jwks.waitStarted(t)
 
 	// A token with the cached key does not wait for that refresh.
@@ -340,18 +340,18 @@ func TestValidateUsesCachedKeyDuringUnrelatedRefresh(t *testing.T) {
 	}
 
 	jwks.unstall()
-	if r := receiveValidation(t, rotated, "unknown key request"); r.err == nil {
-		t.Fatal("token with an unknown key validated")
-	} else if got := reasonOf(t, r.err); got != auth.RejectUnknownKey {
-		t.Fatalf("reason = %q, want unknown_key", got)
+	r := receiveValidation(t, firstUnknown, "first unknown key request")
+	if got := reasonOf(t, r.err); got != auth.RejectUnknownKey {
+		t.Fatalf("first unknown key rejection = %q, want %q", got, auth.RejectUnknownKey)
 	}
 	if got := jwks.requests.Load(); got != 2 {
 		t.Fatalf("key set requests = %d, want 2", got)
 	}
 
 	// The cooldown still holds: another unknown key ID is not fetched.
-	if _, err := v.Validate(context.Background(), unknownKeyToken(t, iss)); err == nil {
-		t.Fatal("token with an unknown key validated")
+	_, err := v.Validate(context.Background(), unknownKeyToken(t, iss, "unknown-key-2"))
+	if got := reasonOf(t, err); got != auth.RejectUnknownKey {
+		t.Fatalf("second unknown key rejection = %q, want %q", got, auth.RejectUnknownKey)
 	}
 	if got := jwks.requests.Load(); got != 2 {
 		t.Fatalf("key set requests = %d, want 2 within the cooldown", got)
