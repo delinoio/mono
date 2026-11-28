@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	// cleanupTimeout bounds the guest clean-up after a failed sync or download.
+	// cleanupTimeout bounds guest cleanup for sync and directory downloads.
 	cleanupTimeout = 30 * time.Second
 	// guestExecRecoveryWait bounds the wait for a terminal result after a
 	// guest command loses its exec stream.
