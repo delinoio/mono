@@ -74,11 +74,19 @@ type entryResult struct {
 	delete *pendingDelete
 }
 
+type sandboxEntrySource int
+
+const (
+	sandboxEntryFromStateReport sandboxEntrySource = iota
+	sandboxEntryFromIncrementalUpdate
+	sandboxEntryFromCommandResult
+)
+
 // applySandboxEntry applies an agent-reported sandbox entry of deviceID
 // under the revision rule. Terminal states are absorbing: a later entry
 // never changes them, and a live VM of a terminal sandbox gets a delete
 // command.
-func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID string, e *ownsandv1.SandboxStateEntry) (entryResult, error) {
+func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID string, e *ownsandv1.SandboxStateEntry, source sandboxEntrySource) (entryResult, error) {
 	var res entryResult
 	if !uuidv7.Valid(e.GetSandboxId()) || !validAgentState(e.GetState()) || e.GetRevision() == nil || !uuidv7.Valid(e.GetRevision().GetEpoch()) {
 		return res, nil
@@ -142,10 +150,11 @@ func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID str
 			return res, err
 		}
 	}
-	// An entry with a lower revision is ignored; an equal one confirms the
-	// stored state. Either way a pending delete is sent again while the
-	// agent lists the sandbox as not deleted.
-	if r.DeletePending && !isTerminal(e.GetState()) {
+	// A full report can recover a pending delete on a replacement channel,
+	// even at the same revision. Incremental DELETING progress leaves the
+	// retry to the agent.
+	deletingProgress := source == sandboxEntryFromIncrementalUpdate && e.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_DELETING
+	if r.DeletePending && !isTerminal(e.GetState()) && !deletingProgress {
 		res.delete = &pendingDelete{sandboxID: r.ID, reason: r.DeleteEndReason}
 	}
 	return res, nil
@@ -237,7 +246,7 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID, channelID 
 		listed := map[string]bool{}
 		for _, e := range report.GetSandboxes() {
 			listed[canonicalUUID(e.GetSandboxId())] = true
-			res, err := s.applySandboxEntry(ctx, tx, deviceID, e)
+			res, err := s.applySandboxEntry(ctx, tx, deviceID, e, sandboxEntryFromStateReport)
 			if err != nil {
 				return err
 			}
@@ -527,12 +536,12 @@ func (s *Service) mergeBuiltImagesTx(ctx context.Context, tx pgx.Tx, deviceID st
 	return err
 }
 
-// applySandboxUpdate applies one sandbox update in its own transaction.
-func (s *Service) applySandboxUpdate(ctx context.Context, deviceID string, e *ownsandv1.SandboxStateEntry) (entryResult, error) {
+// applySandboxUpdate applies one agent entry in its own transaction.
+func (s *Service) applySandboxUpdate(ctx context.Context, deviceID string, e *ownsandv1.SandboxStateEntry, source sandboxEntrySource) (entryResult, error) {
 	var res entryResult
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		res, err = s.applySandboxEntry(ctx, tx, deviceID, e)
+		res, err = s.applySandboxEntry(ctx, tx, deviceID, e, source)
 		return err
 	})
 	return res, err
