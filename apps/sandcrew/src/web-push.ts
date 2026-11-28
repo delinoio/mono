@@ -95,6 +95,32 @@ export function bytesToBase64Url(bytes: ArrayBuffer | null): string {
     .replace(/=+$/, "");
 }
 
+/** Waits until the registration has an active service worker. */
+export async function activeWorker(
+  registration: Pick<
+    ServiceWorkerRegistration,
+    "active" | "installing" | "waiting"
+  >,
+): Promise<void> {
+  if (registration.active) return;
+  const worker = registration.installing ?? registration.waiting;
+  // Without a worker there is nothing to wait for; subscribe() reports it.
+  if (!worker) return;
+  await new Promise<void>((resolve, reject) => {
+    const check = () => {
+      if (worker.state === "activated") {
+        worker.removeEventListener("statechange", check);
+        resolve();
+      } else if (worker.state === "redundant") {
+        worker.removeEventListener("statechange", check);
+        reject(new Error("The notification service worker did not start."));
+      }
+    };
+    worker.addEventListener("statechange", check);
+    check();
+  });
+}
+
 /**
  * Turns on Web Push for this browser after the user clicked the button:
  * asks for the browser permission, registers the service worker and
@@ -115,6 +141,9 @@ export async function subscribeToPush(
   const registration = await env.serviceWorker!.register(SERVICE_WORKER_URL, {
     scope: "/",
   });
+  // On the first opt-in, register() can resolve while the worker is still
+  // installing, and subscribe() needs an active worker.
+  await activeWorker(registration);
   const subscription = await registration.pushManager.subscribe({
     userVisibleOnly: true,
     applicationServerKey: base64UrlToBytes(vapidPublicKey),

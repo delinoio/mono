@@ -660,6 +660,47 @@ describe("web push", () => {
     });
   });
 
+  test("subscribes only after a new service worker is active", async () => {
+    const calls: string[] = [];
+    const worker = new EventTarget() as EventTarget & {
+      state: ServiceWorkerState;
+    };
+    worker.state = "installing";
+    const env: PushEnvironment = {
+      hasPushManager: true,
+      notification: {
+        permission: "granted",
+        requestPermission: async () => "granted",
+      },
+      serviceWorker: {
+        register: async () =>
+          ({
+            active: null,
+            installing: worker,
+            waiting: null,
+            pushManager: {
+              subscribe: async () => {
+                calls.push(`subscribe while ${worker.state}`);
+                return {
+                  endpoint: "https://push.example.com/abc",
+                  getKey: () => new Uint8Array([1]).buffer,
+                };
+              },
+            },
+          }) as unknown as ServiceWorkerRegistration,
+      },
+    };
+    const subscribing = subscribeToPush("AAAA", env);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toEqual([]);
+    worker.state = "installed";
+    worker.dispatchEvent(new Event("statechange"));
+    worker.state = "activated";
+    worker.dispatchEvent(new Event("statechange"));
+    await subscribing;
+    expect(calls).toEqual(["subscribe while activated"]);
+  });
+
   test("stops when the user does not grant permission", async () => {
     const { env, calls } = fakeEnvironment("default", "denied");
     const error = await subscribeToPush("AAAA", env).catch((e: unknown) => e);
