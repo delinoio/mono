@@ -32,6 +32,8 @@ import {
   isScheduledMain,
   main,
   plan,
+  releaseOnlyPackageDirs,
+  taskPackageDirs,
   workspacePackageDirs,
   workspaceRoots,
 } from "./plan.mjs";
@@ -766,10 +768,10 @@ test("workspace cross-check detects an extra single package directory", () => {
   );
 });
 
-test("single workspace packages declare no package tasks", () => {
+test("release-only single workspace packages declare no package tasks", () => {
   // The planner treats only their manifests as workspace inputs, so a
   // package task there would not run when its Go source changes.
-  for (const dir of workspacePackageDirs) {
+  for (const dir of releaseOnlyPackageDirs) {
     const manifest = JSON.parse(
       readFileSync(join(root, dir, "package.json"), "utf8"),
     );
@@ -789,6 +791,44 @@ test("single workspace package manifests select workspace and fixture checks", (
   f.write("cmds/ownsand-agent/main.go", "package main // changed\n");
   result = plan(f.cwd, base, f.commit());
   assert.equal(result.workspace, false);
+});
+
+test("task single workspace packages declare tasks and select workspace checks", async (t) => {
+  for (const dir of taskPackageDirs) {
+    const manifest = JSON.parse(
+      readFileSync(join(root, dir, "package.json"), "utf8"),
+    );
+    assert.equal(manifest.private, true, `${dir} must be private`);
+    assert.ok(manifest.scripts?.test, `${dir} must declare a test script`);
+    // The go-vet, go-test and go-platforms jobs check the Go source of the
+    // root module. A `build` or `lint` script would repeat that work in the
+    // workspace jobs, and a release build there has no consumer.
+    for (const name of ["build", "lint"]) {
+      assert.equal(
+        manifest.scripts?.[name],
+        undefined,
+        `${dir} must not declare a ${name} script`,
+      );
+    }
+    assert.ok(!releaseOnlyPackageDirs.includes(dir));
+  }
+  // Go source and the data files that its Go tests embed both select the Go
+  // checks, because the package tasks run no Go.
+  for (const path of [
+    "cmds/sandcrew-bridge/main.go",
+    "cmds/sandcrew-bridge/internal/pins/pins.json",
+    "cmds/sandcrew-bridge/internal/pins/npm/openai-codex/package-lock.json",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      const base = f.commit();
+      f.write(path, "changed\n");
+      const result = plan(f.cwd, base, f.commit());
+      assert.equal(result.workspace, true);
+      assert.equal(result.go, true);
+    });
+  }
 });
 
 test("workspace glob parser rejects an empty packages block", () => {

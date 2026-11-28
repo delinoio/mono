@@ -18,6 +18,7 @@ import {
   MemberService,
   type AcceptInvitationResponse,
   type ListInvitationsResponse,
+  type ListMembersResponse,
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
 import {
@@ -28,8 +29,10 @@ import type { GetDeviceResponse } from "@delino/ownsand-protos/v1/device_pb";
 import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
 import {
   CreateSandboxRequestSchema,
+  SandboxSourceSchema,
   type CreateSandboxRequest,
   type CreateSandboxResponse,
+  type GetSandboxResponse,
   type ListSandboxesResponse,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type {
@@ -131,6 +134,34 @@ function holdTemplateRequest(request: "first-page" | "create") {
 }
 
 export function createMockTransport(): Transport {
+  const templateSourceKey = "ownsand-e2e-sandbox-template-lookup";
+  if (sessionStorage.getItem(templateSourceKey) !== null) {
+    const base = createBaseMock();
+    return {
+      ...base,
+      async unary(method, ...args) {
+        if (
+          method.name === "ListTemplates" &&
+          sessionStorage.getItem(templateSourceKey) === "fail"
+        ) {
+          throw new ConnectError(
+            "Synthetic template lookup failure",
+            Code.Unavailable,
+          );
+        }
+        const response = await base.unary(method, ...args);
+        if (method.name === "GetSandbox") {
+          const { sandbox } = response.message as unknown as GetSandboxResponse;
+          if (sandbox?.sandboxId === MOCK_IDS.runningSandbox) {
+            sandbox.source = create(SandboxSourceSchema, {
+              source: { case: "templateId", value: MOCK_IDS.template },
+            });
+          }
+        }
+        return response;
+      },
+    };
+  }
   const billingSeed = sessionStorage.getItem("ownsand-e2e-billing-status-seed");
   const billingRefresh = createRouterTransport((router) => {
     router.rpc(BillingService.method.getBillingStatus, () => {
@@ -327,6 +358,35 @@ export function createMockTransport(): Transport {
         // Simulate another caller deleting the template before confirmation.
         await base.unary(method, signal, timeout, header, input, contextValues);
       }
+      if (
+        method.name === "ListSnapshots" &&
+        sessionStorage.getItem("ownsand-e2e-snapshot-export-failed") === "true"
+      ) {
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        const { snapshots } =
+          response.message as unknown as ListSnapshotsResponse;
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            snapshots: snapshots.map((snapshot) =>
+              snapshot.snapshotId === MOCK_IDS.snapshot
+                ? {
+                    ...snapshot,
+                    exportState: SnapshotExportState.EXPORT_FAILED,
+                  }
+                : snapshot,
+            ),
+          },
+        };
+      }
       if (holdTemplateFirstPage && method.name === "ListTemplates") {
         const response = await base.unary(
           method,
@@ -368,7 +428,8 @@ export function createMockTransport(): Transport {
         recordToken("ownsand-e2e-mutation-calls", method.name);
         if (
           method.name === "CreateSandbox" ||
-          method.name === "ReplaceDeviceLimits"
+          method.name === "ReplaceDeviceLimits" ||
+          method.name === "TransferOwnership"
         ) {
           recordToken(
             "ownsand-e2e-resource-mutation-inputs",
@@ -427,6 +488,27 @@ export function createMockTransport(): Transport {
             "Synthetic full refresh failure",
             Number(code) as Code,
           );
+        }
+      }
+      if (method.name === "ListMembers" && refreshList === "ListMembers") {
+        const excluded = sessionStorage.getItem("ownsand-e2e-excluded-member");
+        if (excluded !== null) {
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          const { members } = response.message as ListMembersResponse;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              members: members.filter(({ userId }) => userId !== excluded),
+            },
+          };
         }
       }
       if (credential && method.name === credential.create) {

@@ -157,7 +157,7 @@ function fixture(t, scratchName) {
   write(join(repo, "protos", "buf.yaml"), "version: v2\n");
   write(join(repo, "protos", schemaPath), baseSchema);
   write(join(repo, "protos", "delino", "ownsand", "v1", "gen.pb.go"), "go\n");
-  for (const pkg of ["ownsand", "accounts", "sandrun"]) {
+  for (const pkg of ["ownsand", "accounts", "sandrun", "sandcrew"]) {
     const pkgDir = join(repo, "protos", "delino", pkg);
     write(join(pkgDir, "buf.gen.yaml"), "version: v2\n");
     write(join(pkgDir, "v1", "gen_pb.ts"), `ts delino/${pkg}\n`);

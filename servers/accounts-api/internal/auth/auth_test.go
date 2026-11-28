@@ -3,6 +3,7 @@
 package auth_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
@@ -235,37 +237,96 @@ func receiveValidation(t *testing.T, ch <-chan validation, what string) validati
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestValidateCanceledWaiterReturnsWhileRefreshRuns(t *testing.T) {
 	iss := authtest.NewIssuer(t)
-	jwks := newStallableJWKS(t, iss)
-	jwks.stall()
-	v := newStalledValidator(iss, jwks.url, nil)
-
-	leader := startValidate(context.Background(), v, iss.UserToken(t, "u"))
-	jwks.waitStarted(t)
-
-	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
-	waiter := startValidate(waiterCtx, v, iss.UserToken(t, "u"))
-	cancelWaiter()
-	if r := receiveValidation(t, waiter, "canceled waiter"); r.err == nil {
-		t.Fatal("canceled waiter validated a token without a key set")
-	} else if got := reasonOf(t, r.err); got != auth.RejectUnknownKey {
-		t.Fatalf("reason = %q, want unknown_key", got)
+	raw := iss.UserToken(t, "u")
+	tokenTime := time.Now()
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(iss.JWKSURL)
+	if err != nil {
+		t.Fatalf("fetch test key set: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("test key set status = %d, want 200", resp.StatusCode)
+	}
+	jwks, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read test key set: %v", err)
 	}
 
-	// The refresh that the leader started keeps running.
-	select {
-	case r := <-leader:
-		t.Fatalf("leader returned early: %+v", r)
-	case <-time.After(50 * time.Millisecond):
-	}
-	jwks.unstall()
-	if r := receiveValidation(t, leader, "leader"); r.err != nil || r.token.Subject != "u" {
-		t.Fatalf("leader = %+v, want a valid token", r)
-	}
-	if got := jwks.requests.Load(); got != 1 {
-		t.Fatalf("key set requests = %d, want 1", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		releaseResponse := sync.OnceFunc(func() { close(release) })
+		defer releaseResponse()
+
+		var requests atomic.Int32
+		v := auth.NewLogtoValidator(auth.LogtoConfig{
+			Issuer:   iss.URL,
+			Audience: authtest.Audience,
+			Now:      func() time.Time { return tokenTime },
+			Logger:   slog.New(slog.NewJSONHandler(io.Discard, nil)),
+			Client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				if requests.Add(1) == 1 {
+					close(started)
+				}
+				<-release
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewReader(jwks)),
+				}, nil
+			})},
+		})
+
+		leader := startValidate(context.Background(), v, raw)
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("key set request did not start")
+		}
+
+		waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+		defer cancelWaiter()
+		waiter := startValidate(waiterCtx, v, raw)
+		// Wait for the live waiter to block while the transport holds the key set.
+		synctest.Wait()
+		if err := waiterCtx.Err(); err != nil {
+			t.Fatalf("waiter context ended before cancellation: %v", err)
+		}
+		select {
+		case r := <-waiter:
+			t.Fatalf("waiter returned before cancellation: %+v", r)
+		case r := <-leader:
+			t.Fatalf("leader returned before cancellation: %+v", r)
+		default:
+		}
+
+		cancelWaiter()
+		if r := receiveValidation(t, waiter, "canceled waiter"); r.err == nil {
+			t.Fatal("canceled waiter validated a token without a key set")
+		} else if got := reasonOf(t, r.err); got != auth.RejectUnknownKey {
+			t.Fatalf("reason = %q, want unknown_key", got)
+		}
+		select {
+		case r := <-leader:
+			t.Fatalf("leader returned before key set release: %+v", r)
+		default:
+		}
+
+		releaseResponse()
+		if r := receiveValidation(t, leader, "leader"); r.err != nil || r.token.Subject != "u" {
+			t.Fatalf("leader = %+v, want a valid token", r)
+		}
+		if got := requests.Load(); got != 1 {
+			t.Fatalf("key set requests = %d, want 1", got)
+		}
+	})
 }
 
 func TestValidateCanceledLeaderDoesNotAbortSharedRefresh(t *testing.T) {
@@ -294,13 +355,13 @@ func TestValidateCanceledLeaderDoesNotAbortSharedRefresh(t *testing.T) {
 
 // unknownKeyToken returns a token that is signed with a key that the key set
 // does not contain.
-func unknownKeyToken(t *testing.T, iss *authtest.Issuer) string {
+func unknownKeyToken(t *testing.T, iss *authtest.Issuer, kid string) string {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts := (&jose.SignerOptions{}).WithType("at+jwt").WithHeader(jose.HeaderKey("kid"), "rotated-key")
+	opts := (&jose.SignerOptions{}).WithType("at+jwt").WithHeader(jose.HeaderKey("kid"), kid)
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -331,7 +392,7 @@ func TestValidateUsesCachedKeyDuringUnrelatedRefresh(t *testing.T) {
 	// Past the cooldown, a token with an unknown key ID starts a refresh.
 	clock.advance(2 * time.Minute)
 	jwks.stall()
-	rotated := startValidate(context.Background(), v, unknownKeyToken(t, iss))
+	firstUnknown := startValidate(context.Background(), v, unknownKeyToken(t, iss, "unknown-key-1"))
 	jwks.waitStarted(t)
 
 	// A token with the cached key does not wait for that refresh.
@@ -340,18 +401,18 @@ func TestValidateUsesCachedKeyDuringUnrelatedRefresh(t *testing.T) {
 	}
 
 	jwks.unstall()
-	if r := receiveValidation(t, rotated, "unknown key request"); r.err == nil {
-		t.Fatal("token with an unknown key validated")
-	} else if got := reasonOf(t, r.err); got != auth.RejectUnknownKey {
-		t.Fatalf("reason = %q, want unknown_key", got)
+	r := receiveValidation(t, firstUnknown, "first unknown key request")
+	if got := reasonOf(t, r.err); got != auth.RejectUnknownKey {
+		t.Fatalf("first unknown key rejection = %q, want %q", got, auth.RejectUnknownKey)
 	}
 	if got := jwks.requests.Load(); got != 2 {
 		t.Fatalf("key set requests = %d, want 2", got)
 	}
 
 	// The cooldown still holds: another unknown key ID is not fetched.
-	if _, err := v.Validate(context.Background(), unknownKeyToken(t, iss)); err == nil {
-		t.Fatal("token with an unknown key validated")
+	_, err := v.Validate(context.Background(), unknownKeyToken(t, iss, "unknown-key-2"))
+	if got := reasonOf(t, err); got != auth.RejectUnknownKey {
+		t.Fatalf("second unknown key rejection = %q, want %q", got, auth.RejectUnknownKey)
 	}
 	if got := jwks.requests.Load(); got != 2 {
 		t.Fatalf("key set requests = %d, want 2 within the cooldown", got)

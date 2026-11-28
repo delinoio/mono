@@ -4,6 +4,7 @@ package sandruntest_test
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/go/sandrun/sandruntest"
+	"github.com/delinoio/mono/go/uuidv7"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
@@ -85,6 +87,121 @@ func TestFakeWriteBinding(t *testing.T) {
 			t.Fatalf("stat %s: got %v, want file absent", path, err)
 		}
 	}
+
+	t.Run("staged ranges", func(t *testing.T) {
+		type chunk struct {
+			offset int64
+			data   string
+			final  bool
+			fail   bool
+			file   string
+		}
+		for _, tc := range []struct {
+			name  string
+			start string
+			steps []chunk
+		}{
+			{
+				name: "out of order",
+				steps: []chunk{
+					{offset: 1, data: "B"},
+					{offset: 0, data: "A"},
+					{offset: 2, final: true, file: "AB"},
+				},
+			},
+			{
+				name: "matching overlap extends coverage and retries",
+				steps: []chunk{
+					{data: "AB"},
+					{offset: 1, data: "BC"},
+					{offset: 1, data: "BC"},
+					{offset: 3, final: true, file: "ABC"},
+				},
+			},
+			{
+				name: "conflicting overlap leaves data intact",
+				steps: []chunk{
+					{data: "AB"},
+					{offset: 1, data: "XC", fail: true},
+					{offset: 1, data: "BC"},
+					{offset: 3, final: true, file: "ABC"},
+				},
+			},
+			{
+				name:  "failed final chunk stays staged",
+				start: "old",
+				steps: []chunk{
+					{offset: 1, data: "B", final: true, fail: true, file: "old"},
+					{data: "A", file: "old"},
+					{offset: 2, final: true, file: "AB"},
+				},
+			},
+			{
+				name: "final offset excludes staged bytes",
+				steps: []chunk{
+					{data: "ABC"},
+					{offset: 2, final: true, fail: true},
+					{offset: 3, final: true, file: "ABC"},
+				},
+			},
+			{
+				name: "chunk bridges multiple ranges only when all overlaps match",
+				steps: []chunk{
+					{data: "AB"},
+					{offset: 4, data: "EF"},
+					{offset: 8, data: "IJK"},
+					{offset: 1, data: "BCDEFGHX", fail: true},
+					{offset: 11, final: true, fail: true},
+					{offset: 1, data: "BCDEFGHI"},
+					{offset: 11, final: true, file: "ABCDEFGHIJK"},
+				},
+			},
+			{
+				name: "sparse chunk ends at maximum offset",
+				steps: []chunk{
+					{offset: math.MaxInt64 - 1, data: "X"},
+					{offset: math.MaxInt64 - 1, data: "X"},
+					{offset: math.MaxInt64, final: true, fail: true},
+				},
+			},
+			{
+				name: "empty chunks add no coverage",
+				steps: []chunk{
+					{offset: math.MaxInt64},
+					{offset: 1, final: true, fail: true},
+					{final: true},
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				session := newSession(t)
+				id, err := uuidv7.NewString()
+				if err != nil {
+					t.Fatal(err)
+				}
+				const path = "out.txt"
+				if tc.start != "" {
+					if err := os.WriteFile(filepath.Join(session.GetWorkspacePath(), path), []byte(tc.start), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, step := range tc.steps {
+					if step.fail {
+						if _, err := write(t, session, id, path, step.offset, step.data, step.final); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+							t.Fatalf("write at offset %d returned %v, want failed_precondition", step.offset, err)
+						}
+					} else {
+						checkChunk(t, session, id, path, step.offset, step.data, step.final)
+					}
+					if step.file == "" && (!step.final || step.fail) {
+						checkAbsent(t, session, path)
+					} else {
+						checkFile(t, session, path, step.file)
+					}
+				}
+			})
+		}
+	})
 
 	t.Run("completed write in another session", func(t *testing.T) {
 		first, second := newSession(t), newSession(t)

@@ -199,7 +199,7 @@ func ReadFileRequest(req *ownsandv1.ReadFileRequest) error {
 	if err := UUIDv7("read_id", req.GetReadId()); err != nil {
 		return err
 	}
-	if err := guestPath("path", req.GetPath()); err != nil {
+	if err := GuestPath(req.GetPath()); err != nil {
 		return err
 	}
 	if req.GetOffset() < 0 {
@@ -222,7 +222,7 @@ func WriteFileRequest(req *ownsandv1.WriteFileRequest, first bool) error {
 		return err
 	}
 	if first || req.GetPath() != "" || len(req.GetBindingSalt()) > 0 {
-		if err := guestPath("path", req.GetPath()); err != nil {
+		if err := GuestPath(req.GetPath()); err != nil {
 			return err
 		}
 		if err := BindingSalt(req.GetBindingSalt()); err != nil {
@@ -246,18 +246,17 @@ func WriteFileRequest(req *ownsandv1.WriteFileRequest, first bool) error {
 	return nil
 }
 
-// guestPath checks that a guest path is present. The guest helper decides
-// whether it is absolute for its guest OS (for example `/etc/hosts` or
-// `C:\Users`), so this check accepts both forms.
-func guestPath(field, path string) error {
+// GuestPath checks that a path is valid UTF-8 and absolute on a supported
+// guest OS. The guest helper applies the rules of its own OS.
+func GuestPath(path string) error {
 	if path == "" {
-		return fail(field, "is required")
+		return fail("path", "is required")
 	}
 	if !utf8.ValidString(path) {
-		return fail(field, "must be valid UTF-8")
+		return fail("path", "must be valid UTF-8")
 	}
 	if !isAbsoluteGuestPath(path) {
-		return fail(field, "must be an absolute guest path")
+		return fail("path", "must be an absolute guest path")
 	}
 	return nil
 }

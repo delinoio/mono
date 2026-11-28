@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sort"
 	"time"
 
@@ -118,12 +119,15 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 		}
 		if a.BindsAtDispatch() {
 			if warm := oldestWarm(runners, p.ID); warm != nil {
-				expired, err := e.assignWarm(ctx, req, warm)
+				outcome, err := e.assignWarm(ctx, req, warm)
 				if err != nil {
 					e.svc.Logger.WarnContext(ctx, "dispatch_assign_failed", slog.String("request_id", req.ID), slog.Any("error", err))
 				}
-				if !expired {
+				switch outcome {
+				case warmBound:
 					warm.RequestID = req.ID
+				case warmUnavailable:
+					runners = slices.DeleteFunc(runners, func(r *Runner) bool { return r == warm })
 				}
 				continue
 			}
@@ -362,10 +366,19 @@ func oldestWarm(runners []*Runner, profileID string) *Runner {
 	return nil
 }
 
-// assignWarm binds a warm runner to a request and wakes its driver.
-// It reports whether queue expiry left the runner available.
-func (e *Engine) assignWarm(ctx context.Context, req *Request, warm *Runner) (bool, error) {
-	var expired *Request
+type warmAssignment int
+
+const (
+	warmUnavailable warmAssignment = iota
+	warmAvailable
+	warmBound
+)
+
+// assignWarm reports whether the committed transaction bound the runner or
+// left it available. A failed transaction leaves its availability uncertain.
+func (e *Engine) assignWarm(ctx context.Context, req *Request, warm *Runner) (warmAssignment, error) {
+	var start bindingResult
+	outcome := warmUnavailable
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, req.OrganizationID); err != nil {
 			return err
@@ -380,18 +393,23 @@ func (e *Engine) assignWarm(ctx context.Context, req *Request, warm *Runner) (bo
 		if err != nil || r.State != runWarm || r.RequestID != "" {
 			return err
 		}
-		expired, err = e.bindStartTx(ctx, tx, r, req.ID)
+		start, err = e.bindStartTx(ctx, tx, r, req.ID)
+		outcome = warmAvailable
+		if start.bound {
+			outcome = warmBound
+		}
 		return err
 	})
 	if err != nil {
-		return false, err
+		return warmUnavailable, err
 	}
-	if expired != nil {
-		e.releaseClaim(ctx, expired)
-		return true, nil
+	if start.expired != nil {
+		e.releaseClaim(ctx, start.expired)
 	}
-	e.kickRunner(warm.ID)
-	return false, nil
+	if outcome == warmBound {
+		e.kickRunner(warm.ID)
+	}
+	return outcome, nil
 }
 
 type createResult int
@@ -575,7 +593,7 @@ var (
 
 // applyCreate applies a CreateSandbox result to a stored CREATING runner.
 func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandbox, err error) createResult {
-	var expired *Request
+	var start bindingResult
 	switch {
 	case err == nil:
 		uerr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -599,15 +617,15 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 				// the sandbox, and starts nothing.
 				return nil
 			}
-			expired, err = e.bindStartTx(ctx, tx, cur, cur.RequestID)
+			start, err = e.bindStartTx(ctx, tx, cur, cur.RequestID)
 			return err
 		})
 		if uerr != nil {
 			// The driver repeats CreateSandbox with the same key and gets
 			// the same sandbox.
 			e.svc.Logger.WarnContext(ctx, "runner_sandbox_store_failed", slog.String("runner_id", r.ID), slog.Any("error", uerr))
-		} else if expired != nil {
-			e.releaseClaim(ctx, expired)
+		} else if start.expired != nil {
+			e.releaseClaim(ctx, start.expired)
 		}
 		e.ensureDriver(r.ID)
 		e.kickRunner(r.ID)
@@ -626,13 +644,13 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 		// a start failure that counts as an attempt.
 		berr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 			var err error
-			expired, err = e.bindStartTx(ctx, tx, r, r.RequestID)
+			start, err = e.bindStartTx(ctx, tx, r, r.RequestID)
 			return err
 		})
 		if berr != nil {
 			e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", berr))
-		} else if expired != nil {
-			e.releaseClaim(ctx, expired)
+		} else if start.expired != nil {
+			e.releaseClaim(ctx, start.expired)
 		}
 		e.startFailed(ctx, r, createSandboxRejected)
 		return createFailed
@@ -728,30 +746,38 @@ func (e *Engine) dropRunner(ctx context.Context, r *Runner, noDevice bool) {
 	}
 }
 
+type bindingResult struct {
+	bound   bool
+	expired *Request
+}
+
 // bindStartTx checks the locked request's deadline before binding a runner
 // or counting a start attempt. The caller releases an expired request's
 // claim after commit.
-func (e *Engine) bindStartTx(ctx context.Context, tx pgx.Tx, r *Runner, requestID string) (*Request, error) {
+func (e *Engine) bindStartTx(ctx context.Context, tx pgx.Tx, r *Runner, requestID string) (bindingResult, error) {
 	if requestID == "" {
-		return nil, nil
+		return bindingResult{}, nil
 	}
 	req, err := e.LockRequest(ctx, tx, requestID)
 	if err != nil || req.State != reqQueued {
-		return nil, err
+		return bindingResult{}, err
 	}
 	expired, err := e.expireQueuedTx(ctx, tx, req)
 	if err != nil || expired != nil {
-		return expired, err
+		return bindingResult{expired: expired}, err
 	}
 	if r.State == runWarm {
 		if _, err := tx.Exec(ctx, "UPDATE runners SET request_id = $2, update_time = $3 WHERE runner_id = $1", r.ID, req.ID, e.svc.NowUTC()); err != nil {
-			return nil, err
+			return bindingResult{}, err
 		}
 	}
 	if _, err := tx.Exec(ctx, "UPDATE requests SET start_attempts = start_attempts + 1 WHERE request_id = $1", req.ID); err != nil {
-		return nil, err
+		return bindingResult{}, err
 	}
-	return nil, e.startRequestTx(ctx, tx, req.ID, r.ID, []sandrunv1.RequestState{reqQueued}, reqStarting)
+	if err := e.startRequestTx(ctx, tx, req.ID, r.ID, []sandrunv1.RequestState{reqQueued}, reqStarting); err != nil {
+		return bindingResult{}, err
+	}
+	return bindingResult{bound: true}, nil
 }
 
 // requeueTx returns a STARTING request to QUEUED with its original queue

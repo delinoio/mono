@@ -3,10 +3,14 @@
   "extends": ["//"],
   "tasks": {
     "test": {
+      "dependsOn": ["$TURBO_EXTENDS$", "test:node"],
       "inputs": [
         "$TURBO_DEFAULT$",
         "$TURBO_ROOT$/go/ownsand/relaybinding/testdata/request-digest-vectors.json"
       ]
+    },
+    "test:node": {
+      "dependsOn": ["build"]
     }
   }
 }

@@ -228,7 +228,7 @@ func (h *Handler) relayExec(ctx context.Context, sess *session, execID string, o
 // its environment and its output are never logged, stored or audited.
 func (h *Handler) ExecDevSession(ctx context.Context, req *connect.Request[sandrunv1.ExecDevSessionRequest], stream *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
 	m := req.Msg
-	sess, _, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
+	sess, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
 	if err != nil {
 		return err
 	}
@@ -266,7 +266,7 @@ func (h *Handler) ExecDevSession(ctx context.Context, req *connect.Request[sandr
 // AttachDevSessionExec continues the event stream of an exec.
 func (h *Handler) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest], stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
 	m := req.Msg
-	sess, _, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
+	sess, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
 	if err != nil {
 		return err
 	}
@@ -320,7 +320,7 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 // with the same read_id from its next offset.
 func (h *Handler) ReadDevSessionFile(ctx context.Context, req *connect.Request[sandrunv1.ReadDevSessionFileRequest], stream *connect.ServerStream[sandrunv1.ReadDevSessionFileResponse]) error {
 	m := req.Msg
-	sess, _, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
+	sess, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
 	if err != nil {
 		return err
 	}
@@ -490,7 +490,7 @@ func (w *writes) release(key string, e *writeEntry, finished bool, err error) {
 // the written chunks to cover exactly [0, offset + len(data)).
 func (h *Handler) WriteDevSessionFile(ctx context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
 	m := req.Msg
-	sess, _, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
+	sess, err := h.operable(ctx, m.GetOrganizationId(), m.GetDevSessionId())
 	if err != nil {
 		return nil, err
 	}

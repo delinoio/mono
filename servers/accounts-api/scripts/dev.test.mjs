@@ -256,15 +256,18 @@ function fakeGo(t, script) {
 
 // A fake `go` whose "build" writes a signal-counting program to the -o path.
 // The program mirrors the server's signal contract: the first SIGINT starts a
-// drain that ends after DrainMs with server_shutdown_completed; a second SIGINT
-// ends it at once without that event. Every SIGINT prints a child_sigint event.
+// drain that ends after DrainMs with server_shutdown_completed in timed mode.
+// Hold mode keeps the drain open until the second SIGINT. In either mode, a
+// second SIGINT ends the drain without a completion event.
 const DrainMs = 1500;
 const countingServer = `#!${process.execPath}
+const mode = process.env.FAKE_MODE;
 let sigints = 0;
 process.on("SIGINT", () => {
   sigints += 1;
   console.log(JSON.stringify({ event: "child_sigint", n: sigints }));
   if (sigints > 1) process.exit(2);
+  if (mode === "hold") return;
   setTimeout(() => {
     console.log(JSON.stringify({ event: "server_shutdown_completed" }));
     process.exit(0);
@@ -297,6 +300,14 @@ function serverExitError(stdout) {
   assert.ok(record, `missing server_exited record in stdout: ${stdout}`);
   return record.error;
 }
+
+const childSigintCounts = (output) =>
+  output
+    .split("\n")
+    // The fragment after the last newline can still be incomplete.
+    .slice(0, -1)
+    .filter((line) => line.includes('"event":"child_sigint"'))
+    .map((line) => JSON.parse(line).n);
 
 test(
   "skips without DATABASE_URL and starts no build",
@@ -451,6 +462,7 @@ test(
   async (t) => {
     const run = startLauncher(t, {
       port: await freePort(),
+      env: { FAKE_MODE: "timed" },
       pathPrefix: fakeGoBuildingCountingServer(t),
     });
     await waitReady(run);
@@ -475,23 +487,30 @@ test(
   async (t) => {
     const run = startLauncher(t, {
       port: await freePort(),
+      env: { FAKE_MODE: "hold" },
       pathPrefix: fakeGoBuildingCountingServer(t),
     });
     await waitReady(run);
 
-    const started = Date.now();
     process.kill(-run.child.pid, "SIGINT");
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(
+      run,
+      () => {
+        assert.equal(
+          run.child.exitCode ?? run.child.signalCode,
+          null,
+          "launcher exited before the second SIGINT",
+        );
+        return childSigintCounts(run.stdout).includes(1);
+      },
+      "the first child_sigint record",
+    );
     process.kill(-run.child.pid, "SIGINT");
     const { code } = await run.exited;
 
     assert.equal(code, StatusSigint, run.stderr);
-    assert.equal(countEvents(run.stdout, "child_sigint"), 2, run.stdout);
+    assert.deepEqual(childSigintCounts(run.stdout), [1, 2], run.stdout);
     assert.doesNotMatch(run.stdout, /"server_shutdown_completed"/);
-    assert.ok(
-      Date.now() - started < DrainMs,
-      "the second SIGINT did not end the drain early",
-    );
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
   },
 );

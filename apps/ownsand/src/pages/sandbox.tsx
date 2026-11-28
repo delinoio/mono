@@ -260,7 +260,11 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
           </Link>
         </Detail>
         <Detail term={t("sandbox.details.source")}>
-          {sourceText(s, templates.data?.templates ?? [], i18n)}
+          {sourceText(
+            s,
+            templates.isError ? [] : (templates.data?.templates ?? []),
+            i18n,
+          )}
         </Detail>
         <Detail term={t("sandbox.details.resources")}>
           {resourcesText(s.resources, i18n, "sandbox.resourcesValue")}

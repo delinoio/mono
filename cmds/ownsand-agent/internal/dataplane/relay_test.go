@@ -1690,23 +1690,41 @@ func closeFrame(id uint64) *ownsandv1.DataFrame {
 // while the connection keeps serving other streams.
 func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 	t.Parallel()
+	const bound = 5 * time.Second
 	f, _, st := blockedSendFixture(t)
-	frame := datapath.MustNewFrame(1, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("payload")}}})
+	frame := relayStdout(st.id, "payload")
+	sendProbe := newWaitProbeContext(st.ctx)
+	st.ctx = sendProbe
+	sendProbe.arm()
 	result := make(chan error, 1)
-	go func() { result <- relaySink{f.r, st}.Send(st.ctx, frame) }()
+	go func() { result <- relaySink{f.r, st}.Send(sendProbe, frame) }()
+	// The fixture gives the stream enough credit, so the probe observes the queue wait.
+	select {
+	case <-sendProbe.waited:
+	case err := <-result:
+		t.Fatalf("send returned %v before reaching the full queue", err)
+	case <-time.After(bound):
+		t.Fatal("the send did not reach the full queue")
+	}
+	if err := st.ctx.Err(); err != nil {
+		t.Fatalf("stream context ended before close: %v", err)
+	}
+	if len(f.c.out) != cap(f.c.out) {
+		t.Fatalf("queue changed before close: %d frames", len(f.c.out))
+	}
 	select {
 	case err := <-result:
-		t.Fatalf("send returned %v while the queue was full", err)
-	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("send returned %v before stream close", err)
+	default:
 	}
 
-	f.r.onFrame(f.c, closeFrame(1))
+	f.r.onFrame(f.c, closeFrame(st.id))
 	select {
 	case err := <-result:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("send returned %v, want context.Canceled", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(bound):
 		t.Fatal("the blocked send was not canceled by the stream close frame")
 	}
 	if len(f.c.out) != cap(f.c.out) {
@@ -1717,7 +1735,6 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 	if first := <-f.c.out; first.GetKind() != keepaliveFrame(false).GetKind() {
 		t.Fatalf("queued frame %v", first)
 	}
-	time.Sleep(100 * time.Millisecond)
 	if len(f.c.out) != 0 {
 		t.Fatalf("a frame of the closed stream was queued after the drain: %d frames", len(f.c.out))
 	}
@@ -1742,7 +1759,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 	}()
 	select {
 	case <-probe.waited:
-	case <-time.After(5 * time.Second):
+	case <-time.After(bound):
 		t.Fatal("the second stream did not reach the full queue")
 	}
 	if got := <-f.c.out; got.GetRelayKeepalive() == nil {
@@ -1754,7 +1771,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 		if err != nil {
 			t.Fatalf("send on another stream: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(bound):
 		t.Fatal("the second stream did not resume when the queue had space")
 	}
 	if got := <-f.c.out; got.GetStreamId() != other.id {

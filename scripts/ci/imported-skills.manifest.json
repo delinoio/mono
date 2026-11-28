@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "fa8cb8c56426313d31907622fb01e3d2ce6d2ab72d7d9ca6b5a12b32cb93ac8c",
+        "AGENTS.md": "98c10da17d0503f701e51ba4bd025c72b579602b4fe1a02fed4c8bd1f461abc2",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -100,7 +100,7 @@
         "rules/client-passive-event-listeners.md": "1f35016f9053de69e884ee9be00654e37979c2ca85f5e57764dc2626ff7acb4b",
         "rules/client-swr-dedup.md": "d6cfd65bdbaa1e9344ddf952e82d5db8fbb61175cb1e5b2a962c1984d9c950e4",
         "rules/js-batch-dom-css.md": "480b891b9eaf96e929dc1e964274a4828e3a78009b7d00ccd965a0d425215959",
-        "rules/js-cache-function-results.md": "3daaa11d24f4295cb6be8bc6f407f2ce83cc7b5bd1f0e68891ea8ab835721dc7",
+        "rules/js-cache-function-results.md": "206042d693a7d9ba319bf97c392907c8503497232a1cf5dda03fc458940a81eb",
         "rules/js-cache-property-access.md": "73e47431e74878a927061bf0ddc7cd91a7556cb35d2573f3421e82300d9ae311",
         "rules/js-cache-storage.md": "6cb4b8d78c0829c5f05f4609207a2a14aeca8622936173e40475f750879e98e5",
         "rules/js-combine-iterations.md": "71add08aeeb43091d4ff4c0b2842cce8b4bdef8ad3e732cc034bb5a84827e746",

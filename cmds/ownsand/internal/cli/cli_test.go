@@ -1013,6 +1013,20 @@ func TestFileReadWrite(t *testing.T) {
 	}
 }
 
+const invalidGuestPathStderr = "error: invalid path: must be an absolute guest path\nRun 'ownsand help' for usage.\n"
+
+func TestFileReadInvalidGuestPathBeforeSettingUpDestination(t *testing.T) {
+	r := newRunner(t)
+	to := filepath.Join(t.TempDir(), "missing", "out.txt")
+	res := r.run("--no-color", "file", "read", r.f.sb, "relative.txt", "--to", to)
+	if res != (result{code: ExitUsage, stderr: invalidGuestPathStderr}) {
+		t.Errorf("want an invalid guest path error before setting up the destination, got %+v", res)
+	}
+	if calls := r.f.callNames(); len(calls) != 0 {
+		t.Errorf("API received calls for an invalid guest path: %v", calls)
+	}
+}
+
 func TestFileReadDotDotAfterMissingDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows can normalize user-typed paths before lookup")
@@ -1130,6 +1144,12 @@ func TestFileReadFailureKeepsDestination(t *testing.T) {
 	if err := os.WriteFile(to, []byte("previous contents"), 0o640); err != nil {
 		t.Fatal(err)
 	}
+	// Set the exact mode after creation because the umask can mask group read.
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(to, 0o640); err != nil {
+			t.Fatalf("set destination mode: %v", err)
+		}
+	}
 	if res := r.run("file", "read", "--to", to, r.f.sb, "/missing"); res.code != ExitError || !strings.Contains(res.stderr, "not_found") {
 		t.Fatalf("missing: %+v", res)
 	}
@@ -1153,8 +1173,14 @@ func TestFileReadFailureKeepsDestination(t *testing.T) {
 	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatal("the download replaced the symbolic link")
 	}
-	if info, _ := os.Stat(to); runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
-		t.Fatalf("the download changed the mode to %v", info.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(to)
+		if err != nil {
+			t.Fatalf("stat destination: %v", err)
+		}
+		if info.Mode().Perm() != 0o640 {
+			t.Fatalf("the download changed the mode to %v", info.Mode().Perm())
+		}
 	}
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 2 {
@@ -1517,6 +1543,11 @@ func TestFileReadLongDestinationName(t *testing.T) {
 			if err := os.WriteFile(to, []byte("previous"), 0o640); err != nil {
 				t.Fatal(err)
 			}
+			if runtime.GOOS != "windows" {
+				if err := os.Chmod(to, 0o640); err != nil {
+					t.Fatalf("set destination mode: %v", err)
+				}
+			}
 			if res := r.run("file", "read", "--to", to, r.f.sb, "/missing"); res.code != ExitError {
 				t.Fatalf("missing: %+v", res)
 			}
@@ -1529,8 +1560,14 @@ func TestFileReadLongDestinationName(t *testing.T) {
 			if b, _ := os.ReadFile(to); string(b) != "sandbox bytes" {
 				t.Fatalf("content %q", b)
 			}
-			if info, _ := os.Stat(to); runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
-				t.Fatalf("mode %v", info.Mode().Perm())
+			if runtime.GOOS != "windows" {
+				info, err := os.Stat(to)
+				if err != nil {
+					t.Fatalf("stat destination: %v", err)
+				}
+				if info.Mode().Perm() != 0o640 {
+					t.Fatalf("mode %v", info.Mode().Perm())
+				}
 			}
 			if entries, _ := os.ReadDir(dir); len(entries) != 1 {
 				t.Fatalf("temporary files left: %v", entries)

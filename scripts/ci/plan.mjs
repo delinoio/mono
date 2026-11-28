@@ -9,13 +9,20 @@ import {
 } from "./format-changed.mjs";
 import {
   declaredReleaseInputs,
+  releaseOnlyPackageDirs,
+  taskPackageDirs,
   workspacePackageDirs,
   workspaceRoots,
 } from "./workspace-packages.mjs";
 import { isWorkspaceCli } from "./workspace-node.mjs";
 
 // Re-exported for the planner's callers and fixtures.
-export { workspacePackageDirs, workspaceRoots };
+export {
+  releaseOnlyPackageDirs,
+  taskPackageDirs,
+  workspacePackageDirs,
+  workspaceRoots,
+};
 
 const fixtureInputs = new Set([
   // The deploy fixtures read the repository Changesets config, and the
@@ -124,8 +131,9 @@ const workspaceTaskInputs = new Set([
   "turbo.json",
 ]);
 
-// Any path inside a workspace package, or a root input of its tasks, selects
-// the `workspace-packages` and `workspace-servers` jobs. Together they run the
+// Any path inside a workspace package (under a workspace root or a task
+// single package directory), or a root input of its tasks, selects the
+// `workspace-packages` and `workspace-servers` jobs. Together they run the
 // build, lint, typecheck and test tasks of every workspace package, because
 // `turbo run --affected` selects no package
 // when only a root input such as `package.json`, `turbo.json` or `go.mod`
@@ -135,7 +143,8 @@ export function isWorkspaceInput(path) {
     workspaceTaskInputs.has(path) ||
     path === relayDigestVectors ||
     isWorkspaceManifest(path) ||
-    new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/`).test(path)
+    new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/`).test(path) ||
+    taskPackageDirs.some((dir) => path.startsWith(`${dir}/`))
   );
 }
 
@@ -250,7 +259,12 @@ export function isGoInput(path) {
     path === relayDigestVectors ||
     path === ownsandApiLauncher ||
     goTestInputs.has(path) ||
-    goTestdata.test(path)
+    goTestdata.test(path) ||
+    // The Go tests of a task package read its embedded data files (for
+    // example the pinned agent components and npm lockfiles of the SandCrew
+    // guest bridge), and its package tasks do not run Go, so every path
+    // inside it selects the Go checks.
+    taskPackageDirs.some((dir) => path.startsWith(`${dir}/`))
   );
 }
 
