@@ -793,19 +793,59 @@ func TestInterruptedRemovalTreatsUnknownDeviceAsConfirmed(t *testing.T) {
 	}
 }
 
+type unknownDeviceChallengeClient struct {
+	ownsandv1connect.AgentServiceClient
+	deviceID string
+	notFound chan<- struct{}
+}
+
+func (c unknownDeviceChallengeClient) CreateChallenge(ctx context.Context, req *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
+	resp, err := c.AgentServiceClient.CreateChallenge(ctx, req)
+	if req.Msg.GetDeviceId() == c.deviceID && connect.CodeOf(err) == connect.CodeNotFound {
+		select {
+		case c.notFound <- struct{}{}:
+		default:
+		}
+	}
+	return resp, err
+}
+
 func TestUnknownDeviceKeepsData(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
 	cp.Forget(id.DeviceID)
-	h := start(t, cp, st, id)
-	time.Sleep(300 * time.Millisecond)
+
+	const wantChallenges = 2
+	notFound := make(chan struct{}, wantChallenges)
+	h := startWith(t, cp, st, id, func(o *Options) {
+		o.Control.Agent = unknownDeviceChallengeClient{
+			AgentServiceClient: o.Control.Agent,
+			deviceID:           id.DeviceID,
+			notFound:           notFound,
+		}
+	})
+
+	// The retry shows that the agent handled the first NotFound response.
+	const waitTimeout = 5 * time.Second
+	deadline := time.NewTimer(waitTimeout)
+	defer deadline.Stop()
+	// The harness cleanup waits on its own done channel if this test reads errc.
+	for received := range wantChallenges {
+		select {
+		case <-notFound:
+		case err := <-h.errc:
+			t.Fatalf("agent stopped after %d of %d NotFound challenge responses: %v", received, wantChallenges, err)
+		case <-deadline.C:
+			t.Fatalf("received %d of %d NotFound challenge responses in %s", received, wantChallenges, waitTimeout)
+		}
+	}
 	select {
 	case err := <-h.errc:
-		t.Fatalf("agent stopped: %v", err)
+		t.Fatalf("agent stopped before the identity check: %v", err)
 	default:
 	}
 	if _, err := st.LoadIdentity(); err != nil {
-		t.Fatal("identity deleted for an unknown device without a removal notice")
+		t.Fatalf("cannot read the enrolled identity after the unknown-device retry: %v", err)
 	}
 }
 
