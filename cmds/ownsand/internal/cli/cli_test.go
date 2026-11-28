@@ -1188,6 +1188,26 @@ func TestFileReadFailureKeepsDestination(t *testing.T) {
 	}
 }
 
+func TestFileReadPartialFailureKeepsDestination(t *testing.T) {
+	r := newRunner(t)
+	dir := t.TempDir()
+	to := filepath.Join(dir, "out")
+	const previous = "previous contents"
+	if err := os.WriteFile(to, []byte(previous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := r.run("--no-color", "file", "read", "--to", to, r.f.sb, "/tmp/fail-after-chunk")
+	if res.code != ExitError || res.stderr != "error: aborted: fixture failed after chunk\n" {
+		t.Fatalf("partial read: %+v", res)
+	}
+	if b, err := os.ReadFile(to); err != nil || string(b) != previous {
+		t.Errorf("a failed read changed the destination: %q, %v", b, err)
+	}
+	if entries := mustReadDir(t, dir); !slices.Equal(entries, []string{"out"}) {
+		t.Errorf("unexpected destination directory entries: %v", entries)
+	}
+}
+
 func TestFileReadDanglingSymlink(t *testing.T) {
 	r := newRunner(t)
 	r.stdin = "downloaded contents"

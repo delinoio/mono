@@ -336,22 +336,29 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 }
 
 func (h *fakeRelay) ReadFile(_ context.Context, r *connect.Request[ownsandv1.ReadFileRequest], s *connect.ServerStream[ownsandv1.ReadFileResponse]) error {
+	failAfterChunk := r.Msg.GetPath() == "/tmp/fail-after-chunk"
 	h.f.mu.Lock()
 	data, ok := h.f.files[r.Msg.GetPath()]
 	h.f.mu.Unlock()
-	if !ok {
+	if failAfterChunk {
+		data = []byte("partial contents")
+	} else if !ok {
 		return connect.NewError(connect.CodeNotFound, errors.New("no such file"))
 	}
 	for _, e := range []*ownsandv1.FileReadEvent{
 		{Event: &ownsandv1.FileReadEvent_Accepted{Accepted: &ownsandv1.RequestAccepted{}}},
 		{Event: &ownsandv1.FileReadEvent_Chunk{Chunk: &ownsandv1.FileChunk{Offset: 0, Data: data}}},
-		{Event: &ownsandv1.FileReadEvent_End{End: &ownsandv1.FileReadEnd{SizeBytes: int64(len(data))}}},
 	} {
 		if err := s.Send(&ownsandv1.ReadFileResponse{Event: e}); err != nil {
 			return err
 		}
 	}
-	return nil
+	if failAfterChunk {
+		return connect.NewError(connect.CodeAborted, errors.New("fixture failed after chunk"))
+	}
+	return s.Send(&ownsandv1.ReadFileResponse{Event: &ownsandv1.FileReadEvent{
+		Event: &ownsandv1.FileReadEvent_End{End: &ownsandv1.FileReadEnd{SizeBytes: int64(len(data))}},
+	}})
 }
 
 func (h *fakeRelay) WriteFile(_ context.Context, r *connect.Request[ownsandv1.WriteFileRequest]) (*connect.Response[ownsandv1.WriteFileResponse], error) {
