@@ -228,6 +228,9 @@ func TestNewServerKeepAliveSequenceEndingInRejectionLogsEveryRequestOnce(t *test
 		if _, err := io.WriteString(conn, reject); err != nil {
 			t.Fatalf("write: %v", err)
 		}
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
 		rest, err := io.ReadAll(reader)
 		if err != nil {
 			t.Fatalf("read: %v", err)

@@ -263,6 +263,7 @@ type backgroundRig struct {
 	publicAddr    string
 	logs          *syncBuffer
 	workerStarted chan struct{}
+	workerStopped atomic.Bool
 	result        chan error
 }
 
@@ -285,6 +286,7 @@ func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) 
 	worker := func(background context.Context) {
 		close(rig.workerStarted)
 		<-background.Done()
+		rig.workerStopped.Store(true)
 	}
 	srv := newServer(http.NewServeMux(), logger)
 	go func() {
@@ -310,16 +312,6 @@ func (r *backgroundRig) await(t *testing.T) error {
 	}
 }
 
-// publicRefusesConnections reports whether the public listener is closed.
-func (r *backgroundRig) publicRefusesConnections() bool {
-	conn, err := net.DialTimeout("tcp", r.publicAddr, time.Second)
-	if err == nil {
-		_ = conn.Close()
-		return false
-	}
-	return true
-}
-
 // permanentAcceptMetrics serves the metrics handler on a listener whose Accept
 // fails with errMetricsAccept, after the bind has succeeded.
 func permanentAcceptMetrics(t *testing.T) func(context.Context) error {
@@ -340,8 +332,15 @@ func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	if !errors.Is(err, errMetricsAccept) {
 		t.Fatalf("runServers error = %v; want the metrics Accept error", err)
 	}
-	if !rig.publicRefusesConnections() {
-		t.Error("public listener still accepts connections after runServers returned")
+	if !rig.workerStopped.Load() {
+		t.Error("runServers returned before the billing worker finished its in-progress work")
+	}
+	dialer := net.Dialer{Timeout: listenerProbeTimeout}
+	refused, err := probeTCPRefusal(rig.publicAddr, dialer.Dial)
+	if err != nil {
+		t.Errorf("after runServers returned: %v", err)
+	} else if !refused {
+		t.Errorf("public listener at %s still accepts connections after runServers returned", rig.publicAddr)
 	}
 	logs := rig.logs.String()
 	for _, want := range []string{"metrics_listener_failed", "server_shutdown_started", "server_shutdown_completed", errMetricsAccept.Error()} {
@@ -351,20 +350,57 @@ func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	}
 }
 
+func newMetricsErrorGate(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return gate, release
+}
+
+func TestRunServersKeepsMetricsErrorAfterFixtureCleanup(t *testing.T) {
+	var rig *backgroundRig
+	if !t.Run("fixture", func(fixture *testing.T) {
+		gate, release := newMetricsErrorGate(fixture)
+		// Release the gate from the parent if the fixture cleanup fails to do so.
+		t.Cleanup(release)
+		atGate := make(chan struct{})
+		rig = startBackgroundRig(fixture, func(context.Context) error {
+			close(atGate)
+			<-gate
+			return errMetricsAccept
+		})
+		select {
+		case <-atGate:
+		case <-time.After(handlerStartTimeout):
+			fixture.Fatal("metrics callback did not reach the release gate")
+		}
+	}) || rig == nil {
+		return
+	}
+
+	if err := rig.await(t); !errors.Is(err, errMetricsAccept) {
+		t.Fatalf("runServers error = %v, want the metrics Accept error", err)
+	}
+	if !rig.workerStopped.Load() {
+		t.Fatal("runServers returned before the billing worker finished")
+	}
+}
+
 // TestRunServersKeepsMetricsErrorWhenShutdownSignalRaces verifies that the
 // metrics listener error is not lost when the shutdown trigger fires first,
 // or at the same time, and runServers has already started the drain.
 func TestRunServersKeepsMetricsErrorWhenShutdownSignalRaces(t *testing.T) {
 	for i := 0; i < 20; i++ {
-		release := make(chan struct{})
+		gate, release := newMetricsErrorGate(t)
 		rig := startBackgroundRig(t, func(context.Context) error {
-			<-release
+			<-gate
 			return errMetricsAccept
 		})
 		// The signal arrives, the drain starts and the metrics listener fails
 		// in the same moment. Which of them runServers observes first varies.
 		rig.cancel()
-		close(release)
+		release()
 
 		err := rig.await(t)
 		if !errors.Is(err, errMetricsAccept) {

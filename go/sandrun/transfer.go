@@ -118,6 +118,14 @@ func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, pa
 	}
 }
 
+type readLimitError struct {
+	observed int64
+}
+
+func (e *readLimitError) Error() string {
+	return fmt.Sprintf("guest file read exceeds the size limit at %d bytes", e.observed)
+}
+
 // readGuestFile streams the guest file at path into w with
 // ReadDevSessionFile and returns its size. It stops with an error when the
 // file is larger than limit bytes. After a transient failure or a stream
@@ -173,9 +181,10 @@ func (c *Client) readGuestFile(ctx context.Context, s *sandrunv1.DevSession, pat
 				if len(data) == 0 {
 					continue
 				}
-				if offset+int64(len(data)) > limit {
+				observed := offset + int64(len(data))
+				if observed > limit {
 					_ = stream.Close()
-					return offset, &LimitError{Operation: "download", FileLimit: limit, TotalLimit: limit, Paths: []PathSize{{Path: path, Size: offset + int64(len(data))}}}
+					return offset, &readLimitError{observed: observed}
 				}
 				n, err := w.Write(data)
 				if err != nil {
