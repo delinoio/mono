@@ -107,10 +107,15 @@ func run() error {
 		return err
 	}
 
+	if ctx.Err() != nil {
+		stop()
+		return nil
+	}
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = listener.Close() }()
 
 	// Bind the internal metrics listener before any background task starts. A
 	// bind failure then returns before the billing worker exists, so run never
@@ -119,15 +124,17 @@ func run() error {
 	if cfg.MetricsAddr != "" {
 		metricsListener, err = net.Listen("tcp", cfg.MetricsAddr)
 		if err != nil {
-			_ = listener.Close()
 			return err
 		}
+		defer func() { _ = metricsListener.Close() }()
 	}
 
 	srv := newServer(handler, logger)
 
-	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)),
-		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
+	onStart := func() {
+		logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)),
+			slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
+	}
 	worker := func(background context.Context) {
 		billingService.RunWorker(background, billing.DefaultWorkerInterval)
 	}
@@ -138,7 +145,11 @@ func run() error {
 			return metrics.Serve(background, metricsListener, metricsHandler, logger)
 		}
 	}
-	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, worker, serveMetrics)
+	if ctx.Err() != nil {
+		stop()
+		return nil
+	}
+	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, onStart, worker, serveMetrics)
 }
 
 // runServers serves the public srv on listener together with the background
@@ -146,6 +157,9 @@ func run() error {
 // metrics listener. It returns after srv has drained and both tasks have
 // returned, so no task outlives it. A Paddle charge that has started can
 // finish its request and attempt to record the outcome before shutdown.
+//
+// If ctx is already canceled, runServers closes listener and skips onStart
+// and all serving and background work.
 //
 // The metrics listener is not optional infrastructure once it is bound: when
 // serveMetrics fails by itself (for example a permanent Accept error), runServers
@@ -158,7 +172,16 @@ func run() error {
 // has drained. runServers takes them as functions so tests can inject failures
 // without OS signals.
 func runServers(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration,
-	worker func(context.Context), serveMetrics func(context.Context) error) error {
+	onStart func(), worker func(context.Context), serveMetrics func(context.Context) error) error {
+	if ctx.Err() != nil {
+		stop()
+		_ = listener.Close()
+		return nil
+	}
+	if onStart != nil {
+		onStart()
+	}
+
 	// Only the original context tells us that a signal arrived.
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()

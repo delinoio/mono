@@ -79,6 +79,9 @@ func (s *Service) RunOnce(ctx context.Context) {
 // may run it at the same time: every task locks what it changes. It returns
 // after the step in progress has finished.
 func (s *Service) RunWorker(ctx context.Context, interval time.Duration) {
+	if ctx.Err() != nil {
+		return
+	}
 	if interval <= 0 {
 		interval = DefaultWorkerInterval
 	}
