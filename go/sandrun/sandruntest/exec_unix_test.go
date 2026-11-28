@@ -62,6 +62,10 @@ func TestExecDeadlineDuringOutputDrain(t *testing.T) {
 	if !proto.Equal(final, attached) {
 		t.Errorf("attach reported %v, want %v", attached, final)
 	}
+	s.Close()
+	if !execTestProcessRunning(child) {
+		t.Errorf("Close signaled the descendant of a completed exec")
+	}
 }
 
 func TestExecGroupCancellation(t *testing.T) {
@@ -111,10 +115,88 @@ func TestExecGroupCancellation(t *testing.T) {
 	}
 }
 
+func TestCloseDuringExecOutputDrain(t *testing.T) {
+	testCloseDuringExecOutputDrain(t, false)
+}
+
+func TestCloseRacesExecOutputDrainCompletion(t *testing.T) {
+	testCloseDuringExecOutputDrain(t, true)
+}
+
+func testCloseDuringExecOutputDrain(t *testing.T, raceCompletion bool) {
+	t.Helper()
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	workspace := t.TempDir()
+	client, ds := createExecTestSession(t, ctx, s, workspace)
+	pidFile := execGroupPIDFile(t, workspace)
+	stream, err := client.ExecDevSession(ctx, listTestRequest(&sandrunv1.ExecDevSessionRequest{
+		OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(), ExecId: streamTestExecID,
+		Command: []string{"/bin/sh", "-c", "trap 'exit 17' USR1; " + execGroupSetup + "; wait"},
+		Env:     map[string]string{"PID_FILE": pidFile},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	leader, child := readExecGroupPIDs(t, pidFile)
+	if !execTestProcessRunning(child) {
+		t.Fatalf("descendant %d was not running before the direct child exited", child)
+	}
+	groupID, err := syscall.Getpgid(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.guest.mu.Lock()
+	p := s.guest.execs[streamTestExecID]
+	s.guest.mu.Unlock()
+	// Start the one-second drain window only after the process checks and setup.
+	if err := syscall.Kill(leader, syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	waitForExecTestProcessReaped(t, leader)
+	if groupID == leader || syscall.Kill(groupID, 0) != nil {
+		t.Errorf("process group %d has no fixture anchor after command %d exited", groupID, leader)
+	}
+	p.mu.Lock()
+	final := p.final
+	p.mu.Unlock()
+	if final != nil {
+		t.Fatal("exec finished before Close could interrupt output drain")
+	}
+
+	if raceCompletion {
+		// Closing the descendant's pipe lets Wait finish independently of Close.
+		// Either operation can win ownership of group cleanup.
+		stopped := make(chan error, 1)
+		go func() { stopped <- syscall.Kill(child, syscall.SIGTERM) }()
+		s.Close()
+		if err := <-stopped; err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Fatal(err)
+		}
+	} else {
+		s.Close()
+	}
+	if execTestProcessRunning(child) {
+		t.Fatalf("descendant %d was still running when Close returned", child)
+	}
+	if !errors.Is(syscall.Kill(groupID, 0), syscall.ESRCH) {
+		t.Errorf("process group anchor %d was not reaped", groupID)
+	}
+	exited := p.final.GetExited()
+	if exited.GetExitCode() != 17 || exited.GetTimedOut() || string(p.out[0].data) != "ready" {
+		t.Errorf("stdout = %q, terminal event = %v, want ready and exit 17 without timeout", p.out[0].data, p.final)
+	}
+}
+
 func TestExecDeadlineSkipsExitedGroupLeader(t *testing.T) {
 	pidFile := execGroupPIDFile(t, t.TempDir())
 	cmd := newExecCommand(t.Context(), []string{"/bin/sh", "-c", execGroupSetup + "; exit 0"}, map[string]string{"PID_FILE": pidFile})
-	if err := cmd.Start(); err != nil {
+	group := new(execGroup)
+	t.Cleanup(group.release)
+	if err := group.start(t.Context(), cmd); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -128,7 +210,7 @@ func TestExecDeadlineSkipsExitedGroupLeader(t *testing.T) {
 
 	checkDeadline := func(phase string) {
 		t.Helper()
-		if err := cancelExecGroup(cmd.Process, true); !errors.Is(err, os.ErrProcessDone) {
+		if err := group.cancel(true); !errors.Is(err, os.ErrProcessDone) {
 			t.Errorf("deadline with %s leader returned %v, want os.ErrProcessDone", phase, err)
 		}
 		if !execTestProcessRunning(child) {
@@ -217,4 +299,15 @@ func waitForExecTestProcessExit(t *testing.T, pid int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("process %d is still running", pid)
+}
+
+func waitForExecTestProcessReaped(t *testing.T, pid int) {
+	t.Helper()
+	for range 100 {
+		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("process %d was not reaped", pid)
 }
