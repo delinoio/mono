@@ -21,9 +21,11 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const launcher = fileURLToPath(new URL("./dev.mjs", import.meta.url));
+const gracePreload = new URL("./dev-forced-stop-preload.mjs", import.meta.url);
 const fixture = fileURLToPath(import.meta.url);
 const signals = ["SIGINT", "SIGTERM", "SIGQUIT"];
 const options = { skip: process.platform === "win32", timeout: 60_000 };
+const stopObservationTimeout = 4_000;
 const fakeServer =
   '#!/bin/sh\nexec "$FIXTURE_NODE" "$FIXTURE_SCRIPT" --fixture server\n';
 
@@ -138,28 +140,45 @@ function startLauncher(t, phase, stop) {
   const dir = mkdtempSync(join(tmpdir(), "sandrun-api-forced-stop-"));
   const buildTmp = join(dir, "builds");
   const exitFile = join(dir, "exit");
+  const releaseGraceFile = join(dir, "release-grace");
   mkdirSync(buildTmp);
   writeFileSync(
     join(dir, "go"),
     '#!/bin/sh\nexec "$FIXTURE_NODE" "$FIXTURE_SCRIPT" --fixture build "$@"\n',
     { mode: 0o755 },
   );
+  const env = {
+    ...process.env,
+    DATABASE_URL: "postgres://launcher-test",
+    PATH: dir + delimiter + process.env.PATH,
+    TMPDIR: buildTmp,
+    FIXTURE_SCRIPT: fixture,
+    FIXTURE_NODE: process.execPath,
+    FIXTURE_PHASE: phase,
+    FIXTURE_STOP: stop,
+    FIXTURE_EXIT: exitFile,
+  };
+  if (phase === "server" && stop === "ignore-term") {
+    env.FIXTURE_RELEASE_GRACE = releaseGraceFile;
+    env.NODE_OPTIONS = [env.NODE_OPTIONS, `--import=${gracePreload}`]
+      .filter(Boolean)
+      .join(" ");
+  }
   const task = spawn(process.execPath, [launcher], {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      DATABASE_URL: "postgres://launcher-test",
-      PATH: dir + delimiter + process.env.PATH,
-      TMPDIR: buildTmp,
-      FIXTURE_SCRIPT: fixture,
-      FIXTURE_NODE: process.execPath,
-      FIXTURE_PHASE: phase,
-      FIXTURE_STOP: stop,
-      FIXTURE_EXIT: exitFile,
-    },
+    env,
   });
-  const run = { task, buildTmp, exitFile, records: [], stderr: "", exit: null };
+  const run = {
+    task,
+    buildTmp,
+    exitFile,
+    releaseGraceFile,
+    records: [],
+    stderr: "",
+    exit: null,
+    outputClosed: false,
+  };
   const targets = new Set([-task.pid]);
   t.after(() => {
     for (const target of targets) killIfPresent(target);
@@ -181,7 +200,9 @@ function startLauncher(t, phase, stop) {
     run.exit = { code, signal };
     return run.exit;
   });
-  run.closed = once(task, "close");
+  run.closed = once(task, "close").then(() => {
+    run.outputClosed = true;
+  });
   return run;
 }
 
@@ -209,11 +230,21 @@ const observedSignals = (run, source = "signal") =>
     .filter(({ event }) => event === source)
     .map(({ signal }) => signal);
 
+async function bindLoopbackPort(port) {
+  const signal = AbortSignal.timeout(stopObservationTimeout);
+  const probe = createServer().listen({ host: "127.0.0.1", port, signal });
+  await once(probe, "listening", { signal });
+  const closed = once(probe, "close", { signal });
+  probe.close();
+  await closed;
+}
+
 async function assertPortsReleased(ports) {
   for (const port of ports) {
-    const probe = createServer().listen(port, "127.0.0.1");
-    await once(probe, "listening");
-    await new Promise((resolve) => probe.close(resolve));
+    await assert.doesNotReject(
+      bindLoopbackPort(port),
+      `rebind loopback port ${port}`,
+    );
   }
 }
 
@@ -234,16 +265,61 @@ if (process.argv[2] === "--fixture") {
         assert.equal(active.phase, phase);
         assert.ok(active.descendant > 1);
         assert.ok(isRunning(active.pid) && isRunning(active.descendant));
+        if (phase === "server") assert.equal(active.ports.length, 2);
 
         process.kill(-run.task.pid, "SIGKILL");
-        assert.deepEqual(await run.exited, { code: null, signal: "SIGKILL" });
+        const exit = await waitFor(
+          run,
+          () => run.exit,
+          "the launcher to exit after task-group SIGKILL",
+          stopObservationTimeout,
+        );
+        assert.deepEqual(exit, { code: null, signal: "SIGKILL" });
+        const pids = [active.pid, active.descendant];
+        if (stop === "ignore-term") {
+          const grace = await waitFor(
+            run,
+            () => run.records.find(({ event }) => event === "grace_timer"),
+            "the server supervisor to schedule escalation",
+            stopObservationTimeout,
+          );
+          assert.equal(grace.delay, 5_000, "the escalation delay in ms");
+          await waitFor(
+            run,
+            () => observedSignals(run).length,
+            "the server to receive its first shutdown signal",
+            stopObservationTimeout,
+          );
+          assert.deepEqual(observedSignals(run), ["SIGTERM"]);
+          assert.ok(isRunning(active.pid), "the server stopped before release");
+          assert.ok(
+            isRunning(active.descendant),
+            "the descendant stopped before release",
+          );
+          for (const port of active.ports) {
+            await assert.rejects(
+              bindLoopbackPort(port),
+              { code: "EADDRINUSE" },
+              `loopback port ${port} must remain bound before release`,
+            );
+          }
+          pids.push(grace.pid);
+          writeFileSync(run.releaseGraceFile, "");
+        }
         await waitFor(
           run,
-          () => !isRunning(active.pid) && !isRunning(active.descendant),
-          "the phase and its descendant to stop",
-          stop === "exit" ? 4_000 : 15_000,
+          () => pids.every((pid) => !isRunning(pid)),
+          stop === "ignore-term"
+            ? "the server supervisor, server and descendant to stop after releasing escalation"
+            : "the phase and its descendant to stop",
+          stopObservationTimeout,
         );
-        await run.closed;
+        await waitFor(
+          run,
+          () => run.outputClosed,
+          "the launcher output pipes to close after the group stops",
+          stopObservationTimeout,
+        );
 
         assert.equal(
           active.hasNullFd,
@@ -255,10 +331,7 @@ if (process.argv[2] === "--fixture") {
           run.records.filter(({ event }) => event === "ready").length,
           1,
         );
-        if (phase === "server") {
-          assert.equal(active.ports.length, 2);
-          await assertPortsReleased(active.ports);
-        }
+        if (phase === "server") await assertPortsReleased(active.ports);
       },
     );
   }
