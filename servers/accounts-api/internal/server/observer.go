@@ -115,19 +115,16 @@ const (
 //     write once the response of the last handler call is complete (the
 //     ConnState hook reports the connection idle) and logs it once, before the
 //     write.
-//   - When ReadHeaderTimeout expires, net/http either closes the connection
-//     without any response or answers a malformed partial line with the 400 above
-//     and closes it. The observer sees the timed-out read of the connection when
-//     the read was waiting for a request head. With nothing buffered after the
-//     last line break it logs a header_read_timeout record at once. With a
-//     partial line buffered it waits for what net/http does: the 400 is logged
-//     as the malformed request it is, and a close without a response is logged
-//     as header_read_timeout when the connection closes (see ConnState). After
+//   - When ReadHeaderTimeout expires, net/http can write a rejection or close
+//     without a response, even at a line boundary. The observer records the
+//     timeout as pending. A direct rejection write supplies the HTTP status.
+//     If the timeout is still pending when the connection closes, ConnState
+//     logs a header_read_timeout record with status 0. After
 //     an earlier request, net/http arms ReadHeaderTimeout only once four bytes of
 //     the next request arrived, so a stall with fewer bytes is the keep-alive
 //     wait. A timeout of the keep-alive wait between requests (IdleTimeout), of
 //     a request body (ReadTimeout) and the read interruptions that net/http
-//     causes itself are not logged; see claimReadTimeout.
+//     causes itself are not logged; see noteReadTimeout.
 //   - A connection that a handler hijacked is no longer net/http's, so the
 //     observer never logs for it (see ConnState).
 
@@ -203,12 +200,9 @@ type connObserver struct {
 	rejected bool
 	// hijacked is set when a handler took the connection over.
 	hijacked bool
-	// timeoutPending is set when a read deadline expired while a partial line of
-	// a request head was buffered. net/http answers such a head with a 400 or
-	// closes the connection without a response, depending on the partial line,
-	// and the observer does not know which until the write or the close, so the
-	// header read timeout record waits (see claimReadTimeout). timeoutPendingStart
-	// is the start of the request that the record measures.
+	// timeoutPending is set when a header read deadline expires. The write or
+	// close determines which record to log. Both use the request start saved in
+	// timeoutPendingStart.
 	timeoutPending      bool
 	timeoutPendingStart time.Time
 
@@ -756,11 +750,13 @@ func (o *connObserver) claimDirectRejection(p []byte) (RejectionReason, int, tim
 	if !ok {
 		return "", 0, time.Time{}, false
 	}
+	start := o.rejectionStart()
+	if o.timeoutPending {
+		start = o.timeoutPendingStart
+		o.timeoutPending = false
+	}
 	o.rejected = true
-	// The 400 that net/http writes after a header timeout inside a malformed
-	// partial line is the record of that request; the timeout is not logged too.
-	o.timeoutPending = false
-	return rejectionReasonFor(status), status, o.rejectionStart(), true
+	return rejectionReasonFor(status), status, start, true
 }
 
 // setReadDeadline records the read deadline that net/http sets on the
@@ -783,10 +779,8 @@ func (o *connObserver) deadlineExpired() bool {
 	return !o.readDeadline.IsZero() && o.readDeadline.After(o.deadlineSetAt)
 }
 
-// claimReadTimeout reports whether a read of the connection that failed with a
-// timeout was waiting for a request head that did not arrive in time, and
-// claims it so it is logged exactly once as a header read timeout without a
-// response.
+// noteReadTimeout records an eligible header read timeout as pending and saves
+// the request start time on the first timeout.
 //
 // Only a deadline timer that expired while the parser waited for (more of) a
 // request head counts, with no handler call or response in progress:
@@ -805,20 +799,15 @@ func (o *connObserver) deadlineExpired() bool {
 //   - A timeout while the parser skips a body (ReadTimeout), or after it
 //     stopped, is not a header timeout.
 //
-// What net/http does after the timeout depends on the bytes after the last line
-// break of the head. With none, it closes the connection without a response and
-// the timeout is claimed here. With a partial line, net/http parses that line as
-// if it were complete: it answers the 400 of a malformed request when the line
-// is invalid at its position, and closes the connection without a response when
-// it is a valid start of a line (and always during a shutdown). The observer
-// does not copy that validation. It leaves the timeout pending instead:
-// claimDirectRejection claims the 400 as a malformed request, and
-// claimPendingTimeout claims the timeout when the connection closes without one.
-func (o *connObserver) claimReadTimeout() (time.Time, bool) {
+// A timeout can occur while net/http looks for a header continuation. The
+// parser can still find a malformed line and send a 400 after that read fails,
+// even at a line boundary. claimDirectRejection records the direct response.
+// claimPendingTimeout records a timeout when net/http closes silently.
+func (o *connObserver) noteReadTimeout() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.rejected || o.hijacked || o.responding || o.phase != phaseHead || !o.deadlineExpired() {
-		return time.Time{}, false
+	if o.timeoutPending || o.rejected || o.hijacked || o.responding || o.phase != phaseHead || !o.deadlineExpired() {
+		return
 	}
 	// The observer cannot see which deadline net/http set, but it sees every byte
 	// first, so the bytes of the next request that it received (the head buffer
@@ -826,23 +815,14 @@ func (o *connObserver) claimReadTimeout() (time.Time, bool) {
 	// received too) are a lower bound of what net/http has buffered. Below
 	// peekedHeadBytes net/http is still in the keep-alive wait under IdleTimeout.
 	if o.parsedHeads > 0 && len(o.head)+o.leadingSkipped < peekedHeadBytes {
-		return time.Time{}, false
+		return
 	}
-	if len(o.head) > o.lineStart {
-		if !o.timeoutPending {
-			o.timeoutPending = true
-			o.timeoutPendingStart = o.rejectionStart()
-		}
-		return time.Time{}, false
-	}
-	o.rejected = true
-	return o.rejectionStart(), true
+	o.timeoutPending = true
+	o.timeoutPendingStart = o.rejectionStart()
 }
 
-// claimPendingTimeout reports the start of a header read timeout that is still
-// pending when the connection closes, and claims it so it is logged exactly
-// once. net/http closed the connection without writing the 400 that would have
-// replaced the record, so the connection closed without a response.
+// claimPendingTimeout claims a header read timeout when net/http closes the
+// connection without a response. It returns the saved request start time.
 func (o *connObserver) claimPendingTimeout() (time.Time, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -890,12 +870,7 @@ func (c *observedConn) Read(p []byte) (int, error) {
 	}
 	var netErr net.Error
 	if err != nil && errors.As(err, &netErr) && netErr.Timeout() {
-		// net/http closes the connection without a response after this error,
-		// except that it answers a malformed partial line with a 400 first. Such a
-		// timeout is left pending (see claimReadTimeout) and the 400 write claims it.
-		if start, ok := c.obs.claimReadTimeout(); ok {
-			c.obs.logRejected(RejectionHeaderReadTimeout, 0, start)
-		}
+		c.obs.noteReadTimeout()
 	}
 	return n, err
 }
@@ -989,9 +964,7 @@ func ConnState(conn net.Conn, state http.ConnState) {
 	case http.StateIdle:
 		observed.obs.responseFinished()
 	case http.StateClosed:
-		// net/http reports StateClosed with the connection that the listener
-		// returned, which is the observedConn. A header read timeout inside a
-		// partial line is still pending here when net/http wrote no 400.
+		// A direct rejection write would already have claimed the timeout.
 		if start, ok := observed.obs.claimPendingTimeout(); ok {
 			observed.obs.logRejected(RejectionHeaderReadTimeout, 0, start)
 		}
