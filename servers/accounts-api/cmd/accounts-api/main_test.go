@@ -45,6 +45,20 @@ func (l acceptErrorOnCloseListener) Accept() (net.Conn, error) {
 	return conn, err
 }
 
+type closeNotifyingListener struct {
+	net.Listener
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (l *closeNotifyingListener) Close() error {
+	err := l.Listener.Close()
+	if err == nil {
+		l.closeOnce.Do(func() { close(l.closed) })
+	}
+	return err
+}
+
 // noStop stands in for the signal-registration stop function in tests that
 // drive serve with a plain context.
 func noStop() {}
@@ -319,10 +333,13 @@ func TestAwaitHandlerStartedReportsFailedRequestToClosedListener(t *testing.T) {
 }
 
 func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
+	const waitTimeout = 5 * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	listener := &closeNotifyingListener{Listener: newTestListener(t), closed: make(chan struct{})}
 	started := make(chan struct{})
+	checkContext := make(chan struct{})
 	release := make(chan struct{})
 	var startOnce, releaseOnce sync.Once
 	// Release the handler on every exit path, including an early Fatalf, so it
@@ -330,40 +347,75 @@ func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
 	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(releaseHandler)
 	handlerCtxErr := make(chan error, 1)
-	srv, addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startOnce.Do(func() { close(started) })
+		select {
+		case <-checkContext:
+			handlerCtxErr <- r.Context().Err()
+		case <-release:
+			return
+		}
 		<-release
-		handlerCtxErr <- r.Context().Err()
 		_, _ = io.WriteString(w, "completed")
-	}), 5*time.Second)
+	})}
+	done := make(chan error, 1)
+	go func() {
+		done <- serve(ctx, noStop, srv, listener, newTestLogger(), 5*time.Second)
+	}()
 
-	responded, requestErr := getWithEarlyError(addr)
+	responded, requestErr := getWithEarlyError(listener.Addr().String())
 
 	if err := awaitHandlerStarted(started, requestErr, done, handlerStartTimeout); err != nil {
 		t.Fatal(err)
 	}
 	cancel() // the shutdown trigger
 
-	// Shutdown must wait for the in-flight request instead of returning.
 	select {
+	case <-listener.closed:
+	case err := <-requestErr:
+		t.Fatalf("request failed while waiting for the public listener to close: %v", err)
 	case err := <-done:
-		t.Fatalf("serve returned %v while a request was in flight", err)
-	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("serve returned %v while waiting for the public listener to close", err)
+	case <-time.After(waitTimeout):
+		t.Fatal("public listener did not close after the shutdown trigger")
+	}
+
+	close(checkContext)
+	select {
+	case err := <-handlerCtxErr:
+		if err != nil {
+			t.Fatalf("request context error during drain = %v, want nil", err)
+		}
+	case err := <-requestErr:
+		t.Fatalf("request failed while waiting for its context error: %v", err)
+	case err := <-done:
+		t.Fatalf("serve returned %v before the handler reported its context error", err)
+	case <-time.After(waitTimeout):
+		t.Fatal("handler did not report its context error during drain")
+	}
+	select {
+	case err := <-requestErr:
+		t.Fatalf("request failed before handler release: %v", err)
+	case err := <-done:
+		t.Fatalf("serve returned %v before handler release", err)
+	default:
 	}
 
 	releaseHandler()
-	if err := <-handlerCtxErr; err != nil {
-		t.Fatalf("request context error during drain = %v, want nil", err)
-	}
-	if got := <-responded; got.err != nil || got.status != http.StatusOK || got.body != "completed" {
-		t.Fatalf("response = %+v, want 200 completed", got)
+	select {
+	case got := <-responded:
+		if got.err != nil || got.status != http.StatusOK || got.body != "completed" {
+			t.Fatalf("response = %+v, want 200 completed", got)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("request did not complete after handler release")
 	}
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("serve error = %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(waitTimeout):
 		t.Fatal("serve did not return after the request completed")
 	}
 
