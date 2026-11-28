@@ -2,4 +2,4 @@
 "sandrun-console": patch
 ---
 
-Show every linked GitHub installation in the Integrations page. Keep the loaded rows visible when a page fails so users can retry and owners and admins can manage installations beyond the first page.
+Show every linked GitHub installation on the Integrations page. If a later page fails with a transient error, keep the loaded rows visible and let users retry that page. Owners and admins can manage installations on every loaded page.

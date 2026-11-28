@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"runtime"
@@ -253,30 +254,91 @@ func startHelperProcess(t *testing.T, mode string) *helperProcess {
 	return h
 }
 
-// waitForLine returns the first output line that contains substr.
+// findCompleteLine returns the first newline-terminated line that contains substr.
+func findCompleteLine(output, substr string) (string, bool) {
+	for {
+		line, rest, complete := strings.Cut(output, "\n")
+		if !complete {
+			return "", false
+		}
+		if strings.Contains(line, substr) {
+			return line, true
+		}
+		output = rest
+	}
+}
+
+// waitForLine returns the first complete output line that contains substr.
 func (h *helperProcess) waitForLine(substr string) string {
 	h.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		for _, line := range strings.Split(h.out.String(), "\n") {
-			if strings.Contains(line, substr) {
-				return line
-			}
+		if line, ok := findCompleteLine(h.out.String(), substr); ok {
+			return line
 		}
 		select {
 		case <-h.exited:
-			// The output is complete once the process has exited.
-			for _, line := range strings.Split(h.out.String(), "\n") {
-				if strings.Contains(line, substr) {
-					return line
-				}
+			// cmd.Wait has finished copying the child's output.
+			output := h.out.String()
+			if line, ok := findCompleteLine(output, substr); ok {
+				return line
 			}
-			h.t.Fatalf("helper exited before printing a line containing %q; output:\n%s", substr, h.out.String())
+			h.t.Fatalf("helper exited before printing a line containing %q; output:\n%s", substr, output)
 		case <-time.After(10 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
 			h.t.Fatalf("timed out waiting for a line containing %q; output so far:\n%s", substr, h.out.String())
 		}
+	}
+}
+
+func TestFindCompleteLineWaitsForNewline(t *testing.T) {
+	t.Parallel()
+	var out syncBuffer
+	for _, fragment := range []string{"listening 127.0.0.1:345", "67"} {
+		_, _ = out.Write([]byte(fragment))
+		if line, ok := findCompleteLine(out.String(), "listening "); ok {
+			t.Fatalf("matched unterminated readiness line %q", line)
+		}
+	}
+	_, _ = out.Write([]byte("\n"))
+	if line, ok := findCompleteLine(out.String(), "listening "); !ok || line != "listening 127.0.0.1:34567" {
+		t.Fatalf("readiness match = %q, %t, want the complete listener address", line, ok)
+	}
+}
+
+func TestFindCompleteLineSnapshots(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		output string
+		marker string
+		want   string
+	}{
+		{
+			name:   "first readiness line before unfinished output",
+			output: "listening 127.0.0.1:34567\nlistening 127.0.0.1:45678\nunfinished",
+			marker: "listening ",
+			want:   "listening 127.0.0.1:34567",
+		},
+		{
+			name:   "complete exit marker in final output",
+			output: "listening 127.0.0.1:34567\n{\"msg\":\"server_exited\"}\n",
+			marker: `"msg":"server_exited"`,
+			want:   `{"msg":"server_exited"}`,
+		},
+		{
+			name:   "unterminated readiness line in final output",
+			output: "listening 127.0.0.1:345",
+			marker: "listening ",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line, ok := findCompleteLine(tc.output, tc.marker)
+			if line != tc.want || ok != (tc.want != "") {
+				t.Fatalf("match = %q, %t, want %q, %t", line, ok, tc.want, tc.want != "")
+			}
+		})
 	}
 }
 
@@ -320,20 +382,20 @@ func (h *helperProcess) finished() bool {
 
 func (h *helperProcess) waitForListenerClosure() {
 	h.t.Helper()
-	// server_shutdown_started is logged just before the server closes its
-	// listeners. A failed dial proves that the public listener is closed.
+	// Shutdown logs server_shutdown_started before closing its listeners.
 	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err := net.DialTimeout("tcp", h.addr, time.Second)
+	dialer := net.Dialer{Deadline: deadline, Timeout: listenerProbeTimeout}
+	for time.Now().Before(deadline) {
+		refused, err := probeTCPRefusal(h.addr, dialer.Dial)
 		if err != nil {
+			h.t.Fatalf("%v; helper output:\n%s", err, h.out.String())
+		}
+		if refused {
 			return
 		}
-		_ = conn.Close()
-		if time.Now().After(deadline) {
-			h.t.Fatalf("helper listener still accepts connections after shutdown started; output:\n%s", h.out.String())
-		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(min(10*time.Millisecond, time.Until(deadline)))
 	}
+	h.t.Fatalf("helper listener at %s still accepts connections after shutdown started; output:\n%s", h.addr, h.out.String())
 }
 
 // getAsync starts a GET and delivers the status code, or -1 on a client error.
@@ -433,13 +495,12 @@ func TestSingleTerminationSignalDrainsInFlightRequestAndExitsZero(t *testing.T) 
 func TestSingleTerminationSignalWithoutTrafficExitsZero(t *testing.T) {
 	h := startHelperProcess(t, signalHelperHealthy)
 
-	resp, err := http.Get("http://" + h.addr + "/ping")
+	status, err := requestSignalHelperPing(t.Context(), "http://"+h.addr, 5*time.Second)
 	if err != nil {
-		t.Fatalf("GET /ping before any signal: %v", err)
+		t.Fatalf("GET /ping before any signal: %v; output:\n%s", err, h.out.String())
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("GET /ping status = %d, want %d", resp.StatusCode, http.StatusOK)
+	if status != http.StatusOK {
+		t.Errorf("GET /ping status = %d, want %d", status, http.StatusOK)
 	}
 
 	h.signal(syscall.SIGTERM)
@@ -447,6 +508,58 @@ func TestSingleTerminationSignalWithoutTrafficExitsZero(t *testing.T) {
 	ws := h.wait(5 * time.Second)
 	if !ws.Exited() || ws.ExitStatus() != 0 {
 		t.Errorf("wait status = %v, want exit status 0", ws)
+	}
+}
+
+func requestSignalHelperPing(ctx context.Context, baseURL string, timeout time.Duration) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/ping", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+func TestSignalHelperPingTimesOutWaitingForHeaders(t *testing.T) {
+	t.Parallel()
+
+	received := make(chan struct{})
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
+		close(received)
+		<-release
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := requestSignalHelperPing(t.Context(), server.URL, 500*time.Millisecond)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GET /ping error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GET /ping did not return before the test deadline")
+	}
+	select {
+	case <-received:
+	default:
+		t.Fatal("server did not receive GET /ping before the request deadline")
 	}
 }
 

@@ -274,23 +274,11 @@ func (h *CreditHandler) GetAutoTopUpSettings(ctx context.Context, req *connect.R
 	if err != nil {
 		return nil, h.internal(ctx, "get_auto_top_up_settings", err)
 	}
-	settings, err := h.autoTopUp(ctx, accountID)
+	settings, err := billing.LoadAutoTopUpSettings(ctx, h.db.Pool, accountID, h.timestamp())
 	if err != nil {
 		return nil, h.internal(ctx, "get_auto_top_up_settings", err)
 	}
 	return connect.NewResponse(&accountsv1.GetAutoTopUpSettingsResponse{Settings: settings}), nil
-}
-
-func (h *CreditHandler) autoTopUp(ctx context.Context, accountID string) (*accountsv1.AutoTopUpSettings, error) {
-	st, err := billing.LoadSettings(ctx, h.db.Pool, accountID)
-	if err != nil {
-		return nil, err
-	}
-	mtd, err := billing.MonthToDate(ctx, h.db.Pool, accountID, h.timestamp())
-	if err != nil {
-		return nil, err
-	}
-	return st.AutoTopUpProto(mtd), nil
 }
 
 // UpdateAutoTopUpSettings replaces the automatic top-up settings. Owner and
