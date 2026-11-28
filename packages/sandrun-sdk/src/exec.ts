@@ -128,7 +128,9 @@ export interface ExecHelperOptions {
  * - It yields output in order and without duplicates, and reports output
  *   that it never received as `OutputLost`.
  * - After it delivers a terminal event, it closes the active stream. If
- *   closing rejects, iteration still ends normally.
+ *   closing rejects on `next()` or `return()`, iteration still ends normally.
+ * - If the caller invokes `throw(value)` at a yielded event, the iterator
+ *   closes and rejects with that value.
  * - Cancellation ends the iterator and stops following the command. The
  *   command keeps running in the guest.
  * - A status that is the server's answer ends the iteration with that
@@ -155,6 +157,8 @@ export async function* execDevSession(
   let terminalDelivered = false;
   let execError: unknown;
   let failures = 0;
+  const consumerThrow = Symbol("consumer throw");
+  let consumerError: unknown;
 
   function* handle(
     event: DevSessionExecEvent["event"],
@@ -240,13 +244,7 @@ export async function* execDevSession(
     }
     // The caller can close this generator while it is yielding the outcome.
     terminalDelivered = true;
-    try {
-      yield outcome;
-    } catch (error) {
-      // Preserve errors thrown into the generator by its caller.
-      terminalDelivered = false;
-      throw error;
-    }
+    yield outcome;
   }
 
   for (let attempt = 0; !abortedBy(signal); attempt++) {
@@ -295,7 +293,15 @@ export async function* execDevSession(
         const wasStarted: boolean = started;
         const previousStdoutOffset = stdoutOffset;
         const previousStderrOffset = stderrOffset;
-        yield* handle(event);
+        for (const output of handle(event)) {
+          try {
+            yield output;
+          } catch (error) {
+            // Mark only throws injected by the caller at the yield.
+            consumerError = error;
+            throw consumerThrow;
+          }
+        }
         progressed ||=
           terminalDelivered ||
           started !== wasStarted ||
@@ -306,6 +312,9 @@ export async function* execDevSession(
         }
       }
     } catch (error) {
+      if (error === consumerThrow) {
+        throw consumerError;
+      }
       // After the terminal event, the only upstream operation left is close.
       if (terminalDelivered || abortedBy(signal)) {
         return;
