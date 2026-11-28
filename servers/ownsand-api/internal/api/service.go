@@ -90,7 +90,8 @@ type Service struct {
 	// Notify, when set, tells the lease holder's event processor that a
 	// transaction wrote control events, so it does not wait for its next
 	// poll.
-	Notify func()
+	Notify  func()
+	control *Control
 
 	// Agent channel dependencies.
 	Hub   *hub.Hub
@@ -143,6 +144,9 @@ type Service struct {
 	// it read the device limits and before it queues the message. It is nil in
 	// production.
 	afterConfigLimitsRead atomic.Pointer[func(deviceID string)]
+
+	// afterInitialReportCommit is a test hook before the first report acknowledgement.
+	afterInitialReportCommit atomic.Pointer[func(*hub.Conn)]
 
 	// importContext is a test hook that importThenCreate calls to build the
 	// context that bounds the whole import flow instead of the
