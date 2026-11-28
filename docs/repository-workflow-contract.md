@@ -14,9 +14,12 @@ Agent instructions live only in `AGENTS.md` files: the root file for repository-
 
 A commit that an AI model wrote or changed names that model in a `Co-Authored-By:` Git trailer at the end of the commit message. This applies to every AI agent and harness (for example Claude Code and Codex). The trailer gives the exact model name and version that the agent used, not only the product or harness name, and the no-reply email address of the model provider:
 
-```text
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-```
+| Provider  | Email address           | Example trailer                                            |
+| --------- | ----------------------- | ---------------------------------------------------------- |
+| Anthropic | `noreply@anthropic.com` | `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`  |
+| OpenAI    | `noreply@openai.com`    | `Co-Authored-By: GPT-6.2 Sol (Codex) <noreply@openai.com>` |
+
+An OpenAI model that runs in Codex adds `(Codex)` after the model name, as in the example.
 
 - Add one trailer for each model that wrote or changed the commit content. Do not add a trailer for a model that only reviewed or read the change.
 - Use the model that actually ran. When a session changes models, name each model that contributed to the commit.
