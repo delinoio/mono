@@ -9,14 +9,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
-	"text/tabwriter"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/text/width"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -236,35 +237,69 @@ func ts(t *timestamppb.Timestamp) string {
 	return t.AsTime().UTC().Format(time.RFC3339)
 }
 
-// printTable prints a table in text mode and returns the first error of w.
-// The tabwriter buffers its output, and a write can flush early, so an error
-// can come from a row write as well as from the final flush.
+// displayWidth counts terminal cells in text that has already been escaped.
+func displayWidth(text string) int {
+	cells := 0
+	for _, r := range text {
+		if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
+			continue
+		}
+		switch width.LookupRune(r).Kind() {
+		case width.EastAsianWide, width.EastAsianFullwidth:
+			cells += 2
+		default:
+			cells++
+		}
+	}
+	return cells
+}
+
+// printTable aligns escaped text in terminal cells and returns the first write error.
 func (a *app) printTable(w io.Writer, headers []string, rows [][]string) error {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	for i, h := range headers {
-		if i > 0 {
-			if _, err := fmt.Fprint(tw, "\t"); err != nil {
-				return err
+	type cell struct {
+		text        string
+		width       int
+		columnWidth *int
+	}
+
+	table := make([][]cell, len(rows)+1)
+	var columns []*int
+	for i, row := range slices.Concat([][]string{headers}, rows) {
+		table[i] = make([]cell, len(row))
+		// A missing gap ends the column, as it did with tabwriter.
+		gaps := max(0, len(row)-1)
+		columns = columns[:min(len(columns), gaps)]
+		for j, value := range row {
+			text := safeText(value)
+			if j == gaps {
+				table[i][j].text = text
+				continue
+			}
+			if j == len(columns) {
+				columns = append(columns, new(int))
+			}
+			width := displayWidth(text)
+			columnWidth := columns[j]
+			*columnWidth = max(*columnWidth, width)
+			table[i][j] = cell{text: text, width: width, columnWidth: columnWidth}
+		}
+	}
+
+	const gap = 2
+	var line bytes.Buffer
+	for _, row := range table {
+		for _, cell := range row {
+			line.WriteString(cell.text)
+			if cell.columnWidth != nil {
+				line.WriteString(strings.Repeat(" ", *cell.columnWidth-cell.width+gap))
 			}
 		}
-		if _, err := fmt.Fprint(tw, safeText(h)); err != nil {
+		line.WriteByte('\n')
+		if _, err := line.WriteTo(w); err != nil {
 			return err
 		}
 	}
-	if _, err := fmt.Fprintln(tw); err != nil {
-		return err
-	}
-	for _, r := range rows {
-		// Escape each cell before inserting the table delimiters.
-		cells := make([]string, len(r))
-		for i, c := range r {
-			cells[i] = safeText(c)
-		}
-		if _, err := fmt.Fprintln(tw, strings.Join(cells, "\t")); err != nil {
-			return err
-		}
-	}
-	return tw.Flush()
+	return nil
 }
 
 // printList prints the whole list response as one JSON object or a text table.
