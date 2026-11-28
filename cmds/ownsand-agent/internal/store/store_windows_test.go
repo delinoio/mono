@@ -72,29 +72,76 @@ func dacl(t *testing.T, path string) ([]aceInfo, bool) {
 	return out, protected
 }
 
-// assertOnlyTrusted fails unless every entry of aces grants access to
-// SYSTEM or Administrators only, and both are present.
-func assertOnlyTrusted(t *testing.T, path string, aces []aceInfo) {
+// FILE_ALL_ACCESS from the Windows SDK. Keep the expectation independent of
+// the mask that protectRoot writes.
+const wantFileAllAccess windows.ACCESS_MASK = 0x001F01FF
+
+func assertTrustedFullControl(t *testing.T, path string, aces []aceInfo, wantInherited bool) {
 	t.Helper()
 	system := wellKnown(t, windows.WinLocalSystemSid)
 	admins := wellKnown(t, windows.WinBuiltinAdministratorsSid)
-	seenSystem, seenAdmins := false, false
+	if err := checkTrustedFullControl(path, aces, system, admins, wantInherited); err != nil {
+		t.Error(err)
+	}
+}
+
+// checkTrustedFullControl checks the inheritable pair on a root or the
+// inherited pair on a child. A child can also have explicit trusted grants.
+func checkTrustedFullControl(path string, aces []aceInfo, system, admins *windows.SID, wantInherited bool) error {
+	systemCount, adminsCount := 0, 0
 	for _, a := range aces {
 		if a.aceType != windows.ACCESS_ALLOWED_ACE_TYPE || a.sid == nil {
-			t.Errorf("%s: unexpected ACE type %d", path, a.aceType)
+			return fmt.Errorf("%s: unexpected ACE type %d", path, a.aceType)
+		}
+		isSystem := a.sid.Equals(system)
+		if !isSystem && !a.sid.Equals(admins) {
+			return fmt.Errorf("%s: unexpected ACE for %s", path, a.sid)
+		}
+		if wantInherited && !a.inherited {
 			continue
 		}
-		switch {
-		case a.sid.Equals(system):
-			seenSystem = true
-		case a.sid.Equals(admins):
-			seenAdmins = true
-		default:
-			t.Errorf("%s: ACE for %s", path, a.sid)
+		if a.mask != wantFileAllAccess {
+			return fmt.Errorf("%s: ACE for %s has mask %#08x, want %#08x", path, a.sid, a.mask, wantFileAllAccess)
+		}
+		if !wantInherited && (a.inherited || a.flags != windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE) {
+			return fmt.Errorf("%s: root ACE for %s has flags %#x, want object and container inheritance", path, a.sid, a.flags)
+		}
+		if isSystem {
+			systemCount++
+		} else {
+			adminsCount++
 		}
 	}
-	if !seenSystem || !seenAdmins {
-		t.Errorf("%s: SYSTEM present %v, Administrators present %v", path, seenSystem, seenAdmins)
+	if systemCount != 1 || adminsCount != 1 {
+		return fmt.Errorf("%s: got %d SYSTEM ACEs and %d Administrators ACEs, want one of each (inherited=%t)", path, systemCount, adminsCount, wantInherited)
+	}
+	return nil
+}
+
+func TestTrustedFullControlACEs(t *testing.T) {
+	t.Parallel()
+	system := wellKnown(t, windows.WinLocalSystemSid)
+	admins := wellKnown(t, windows.WinBuiltinAdministratorsSid)
+	incompleteMask := wantFileAllAccess &^ windows.WRITE_OWNER
+	aces := [...]aceInfo{
+		{aceType: windows.ACCESS_ALLOWED_ACE_TYPE, sid: system, mask: wantFileAllAccess, inherited: true},
+		{aceType: windows.ACCESS_ALLOWED_ACE_TYPE, sid: admins, mask: wantFileAllAccess, inherited: true},
+		{aceType: windows.ACCESS_ALLOWED_ACE_TYPE, sid: system, mask: incompleteMask},
+	}
+	const path = "fixture"
+	if err := checkTrustedFullControl(path, aces[:], system, admins, true); err != nil {
+		t.Fatalf("full-control inherited pair with a narrower explicit grant: %v", err)
+	}
+	for i, sid := range []*windows.SID{system, admins} {
+		t.Run(sid.String(), func(t *testing.T) {
+			incomplete := aces
+			incomplete[i].mask = incompleteMask
+			err := checkTrustedFullControl(path, incomplete[:], system, admins, true)
+			want := fmt.Sprintf("%s: ACE for %s has mask %#08x, want %#08x", path, sid, incompleteMask, wantFileAllAccess)
+			if err == nil || err.Error() != want {
+				t.Errorf("checkTrustedFullControl = %v, want %q", err, want)
+			}
+		})
 	}
 }
 
@@ -152,18 +199,13 @@ func TestOpenRestrictsStateDirACL(t *testing.T) {
 	if !protected {
 		t.Error("the DACL of the state directory inherits from its parent")
 	}
-	assertOnlyTrusted(t, dir, aces)
-	if len(aces) != 2 {
-		t.Errorf("state directory has %d ACEs, want 2", len(aces))
-	}
+	assertTrustedFullControl(t, dir, aces, false)
 	for _, rel := range []string{IdentityFile, SandboxesDir, filepath.Join(SandboxesDir, "sb1.json"), VMsDir} {
 		path := filepath.Join(dir, rel)
 		aces, _ := dacl(t, path)
-		assertOnlyTrusted(t, path, aces)
-		for _, a := range aces {
-			if !a.inherited {
-				t.Errorf("%s: explicit ACE for %s, want inherited", path, a.sid)
-			}
+		assertTrustedFullControl(t, path, aces, true)
+		if len(aces) != 2 {
+			t.Errorf("%s: got %d ACEs, want only the two inherited ACEs", path, len(aces))
 		}
 	}
 	for _, sid := range []*windows.SID{
@@ -244,10 +286,10 @@ func TestOpenCorrectsExistingStateDirACL(t *testing.T) {
 		if !protected || len(aces) != 2 {
 			t.Fatalf("Open %d: root protected %v with %d ACEs", i, protected, len(aces))
 		}
-		assertOnlyTrusted(t, dir, aces)
+		assertTrustedFullControl(t, dir, aces, false)
 
 		idAces, _ := dacl(t, identity)
-		assertOnlyTrusted(t, identity, idAces)
+		assertTrustedFullControl(t, identity, idAces, true)
 		if hasSID(idAces, everyone) {
 			t.Errorf("Open %d: identity.json still grants Everyone", i)
 		}
@@ -255,10 +297,12 @@ func TestOpenCorrectsExistingStateDirACL(t *testing.T) {
 		if pProtected || hasSID(pAces, everyone) {
 			t.Errorf("Open %d: protected child protected=%v everyone=%v", i, pProtected, hasSID(pAces, everyone))
 		}
-		assertOnlyTrusted(t, protectedFile, pAces)
+		assertTrustedFullControl(t, protectedFile, pAces, true)
 
 		vmAces, _ := dacl(t, vmDir)
 		diskAces, _ := dacl(t, disk)
+		assertTrustedFullControl(t, vmDir, vmAces, true)
+		assertTrustedFullControl(t, disk, diskAces, true)
 		if hasSID(vmAces, vmGroup) || hasSID(diskAces, vmGroup) {
 			t.Errorf("Open %d: the legacy worker group grant remains on the VM directory or disk", i)
 		}
@@ -298,7 +342,7 @@ func TestWipeLocalDataKeepsACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	aces, _ := dacl(t, s.Path(VMsDir))
-	assertOnlyTrusted(t, s.Path(VMsDir), aces)
+	assertTrustedFullControl(t, s.Path(VMsDir), aces, true)
 }
 
 func TestOwnerAllowed(t *testing.T) {
