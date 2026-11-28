@@ -96,6 +96,7 @@ import {
   integrationOpenings,
   integrationPermissionFixture,
 } from "../e2e/integration-permission-fixture.ts";
+import { organizationCreationFixture } from "../e2e/organization-creation-fixture.ts";
 import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
 import {
   linkedSetupTransport,
@@ -511,6 +512,40 @@ describe("organizations", () => {
     await settle(80);
     expect(window.location.pathname).toMatch(/^\/orgs\/[0-9a-f-]+$/);
     expect(await screen.findByText("Set up SandRun")).toBeTruthy();
+  });
+
+  test("opens the created organization while the list continuation waits", async () => {
+    const fixture = organizationCreationFixture(
+      createMockTransport(),
+      "hold-list",
+    );
+    renderConsole("/", { transport: fixture.transport, staleTime: 10_000 });
+    await screen.findByRole("link", { name: /Acme Robotics/ });
+    await click(screen.getByRole("button", { name: "Create organization" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Create an organization",
+    });
+    await type(
+      within(dialog).getByRole("textbox", { name: "Organization name" }),
+      "New testing org",
+    );
+    await click(within(dialog).getByRole("button", { name: "Create" }));
+
+    try {
+      await waitFor(() => expect(fixture.state.continuationPending).toBe(true));
+      expect(fixture.state.createdId).not.toBe("");
+      expect(window.location.pathname).toBe(`/orgs/${fixture.state.createdId}`);
+      expect(screen.queryByRole("dialog")).toBeNull();
+    } finally {
+      await act(async () => fixture.releaseContinuation());
+    }
+
+    const switcher = await screen.findByRole("combobox", {
+      name: "Organization",
+    });
+    await waitFor(() =>
+      expect(switcher.textContent).toContain("New testing org"),
+    );
   });
 
   test("masks invitations by default and re-masks after invalid submission", async () => {

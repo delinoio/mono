@@ -6,6 +6,10 @@ import {
   INTEGRATION_PERMISSION_FIXTURE,
   integrationPermissionFixture,
 } from "./integration-permission-fixture.ts";
+import {
+  organizationCreationFixture,
+  ORGANIZATION_CREATION_FIXTURE,
+} from "./organization-creation-fixture.ts";
 import { createMockTransport as createSettingsMock } from "./settings-mock.ts";
 import {
   pagedProfileIntegrations,
@@ -19,6 +23,10 @@ import {
 
 declare global {
   interface Window {
+    sandrunOrganizationCreationFixture?: Omit<
+      ReturnType<typeof organizationCreationFixture>,
+      "transport"
+    >;
     sandrunIntegrationPermissionFixture?: Omit<
       ReturnType<typeof integrationPermissionFixture>,
       "transport"
@@ -31,6 +39,20 @@ declare global {
 }
 
 export function createMockTransport(options?: MockTransportOptions): Transport {
+  const createMode = sessionStorage.getItem(ORGANIZATION_CREATION_FIXTURE);
+  if (
+    createMode === "hold-list" ||
+    createMode === "hold-create" ||
+    createMode === "fail-create"
+  ) {
+    const { transport, ...fixture } = organizationCreationFixture(
+      createSettingsMock(options),
+      createMode,
+    );
+    window.sandrunOrganizationCreationFixture = fixture;
+    return transport;
+  }
+
   const setup = sessionStorage.getItem(SETUP_GUIDANCE_FIXTURE);
   if (setup === "with-work-source") {
     return linkedSetupTransport(createSettingsMock(options), [
