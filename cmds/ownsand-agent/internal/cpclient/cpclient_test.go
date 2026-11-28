@@ -73,6 +73,10 @@ func TestNewHTTPClientRejectsInvalidOrigin(t *testing.T) {
 		{"HTTP with port only", "http://:18300", "requires a hostname"},
 		{"malformed URL", "https://example.test:bad-port/control", "invalid control plane origin URL"},
 		{"unsupported scheme", "ftp://example.test", "must use https or http"},
+		{"query", "https://agent.example.test?source=setup", "must not include a query"},
+		{"empty query", "https://agent.example.test?", "must not include a query"},
+		{"fragment", "https://agent.example.test#setup", "must not include a fragment"},
+		{"empty fragment", "https://agent.example.test#", "must not include a fragment"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client, err := NewHTTPClient(tc.origin, nil)
@@ -91,6 +95,7 @@ func TestNewHTTPClientSelectsHTTP2Transport(t *testing.T) {
 		{"https://example.test", true},
 		{"http://127.0.0.1:18300", false},
 		{"http://[::1]:18300", false},
+		{"https://example.test:8443/control%3F%23/", true},
 	} {
 		t.Run(tc.origin, func(t *testing.T) {
 			client, err := NewHTTPClient(tc.origin, nil)
