@@ -495,26 +495,35 @@ describe("organization settings", () => {
   });
 
   test("validates the ranges of the control plane", () => {
-    expect(validateDraft(saved)).toEqual({});
+    expect(validateDraft(saved, saved)).toEqual({});
     expect(
-      validateDraft({ ...saved, pauseDelayMinutes: 0 }).pauseDelay,
+      validateDraft({ ...saved, pauseDelayMinutes: 0 }, saved).pauseDelay,
     ).toBeDefined();
     expect(
-      validateDraft({ ...saved, pauseDelayMinutes: 1441 }).pauseDelay,
+      validateDraft({ ...saved, pauseDelayMinutes: 1441 }, saved).pauseDelay,
     ).toBeDefined();
     expect(
-      validateDraft({ ...saved, pauseDelayMinutes: 1.5 }).pauseDelay,
+      validateDraft({ ...saved, pauseDelayMinutes: 1.5 }, saved).pauseDelay,
     ).toBeDefined();
     expect(
-      validateDraft({ ...saved, retentionDays: 366 }).retentionDays,
+      validateDraft({ ...saved, retentionDays: 366 }, saved).retentionDays,
     ).toBeDefined();
     expect(
-      validateDraft({
-        ...saved,
-        retention: "unlimited" as typeof saved.retention,
-        retentionDays: null,
-      }),
+      validateDraft(
+        {
+          ...saved,
+          retention: "unlimited" as typeof saved.retention,
+          retentionDays: null,
+        },
+        saved,
+      ),
     ).toEqual({});
+  });
+
+  test("accepts an unchanged whole-second pause delay of the server", () => {
+    // 90 seconds is valid for the control plane but not a whole minute.
+    const server = { ...saved, pauseDelayMinutes: 1.5 };
+    expect(validateDraft({ ...server, retentionDays: 60 }, server)).toEqual({});
   });
 });
 

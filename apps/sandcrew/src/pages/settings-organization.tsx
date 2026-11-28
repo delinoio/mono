@@ -79,20 +79,26 @@ const LIMITS = {
 };
 
 /**
- * Validates a draft. Returns the catalog keys of field errors; an empty
- * object means valid.
+ * Validates a draft against the saved values. Returns the catalog keys of
+ * field errors; an empty object means valid. An unchanged pause delay is
+ * not checked: the control plane allows whole seconds (for example 90
+ * seconds), which the form cannot enter but must keep.
  */
-export function validateDraft(draft: SettingsDraft): {
+export function validateDraft(
+  draft: SettingsDraft,
+  saved: SettingsDraft,
+): {
   pauseDelay?: MessageKey;
   retentionDays?: MessageKey;
 } {
   const errors: { pauseDelay?: MessageKey; retentionDays?: MessageKey } = {};
   const delay = draft.pauseDelayMinutes;
   if (
-    delay === null ||
-    !Number.isInteger(delay) ||
-    delay < PAUSE_DELAY_MIN_MINUTES ||
-    delay > PAUSE_DELAY_MAX_MINUTES
+    delay !== saved.pauseDelayMinutes &&
+    (delay === null ||
+      !Number.isInteger(delay) ||
+      delay < PAUSE_DELAY_MIN_MINUTES ||
+      delay > PAUSE_DELAY_MAX_MINUTES)
   ) {
     errors.pauseDelay = "orgSettings.error.pauseDelay";
   }
@@ -215,7 +221,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const nextErrors = validateDraft(draft);
+    const nextErrors = validateDraft(draft, saved);
     setErrors(nextErrors);
     if (nextErrors.pauseDelay || nextErrors.retentionDays) return;
     if (change === undefined || update.isPending) return;
