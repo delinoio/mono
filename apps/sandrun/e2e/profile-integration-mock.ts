@@ -23,6 +23,10 @@ import {
   requestCancellationFixture,
 } from "./request-cancellation-fixture.ts";
 import { observeDisplayNameWrites } from "./display-name-fixture.ts";
+import {
+  OWN_SAND_CAPACITY_FIXTURE,
+  ownSandCapacityFixture,
+} from "./ownsand-capacity-fixture.ts";
 import { createMockTransport as createSettingsMock } from "./settings-mock.ts";
 import {
   pagedProfileIntegrations,
@@ -39,6 +43,10 @@ declare global {
     sandrunDevSessionReads?: boolean[];
     sandrunRequestCancellationFixture?: Omit<
       ReturnType<typeof requestCancellationFixture>,
+      "transport"
+    >;
+    sandrunOwnSandCapacityFixture?: Omit<
+      ReturnType<typeof ownSandCapacityFixture>,
       "transport"
     >;
     sandrunOrganizationCreationFixture?: Omit<
@@ -84,6 +92,14 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
       createSettingsMock(options),
     );
     window.sandrunRequestCancellationFixture = fixture;
+    return transport;
+  }
+
+  if (sessionStorage.getItem(OWN_SAND_CAPACITY_FIXTURE) === "enabled") {
+    const { transport, ...fixture } = ownSandCapacityFixture(
+      createSettingsMock(options),
+    );
+    window.sandrunOwnSandCapacityFixture = fixture;
     return transport;
   }
   const createMode = sessionStorage.getItem(ORGANIZATION_CREATION_FIXTURE);

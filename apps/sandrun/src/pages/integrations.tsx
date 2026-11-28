@@ -36,6 +36,7 @@ import {
   type OwnSandLink,
   OwnSandLinkService,
 } from "@delino/sandrun-protos/v1/ownsand_link_pb";
+import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { useLayoutEffect, useRef, useState } from "react";
 import {
@@ -129,14 +130,28 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
   const { organizationId } = useOrg();
   const transport = useTransport();
   const queryClient = useQueryClient();
-  const refresh = () => invalidateServices(queryClient, OwnSandLinkService);
+  const refreshAfterLinkChange = (
+    _response: unknown,
+    { organizationId }: { organizationId?: string },
+  ) => {
+    if (organizationId !== undefined) {
+      const { queryKey } = createQueryOptions(
+        WorkService.method.getCapacity,
+        { organizationId },
+        { transport },
+      );
+      // Reset drops the former pool and cancels any in-flight capacity request.
+      void queryClient.resetQueries({ queryKey, exact: true });
+    }
+    return invalidateServices(queryClient, OwnSandLinkService);
+  };
   const getLink = OwnSandLinkService.method.getOwnSandLink;
   const link = useQuery(getLink, { organizationId });
   const setLink = useMutation(OwnSandLinkService.method.setOwnSandLink, {
-    onSuccess: refresh,
+    onSuccess: refreshAfterLinkChange,
   });
   const removeLink = useMutation(OwnSandLinkService.method.removeOwnSandLink, {
-    onSuccess: refresh,
+    onSuccess: refreshAfterLinkChange,
   });
   const [dialog, setDialog] = useState<OwnSandLinkDialog>();
   const [ownsandOrg, setOwnsandOrg] = useState("");
