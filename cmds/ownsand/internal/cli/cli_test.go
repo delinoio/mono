@@ -1013,6 +1013,20 @@ func TestFileReadWrite(t *testing.T) {
 	}
 }
 
+const invalidGuestPathStderr = "error: invalid path: must be an absolute guest path\nRun 'ownsand help' for usage.\n"
+
+func TestFileReadInvalidGuestPathBeforeSettingUpDestination(t *testing.T) {
+	r := newRunner(t)
+	to := filepath.Join(t.TempDir(), "missing", "out.txt")
+	res := r.run("--no-color", "file", "read", r.f.sb, "relative.txt", "--to", to)
+	if res != (result{code: ExitUsage, stderr: invalidGuestPathStderr}) {
+		t.Errorf("want an invalid guest path error before setting up the destination, got %+v", res)
+	}
+	if calls := r.f.callNames(); len(calls) != 0 {
+		t.Errorf("API received calls for an invalid guest path: %v", calls)
+	}
+}
+
 func TestFileReadDotDotAfterMissingDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows can normalize user-typed paths before lookup")

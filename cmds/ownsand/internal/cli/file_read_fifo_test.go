@@ -147,6 +147,27 @@ func (r *runner) runCtx(ctx context.Context, args ...string) result {
 	return result{code: code, stdout: out.String(), stderr: errb.String()}
 }
 
+func TestFileReadInvalidGuestPathBeforeOpeningFIFO(t *testing.T) {
+	r := newRunner(t)
+	fifo := makeFIFO(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	res := r.runCtx(ctx, "--no-color", "file", "read", r.f.sb, "relative.txt", "--to", fifo)
+	if ctx.Err() != nil && res.code == ExitError {
+		// Release the blocked open if the regression returns.
+		if err := readEmptyTestFIFO(fifo); err != nil {
+			t.Errorf("release FIFO open: %v", err)
+		}
+	}
+	if ctx.Err() != nil || res != (result{code: ExitUsage, stderr: invalidGuestPathStderr}) {
+		t.Errorf("want usage error before the deadline, got %+v (context error: %v)", res, ctx.Err())
+	}
+	if calls := r.f.callNames(); len(calls) != 0 {
+		t.Errorf("API received calls for an invalid guest path: %v", calls)
+	}
+}
+
 // A FIFO without a reader blocks open(2) for writing. Cancelling the command
 // must end the wait before any request reaches the API.
 func TestFileReadFIFOWithoutReaderEndsOnCancel(t *testing.T) {
