@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/delinoio/mono/servers/internal/dbtestslot"
 	"github.com/delinoio/mono/servers/internal/dbtesturl"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 )
@@ -56,6 +57,9 @@ func NewURLAtVersion(t testing.TB, maxVersion int64) string {
 func newURL(t testing.TB, maxVersion int64) string {
 	t.Helper()
 	admin := URL(t)
+	// Take the slot before the setup timeout starts: the wait for a slot
+	// can be longer than the setup.
+	dbtestslot.Acquire(t, admin)
 	// Pool options configure the generated database's pool. They must not
 	// reach Postgres as session parameters on the admin connections.
 	adminConfig, err := pgxpool.ParseConfig(admin)

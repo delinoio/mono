@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+	"github.com/delinoio/mono/servers/internal/dbtestslot"
 	"github.com/delinoio/mono/servers/internal/dbtesturl"
 )
 
@@ -64,6 +65,9 @@ func NewEmptyURL(t testing.TB) string {
 func newURL(t testing.TB, version int64) string {
 	t.Helper()
 	admin := URL(t)
+	// Take the slot before the setup timeout starts: the wait for a slot
+	// can be longer than the setup.
+	dbtestslot.Acquire(t, admin)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	// Close on a server error so pgx returns the error even if the
