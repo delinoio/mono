@@ -7,7 +7,7 @@
 // - the SDK runs in browsers too, so runtime sources do not import `node:`
 //   modules (tests and the test helpers under `testing/` may).
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
@@ -38,7 +38,8 @@ function check(path) {
   if (!name.endsWith(".test.ts") && /\bconsole\s*\./.test(source)) {
     failures.push(`${name}: the SDK must not log through console`);
   }
-  const runtime = !name.endsWith(".test.ts") && !name.startsWith("testing");
+  const [firstComponent] = name.split(sep, 1);
+  const runtime = !name.endsWith(".test.ts") && firstComponent !== "testing";
   const specifiers = moduleSpecifiers(name, source);
   if (
     runtime &&
