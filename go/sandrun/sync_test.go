@@ -3227,9 +3227,18 @@ func TestDownloadFileAndDirectory(t *testing.T) {
 
 	// A file over the limit is rejected before it is read.
 	big := filepath.Join(ws, "big.bin")
-	f, _ := os.Create(big)
-	_ = f.Truncate(DownloadFileLimit + 1)
-	f.Close()
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatalf("create oversized download fixture %q: %v", big, err)
+	}
+	truncateErr := f.Truncate(DownloadFileLimit + 1)
+	closeErr := f.Close()
+	if truncateErr != nil {
+		t.Fatalf("truncate oversized download fixture %q: %v", big, truncateErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close oversized download fixture %q: %v", big, closeErr)
+	}
 	reads := srv.Calls("/delino.sandrun.v1.DevSessionService/ReadDevSessionFile")
 	_, err = c.Download(ctx, DownloadParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "big.bin", LocalPath: filepath.Join(local, "big")})
 	var le *LimitError
