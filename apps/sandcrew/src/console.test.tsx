@@ -499,6 +499,50 @@ describe("chat view", () => {
     expect(await screen.findByText("Turn stopped")).toBeTruthy();
   });
 
+  test("reuses the message ID when a failed send is retried", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    const sent: { clientMessageId: string; text: string }[] = [];
+    let loseResponse = true;
+    const transport: Transport = {
+      ...base,
+      async unary(method, signal, timeout, header, input, contextValues) {
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        if (method.name === "SendMessage") {
+          sent.push(input as { clientMessageId: string; text: string });
+          // The server accepted the first message, but its response is lost.
+          if (loseResponse) {
+            loseResponse = false;
+            throw new ConnectError("connection reset", Code.Unavailable);
+          }
+        }
+        return response;
+      },
+    };
+    renderConsole(chatPath, { transport });
+    const message = await screen.findByRole("textbox", { name: "Message" });
+    await type(message, "Explain the fix");
+    await click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect((message as HTMLTextAreaElement).value).toBe("Explain the fix");
+    await click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sent).toHaveLength(2));
+    expect(sent[1]!.clientMessageId).toBe(sent[0]!.clientMessageId);
+    await waitFor(() =>
+      expect((message as HTMLTextAreaElement).value).toBe(""),
+    );
+    await type(message, "Explain the fix");
+    await click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sent).toHaveLength(3));
+    expect(sent[2]!.clientMessageId).not.toBe(sent[0]!.clientMessageId);
+  });
+
   test("stops a turn that waits for a permission answer", async () => {
     const { transport, calls } = recording(
       createMockTransport({ agentStepMs: 5 }),

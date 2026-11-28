@@ -409,6 +409,11 @@ function Composer({
   const { organizationId } = useOrg();
   const [text, setText] = useState("");
   const [error, setError] = useState<string>();
+  // The ID of the last send that did not succeed. A retry of the same text
+  // reuses it, so the API deduplicates a message whose response was lost.
+  const unconfirmed = useRef<{ text: string; clientMessageId: string }>(
+    undefined,
+  );
   const send = useMutation(SessionService.method.sendMessage, {
     onSuccess: onSessionChange,
   });
@@ -431,13 +436,19 @@ function Composer({
       setError("Enter a message.");
       return;
     }
+    const clientMessageId =
+      unconfirmed.current?.text === message
+        ? unconfirmed.current.clientMessageId
+        : uuidV7();
+    unconfirmed.current = { text: message, clientMessageId };
     try {
       await send.mutateAsync({
         organizationId,
         sessionId: session.sessionId,
-        clientMessageId: uuidV7(),
+        clientMessageId,
         text: message,
       });
+      unconfirmed.current = undefined;
       setText("");
     } catch {
       // The composer shows the mutation error and keeps the text.
