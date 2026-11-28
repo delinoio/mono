@@ -5,6 +5,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -65,6 +66,8 @@ var stepWallDeltas = map[string]time.Duration{
 // have fired many times by then.
 const stepSettle = 150 * time.Millisecond
 
+const stepShutdownTimeout = 2 * time.Second
+
 // stepConn is a running connection on a stepClock. recvCh feeds its recv and
 // sent receives the frames that its send wrote.
 type stepConn struct {
@@ -79,6 +82,11 @@ type stepConn struct {
 
 func runStepConn(t *testing.T, limits Limits) *stepConn {
 	t.Helper()
+	return runStepConnWithSend(t, limits, nil)
+}
+
+func runStepConnWithSend(t *testing.T, limits Limits, wrapSend func(func(*ownsandv1.DataFrame) error) func(*ownsandv1.DataFrame) error) *stepConn {
+	t.Helper()
 	clk := newStepClock()
 	c := NewConnWithClock(context.Background(), "device", 1, limits, clk)
 	sc := &stepConn{c: c, clk: clk, recvCh: make(chan *ownsandv1.DataFrame), sent: make(chan *ownsandv1.DataFrame, 64)}
@@ -90,9 +98,21 @@ func runStepConn(t *testing.T, limits Limits) *stepConn {
 			return nil, c.Err()
 		}
 	}
-	send := func(f *ownsandv1.DataFrame) error {
-		sc.sent <- f
+	stop := make(chan struct{})
+	c.SetSendInterrupt(func() error {
+		close(stop)
 		return nil
+	})
+	send := func(f *ownsandv1.DataFrame) error {
+		select {
+		case sc.sent <- f:
+			return nil
+		case <-stop:
+			return c.Err()
+		}
+	}
+	if wrapSend != nil {
+		send = wrapSend(send)
 	}
 	done := make(chan error, 1)
 	finished := make(chan struct{})
@@ -103,9 +123,97 @@ func runStepConn(t *testing.T, limits Limits) *stepConn {
 	sc.done, sc.finished = done, finished
 	t.Cleanup(func() {
 		c.Close(errors.New("test done"))
-		<-finished
+		select {
+		case <-finished:
+		case <-time.After(stepShutdownTimeout):
+			t.Error("clock-step connection did not finish after close")
+		}
 	})
 	return sc
+}
+
+func TestClockStepFixtureStopsBlockedWriter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		blockedFrame := stepKeepaliveFrame()
+		entered := make(chan struct{})
+		sendResult := make(chan error, 1)
+		returnSend := make(chan struct{})
+		allowReturn := sync.OnceFunc(func() { close(returnSend) })
+		defer allowReturn()
+
+		sc := runStepConnWithSend(t, stepLimits, func(send func(*ownsandv1.DataFrame) error) func(*ownsandv1.DataFrame) error {
+			return func(f *ownsandv1.DataFrame) error {
+				if f != blockedFrame {
+					return send(f)
+				}
+				close(entered)
+				err := send(f)
+				sendResult <- err
+				<-returnSend
+				return err
+			}
+		})
+		defer func() {
+			if t.Failed() {
+				// Free one slot on failure so a broken interrupt cannot strand the send.
+				sc.c.Close(errors.New("test failed"))
+				select {
+				case <-sc.sent:
+				default:
+				}
+			}
+		}()
+
+		sc.awaitFrame(t) // supported frame kinds
+		filler := stepKeepaliveFrame()
+		for range cap(sc.sent) {
+			if err := sc.c.enqueue(t.Context(), filler); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := sc.c.enqueue(t.Context(), blockedFrame); err != nil {
+			t.Fatal(err)
+		}
+		awaitSendEntry(t, entered, sc.done)
+		synctest.Wait()
+		if len(sc.sent) != cap(sc.sent) {
+			t.Fatalf("capture holds %d frames, want %d", len(sc.sent), cap(sc.sent))
+		}
+		select {
+		case err := <-sendResult:
+			t.Fatalf("send returned %v while capture was full and the connection was open", err)
+		default:
+		}
+
+		cause := errors.New("close with a full capture channel")
+		sc.c.Close(cause)
+		select {
+		case err := <-sendResult:
+			if err != cause {
+				t.Fatalf("blocked send returned %v, want %v", err, cause)
+			}
+		case <-time.After(stepShutdownTimeout):
+			t.Fatal("closing the connection did not release the blocked send")
+		}
+
+		// Even after the fallback grace period, Run must wait for the writer.
+		time.Sleep(2 * writerGrace)
+		synctest.Wait()
+		select {
+		case <-sc.finished:
+			t.Fatal("Run finished before the writer could return from send")
+		default:
+		}
+		allowReturn()
+		select {
+		case <-sc.finished:
+			if err := <-sc.done; err != cause {
+				t.Fatalf("Run returned %v, want %v", err, cause)
+			}
+		case <-time.After(stepShutdownTimeout):
+			t.Fatal("Run did not finish after the blocked send returned")
+		}
+	})
 }
 
 // awaitFrame returns the next frame that the connection sent, or fails.
