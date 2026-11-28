@@ -472,18 +472,7 @@ func TestIdentityReadFailureIsNotNotEnrolled(t *testing.T) {
 
 // A valid identity is enrolled: status reports it and exits 0.
 func TestStatusWithValidIdentity(t *testing.T) {
-	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
-	clearAgentEnv(t)
-	dir := t.TempDir()
-	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
-	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.SaveIdentity(&store.Identity{DeviceID: "dev-1", OrganizationID: "org-1", PrivateKeySeed: make([]byte, 32)}); err != nil {
-		t.Fatal(err)
-	}
+	statusFixture(t)
 	var out, errb bytes.Buffer
 	if code := run([]string{"status", "--no-color"}, nil, &out, &errb); code != exitOK || !strings.Contains(out.String(), "Enrollment: enrolled (device dev-1, organization org-1)") {
 		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
@@ -494,6 +483,7 @@ func TestStatusWithValidIdentity(t *testing.T) {
 // store, so a test can place a status.json of its choice.
 func statusFixture(t *testing.T) *store.Store {
 	t.Helper()
+	requireStatusFixturePrivileges(t)
 	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
 	clearAgentEnv(t)
 	dir := t.TempDir()
