@@ -139,7 +139,7 @@ The owning domain contracts hold the details:
 
 - Metrics: the default retention of the Grafana Cloud plan, one SandRun dashboard committed as Grafana dashboard JSON, and Grafana Cloud alerts to the operators' contact point ([control plane contract](servers-sandrun-api-foundation.md#metrics)).
 - Runner programs: SandRun installs them on the guest OSes that each workload kind and vendor allows (Linux, macOS and Windows; Claude Code and OpenAI Codex on Linux and macOS only). It pins the GitHub Actions runner, `codex` and Node.js, and Renovate updates the pins. It installs `claude`, Cursor `agent` and `devin` at the version of the official installer, with a minimum version only for `claude` ([control plane contract](servers-sandrun-api-foundation.md#runner-installation)).
-- Storage: ended requests and runners are kept for 30 days and audit events for 90 days, the migration tool is goose, and the backups are the PlanetScale Postgres defaults ([control plane contract](servers-sandrun-api-foundation.md#storage)).
+- Storage: ended requests and runners are kept for at least 30 days. Runner retention also waits for pending sandbox cleanup to clear. Audit events are kept for 90 days. The migration tool is goose, and backups use the PlanetScale Postgres defaults ([control plane contract](servers-sandrun-api-foundation.md#storage)).
 - Rate limits: the same values as OwnSand ([control plane contract](servers-sandrun-api-foundation.md#security)).
 - TypeScript SDK package: the workspace package `sandrun-sdk` is private and unpublished, like `ownsand-sdk` ([SDK contract](packages-sandrun-sdk-foundation.md#dependencies-and-integrations)).
 

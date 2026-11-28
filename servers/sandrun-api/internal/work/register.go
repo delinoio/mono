@@ -43,7 +43,7 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "runner_reconciler", RunFunc: e.RunReconciler})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "work_gauges", RunFunc: e.RunGauges})
 	r.AddDailyJob(jobs.SQLJob(r.Service.DB, "ended_requests", "DELETE FROM requests WHERE end_time < $1::timestamptz - interval '30 days'"))
-	r.AddDailyJob(jobs.SQLJob(r.Service.DB, "ended_runners", "DELETE FROM runners WHERE end_time < $1::timestamptz - interval '30 days'"))
+	r.AddDailyJob(jobs.SQLJob(r.Service.DB, "ended_runners", "DELETE FROM runners WHERE end_time < $1::timestamptz - interval '30 days' AND NOT sandbox_cleanup"))
 
 	links.OnRemoval(link.RemovalHook{
 		Name: "work",

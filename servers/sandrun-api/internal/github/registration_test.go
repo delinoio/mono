@@ -16,7 +16,10 @@ import (
 	"connectrpc.com/connect"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/githubapi/githubfake"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/jobs"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
 )
 
@@ -169,7 +172,31 @@ func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
 	t.Parallel()
 	for _, status := range []int{http.StatusNoContent, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			w := newGHWorld(t, worldOpts{})
+			nextRetention := make(chan struct{})
+			w := newGHWorld(t, worldOpts{}, func(o *app.Options) {
+				o.DailyJobInterval = 50 * time.Millisecond
+				o.Extensions = append(o.Extensions, func(r *app.Registry) error {
+					// Pause after the registered jobs so cleanup can finish
+					// before the test allows the next retention pass.
+					r.AddDailyJob(jobs.Job{Name: "test_retention_barrier", Run: func(ctx context.Context, _ time.Time) (int64, error) {
+						select {
+						case <-nextRetention:
+							return 0, nil
+						case <-ctx.Done():
+							return 0, ctx.Err()
+						}
+					}})
+					return nil
+				})
+			})
+			runNextRetention := func() {
+				t.Helper()
+				select {
+				case nextRetention <- struct{}{}:
+				case <-time.After(10 * time.Second):
+					t.Fatal("timed out waiting for the daily jobs")
+				}
+			}
 			w.link(t, 501, "acme")
 			w.createProfile(t, ghProfile("linux", 0))
 
@@ -229,7 +256,7 @@ func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
 				t.Helper()
 				if err := w.env.DB.Pool.QueryRow(t.Context(), `SELECT g.github_runner_id, r.sandbox_cleanup, g.registration_removed
 					FROM runners r JOIN github_runners g USING (runner_id) WHERE r.runner_id = $1`, runnerID).Scan(&id, &pending, &removed); err != nil {
-					t.Fatal(err)
+					t.Fatalf("read runner and its GitHub registration: %v", err)
 				}
 				return id, pending, removed
 			}
@@ -252,6 +279,68 @@ func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
 				t.Fatal("teardown lost the cleanup mark or began sandbox deletion")
 			}
 			t.Logf("GitHub returned HTTP 503 on repeated deletion of the stored registration. SandRun kept the sandbox and cleanup mark. RemoveOwnSandLink returned %s.", connect.CodeOf(err))
+
+			endedAt := w.runner(t, runnerID).GetEndedAt()
+			if endedAt == nil {
+				t.Fatal("failed runner has no end time")
+			}
+			jobTime := endedAt.AsTime().Add(31 * 24 * time.Hour)
+			w.env.Clock.Advance(jobTime.Sub(w.env.Clock.Now()))
+			db := w.env.DB.Pool
+			ctx := t.Context()
+			older, boundary, younger, active, expiredRequest := api.NewID(), api.NewID(), api.NewID(), api.NewID(), api.NewID()
+			// The active control uses the existing fake sandbox so the reconciler
+			// does not end it before the first retention pass.
+			if tag, err := db.Exec(ctx, `
+				INSERT INTO runners (runner_id, organization_id, runner_profile_id, kind, guest_os, state,
+					idempotency_key, create_request, ownsand_sandbox_id, create_time, end_time, update_time)
+				SELECT control.id, r.organization_id, r.runner_profile_id, r.kind, r.guest_os,
+					CASE WHEN control.end_time IS NULL THEN $7::smallint ELSE r.state END,
+					control.id, r.create_request, CASE WHEN control.end_time IS NULL THEN r.ownsand_sandbox_id END,
+					r.create_time, control.end_time, r.update_time
+				FROM runners r CROSS JOIN (VALUES
+					($2::uuid, $6::timestamptz - interval '31 days'),
+					($3::uuid, $6::timestamptz - interval '30 days'),
+					($4::uuid, $6::timestamptz - interval '29 days'),
+					($5::uuid, NULL)
+				) control(id, end_time)
+				WHERE r.runner_id = $1`, runnerID, older, boundary, younger, active, jobTime,
+				int16(sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)); err != nil || tag.RowsAffected() != 4 {
+				t.Fatalf("insert retention control runners: %v, %v", tag, err)
+			}
+			if tag, err := db.Exec(ctx, `
+				INSERT INTO requests (request_id, organization_id, runner_profile_id, kind, source, source_key,
+					state, priority, queue_time, queue_deadline, end_time, create_time, update_time)
+				SELECT $2::uuid, organization_id, runner_profile_id, kind, source, $2::uuid::text,
+					$3, priority, queue_time, queue_deadline, $4, create_time, update_time
+				FROM requests WHERE organization_id = $1 LIMIT 1`, w.org.ID, expiredRequest,
+				int16(sandrunv1.RequestState_REQUEST_STATE_FAILED), endedAt.AsTime()); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("insert expired request: %v, %v", tag, err)
+			}
+			rowsExist := func(query, id string) bool {
+				t.Helper()
+				var exists bool
+				if err := db.QueryRow(ctx, query, id).Scan(&exists); err != nil {
+					t.Fatal(err)
+				}
+				return exists
+			}
+			const runnerExists = "SELECT EXISTS (SELECT 1 FROM runners WHERE runner_id = $1)"
+			runNextRetention()
+			eventually(t, "unmarked 31-day-old runner deleted by retention", func() bool {
+				return !rowsExist(runnerExists, older)
+			})
+			if id, pending, removed := readCleanup(); id != storedID || !pending || removed {
+				t.Fatalf("after retention: GitHub ID = %d, cleanup pending = %v, registration removed = %v", id, pending, removed)
+			}
+			if !rowsExist(runnerExists, boundary) || !rowsExist(runnerExists, younger) ||
+				!rowsExist("SELECT EXISTS (SELECT 1 FROM runners WHERE runner_id = $1 AND end_time IS NULL)", active) {
+				t.Fatal("retention removed a runner at or below the cutoff or with no end time")
+			}
+			if rowsExist("SELECT EXISTS (SELECT 1 FROM requests WHERE request_id = $1)", expiredRequest) {
+				t.Fatal("request retention kept an expired request")
+			}
+			t.Log("At 31 days, daily retention deleted the unmarked expired runner and request and kept the marked runner, registration, and all three runner controls.")
 
 			if status == http.StatusNotFound {
 				w.gh.ForgetRunner(storedID)
@@ -309,10 +398,19 @@ func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
 			}
 			mu.Unlock()
 			if r := w.runner(t, runnerID); r.GetState() != sandrunv1.RunnerState_RUNNER_STATE_FAILED ||
-				r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
-				t.Fatalf("runner after cleanup = %v, want FAILED with START_FAILED", r)
+				r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED ||
+				!r.GetEndedAt().AsTime().Equal(endedAt.AsTime()) {
+				t.Fatalf("runner after cleanup = %v, want FAILED with START_FAILED and original end time %v", r, endedAt)
 			}
 			t.Logf("GitHub HTTP %d allowed OwnSand deletion. An OwnSand retry sent no additional GitHub deletion. GetRunner returned FAILED with START_FAILED after the mark cleared.", status)
+			runNextRetention()
+			eventually(t, "expired runner deleted after cleanup", func() bool {
+				return !rowsExist(runnerExists, runnerID)
+			})
+			if rowsExist("SELECT EXISTS (SELECT 1 FROM github_runners WHERE runner_id = $1)", runnerID) {
+				t.Fatal("runner deletion did not cascade to its registration")
+			}
+			t.Log("At the same job time, the next retention pass deleted the cleaned-up runner and cascaded to its registration.")
 		})
 	}
 }
