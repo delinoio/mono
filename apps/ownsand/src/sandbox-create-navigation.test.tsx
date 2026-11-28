@@ -83,11 +83,24 @@ describe("create sandbox navigation", () => {
     // The page's first load of the list passes; the refetch that the
     // invalidation after the create starts is held.
     let hold = false;
-    const { transport, calls } = holdingTransport(
+    let createdSandboxId: string | undefined;
+    const { transport: base, calls } = holdingTransport(
       ["ListSandboxes"],
       () => hold,
     );
-    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    const transport: Transport = {
+      ...base,
+      async unary(method, ...args) {
+        const response = await base.unary(method, ...args);
+        if (method.name === "CreateSandbox") {
+          const { sandbox } =
+            response.message as unknown as CreateSandboxResponse;
+          createdSandboxId = sandbox?.sandboxId;
+        }
+        return response;
+      },
+    };
+    renderConsole(SANDBOXES, { transport });
     await act(async () => {
       fireEvent.click(
         await screen.findByRole("button", { name: "Create sandbox" }),
@@ -97,28 +110,29 @@ describe("create sandbox navigation", () => {
     const dialog = await screen.findByRole("dialog", {
       name: "Create a sandbox",
     });
+    let expectedPath: string;
     hold = true;
-    await act(async () => {
-      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-    });
+    try {
+      await submit(within(dialog), "Create");
+      await settle(60);
+      expect(calls.ListSandboxes).toHaveLength(1);
+      expect(
+        screen.queryByRole("dialog", { name: "Create a sandbox" }),
+      ).toBeNull();
+      expect(
+        await screen.findByRole("heading", { name: "Sandbox" }),
+      ).toBeTruthy();
+      expect(createdSandboxId).toBeTruthy();
+      expectedPath = `${SANDBOXES}/${createdSandboxId}`;
+      expect(window.location.pathname).toBe(expectedPath);
+    } finally {
+      hold = false;
+      await act(async () => {
+        for (const call of calls.ListSandboxes ?? []) call.settle();
+      });
+    }
     await settle(60);
-    // The list refetch is still held, so the invalidation did run, and the
-    // console already moved on to the new sandbox.
-    expect(calls.ListSandboxes).toHaveLength(1);
-    expect(window.location.pathname).toMatch(
-      new RegExp(`^/orgs/${MOCK_IDS.acme}/sandboxes/[0-9a-f-]{36}$`),
-    );
-    expect(
-      screen.queryByRole("dialog", { name: "Create a sandbox" }),
-    ).toBeNull();
-    expect(
-      await screen.findByRole("heading", { name: "Sandbox" }),
-    ).toBeTruthy();
-    await act(async () => {
-      calls.ListSandboxes?.[0]?.settle();
-    });
-    await settle(60);
-    expect(window.location.pathname).toMatch(/\/sandboxes\/[0-9a-f-]{36}$/);
+    expect(window.location.pathname).toBe(expectedPath);
   });
 
   test("recovers a committed create with the full original request after losing its reply", async () => {
