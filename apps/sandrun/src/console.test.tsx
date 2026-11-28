@@ -598,6 +598,130 @@ describe("organizations", () => {
   });
 });
 
+describe("leave organization confirmation", () => {
+  const leaveLabel = "Leave organization";
+
+  function renderMembers(organizationId: string, userId: Auth["userId"]) {
+    const path = `/orgs/${organizationId}/members`;
+    window.history.replaceState(null, "", path);
+    const { transport, calls } = gatedTransport(
+      "RemoveMember",
+      createMockTransport({ failFirstAcmeMemberContinuation: false }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    const invalidate = rs.spyOn(queryClient, "invalidateQueries");
+    const auth: Auth = {
+      isAuthenticated: true,
+      isLoading: false,
+      userId,
+      signIn: async () => {},
+      signInFailed: false,
+      signOut: async () => {},
+      getAccessToken: async () => "token",
+    };
+    const view = (userId: Auth["userId"]) => (
+      <AuthContextProvider value={{ ...auth, userId }}>
+        <Console
+          config={config}
+          transport={transport}
+          queryClient={queryClient}
+        />
+      </AuthContextProvider>
+    );
+    const { rerender } = render(view(userId));
+    return {
+      calls,
+      invalidate,
+      path,
+      setUserId: (userId: Auth["userId"]) => rerender(view(userId)),
+    };
+  }
+
+  test.each([
+    { role: "admin", organizationId: MOCK_IDS.globex },
+    { role: "member", organizationId: MOCK_IDS.northwind },
+  ])(
+    "keeps the $role roster readable while the caller ID is missing",
+    async ({ organizationId }) => {
+      const { calls, setUserId } = renderMembers(organizationId, undefined);
+      const roster = await screen.findByRole("list", { name: "Members" });
+      expect(within(roster).getByText("Mina Kim")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: leaveLabel })).toBeNull();
+
+      setUserId("");
+      expect(within(roster).getByText("Mina Kim")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: leaveLabel })).toBeNull();
+      expect(calls).toHaveLength(0);
+
+      setUserId(MOCK_USER);
+      await click(screen.getByRole("button", { name: leaveLabel }));
+      const dialog = await screen.findByRole("alertdialog");
+      await click(within(dialog).getByRole("button", { name: leaveLabel }));
+      expect(calls.map(({ input }) => input)).toEqual([
+        expect.objectContaining({ organizationId, userId: MOCK_USER }),
+      ]);
+      await act(async () => calls[0].settle());
+      await waitFor(() => expect(window.location.pathname).toBe("/"));
+    },
+  );
+
+  test("keeps Leave unavailable to the owner with a resolved caller ID", async () => {
+    const { calls } = renderMembers(MOCK_IDS.acme, MOCK_USER);
+    await screen.findByRole("list", { name: "Members" });
+    expect(screen.queryByRole("button", { name: leaveLabel })).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  test("dismisses Leave when the caller ID disappears and allows a fresh confirmation", async () => {
+    const organizationId = MOCK_IDS.northwind;
+    const { calls, invalidate, path, setUserId } = renderMembers(
+      organizationId,
+      MOCK_USER,
+    );
+    await click(await screen.findByRole("button", { name: leaveLabel }));
+    const first = await screen.findByRole("alertdialog");
+    const historyLength = window.history.length;
+
+    setUserId(undefined);
+    await click(within(first).getByRole("button", { name: leaveLabel }));
+
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(calls).toHaveLength(0);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(window.location.pathname).toBe(path);
+    expect(window.history.length).toBe(historyLength);
+
+    setUserId(MOCK_USER);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await click(screen.getByRole("button", { name: leaveLabel }));
+    const fresh = await screen.findByRole("alertdialog");
+    const confirm = within(fresh).getByRole<HTMLButtonElement>("button", {
+      name: leaveLabel,
+    });
+    await click(confirm);
+    await act(async () =>
+      calls[0].settle(new ConnectError("Leave failed", Code.Unavailable)),
+    );
+    expect(
+      await within(fresh).findByText(
+        "SandRun is not available right now. Try again in a moment.",
+      ),
+    ).toBeTruthy();
+    expect(confirm.disabled).toBe(false);
+    expect(window.location.pathname).toBe(path);
+
+    await click(confirm);
+    expect(calls.map(({ input }) => input)).toEqual([
+      expect.objectContaining({ organizationId, userId: MOCK_USER }),
+      expect.objectContaining({ organizationId, userId: MOCK_USER }),
+    ]);
+    await act(async () => calls[1].settle());
+    await waitFor(() => expect(window.location.pathname).toBe("/"));
+  });
+});
+
 describe("member removal confirmation", () => {
   const organizationId = MOCK_IDS.acme;
   const target = {
