@@ -2117,16 +2117,22 @@
        current page fills and `HighlightText` for their labels. A border
        would widen these controls, because their size follows their content
        and a `min-width` that already includes the border box, while a fill
-       changes no size. The focus ring is an outline, so it stays visible on
-       the fill. Chromium paints a Canvas text backplate behind the label of
-       a filled control, which hides the HighlightText label; opting out of
-       the adjustment removes the backplate, and both colors are already
-       system colors. Remove the opt-out if engines stop painting it. */
+       changes no size. Chromium paints a Canvas text backplate behind the
+       label of a filled control, which hides the HighlightText label. The
+       opt-out removes the backplate. Both colors are already system colors.
+       Remove the opt-out if engines stop painting the backplate. */
     .dui-toggle[data-pressed],
     .dui-pagination-link[data-current] {
       forced-color-adjust: none;
       background: Highlight;
       color: HighlightText;
+    }
+
+    /* The opt-out also preserves the default outline color. Use CanvasText
+       for the offset outline against the surrounding Canvas. */
+    .dui-toggle[data-pressed]:focus-visible,
+    .dui-pagination-link[data-current]:focus-visible {
+      outline-color: CanvasText;
     }
 
     /* The opt-out also keeps the inset shadow unless it is cleared. */

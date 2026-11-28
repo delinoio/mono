@@ -1752,6 +1752,26 @@ describe("Forced colors", () => {
       "border: 0;",
     );
   });
+
+  test("draws the pressed Toggle and current page focus outlines in CanvasText", () => {
+    expect(
+      findRuleBlock(
+        forcedColorsStyles(),
+        ".dui-toggle[data-pressed]:focus-visible, .dui-pagination-link[data-current]:focus-visible",
+      ),
+    ).toBe("outline-color: CanvasText;");
+
+    for (const selector of [
+      ".dui-toggle:focus-visible",
+      ".dui-pagination-link:focus-visible, .dui-pagination-step:focus-visible",
+    ]) {
+      const focus = block(selector);
+      expect(focus).toContain(
+        "outline: 2px solid var(--dui-color-focus-ring);",
+      );
+      expect(focus).toContain("outline-offset: 2px;");
+    }
+  });
 });
 
 describe("Toggle", () => {
