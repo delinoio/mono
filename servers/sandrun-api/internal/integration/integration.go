@@ -25,6 +25,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
@@ -527,7 +528,7 @@ func (h *Handler) UpdateAgentIntegration(ctx context.Context, req *connect.Reque
 		}
 		paths := m.GetUpdateMask().GetPaths()
 		if len(paths) == 0 {
-			return api.ErrInvalidf("invalid update_mask: must name at least one of name, settings and credentials")
+			return api.ErrInvalidf("invalid update_mask: must name at least one path")
 		}
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
@@ -540,6 +541,8 @@ func (h *Handler) UpdateAgentIntegration(ctx context.Context, req *connect.Reque
 			return err
 		}
 		var setName, setSettings, setCredentials bool
+		message := m.ProtoReflect()
+		fields := message.Descriptor().Fields()
 		for _, p := range paths {
 			switch p {
 			case "name":
@@ -547,6 +550,16 @@ func (h *Handler) UpdateAgentIntegration(ctx context.Context, req *connect.Reque
 			case "settings":
 				setSettings = true
 			case "credentials":
+				setCredentials = true
+			case "claude_code", "cursor", "openai_codex", "devin":
+				if !message.Has(fields.ByName(protoreflect.Name(p))) {
+					return api.ErrInvalidf("invalid update_mask: path %q must match the request settings", p)
+				}
+				setSettings = true
+			case "claude_code_credentials", "cursor_credentials", "openai_codex_credentials", "devin_credentials":
+				if !message.Has(fields.ByName(protoreflect.Name(p))) {
+					return api.ErrInvalidf("invalid update_mask: path %q must match the request credentials", p)
+				}
 				setCredentials = true
 			default:
 				return api.ErrInvalidf("invalid update_mask: unknown path %q", p)

@@ -6,7 +6,7 @@ import {
   timestampFromMs,
   timestampMs,
 } from "@bufbuild/protobuf/wkt";
-import { Code, createClient } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import {
   AgentCredential,
   AgentIntegrationService,
@@ -29,7 +29,10 @@ import {
   WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
 import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
-import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
+import {
+  GitHubInstallOrganizationMismatchSchema,
+  GitHubService,
+} from "@delino/sandrun-protos/v1/github_pb";
 import { MemberService } from "@delino/sandrun-protos/v1/member_pb";
 import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
 import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
@@ -139,6 +142,7 @@ test("ends the departing member's queued dev session and publishes one update", 
 const invalidInstallationState = {
   code: Code.FailedPrecondition,
   rawMessage: "the installation state is not valid or has expired",
+  details: [],
 };
 
 test("rejects undefined kind filters on runner profiles and requests", async () => {
@@ -1192,6 +1196,56 @@ test("capacity groups only open runners assigned to devices in the organization"
   ]);
 });
 
+test("capacity follows the OwnSand organization after relinking", async () => {
+  const transport = createMockTransport();
+  const work = createClient(WorkService, transport);
+  const links = createClient(OwnSandLinkService, transport);
+  const organization = { organizationId: MOCK_IDS.acme };
+  const ownsandOrganizationId = "0193a000-0000-7000-8000-00000000f036";
+
+  const { devices } = await work.getCapacity(organization);
+  expect(devices.map(({ name }) => name)).toEqual([
+    "build-box",
+    "studio-mac",
+    "win-desk",
+  ]);
+
+  await links.removeOwnSandLink(organization);
+  await expect(work.getCapacity(organization)).rejects.toMatchObject({
+    code: Code.FailedPrecondition,
+  });
+
+  await links.setOwnSandLink({
+    ...organization,
+    ownsandOrganizationId,
+    ownsandApiKey: "osk_fixture",
+  });
+  const { link } = await links.getOwnSandLink(organization);
+  expect(link?.ownsandOrganizationId).toBe(ownsandOrganizationId);
+  expect((await work.getCapacity(organization)).devices).toEqual([]);
+});
+
+test("capacity retains the device pool after a key replacement", async () => {
+  const transport = createMockTransport();
+  const work = createClient(WorkService, transport);
+  const links = createClient(OwnSandLinkService, transport);
+  const organization = { organizationId: MOCK_IDS.acme };
+  const before = await work.getCapacity(organization);
+  expect(before.devices.map(({ name }) => name)).toEqual([
+    "build-box",
+    "studio-mac",
+    "win-desk",
+  ]);
+
+  await links.setOwnSandLink({
+    ...organization,
+    ownsandOrganizationId: MOCK_IDS.ownsandAcme,
+    ownsandApiKey: "osk_fixture_replacement",
+  });
+
+  expect(await work.getCapacity(organization)).toEqual(before);
+});
+
 test.each([
   [MOCK_IDS.globex, "the organization has no OwnSand link"],
   [
@@ -1522,12 +1576,16 @@ test("GitHub installation state is scoped to its organization and can be used on
       code: "fixture-code",
       state,
     };
-    await expect(
-      github.linkGitHubInstallation({
-        ...callback,
-        organizationId: MOCK_IDS.acme,
-      }),
-    ).rejects.toMatchObject(invalidInstallationState);
+    const mismatch = await github
+      .linkGitHubInstallation({ ...callback, organizationId: MOCK_IDS.acme })
+      .catch(ConnectError.from);
+    expect(mismatch).toBeInstanceOf(ConnectError);
+    if (!(mismatch instanceof ConnectError))
+      throw new Error("Expected a mismatch");
+    expect(mismatch.code).toBe(Code.InvalidArgument);
+    expect(
+      mismatch.findDetails(GitHubInstallOrganizationMismatchSchema),
+    ).toEqual([create(GitHubInstallOrganizationMismatchSchema)]);
     await expect(
       github.linkGitHubInstallation({ ...callback, state: "unknown-state" }),
     ).rejects.toMatchObject(invalidInstallationState);
@@ -1548,6 +1606,30 @@ test("GitHub installation state is scoped to its organization and can be used on
   } finally {
     clock.mockRestore();
   }
+});
+
+test("GitHub installation state gives no mismatch detail after the caller leaves its issuing organization", async () => {
+  const transport = createMockTransport();
+  const github = createClient(GitHubService, transport);
+  const members = createClient(MemberService, transport);
+  const { url } = await github.createGitHubInstallUrl({
+    organizationId: MOCK_IDS.globex,
+  });
+  const state = new URL(url).searchParams.get("state");
+  if (!state) throw new Error("Expected an issued installation state");
+
+  await members.removeMember({
+    organizationId: MOCK_IDS.globex,
+    userId: MOCK_USER,
+  });
+  await expect(
+    github.linkGitHubInstallation({
+      organizationId: MOCK_IDS.acme,
+      githubInstallationId: 51_000_002n,
+      code: "fixture-code",
+      state,
+    }),
+  ).rejects.toMatchObject(invalidInstallationState);
 });
 
 test.each([0, 1])(

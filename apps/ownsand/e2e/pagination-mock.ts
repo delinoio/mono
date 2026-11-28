@@ -3,13 +3,16 @@ import { create, toJsonString } from "@bufbuild/protobuf";
 import {
   Code,
   ConnectError,
+  createClient,
   createRouterTransport,
   type Transport,
 } from "@connectrpc/connect";
 import {
   BillingAccountRole,
+  BillingMeter,
   BillingPhase,
   BillingService,
+  type GetBillingUsageResponse,
   type LinkBillingAccountRequest,
   type ListLinkableBillingAccountsResponse,
   type UnlinkBillingAccountRequest,
@@ -140,7 +143,70 @@ function holdTemplateRequest(request: "first-page" | "create") {
   });
 }
 
+function billingUsageRefreshTransport(userId?: string): Transport {
+  const base = createBaseMock({ userId });
+  const client = createClient(BillingService, base);
+  const usageResult = "ownsand-e2e-billing-usage-result";
+  return {
+    ...base,
+    async unary(method, ...rest) {
+      if (
+        method.name === "GetBillingStatus" &&
+        sessionStorage.getItem("ownsand-e2e-billing-relink") === "true"
+      ) {
+        sessionStorage.removeItem("ownsand-e2e-billing-relink");
+        await client.unlinkBillingAccount({ organizationId: MOCK_IDS.acme });
+        await client.linkBillingAccount({
+          organizationId: MOCK_IDS.acme,
+          billingAccountId: MOCK_IDS.labBillingAccount,
+        });
+      }
+      if (method.name === "UnlinkBillingAccount") {
+        const request = rest[3] as UnlinkBillingAccountRequest;
+        recordToken(
+          "ownsand-e2e-billing-unlink-requests",
+          request.expectedBillingAccountId ?? "",
+        );
+      }
+      if (method.name !== "GetBillingUsage") return base.unary(method, ...rest);
+
+      if (sessionStorage.getItem(usageResult) === "hold") {
+        await new Promise<void>((resolve) => {
+          window.addEventListener(`${usageResult}-release`, () => resolve(), {
+            once: true,
+          });
+          sessionStorage.setItem(usageResult, "held");
+        });
+      }
+      if (sessionStorage.getItem(usageResult) === "fail") {
+        throw new ConnectError(
+          "Synthetic usage refresh failure",
+          Code.Unavailable,
+        );
+      }
+      const response = await base.unary(method, ...rest);
+      const usage = response.message as unknown as GetBillingUsageResponse;
+      if (usage.billingAccountId === MOCK_IDS.labBillingAccount) {
+        const meter = usage.meterUsages.find(
+          (row) => row.meter === BillingMeter.CLASS_A_RPC,
+        )!;
+        meter.quantity = 9_999n;
+        meter.amountUsdMicros = 2_500_000n;
+      }
+      return response;
+    },
+  };
+}
+
 export function createMockTransport(): Transport {
+  const billingUsageRole = sessionStorage.getItem(
+    "ownsand-e2e-billing-usage-role",
+  );
+  if (billingUsageRole !== null) {
+    return billingUsageRefreshTransport(
+      billingUsageRole === "admin" ? "user-admin-jun" : undefined,
+    );
+  }
   const templateSourceKey = "ownsand-e2e-sandbox-template-lookup";
   if (sessionStorage.getItem(templateSourceKey) !== null) {
     const base = createBaseMock();
@@ -356,6 +422,43 @@ export function createMockTransport(): Transport {
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
+      if (method.name === "ListSnapshots" || method.name === "ListTemplates") {
+        const key = `ownsand-e2e-hold-initial-${method.name}`;
+        const state = sessionStorage.getItem(key);
+        const { organizationId, pageToken = "" } = input as {
+          organizationId: string;
+          pageToken?: string;
+        };
+        if (
+          organizationId === MOCK_IDS.acme &&
+          pageToken === "" &&
+          (state === "hold" || state === "held")
+        ) {
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          // Strict Mode may abort the first request before it can be held.
+          if (!signal?.aborted && sessionStorage.getItem(key) !== "released") {
+            await new Promise<void>((resolve) => {
+              window.addEventListener(
+                `${key}-release`,
+                () => {
+                  sessionStorage.setItem(key, "released");
+                  resolve();
+                },
+                { once: true },
+              );
+              sessionStorage.setItem(key, "held");
+            });
+          }
+          return response;
+        }
+      }
       const staleTemplateDelete = "ownsand-e2e-stale-template-delete";
       if (
         method.name === "DeleteTemplate" &&

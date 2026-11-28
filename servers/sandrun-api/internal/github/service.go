@@ -97,20 +97,20 @@ func (h *Handler) LinkGitHubInstallation(ctx context.Context, req *connect.Reque
 	case m.GetState() == "" || len(m.GetState()) > maxStateLength:
 		return nil, api.ErrInvalidf("invalid state: must be the state of the GitHub callback")
 	}
-	// The same limit as the OwnSand link validation: every call reaches
-	// GitHub.
+	// Count every attempt against the same per-user limit as OwnSand link validation.
 	if ok, retry := s.Limits.PerUser.Allow("github-link:"+c.UserID, 1); !ok {
 		return nil, api.ErrRateLimited(retry)
 	}
 	// The state is single-use: it is consumed before the GitHub calls, so a
 	// failed link needs a new installation URL.
+	stateHash := hashState(m.GetState())
 	tag, err := s.DB.Pool.Exec(ctx, "DELETE FROM github_install_states WHERE state_hash = $1 AND organization_id = $2 AND user_id = $3 AND expire_time > $4",
-		hashState(m.GetState()), c.OrganizationID, c.UserID, s.NowUTC())
+		stateHash, c.OrganizationID, c.UserID, s.NowUTC())
 	if err != nil {
 		return nil, s.Internal(ctx, "consume install state", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return nil, api.ErrInvalidf("invalid state: unknown, expired, already used or created by another user or organization; start the installation again")
+		return nil, l.installStateError(ctx, c, stateHash)
 	}
 	token, err := l.gh.ExchangeCode(ctx, m.GetCode())
 	if errors.Is(err, githubapi.ErrBadCode) {
@@ -190,6 +190,35 @@ func (h *Handler) LinkGitHubInstallation(ctx context.Context, req *connect.Reque
 		slog.Int64("github_installation_id", ghID), slog.Int64("github_runner_group_id", group.ID))
 	s.WorkChanged(c.OrganizationID)
 	return connect.NewResponse(&sandrunv1.LinkGitHubInstallationResponse{Installation: out.proto()}), nil
+}
+
+// installStateError checks live state and issuer membership in one snapshot.
+func (l *Layer) installStateError(ctx context.Context, caller api.Caller, stateHash []byte) error {
+	invalid := connect.NewError(connect.CodeInvalidArgument, errors.New("invalid state: unknown, expired, already used or created by another user or organization; start the installation again"))
+	if !caller.Principal.IsUser() {
+		return invalid
+	}
+
+	var role int16
+	err := l.svc.DB.Pool.QueryRow(ctx, `SELECT m.role
+		FROM github_install_states AS s
+		JOIN memberships AS m ON m.organization_id = s.organization_id AND m.user_id = s.user_id
+		WHERE s.state_hash = $1 AND s.organization_id <> $2 AND s.user_id = $3 AND s.expire_time > $4`,
+		stateHash, caller.OrganizationID, caller.UserID, l.svc.NowUTC()).Scan(&role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return invalid
+	}
+	if err != nil {
+		return l.svc.Internal(ctx, "check install state organization", err)
+	}
+	if authz.RoleAllowed(sandrunv1.Role(role), authz.ActionManageIntegrations) {
+		detail, err := connect.NewErrorDetail(&sandrunv1.GitHubInstallOrganizationMismatch{})
+		if err != nil {
+			return l.svc.Internal(ctx, "encode install state mismatch", err)
+		}
+		invalid.AddDetail(detail)
+	}
+	return invalid
 }
 
 // ListGitHubInstallations lists the links of the organization. It reads

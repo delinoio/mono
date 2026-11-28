@@ -20,14 +20,9 @@ import (
 
 func TestWatchQueueContextAtDispatch(t *testing.T) {
 	const requestID = "request-1"
-	payload, err := proto.Marshal(&sandrunv1.WatchQueueResponse{
+	message := &sandrunv1.WatchQueueResponse{
 		Event: &sandrunv1.WatchQueueResponse_Request{Request: &sandrunv1.Request{RequestId: requestID}},
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	var prefix [5]byte
-	binary.BigEndian.PutUint32(prefix[1:], uint32(len(payload)))
 
 	for _, tc := range []struct {
 		name           string
@@ -47,23 +42,19 @@ func TestWatchQueueContextAtDispatch(t *testing.T) {
 					ctx = deadlineCtx
 				}
 
-				body := &watchTestBody{
-					prefix:  bytes.NewReader(prefix[:]),
-					payload: bytes.NewReader(payload),
-					beforePayload: func() {
-						switch tc.wantContextErr {
-						case context.Canceled:
-							cancel()
-						case context.DeadlineExceeded:
-							<-ctx.Done()
-						}
-					},
-				}
+				body := newConnectTestBody(t, func() {
+					switch tc.wantContextErr {
+					case context.Canceled:
+						cancel()
+					case context.DeadlineExceeded:
+						<-ctx.Done()
+					}
+				}, message)
 				requests := 0
 				client, err := New(Options{
 					BaseURL: "http://127.0.0.1:18400",
 					APIKey:  "test-token",
-					HTTPClient: &http.Client{Transport: watchTestTransport(func(req *http.Request) (*http.Response, error) {
+					HTTPClient: &http.Client{Transport: connectTestTransport(func(req *http.Request) (*http.Response, error) {
 						requests++
 						_ = req.Body.Close()
 						if req.URL.Path != sandrunv1connect.WorkServiceWatchQueueProcedure {
@@ -105,20 +96,40 @@ func TestWatchQueueContextAtDispatch(t *testing.T) {
 	}
 }
 
-type watchTestTransport func(*http.Request) (*http.Response, error)
+type connectTestTransport func(*http.Request) (*http.Response, error)
 
-func (transport watchTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (transport connectTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return transport(req)
 }
 
-type watchTestBody struct {
+type connectTestBody struct {
 	prefix        *bytes.Reader
 	payload       *bytes.Reader
 	beforePayload func()
 	closed        bool
 }
 
-func (body *watchTestBody) Read(p []byte) (int, error) {
+// newConnectTestBody runs beforePayload when Connect starts reading the last payload.
+func newConnectTestBody(t *testing.T, beforePayload func(), messages ...proto.Message) *connectTestBody {
+	t.Helper()
+	var prefix, payload []byte
+	for i, message := range messages {
+		var err error
+		payload, err = proto.Marshal(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefix = binary.BigEndian.AppendUint32(append(prefix, 0), uint32(len(payload)))
+		if i < len(messages)-1 {
+			prefix = append(prefix, payload...)
+		}
+	}
+	return &connectTestBody{
+		prefix: bytes.NewReader(prefix), payload: bytes.NewReader(payload), beforePayload: beforePayload,
+	}
+}
+
+func (body *connectTestBody) Read(p []byte) (int, error) {
 	if body.prefix.Len() > 0 {
 		return body.prefix.Read(p)
 	}
@@ -130,7 +141,7 @@ func (body *watchTestBody) Read(p []byte) (int, error) {
 	return body.payload.Read(p)
 }
 
-func (body *watchTestBody) Close() error {
+func (body *connectTestBody) Close() error {
 	body.closed = true
 	return nil
 }

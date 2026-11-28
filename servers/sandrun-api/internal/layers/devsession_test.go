@@ -114,22 +114,25 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 	if err != nil || del.Msg.GetDevSession().GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED {
 		t.Fatalf("owner deletes: %v %v", del, err)
 	}
-	// A queued session is canceled.
-	s3 := w.createSession(t, memberByKey, profileID)
+	// Keep the third session queued even if the dispatcher picks it up immediately.
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
-		o.MaxSandboxes = 0
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
+	sandboxCount := len(w.fake.Sandboxes(w.osOrg))
+	s3 := w.createSession(t, memberByKey, profileID)
+	if state := w.session(t, s3.GetDevSessionId()).GetState(); state != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("third session state = %v, want QUEUED", state)
+	}
 	del, err = memberByKey.DevSession.DeleteDevSession(ctx, connect.NewRequest(&sandrunv1.DeleteDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s3.GetDevSessionId()}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st := del.Msg.GetDevSession(); st.GetState() == sandrunv1.RequestState_REQUEST_STATE_CANCELED {
-		if st.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER {
-			t.Fatalf("canceled %v", st)
-		}
-	} else if st.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED {
-		t.Fatalf("deleted third session %v", st)
+	if st := del.Msg.GetDevSession(); st.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+		st.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER {
+		t.Fatalf("third session deletion = %v / %v, want CANCELED / CANCELED_BY_USER", st.GetState(), st.GetEndReason())
+	}
+	if got := len(w.fake.Sandboxes(w.osOrg)); got != sandboxCount {
+		t.Fatalf("sandbox count after canceling third session = %d, want %d", got, sandboxCount)
 	}
 	// Audit: creations and deletions name the owner and the actor key.
 	var created, deleted, byKey int
@@ -281,7 +284,10 @@ func TestDevSessionEnds(t *testing.T) {
 		code := int64(1)
 		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
 	}, nil)
-	before := len(w.fake.Sandboxes(w.osOrg))
+	before := make(map[string]struct{})
+	for _, sb := range w.fake.Sandboxes(w.osOrg) {
+		before[sb.GetSandboxId()] = struct{}{}
+	}
 	s = w.createSession(t, member, profileID)
 	s = w.waitState(t, s.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_FAILED)
 	req, err := w.env.User(w.org.Owner).Work.GetRequest(context.Background(), connect.NewRequest(&sandrunv1.GetRequestRequest{OrganizationId: w.org.ID, RequestId: s.GetDevSessionId()}))
@@ -289,15 +295,35 @@ func TestDevSessionEnds(t *testing.T) {
 		!req.Msg.GetRequest().GetQueuedAt().AsTime().Equal(s.GetQueuedAt().AsTime()) {
 		t.Fatalf("start failures %v %v %v", s, req, err)
 	}
-	sandboxes := w.fake.Sandboxes(w.osOrg)
-	if len(sandboxes)-before != 3 {
-		t.Fatalf("%d sandboxes for 3 attempts", len(sandboxes)-before)
-	}
-	for _, sb := range sandboxes[before:] {
-		if sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-			t.Fatal("a failed start left its sandbox")
+	pending := make(map[string]ownsandv1.SandboxState)
+	for _, sb := range w.fake.Sandboxes(w.osOrg) {
+		if _, exists := before[sb.GetSandboxId()]; !exists {
+			pending[sb.GetSandboxId()] = sb.GetState()
 		}
 	}
+	if len(pending) != 3 {
+		t.Fatalf("%d new sandboxes for 3 attempts", len(pending))
+	}
+	defer func() {
+		if len(pending) != 0 {
+			t.Errorf("sandboxes awaiting deletion with their last observed states: %v", pending)
+		}
+	}()
+	// The driver commits FAILED before it deletes the final sandbox.
+	eventually(t, "all failed-start sandboxes to be deleted", func() bool {
+		for _, sb := range w.fake.Sandboxes(w.osOrg) {
+			id := sb.GetSandboxId()
+			if _, tracked := pending[id]; !tracked {
+				continue
+			}
+			if state := sb.GetState(); state == ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				delete(pending, id)
+			} else {
+				pending[id] = state
+			}
+		}
+		return len(pending) == 0
+	})
 	w.fake.SetExec(nil, nil)
 
 	// The maximum queue wait ends a session that never got capacity.

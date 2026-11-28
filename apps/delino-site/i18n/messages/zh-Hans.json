@@ -34,5 +34,6 @@
   "theme.promptCopyText": "复制提示词",
   "theme.promptCopiedText": "已复制",
   "theme.promptExpandText": "展开",
-  "theme.promptCollapseText": "收起"
+  "theme.promptCollapseText": "收起",
+  "nav.darkMode": "深色模式"
 }

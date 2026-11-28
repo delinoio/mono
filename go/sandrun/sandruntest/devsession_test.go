@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -286,13 +287,15 @@ func TestListDevSessionsFilters(t *testing.T) {
 	org := s.AddOrganization("first").GetOrganizationId()
 	other := s.AddOrganization("second").GetOrganizationId()
 	s.mu.Lock()
-	s.sessions = []*sandrunv1.DevSession{
+	for _, ds := range []*sandrunv1.DevSession{
 		{DevSessionId: "other-org", OrganizationId: other, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: ended},
 		{DevSessionId: "second-ended", OrganizationId: org, RunnerProfileId: secondListProfile, OwnerUserId: s.UserID, State: ended},
 		{DevSessionId: "other-owner", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: otherOwner, State: ended},
 		{DevSessionId: "first-running", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: running},
 		{DevSessionId: "first-ended", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID, State: ended},
 		{DevSessionId: "unspecified", OrganizationId: org, RunnerProfileId: firstListProfile, OwnerUserId: s.UserID},
+	} {
+		s.sessions = append(s.sessions, &devSessionRecord{session: ds})
 	}
 	s.mu.Unlock()
 	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
@@ -377,7 +380,7 @@ func TestCloseDuringExecStart(t *testing.T) {
 			WorkspacePath:  workspace,
 		}
 		s := &Server{
-			sessions:     []*sandrunv1.DevSession{ds},
+			sessions:     []*devSessionRecord{{session: ds}},
 			sessionExecs: make(map[string]*sessionExecs),
 		}
 		g := newGuest(s)
@@ -854,6 +857,88 @@ func TestExecRequestPathProcess(t *testing.T) {
 	}
 	fmt.Printf("%s\n%s\n%s\n%s", path, os.Args[0], os.Getenv("PATH"), os.Getenv("PATHEXT"))
 	os.Exit(0)
+}
+
+func TestExecDevSessionTimeout(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name        string
+		timeout     *durationpb.Duration
+		wantInvalid bool
+	}{
+		{name: "zero", timeout: &durationpb.Duration{}, wantInvalid: true},
+		{name: "negative", timeout: durationpb.New(-time.Second), wantInvalid: true},
+		{name: "malformed", timeout: &durationpb.Duration{Seconds: 1, Nanos: -1}, wantInvalid: true},
+		{name: "positive", timeout: durationpb.New(5 * time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New()
+			t.Cleanup(s.Close)
+			var hookCalls atomic.Int32
+			s.BeforeExec = func(*sandrunv1.ExecDevSessionRequest) { hookCalls.Add(1) }
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			client, ds := createExecTestSession(t, ctx, s, t.TempDir())
+			req := &sandrunv1.ExecDevSessionRequest{
+				OrganizationId: ds.GetOrganizationId(),
+				DevSessionId:   ds.GetDevSessionId(),
+				ExecId:         s.newID(),
+				Command:        []string{executable, "-test.run=^$"},
+				Timeout:        tc.timeout,
+			}
+			if tc.wantInvalid {
+				stream, err := client.ExecDevSession(ctx, listTestRequest(req))
+				if err == nil {
+					defer stream.Close()
+					if stream.Receive() {
+						t.Fatalf("rejected exec sent an event: %v", stream.Msg().GetEvent())
+					}
+					err = stream.Err()
+				}
+				var connectErr *connect.Error
+				if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeInvalidArgument ||
+					connectErr.Message() != "invalid timeout: must be greater than zero" {
+					t.Fatalf("exec error = %v, want invalid_argument for invalid timeout", err)
+				}
+				if hooks, history := hookCalls.Load(), len(s.ExecRequests()); hooks != 0 || history != 0 {
+					t.Fatalf("rejected exec left %d hook calls and %d history entries, want zero", hooks, history)
+				}
+
+				attach, err := client.AttachDevSessionExec(ctx, listTestRequest(&sandrunv1.AttachDevSessionExecRequest{
+					OrganizationId: req.GetOrganizationId(),
+					DevSessionId:   req.GetDevSessionId(),
+					ExecId:         req.GetExecId(),
+				}))
+				if err == nil {
+					defer attach.Close()
+					if attach.Receive() {
+						t.Fatalf("attach to rejected exec sent an event: %v", attach.Msg().GetEvent())
+					}
+					err = attach.Err()
+				}
+				if connect.CodeOf(err) != connect.CodeNotFound {
+					t.Fatalf("attach to rejected exec returned %v, want not_found", err)
+				}
+				req.Timeout = nil
+			}
+
+			stream, err := client.ExecDevSession(ctx, listTestRequest(req))
+			events := receiveExecEvents(t, stream, err)
+			if len(events) == 0 {
+				t.Fatal("accepted exec sent no events")
+			}
+			final := events[len(events)-1]
+			if !hasExplicitZeroExitCode(final) || final.GetExited().GetTimedOut() {
+				t.Fatalf("accepted exec ended with %v, want exit code 0 without timeout", final)
+			}
+			if hooks, history := hookCalls.Load(), s.ExecRequests(); hooks != 1 || len(history) != 1 || !proto.Equal(history[0], req) {
+				t.Errorf("accepted exec left %d hook calls and history %v, want one call and the accepted request", hooks, history)
+			}
+		})
+	}
 }
 
 func TestExecStreamEventLimit(t *testing.T) {

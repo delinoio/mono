@@ -12,8 +12,10 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -125,10 +127,26 @@ function write(file, content) {
 // which are also the binding package directories.
 const tsPackages = ["ownsand", "accounts", "sandrun", "sandcrew"];
 
+function listingParent(t, symlinked) {
+  const dir = mkdtempSync(
+    join(realpathSync(tmpdir()), "protos-generate-parent-"),
+  );
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const parent = join(dir, "parent [with 'quotes']");
+  mkdirSync(parent);
+  if (symlinked) {
+    const link = join(dir, "parent-link");
+    symlinkSync(parent, link);
+    return link;
+  }
+  return parent;
+}
+
 // Creates a repository with the real script, committed (old) bindings of both
 // languages and every TypeScript target, and the fake go in a bin directory.
 function fixture(t, { parent = tmpdir(), plugin = true } = {}) {
-  const dir = mkdtempSync(join(parent, "protos-generate-"));
+  // Git reports the physical checkout path, which fake find compares with PWD.
+  const dir = mkdtempSync(join(realpathSync(parent), "protos-generate-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const repo = join(dir, "repo");
   const bin = join(dir, "bin");
@@ -245,7 +263,7 @@ function run({ repo, env }, command, extraEnv = {}) {
 function assertPreserved(f, result, diagnostic) {
   const before = bindings(f.repo);
   const run = result();
-  assert.notEqual(run.status, 0, run.stdout);
+  assert.equal(run.status, 1, run.stderr);
   assert.match(run.stderr, diagnostic);
   assert.deepEqual(bindings(f.repo), before);
   assert.equal(before.size, 27);
@@ -406,17 +424,38 @@ for (const { target, label, binding, extra } of [
     extra: "zz_extra_pb.ts",
   },
 ]) {
-  for (const phase of ["existing", "staged"]) {
+  for (const symlinked of [false, true]) {
+    const parent = symlinked ? "symlinked parent" : "physical parent";
+    for (const phase of ["existing", "staged"]) {
+      test(
+        `generate preserves every binding when listing ${phase} ${label} fails under a ${parent}`,
+        { skip },
+        (t) => {
+          const f = fixture(t, { parent: listingParent(t, symlinked) });
+          assertPreserved(
+            f,
+            () => run(f, "generate", { FAKE_FIND_FAIL: `${phase}:${target}` }),
+            new RegExp(`cannot list ${phase} ${label}`),
+          );
+        },
+      );
+    }
+
     test(
-      `generate preserves every binding when listing ${phase} ${label} fails`,
+      `check rejects matching partial lists of ${label} under a ${parent}`,
       { skip },
       (t) => {
-        const f = fixture(t);
-        assertPreserved(
-          f,
-          () => run(f, "generate", { FAKE_FIND_FAIL: `${phase}:${target}` }),
-          new RegExp(`cannot list ${phase} ${label}`),
+        const f = fixture(t, { parent: listingParent(t, symlinked) });
+        const generated = run(f, "generate");
+        assert.equal(generated.status, 0, generated.stderr);
+        write(join(f.repo, dirname(binding), extra), "extra binding\n");
+        const checked = run(f, "check", { FAKE_FIND_FAIL: `both:${target}` });
+        assert.equal(checked.status, 1, checked.stdout);
+        assert.match(
+          checked.stderr,
+          new RegExp(`cannot list existing ${label}`),
         );
+        assert.deepEqual(readdirSync(f.scratch), []);
       },
     );
   }
@@ -433,17 +472,6 @@ for (const { target, label, binding, extra } of [
       );
     },
   );
-
-  test(`check rejects matching partial lists of ${label}`, { skip }, (t) => {
-    const f = fixture(t);
-    const generated = run(f, "generate");
-    assert.equal(generated.status, 0, generated.stderr);
-    write(join(f.repo, dirname(binding), extra), "extra binding\n");
-    const checked = run(f, "check", { FAKE_FIND_FAIL: `both:${target}` });
-    assert.equal(checked.status, 1, checked.stdout);
-    assert.match(checked.stderr, new RegExp(`cannot list existing ${label}`));
-    assert.deepEqual(readdirSync(f.scratch), []);
-  });
 
   test(`check compares the paths and bytes of ${label}`, { skip }, (t) => {
     const f = fixture(t);

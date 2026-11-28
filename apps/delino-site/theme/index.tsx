@@ -4,11 +4,24 @@
 import "./index.css";
 import "./nav-focus.css";
 import { forwardRef, type ComponentProps } from "react";
-import { useLang } from "@rspress/core/runtime";
-import { Link as BaseLink } from "@rspress/core/theme-original";
+import { useLang, usePage } from "@rspress/core/runtime";
+import {
+  Link as BaseLink,
+  LlmsHint as BaseLlmsHint,
+} from "@rspress/core/theme-original";
 import { localizeCrossSiteHref } from "./cross-site-link";
 
 export * from "@rspress/core/theme-original";
+export { NavHamburger } from "./nav-hamburger";
+export { SwitchAppearance } from "./switch-appearance";
+
+// Rspress emits the synthetic 404 page only as HTML, but its default hint
+// advertises a Markdown alternate for every route. Remove this override when
+// the default hint stops advertising Markdown for synthetic 404 pages.
+export function LlmsHint() {
+  const { page } = usePage();
+  return page?.pageType === "404" ? null : <BaseLlmsHint />;
+}
 
 // Workaround: the marketing site has no documentation search (docs.delino.io
 // owns it), but the Rspress 2.1.3 default theme `Nav` mounts `<Search />`

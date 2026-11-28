@@ -254,10 +254,17 @@ func (c Config) post(ctx context.Context, path string, form url.Values, out any)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		var fieldErr *json.UnmarshalTypeError
-		if _, ok := out.(*DeviceAuthorization); ok && errors.As(err, &fieldErr) {
-			switch fieldErr.Field {
-			case "expires_in", "interval":
-				return invalidDeviceTiming(fieldErr.Field)
+		if errors.As(err, &fieldErr) {
+			switch out.(type) {
+			case *DeviceAuthorization:
+				switch fieldErr.Field {
+				case "expires_in", "interval":
+					return invalidDeviceTiming(fieldErr.Field)
+				}
+			case *Token:
+				if form.Get("grant_type") == "refresh_token" && fieldErr.Field == "expires_in" {
+					return errInvalidTokenLifetime
+				}
 			}
 		}
 		return fmt.Errorf("logto: %s: invalid response", path)
@@ -465,8 +472,11 @@ func isDialTimeout(err error) bool {
 	return errors.As(err, &oe) && oe.Op == "dial" && oe.Timeout()
 }
 
+var errInvalidTokenLifetime = errors.New("logto: invalid token response: expires_in must be an integer in the supported duration range")
+
 // Refresh exchanges a refresh token for an access token of the configured
-// API resource. Logto rotates refresh tokens: store the returned one.
+// API resource. It only returns lifetimes that fit in a time.Duration when
+// converted from seconds. Logto rotates refresh tokens: store the returned one.
 func (c Config) Refresh(ctx context.Context, refreshToken string) (*Token, error) {
 	form := url.Values{
 		"client_id":     {c.AppID},
@@ -479,6 +489,9 @@ func (c Config) Refresh(ctx context.Context, refreshToken string) (*Token, error
 	var tok Token
 	if err := c.post(ctx, "/oidc/token", form, &tok); err != nil {
 		return nil, err
+	}
+	if seconds := int64(tok.ExpiresIn); seconds < math.MinInt64/int64(time.Second) || seconds > math.MaxInt64/int64(time.Second) {
+		return nil, errInvalidTokenLifetime
 	}
 	if tok.AccessToken == "" {
 		return nil, errors.New("logto: the token response has no access token")

@@ -8,8 +8,6 @@ import (
 	"context"
 	"os"
 	"os/signal"
-
-	"github.com/delinoio/mono/cmds/ownsand/internal/cli"
 )
 
 func main() {
@@ -31,7 +29,7 @@ func run(afterFirstInterrupt func()) int {
 			afterFirstInterrupt()
 		}
 	}()
-	code := cli.Run(ctx, cli.Env{Args: os.Args[1:]})
+	code := runCLI(ctx, os.Args[1:])
 	stop()
 	return code
 }

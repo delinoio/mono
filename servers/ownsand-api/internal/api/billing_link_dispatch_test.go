@@ -4,7 +4,9 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,13 +50,151 @@ func (q linkDispatchTrace) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data 
 
 type linkDispatchClient struct {
 	accountsv1connect.UsageServiceClient
-	budget chan time.Duration
+	recorder     *linkDispatchRecorder
+	observations chan linkDispatchObservation
+}
+
+var errLinkDispatchMissingDeadline = errors.New("Accounts LinkOrganization dispatch context has no deadline")
+
+type linkDispatchObservation struct {
+	hasDeadline bool
+	budget      time.Duration
+}
+
+type linkDispatchRecord struct {
+	calls       int
+	firstBudget time.Duration
+}
+
+type linkDispatchRecorder struct {
+	mu          sync.Mutex
+	observation linkDispatchRecord
+}
+
+func (r *linkDispatchRecorder) record(budget time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.observation.calls == 0 {
+		r.observation.firstBudget = budget
+	}
+	r.observation.calls++
+}
+
+func (r *linkDispatchRecorder) snapshot() linkDispatchRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.observation
 }
 
 func (c linkDispatchClient) LinkOrganization(ctx context.Context, req *connect.Request[accountsv1.LinkOrganizationRequest]) (*connect.Response[accountsv1.LinkOrganizationResponse], error) {
-	deadline, _ := ctx.Deadline()
-	c.budget <- time.Until(deadline)
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		c.recorder.record(0)
+		if c.observations != nil {
+			c.observations <- linkDispatchObservation{hasDeadline: false}
+		}
+		return nil, errLinkDispatchMissingDeadline
+	}
+	budget := time.Until(deadline)
+	c.recorder.record(budget)
+	if c.observations != nil {
+		c.observations <- linkDispatchObservation{hasDeadline: true, budget: budget}
+	}
 	return c.UsageServiceClient.LinkOrganization(ctx, req)
+}
+
+func TestLinkDispatchClientRejectsMissingDeadline(t *testing.T) {
+	t.Parallel()
+	fake := accountstest.New(t, nil)
+	observations := make(chan linkDispatchObservation, 1)
+	var recorder linkDispatchRecorder
+	client := linkDispatchClient{UsageServiceClient: fake.Client(), recorder: &recorder, observations: observations}
+
+	_, err := client.LinkOrganization(context.Background(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{}))
+	if !errors.Is(err, errLinkDispatchMissingDeadline) {
+		t.Errorf("LinkOrganization error = %v, want %v", err, errLinkDispatchMissingDeadline)
+	}
+	select {
+	case observation := <-observations:
+		if observation.hasDeadline {
+			t.Error("LinkOrganization observation reports a deadline, want no deadline")
+		}
+	default:
+		t.Error("no LinkOrganization dispatch observation")
+	}
+	if calls := fake.Calls(accountstest.MethodLinkOrganization); calls != 0 {
+		t.Errorf("Accounts link calls = %d, want 0", calls)
+	}
+}
+
+type linkDispatchStub struct {
+	accountsv1connect.UsageServiceClient
+	link func(*connect.Request[accountsv1.LinkOrganizationRequest]) (*connect.Response[accountsv1.LinkOrganizationResponse], error)
+}
+
+func (s linkDispatchStub) LinkOrganization(_ context.Context, req *connect.Request[accountsv1.LinkOrganizationRequest]) (*connect.Response[accountsv1.LinkOrganizationResponse], error) {
+	return s.link(req)
+}
+
+func TestLinkDispatchClientRecordsBothCalls(t *testing.T) {
+	t.Parallel()
+
+	firstDeadline := time.Now().Add(time.Minute)
+	firstCtx, cancelFirst := context.WithDeadline(t.Context(), firstDeadline)
+	defer cancelFirst()
+	secondCtx, cancelSecond := context.WithDeadline(t.Context(), firstDeadline.Add(time.Minute))
+	defer cancelSecond()
+
+	firstReq := connect.NewRequest(&accountsv1.LinkOrganizationRequest{})
+	secondReq := connect.NewRequest(&accountsv1.LinkOrganizationRequest{})
+	wantResponse := connect.NewResponse(&accountsv1.LinkOrganizationResponse{})
+	wantErr := errors.New("delegate rejected the second call")
+	var forwarded []*connect.Request[accountsv1.LinkOrganizationRequest]
+	stub := linkDispatchStub{link: func(req *connect.Request[accountsv1.LinkOrganizationRequest]) (*connect.Response[accountsv1.LinkOrganizationResponse], error) {
+		forwarded = append(forwarded, req)
+		if req == firstReq {
+			return wantResponse, nil
+		}
+		return nil, wantErr
+	}}
+
+	var recorder linkDispatchRecorder
+	client := linkDispatchClient{UsageServiceClient: stub, recorder: &recorder}
+	var firstResp, secondResp *connect.Response[accountsv1.LinkOrganizationResponse]
+	var firstErr, secondErr error
+	done := make(chan struct{})
+	before := time.Until(firstDeadline)
+	go func() {
+		defer close(done)
+		firstResp, firstErr = client.LinkOrganization(firstCtx, firstReq)
+		secondResp, secondErr = client.LinkOrganization(secondCtx, secondReq)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("two link dispatches did not return before reading the recorder")
+	}
+	after := time.Until(firstDeadline)
+
+	if got := len(forwarded); got != 2 {
+		t.Fatalf("forwarded calls = %d, want 2", got)
+	}
+	if forwarded[0] != firstReq || forwarded[1] != secondReq {
+		t.Error("delegate did not receive the original requests in order")
+	}
+	if firstResp != wantResponse || firstErr != nil {
+		t.Errorf("first dispatch = %v, %v, want %v, nil", firstResp, firstErr, wantResponse)
+	}
+	if secondResp != nil || secondErr != wantErr {
+		t.Errorf("second dispatch = %v, %v, want nil, %v", secondResp, secondErr, wantErr)
+	}
+	observation := recorder.snapshot()
+	if observation.calls != 2 {
+		t.Fatalf("recorded calls = %d, want 2", observation.calls)
+	}
+	if budget := observation.firstBudget; budget < after || budget > before {
+		t.Errorf("first recorded budget = %v, want [%v, %v]", budget, after, before)
+	}
 }
 
 func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
@@ -112,35 +252,58 @@ func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
 					}
 				},
 			}
-			budgets := make(chan time.Duration, 1)
+			var recorder linkDispatchRecorder
+			observations := make(chan linkDispatchObservation, 1)
 			f = newLinkAttemptFixture(t, "dispatch-owner", func(o *app.Options) {
 				testDB = o.DB
 				o.DB = linkDispatchDB(t, testDB, trace)
-				o.UsageClient = linkDispatchClient{UsageServiceClient: o.UsageClient, budget: budgets}
+				o.UsageClient = linkDispatchClient{UsageServiceClient: o.UsageClient, recorder: &recorder, observations: observations}
 			})
 
+			wantCalls := 0
 			if tc.wantRemainingBudget > 0 {
+				wantCalls = 1
 				gate := f.fake.Hold(accountstest.MethodLinkOrganization)
 				t.Cleanup(gate.Release)
 			}
-			if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != tc.wantCode {
+			err := f.link(f.org.OwnerClient, billingAccountA)
+			record := recorder.snapshot()
+			var dispatchObservation linkDispatchObservation
+			dispatched := false
+			select {
+			case dispatchObservation = <-observations:
+				dispatched = true
+				if !dispatchObservation.hasDeadline {
+					t.Fatal(errLinkDispatchMissingDeadline)
+				}
+			default:
+			}
+			if record.calls != wantCalls {
+				t.Errorf("recorded Accounts link calls = %d, want %d", record.calls, wantCalls)
+			}
+			if calls := f.fake.Calls(accountstest.MethodLinkOrganization); calls != wantCalls {
+				t.Errorf("fake Accounts link calls = %d, want %d", calls, wantCalls)
+			}
+			if dispatched != (wantCalls == 1) {
+				t.Errorf("Accounts link dispatch observed = %t, want %t", dispatched, wantCalls == 1)
+			}
+			if testenv.Code(err) != tc.wantCode {
 				t.Fatalf("link = %v, want %v", err, tc.wantCode)
 			}
 			if logged := strings.Contains(f.env.Logs.String(), "billing_link_attempt_expired_before_dispatch"); logged != tc.wantExpiry {
 				t.Errorf("expiration logged = %t, want %t", logged, tc.wantExpiry)
 			}
-			if tc.wantRemainingBudget > 0 {
-				if calls := f.fake.Calls(accountstest.MethodLinkOrganization); calls != 1 {
-					t.Fatalf("Accounts link calls = %d, want 1", calls)
-				}
-				if budget := <-budgets; budget <= 0 || budget > tc.wantRemainingBudget {
+			if record.calls == 1 && wantCalls == 1 {
+				if budget := record.firstBudget; budget <= 0 || budget > tc.wantRemainingBudget {
 					t.Errorf("Accounts call budget = %v, want (0, %v]", budget, tc.wantRemainingBudget)
 				}
+				if budget := dispatchObservation.budget; budget <= 0 || budget > tc.wantRemainingBudget {
+					t.Errorf("Accounts observed call budget = %v, want (0, %v]", budget, tc.wantRemainingBudget)
+				}
+			}
+			if wantCalls == 1 {
 				f.wantRows(t, 1, 1)
 			} else {
-				if calls := f.fake.Calls(accountstest.MethodLinkOrganization); calls != 0 || len(budgets) != 0 {
-					t.Errorf("Accounts link calls = %d, client calls = %d, want none", calls, len(budgets))
-				}
 				switch tc.change {
 				case replaceBeforeLookup, replaceAfterLookup:
 					var got string

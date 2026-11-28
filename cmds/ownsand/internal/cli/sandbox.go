@@ -325,7 +325,7 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 	cwd := fs.String("cwd", "", "working directory")
 	timeout := fs.String("timeout", "", "exec timeout, for example 10m")
 	binary := fs.Bool("binary", false, "with --format json, encode output as base64")
-	rest, err := a.parseUntil(fs, args, 2)
+	rest, _, err := a.parseUntil(fs, args, 2)
 	if err != nil {
 		return err
 	}

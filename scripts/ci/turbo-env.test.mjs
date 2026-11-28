@@ -252,6 +252,9 @@ function devTaskProblems(cwd) {
   if (config.globalPassThroughEnv?.length > 0) {
     problems.push("Root turbo.json globalPassThroughEnv must be empty");
   }
+  if (config.globalEnv?.length > 0) {
+    problems.push("Root turbo.json globalEnv must be empty");
+  }
   if (dry.envMode !== "strict") {
     problems.push(`envMode is ${dry.envMode}, expected strict`);
   }
@@ -341,6 +344,18 @@ test("adding a global pass-through entry fails and names the root setting", (t) 
 
   assert.deepEqual(devTaskProblems(cwd), [
     "Root turbo.json globalPassThroughEnv must be empty",
+  ]);
+});
+
+test("adding a global env entry fails and names the root setting", (t) => {
+  const cwd = copyTurboConfiguration(t);
+  const file = join(cwd, "turbo.json");
+  const config = JSON.parse(readFileSync(file, "utf8"));
+  config.globalEnv = ["ADDR"];
+  writeFileSync(file, JSON.stringify(config));
+
+  assert.deepEqual(devTaskProblems(cwd), [
+    "Root turbo.json globalEnv must be empty",
   ]);
 });
 

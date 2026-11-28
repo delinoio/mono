@@ -467,12 +467,26 @@ export function createFakeApi({
       listInvitations(req) {
         record("ListInvitations", req);
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
-        const { page, nextPageToken } = paginate(
-          account.invitations.filter(
-            (i) => i.state === InvitationState.PENDING,
-          ),
-          req,
+        const pending = account.invitations.filter(
+          (invitation) => invitation.state === InvitationState.PENDING,
         );
+        pending.sort((left, right) => {
+          const leftTime = left.createTime;
+          const rightTime = right.createTime;
+          if (leftTime !== rightTime) {
+            if (leftTime === undefined) return 1;
+            if (rightTime === undefined) return -1;
+            if (leftTime.seconds !== rightTime.seconds) {
+              return leftTime.seconds > rightTime.seconds ? -1 : 1;
+            }
+            if (leftTime.nanos !== rightTime.nanos) {
+              return rightTime.nanos - leftTime.nanos;
+            }
+          }
+          if (left.invitationId === right.invitationId) return 0;
+          return left.invitationId > right.invitationId ? -1 : 1;
+        });
+        const { page, nextPageToken } = paginate(pending, req);
         return { invitations: page, nextPageToken };
       },
       revokeInvitation(req) {

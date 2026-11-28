@@ -24,6 +24,9 @@ import (
 // CORS, the Paddle webhook checks signatures, /metrics is not public and
 // /healthz still answers.
 func TestNewHandlerServesTheBillingServices(t *testing.T) {
+	// Prevent pgx from loading a service file from the caller's environment.
+	t.Setenv("PGSERVICE", "")
+
 	cfg, err := config.Load(func(name string) (string, bool) {
 		value, ok := map[string]string{
 			config.EnvDatabaseURL:             "postgres://user@127.0.0.1:1/none",

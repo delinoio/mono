@@ -126,7 +126,7 @@ const plannedSha = "c".repeat(40);
 const blobA = "a".repeat(40);
 const blobNew = "b".repeat(40);
 
-function runGuard(t, responses, blobs, runNumber = "7") {
+function runGuard(t, responses, blobs, { runsOnly = false } = {}) {
   const dir = scratch(t);
   const bin = stubGh(dir, {
     [`repos/owner/repo/compare/${plannedSha}...main`]: [
@@ -142,7 +142,8 @@ function runGuard(t, responses, blobs, runNumber = "7") {
       CHANGESET_BLOBS: JSON.stringify(blobs),
       REPOSITORY: "owner/repo",
       WORKFLOW: "deploy.yml",
-      GITHUB_RUN_NUMBER: runNumber,
+      GITHUB_RUN_NUMBER: "7",
+      RUNS_ONLY: String(runsOnly),
       SHA: plannedSha,
       GH_TOKEN: "token",
       CHECK_RETRY_DELAY: "0",
@@ -196,6 +197,21 @@ const jobPages = (runNumber, ...pages) => ({
   ],
 });
 const jobs = (runNumber, ...startedAt) => jobPages(runNumber, startedAt);
+function runHistoryAtLimit(lastRun = [8, "queued", null, 2]) {
+  const pages = Array.from({ length: 10 }, (_, page) =>
+    Array.from({ length: 100 }, (_, row) => [
+      1007 - page * 100 - row,
+      "pending",
+    ]),
+  );
+  pages[9][98] = [9, "completed", "cancelled"];
+  pages[9][99] = lastRun;
+  return { ...runPages(...pages), ...jobs(9), ...jobs(8) };
+}
+
+const runHistoryLimitError =
+  /Could not verify the plan: GitHub's workflow run history limit of 1,000 results .* Start a new deployment/;
+
 const changeset = (id, ...list) => ({
   // The guard lists the `.changeset` directory once; a {body: {sha}}
   // response becomes a listing that contains `<id>.md` with that blob.
@@ -392,6 +408,84 @@ test("guard reads further pages until it reaches this run", { skip }, (t) => {
     ["1", "2"],
   );
 });
+
+test(
+  "guard rejects incomplete workflow run history in both modes",
+  { skip },
+  (t) => {
+    for (const runsOnly of [false, true]) {
+      const result = runGuard(
+        t,
+        {
+          ...runHistoryAtLimit(),
+          ...changeset("a", { body: { sha: blobA } }),
+        },
+        { a: blobA },
+        { runsOnly },
+      );
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stdout, runHistoryLimitError);
+      assert.match(result.stdout, /Ignoring run #9/);
+      assert.match(result.stdout, /Ignoring run #8/);
+      assert.doesNotMatch(result.args, /\/compare\/|\/contents\/\.changeset/);
+    }
+  },
+);
+
+test(
+  "guard accepts a boundary at the workflow run history limit",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runHistoryAtLimit([6, "completed", "success"]),
+        ...changeset("a", { body: { sha: blobA } }),
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /The plan is current/);
+  },
+);
+
+test(
+  "guard accepts shorter workflow run history without a boundary",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runs([8, "pending"]),
+        ...changeset("a", { body: { sha: blobA } }),
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /The plan is current/);
+  },
+);
+
+test(
+  "guard reports a stale plan when jobs confirm a newer run at the history limit",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runHistoryAtLimit(),
+        ...jobs(8, "2026-11-18T00:00:00Z"),
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stdout,
+      /plan is stale: run #8 .* started after this run #7/,
+    );
+    assert.doesNotMatch(result.stdout, runHistoryLimitError);
+  },
+);
 
 test("guard lists only runs on main", { skip }, (t) => {
   const result = runGuard(
@@ -1550,6 +1644,14 @@ test("recovery rejects a superseding deployment", { skip }, (t) => {
   assert.equal(result.recovered, "recovered=false");
   assert.match(result.stdout, /run #8 of deploy\.yml started after this run/);
   assert.match(result.stdout, /newer deployment run exists/);
+  assert.ok(result.refsUnchanged);
+});
+
+test("recovery rejects incomplete workflow run history", { skip }, (t) => {
+  const state = landedRelease(t);
+  const result = runRecovery(t, state, { responses: runHistoryAtLimit() });
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, runHistoryLimitError);
   assert.ok(result.refsUnchanged);
 });
 
@@ -4970,14 +5072,13 @@ test(
   },
 );
 
+const skipRealCurlDroplet =
+  skipDroplet ||
+  (spawnSync("curl", ["--version"]).status !== 0 && "curl is not installed");
+
 test(
   "droplet deploy probes the replacement directly despite HTTP proxy settings",
-  {
-    skip:
-      skipDroplet ||
-      (spawnSync("curl", ["--version"]).status !== 0 &&
-        "curl is not installed"),
-  },
+  { skip: skipRealCurlDroplet },
   async (t) => {
     for (const [name, response, noProxy] of [
       ["200 with an empty bypass list", 200, ""],
@@ -5050,6 +5151,88 @@ test(
           assert.equal(setup.read("caddy/sites/api.caddy"), route);
           assert.equal(setup.read("state/api.current"), current);
           assert.equal(setup.read("state/api.previous"), previous);
+        }
+      });
+    }
+  },
+);
+
+test(
+  "droplet deploy ignores curl defaults when probing replacement health",
+  { skip: skipRealCurlDroplet },
+  async (t) => {
+    const curlHome = scratch(t);
+    writeFileSync(join(curlHome, ".curlrc"), "location\n");
+
+    for (const [name, redirect] of [
+      ["persistent 302", true],
+      ["direct 204", false],
+    ]) {
+      await t.test(name, { timeout: 10000 }, async (t) => {
+        const requests = [];
+        const origin = createServer((req, res) => {
+          requests.push(`${req.method} ${req.url}`);
+          if (redirect && req.url === "/healthz") {
+            res.writeHead(302, { Location: "/redirect-target" }).end();
+          } else {
+            res.writeHead(204).end();
+          }
+        });
+        origin.listen(0, "127.0.0.1");
+        t.after(() => new Promise((resolve) => origin.close(resolve)));
+        await once(origin, "listening");
+
+        const port = origin.address().port;
+        const args = [...httpArgs];
+        args[2] = String(port);
+        const current = `${olderImage}\n`;
+        const previous = `${oldestImage}\n`;
+        const setup = setupDroplet(t, args, {
+          old: ["old1"],
+          route: oldApiRoute,
+          state: current,
+          previous,
+          stubs: {
+            curl: 'exec "$(PATH="${PATH#*:}" command -v curl)" "$@"',
+          },
+        });
+        const result = await startDroplet(t, setup, args, {
+          CURL_HOME: curlHome,
+          DROPLET_HEALTH_TIMEOUT: "4",
+          STUB_ADDRESS: "127.0.0.1",
+        }).done;
+        const calls = setup.calls();
+        const route = setup.read("caddy/sites/api.caddy");
+        const output = result.stdout + result.stderr;
+
+        assert.ok(requests.length >= 2, `Expected repeated probes: ${output}`);
+        assert.ok(
+          requests.every((request) => request === "GET /healthz"),
+          JSON.stringify(requests),
+        );
+        if (redirect) {
+          assert.equal(result.status, 1, output);
+          assert.match(
+            result.stderr,
+            /did not pass the health check within 4 seconds/,
+          );
+          assert.equal(route, oldApiRoute);
+          assert.equal(setup.read("state/api.current"), current);
+          assert.equal(setup.read("state/api.previous"), previous);
+          assert.ok(!calls.some((call) => call.startsWith("docker exec")));
+          assert.ok(!calls.includes("docker stop --time 30 old1"));
+          assert.ok(!calls.includes("docker rm old1"));
+          assert.match(calls.at(-1), /^docker rm --force api-/);
+        } else {
+          assert.equal(result.status, 0, output);
+          assert.equal(
+            route?.match(/reverse_proxy (\S+)/)?.[1],
+            `api-${dropletDeploymentUuid.replaceAll("-", "")}:${port}`,
+          );
+          assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+          assert.equal(setup.read("state/api.previous"), current);
+          assert.ok(calls.some(isProxyLoad));
+          assert.ok(calls.includes("docker rm old1"));
         }
       });
     }

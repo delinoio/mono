@@ -141,7 +141,7 @@ func TestDownloadCleansUpCanceledHardLinkFallback(t *testing.T) {
 			}}
 			res, err := c.download(ctx, DownloadParams{
 				OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "out", LocalPath: dest,
-			}, extractor)
+			}, downloadLimits{file: DownloadFileLimit, total: DownloadTotalLimit}, extractor)
 			if res != nil || !errors.Is(err, context.Canceled) {
 				t.Fatalf("download = %+v, %v, want context.Canceled", res, err)
 			}

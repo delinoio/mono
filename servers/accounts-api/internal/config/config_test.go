@@ -102,6 +102,7 @@ func TestLoadRejectsInvalidAddrHost(t *testing.T) {
 		"label too long":       {strings.Repeat("a", 64) + ":8100", strings.Repeat("a", 64)},
 		"hostname too long":    {strings.Repeat("a.", 127) + "a:8100", strings.Repeat("a.", 127) + "a"},
 		"bad IPv6 in brackets": {"[::1%]:8100", "::1%"},
+		"invalid IPv4 octet":   {"256.0.0.1:8100", "256.0.0.1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(lookupFrom(map[string]string{EnvAddr: tc.addr}))
@@ -345,9 +346,9 @@ func TestLoadBillingDefaults(t *testing.T) {
 func TestLoadBillingOverrides(t *testing.T) {
 	cfg, err := Load(lookupFrom(map[string]string{
 		EnvRunMigrations:           "false",
-		EnvLogtoIssuer:             "https://tenant.logto.app/oidc/",
+		EnvLogtoIssuer:             "\t https://tenant.example.test:443/oidc/ \r",
 		EnvLogtoAudience:           "https://accounts.api.example",
-		EnvLogtoManagementEndpoint: "https://tenant.logto.app/",
+		EnvLogtoManagementEndpoint: " http://127.0.0.1:8080/ ",
 		EnvCORSOrigins:             " https://accounts.delino.io , http://127.0.0.1:13100,",
 		EnvWebOrigin:               "http://127.0.0.1:13100",
 	}))
@@ -357,10 +358,10 @@ func TestLoadBillingOverrides(t *testing.T) {
 	if cfg.RunMigrations {
 		t.Error("RunMigrations = true, want false")
 	}
-	if cfg.LogtoIssuer != "https://tenant.logto.app/oidc" {
+	if cfg.LogtoIssuer != "https://tenant.example.test:443/oidc" {
 		t.Errorf("LogtoIssuer = %q", cfg.LogtoIssuer)
 	}
-	if cfg.LogtoManagementEndpoint != "https://tenant.logto.app" {
+	if cfg.LogtoManagementEndpoint != "http://127.0.0.1:8080" {
 		t.Errorf("LogtoManagementEndpoint = %q", cfg.LogtoManagementEndpoint)
 	}
 	if cfg.LogtoAudience != "https://accounts.api.example" {
@@ -442,16 +443,25 @@ func TestLoadRejectsInvalidBillingValues(t *testing.T) {
 
 func TestLoadRejectsInvalidURLAndOriginHosts(t *testing.T) {
 	for name, tc := range map[string]struct{ env, value string }{
-		"issuer https port only":       {EnvLogtoIssuer, "https://:443/oidc"},
-		"issuer http port only":        {EnvLogtoIssuer, "http://:80"},
-		"management port only":         {EnvLogtoManagementEndpoint, "https://:443"},
-		"cors port only":               {EnvCORSOrigins, "https://:443"},
-		"cors port only in a list":     {EnvCORSOrigins, "https://accounts.delino.io, https://:443"},
-		"web origin port only":         {EnvWebOrigin, "https://:443"},
-		"web origin http port only":    {EnvWebOrigin, "http://:80"},
-		"cors empty bracketed address": {EnvCORSOrigins, "http://[]:80"},
-		"cors percent in host":         {EnvCORSOrigins, "https://exa%25mple.test"},
-		"web origin percent in host":   {EnvWebOrigin, "https://exa%25mple.test"},
+		"issuer https port only":             {EnvLogtoIssuer, "https://:443/oidc"},
+		"issuer http port only":              {EnvLogtoIssuer, "http://:80"},
+		"management port only":               {EnvLogtoManagementEndpoint, "https://:443"},
+		"issuer no-break space":              {EnvLogtoIssuer, "https://tenant\u00a0.example.test/oidc"},
+		"issuer ideographic space":           {EnvLogtoIssuer, "https://tenant\u3000.example.test/oidc"},
+		"issuer escaped space":               {EnvLogtoIssuer, "https://tenant%C2%A0.example.test/oidc"},
+		"management no-break space":          {EnvLogtoManagementEndpoint, "https://tenant\u00a0.example.test"},
+		"management ideographic space":       {EnvLogtoManagementEndpoint, "https://tenant\u3000.example.test"},
+		"management escaped space":           {EnvLogtoManagementEndpoint, "https://tenant%C2%A0.example.test"},
+		"management resource escaped space":  {EnvLogtoManagementResource, "https://tenant%C2%A0.example.test/api"},
+		"cors port only":                     {EnvCORSOrigins, "https://:443"},
+		"cors port only in a list":           {EnvCORSOrigins, "https://valid.example, https://:443"},
+		"web origin port only":               {EnvWebOrigin, "https://:443"},
+		"web origin http port only":          {EnvWebOrigin, "http://:80"},
+		"cors empty bracketed address":       {EnvCORSOrigins, "http://[]:80"},
+		"cors percent in host":               {EnvCORSOrigins, "https://exa%25mple.test"},
+		"web origin percent in host":         {EnvWebOrigin, "https://exa%25mple.test"},
+		"web origin whitespace in host":      {EnvWebOrigin, "https://example.test\u00a0"},
+		"cors whitespace after valid origin": {EnvCORSOrigins, "https://valid.example, https://exam\u3000ple.test"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(lookupFrom(map[string]string{tc.env: tc.value}))
@@ -463,6 +473,11 @@ func TestLoadRejectsInvalidURLAndOriginHosts(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), ":443") || strings.Contains(err.Error(), ":80") {
 				t.Errorf("error %q contains the value", err)
+			}
+			for _, value := range strings.Split(tc.value, ", ") {
+				if strings.Contains(err.Error(), value) {
+					t.Errorf("error %q contains the configured URL %q", err, value)
+				}
 			}
 		})
 	}
@@ -486,8 +501,8 @@ func TestLoadKeepsLoopbackAndIPv6Hosts(t *testing.T) {
 
 func TestLoadCanonicalizesOrigins(t *testing.T) {
 	cfg, err := Load(lookupFrom(map[string]string{
-		EnvCORSOrigins: "HTTPS://Accounts.Delino.IO:443, http://Accounts.Delino.Localhost:80, https://accounts.delino.io:8443, http://localhost:443, https://[2001:DB8::1]:443",
-		EnvWebOrigin:   "HTTPS://Accounts.Delino.IO:443",
+		EnvCORSOrigins: "HTTPS://Accounts.Delino.IO:443, http://Accounts.Delino.Localhost:80, https://accounts.delino.io:8443, http://localhost:443, https://[2001:DB8::1]:443, \tHTTPS://XN--BCHER-KVA.EXAMPLE:443 \r",
+		EnvWebOrigin:   " \tHTTPS://XN--BCHER-KVA.EXAMPLE:443 \r",
 	}))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -498,12 +513,13 @@ func TestLoadCanonicalizesOrigins(t *testing.T) {
 		"https://accounts.delino.io:8443",
 		"http://localhost:443",
 		"https://[2001:db8::1]",
+		"https://xn--bcher-kva.example",
 	}
 	if !slices.Equal(cfg.CORSOrigins, want) {
 		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
 	}
-	if cfg.WebOrigin != "https://accounts.delino.io" {
-		t.Errorf("WebOrigin = %q, want %q", cfg.WebOrigin, "https://accounts.delino.io")
+	if want := "https://xn--bcher-kva.example"; cfg.WebOrigin != want {
+		t.Errorf("WebOrigin = %q, want %q", cfg.WebOrigin, want)
 	}
 }
 

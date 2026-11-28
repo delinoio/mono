@@ -56,6 +56,7 @@ func TestMain(m *testing.M) {
 	}
 	guestBinary = filepath.Join(dir, "ownsand-guest")
 	if out, err := exec.Command("go", "build", "-o", guestBinary, "github.com/delinoio/mono/cmds/ownsand-guest").CombinedOutput(); err != nil {
+		os.RemoveAll(dir)
 		panic(fmt.Sprintf("build guest helper: %v\n%s", err, out))
 	}
 	code := m.Run()
@@ -793,19 +794,59 @@ func TestInterruptedRemovalTreatsUnknownDeviceAsConfirmed(t *testing.T) {
 	}
 }
 
+type unknownDeviceChallengeClient struct {
+	ownsandv1connect.AgentServiceClient
+	deviceID string
+	notFound chan<- struct{}
+}
+
+func (c unknownDeviceChallengeClient) CreateChallenge(ctx context.Context, req *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
+	resp, err := c.AgentServiceClient.CreateChallenge(ctx, req)
+	if req.Msg.GetDeviceId() == c.deviceID && connect.CodeOf(err) == connect.CodeNotFound {
+		select {
+		case c.notFound <- struct{}{}:
+		default:
+		}
+	}
+	return resp, err
+}
+
 func TestUnknownDeviceKeepsData(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
 	cp.Forget(id.DeviceID)
-	h := start(t, cp, st, id)
-	time.Sleep(300 * time.Millisecond)
+
+	const wantChallenges = 2
+	notFound := make(chan struct{}, wantChallenges)
+	h := startWith(t, cp, st, id, func(o *Options) {
+		o.Control.Agent = unknownDeviceChallengeClient{
+			AgentServiceClient: o.Control.Agent,
+			deviceID:           id.DeviceID,
+			notFound:           notFound,
+		}
+	})
+
+	// The retry shows that the agent handled the first NotFound response.
+	const waitTimeout = 5 * time.Second
+	deadline := time.NewTimer(waitTimeout)
+	defer deadline.Stop()
+	// The harness cleanup waits on its own done channel if this test reads errc.
+	for received := range wantChallenges {
+		select {
+		case <-notFound:
+		case err := <-h.errc:
+			t.Fatalf("agent stopped after %d of %d NotFound challenge responses: %v", received, wantChallenges, err)
+		case <-deadline.C:
+			t.Fatalf("received %d of %d NotFound challenge responses in %s", received, wantChallenges, waitTimeout)
+		}
+	}
 	select {
 	case err := <-h.errc:
-		t.Fatalf("agent stopped: %v", err)
+		t.Fatalf("agent stopped before the identity check: %v", err)
 	default:
 	}
 	if _, err := st.LoadIdentity(); err != nil {
-		t.Fatal("identity deleted for an unknown device without a removal notice")
+		t.Fatalf("cannot read the enrolled identity after the unknown-device retry: %v", err)
 	}
 }
 
@@ -1042,16 +1083,22 @@ func (f *importFixture) requireRestorable(t *testing.T, id string) {
 // hook synchronously, and httptest.Server.Close waits for active requests,
 // so a blocked handler would otherwise strand the test teardown.
 type getGate struct {
-	id      string
-	mu      sync.Mutex
-	gets    int
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
+	id       string
+	mu       sync.Mutex
+	gets     int
+	started  chan struct{}
+	earlyGET chan struct{}
+	release  chan struct{}
+	once     sync.Once
 }
 
 func newGetGate(id string) *getGate {
-	return &getGate{id: id, started: make(chan struct{}), release: make(chan struct{})}
+	return &getGate{
+		id:       id,
+		started:  make(chan struct{}),
+		earlyGET: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
 }
 
 // newGatedImportFixture creates the fixture whose bucket uses a new gate for
@@ -1070,7 +1117,11 @@ func newGatedImportFixture(t *testing.T, id string, tweak func(*Options)) (*getG
 // Release unblocks the gated download. It is idempotent, and every release
 // of the gate, explicit or from a cleanup, goes through it.
 func (g *getGate) Release() {
-	g.once.Do(func() { close(g.release) })
+	g.once.Do(func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		close(g.release)
+	})
 }
 
 func (g *getGate) hook(r *http.Request) int {
@@ -1080,6 +1131,13 @@ func (g *getGate) hook(r *http.Request) int {
 	g.mu.Lock()
 	g.gets++
 	first := g.gets == 1
+	if g.gets == 2 {
+		select {
+		case <-g.release:
+		default:
+			close(g.earlyGET)
+		}
+	}
 	g.mu.Unlock()
 	if first {
 		close(g.started)
@@ -1095,6 +1153,38 @@ func (g *getGate) count() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.gets
+}
+
+func (f *importFixture) observeImportWaiter(t *testing.T, id string) <-chan struct{} {
+	t.Helper()
+	waiting := make(chan struct{})
+	signal := sync.OnceFunc(func() { close(waiting) })
+	m := f.h.agent.Sandboxes
+	m.SetSnapshotImportWaiterHookForTest(func(waiterID string) {
+		if waiterID == id {
+			signal()
+		}
+	})
+	t.Cleanup(func() { m.SetSnapshotImportWaiterHookForTest(nil) })
+	return waiting
+}
+
+func (g *getGate) releaseAfterWaiter(t *testing.T, waiting <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-g.earlyGET:
+		t.Fatal("a second part GET reached the bucket before gate release")
+	case <-waiting:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the second import to register on the held snapshot import lock")
+	}
+	g.Release()
+	// Catch a GET that arrived between the waiter signal and gate release.
+	select {
+	case <-g.earlyGET:
+		t.Fatal("a second part GET reached the bucket before gate release")
+	default:
+	}
 }
 
 func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
@@ -1116,11 +1206,11 @@ func settle() { time.Sleep(300 * time.Millisecond) }
 func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
 	id, _ := uuidv7.NewString()
 	gate, f := newGatedImportFixture(t, id, nil)
+	waiting := f.observeImportWaiter(t, id)
 	first := f.h.sendCommand(f.stage(t, id, false))
 	waitClosed(t, gate.started, "the first download")
 	second := f.h.sendCommand(f.command(id, false))
-	settle()
-	gate.Release()
+	gate.releaseAfterWaiter(t, waiting)
 	r1, r2 := f.h.result(first), f.h.result(second)
 	for _, r := range []*ownsandv1.AgentCommandResult{r1, r2} {
 		if r.GetError() != nil || r.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
@@ -1143,13 +1233,11 @@ func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
 func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	id, _ := uuidv7.NewString()
 	gate, f := newGatedImportFixture(t, id, nil)
+	waiting := f.observeImportWaiter(t, id)
 	bad := f.h.sendCommand(f.stage(t, id, true))
 	waitClosed(t, gate.started, "the first download")
 	good := f.h.sendCommand(f.command(id, false))
-	// Without the per-snapshot lock the good import publishes the copy while
-	// the bad one still waits at its gate, and the bad one then deletes it.
-	settle()
-	gate.Release()
+	gate.releaseAfterWaiter(t, waiting)
 	badRes, goodRes := f.h.result(bad), f.h.result(good)
 	if badRes.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS {
 		t.Fatalf("bad import = %v", badRes)
@@ -1160,8 +1248,12 @@ func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	f.requireRestorable(t, id)
 	// A later import reuses the copy: even one that would fail its hash check
 	// returns the ready entry and leaves the content alone.
+	gets := gate.count()
 	if res := f.h.command(f.command(id, true)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
 		t.Fatalf("later import = %v", res)
+	}
+	if got := gate.count(); got != gets {
+		t.Fatalf("part downloads after the later import = %d, want %d", got, gets)
 	}
 	f.requireRestorable(t, id)
 }
@@ -2536,6 +2628,7 @@ type retainedCreateRuntime struct {
 	failDeletes int
 	deleteCalls int
 	firstDelete func()
+	thirdDelete func()
 }
 
 func (r *retainedCreateRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
@@ -2555,6 +2648,9 @@ func (r *retainedCreateRuntime) Delete(ctx context.Context, id string) error {
 	}
 	if attempt <= r.failDeletes {
 		return errors.New("injected stop failure")
+	}
+	if attempt == 3 && r.thirdDelete != nil {
+		r.thirdDelete()
 	}
 	return r.Runtime.Delete(ctx, id)
 }
@@ -2682,11 +2778,24 @@ func testRemovalRetriesRetainedFailedCreate(t *testing.T, runtimeForStore func(*
 func TestFailedCreateRetainedVMIsStoppedByRunningAgent(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
+	thirdDeleteEntered := make(chan struct{})
+	resumeDelete := make(chan struct{})
 	var rt *retainedCreateRuntime
 	h := startWith(t, cp, st, id, func(o *Options) {
-		rt = &retainedCreateRuntime{Runtime: o.Runtime, failDeletes: 2}
+		rt = &retainedCreateRuntime{
+			Runtime:     o.Runtime,
+			failDeletes: 2,
+			thirdDelete: func() {
+				close(thirdDeleteEntered)
+				<-resumeDelete
+			},
+		}
 		o.Runtime = rt
 	})
+	release := sync.OnceFunc(func() { close(resumeDelete) })
+	// Release the blocked Delete before the harness waits for the agent to exit.
+	t.Cleanup(release)
+
 	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
 	sandboxID, _ := uuidv7.NewString()
@@ -2694,19 +2803,22 @@ func TestFailedCreateRetainedVMIsStoppedByRunningAgent(t *testing.T) {
 	if res.GetError() == nil {
 		t.Fatalf("create result %v, want a failure", res)
 	}
+	waitClosed(t, thirdDeleteEntered, "the agent to enter the third Delete")
 	vmDir := st.Path(store.VMsDir, sandboxID)
 	running, err := rt.Runtime.Running(context.Background())
 	if err != nil || len(running) != 1 || running[0] != sandboxID {
-		t.Fatalf("VMs after the failed create: %v, %v; want the retained VM", running, err)
+		t.Fatalf("VMs before the third Delete proceeds = %v, %v, want [%s]", running, err, sandboxID)
 	}
+	info, err := os.Stat(vmDir)
+	if err != nil {
+		t.Fatalf("stat retained VM directory: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("retained VM path %q is not a directory", vmDir)
+	}
+	release()
 
 	deadline := time.Now().Add(20 * time.Second)
-	for rt.calls() < 3 {
-		if time.Now().After(deadline) {
-			t.Fatalf("the agent retried the stop %d times, want 3", rt.calls())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	for {
 		running, err = rt.Runtime.Running(context.Background())
 		_, statErr := os.Stat(vmDir)
@@ -2718,9 +2830,11 @@ func TestFailedCreateRetainedVMIsStoppedByRunningAgent(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	calls := rt.calls()
+	if got := rt.calls(); got != 3 {
+		t.Fatalf("Delete calls after cleanup = %d, want 3", got)
+	}
 	time.Sleep(2500 * time.Millisecond)
-	if got := rt.calls(); got != calls {
-		t.Fatalf("the agent kept stopping after success: %d Delete calls, want %d", got, calls)
+	if got := rt.calls(); got != 3 {
+		t.Fatalf("the agent kept stopping after success: %d Delete calls, want 3", got)
 	}
 }

@@ -124,6 +124,33 @@ func (l *failingMetricsListener) Close() error {
 	return err
 }
 
+func bindLoopback(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+func checkHTTPStatusOK(t *testing.T, listener net.Listener, path string, timeout time.Duration) {
+	t.Helper()
+	client := &http.Client{Timeout: timeout, Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Get("http://" + listener.Addr().String() + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, readErr := io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read %s response: %v", path, readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%s status = %d, want 200", path, resp.StatusCode)
+	}
+}
+
 func TestRunServersShutdown(t *testing.T) {
 	for _, tt := range []struct {
 		name           string
@@ -138,14 +165,6 @@ func TestRunServersShutdown(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			const timeout = 5 * time.Second
-			bind := func() net.Listener {
-				listener, err := net.Listen("tcp", "127.0.0.1:0")
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = listener.Close() })
-				return listener
-			}
 			wait := func(done <-chan struct{}, event string) {
 				t.Helper()
 				select {
@@ -154,22 +173,9 @@ func TestRunServersShutdown(t *testing.T) {
 					t.Fatalf("timed out waiting for %s", event)
 				}
 			}
-			checkHTTP := func(listener net.Listener, path string) {
-				t.Helper()
-				client := &http.Client{Timeout: timeout, Transport: &http.Transport{DisableKeepAlives: true}}
-				resp, err := client.Get("http://" + listener.Addr().String() + path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-				if resp.StatusCode != http.StatusOK {
-					t.Fatalf("%s status = %d, want 200", path, resp.StatusCode)
-				}
-			}
 			ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
-			public := bind()
+			public := bindLoopback(t)
 			var logs bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&logs, nil))
 			srv := newServer(ok, logger)
@@ -179,7 +185,7 @@ func TestRunServersShutdown(t *testing.T) {
 			var failedMetrics *failingMetricsListener
 			var metricsSrv *http.Server
 			if tt.metricsEnabled {
-				failedMetrics = &failingMetricsListener{Listener: bind(), fail: failMetrics, closed: make(chan struct{})}
+				failedMetrics = &failingMetricsListener{Listener: bindLoopback(t), fail: failMetrics, closed: make(chan struct{})}
 				metricsListener = failedMetrics
 				metricsSrv = &http.Server{Handler: ok}
 			}
@@ -201,9 +207,9 @@ func TestRunServersShutdown(t *testing.T) {
 				}, metricsSrv, metricsListener)
 			}()
 
-			checkHTTP(public, "/healthz")
+			checkHTTPStatusOK(t, public, "/healthz", timeout)
 			if tt.metricsEnabled {
-				checkHTTP(metricsListener, "/metrics")
+				checkHTTPStatusOK(t, metricsListener, "/metrics", timeout)
 			}
 			if tt.signalFirst {
 				cancel()
@@ -231,7 +237,7 @@ func TestRunServersShutdown(t *testing.T) {
 			}
 			// A fresh public connection still works while the worker and
 			// lease callback is blocked. The HTTP drain must wait for it.
-			checkHTTP(public, "/healthz")
+			checkHTTPStatusOK(t, public, "/healthz", timeout)
 			releaseWorkers()
 
 			var err error
@@ -250,10 +256,115 @@ func TestRunServersShutdown(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatalf("runServers error = %v, want nil", err)
+			} else if strings.Contains(logs.String(), "metrics_server_failed") || !strings.Contains(logs.String(), "server_shutdown_completed") {
+				t.Fatalf("unexpected clean shutdown logs: %s", &logs)
 			}
 			if conn, err := net.DialTimeout("tcp", public.Addr().String(), timeout); err == nil {
 				_ = conn.Close()
 				t.Fatal("public listener still accepts connections after shutdown")
+			}
+		})
+	}
+}
+
+type temporaryAcceptError struct{}
+
+func (temporaryAcceptError) Error() string   { return "temporary accept failure" }
+func (temporaryAcceptError) Timeout() bool   { return false }
+func (temporaryAcceptError) Temporary() bool { return true }
+
+type temporaryAcceptListener struct {
+	net.Listener
+	failed bool
+}
+
+func (l *temporaryAcceptListener) Accept() (net.Conn, error) {
+	if !l.failed {
+		l.failed = true
+		return nil, temporaryAcceptError{}
+	}
+	return l.Listener.Accept()
+}
+
+func TestRunServersAcceptErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		publicFailure bool
+		temporary     bool
+	}{
+		{name: "metrics Accept fails after shutdown closes the listener"},
+		{name: "public failure joins metrics failure during shutdown", publicFailure: true},
+		{name: "both listeners retry temporary failures and shut down cleanly", temporary: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const timeout = 5 * time.Second
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			waitForFailure := func(l *acceptFailureListener) {
+				t.Helper()
+				select {
+				case <-l.failureReady:
+				case <-time.After(timeout):
+					t.Fatalf("no pending Accept failure on %s", l.Addr())
+				}
+			}
+			public, metrics := bindLoopback(t), bindLoopback(t)
+			failPublic := make(chan struct{})
+			var failedPublic, failedMetrics *acceptFailureListener
+			if tc.publicFailure {
+				failedPublic = newAcceptFailureListener(t, public, errPublicAccept, failPublic)
+				public = failedPublic
+			}
+			if tc.temporary {
+				public = &temporaryAcceptListener{Listener: public}
+				metrics = &temporaryAcceptListener{Listener: metrics}
+			} else {
+				failedMetrics = newAcceptFailureListener(t, metrics, errMetricsAccept, nil)
+				metrics = failedMetrics
+			}
+
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+			srv := newServer(ok, logger)
+			metricsSrv := &http.Server{Handler: ok, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
+			done := make(chan error, 1)
+			go func() {
+				done <- runServers(ctx, func() {}, srv, public, logger, timeout, func() {}, metricsSrv, metrics)
+			}()
+
+			checkHTTPStatusOK(t, public, "/healthz", timeout)
+			checkHTTPStatusOK(t, metrics, "/metrics", timeout)
+			if failedMetrics != nil {
+				waitForFailure(failedMetrics)
+			}
+			if failedPublic != nil {
+				waitForFailure(failedPublic)
+				close(failPublic)
+			} else {
+				cancel()
+			}
+
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(timeout):
+				t.Fatal("runServers did not return")
+			}
+			if tc.temporary {
+				if err != nil {
+					t.Fatalf("runServers error = %v, want nil", err)
+				}
+				if strings.Contains(logs.String(), "metrics_server_failed") || !strings.Contains(logs.String(), "server_shutdown_completed") {
+					t.Fatalf("unexpected clean shutdown logs: %s", &logs)
+				}
+				return
+			}
+			if !errors.Is(err, errMetricsAccept) || (tc.publicFailure && !errors.Is(err, errPublicAccept)) {
+				t.Fatalf("runServers error = %v, want metrics error and public error when both fail", err)
+			}
+			if !strings.Contains(logs.String(), "metrics_server_failed") || !strings.Contains(logs.String(), errMetricsAccept.Error()) {
+				t.Fatalf("missing metrics error in logs: %s", &logs)
 			}
 		})
 	}

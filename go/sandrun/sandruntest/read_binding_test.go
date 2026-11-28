@@ -4,6 +4,7 @@ package sandruntest
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
@@ -112,6 +114,28 @@ func TestFakeReadBinding(t *testing.T) {
 	const retainedID = "retained-read"
 	checkRead(t, read(first, retainedID, path, 0), original, int64(len(original)))
 
+	t.Run("empty path", func(t *testing.T) {
+		id, err := uuidv7.NewString()
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := len(s.ReadRequests())
+		got := read(first, id, "", 0)
+		checkRejected(t, got, connect.CodeInvalidArgument)
+		var rpcErr *connect.Error
+		if !errors.As(got.err, &rpcErr) || rpcErr.Message() != "invalid path: is required" {
+			t.Fatalf("read returned %v, want the missing path error", got.err)
+		}
+		requests := s.ReadRequests()[before:]
+		if len(requests) != 1 {
+			t.Fatalf("recorded %d requests, want one", len(requests))
+		}
+		req := requests[0]
+		if req.GetReadId() != id || req.GetPath() != "" || req.GetOffset() != 0 {
+			t.Fatalf("recorded request %v, want read ID %q, empty path and offset zero", req, id)
+		}
+		checkRead(t, read(first, id, path, 0), original, int64(len(original)))
+	})
 	t.Run("directory", func(t *testing.T) {
 		checkRejected(t, read(first, "directory-read", ".", 0), connect.CodeFailedPrecondition)
 	})

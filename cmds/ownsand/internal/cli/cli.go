@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,23 +103,40 @@ func usageErr(format string, args ...any) error {
 	return &exitError{code: ExitUsage, msg: fmt.Sprintf(format, args...)}
 }
 
+// noColorFlag keeps the last valid value if a later occurrence fails to parse.
+type noColorFlag bool
+
+func (f *noColorFlag) IsBoolFlag() bool { return true }
+
+func (f *noColorFlag) String() string { return strconv.FormatBool(f != nil && bool(*f)) }
+
+func (f *noColorFlag) Set(s string) error {
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		return errors.New("parse error")
+	}
+	*f = noColorFlag(v)
+	return nil
+}
+
 // globals are the flags that every command accepts.
 type globals struct {
 	apiURL    string
 	org       string
 	format    string
-	noColor   bool
+	noColor   noColorFlag
 	verbose   bool
 	transport string
 }
 
 type app struct {
-	env    Env
-	g      globals
-	fmt    Format
-	color  bool
-	logger *slog.Logger
-	client *ownsand.Client
+	env                 Env
+	g                   globals
+	fmt                 Format
+	color               bool
+	logger              *slog.Logger
+	client              *ownsand.Client
+	rootFlagsTerminated bool
 }
 
 func (a *app) getenv(k string) string {
@@ -194,7 +212,7 @@ func (a *app) registerGlobals(fs *flag.FlagSet) {
 	fs.StringVar(&a.g.apiURL, "api-url", a.g.apiURL, "API origin (env "+EnvAPIURL+")")
 	fs.StringVar(&a.g.org, "org", a.g.org, "organization ID (env "+ownsand.EnvOrganization+")")
 	fs.StringVar(&a.g.format, "format", a.g.format, "output format: text or json")
-	fs.BoolVar(&a.g.noColor, "no-color", a.g.noColor, "disable ANSI color (env "+EnvNoColor+" set to a non-empty value)")
+	fs.Var(&a.g.noColor, "no-color", "disable ANSI color (env "+EnvNoColor+" set to a non-empty value)")
 	fs.BoolVar(&a.g.verbose, "verbose", a.g.verbose, "write structured logs to standard error")
 	fs.StringVar(&a.g.transport, "transport", a.g.transport, "data path transport: auto, peer-to-peer or relay (env "+EnvTransport+")")
 }
@@ -209,30 +227,35 @@ func (a *app) newFlags(name string) *flag.FlagSet {
 // parse parses fs and applies the global settings. Flags may follow
 // positional arguments; "--" ends flag parsing.
 func (a *app) parse(fs *flag.FlagSet, args []string) ([]string, error) {
-	return a.parseUntil(fs, args, -1)
+	rest, _, err := a.parseUntil(fs, args, -1)
+	return rest, err
 }
 
-// parseUntil is parse that stops reading flags after stopAfter positional
-// arguments (-1: never), so that `sandbox exec <id> <command> -flag` keeps
-// the command's own flags.
-func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]string, error) {
+// parseUntil reports whether "--" ended flag parsing. It also stops after
+// stopAfter positional arguments (-1: no limit), so sandbox exec can pass the
+// guest command's flags through.
+func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]string, bool, error) {
+	if a.rootFlagsTerminated {
+		return args, true, nil
+	}
 	var positional []string
+	var terminated bool
 	for {
 		if err := fs.Parse(args); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
 				// A failed write of the help (a full disk or a closed pipe)
 				// exits with 1 and the write error, as a failed result does.
 				if werr := a.printFlags(fs); werr != nil {
-					return nil, werr
+					return nil, false, werr
 				}
-				return nil, &exitError{code: ExitOK}
+				return nil, false, &exitError{code: ExitOK}
 			}
-			return nil, usageErr("%s: %v", fs.Name(), err)
+			return nil, false, a.flagUsageErr(fs, "%s: %v", fs.Name(), err)
 		}
 		rest := fs.Args()
-		consumedDash := endedWithTerminator(fs, args[:len(args)-len(rest)])
-		if len(rest) == 0 || consumedDash {
-			if consumedDash && len(positional) > 0 && stopAfter >= 0 {
+		terminated = endedWithTerminator(fs, args[:len(args)-len(rest)])
+		if len(rest) == 0 || terminated {
+			if terminated && len(positional) > 0 && stopAfter >= 0 {
 				positional = append(positional, "--")
 			}
 			positional = append(positional, rest...)
@@ -245,10 +268,20 @@ func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]stri
 			break
 		}
 	}
-	if err := a.applyGlobals(); err != nil {
-		return nil, err
+	f, err := parseFormat(a.g.format)
+	if err != nil {
+		return nil, false, a.flagUsageErr(fs, "%v", err)
 	}
-	return positional, nil
+	a.applyGlobals(f)
+	return positional, terminated, nil
+}
+
+func (a *app) flagUsageErr(fs *flag.FlagSet, format string, args ...any) error {
+	// Subcommand parsing can change the root color preference before it fails.
+	if fs.Name() != rootFlagSetName {
+		a.color = a.colorEnabled()
+	}
+	return usageErr(format, args...)
 }
 
 // endedWithTerminator reports whether the tokens fs.Parse consumed end with a
@@ -294,22 +327,20 @@ func (a *app) printFlags(fs *flag.FlagSet) error {
 	return w.err
 }
 
-func (a *app) applyGlobals() error {
-	f, err := parseFormat(a.g.format)
-	if err != nil {
-		return usageErr("%v", err)
-	}
-	a.fmt = f
+func (a *app) colorEnabled() bool {
 	// NO_COLOR turns color off only when it is set to a non-empty value, as
 	// the no-color.org convention says; an empty value counts as unset.
-	noColorEnv, _ := a.env.LookupEnv(EnvNoColor)
-	a.color = !a.g.noColor && noColorEnv == ""
+	return !bool(a.g.noColor) && a.getenv(EnvNoColor) == ""
+}
+
+func (a *app) applyGlobals(f Format) {
+	a.fmt = f
+	a.color = a.colorEnabled()
 	if a.g.verbose {
 		a.logger = slog.New(newLogHandler(a.env.Stderr, a.color))
 	} else {
 		a.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return nil
 }
 
 // rootFlagSetName names the flag set of the global flags before the command.
@@ -318,10 +349,11 @@ const rootFlagSetName = "ownsand"
 func (a *app) run(ctx context.Context, args []string) error {
 	a.g.format = "text"
 	root := a.newFlags(rootFlagSetName)
-	rest, err := a.parseUntil(root, args, 1)
+	rest, terminated, err := a.parseUntil(root, args, 1)
 	if err != nil {
 		return err
 	}
+	a.rootFlagsTerminated = terminated
 	if len(rest) == 0 {
 		// The usage goes to standard error on a usage error; a failed write
 		// there cannot be reported anywhere else, so it stays best-effort.
@@ -330,7 +362,7 @@ func (a *app) run(ctx context.Context, args []string) error {
 	}
 	group := rest[0]
 	switch group {
-	case "help", "-h", "--help":
+	case "help":
 		return a.usage(a.env.Stdout)
 	case "login":
 		return a.login(ctx, rest[1:])

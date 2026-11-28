@@ -1541,19 +1541,35 @@ test(
     const manifests = prepared(f, [
       { version: "0.0.9", artifacts: { "ownsand-agent-linux-amd64": "old\n" } },
     ]);
-    const result = f.run(["github-releases", assembled(f), manifests], {}, [
-      agent,
-    ]);
+    const assets = assembled(f);
+    const result = f.run(["github-releases", assets, manifests], {}, [agent]);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(
-      result.log,
-      /gh release upload ownsand-agent@0\.1\.0 --repo owner\/repo --clobber /,
+    assert.deepEqual(
+      loggedArgs(result, "gh", "release").filter(
+        ([, action]) => action !== "view",
+      ),
+      [
+        [
+          "release",
+          "upload",
+          "ownsand-agent@0.1.0",
+          "--repo",
+          "owner/repo",
+          "--clobber",
+          join(assets, "ownsand-agent/SHA256SUMS"),
+          join(assets, "ownsand-agent/ownsand-agent-linux-amd64"),
+        ],
+        [
+          "release",
+          "edit",
+          "ownsand-agent@0.1.0",
+          "--repo",
+          "owner/repo",
+          "--draft=false",
+          "--latest=false",
+        ],
+      ],
     );
-    assert.match(
-      result.log,
-      /gh release edit ownsand-agent@0\.1\.0 --repo owner\/repo --draft=false/,
-    );
-    assert.doesNotMatch(result.log, /gh release create/);
   },
 );
 
@@ -1597,10 +1613,17 @@ test(
         );
         assert.equal(result.status, 0, result.stderr);
         assert.doesNotMatch(result.log, /gh release (create|upload|delete)/);
-        assert.match(
-          result.log,
-          /gh release edit ownsand-agent@0\.1\.0 .*--draft=false/,
-        );
+        assert.deepEqual(loggedArgs(result, "gh", "release", "edit"), [
+          [
+            "release",
+            "edit",
+            "ownsand-agent@0.1.0",
+            "--repo",
+            "owner/repo",
+            "--draft=false",
+            "--latest=false",
+          ],
+        ]);
       },
     );
     await t.test("a missing asset is restored without overwriting", (t) => {
@@ -2360,6 +2383,7 @@ test("publish-binaries stores the signed manifests before the first R2 upload", 
   const upload = index("release-binaries.sh upload-manifests");
   assert.ok(sign >= 0 && sign < saveAt);
   assert.ok(saveAt < upload);
+  assert.match(save, /^ {10}path: \$\{\{ runner\.temp \}\}\/manifests$/m);
   // Only `upload-manifests` writes to the bucket.
   assert.equal(
     steps.filter((step) => step.includes("upload-manifests")).length,

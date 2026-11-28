@@ -94,6 +94,10 @@ export function BillingSection() {
     BillingService.method.getBillingUsage,
     linked === true ? { organizationId } : skipToken,
   );
+  const usageAccountMismatch =
+    Boolean(billingAccountId) &&
+    usage.data !== undefined &&
+    usage.data.billingAccountId !== billingAccountId;
   const unlink = useMutation(BillingService.method.unlinkBillingAccount, {
     onSuccess: () => invalidateServices(queryClient, BillingService),
     onError: (error) => {
@@ -134,9 +138,13 @@ export function BillingSection() {
     // Linked: the usage portion depends on `GetBillingUsage`, but the owner's
     // unlink action must not, so a loading or failed usage request keeps it.
     let usageBody;
-    if (usage.isPending) {
+    if (usage.isPending || (usageAccountMismatch && usage.isFetching)) {
       usageBody = <Loading label={t("billing.loadingUsage")} />;
-    } else if (usage.data === undefined || showsFullError(usage)) {
+    } else if (
+      usageAccountMismatch ||
+      usage.data === undefined ||
+      showsFullError(usage)
+    ) {
       usageBody = (
         <ErrorNotice error={usage.error} onRetry={() => void usage.refetch()} />
       );
@@ -219,11 +227,12 @@ export function BillingSection() {
       <p className="muted">
         {rich("billing.description", { site: <AccountsLink /> })}
       </p>
-      {[status, usage].map((query, i) =>
-        query.error && !showsFullError(query) ? (
-          <RefreshFailedNotice key={i} query={query} />
-        ) : null,
-      )}
+      {status.error && !showsFullError(status) ? (
+        <RefreshFailedNotice query={status} />
+      ) : null}
+      {usage.error && !usageAccountMismatch && !showsFullError(usage) ? (
+        <RefreshFailedNotice query={usage} />
+      ) : null}
       {body}
       {owner ? (
         <>

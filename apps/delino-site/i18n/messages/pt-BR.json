@@ -34,5 +34,6 @@
   "theme.promptCopyText": "Copiar prompt",
   "theme.promptCopiedText": "Copiado",
   "theme.promptExpandText": "Expandir",
-  "theme.promptCollapseText": "Recolher"
+  "theme.promptCollapseText": "Recolher",
+  "nav.darkMode": "Modo escuro"
 }

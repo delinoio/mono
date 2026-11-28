@@ -23,7 +23,8 @@ const (
 // configuration variable that holds the value; error messages start with
 // it. The port must be a number from 0 to 65535. The host must be empty
 // (all interfaces), an IP address (IPv6 in brackets, with an optional
-// zone) or an RFC 1123 host name.
+// zone) or an RFC 1123 host name. A host with exactly four decimal
+// components must be a valid IPv4 address.
 func Validate(name, value string) error {
 	host, port, err := net.SplitHostPort(value)
 	if err != nil {
@@ -45,7 +46,25 @@ func validHost(host string) bool {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return true
 	}
-	return isHostname(host)
+	return !isDottedDecimal(host) && isHostname(host)
+}
+
+func isDottedDecimal(host string) bool {
+	parts := strings.SplitN(host, ".", 5)
+	if len(parts) != 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isHostname reports whether name is an RFC 1123 hostname: dot-separated

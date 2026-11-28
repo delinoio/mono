@@ -77,6 +77,10 @@ message LinkGitHubInstallationResponse {
   GitHubInstallation installation = 1;
 }
 
+// LinkGitHubInstallation error detail for an unused callback issued to the
+// caller for a different organization they can still manage.
+message GitHubInstallOrganizationMismatch {}
+
 message ListGitHubInstallationsRequest {
   string organization_id = 1;
   int32 page_size = 2;

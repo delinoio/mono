@@ -145,13 +145,16 @@ function resolveConfig(platformName) {
     }
     let overrides = {};
     let configIndex = 0;
+    let debFilesCleared = false;
     for (let index = 0; index < tauriOptions.length; index++) {
       const option = tauriOptions[index];
       const config = /^(?:--config(?:=(.*))?|-[dv]*c(?:=?(.*))?)$/.exec(option);
       if (!config) continue;
 
       const value = (config[1] ?? config[2]) || tauriOptions[++index];
-      overrides = mergeConfig(overrides, readConfig(value, getProbeDir), false);
+      const patch = readConfig(value, getProbeDir);
+      debFilesCleared ||= patch?.bundle?.linux?.deb?.files === null;
+      overrides = mergeConfig(overrides, patch, false);
       configIndex = index + 1;
     }
     return {
@@ -159,6 +162,7 @@ function resolveConfig(platformName) {
       baseConfig,
       overrides,
       configIndex,
+      debFilesCleared,
     };
   } finally {
     if (probeDir) rmSync(probeDir, { recursive: true, force: true });
@@ -290,7 +294,15 @@ async function runPatchedCli(cli, args, options) {
 }
 
 async function runNoticeBuild(
-  { config, baseConfig, overrides, configIndex, platformName, formats },
+  {
+    config,
+    baseConfig,
+    overrides,
+    configIndex,
+    debFilesCleared,
+    platformName,
+    formats,
+  },
   cli,
 ) {
   // Tauri reads its file mappings before Cargo downloads CEF. Stage the files
@@ -329,6 +341,10 @@ async function runNoticeBuild(
       };
     } else {
       const linux = {};
+      if (debFilesCleared && formats.includes("deb")) {
+        // The clear removes the notice defaults. Restore them in the final patch.
+        linux.deb = { files: noticeFiles("/usr/share/doc/delidev/cef") };
+      }
       if (formats.includes("rpm")) {
         linux.rpm = {
           files: noticeFiles("/usr/share/doc/delidev/cef"),
@@ -348,7 +364,7 @@ async function runNoticeBuild(
       "--config",
       JSON.stringify(patch),
     );
-    if (formats.includes("deb")) {
+    if (!debFilesCleared && formats.includes("deb")) {
       // Preserve the precedence of the Debian file mapping.
       const fileConfig = JSON.stringify({
         bundle: {

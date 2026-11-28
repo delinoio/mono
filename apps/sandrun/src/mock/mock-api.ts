@@ -66,6 +66,7 @@ import {
 import {
   type GitHubInstallation,
   GitHubInstallationSchema,
+  GitHubInstallOrganizationMismatchSchema,
   GitHubService,
 } from "@delino/sandrun-protos/v1/github_pb";
 import {
@@ -101,6 +102,7 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
+import { isUuidV7 } from "sandrun-sdk";
 import {
   compareTimestamps,
   TERMINAL_REQUEST_STATES,
@@ -121,6 +123,7 @@ import {
   ORGANIZATION_NAME_LIMIT,
 } from "../name.ts";
 import { compareQueueOrder } from "../queue.ts";
+import { can, Permission } from "../roles.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -208,7 +211,6 @@ interface OrgState {
   profiles: RunnerProfile[];
   requests: Request[];
   runners: Runner[];
-  devices: DeviceCapacity[];
   devSessions: DevSession[];
   apiKeys: (ApiKey & { userId: string })[];
   audit: AuditEvent[];
@@ -255,7 +257,6 @@ function emptyOrg(organizationId: string, name: string): OrgState {
     profiles: [],
     requests: [],
     runners: [],
-    devices: [],
     devSessions: [],
     apiKeys: [],
     audit: [],
@@ -310,8 +311,9 @@ function seed(
   userId: string,
   runnerProfileCount: number,
   agentIntegrationPageSize: number | undefined,
-): Map<string, OrgState> {
+) {
   const orgs = new Map<string, OrgState>();
+  const devicePools = new Map<string, DeviceCapacity[]>();
 
   const acme = emptyOrg(MOCK_IDS.acme, "Acme Robotics");
   acme.organization.settings = {
@@ -605,7 +607,7 @@ function seed(
       guestOs: GuestOs.LINUX,
     }),
   );
-  acme.devices.push(
+  devicePools.set(MOCK_IDS.ownsandAcme, [
     create(DeviceCapacitySchema, {
       ownsandDeviceId: MOCK_IDS.linuxDevice,
       name: "build-box",
@@ -651,7 +653,7 @@ function seed(
       effectiveVcpuLimit: 8n,
       allocation: { vcpuCount: 0n, memoryMib: 0n, diskGib: 0n },
     }),
-  );
+  ]);
   acme.devSessions.push(
     create(DevSessionSchema, {
       devSessionId: MOCK_IDS.queuedDev,
@@ -812,7 +814,7 @@ function seed(
     member(MOCK_IDS.globex, userId, Role.ADMIN, "Mina Kim"),
   );
   orgs.set(MOCK_IDS.globex, globex);
-  return orgs;
+  return { orgs, devicePools };
 }
 
 /** Serves one page of a list with numeric offsets as page tokens. */
@@ -892,7 +894,7 @@ export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
-  const orgs = seed(
+  const { orgs, devicePools } = seed(
     userId,
     options.runnerProfileCount ?? 3,
     options.agentIntegrationPageSize,
@@ -1506,15 +1508,27 @@ export function createMockTransport(
         // The development server and the e2e suite can use the fixed
         // "mock-state" fixture. Issued states are single-use.
         const issued = issuedStates.get(req.state);
-        if (
-          req.state !== "mock-state" &&
-          (issued?.organizationId !== req.organizationId ||
-            now() >= issued.expiresAtMs)
-        )
-          throw new ConnectError(
-            "the installation state is not valid or has expired",
-            Code.FailedPrecondition,
-          );
+        if (req.state !== "mock-state") {
+          const invalidState =
+            "the installation state is not valid or has expired";
+          if (issued === undefined || now() >= issued.expiresAtMs) {
+            throw new ConnectError(invalidState, Code.FailedPrecondition);
+          }
+          if (issued.organizationId !== req.organizationId) {
+            const issuerRole = orgs
+              .get(issued.organizationId)
+              ?.members.find((member) => member.userId === userId)?.role;
+            if (can(issuerRole, Permission.ManageIntegrations)) {
+              throw new ConnectError(
+                invalidState,
+                Code.InvalidArgument,
+                undefined,
+                [{ desc: GitHubInstallOrganizationMismatchSchema, value: {} }],
+              );
+            }
+            throw new ConnectError(invalidState, Code.FailedPrecondition);
+          }
+        }
         issuedStates.delete(req.state);
         for (const linkedOrg of orgs.values()) {
           if (
@@ -1767,7 +1781,7 @@ export function createMockTransport(
         const input = req.profile;
         if (input === undefined)
           throw new ConnectError("profile is required", Code.InvalidArgument);
-        validateProfile(input);
+        const source = validateProfile(input);
         if (org.profiles.some((p) => p.name === input.name))
           throw new ConnectError(
             "a runner profile with this name exists",
@@ -1777,6 +1791,7 @@ export function createMockTransport(
           findIntegration(org, input.agentIntegrationId);
         const p = profile(req.organizationId, {
           ...input,
+          source,
           runnerProfileId: uuidV7(),
           priority:
             input.priority === Priority.UNSPECIFIED
@@ -1901,7 +1916,7 @@ export function createMockTransport(
               );
           }
         }
-        validateProfile(next);
+        next.source = validateProfile(next);
         if (
           org.profiles.some(
             (other) =>
@@ -2084,8 +2099,9 @@ export function createMockTransport(
           counts.set(state, (counts.get(state) ?? 0) + 1);
           countsByDevice.set(ownsandDeviceId, counts);
         }
+        const devices = devicePools.get(org.link.ownsandOrganizationId) ?? [];
         return {
-          devices: org.devices.map((device) => ({
+          devices: devices.map((device) => ({
             ...device,
             runners: Array.from(
               countsByDevice.get(device.ownsandDeviceId) ?? [],
@@ -2373,7 +2389,7 @@ const VENDOR_CREDENTIAL_CASE: Record<AgentVendor, string | undefined> = {
 };
 
 /** The runner profile rules of the control plane contract. */
-function validateProfile(p: RunnerProfile): void {
+function validateProfile(p: RunnerProfile): RunnerProfile["source"] {
   function fail(message: string): never {
     throw new ConnectError(message, Code.InvalidArgument);
   }
@@ -2411,9 +2427,16 @@ function validateProfile(p: RunnerProfile): void {
   if (p.workloadKind !== WorkloadKind.DEV_SESSION && p.workspacePath !== "")
     fail("workspace_path is only for DEV_SESSION");
   if (p.guestOs === GuestOs.UNSPECIFIED) fail("guest_os is required");
-  if (p.source.case === "baseImage" && p.source.value !== p.guestOs)
+  let source = p.source;
+  if (source.case === "baseImage" && source.value !== p.guestOs)
     fail("the base image must be of guest_os");
-  if (p.source.case === undefined) fail("source is required");
+  if (source.case === undefined) fail("source is required");
+  if (source.case === "ownsandTemplateId") {
+    const value = source.value.toLowerCase();
+    if (!isUuidV7(value))
+      fail("invalid ownsand_template_id: must be a UUID v7");
+    source = { case: "ownsandTemplateId", value };
+  }
   if (p.networkMode !== NetworkMode.OUTBOUND)
     fail("network_mode must be OUTBOUND");
   const r = p.resources;
@@ -2441,4 +2464,5 @@ function validateProfile(p: RunnerProfile): void {
   if (maxQueueWait > BigInt(MAX_QUEUE_WAIT_MS))
     fail("max_queue_wait must be at most 24 hours");
   if (p.warmCount < 0 || p.warmCount > 10) fail("warm_count must be 0 to 10");
+  return source;
 }

@@ -7,14 +7,16 @@ tags: react, hooks, useState, performance, initialization
 
 ## Use Lazy State Initialization
 
-Pass a function to `useState` for expensive initial values. Without the function form, the initializer runs on every render even though the value is only used once.
+Pass a function to `useState` for expensive initial values. If you pass the result of a calculation instead, the calculation runs on every render. React keeps the value from initialization.
+
+Each `FilteredList` instance keeps an index of the `initialItems` array it receives when it mounts, even if the parent later supplies a different array.
 
 **Incorrect (runs on every render):**
 
 ```tsx
-function FilteredList({ items }: { items: Item[] }) {
+function FilteredList({ initialItems }: { initialItems: Item[] }) {
   // buildSearchIndex() runs on EVERY render, even after initialization
-  const [searchIndex, setSearchIndex] = useState(buildSearchIndex(items))
+  const [searchIndex] = useState(buildSearchIndex(initialItems))
   const [query, setQuery] = useState('')
   
   // When query changes, buildSearchIndex runs again unnecessarily
@@ -31,12 +33,11 @@ function UserProfile() {
 }
 ```
 
-**Correct (runs only once):**
+**Correct (lazy initialization)**
 
 ```tsx
-function FilteredList({ items }: { items: Item[] }) {
-  // buildSearchIndex() runs ONLY on initial render
-  const [searchIndex, setSearchIndex] = useState(() => buildSearchIndex(items))
+function FilteredList({ initialItems }: { initialItems: Item[] }) {
+  const [searchIndex] = useState(() => buildSearchIndex(initialItems))
   const [query, setQuery] = useState('')
   
   return <SearchResults index={searchIndex} query={query} />
@@ -84,3 +85,25 @@ When no `settings` key is stored, the defaults stay. The pure `buildSearchIndex`
 Use lazy initialization when computing initial values from localStorage/sessionStorage or the DOM (in browser-only components; see the server-rendered variant above), building data structures (indexes, maps), or performing heavy transformations.
 
 For simple primitives (`useState(0)`), direct references (`useState(props.value)`), or cheap literals (`useState({})`), the function form is unnecessary.
+
+**Index derived from current items**
+
+If the index must follow the current `items` prop, build it during render with `useMemo` and keep `query` in state. Replace the array when its contents change, for example with `setItems(previousItems => [...previousItems, newItem])`. On a render that changes only the query, React can reuse the index if `items` has the same array reference.
+
+```tsx
+function FilteredList({ items }: { items: Item[] }) {
+  const searchIndex = useMemo(() => buildSearchIndex(items), [items])
+  const [query, setQuery] = useState('')
+
+  return (
+    <>
+      <input
+        aria-label="Search items"
+        value={query}
+        onChange={event => setQuery(event.target.value)}
+      />
+      <SearchResults index={searchIndex} query={query} />
+    </>
+  )
+}
+```

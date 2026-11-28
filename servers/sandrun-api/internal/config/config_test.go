@@ -228,6 +228,7 @@ func TestInvalid(t *testing.T) {
 		{EnvCORSOrigins, "https://u@sandrun.delino.io", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://:443", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://exa%25mple.test", EnvCORSOrigins},
+		{EnvCORSOrigins, "https://exam%C2%A0ple.test", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://1.2.3.4.5", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://sandrun.delino.io?", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://sandrun.delino.io/path", EnvCORSOrigins},

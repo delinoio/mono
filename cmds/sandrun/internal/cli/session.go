@@ -348,6 +348,7 @@ func (w *execWriter) writeOutput(kind sandrun.ExecEventKind, execID string, offs
 
 func (w *execWriter) flush(kind sandrun.ExecEventKind, execID string) error {
 	stream := w.stream(kind)
+	stream.invalidRun = false
 	if len(stream.pending) == 0 {
 		return nil
 	}
@@ -363,11 +364,11 @@ func (w *execWriter) flushAll(execID string) error {
 	return w.flush(sandrun.ExecEventStderr, execID)
 }
 
-// utf8Stream holds up to three bytes of an incomplete UTF-8 character
-// until the next contiguous chunk arrives.
+// utf8Stream keeps the decoding state between contiguous chunks of one stream.
 type utf8Stream struct {
-	pending []byte
-	next    int64 // Offset after the last byte received.
+	pending    []byte // Up to three bytes of an incomplete rune.
+	next       int64  // Offset after the last byte received.
+	invalidRun bool   // The current malformed run already emitted a replacement.
 }
 
 func (u *utf8Stream) decode(offset int64, data []byte) (int64, string) {
@@ -376,10 +377,32 @@ func (u *utf8Stream) decode(offset int64, data []byte) (int64, string) {
 	if len(u.pending) != 0 {
 		data = append(u.pending, data...)
 	}
-	cut := incompleteRuneStart(data)
-	text := strings.ToValidUTF8(string(data[:cut]), string(utf8.RuneError))
-	u.pending = append(u.pending[:0], data[cut:]...)
-	return start, text
+
+	if len(data) != 0 && utf8.Valid(data) {
+		u.pending = u.pending[:0]
+		u.invalidRun = false
+		return start, string(data)
+	}
+
+	var text strings.Builder
+	i := 0
+	for i < len(data) {
+		r, size := utf8.DecodeRune(data[i:])
+		malformed := r == utf8.RuneError && size == 1
+		if malformed && !utf8.FullRune(data[i:]) {
+			break
+		}
+		if !malformed || !u.invalidRun {
+			if text.Len() == 0 {
+				start += int64(i)
+			}
+			text.WriteRune(r)
+		}
+		u.invalidRun = malformed
+		i += size
+	}
+	u.pending = append(u.pending[:0], data[i:]...)
+	return start, text.String()
 }
 
 func (u *utf8Stream) resumeOffset(receivedOffset int64) int64 {
@@ -387,20 +410,6 @@ func (u *utf8Stream) resumeOffset(receivedOffset int64) int64 {
 		return u.next - int64(len(u.pending))
 	}
 	return receivedOffset
-}
-
-// incompleteRuneStart returns the start of a valid but incomplete UTF-8
-// sequence at the end of data, or len(data) if there is no such sequence.
-func incompleteRuneStart(data []byte) int {
-	for i := len(data) - 1; i >= 0 && i >= len(data)-utf8.UTFMax+1; i-- {
-		if utf8.RuneStart(data[i]) {
-			if !utf8.FullRune(data[i:]) {
-				return i
-			}
-			break
-		}
-	}
-	return len(data)
 }
 
 // finishExec maps an exec result to the exit status of the ownsand sandbox
@@ -423,7 +432,11 @@ func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res
 				stderrOffset = w.stderr.resumeOffset(stderrOffset)
 			}
 			hint := a.attachCommand(session, se.ExecID, stdoutOffset, stderrOffset)
-			return &exitError{code: ExitInterrupted, msg: "interrupted; the command keeps running. Continue with: " + hint}
+			msg := "interrupted. Command start is unconfirmed. Check with: "
+			if se.Started {
+				msg = "interrupted. Detached from the output stream after the command started. Continue with: "
+			}
+			return &exitError{code: ExitInterrupted, msg: msg + hint}
 		}
 		if jsonMode {
 			if err := w.flushAll(se.ExecID); err != nil {

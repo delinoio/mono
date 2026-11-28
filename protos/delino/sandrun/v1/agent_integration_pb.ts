@@ -510,7 +510,8 @@ export type UpdateAgentIntegrationRequest = Message<"delino.sandrun.v1.UpdateAge
   name: string;
 
   /**
-   * New settings of the integration's vendor, for the mask path `settings`.
+   * New settings of the integration's vendor. Mask the active member or use
+   * the legacy alias `settings`.
    *
    * @generated from oneof delino.sandrun.v1.UpdateAgentIntegrationRequest.settings
    */
@@ -541,8 +542,9 @@ export type UpdateAgentIntegrationRequest = Message<"delino.sandrun.v1.UpdateAge
   } | { case: undefined; value?: undefined };
 
   /**
-   * Replacement credentials, for the mask path `credentials`. Only the
-   * non-empty fields replace stored credentials.
+   * Replacement credentials of the integration's vendor. Mask the active member
+   * or use the legacy alias `credentials`. At least one field must be non-empty.
+   * Only non-empty fields replace stored credentials.
    *
    * @generated from oneof delino.sandrun.v1.UpdateAgentIntegrationRequest.credentials
    */
@@ -573,7 +575,9 @@ export type UpdateAgentIntegrationRequest = Message<"delino.sandrun.v1.UpdateAge
   } | { case: undefined; value?: undefined };
 
   /**
-   * `name`, `settings` and `credentials`.
+   * A non-empty mask of top-level paths. Use `name`, the active vendor-specific
+   * settings or credentials member names, or their legacy aliases. Each selected
+   * group is applied once, even if several paths select it.
    *
    * @generated from field: google.protobuf.FieldMask update_mask = 12;
    */

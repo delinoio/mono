@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -17,6 +18,10 @@ import (
 // TestMetricsServer checks that the internal listener serves only
 // GET /metrics from the OpenTelemetry meter provider.
 func TestMetricsServer(t *testing.T) {
+	// The SDK reads resource settings from the process environment.
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+
 	ctx := context.Background()
 	tel, err := telemetry.New(ctx, telemetry.Options{
 		ServiceName: "ownsand-api",
@@ -40,7 +45,7 @@ func TestMetricsServer(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ownsand_test_gauge 3") {
+	if resp.StatusCode != http.StatusOK || !slices.Contains(strings.Split(string(body), "\n"), "ownsand_test_gauge 3") {
 		t.Fatalf("metrics: %d %s", resp.StatusCode, body)
 	}
 	for _, path := range []string{"/", "/healthz", "/delino.ownsand.v1.OrganizationService/ListOrganizations"} {

@@ -34,5 +34,6 @@
   "theme.promptCopyText": "Copiar instrucción",
   "theme.promptCopiedText": "Copiado",
   "theme.promptExpandText": "Expandir",
-  "theme.promptCollapseText": "Contraer"
+  "theme.promptCollapseText": "Contraer",
+  "nav.darkMode": "Modo oscuro"
 }

@@ -14,8 +14,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,6 +44,58 @@ func (l acceptErrorOnCloseListener) Accept() (net.Conn, error) {
 		return nil, l.err
 	}
 	return conn, err
+}
+
+type closeNotifyingListener struct {
+	net.Listener
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (l *closeNotifyingListener) Close() error {
+	err := l.Listener.Close()
+	if err == nil {
+		l.closeOnce.Do(func() { close(l.closed) })
+	}
+	return err
+}
+
+// readLimitedListener caps reads and records their sizes for tests that open
+// one client connection.
+type readLimitedListener struct {
+	net.Listener
+	maxReadSize int
+	mu          sync.Mutex
+	sizes       []int
+}
+
+func (l *readLimitedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &readLimitedConn{Conn: conn, listener: l}, nil
+}
+
+func (l *readLimitedListener) readSizes() []int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.sizes)
+}
+
+type readLimitedConn struct {
+	net.Conn
+	listener *readLimitedListener
+}
+
+func (c *readLimitedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p[:min(len(p), c.listener.maxReadSize)])
+	if n > 0 {
+		c.listener.mu.Lock()
+		c.listener.sizes = append(c.listener.sizes, n)
+		c.listener.mu.Unlock()
+	}
+	return n, err
 }
 
 // noStop stands in for the signal-registration stop function in tests that
@@ -318,10 +372,13 @@ func TestAwaitHandlerStartedReportsFailedRequestToClosedListener(t *testing.T) {
 }
 
 func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
+	const waitTimeout = 5 * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	listener := &closeNotifyingListener{Listener: newTestListener(t), closed: make(chan struct{})}
 	started := make(chan struct{})
+	checkContext := make(chan struct{})
 	release := make(chan struct{})
 	var startOnce, releaseOnce sync.Once
 	// Release the handler on every exit path, including an early Fatalf, so it
@@ -329,40 +386,75 @@ func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
 	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(releaseHandler)
 	handlerCtxErr := make(chan error, 1)
-	srv, addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startOnce.Do(func() { close(started) })
+		select {
+		case <-checkContext:
+			handlerCtxErr <- r.Context().Err()
+		case <-release:
+			return
+		}
 		<-release
-		handlerCtxErr <- r.Context().Err()
 		_, _ = io.WriteString(w, "completed")
-	}), 5*time.Second)
+	})}
+	done := make(chan error, 1)
+	go func() {
+		done <- serve(ctx, noStop, srv, listener, newTestLogger(), 5*time.Second)
+	}()
 
-	responded, requestErr := getWithEarlyError(addr)
+	responded, requestErr := getWithEarlyError(listener.Addr().String())
 
 	if err := awaitHandlerStarted(started, requestErr, done, handlerStartTimeout); err != nil {
 		t.Fatal(err)
 	}
 	cancel() // the shutdown trigger
 
-	// Shutdown must wait for the in-flight request instead of returning.
 	select {
+	case <-listener.closed:
+	case err := <-requestErr:
+		t.Fatalf("request failed while waiting for the public listener to close: %v", err)
 	case err := <-done:
-		t.Fatalf("serve returned %v while a request was in flight", err)
-	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("serve returned %v while waiting for the public listener to close", err)
+	case <-time.After(waitTimeout):
+		t.Fatal("public listener did not close after the shutdown trigger")
+	}
+
+	close(checkContext)
+	select {
+	case err := <-handlerCtxErr:
+		if err != nil {
+			t.Fatalf("request context error during drain = %v, want nil", err)
+		}
+	case err := <-requestErr:
+		t.Fatalf("request failed while waiting for its context error: %v", err)
+	case err := <-done:
+		t.Fatalf("serve returned %v before the handler reported its context error", err)
+	case <-time.After(waitTimeout):
+		t.Fatal("handler did not report its context error during drain")
+	}
+	select {
+	case err := <-requestErr:
+		t.Fatalf("request failed before handler release: %v", err)
+	case err := <-done:
+		t.Fatalf("serve returned %v before handler release", err)
+	default:
 	}
 
 	releaseHandler()
-	if err := <-handlerCtxErr; err != nil {
-		t.Fatalf("request context error during drain = %v, want nil", err)
-	}
-	if got := <-responded; got.err != nil || got.status != http.StatusOK || got.body != "completed" {
-		t.Fatalf("response = %+v, want 200 completed", got)
+	select {
+	case got := <-responded:
+		if got.err != nil || got.status != http.StatusOK || got.body != "completed" {
+			t.Fatalf("response = %+v, want 200 completed", got)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("request did not complete after handler release")
 	}
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("serve error = %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(waitTimeout):
 		t.Fatal("serve did not return after the request completed")
 	}
 
@@ -567,44 +659,83 @@ func TestNewServerClosesConnectionWithStalledRequestBody(t *testing.T) {
 
 func TestNewServerClosesIdleKeepAliveConnection(t *testing.T) {
 	const timeout = 300 * time.Millisecond
-	addr, logs := startShortTimeoutServer(t, timeout)
+	const waitLimit = 10 * timeout
+	for _, tc := range []struct {
+		name                   string
+		waitForCloseBeforeRead bool
+	}{
+		{"prompt client read", false},
+		{"client read after server close", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Each subtest serves just one connection on its own listener.
+			var idleAt, closedAt time.Time
+			closed := make(chan struct{})
+			addr, logs, _, _ := startRejectLogServerWithShutdown(t, readHeaderTimeout, timeout, func(srv *http.Server, listener net.Listener) net.Listener {
+				srv.ReadTimeout = timeout
+				productionConnState := srv.ConnState
+				srv.ConnState = func(conn net.Conn, state http.ConnState) {
+					at := time.Now()
+					productionConnState(conn, state)
+					switch state {
+					case http.StateIdle:
+						idleAt = at
+					case http.StateClosed:
+						closedAt = at
+						close(closed)
+					}
+				}
+				return listener
+			})
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	resp, err := http.ReadResponse(reader, nil)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != `{"status":"ok"}` {
-		t.Fatalf("healthz = %d %q, want 200 {\"status\":\"ok\"}", resp.StatusCode, body)
-	}
+			conn, err := net.DialTimeout("tcp", addr, waitLimit)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			if err := conn.SetWriteDeadline(time.Now().Add(waitLimit)); err != nil {
+				t.Fatalf("set write deadline: %v", err)
+			}
+			reader := bufio.NewReader(conn)
+			if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			status, body := readResponse(t, conn, reader)
+			if status != http.StatusOK || strings.TrimSpace(body) != `{"status":"ok"}` {
+				t.Fatalf("healthz = %d %q, want 200 {\"status\":\"ok\"}", status, body)
+			}
 
-	// The connection stays open for another request, then the server closes it.
-	elapsed, _ := expectClosedWithin(t, conn, 10*timeout)
-	if elapsed < timeout/2 {
-		t.Errorf("idle connection closed after %v, want it held until about IdleTimeout %v", elapsed, timeout)
-	}
-
-	var requestLogs int
-	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
-		if strings.Contains(line, `"msg":"http_request"`) {
-			requestLogs++
-		}
-	}
-	if requestLogs != 1 {
-		t.Errorf("http_request records = %d, want 1; logs: %s", requestLogs, logs.String())
+			deadline := time.Now().Add(waitLimit)
+			if err := conn.SetReadDeadline(deadline); err != nil {
+				t.Fatalf("set read deadline: %v", err)
+			}
+			awaitServerClose := func() {
+				select {
+				case <-closed:
+				case <-time.After(time.Until(deadline)):
+					t.Fatalf("server did not report StateClosed within %v", waitLimit)
+				}
+			}
+			if tc.waitForCloseBeforeRead {
+				awaitServerClose()
+			}
+			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("read after health response: %v, want EOF or connection reset", err)
+			}
+			if !tc.waitForCloseBeforeRead {
+				// The client can see EOF before the server runs ConnState.
+				awaitServerClose()
+			}
+			if idleAt.IsZero() {
+				t.Fatal("server did not report StateIdle before StateClosed")
+			}
+			if elapsed := closedAt.Sub(idleAt); elapsed < timeout/2 {
+				t.Errorf("server closed the idle connection after %v, want at least %v", elapsed, timeout/2)
+			}
+			if records := requestRecords(t, logs); len(records) != 1 {
+				t.Errorf("http_request records = %d, want 1; logs: %s", len(records), logs.String())
+			}
+		})
 	}
 }
 
@@ -687,6 +818,11 @@ func startRequestLogServer(t *testing.T) (string, *syncBuffer) {
 // client disconnect waits on it instead of sleeping.
 func startRequestLogServerWithClosed(t *testing.T) (string, *syncBuffer, <-chan struct{}) {
 	t.Helper()
+	return startRequestLogServerOnListener(t, newTestListener(t))
+}
+
+func startRequestLogServerOnListener(t *testing.T, listener net.Listener) (string, *syncBuffer, <-chan struct{}) {
+	t.Helper()
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	srv := newServer(server.NewHandler(logger), logger)
@@ -703,7 +839,6 @@ func startRequestLogServerWithClosed(t *testing.T) (string, *syncBuffer, <-chan 
 		}
 	}
 
-	listener := newTestListener(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx, noStop, srv, listener, logger, time.Second) }()
