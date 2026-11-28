@@ -95,9 +95,7 @@ func TestOpenSessionDeferredRevocation(t *testing.T) {
 		t.Fatalf("pending revocations before acknowledgement = %d, want 2", n)
 	}
 	agent.Heartbeat(901)
-	agent.WaitFor("heartbeat ack after the second sweep", func(e *ownsandv1.AgentEnvelope) bool {
-		return e.GetHeartbeatAck().GetSequence() == 901
-	})
+	waitHeartbeatAck(agent, 901)
 	for _, msg := range agent.Received() {
 		r := msg.GetSessionRevocation()
 		if r == nil {
@@ -111,14 +109,26 @@ func TestOpenSessionDeferredRevocation(t *testing.T) {
 		if !logHasRevocationSent(env.Logs.String(), id) {
 			t.Fatalf("missing sent event for revocation %s", id)
 		}
-		ackRevocation(agent, id)
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing revocations %v", want)
 	}
-	testenv.Eventually(t, "both revocations acknowledged", func() bool {
-		return env.App.Plane.PendingRevocations() == 0
-	})
+
+	// The server processes messages on this channel in order. Each heartbeat
+	// reply confirms that the preceding revocation acknowledgement was handled.
+	ackRevocation(agent, sessionRevocationID)
+	agent.Heartbeat(902)
+	waitHeartbeatAck(agent, 902)
+	if n := env.App.Plane.PendingRevocations(); n != 1 {
+		t.Fatalf("pending revocations after session acknowledgement = %d, want 1", n)
+	}
+
+	ackRevocation(agent, grantRevocationID)
+	agent.Heartbeat(903)
+	waitHeartbeatAck(agent, 903)
+	if n := env.App.Plane.PendingRevocations(); n != 0 {
+		t.Fatalf("pending revocations after relay grant acknowledgement = %d, want 0", n)
+	}
 }
 
 const abandonEnqueueBudget = 2 * time.Second
