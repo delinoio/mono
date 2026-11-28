@@ -1656,6 +1656,73 @@ describe("integrations", () => {
 });
 
 describe("runner profiles", () => {
+  for (const { organizationId, mode, nextAction, scenario } of [
+    {
+      organizationId: NORTHWIND,
+      mode: "with-work-source",
+      nextAction: "Create a runner profile",
+      scenario: "member",
+    },
+    {
+      organizationId: ACME,
+      mode: "with-work-source",
+      nextAction: "Create a runner profile",
+      scenario: "owner",
+    },
+    {
+      organizationId: NORTHWIND,
+      mode: "without-work-sources",
+      nextAction: "Connect GitHub or create an agent integration",
+      scenario: "member without a work source",
+    },
+  ] as const) {
+    test(`shows the empty profile state (${scenario})`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await browser.evaluate((mode) => {
+        sessionStorage.setItem("sandrun-e2e-setup-guidance", mode);
+        return null;
+      }, mode);
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      const organizationPath = `/orgs/${organizationId}`;
+      await app.open(organizationPath);
+      await expect(
+        screen
+          .getByRole("region", "Set up SandRun")
+          .getByRole("link", nextAction),
+      ).toBeVisible();
+      await screen.getByRole("link", "Runner profiles").tap();
+      await expect(screen.getByText("No runner profiles")).toBeVisible();
+
+      const create = screen.getByRole("button", "Create runner profile");
+      if (scenario === "owner") {
+        await create.tap();
+        await expect(
+          screen.getByRole("dialog", "Create a runner profile"),
+        ).toBeVisible();
+      } else if (scenario === "member") {
+        await expect(
+          screen.getByText("Ask an admin to create a runner profile."),
+        ).toBeVisible();
+        await expect(
+          screen.getByText("Next step: create a runner profile.", {
+            exact: false,
+          }),
+        ).toBeHidden();
+        await expect(screen.getByRole("link", nextAction)).toBeHidden();
+        await expect(create).toBeHidden();
+      } else {
+        await expect(screen.getByRole("link", nextAction)).toHaveAttribute(
+          "href",
+          `${organizationPath}/integrations`,
+        );
+      }
+    });
+  }
+
   for (const mode of ["create", "edit"] as const) {
     test(`blocks ${mode} when no OpenAI Codex guest OS is verified`, async ({
       app,

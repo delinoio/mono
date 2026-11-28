@@ -162,20 +162,22 @@ export function SetupGuide({ organizationId }: { organizationId: string }) {
 }
 
 /**
- * Shows the next setup step when known, or the given empty-state text.
+ * Shows the next setup step when known and visible, or the given empty-state text.
  */
 export function SetupEmpty({
   organizationId,
   title,
+  hiddenStep,
   children,
 }: {
   organizationId: string;
   title: string;
+  hiddenStep?: Exclude<SetupStep, SetupStep.Done>;
   children?: React.ReactNode;
 }) {
   const { t } = useI18n();
   const guidance = useSetupGuidance(organizationId);
-  if (guidance === undefined) {
+  if (guidance === undefined || guidance.step === hiddenStep) {
     return <Empty title={title}>{children}</Empty>;
   }
   const { text } = guidance;
