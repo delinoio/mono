@@ -740,7 +740,7 @@ Each entry requires a host and permits an optional port. Startup fails if an ent
 - Rate limits (recorded decision, the same values as [OwnSand](servers-ownsand-api-foundation.md#security)): in-memory token buckets, which are service-wide because the service runs as one replica. A rejected call fails with `resource_exhausted`.
   - `AcceptInvitation`: 10 calls per invitation display prefix per minute and 10 calls per user per minute, each with a burst of 10.
   - The OwnSand link validation of `SetOwnSandLink`: 10 calls per user per minute with a burst of 10.
-  - Personal API key authentication failures: 10 failures per key display prefix per minute with a burst of 10. Only failures take tokens, and a prefix without tokens is rejected before validation.
+  - Personal API key authentication failures: 10 failures per key display prefix per minute with a burst of 10. Only failures take tokens. A valid key is accepted even when its prefix has no tokens; a failed validation with a prefix without tokens gets `resource_exhausted`.
   - When the request has a client address: 120 calls per client address per minute with a burst of 60, in one bucket per address that these limits share. The client address comes from the same rule and the same configuration settings as in OwnSand (`TRUST_PROXY_CLIENT_ADDRESS` and `ALLOW_DIRECT_CLIENT_ADDRESS`); without a client address, this bucket does not apply.
 
 ## Logging
@@ -749,6 +749,7 @@ Each entry requires a host and permits an optional port. Startup fails if an ent
 - Log every dev session exec end with its result, exit code or failure reason and duration, and every relayed file operation with its size and duration.
 - Log every request and runner state change after its transaction commits, with the previous state, the new state and the end reason.
 - Log every OwnSand call result with the RPC and the Connect code, every GitHub API error with its status, every vendor watch reconnect and every orchestrator restart.
+- When the personal API key prefix limit rejects a failed validation, log `api_key_prefix_rate_limited` at warning level with `key_prefix` and `rpc_id`, at most once per prefix every 10 seconds. Redact `key_prefix` if the display prefix is the entire presented value.
 - Never log credentials, tokens, API key secrets, JIT configurations, work orders, webhook bodies, exec commands that carry credentials, runner output, or dev session command arguments, environment values, output and file contents.
 - CLI-style output of the development launcher uses ANSI color by default, with the `NO_COLOR` opt-out.
 
