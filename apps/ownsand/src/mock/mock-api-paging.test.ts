@@ -28,6 +28,19 @@ async function codeOf(call: Promise<unknown>) {
 }
 
 describe("mock sandbox list paging", () => {
+  test.each([SandboxState.UNSPECIFIED, 99 as SandboxState])(
+    "rejects explicit state %s",
+    async (state) => {
+      const client = createClient(SandboxService, createMockTransport());
+      const request = client.listSandboxes({ organizationId, state });
+      await expect(request).rejects.toBeInstanceOf(ConnectError);
+      await expect(request).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage: "invalid state: must be a sandbox state",
+      });
+    },
+  );
+
   test("pages 51 matching sandboxes as 50 and then 1 in ascending ID order", async () => {
     const client = createClient(
       SandboxService,
@@ -105,7 +118,7 @@ describe("mock sandbox list paging", () => {
     expect(first.sandboxes.map((s) => s.sandboxId)).toEqual([
       MOCK_IDS.runningSandbox,
     ]);
-    expect(first.nextPageToken).not.toBe("");
+    expect(first.nextPageToken).toBe(tokenOf(MOCK_IDS.runningSandbox));
     const second = await client.listSandboxes({
       ...filter,
       pageSize: 1,
@@ -115,7 +128,7 @@ describe("mock sandbox list paging", () => {
       MOCK_IDS.pausedSandbox,
     ]);
     // A full page returns a token even though no row follows.
-    expect(second.nextPageToken).not.toBe("");
+    expect(second.nextPageToken).toBe(tokenOf(MOCK_IDS.pausedSandbox));
     const third = await client.listSandboxes({
       ...filter,
       pageSize: 1,
@@ -143,6 +156,24 @@ describe("mock sandbox list paging", () => {
     expect(paused.sandboxes.map((s) => s.sandboxId)).toEqual([
       MOCK_IDS.pausedSandbox,
     ]);
+  });
+
+  test("returns matches for an explicit ended state and an empty page for a state without matches", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const deleted = await client.listSandboxes({
+      organizationId,
+      state: SandboxState.DELETED,
+    });
+    expect(deleted.sandboxes.map((s) => s.sandboxId)).toEqual([
+      MOCK_IDS.deletedSandbox,
+    ]);
+
+    const failed = await client.listSandboxes({
+      organizationId,
+      state: SandboxState.FAILED,
+    });
+    expect(failed.sandboxes).toHaveLength(0);
+    expect(failed.nextPageToken).toBe("");
   });
 
   test("continues after a deleted last row and after a token that names no row", async () => {
