@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
+import { create } from "@bufbuild/protobuf";
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
+import { Role } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  OrganizationService,
+  type GetOrganizationResponse,
+} from "@delino/ownsand-protos/v1/organization_pb";
+import {
+  ListSandboxesResponseSchema,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
+import {
+  ListSnapshotsResponseSchema,
+  SnapshotService,
+} from "@delino/ownsand-protos/v1/snapshot_pb";
+import { QueryClient } from "@tanstack/react-query";
 import {
   act,
   cleanup,
@@ -37,9 +53,9 @@ interface Flow {
   /** A query that the success refreshes while the user is elsewhere. */
   refreshed: string;
   /**
-   * Whether the page, and with it a newer confirmation, survives the
-   * success. Leaving or deleting the organization makes the refreshed
-   * organization queries fail with not_found, which replaces the page.
+   * Whether the page survives the success. Leaving or deleting the
+   * organization makes the refreshed organization queries fail with
+   * not_found, which replaces the page.
    */
   pageSurvives: boolean;
 }
@@ -112,9 +128,147 @@ test("device removal redirects while the detail refresh is pending", async () =>
   }
 });
 
-describe.each(FLOWS)("$name confirmation redirect", (flow) => {
+describe("device removal permission refresh", () => {
+  const organizationId = MOCK_IDS.acme;
+  const devicesPath = `/orgs/${organizationId}/devices`;
+  const detailPath = `${devicesPath}/${MOCK_IDS.buildBox}`;
+  const removeButton = { name: "Remove device" };
+
   async function start() {
-    const held = holdingTransport([flow.method]);
+    const userId = "user-admin-jun";
+    const mock = createMockTransport({ userId });
+    const queryClient = new QueryClient();
+    let callerRole = Role.ADMIN;
+    const roleTransport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        const response = await mock.unary(method, ...args);
+        if (method.name !== "GetOrganization") return response;
+        const { organization } = response.message as GetOrganizationResponse;
+        if (organization?.organizationId !== organizationId) return response;
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            organization: { ...organization, callerRole },
+          },
+        };
+      },
+    };
+    const held = holdingTransport(["RemoveDevice"], undefined, roleTransport);
+    async function refreshRole(role: Role) {
+      callerRole = role;
+      await act(async () => {
+        await queryClient.refetchQueries({
+          queryKey: createConnectQueryKey({
+            schema: OrganizationService.method.getOrganization,
+            input: { organizationId },
+            cardinality: "finite",
+          }),
+        });
+      });
+    }
+    renderConsole(detailPath, {
+      transport: held.transport,
+      queryClient,
+      userId,
+    });
+    fireEvent.click(await screen.findByRole("button", removeButton));
+    const dialog = await screen.findByRole("alertdialog");
+    return { ...held, queryClient, refreshRole, dialog };
+  }
+
+  test("a refresh that retains removal permission keeps the same confirmation", async () => {
+    const { calls, dialog, refreshRole } = await start();
+    await refreshRole(Role.OWNER);
+    await screen.findByText("· Owner");
+    expect(screen.getByRole("alertdialog")).toBe(dialog);
+    fireEvent.click(within(dialog).getByRole("button", removeButton));
+    await waitFor(() => expect(calls.RemoveDevice).toHaveLength(1));
+    await act(() => calls.RemoveDevice![0]!.settle());
+    await waitFor(() => expect(window.location.pathname).toBe(devicesPath));
+    expect(calls.RemoveDevice).toHaveLength(1);
+  });
+
+  test("demotion closes the confirmation until the opener is used again", async () => {
+    const { dialog, refreshRole, seen } = await start();
+    const confirm = within(dialog).getByRole("button", removeButton);
+    await refreshRole(Role.MEMBER);
+    await screen.findByText("· Member");
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(screen.queryByRole("button", removeButton)).toBeNull();
+    const heading = screen.getByRole("heading", { name: "build-box-1" });
+    fireEvent.keyDown(heading, { key: "Enter" });
+    fireEvent.click(confirm);
+    expect(seen.RemoveDevice ?? 0).toBe(0);
+
+    await refreshRole(Role.ADMIN);
+    const opener = await screen.findByRole("button", removeButton);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    fireEvent.click(opener);
+    await screen.findByRole("alertdialog");
+    expect(seen.RemoveDevice ?? 0).toBe(0);
+  });
+
+  test("a late success refreshes all affected caches and leaves the route in place", async () => {
+    const { calls, dialog, queryClient, refreshRole } = await start();
+    const sandboxes = createConnectQueryKey({
+      schema: SandboxService.method.listSandboxes,
+      input: { organizationId },
+      cardinality: "finite",
+    });
+    const snapshots = createConnectQueryKey({
+      schema: SnapshotService.method.listSnapshots,
+      input: { organizationId },
+      cardinality: "finite",
+    });
+    queryClient.setQueryData(sandboxes, create(ListSandboxesResponseSchema));
+    queryClient.setQueryData(snapshots, create(ListSnapshotsResponseSchema));
+    const entries = window.history.length;
+    fireEvent.click(within(dialog).getByRole("button", removeButton));
+    await waitFor(() => expect(calls.RemoveDevice).toHaveLength(1));
+    await refreshRole(Role.MEMBER);
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    await act(() => calls.RemoveDevice![0]!.settle());
+    await screen.findByText("Removed", { exact: true });
+    expect(window.location.pathname).toBe(detailPath);
+    expect(window.history.length).toBe(entries);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(queryClient.getQueryState(sandboxes)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(snapshots)?.isInvalidated).toBe(true);
+  });
+
+  test("a late failure leaves a newer confirmation free of errors after recovery", async () => {
+    const { calls, dialog, queryClient, refreshRole } = await start();
+    fireEvent.click(within(dialog).getByRole("button", removeButton));
+    await waitFor(() => expect(calls.RemoveDevice).toHaveLength(1));
+    await refreshRole(Role.MEMBER);
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    await refreshRole(Role.ADMIN);
+    fireEvent.click(await screen.findByRole("button", removeButton));
+    const current = await screen.findByRole("alertdialog");
+    await act(() =>
+      calls.RemoveDevice![0]!.settle(
+        new ConnectError("the earlier removal failed", Code.PermissionDenied),
+      ),
+    );
+    await waitFor(() =>
+      expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
+        "error",
+      ),
+    );
+    expect(window.location.pathname).toBe(detailPath);
+    expect(screen.getByRole("alertdialog")).toBe(current);
+    expect(current.querySelector(".notice-error")).toBeNull();
+  });
+});
+
+describe.each(FLOWS)("$name confirmation redirect", (flow) => {
+  async function start(shouldHoldDeviceRefresh = () => false) {
+    const held = holdingTransport(
+      [flow.method, "GetDevice"],
+      (method) => method === flow.method || shouldHoldDeviceRefresh(),
+    );
     renderConsole(flow.path, {
       transport: held.transport,
       userId: flow.userId,
@@ -197,25 +351,36 @@ describe.each(FLOWS)("$name confirmation redirect", (flow) => {
   });
 
   test("a request that succeeds while a newer confirmation is open does not move the user or close it", async () => {
-    const held = await start();
+    let holdDeviceRefresh = false;
+    const held = await start(() => holdDeviceRefresh);
     const first = await open();
     await confirm(first);
     await escape(first);
     const path = window.location.pathname;
     const entries = window.history.length;
     const second = await open();
-    await release(held);
-    expect(window.location.pathname).toBe(path);
-    expect(window.history.length).toBe(entries);
-    if (flow.pageSurvives) {
-      expect(screen.getByRole("alertdialog")).toBe(second);
-      expect(
-        (
-          within(second).getByRole("button", {
-            name: flow.confirm,
-          }) as HTMLButtonElement
-        ).disabled,
-      ).toBe(false);
+    // Hold the device readback so the device stays eligible during this
+    // assertion. A readback that shows it was removed closes the dialog.
+    holdDeviceRefresh = true;
+    try {
+      await release(held);
+      expect(window.location.pathname).toBe(path);
+      expect(window.history.length).toBe(entries);
+      if (flow.pageSurvives) {
+        await waitFor(() => expect(held.calls.GetDevice).toHaveLength(1));
+        expect(screen.getByRole("alertdialog")).toBe(second);
+        expect(
+          (
+            within(second).getByRole("button", {
+              name: flow.confirm,
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(false);
+      }
+    } finally {
+      await act(async () => {
+        for (const call of held.calls.GetDevice ?? []) call.settle();
+      });
     }
   });
 

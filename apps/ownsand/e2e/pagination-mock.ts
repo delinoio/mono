@@ -200,7 +200,49 @@ function billingUsageRefreshTransport(userId?: string): Transport {
   };
 }
 
+function deviceRemovalRoleTransport(): Transport {
+  const base = createBaseMock({ userId: "user-admin-jun" });
+  const prefix = "ownsand-e2e-device-removal";
+  return {
+    ...base,
+    async unary(method, ...args) {
+      const role = Number(sessionStorage.getItem(`${prefix}-role`)) as Role;
+      if (method.name === "RemoveDevice") {
+        recordToken(`${prefix}-requests`, method.name);
+        if (role === Role.MEMBER) {
+          throw new ConnectError(
+            "Only admins can remove devices",
+            Code.PermissionDenied,
+          );
+        }
+        if (sessionStorage.getItem(`${prefix}-hold`) === "true") {
+          await new Promise<void>((resolve) => {
+            window.addEventListener(`${prefix}-release`, () => resolve(), {
+              once: true,
+            });
+            sessionStorage.setItem(`${prefix}-held`, "true");
+          });
+        }
+      }
+      const response = await base.unary(method, ...args);
+      if (method.name !== "GetOrganization") return response;
+      const { organization } = response.message as GetOrganizationResponse;
+      if (organization?.organizationId !== MOCK_IDS.acme) return response;
+      return {
+        ...response,
+        message: {
+          ...response.message,
+          organization: { ...organization, callerRole: role },
+        },
+      };
+    },
+  };
+}
+
 export function createMockTransport(): Transport {
+  if (sessionStorage.getItem("ownsand-e2e-device-removal-role") !== null) {
+    return deviceRemovalRoleTransport();
+  }
   const billingUsageRole = sessionStorage.getItem(
     "ownsand-e2e-billing-usage-role",
   );
