@@ -1440,7 +1440,7 @@ Automatic deduplication and efficient data fetching patterns reduce redundant ne
 
 **Impact: LOW (single listener for N components)**
 
-Use `useSWRSubscription()` to share global event listeners across component instances.
+Share one window listener across all instances of the hook. Keep the handler and callback registry in the same module so instances under different SWR cache providers share the listener. Attach the listener when the first callback is registered and remove it when the last registration is removed.
 
 **Incorrect: N instances = N listeners**
 
@@ -1463,43 +1463,39 @@ When using the `useKeyboardShortcut` hook multiple times, each instance will reg
 **Correct: N instances = 1 listener**
 
 ```tsx
-import useSWRSubscription from 'swr/subscription'
+import { useEffect } from 'react'
 
-// Module-level Map to track callbacks per key
 const keyCallbacks = new Map<string, Set<() => void>>()
 
-function useKeyboardShortcut(key: string, callback: () => void) {
-  // Register this callback in the Map
-  useEffect(() => {
-    // A Set stores one entry per function reference, so wrap the callback:
-    // consumers that share a function still get their own registration
-    const registration = () => callback()
+function handleKeydown(event: KeyboardEvent) {
+  if (event.metaKey) {
+    keyCallbacks.get(event.key)?.forEach(callback => callback())
+  }
+}
 
-    if (!keyCallbacks.has(key)) {
-      keyCallbacks.set(key, new Set())
+function useKeyboardShortcut(key: string, callback: () => void) {
+  useEffect(() => {
+    // Wrap the callback so consumers that share a function get separate registrations.
+    const registration = () => callback()
+    const isFirstRegistration = keyCallbacks.size === 0
+    const callbacks = keyCallbacks.get(key) ?? new Set<() => void>()
+
+    callbacks.add(registration)
+    keyCallbacks.set(key, callbacks)
+    if (isFirstRegistration) {
+      window.addEventListener('keydown', handleKeydown)
     }
-    keyCallbacks.get(key)!.add(registration)
 
     return () => {
-      const set = keyCallbacks.get(key)
-      if (set) {
-        set.delete(registration)
-        if (set.size === 0) {
-          keyCallbacks.delete(key)
-        }
+      callbacks.delete(registration)
+      if (callbacks.size === 0) {
+        keyCallbacks.delete(key)
+      }
+      if (keyCallbacks.size === 0) {
+        window.removeEventListener('keydown', handleKeydown)
       }
     }
   }, [key, callback])
-
-  useSWRSubscription('global-keydown', () => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.metaKey && keyCallbacks.has(e.key)) {
-        keyCallbacks.get(e.key)!.forEach(cb => cb())
-      }
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  })
 }
 
 function Profile() {
