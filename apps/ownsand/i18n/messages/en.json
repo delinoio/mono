@@ -457,6 +457,7 @@
   "templates.createDialog.title": "Make a template",
   "templates.createDialog.submit": "Create template",
   "templates.createDialog.name": "Template name",
+  "templates.createDialog.sourceUnavailable": "The source snapshot is no longer available for templates.",
   "templates.deleteDialog.title": "Delete the template {name}?",
   "templates.deleteDialog.description": "Its snapshot stays.",
   "templates.deleteDialog.confirm": "Delete template",

@@ -457,6 +457,7 @@
   "templates.createDialog.title": "Crear una plantilla",
   "templates.createDialog.submit": "Crear plantilla",
   "templates.createDialog.name": "Nombre de la plantilla",
+  "templates.createDialog.sourceUnavailable": "La instantánea de origen ya no se puede usar para crear plantillas.",
   "templates.deleteDialog.title": "¿Eliminar la plantilla {name}?",
   "templates.deleteDialog.description": "Su snapshot se conserva.",
   "templates.deleteDialog.confirm": "Eliminar plantilla",

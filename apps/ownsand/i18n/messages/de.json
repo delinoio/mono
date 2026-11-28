@@ -457,6 +457,7 @@
   "templates.createDialog.title": "Vorlage erstellen",
   "templates.createDialog.submit": "Vorlage erstellen",
   "templates.createDialog.name": "Vorlagenname",
+  "templates.createDialog.sourceUnavailable": "Der Quell-Snapshot kann nicht mehr für Vorlagen verwendet werden.",
   "templates.deleteDialog.title": "Vorlage {name} löschen?",
   "templates.deleteDialog.description": "Der zugehörige Snapshot bleibt erhalten.",
   "templates.deleteDialog.confirm": "Vorlage löschen",

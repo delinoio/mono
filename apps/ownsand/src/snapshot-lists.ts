@@ -80,7 +80,15 @@ export function useSnapshots(
       ),
     [data],
   );
-  return { rows, boundary, pages, fetchNextPage: query.fetchNextPage };
+  const isComplete =
+    query.isSuccess && query.fetchStatus === "idle" && !query.hasNextPage;
+  return {
+    rows,
+    boundary,
+    pages,
+    isComplete,
+    fetchNextPage: query.fetchNextPage,
+  };
 }
 
 export function templateListOptions(

@@ -93,6 +93,161 @@ describe("template deletion", () => {
   );
 });
 
+describe("open template form after a snapshot refresh", () => {
+  const sourceAction = "Make template from snapshot 0193a000…00b1";
+  const draft = "review-template-draft";
+  const unavailable =
+    "The source snapshot is no longer available for templates.";
+
+  const refreshingSource = pagedSources.extend<{
+    refreshSource: (state: string) => Promise<void>;
+  }>({
+    refreshSource: async ({ browser, screen, sources }, use) => {
+      await sources.open("snapshots", { "template-source-state": "initial" });
+      await screen.getByRole("button", sourceAction).tap();
+      await screen
+        .getByRole("dialog", "Make a template")
+        .getByLabel("Template name")
+        .fill(draft);
+      await use(async (state) => {
+        await browser.evaluate((value) => {
+          sessionStorage.setItem("ownsand-e2e-template-source-state", value);
+          return true;
+        }, state);
+      });
+    },
+  });
+
+  for (const state of ["missing", "non-ready"] as const) {
+    refreshingSource(
+      `blocks template submission when the refreshed source is ${state}`,
+      async ({ app, browser, refreshSource, screen, sources }) => {
+        await refreshSource(state);
+
+        const form = screen.getByRole("dialog", "Make a template");
+        const name = form.getByLabel("Template name");
+        const submit = form.getByRole("button", "Create template");
+        await expect(form.getByRole("alert")).toHaveText(unavailable);
+        await expect(name).toHaveValue(draft);
+        await expect(submit).toBeDisabled();
+
+        await browser.evaluate(() => {
+          const form = document.querySelector<HTMLFormElement>(
+            '[role="dialog"] form',
+          );
+          if (!form) throw new Error("Missing template form");
+          form
+            .querySelector<HTMLButtonElement>('button[type="submit"]')
+            ?.click();
+          form.querySelector("input")?.focus();
+          return true;
+        });
+        await browser.keyboard.press("Enter");
+        await browser.evaluate(() => {
+          document
+            .querySelector<HTMLFormElement>('[role="dialog"] form')
+            ?.requestSubmit();
+          return true;
+        });
+        expect(await sources.value("template-source-snapshot")).toBe("");
+        await app.screenshot(`template-source-${state}-draft`);
+      },
+    );
+  }
+
+  refreshingSource(
+    "keeps the draft through a failed refresh and submits when the source stays ready",
+    async ({ browser, refreshSource, screen, sources }) => {
+      const form = screen.getByRole("dialog", "Make a template");
+      const name = form.getByLabel("Template name");
+      const submit = form.getByRole("button", "Create template");
+      await refreshSource("transient");
+      await expect(
+        screen.getByText("OwnSand is not available right now.", {
+          exact: false,
+        }),
+      ).toBeVisible({ timeout: 10_000 });
+      await expect(name).toHaveValue(draft);
+      await expect(submit).toBeEnabled();
+
+      await refreshSource("ready");
+      await expect(
+        browser.locator('ul[aria-label="Snapshots"] li'),
+      ).toHaveCount(1, { timeout: 10_000 });
+      await expect(name).toHaveValue(draft);
+      await submit.tap();
+      await expect(form).toBeHidden();
+      await expect(screen.getByText(draft, { exact: true })).toBeVisible();
+      expect(await sources.value("template-source-snapshot")).toBe(
+        "0193a000-0000-7000-8000-0000000000b1",
+      );
+    },
+  );
+
+  refreshingSource(
+    "keeps the source through a partial refresh and failed continuation",
+    async ({ browser, refreshSource, screen, sources }) => {
+      const form = screen.getByRole("dialog", "Make a template");
+      const name = form.getByLabel("Template name");
+      const submit = form.getByRole("button", "Create template");
+      const sourceButton = browser.locator(
+        `button[aria-label="${sourceAction}"]`,
+      );
+      const more = browser.locator('button[aria-label="Show more snapshots"]');
+      await refreshSource("partial");
+      await expect(more).toBeEnabled();
+      await expect(sourceButton).toHaveCount(0);
+      await expect(name).toHaveValue(draft);
+      await expect(submit).toBeEnabled();
+
+      // Simulate a continuation from the underlying list while the modal is open.
+      const showMore = (error: Code | null) =>
+        browser.evaluate((code) => {
+          sessionStorage.setItem("ownsand-e2e-source-fault", "ListSnapshots");
+          if (code === null)
+            sessionStorage.removeItem("ownsand-e2e-page-error");
+          else sessionStorage.setItem("ownsand-e2e-page-error", String(code));
+          document
+            .querySelector<HTMLButtonElement>(
+              'button[aria-label="Show more snapshots"]',
+            )
+            ?.click();
+          return true;
+        }, error);
+      await showMore(Code.Unavailable);
+      await expect(
+        screen.getByText("OwnSand is not available right now.", {
+          exact: false,
+        }),
+      ).toBeVisible({ timeout: 10_000 });
+      await expect(name).toHaveValue(draft);
+      await expect(submit).toBeEnabled();
+
+      await showMore(null);
+      await expect(sourceButton).toHaveCount(1);
+      await expect(name).toHaveValue(draft);
+      await submit.tap();
+      await expect(form).toBeHidden();
+      expect(await sources.value("template-source-snapshot")).toBe(
+        "0193a000-0000-7000-8000-0000000000b1",
+      );
+    },
+  );
+
+  refreshingSource(
+    "dismisses the form when the snapshot refresh fails with a terminal error",
+    async ({ refreshSource, screen, sources }) => {
+      const form = screen.getByRole("dialog", "Make a template");
+      await refreshSource("terminal");
+      await expect(form).toBeHidden();
+      await expect(
+        screen.getByText("You do not have permission to do this."),
+      ).toBeVisible();
+      expect(await sources.value("template-source-snapshot")).toBe("");
+    },
+  );
+});
+
 describe("snapshot and template pagination", () => {
   pagedSources(
     "refreshes an uncached Templates page after a dismissed create",

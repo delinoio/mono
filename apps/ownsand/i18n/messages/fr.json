@@ -457,6 +457,7 @@
   "templates.createDialog.title": "Créer un modèle",
   "templates.createDialog.submit": "Créer le modèle",
   "templates.createDialog.name": "Nom du modèle",
+  "templates.createDialog.sourceUnavailable": "L’instantané source ne peut plus servir à créer des modèles.",
   "templates.deleteDialog.title": "Supprimer le modèle {name} ?",
   "templates.deleteDialog.description": "Le snapshot associé est conservé.",
   "templates.deleteDialog.confirm": "Supprimer le modèle",

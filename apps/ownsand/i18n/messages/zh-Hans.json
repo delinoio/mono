@@ -457,6 +457,7 @@
   "templates.createDialog.title": "创建模板",
   "templates.createDialog.submit": "创建模板",
   "templates.createDialog.name": "模板名称",
+  "templates.createDialog.sourceUnavailable": "此源快照已无法用于创建模板。",
   "templates.deleteDialog.title": "要删除模板 {name} 吗？",
   "templates.deleteDialog.description": "对应的快照将保留。",
   "templates.deleteDialog.confirm": "删除模板",
