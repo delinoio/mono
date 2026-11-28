@@ -348,6 +348,10 @@ func (op *readOp) relayAttempt(ctx context.Context) readAttempt {
 	}
 	defer stream.Close()
 	for stream.Receive() {
+		if err := ctx.Err(); err != nil {
+			at.err = err
+			return at
+		}
 		done := op.handleEvent(stream.Msg().GetEvent(), &at)
 		if at.accepted || !op.rec.inRecovery() {
 			// The agent accepted the continuation, or progress ended the

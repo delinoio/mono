@@ -6,6 +6,8 @@ import {
   BaseImage,
   type HostOs,
 } from "@delino/ownsand-protos/v1/common_pb";
+import { GuestOs } from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import {
   type ListSandboxesRequest,
   type Placement,
@@ -152,8 +154,63 @@ async function listSandboxesForFilterTest(
   }
 }
 
+function sandboxPlacementFixture(windows?: "offline" | "both") {
+  const windowsCapabilities = {
+    guestOses: [GuestOs.LINUX, GuestOs.WINDOWS],
+    builtBaseImages: [BaseImage.LINUX, BaseImage.WINDOWS],
+  };
+  const transport = createMockTransport({
+    deviceCapabilities: {
+      ...(windows && { [MOCK_IDS.studioMac]: windowsCapabilities }),
+      ...(windows === "both" && { [MOCK_IDS.buildBox]: windowsCapabilities }),
+    },
+  });
+  const sandboxes = createClient(SandboxService, transport);
+  const devices = createClient(DeviceService, transport);
+
+  return {
+    buildBoxId: MOCK_IDS.buildBox,
+    studioMacId: MOCK_IDS.studioMac,
+    async create(
+      image: BaseImage,
+      idempotencyKey: string,
+      deviceId?: string,
+    ): Promise<{ deviceId: string } | { code: Code }> {
+      try {
+        const { sandbox } = await sandboxes.createSandbox({
+          ...createRequest,
+          source: { source: { case: "baseImage", value: image } },
+          idempotencyKey,
+          idleTtl: { seconds: 600n },
+          maxTtl: { seconds: 3600n },
+          placement: deviceId === undefined ? undefined : { deviceId },
+        });
+        if (!sandbox) throw new Error("CreateSandbox returned no sandbox");
+        return { deviceId: sandbox.deviceId };
+      } catch (error) {
+        if (error instanceof ConnectError) return { code: error.code };
+        throw error;
+      }
+    },
+    async listIds() {
+      const { sandboxes: listed } = await sandboxes.listSandboxes({
+        organizationId,
+        includeEnded: true,
+      });
+      return listed.map((sandbox) => sandbox.sandboxId);
+    },
+    async removeStudioMac() {
+      await devices.removeDevice({
+        organizationId,
+        deviceId: MOCK_IDS.studioMac,
+      });
+    },
+  };
+}
+
 declare global {
   interface Window {
+    sandboxPlacementFixture: typeof sandboxPlacementFixture;
     createSandboxForIdempotencyTest: typeof createSandbox;
     createSandboxWithTtls: typeof createSandboxWithTtls;
     createSandboxWithPlacement: typeof createSandboxWithPlacement;
@@ -162,6 +219,7 @@ declare global {
   }
 }
 
+window.sandboxPlacementFixture = sandboxPlacementFixture;
 window.createSandboxForIdempotencyTest = createSandbox;
 window.createSandboxWithTtls = createSandboxWithTtls;
 window.createSandboxWithPlacement = createSandboxWithPlacement;

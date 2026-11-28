@@ -390,6 +390,7 @@ if (process.argv[2] === "--fixture") {
         const run = startLauncher(t, "server", "wait");
         const active = await ready(run);
         assert.equal(active.phase, "server");
+        assert.equal(active.ports.length, 2);
         assert.ok(active.descendant > 1);
         assert.equal(ps("pgid", active.pid), ps("pgid", active.descendant));
 
@@ -428,7 +429,6 @@ if (process.argv[2] === "--fixture") {
           1,
         );
         assert.deepEqual(readdirSync(run.buildTmp), []);
-        assert.equal(active.ports.length, 2);
         await assertPortsReleased(active.ports);
       },
     );
@@ -445,6 +445,8 @@ if (process.argv[2] === "--fixture") {
       async (t) => {
         const run = startLauncher(t, "build", "wait");
         const active = await ready(run);
+        assert.equal(active.phase, "build");
+        assert.equal(active.ports.length, 0);
         assert.ok(active.hasNullFd);
 
         for (const [index, signal] of requests.entries()) {
