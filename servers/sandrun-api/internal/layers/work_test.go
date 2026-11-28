@@ -1097,6 +1097,170 @@ func TestDeleteSandboxAttemptTimeout(t *testing.T) {
 	assertRunner(w.runner(t, runnerID), sandrunv1.RunnerState_RUNNER_STATE_DELETED)
 }
 
+func TestTeardownSandboxDeleteAttemptTimeout(t *testing.T) {
+	for _, rpc := range []string{"DeleteRunnerProfile", "RemoveOwnSandLink", "DeleteOrganization"} {
+		for _, scenario := range []struct {
+			name         string
+			cancelCaller bool
+			retryCode    connect.Code
+		}{
+			{name: "success"},
+			{name: "not_found", retryCode: connect.CodeNotFound},
+			{name: "unauthenticated", retryCode: connect.CodeUnauthenticated},
+			{name: "caller_cancellation", cancelCaller: true},
+		} {
+			t.Run(rpc+"/"+scenario.name, func(t *testing.T) {
+				const watchdog = 5 * time.Second
+				timing := testenv.FastWorkTiming()
+				timing.DeleteTimeout = 150 * time.Millisecond
+				wantCause, wantRPCCode := context.DeadlineExceeded, connect.CodeDeadlineExceeded
+				if scenario.cancelCaller {
+					timing.DeleteTimeout = 2 * watchdog
+					wantCause, wantRPCCode = context.Canceled, connect.CodeCanceled
+				}
+				w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
+				admin := w.env.User(w.org.Admin)
+				profileID := w.createProfile(t, devProfileProto("warm", 1, 0))
+				var runnerID, sandboxID string
+				eventually(t, "a warm runner with a sandbox ID", func() bool {
+					resp, err := admin.Work.ListRunners(t.Context(), connect.NewRequest(&sandrunv1.ListRunnersRequest{
+						OrganizationId: w.org.ID,
+						States:         []sandrunv1.RunnerState{sandrunv1.RunnerState_RUNNER_STATE_WARM},
+					}))
+					if err != nil || len(resp.Msg.GetRunners()) != 1 {
+						return false
+					}
+					r := resp.Msg.GetRunners()[0]
+					runnerID, sandboxID = r.GetRunnerId(), r.GetOwnsandSandboxId()
+					return sandboxID != ""
+				})
+
+				// Park the lease to keep reconciliation from racing the teardown retry.
+				w.env.App.Lease.Release()
+				other := lease.Lease{DB: w.env.DB, InstanceID: "other-instance"}
+				if held, err := other.TryAcquire(t.Context()); err != nil || !held {
+					t.Fatalf("could not park the lease: held=%v, err=%v", held, err)
+				}
+
+				pool := w.env.DB.Pool
+				var key []byte
+				if err := pool.QueryRow(t.Context(), "SELECT api_key_ciphertext FROM ownsand_links WHERE organization_id = $1", w.org.ID).Scan(&key); err != nil {
+					t.Fatal(err)
+				}
+				teardown := func(ctx context.Context) error {
+					switch rpc {
+					case "DeleteRunnerProfile":
+						_, err := admin.Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&sandrunv1.DeleteRunnerProfileRequest{
+							OrganizationId: w.org.ID, RunnerProfileId: profileID,
+						}))
+						return err
+					case "RemoveOwnSandLink":
+						return unlinkOwnSand(ctx, w.env, w.org)
+					default:
+						return deleteSandRunOrg(ctx, w.env, w.org)
+					}
+				}
+				arrived := make(chan context.Context, 1)
+				w.fake.SetDeleteHook(func(ctx context.Context) error {
+					arrived <- ctx
+					<-ctx.Done()
+					return ctx.Err()
+				})
+				parent, cancel := context.WithTimeout(t.Context(), watchdog)
+				defer cancel()
+				result := make(chan error, 1)
+				go func() { result <- teardown(parent) }()
+
+				var attempt context.Context
+				select {
+				case attempt = <-arrived:
+				case err := <-result:
+					t.Fatalf("teardown returned before attempting sandbox deletion: %v", err)
+				case <-parent.Done():
+					t.Fatalf("waiting for the OwnSand call: %v", parent.Err())
+				}
+				deadline, ok := attempt.Deadline()
+				remaining := time.Until(deadline)
+				if maxRemaining := min(timing.DeleteTimeout, watchdog+time.Millisecond); !ok || remaining > maxRemaining {
+					t.Fatalf("OwnSand attempt deadline in %v, want at most %v (configured %v)", remaining, maxRemaining, timing.DeleteTimeout)
+				}
+				if scenario.cancelCaller {
+					cancel()
+				}
+				select {
+				case <-attempt.Done():
+				case <-time.After(watchdog):
+					t.Fatal("OwnSand attempt stayed live after teardown cancellation")
+				}
+				if err := attempt.Err(); !errors.Is(err, wantCause) {
+					t.Fatalf("OwnSand attempt ended with %v, want %v", err, wantCause)
+				}
+				if err := <-result; connect.CodeOf(err) != wantRPCCode {
+					t.Fatalf("teardown returned %v, want %v", err, wantRPCCode)
+				}
+				if !scenario.cancelCaller && parent.Err() != nil {
+					t.Fatalf("caller context ended with the attempt: %v", parent.Err())
+				}
+
+				eventually(t, "teardown to release its claim and retain its target and credential", func() bool {
+					var keptKey []byte
+					var removing bool
+					err := pool.QueryRow(t.Context(), `SELECT l.api_key_ciphertext,
+						l.removing OR l.removal_token IS NOT NULL OR o.deletion_attempt_id IS NOT NULL
+						FROM organizations o JOIN ownsand_links l USING (organization_id)
+						JOIN runner_profiles p USING (organization_id)
+						WHERE o.organization_id = $1 AND p.runner_profile_id = $2`, w.org.ID, profileID).Scan(&keptKey, &removing)
+					return err == nil && !removing && bytes.Equal(key, keptKey)
+				})
+				assertRunner := func(state sandrunv1.RunnerState) {
+					t.Helper()
+					r := w.runner(t, runnerID)
+					if r.GetState() != state || r.GetOwnsandSandboxId() != sandboxID ||
+						r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+						t.Fatalf("runner = %v, want %s with the original sandbox ID and CLEAN_UP", r, state)
+					}
+				}
+				assertRunner(sandrunv1.RunnerState_RUNNER_STATE_DELETING)
+				t.Logf("OwnSand had %v until its deadline and observed %v. The runner, teardown target and credential remained available.", remaining, wantCause)
+
+				w.fake.SetDeleteHook(nil)
+				wantActive := 0
+				if scenario.retryCode != 0 {
+					w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+						o.DeleteError = connect.NewWireError(scenario.retryCode, errors.New("sandbox deletion is already terminal"))
+					})
+					if scenario.retryCode == connect.CodeNotFound {
+						w.fake.EndSandbox(w.osOrg, sandboxID, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+					} else {
+						wantActive = 1 // A sandbox with a revoked key ends at its idle TTL.
+					}
+				}
+				retry, cancelRetry := context.WithTimeout(t.Context(), watchdog)
+				defer cancelRetry()
+				if err := teardown(retry); err != nil {
+					t.Fatalf("retry teardown: %v", err)
+				}
+				if calls, active := w.fake.Calls("DeleteSandbox"), w.fake.Active(w.osOrg); calls != 1 || active != wantActive {
+					t.Fatalf("retry made %d delete calls and left %d active sandboxes, want 1 and %d", calls, active, wantActive)
+				}
+				var orgExists, linkExists, profileExists bool
+				if err := pool.QueryRow(t.Context(), `SELECT EXISTS (SELECT FROM organizations WHERE organization_id = $1),
+					EXISTS (SELECT FROM ownsand_links WHERE organization_id = $1),
+					EXISTS (SELECT FROM runner_profiles WHERE runner_profile_id = $2)`, w.org.ID, profileID).Scan(&orgExists, &linkExists, &profileExists); err != nil {
+					t.Fatal(err)
+				}
+				if orgExists != (rpc != "DeleteOrganization") || linkExists != (rpc == "DeleteRunnerProfile") || profileExists != (rpc == "RemoveOwnSandLink") {
+					t.Fatalf("rows after retry: organization=%v link=%v profile=%v", orgExists, linkExists, profileExists)
+				}
+				if orgExists {
+					assertRunner(sandrunv1.RunnerState_RUNNER_STATE_DELETED)
+				}
+				t.Log("The retry finalized teardown.")
+			})
+		}
+	}
+}
+
 func TestDeleteSandboxRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
