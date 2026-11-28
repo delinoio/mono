@@ -2,12 +2,13 @@
 
 // Development launcher for sandrun-api (`pnpm --filter sandrun-api dev`).
 //
-// It builds the server into a temporary directory and runs the binary. Each
-// phase runs under a supervisor on POSIX and starts directly on Windows.
-// The launcher records SIGINT, SIGTERM and SIGQUIT and forwards them to
-// the active phase, except for SIGINT that the Windows console delivers.
-// The launcher waits for the active phase to exit, then removes the build
-// output. A signal before the server starts prevents server startup.
+// It builds the server into a temporary directory and runs the binary. On
+// POSIX, a detached coordinator runs both supervised phases and owns the
+// directory. On Windows, the launcher starts both phases directly and owns
+// the directory. The launcher waits for shutdown and cleanup before exiting.
+// It forwards SIGINT, SIGTERM and SIGQUIT toward the active phase, except for
+// SIGINT that the Windows console delivers. A stop before the server starts
+// prevents server startup.
 //
 // The server needs Postgres and SANDRUN_SECRET_KEYS. A value that is empty or
 // consists only of ASCII white space counts as unset for DATABASE_URL,
@@ -30,6 +31,7 @@
 // Child processes use explicit argument arrays and `shell: false` according
 // to the repository environment contract.
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { closeSync, openSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { Socket } from "node:net";
@@ -45,10 +47,16 @@ const ForwardedSignal = Object.freeze({
 });
 const signalExitCode = (signal) => 128 + constants.signals[signal];
 const useSupervisor = process.platform !== "win32";
+const CoordinateFlag = "--coordinate";
 const SuperviseFlag = "--supervise";
 const StopGraceMs = 5000;
 const Phase = Object.freeze({ Build: "build", Server: "server" });
-const BuildMessage = Object.freeze({ Exited: "exited", Finish: "finish" });
+const BuildMessage = Object.freeze({
+  Exited: "exited",
+  Finish: "finish",
+  ForceStop: "force-stop",
+});
+const StartPhase = "start-phase";
 const DevelopmentConsoleOrigins = Object.freeze([
   "http://127.0.0.1:13400",
   "https://sandrun.delino.localhost",
@@ -99,15 +107,18 @@ const binaryName =
 
 let received = null;
 let forwardSignal = null;
+function requestStop(signal) {
+  received ??= signal;
+  forwardSignal?.(signal);
+}
+
 function installSignalHandlers() {
   return Object.values(ForwardedSignal).map((signal) => {
     const handler = () => {
-      received ??= signal;
       console.error(
         JSON.stringify({ event: "sandrun_api_dev_signal", signal }),
       );
-      // Between phases there is no child; the phase boundary checks received.
-      forwardSignal?.(signal);
+      requestStop(signal);
     };
     process.on(signal, handler);
     return [signal, handler];
@@ -123,18 +134,18 @@ function logFailure(error) {
 // Forced-stop protection (POSIX). A child that runs in its own process group
 // is outside the group that a task runner kills, and SIGKILL of the launcher
 // cannot be forwarded, so a build or server would survive it and keep its
-// port. The launcher therefore starts each phase through a supervisor: this
+// port. The coordinator therefore starts each phase through a supervisor: this
 // file started again with `--supervise` in a process group of its own, with a
-// private channel (file descriptor 3) to the launcher. The supervisor runs the
+// private channel (file descriptor 3) to the coordinator. The supervisor runs the
 // build or server as its child in the same group. The build supervisor reads
 // stop requests from the channel and signals its whole group. The server
 // supervisor relays OS signals to the server once per delivery and sends
 // SIGKILL to the group after the server exits. When the launcher dies, the
-// kernel closes the channel. The supervisor then sends SIGTERM to its group
-// so a server can drain. A group stop ends with SIGKILL when the child exits
-// or the grace period expires. This ends surviving descendants. The
-// launcher's end of the channel stays in the launcher. The supervisor gives
-// its child /dev/null as descriptor 3 to keep the channel private.
+// coordinator requests a forced stop through the channel. The supervisor sends
+// SIGTERM to its group so a server can drain. A group stop ends with SIGKILL
+// when the child exits or the grace period expires. This ends surviving
+// descendants. The coordinator keeps its end of the channel. The supervisor
+// gives its child /dev/null as descriptor 3 to keep the channel private.
 // Windows starts the child directly (`useSupervisor` is false there).
 function supervise(phase, command, args) {
   const isBuild = phase === Phase.Build;
@@ -142,7 +153,7 @@ function supervise(phase, command, args) {
   let serverStopRequested = false;
   let child = null;
   let childStatus = null;
-  // The supervisor leads its group (the launcher starts it detached), so the
+  // The supervisor leads its group (the coordinator starts it detached), so the
   // group id is its own pid and the child and its descendants are members.
   const stopGroup = (signal) => {
     process.kill(-process.pid, signal);
@@ -179,6 +190,8 @@ function supervise(phase, command, args) {
     process.on("message", (message) => {
       if (message === BuildMessage.Finish) {
         finish();
+      } else if (message === BuildMessage.ForceStop) {
+        onLauncherGone();
       } else {
         requestGroupStop(message);
       }
@@ -210,7 +223,7 @@ function supervise(phase, command, args) {
   child.once("close", (code, signal) => {
     childStatus = code ?? (signal ? signalExitCode(signal) : 1);
     if (isBuild && !stoppingGroup) {
-      // Wait for the launcher to acknowledge the exit. A stop it has already
+      // Wait for the coordinator to acknowledge the exit. A stop it has already
       // forwarded arrives before that acknowledgment on the same channel.
       process.send(BuildMessage.Exited, (error) => {
         if (error) onLauncherGone();
@@ -221,7 +234,7 @@ function supervise(phase, command, args) {
   });
 }
 
-function run(phase, command, args, env) {
+function run(phase, command, args, env, launcherLifetime) {
   return new Promise((resolvePromise, reject) => {
     // On POSIX the child runs under a supervisor in its own process group (see
     // the forced-stop protection above); the supervisor exits with the child's
@@ -250,12 +263,18 @@ function run(phase, command, args, env) {
           shell: false,
           env,
         });
-    // The server supervisor uses this pipe only to detect launcher death.
+    // The server supervisor uses this pipe only to detect a forced stop.
     const lifetimePipe = child.stdio[3];
     lifetimePipe?.on("error", () => {});
+    const forceStop = () => {
+      // Keep the build IPC open until the supervisor exits so Node emits close.
+      if (superviseBuild) child.send(BuildMessage.ForceStop, () => {});
+      else lifetimePipe?.destroy();
+    };
+    launcherLifetime?.addEventListener("abort", forceStop, { once: true });
     if (superviseBuild) {
       // A signal can arrive as the build supervisor closes. In that case the
-      // launcher has already recorded the signal and will skip the server.
+      // coordinator has already recorded the signal and will skip the server.
       const send = (message) => child.send(message, () => {});
       child.once("message", (message) => {
         if (message === BuildMessage.Exited) send(BuildMessage.Finish);
@@ -275,6 +294,7 @@ function run(phase, command, args, env) {
     });
     child.once("close", (code, signal) => {
       forwardSignal = null;
+      launcherLifetime?.removeEventListener("abort", forceStop);
       lifetimePipe?.destroy();
       resolvePromise(code ?? (signal ? signalExitCode(signal) : 1));
     });
@@ -282,6 +302,64 @@ function run(phase, command, args, env) {
 }
 
 const stoppedStatus = () => signalExitCode(received);
+
+async function coordinate() {
+  const lifetime = new AbortController();
+  let confirmPhase;
+  const onLauncherGone = () => {
+    lifetime.abort();
+    confirmPhase?.(false);
+  };
+  process.once("disconnect", onLauncherGone);
+  process.on("message", (message) => {
+    if (message === StartPhase) confirmPhase?.(true);
+    else requestStop(message);
+  });
+
+  // Require a fresh reply before each phase. The disconnect event may still
+  // be pending when the previous phase closes.
+  const launcherAllowsPhase = async () => {
+    if (!process.connected) return false;
+    const { promise, resolve } = Promise.withResolvers();
+    confirmPhase = resolve;
+    process.send(StartPhase, (error) => {
+      if (error) onLauncherGone();
+    });
+    try {
+      return await promise;
+    } finally {
+      confirmPhase = undefined;
+    }
+  };
+
+  try {
+    return await runPhases(process.env, launcherAllowsPhase, lifetime.signal);
+  } finally {
+    if (process.connected) process.disconnect();
+  }
+}
+
+async function runCoordinator(env) {
+  const child = spawn(process.execPath, [launcherPath, CoordinateFlag], {
+    cwd: packageDir,
+    stdio: ["inherit", "inherit", "inherit", "ipc"],
+    shell: false,
+    detached: true,
+    env,
+  });
+  const send = (message) => child.send(message, () => {});
+  // Signal requests and phase replies share one ordered channel.
+  forwardSignal = send;
+  child.on("message", (message) => {
+    if (message === StartPhase) send(StartPhase);
+  });
+  try {
+    const [code, signal] = await once(child, "close");
+    return code ?? (signal ? signalExitCode(signal) : 1);
+  } finally {
+    forwardSignal = null;
+  }
+}
 
 async function main() {
   if (isUnset(process.env.DATABASE_URL)) {
@@ -294,8 +372,13 @@ async function main() {
     return 0;
   }
   const env = resolveChildEnv(process.env);
+  return useSupervisor ? runCoordinator(env) : runPhases(env);
+}
+
+async function runPhases(env, launcherAllowsPhase, launcherLifetime) {
   const buildDir = await mkdtemp(join(tmpdir(), "sandrun-api-dev-"));
   try {
+    if (launcherAllowsPhase && !(await launcherAllowsPhase())) return 1;
     if (received) return stoppedStatus();
     const binary = join(buildDir, binaryName);
     // -buildvcs=false matches the `build` script (VCS discovery can fail in
@@ -305,10 +388,19 @@ async function main() {
       "go",
       ["build", "-buildvcs=false", "-o", binary, "./cmd/sandrun-api"],
       env,
+      launcherLifetime,
     );
     if (received) return stoppedStatus();
     if (buildStatus !== 0) return buildStatus;
-    const serverStatus = await run(Phase.Server, binary, [], env);
+    if (launcherAllowsPhase && !(await launcherAllowsPhase())) return 1;
+    if (received) return stoppedStatus();
+    const serverStatus = await run(
+      Phase.Server,
+      binary,
+      [],
+      env,
+      launcherLifetime,
+    );
     return received ? stoppedStatus() : serverStatus;
   } finally {
     await rm(buildDir, { recursive: true, force: true });
@@ -321,7 +413,9 @@ if (isMain && process.argv[2] === SuperviseFlag) {
 } else if (isMain) {
   const handlers = installSignalHandlers();
   try {
-    process.exitCode = await main();
+    process.exitCode = await (process.argv[2] === CoordinateFlag
+      ? coordinate()
+      : main());
   } catch (error) {
     logFailure(error);
     process.exitCode = 1;

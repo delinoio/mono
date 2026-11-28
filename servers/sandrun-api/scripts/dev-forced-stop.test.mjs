@@ -7,6 +7,7 @@ import {
   fstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   statSync,
@@ -21,7 +22,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const launcher = fileURLToPath(new URL("./dev.mjs", import.meta.url));
-const gracePreload = new URL("./dev-forced-stop-preload.mjs", import.meta.url);
+const fixturePreload = new URL(
+  "./dev-forced-stop-preload.mjs",
+  import.meta.url,
+);
 const fixture = fileURLToPath(import.meta.url);
 const signals = ["SIGINT", "SIGTERM", "SIGQUIT"];
 const options = { skip: process.platform === "win32", timeout: 60_000 };
@@ -142,17 +146,20 @@ function isRunning(pid) {
   return state !== "" && !state.startsWith("Z");
 }
 
-function startLauncher(t, phase, stop) {
+function startLauncher(t, phase, stop, holdPhaseBoundary = false) {
   const dir = mkdtempSync(join(tmpdir(), "sandrun-api-forced-stop-"));
   const buildTmp = join(dir, "builds");
   const exitFile = join(dir, "exit");
   const releaseGraceFile = join(dir, "release-grace");
+  const releasePhaseFile = join(dir, "release-phase");
   const stopFile = join(dir, "stop");
   let run;
   t.after(async () => {
     try {
       if (run && !run.outputClosed) {
         writeFileSync(stopFile, "");
+        writeFileSync(releaseGraceFile, "");
+        writeFileSync(releasePhaseFile, "");
         await waitFor(
           run,
           () => run.outputClosed,
@@ -190,7 +197,10 @@ function startLauncher(t, phase, stop) {
   };
   if (phase === "server" && stop === "ignore-term") {
     env.FIXTURE_RELEASE_GRACE = releaseGraceFile;
-    env.NODE_OPTIONS = [env.NODE_OPTIONS, `--import=${gracePreload}`]
+  }
+  if (holdPhaseBoundary) env.FIXTURE_RELEASE_PHASE = releasePhaseFile;
+  if (env.FIXTURE_RELEASE_GRACE || holdPhaseBoundary) {
+    env.NODE_OPTIONS = [env.NODE_OPTIONS, `--import=${fixturePreload}`]
       .filter(Boolean)
       .join(" ");
   }
@@ -254,6 +264,21 @@ const observedSignals = (run, source = "signal") =>
     .filter(({ event }) => event === source)
     .map(({ signal }) => signal);
 
+function buildDirectory(run) {
+  const entries = readdirSync(run.buildTmp);
+  assert.equal(entries.length, 1);
+  assert.ok(entries[0].startsWith("sandrun-api-dev-"));
+  return join(run.buildTmp, entries[0]);
+}
+
+const waitForBuildCleanup = (run, buildDir) =>
+  waitFor(
+    run,
+    () => !existsSync(buildDir),
+    "the launch's build directory to be removed",
+    stopObservationTimeout,
+  );
+
 async function bindLoopbackPort(port) {
   const signal = AbortSignal.timeout(stopObservationTimeout);
   const probe = createServer().listen({ host: "127.0.0.1", port, signal });
@@ -307,7 +332,14 @@ if (process.argv[2] === "--fixture") {
         assert.equal(active.phase, phase);
         assert.ok(active.descendant > 1);
         assert.ok(isRunning(active.pid) && isRunning(active.descendant));
-        if (phase === "server") assert.equal(active.ports.length, 2);
+        const buildDir = buildDirectory(run);
+        if (phase === "server") {
+          assert.equal(active.ports.length, 2);
+          assert.equal(
+            readFileSync(join(buildDir, "sandrun-api"), "utf8"),
+            fakeServer,
+          );
+        }
 
         process.kill(-run.task.pid, "SIGKILL");
         const exit = await waitFor(
@@ -338,6 +370,10 @@ if (process.argv[2] === "--fixture") {
             isRunning(active.descendant),
             "the descendant stopped before release",
           );
+          assert.ok(
+            existsSync(buildDir),
+            "the build directory was removed before shutdown",
+          );
           for (const port of active.ports) {
             await assert.rejects(
               bindLoopbackPort(port),
@@ -362,6 +398,7 @@ if (process.argv[2] === "--fixture") {
           "the launcher output pipes to close after the group stops",
           stopObservationTimeout,
         );
+        await waitForBuildCleanup(run, buildDir);
 
         assert.equal(
           active.hasNullFd,
@@ -377,6 +414,35 @@ if (process.argv[2] === "--fixture") {
       },
     );
   }
+
+  test(
+    "a task-group SIGKILL between phases removes only its own build directory",
+    options,
+    async (t) => {
+      const run = startLauncher(t, "server", "exit", true);
+      await waitFor(
+        run,
+        () => run.records.some(({ event }) => event === "phase_boundary"),
+        "the build to finish before the server phase starts",
+      );
+      const buildDir = buildDirectory(run);
+      assert.equal(
+        readFileSync(join(buildDir, "sandrun-api"), "utf8"),
+        fakeServer,
+      );
+      const sibling = join(run.buildTmp, "sandrun-api-dev-sibling");
+      mkdirSync(sibling);
+      const sentinel = join(sibling, "sentinel");
+      writeFileSync(sentinel, "keep");
+
+      process.kill(-run.task.pid, "SIGKILL");
+      await waitForBuildCleanup(run, buildDir);
+      await waitFor(run, () => run.outputClosed, "the output pipes to close");
+      assert.deepEqual(run.exit, { code: null, signal: "SIGKILL" });
+      assert.ok(!run.records.some(({ event }) => event === "ready"));
+      assert.equal(readFileSync(sentinel, "utf8"), "keep");
+    },
+  );
 
   for (const [requests, code] of [
     [["SIGINT"], 130],
