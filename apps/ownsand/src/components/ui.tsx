@@ -578,6 +578,7 @@ function useDialogOpening(open: boolean) {
  * redirects after the request succeeds does so only while the opening is
  * current, so a request that settles after Escape, Cancel or a click outside
  * does not move the user away from the page they went to since.
+ * Return false if the action could not start and the dialog should stay open.
  */
 export function ConfirmDialog({
   open,
@@ -615,8 +616,8 @@ export function ConfirmDialog({
     // A retry removes the notice of the previous failure.
     setError(undefined);
     try {
-      await onConfirm(mine);
-      if (mine.isCurrent()) onOpenChange(false);
+      const result = await onConfirm(mine);
+      if (result !== false && mine.isCurrent()) onOpenChange(false);
     } catch (e) {
       if (mine.isCurrent()) setError(e);
     } finally {

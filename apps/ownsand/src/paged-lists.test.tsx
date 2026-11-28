@@ -6,15 +6,19 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
-import { createInfiniteQueryOptions } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  createInfiniteQueryOptions,
+} from "@connectrpc/connect-query";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
-import { SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
+import { Role, SnapshotState } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type Invitation,
   type ListInvitationsRequest,
   type ListInvitationsResponse,
+  type ListMembersResponse,
   MemberService,
 } from "@delino/ownsand-protos/v1/member_pb";
 import {
@@ -1176,6 +1180,116 @@ test.each([
   },
   5 * WAIT.timeout + TEST_SETUP_MS,
 );
+
+describe("member removal confirmation", () => {
+  const path = `/orgs/${MOCK_IDS.acme}/members`;
+  const target = "user-admin-jun";
+
+  test("uses the refreshed member and reads the roster again after removal", async () => {
+    const mock = createMockTransport();
+    let name = "Jun Park";
+    const renamedRoster: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        const response = await mock.unary(method, ...args);
+        if (method.name !== "ListMembers") return response;
+        const { members } = response.message as ListMembersResponse;
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            members: members.map((m) =>
+              m.userId === target ? { ...m, displayName: name } : m,
+            ),
+          },
+        };
+      },
+    };
+    const { transport, queryClient, refetch, seen } = fullListRefresh(
+      MemberService.method.listMembers,
+      renamedRoster,
+    );
+    renderConsole(path, { transport, queryClient });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove Jun Park" }, WAIT),
+    );
+    await screen.findByRole("alertdialog", { name: "Remove Jun Park?" }, WAIT);
+
+    name = "Jun Lee";
+    await refetch();
+    const dialog = await screen.findByRole(
+      "alertdialog",
+      { name: "Remove Jun Lee?" },
+      WAIT,
+    );
+    const reads = seen.ListMembers ?? 0;
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Remove member" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(screen.queryByText("Jun Lee")).toBeNull();
+    }, WAIT);
+    expect(seen.RemoveMember).toBe(1);
+    expect(seen.ListMembers).toBe(reads + 1);
+  });
+
+  test.each(["missing", "owner"])(
+    "checks the cache when the target becomes %s before the dialog renders again",
+    async (reason) => {
+      const { transport, queryClient, seen } = fullListRefresh(
+        MemberService.method.listMembers,
+      );
+      renderConsole(path, { transport, queryClient });
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Remove Jun Park" }, WAIT),
+      );
+      const dialog = await screen.findByRole(
+        "alertdialog",
+        { name: "Remove Jun Park?" },
+        WAIT,
+      );
+      const confirm = within(dialog).getByRole("button", {
+        name: "Remove member",
+      });
+      const key = createConnectQueryKey({
+        schema: MemberService.method.listMembers,
+        input: { organizationId: MOCK_IDS.acme, pageSize: 200, pageToken: "" },
+        transport,
+        cardinality: "infinite",
+        pageParamKey: "pageToken",
+      });
+
+      await act(async () => {
+        queryClient.setQueryData(
+          key,
+          (data) =>
+            data && {
+              ...data,
+              pages: data.pages.map((page) => ({
+                ...page,
+                members: page.members.flatMap((m) =>
+                  m.userId !== target
+                    ? [m]
+                    : reason === "missing"
+                      ? []
+                      : [{ ...m, role: Role.OWNER }],
+                ),
+              })),
+            },
+        );
+        fireEvent.click(confirm);
+      });
+
+      await waitFor(
+        () => expect(screen.queryByRole("alertdialog")).toBeNull(),
+        WAIT,
+      );
+      expect(seen.RemoveMember).toBeUndefined();
+    },
+  );
+});
 
 describe.each([
   {

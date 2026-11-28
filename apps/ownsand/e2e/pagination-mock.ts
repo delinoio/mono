@@ -587,6 +587,7 @@ export function createMockTransport(): Transport {
         if (
           method.name === "CreateSandbox" ||
           method.name === "ReplaceDeviceLimits" ||
+          method.name === "RemoveMember" ||
           method.name === "TransferOwnership"
         ) {
           recordToken(
@@ -650,21 +651,45 @@ export function createMockTransport(): Transport {
       }
       if (method.name === "ListMembers" && refreshList === "ListMembers") {
         const excluded = sessionStorage.getItem("ownsand-e2e-excluded-member");
-        if (excluded !== null) {
+        const owner = sessionStorage.getItem("ownsand-e2e-roster-owner");
+        const deferred = sessionStorage.getItem("ownsand-e2e-deferred-member");
+        if (excluded !== null || owner !== null || deferred !== null) {
+          const request = input as typeof input & { pageToken: string };
+          const continuation = deferred !== null && request.pageToken !== "";
+          if (continuation) await failContinuationIfConfigured();
           const response = await base.unary(
             method,
             signal,
             timeout,
             header,
-            input,
+            deferred === null ? request : { ...request, pageToken: "" },
             contextValues,
           );
-          const { members } = response.message as ListMembersResponse;
+          const { members, nextPageToken } =
+            response.message as ListMembersResponse;
           return {
             ...response,
             message: {
               ...response.message,
-              members: members.filter(({ userId }) => userId !== excluded),
+              members: members
+                .filter(({ userId }) => userId !== excluded)
+                .filter(
+                  ({ userId }) =>
+                    deferred === null || (userId === deferred) === continuation,
+                )
+                .map((member) =>
+                  member.userId === owner
+                    ? { ...member, role: Role.OWNER }
+                    : owner !== null && member.role === Role.OWNER
+                      ? { ...member, role: Role.ADMIN }
+                      : member,
+                ),
+              nextPageToken:
+                deferred === null
+                  ? nextPageToken
+                  : continuation
+                    ? ""
+                    : CONTINUATION,
             },
           };
         }
