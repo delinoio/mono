@@ -24,7 +24,7 @@ func (f *fixture) expiryNoticeState(grantID string) (notices int, marked bool) {
 
 // TestQueueExpiryNoticesSkipsGrantThatExpiresWhileWaitingForLocks checks that
 // a notice job that selected a grant before its expiry and waits for the
-// billing account lock queues no "expires in 7 days" notice when the grant
+// billing account lock queues no expiry notice when the grant
 // expires during the wait, and does not mark the grant as noticed.
 func TestQueueExpiryNoticesSkipsGrantThatExpiresWhileWaitingForLocks(t *testing.T) {
 	t.Parallel()

@@ -76,7 +76,7 @@ var subjects = map[Kind]string{
 	KindPaymentFailed:         "A Delino payment failed",
 	KindAutoTopUpDisabled:     "Delino automatic top-up is turned off",
 	KindLowBalance:            "Your Delino credit balance is low",
-	KindCreditExpiry:          "Delino credit expires in 7 days",
+	KindCreditExpiry:          "Your Delino credit expires soon",
 	KindOrganizationBlocked:   "A linked organization is blocked for non-payment",
 	KindOrganizationSuspended: "A linked organization is suspended for non-payment",
 }
