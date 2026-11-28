@@ -65,6 +65,7 @@ func TestWriteRefreshSurvivesExpiryDuringChunk(t *testing.T) {
 			t.Errorf("continuation = %p, want original entry %p", continuation, e)
 		}
 		time.Sleep(time.Minute)
+		synctest.Wait()
 		checkCachedWrite(t, w, e)
 		w.release(testWriteKey, continuation, false, nil)
 		synctest.Wait()
