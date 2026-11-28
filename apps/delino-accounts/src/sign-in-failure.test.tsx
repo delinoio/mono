@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
 import { QueryClient } from "@tanstack/react-query";
 import {
@@ -13,6 +14,8 @@ import {
 import { Accounts } from "./App.tsx";
 import { LogtoAuthProvider } from "./auth.tsx";
 import { PENDING_INVITATION_KEY } from "./invitation.ts";
+import { createFakeApi } from "./testing/fake-api.ts";
+import { seedLogtoIdToken } from "./testing/logto-session.ts";
 import { TEST_CONFIG } from "./testing/render.tsx";
 
 /**
@@ -80,12 +83,13 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-function renderAt(path: string) {
+function renderAt(path: string, transport?: Transport) {
   window.history.replaceState(null, "", path);
   render(
     <LogtoAuthProvider settings={SETTINGS}>
       <Accounts
         config={TEST_CONFIG}
+        transport={transport}
         checkout={undefined}
         queryClient={
           new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -188,6 +192,96 @@ describe("sign-in that fails before the redirect", () => {
       await waitFor(() => expect(screen.queryByText(FAILURE_TEXT)).toBeNull(), {
         timeout: SDK_WAIT_MS,
       });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "an ended invitation session shows a sign-in failure and clears it while retrying",
+    async () => {
+      const path = "/billing/invitations/accept";
+      const invitationUrl = new URL(path, APP_URL).href;
+      const signInAction = "Sign in with Delino";
+      const api = createFakeApi();
+      api.failNext.set(
+        "AcceptInvitation",
+        new ConnectError("token expired", Code.Unauthenticated),
+      );
+      const invitationRequests = () =>
+        api.calls
+          .filter(({ method }) => method === "AcceptInvitation")
+          .map(({ request }) => request.invitationToken);
+
+      seedLogtoIdToken(SETTINGS);
+      window.sessionStorage.setItem(PENDING_INVITATION_KEY, TOKEN);
+      renderAt(path, api.transport);
+
+      await screen.findByRole(
+        "button",
+        { name: "Accept invitation" },
+        { timeout: SDK_WAIT_MS },
+      );
+      await click("Accept invitation");
+      await screen.findByText(
+        "Your session ended. Sign in again.",
+        {},
+        { timeout: SDK_WAIT_MS },
+      );
+      screen.getByRole("button", { name: signInAction });
+      expect(invitationRequests()).toEqual([TOKEN]);
+      expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+
+      await click(signInAction);
+      const alert = await screen.findByText(
+        FAILURE_TEXT,
+        {},
+        { timeout: SDK_WAIT_MS },
+      );
+      expect(alert.getAttribute("role")).toBe("alert");
+      expect(document.body.textContent).not.toContain("secret-detail");
+      const retryButton = screen.getByRole<HTMLButtonElement>("button", {
+        name: signInAction,
+      });
+      expect(retryButton.disabled).toBe(false);
+      expect(window.sessionStorage.getItem(PENDING_INVITATION_KEY)).toBe(TOKEN);
+      expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBeNull();
+      expect(window.location.href).toBe(invitationUrl);
+
+      const beforeRetry = discoveryRequests;
+      let releaseDiscovery!: () => void;
+      discoveryGate = new Promise<void>((resolve) => {
+        releaseDiscovery = resolve;
+      });
+      discoveryWorks = true;
+      try {
+        await click(signInAction);
+        await waitFor(() => expect(discoveryRequests).toBe(beforeRetry + 1), {
+          timeout: SDK_WAIT_MS,
+        });
+        expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+        expect(window.sessionStorage.getItem(PENDING_INVITATION_KEY)).toBe(
+          TOKEN,
+        );
+        expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBeNull();
+        expect(window.location.href).toBe(invitationUrl);
+        expect(invitationRequests()).toEqual([TOKEN]);
+      } finally {
+        await act(async () => {
+          releaseDiscovery();
+        });
+      }
+
+      await expectRedirectStarted();
+      expect(
+        JSON.parse(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)!)
+          .redirectUri,
+      ).toBe(new URL("/callback", APP_URL).href);
+      const authorizationUrl = new URL(window.location.href);
+      expect(authorizationUrl.origin + authorizationUrl.pathname).toBe(
+        `${SETTINGS.endpoint}/oidc/auth`,
+      );
+      expect(window.sessionStorage.getItem(PENDING_INVITATION_KEY)).toBe(TOKEN);
+      expect(invitationRequests()).toEqual([TOKEN]);
     },
     TEST_TIMEOUT_MS,
   );
