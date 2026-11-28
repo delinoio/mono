@@ -846,6 +846,7 @@ function moveMain(dir, remote, file, content) {
   writeFileSync(join(other, file), content);
   commitAll(other, `move main: ${file}`);
   git(other, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+  return other;
 }
 
 // Blob SHAs of the changesets at `sha`, as the plan job records them.
@@ -1094,10 +1095,90 @@ test("release does not restore a rewound main", { skip }, (t) => {
   );
   const result = runRelease(work, sha, [{ name: "a", version: "0.0.1" }]);
   assert.equal(result.status, 1);
-  assert.match(result.stdout, /no longer contains the deployed revision/);
+  assert.ok(
+    result.stdout.includes(
+      `main was rewound or rewritten from expected tip ${sha} to fetched tip ${before}.`,
+    ),
+    result.stdout + result.stderr,
+  );
   assert.equal(remoteGit(remote, "rev-parse", "main"), before);
   assert.equal(remoteGit(remote, "tag"), "");
 });
+
+for (const movement of ["rewind", "rewrite", "fast-forward"]) {
+  test(
+    `release handles a ${movement} of main before the second push`,
+    { skip },
+    (t) => {
+      const { dir, remote, work } = releaseFixture(t);
+      const sha = addChangeset(work, "one", { a: "patch" });
+      const other = moveMain(dir, remote, "pkgs/b/later.txt", "not deployed\n");
+      const firstTip = git(other, "rev-parse", "HEAD");
+      let secondTip = sha;
+      if (movement !== "rewind") {
+        if (movement === "rewrite") git(other, "reset", "--hard", sha);
+        writeFileSync(join(other, "pkgs/b/newer.txt"), "new main change\n");
+        commitAll(other, "change main before the second push");
+        secondTip = git(other, "rev-parse", "HEAD");
+      }
+
+      const bin = join(dir, "bin");
+      const pushLog = join(dir, "atomic-pushes");
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "git"),
+        `#!/usr/bin/env bash
+set -euo pipefail
+export PATH="$RELEASE_TEST_PATH"
+if [[ "\${1:-}" == push && "\${2:-}" == --atomic ]]; then
+  printf '%s\\n' "$3" >> "$RELEASE_TEST_PUSH_LOG"
+  if [[ "$(wc -l < "$RELEASE_TEST_PUSH_LOG")" -eq 2 ]]; then
+    git -C "$RELEASE_TEST_OTHER" push --quiet --force-with-lease="refs/heads/main:$RELEASE_TEST_FIRST_TIP" origin "$RELEASE_TEST_SECOND_TIP:refs/heads/main"
+  fi
+fi
+exec git "$@"
+`,
+        { mode: 0o755 },
+      );
+      const result = runRelease(work, sha, [{ name: "a", version: "0.0.1" }], {
+        PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+        DEPLOY_RELEASE_MAX_ATTEMPTS: "3",
+        RELEASE_TEST_PATH: baseEnv.PATH,
+        RELEASE_TEST_PUSH_LOG: pushLog,
+        RELEASE_TEST_OTHER: other,
+        RELEASE_TEST_FIRST_TIP: firstTip,
+        RELEASE_TEST_SECOND_TIP: secondTip,
+      });
+
+      const advances = movement === "fast-forward";
+      assert.equal(
+        result.status,
+        advances ? 0 : 1,
+        result.stdout + result.stderr,
+      );
+      assert.deepEqual(
+        readFileSync(pushLog, "utf8").trimEnd().split("\n"),
+        [sha, firstTip, ...(advances ? [secondTip] : [])].map(
+          (tip) => `--force-with-lease=refs/heads/main:${tip}`,
+        ),
+      );
+      if (advances) {
+        assert.equal(remoteGit(remote, "rev-parse", "main^"), secondTip);
+        assert.equal(remoteGit(remote, "cat-file", "-t", "a@0.0.1"), "tag");
+        assert.equal(remoteGit(remote, "rev-parse", "a@0.0.1^{commit}^"), sha);
+      } else {
+        assert.ok(
+          result.stdout.includes(
+            `main was rewound or rewritten from expected tip ${firstTip} to fetched tip ${secondTip}.`,
+          ),
+          result.stdout + result.stderr,
+        );
+        assert.equal(remoteGit(remote, "rev-parse", "main"), secondTip);
+        assert.equal(remoteGit(remote, "tag"), "");
+      }
+    },
+  );
+}
 
 test("release stops when main changed package manifests", { skip }, (t) => {
   const { dir, remote, work } = releaseFixture(t);

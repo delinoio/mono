@@ -91,12 +91,9 @@ for tag in "${tags[@]}"; do
 done
 
 # Push `main` and every tag atomically, so a rejected push leaves neither on
-# the remote. The lease pins the expected `main` tip, so a `main` that was
-# rewound or rewritten is never fast-forwarded back over the deployed
-# revision. Only a `main` that moved forward from the deployed revision is
-# retried: the version commit is cherry-picked onto the new `main`
-# (changesets merged later stay pending). Any other rejection, such as a
-# ruleset denial or an existing remote tag, fails at once.
+# the remote. Retry only when `main` moved forward from the rejected push's
+# lease tip. Replay the version commit on the new `main` and leave changesets
+# merged later pending. A rejection with an unchanged tip fails at once.
 expected_tip="$SHA"
 for (( attempt = 1; ; attempt++ )); do
   if git push --atomic --force-with-lease="refs/heads/main:$expected_tip" \
@@ -119,8 +116,8 @@ for (( attempt = 1; ; attempt++ )); do
     echo "::error::The push was rejected although main did not move. Check the main ruleset and existing tags."
     exit 1
   fi
-  if ! git merge-base --is-ancestor "$SHA" "$tip"; then
-    echo "::error::main no longer contains the deployed revision $SHA (it was rewound or rewritten); the version commit and tags were not pushed."
+  if ! git merge-base --is-ancestor "$expected_tip" "$tip"; then
+    echo "::error::main was rewound or rewritten from expected tip $expected_tip to fetched tip $tip. The version commit and tags were not pushed."
     exit 1
   fi
   if (( attempt >= max_attempts )); then
