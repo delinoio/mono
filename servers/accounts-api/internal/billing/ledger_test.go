@@ -151,18 +151,21 @@ var txnSeq atomic.Int64
 func (f *fixture) grant(accountID string, kind LedgerKind, amount int64) string {
 	f.t.Helper()
 	var id string
-	f.tx(func(tx pgx.Tx) error {
+	err := f.s.InObservedTx(ctx(), func(tx pgx.Tx, observations *TxObservations) error {
 		acct, err := lockAccount(ctx(), tx, accountID)
 		if err != nil {
 			return err
 		}
 		now := f.s.timestamp()
-		id, _, err = f.s.addGrant(ctx(), tx, acct, grantInput{
+		id, _, err = f.s.addGrant(ctx(), tx, observations, acct, grantInput{
 			Kind: kind, Amount: amount, PaddleTransactionID: fmt.Sprintf("txn_test_%d", txnSeq.Add(1)),
 			ExpireTime: GrantExpireTime(now),
 		}, now)
 		return err
 	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
 	return id
 }
 

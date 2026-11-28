@@ -143,9 +143,10 @@ func TestReconcilePendingAdjustmentsAfterOldReleaseGrant(t *testing.T) {
 func TestPaymentDeliveryWithExistingGrantAppliesPending(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
+	logs := f.captureAdjustmentLogs()
 	acct := f.account()
 	if code := f.webhook(paddle.EventAdjustmentCreated,
-		paddletest.Adjustment("adj_1", "chargeback", "approved", "txn_buy", 300)); code != http.StatusOK {
+		paddletest.Adjustment("adj_1", "chargeback", "approved", "txn_buy", 400)); code != http.StatusOK {
 		t.Fatal(code)
 	}
 	oldReleaseGrant(t, f.db, acct, "txn_buy", 10*usd, f.clock.Now())
@@ -166,11 +167,12 @@ func TestPaymentDeliveryWithExistingGrantAppliesPending(t *testing.T) {
 	}
 	f.wantLedger(acct,
 		wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
-		wantEntry{LedgerRefund, -3 * usd, 7 * usd},
+		wantEntry{LedgerRefund, -4 * usd, 6 * usd},
 	)
 	if f.pendingCount() != 0 || f.refundCount() != 1 {
 		t.Fatalf("pending %d, refunds %d", f.pendingCount(), f.refundCount())
 	}
+	logs.want(logs.refund(acct, "txn_buy", "adj_1", "chargeback", 4*usd, 6*usd, true))
 }
 
 func TestPaymentWebhookExpiresCreditBeforePendingAdjustment(t *testing.T) {
@@ -315,6 +317,7 @@ func TestPaymentWebhookExpiresCreditBeforePendingAdjustment(t *testing.T) {
 func TestReconcilePendingAdjustmentsIsExactlyOnce(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
+	logs := f.captureAdjustmentLogs()
 	now := f.clock.Now()
 	acct := f.account()
 	oldReleaseGrant(t, f.db, acct, "txn_buy", 10*usd, now)
@@ -353,6 +356,11 @@ func TestReconcilePendingAdjustmentsIsExactlyOnce(t *testing.T) {
 		}
 	}
 
+	refund := logs.refund(acct, "txn_buy", "adj_b", "refund", 6*usd, 4*usd, true)
+	chargeback := logs.refund(acct, "txn_buy", "adj_a", "chargeback", 4*usd, 0, true)
+	summary := logs.reconciliation(acct, "txn_buy", 2, 0)
+	logs.want(refund, chargeback, summary)
+
 	// A pending row left behind although credit_refunds applied it (for
 	// example a copy that an older release wrote after the webhook) is
 	// deleted without a second reversal.
@@ -373,6 +381,10 @@ func TestReconcilePendingAdjustmentsIsExactlyOnce(t *testing.T) {
 	if f.pendingCount() != 0 || f.refundCount() != 3 {
 		t.Fatalf("pending %d, refunds %d", f.pendingCount(), f.refundCount())
 	}
+
+	logs.want(refund, chargeback, summary,
+		logs.refund(acct2, "txn_buy2", "adj_c", "refund", 2*usd, 8*usd, false),
+		logs.reconciliation(acct2, "txn_buy2", 1, 8*usd))
 
 	// A deleted billing account keeps its pending row and its balance.
 	acct3 := f.account()
@@ -429,6 +441,7 @@ func (f *fixture) seedPendingPurchase(transactionID, action string, failing bool
 func TestReconcilePendingAdjustmentsContinuesAfterPurchaseFailure(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
+	logs := f.captureAdjustmentLogs()
 	f.injectPendingAdjustmentFailures()
 	failed := f.seedPendingPurchase("txn_01", "refund", true)
 	healthy := f.seedPendingPurchase("txn_02", "chargeback", false)
@@ -445,6 +458,10 @@ func TestReconcilePendingAdjustmentsContinuesAfterPurchaseFailure(t *testing.T) 
 		t.Fatalf("pending = %d, refunds = %d, want 1 and 1", f.pendingCount(), f.refundCount())
 	}
 
+	healthyRefund := logs.refund(healthy, "txn_02", "adj_txn_02", "chargeback", 4*usd, 6*usd, true)
+	healthySummary := logs.reconciliation(healthy, "txn_02", 1, 6*usd)
+	logs.want(healthyRefund, healthySummary)
+
 	if _, err := f.db.Pool.Exec(ctx(), `DELETE FROM reconciliation_faults`); err != nil {
 		t.Fatal(err)
 	}
@@ -455,9 +472,12 @@ func TestReconcilePendingAdjustmentsContinuesAfterPurchaseFailure(t *testing.T) 
 	}
 	f.wantLedger(failed, credit, refund)
 	f.wantLedger(healthy, credit, refund)
-	if f.pendingCount() != 0 || f.refundCount() != 2 {
-		t.Fatalf("pending = %d, refunds = %d, want 0 and 2", f.pendingCount(), f.refundCount())
+	if f.pendingCount() != 0 || f.refundCount() != 2 || f.balance(failed) != 6*usd {
+		t.Fatalf("after recovery: pending %d, refunds %d, recovered balance %d", f.pendingCount(), f.refundCount(), f.balance(failed))
 	}
+	logs.want(healthyRefund, healthySummary,
+		logs.refund(failed, "txn_01", "adj_txn_01", "refund", 4*usd, 6*usd, true),
+		logs.reconciliation(failed, "txn_01", 1, 6*usd))
 }
 
 func TestReconcilePendingAdjustmentsReachesHealthyPurchaseBeyondBatch(t *testing.T) {
