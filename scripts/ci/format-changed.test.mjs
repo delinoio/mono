@@ -2843,9 +2843,16 @@ test("pre-commit refuses a pathspec commit with a parser error", (t) => {
   f.git("add", "broken.ts");
   const head = f.git("rev-parse", "HEAD");
   const result = runCommit(f, "-m", "pathspec", "--", "broken.ts");
-  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  const output = result.stdout + result.stderr;
+  assert.notEqual(result.status, 0, output);
   assert.equal(f.git("rev-parse", "--verify", "HEAD"), head);
   assert.equal(f.git("status", "--porcelain"), "A  broken.ts");
+  assert.match(output, /"event":"ci_format_error"/u);
+  assert.match(output, /a staged file cannot be parsed/u);
+  assert.match(
+    output,
+    /run `git add` on them and run a plain `git commit` without a path/u,
+  );
 });
 
 test("pre-commit lets a pathspec commit of formatted content through", (t) => {
