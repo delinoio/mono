@@ -709,9 +709,13 @@ describe("file write", () => {
       h.client.sandbox(SANDBOX).writeFile("/empty", new Uint8Array(0)),
     );
     expect(written.sizeBytes).toBe(0n);
-    const [write] = h.api.callsOf("WriteFile").map((c) => c.request as any);
-    expect(write.finish.sizeBytes).toBe(0n);
+    const writes = h.api.callsOf("WriteFile");
+    expect(writes).toHaveLength(1);
+    const write = writes[0]!.request as WriteFileRequest;
     expect(write.path).toBe("/empty");
+    expect(write.offset).toBe(0n);
+    expect(write.data).toHaveLength(0);
+    expect(write.finish?.sizeBytes).toBe(0n);
   });
 
   describe("binary sources from another realm", () => {
