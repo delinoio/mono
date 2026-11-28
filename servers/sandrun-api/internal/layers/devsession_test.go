@@ -114,22 +114,25 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 	if err != nil || del.Msg.GetDevSession().GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED {
 		t.Fatalf("owner deletes: %v %v", del, err)
 	}
-	// A queued session is canceled.
-	s3 := w.createSession(t, memberByKey, profileID)
+	// Keep the third session queued even if the dispatcher picks it up immediately.
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
-		o.MaxSandboxes = 0
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
+	sandboxCount := len(w.fake.Sandboxes(w.osOrg))
+	s3 := w.createSession(t, memberByKey, profileID)
+	if state := w.session(t, s3.GetDevSessionId()).GetState(); state != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("third session state = %v, want QUEUED", state)
+	}
 	del, err = memberByKey.DevSession.DeleteDevSession(ctx, connect.NewRequest(&sandrunv1.DeleteDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s3.GetDevSessionId()}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st := del.Msg.GetDevSession(); st.GetState() == sandrunv1.RequestState_REQUEST_STATE_CANCELED {
-		if st.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER {
-			t.Fatalf("canceled %v", st)
-		}
-	} else if st.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED {
-		t.Fatalf("deleted third session %v", st)
+	if st := del.Msg.GetDevSession(); st.GetState() != sandrunv1.RequestState_REQUEST_STATE_CANCELED ||
+		st.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER {
+		t.Fatalf("third session deletion = %v / %v, want CANCELED / CANCELED_BY_USER", st.GetState(), st.GetEndReason())
+	}
+	if got := len(w.fake.Sandboxes(w.osOrg)); got != sandboxCount {
+		t.Fatalf("sandbox count after canceling third session = %d, want %d", got, sandboxCount)
 	}
 	// Audit: creations and deletions name the owner and the actor key.
 	var created, deleted, byKey int
