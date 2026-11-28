@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -409,7 +410,7 @@ func readPIDFile(t *testing.T, path string) int {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if data, err := os.ReadFile(path); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 1 {
 				return pid
 			}
 		}
@@ -417,6 +418,29 @@ func readPIDFile(t *testing.T, path string) int {
 	}
 	t.Fatalf("the fixture script did not write %s", path)
 	return 0
+}
+
+func waitForTrackedDescendant(t *testing.T, p *launcherProc, pid, pgid int) {
+	t.Helper()
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		p.mu.Lock()
+		_, sawPID := p.seenPIDs[pid]
+		_, sawPGID := p.seenPGIDs[pgid]
+		p.mu.Unlock()
+		if sawPID && sawPGID {
+			return
+		}
+		select {
+		case <-timeout.C:
+			t.Fatalf("the tracker did not record the detached descendant within 10s: PID %d seen=%t, PGID %d seen=%t",
+				pid, sawPID, pgid, sawPGID)
+		case <-ticker.C:
+		}
+	}
 }
 
 // TestLauncherTeardownBoundedWhenLeaderExitedAndDescendantHoldsPipe checks
@@ -435,7 +459,7 @@ func TestLauncherTeardownBoundedWhenLeaderExitedAndDescendantHoldsPipe(t *testin
 
 	tests := []struct {
 		name string
-		// script starts the descendant, writes its pid to $1 and exits.
+		// script starts the descendant and publishes its PID to $1.
 		script string
 		// needsSetsid marks the cases that detach the descendant into its own
 		// session and process group.
@@ -447,11 +471,17 @@ func TestLauncherTeardownBoundedWhenLeaderExitedAndDescendantHoldsPipe(t *testin
 			script: `sleep 300 & echo $! > "$1"; exit 0`,
 		},
 		{
-			// The descendant is detached, like the build and the server that
-			// the launcher starts. The leader lingers long enough for the
-			// tracker to record the descendant, then exits.
-			name:        "own process group, leader exits after the tracker saw the descendant",
-			script:      `setsid sleep 300 & echo $! > "$1"; sleep 1; exit 0`,
+			// The detached shell publishes its own PID after setsid. Exec
+			// keeps that PID. The leader reaps the child on EOF if setup fails.
+			name: "own process group, leader exits after the tracker saw the descendant",
+			script: `
+setsid sh -c 'echo "$$" > "$1" && exec sleep 300' sh "$1" &
+child=$!
+if ! IFS= read -r release; then
+	kill "$child" 2>/dev/null
+	wait "$child" 2>/dev/null
+fi
+exit 0`,
 			needsSetsid: true,
 		},
 	}
@@ -462,10 +492,54 @@ func TestLauncherTeardownBoundedWhenLeaderExitedAndDescendantHoldsPipe(t *testin
 			}
 			pidFile := filepath.Join(t.TempDir(), "descendant.pid")
 			cmd := exec.Command("sh", "-c", tt.script, "sh", pidFile)
+			var release io.WriteCloser
+			if tt.needsSetsid {
+				var err error
+				release, err = cmd.StdinPipe()
+				if err != nil {
+					t.Fatalf("create the fixture release pipe: %v", err)
+				}
+			}
 			p := newLauncherProc(t, cmd)
-			descendant := readPIDFile(t, pidFile)
-			// Never leak the descendant if the assertions below fail.
-			t.Cleanup(func() { _ = syscall.Kill(descendant, syscall.SIGKILL) })
+			var descendant int
+			t.Cleanup(func() {
+				if release != nil {
+					_ = release.Close()
+				} else {
+					// The child can still hold the pipe if PID publication fails.
+					_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+				}
+				if descendant > 1 {
+					_ = syscall.Kill(descendant, syscall.SIGKILL)
+				}
+				select {
+				case <-p.done:
+					return
+				case <-time.After(launcherKillTimeout):
+					p.killTree()
+				}
+				select {
+				case <-p.done:
+				case <-time.After(launcherKillTimeout):
+					t.Error("fixture cleanup could not reap the leader after SIGKILL")
+				}
+			})
+			descendant = readPIDFile(t, pidFile)
+			if release != nil {
+				pgid, err := syscall.Getpgid(descendant)
+				if err != nil {
+					t.Fatalf("get the process group for descendant %d: %v", descendant, err)
+				}
+				if pgid != descendant {
+					t.Fatalf("descendant %d has process group %d, want its own process group", descendant, pgid)
+				}
+				// Keep the leader connected to the descendant until both IDs
+				// are recorded. Stop cannot discover it after reparenting.
+				waitForTrackedDescendant(t, p, descendant, pgid)
+				if _, err := fmt.Fprintln(release, "exit"); err != nil {
+					t.Fatalf("release the fixture leader: %v", err)
+				}
+			}
 
 			// Wait until the leader has exited, so the descendant is orphaned
 			// from the leader. cmd.ProcessState is not read here: cmd.Wait
