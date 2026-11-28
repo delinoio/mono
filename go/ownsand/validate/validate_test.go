@@ -152,7 +152,7 @@ func TestExecIDRequiresLowercase(t *testing.T) {
 	upper := strings.ToUpper(opID)
 	err := ExecID("exec_id", upper)
 	wantInvalid(t, "uppercase", err, "exec_id")
-	if strings.Contains(err.Error(), upper) {
+	if err != nil && strings.Contains(err.Error(), upper) {
 		t.Errorf("error must omit the value: %v", err)
 	}
 	wantInvalid(t, "empty", ExecID("exec_id", ""), "exec_id")
