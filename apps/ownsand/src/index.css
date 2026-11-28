@@ -294,6 +294,11 @@ h1[tabindex="-1"]:focus {
   min-width: 180px;
 }
 
+.device-filter-status:not(:empty) {
+  margin-bottom: 16px;
+  overflow-wrap: anywhere;
+}
+
 .table-wrap {
   overflow-x: auto;
   border-radius: var(--dui-radius-panel, 16px);

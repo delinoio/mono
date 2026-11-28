@@ -224,6 +224,7 @@
   "sandboxes.filters.allStates": "All states",
   "sandboxes.filters.device": "Device",
   "sandboxes.filters.allDevices": "All devices",
+  "sandboxes.filters.deviceMissing": "{device} is no longer in the device inventory. Select {allDevices} to clear the filter.",
   "sandboxes.filters.showEnded": "Show ended sandboxes",
   "sandboxes.loading": "Loading sandboxes",
   "sandboxes.empty.title": "No sandboxes match",

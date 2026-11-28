@@ -224,6 +224,7 @@
   "sandboxes.filters.allStates": "Tous les états",
   "sandboxes.filters.device": "Appareil",
   "sandboxes.filters.allDevices": "Tous les appareils",
+  "sandboxes.filters.deviceMissing": "{device} ne figure plus dans l’inventaire des appareils. Sélectionnez « {allDevices} » pour effacer le filtre.",
   "sandboxes.filters.showEnded": "Afficher les sandboxes arrêtées",
   "sandboxes.loading": "Chargement des sandboxes",
   "sandboxes.empty.title": "Aucune sandbox ne correspond aux filtres",

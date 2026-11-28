@@ -224,6 +224,7 @@
   "sandboxes.filters.allStates": "Todos os estados",
   "sandboxes.filters.device": "Dispositivo",
   "sandboxes.filters.allDevices": "Todos os dispositivos",
+  "sandboxes.filters.deviceMissing": "{device} não está mais no inventário de dispositivos. Selecione “{allDevices}” para limpar o filtro.",
   "sandboxes.filters.showEnded": "Mostrar sandboxes encerrados",
   "sandboxes.loading": "Carregando sandboxes",
   "sandboxes.empty.title": "Nenhum sandbox corresponde aos filtros",

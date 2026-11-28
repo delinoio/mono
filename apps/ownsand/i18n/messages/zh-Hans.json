@@ -224,6 +224,7 @@
   "sandboxes.filters.allStates": "所有状态",
   "sandboxes.filters.device": "设备",
   "sandboxes.filters.allDevices": "所有设备",
+  "sandboxes.filters.deviceMissing": "{device} 已不在设备列表中。选择“{allDevices}”以清除筛选条件。",
   "sandboxes.filters.showEnded": "显示已结束的沙箱",
   "sandboxes.loading": "正在加载沙箱",
   "sandboxes.empty.title": "没有符合条件的沙箱",
