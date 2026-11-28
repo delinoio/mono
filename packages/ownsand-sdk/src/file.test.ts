@@ -2,12 +2,14 @@
 import { runInNewContext } from "node:vm";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
+import { MAX_FILE_CHUNK_SIZE } from "./codec.ts";
 import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
 import type { Clock } from "./clock.ts";
 import { DataPathError, OwnSandValidationError } from "./errors.ts";
 import { Timing } from "./relay/context.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
+import type { WriteFileRequest } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { chunkSource, type WriteSource } from "./operations/write.ts";
@@ -508,6 +510,51 @@ describe("file write", () => {
     );
     // One grant for the whole write.
     expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+  });
+
+  test("uploads reused fragments that cross the chunk boundary in order", async () => {
+    const h = setup();
+    h.api.unary(RelayService, "WriteFile", (req) => ({
+      writeId: req.writeId,
+      offset: req.offset,
+      length: BigInt(req.data.length),
+      finished: req.finish !== undefined,
+      sizeBytes: req.finish?.sizeBytes ?? 0n,
+    }));
+    const fragmentSize = 63;
+    const fragmentCount = 16_645;
+    function* source() {
+      const fragment = new Uint8Array(fragmentSize);
+      for (let index = 0; index < fragmentCount; index++) {
+        fragment.fill(index % 251);
+        yield fragment;
+      }
+      yield Uint8Array.of(255, 255, 255);
+    }
+
+    const result = await h.client.sandbox(SANDBOX).writeFile("/f", source());
+    const writes = h.api
+      .callsOf("WriteFile")
+      .map((c) => c.request as WriteFileRequest);
+    expect(writes).toHaveLength(2);
+    const [first, last] = writes;
+    const expectedFirst = new Uint8Array(MAX_FILE_CHUNK_SIZE).map(
+      (_, index) => Math.floor(index / fragmentSize) % 251,
+    );
+    expect(first!.offset).toBe(0n);
+    expect(first!.data).toHaveLength(MAX_FILE_CHUNK_SIZE);
+    expect(Buffer.from(first!.data).equals(expectedFirst)).toBe(true);
+    expect(first!.finish).toBeUndefined();
+
+    expect(last!.offset).toBe(BigInt(MAX_FILE_CHUNK_SIZE));
+    expect([...last!.data]).toEqual([
+      ...new Uint8Array(59).fill((fragmentCount - 1) % 251),
+      255,
+      255,
+      255,
+    ]);
+    expect(last!.finish?.sizeBytes).toBe(1_048_638n);
+    expect(result.sizeBytes).toBe(1_048_638n);
   });
 
   test("rejects a conflicting final size on the relay without retrying", async () => {
@@ -1293,6 +1340,7 @@ describe("chunkSource", () => {
     const out = [];
     for await (const c of chunkSource(new Uint8Array(0), 4)) out.push(c);
     expect(out).toHaveLength(1);
+    expect(out[0]!.data).toHaveLength(0);
     expect(out[0]!.last).toBe(true);
   });
 
