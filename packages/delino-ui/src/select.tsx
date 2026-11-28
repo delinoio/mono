@@ -86,7 +86,7 @@ export function Select({
     <Field
       className="dui-text-field"
       disabled={disabled}
-      invalid={hasError ? true : undefined}
+      invalid={hasError && !disabled ? true : undefined}
     >
       <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
       <SelectRoot disabled={disabled} {...rootProps}>

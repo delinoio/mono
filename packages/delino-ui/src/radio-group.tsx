@@ -51,7 +51,7 @@ export function RadioGroup({
     <Field
       className="dui-radio-field"
       disabled={disabled}
-      invalid={hasError ? true : undefined}
+      invalid={hasError && !disabled ? true : undefined}
     >
       <FieldLabel className="dui-radio-field-label">{label}</FieldLabel>
       {/* Workaround: the UI SDK Field predicts the description id in
