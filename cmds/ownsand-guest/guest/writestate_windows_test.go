@@ -14,10 +14,12 @@ import (
 )
 
 func TestWriteExpiryOfPrefixedLongStagingPath(t *testing.T) {
+	t.Parallel()
 	testWriteExpiryOfLongStagingPath(t, extendedPath)
 }
 
 func TestWriteRecoveryRecordHandleBlocksPromotionAndCleanup(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	staging := tempPath(target, req.GetWriteId())

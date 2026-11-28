@@ -11,6 +11,7 @@ import (
 )
 
 func TestSessionLimitsDefaults(t *testing.T) {
+	t.Parallel()
 	got := SessionLimits{}.withDefaults()
 	if got != (SessionLimits{MaxStreamsPerSession: 64, MaxSessions: 256}) {
 		t.Fatalf("defaults %+v", got)
@@ -27,6 +28,7 @@ func TestSessionLimitsDefaults(t *testing.T) {
 // The rejection log writes the first record at once, then at most one record
 // per interval and kind, and carries the count of the suppressed rejections.
 func TestLimitRejectLogRateLimit(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
 	var l limitRejectLog

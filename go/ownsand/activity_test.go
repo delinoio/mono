@@ -26,6 +26,7 @@ func newFakeActivity(f *fakeElapsed) *activity {
 }
 
 func TestActivityIdleGrowsWithElapsedTimeAndTouchResetsIt(t *testing.T) {
+	t.Parallel()
 	var f fakeElapsed
 	a := newFakeActivity(&f)
 	if got := a.idle(); got != 0 {
@@ -46,6 +47,7 @@ func TestActivityIdleGrowsWithElapsedTimeAndTouchResetsIt(t *testing.T) {
 }
 
 func TestActivityIdleNeverNegative(t *testing.T) {
+	t.Parallel()
 	var f fakeElapsed
 	f.advance(time.Minute)
 	a := newFakeActivity(&f)
@@ -62,6 +64,7 @@ func TestActivityIdleNeverNegative(t *testing.T) {
 // conversion that strips it would make idle() wall-clock based again, and
 // the String form of a Time shows the reading as "m=".
 func TestActivityBaseKeepsMonotonicReading(t *testing.T) {
+	t.Parallel()
 	a := newActivity()
 	if !strings.Contains(a.base.String(), " m=") {
 		t.Fatalf("activity base %q has no monotonic clock reading", a.base.String())
@@ -76,6 +79,7 @@ func TestActivityBaseKeepsMonotonicReading(t *testing.T) {
 }
 
 func TestActivityBodyReadResetsIdle(t *testing.T) {
+	t.Parallel()
 	var f fakeElapsed
 	a := newFakeActivity(&f)
 	body := &activityBody{ReadCloser: io.NopCloser(strings.NewReader("abc")), a: a}
@@ -113,6 +117,7 @@ func TestActivityBodyReadResetsIdle(t *testing.T) {
 // cancelled with errStall only after the bytes stop. Every bound is generous,
 // so a slow or coarse-timer host passes.
 func TestStallContextByteBeforeExpiryResetsIdle(t *testing.T) {
+	t.Parallel()
 	c := &Client{timing: testTiming()}
 	c.timing.streamStall = 600 * time.Millisecond
 

@@ -50,6 +50,7 @@ func (c *writeResultCall) requireNoResultCreditReturn(t *testing.T, waiting <-ch
 // reaches the agent, and the expired result is neither counted in the call
 // record nor consumed (no window update returns its credit).
 func TestRelayWriteFileLateResultIsRejected(t *testing.T) {
+	t.Parallel()
 	c := startWriteResultCall(t, 4*time.Second)
 	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
 	reached := holdWriteResponse(t, c)
@@ -73,6 +74,7 @@ func TestRelayWriteFileLateResultIsRejected(t *testing.T) {
 // before the handler looked at the queued result keeps its precedence over the
 // expired call deadline.
 func TestRelayWriteFileLateResultCallerCancelWins(t *testing.T) {
+	t.Parallel()
 	c := startWriteResultCall(t, 30*time.Second)
 	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
 	reached := holdWriteResponse(t, c)
@@ -96,6 +98,7 @@ func TestRelayWriteFileLateResultCallerCancelWins(t *testing.T) {
 // TestRelayWriteFileLateTerminalResponse checks that local cancellation and
 // expiry take precedence over both types of queued terminal agent frame.
 func TestRelayWriteFileLateTerminalResponse(t *testing.T) {
+	t.Parallel()
 	for _, terminal := range writeTerminalResponses() {
 		for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeCanceled} {
 			t.Run(terminal.name+"/"+code.String(), func(t *testing.T) {

@@ -230,6 +230,7 @@ func failedCreateSend(t *testing.T, env *testenv.Env) (org *testenv.Org, sandbox
 // budget: the sandbox ends FAILED with CREATE_FAILED, its reservation is
 // released and the channel stays open.
 func TestCreateSendFailRetriesTransientError(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, createFailTiming(10*time.Second, 20*time.Millisecond))
 	fault := sandboxFailFault(t, env)
 	fault.on("40001", 2) // serialization_failure for the first two calls
@@ -258,6 +259,7 @@ func TestCreateSendFailRetriesTransientError(t *testing.T) {
 // and that the state report of the replacement channel ends the stranded
 // sandbox as LOST_ON_DEVICE.
 func TestCreateSendFailUnresolvedClosesChannel(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		code    string
@@ -285,6 +287,7 @@ func TestCreateSendFailUnresolvedClosesChannel(t *testing.T) {
 // compensation that finds the sandbox settled by the replacement channel's
 // state report ends without a failure and does not close the replacement.
 func TestCreateSendFailSettledByReplacementKeepsChannel(t *testing.T) {
+	t.Parallel()
 	// A long backoff leaves time to replace the channel before the next attempt.
 	env := testenv.New(t, createFailTiming(10*time.Second, 600*time.Millisecond))
 	fault := sandboxFailFault(t, env)
@@ -321,6 +324,7 @@ func rejectCreates(agent *testenv.FakeAgent) *atomic.Int64 {
 // TestAgentRejectedCreateRetriesTransientError checks the same retry for the
 // transition that fails a create that the agent rejected.
 func TestAgentRejectedCreateRetriesTransientError(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, createFailTiming(10*time.Second, 20*time.Millisecond))
 	fault := sandboxFailFault(t, env)
 	fault.on("40001", 2)
@@ -345,6 +349,7 @@ func TestAgentRejectedCreateRetriesTransientError(t *testing.T) {
 }
 
 func TestCreateAbortedByTTLAwaitsAgentUpdate(t *testing.T) {
+	t.Parallel()
 	const (
 		creating = ownsandv1.SandboxState_SANDBOX_STATE_CREATING
 		deleted  = ownsandv1.SandboxState_SANDBOX_STATE_DELETED
@@ -397,6 +402,7 @@ func TestCreateAbortedByTTLAwaitsAgentUpdate(t *testing.T) {
 // create whose transition stays unresolved closes the channel and that the
 // replacement channel ends the sandbox as LOST_ON_DEVICE.
 func TestAgentRejectedCreateUnresolvedClosesChannel(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		code    string
@@ -450,6 +456,7 @@ func rejectImports(agent *testenv.FakeAgent) {
 // a transition that stays unresolved closes the channel, so that the
 // replacement channel's state report ends the sandbox as LOST_ON_DEVICE.
 func TestImportFailureCompensationRetriesAndCloses(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		trigger func(agent *testenv.FakeAgent)
@@ -512,6 +519,7 @@ func TestImportFailureCompensationRetriesAndCloses(t *testing.T) {
 // closes the channel, and the state report of the replacement channel (which
 // does not list the snapshot) fails it.
 func TestCreateSnapshotSendFailCompensation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		code    string

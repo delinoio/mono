@@ -102,6 +102,7 @@ func slowQueueFixture(t *testing.T, n int, onCharge func()) (*fixture, []string)
 // run, the top-ups that were not claimed stay pending, and the next run
 // charges them.
 func TestRunOnceLeavesTimeForLaterTasksDuringASlowTopUpQueue(t *testing.T) {
+	t.Parallel()
 	f, accounts := slowQueueFixture(t, 3, nil)
 	// A later task of the run has work: a due credit expiry notice.
 	notice, _ := f.queueNotice(accounts[0])
@@ -133,6 +134,7 @@ func TestRunOnceLeavesTimeForLaterTasksDuringASlowTopUpQueue(t *testing.T) {
 // the Paddle call is in flight: its outcome is recorded, and the top-ups that
 // were not claimed stay pending.
 func TestAutoTopUpInFlightChargeRecordsItsOutcomeWhenTheRunEnds(t *testing.T) {
+	t.Parallel()
 	runCtx, cancel := context.WithCancel(ctx())
 	defer cancel()
 	f, accounts := slowQueueFixture(t, 2, cancel)
@@ -150,6 +152,7 @@ func TestAutoTopUpInFlightChargeRecordsItsOutcomeWhenTheRunEnds(t *testing.T) {
 }
 
 func TestAutoTopUpClaimDeadlineKeepsPending(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []struct {
 		name     string
 		lock     string
@@ -245,6 +248,7 @@ func TestAutoTopUpClaimDeadlineKeepsPending(t *testing.T) {
 }
 
 func TestAutoTopUpClaimPropagatesDatabaseError(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	f.deduct(acct, 25*usd)
 	if _, err := f.db.Pool.Exec(t.Context(), `ALTER TABLE credit_settings RENAME TO unavailable_credit_settings`); err != nil {
@@ -262,6 +266,7 @@ func TestAutoTopUpClaimPropagatesDatabaseError(t *testing.T) {
 }
 
 func TestAutoTopUpClaimPropagatesCommitDeadline(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	f.deduct(acct, 25*usd)
 	f.s.autoTopUpBudget = time.Second

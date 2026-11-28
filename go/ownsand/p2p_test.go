@@ -168,6 +168,7 @@ func (c *manualDeadlineCtx) Err() error {
 // send that wrote nothing leaves the session usable: the next frame is
 // decoded by the peer.
 func TestSendCancelledBeforeFirstFragmentKeepsSession(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -211,6 +212,7 @@ func TestSendCancelledBeforeFirstFragmentKeepsSession(t *testing.T) {
 // the next frame as the tail of the torn one. The next operation opens a new
 // session on the peer-to-peer path and its frames decode.
 func TestSendCancelledAfterFirstFragmentRetiresSession(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportAuto))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -266,6 +268,7 @@ func TestSendCancelledAfterFirstFragmentRetiresSession(t *testing.T) {
 // turn writes no message when the send buffer has room, removes its stream and
 // keeps the session usable.
 func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		want error
@@ -348,6 +351,7 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 }
 
 func TestWriteAttemptDeadlineDuringPeerSend(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		fragment int64
@@ -444,6 +448,7 @@ func TestWriteAttemptDeadlineDuringPeerSend(t *testing.T) {
 }
 
 func TestWriteAttemptDeadlineIncludesPeerReplyWait(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agentGate = make(chan struct{})
 	defer close(cp.agentGate)
@@ -489,6 +494,7 @@ func TestWriteAttemptDeadlineIncludesPeerReplyWait(t *testing.T) {
 }
 
 func TestWriteChunkCallerCancellationWhileWaitingToSend(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
 	setupCtx, cancelSetup := context.WithTimeout(t.Context(), 10*time.Second)
@@ -523,6 +529,7 @@ func TestWriteChunkCallerCancellationWhileWaitingToSend(t *testing.T) {
 // that names the phase when the worker exits first, when the phase never
 // arrives, and when the worker does not finish.
 func TestAwaitReadyDiagnostics(t *testing.T) {
+	t.Parallel()
 	never := func() bool { return false }
 	live, cancelLive := context.WithCancel(context.Background())
 	defer cancelLive()
@@ -570,6 +577,7 @@ func TestAwaitReadyDiagnostics(t *testing.T) {
 // TestManualDeadlineCtx checks that the context reports the deadline error
 // only after expire, and the parent's error when the parent ends first.
 func TestManualDeadlineCtx(t *testing.T) {
+	t.Parallel()
 	parent, cancelParent := context.WithCancel(context.Background())
 	c := newManualDeadlineCtx(parent)
 	defer c.cancel()
@@ -596,6 +604,7 @@ func TestManualDeadlineCtx(t *testing.T) {
 // older request that stays queued still sends its frame after the turn is
 // released, and that a canceled request does not change the session.
 func TestSendQueuedBehindHeldTurnCancelsIndependently(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -702,6 +711,7 @@ func TestSendQueuedBehindHeldTurnCancelsIndependently(t *testing.T) {
 // TestSendWaitingForSendTurnObservesSessionEnd checks that a request that waits
 // for the send turn returns the session's end error when the session ends.
 func TestSendWaitingForSendTurnObservesSessionEnd(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -763,6 +773,7 @@ func newDispatchSession(t *testing.T) (*p2pSession, *p2pStream, *p2pStream) {
 }
 
 func TestDispatchInvalidSessionEndDoesNotEndSession(t *testing.T) {
+	t.Parallel()
 	s, st1, st2 := newDispatchSession(t)
 
 	// A session-end kind without its payload fails only its open stream.
@@ -801,6 +812,7 @@ func TestDispatchInvalidSessionEndDoesNotEndSession(t *testing.T) {
 }
 
 func TestDispatchValidSessionEndEndsSession(t *testing.T) {
+	t.Parallel()
 	s, _, _ := newDispatchSession(t)
 	s.dispatch(datapath.MustNewFrame(1, "", &ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED}))
 	if !s.isDone() {

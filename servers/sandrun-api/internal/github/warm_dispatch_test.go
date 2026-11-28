@@ -18,6 +18,7 @@ import (
 )
 
 func TestWarmDispatchContinuesAfterRejection(t *testing.T) {
+	t.Parallel()
 	for _, pooled := range []bool{false, true} {
 		t.Run(warmProfileKind(pooled), func(t *testing.T) {
 			w, first, later := newWarmDispatchWorld(t, pooled)
@@ -55,6 +56,7 @@ func TestWarmDispatchContinuesAfterRejection(t *testing.T) {
 }
 
 func TestWarmDispatchStopsAfterDeadlineOrCancellation(t *testing.T) {
+	t.Parallel()
 	const watchdogTimeout = 5 * time.Second
 	for _, pooled := range []bool{false, true} {
 		t.Run(warmProfileKind(pooled), func(t *testing.T) {
@@ -111,6 +113,7 @@ func TestWarmDispatchStopsAfterDeadlineOrCancellation(t *testing.T) {
 }
 
 func TestWarmDispatchWaitsForUncoveredQueue(t *testing.T) {
+	t.Parallel()
 	w, _, _ := newWarmDispatchWorld(t, true)
 	queuedProfile := w.createProfile(t, ghProfile("queued", 0))
 	w.send(t, "workflow_job", job("queued", 501, 9001, []string{"sandrun-queued"}, ""))

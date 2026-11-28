@@ -51,6 +51,7 @@ func pollPhase(ctx context.Context, interval time.Duration, poll func(context.Co
 }
 
 func TestWaitForBillingStateRejectsLateSuccess(t *testing.T) {
+	t.Parallel()
 	for _, want := range []ownsandv1.SandboxState{
 		ownsandv1.SandboxState_SANDBOX_STATE_PAUSED,
 		ownsandv1.SandboxState_SANDBOX_STATE_RUNNING,
@@ -76,6 +77,7 @@ func TestWaitForBillingStateRejectsLateSuccess(t *testing.T) {
 }
 
 func TestWaitForBillingStateStopsDuringRetry(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		parentEnds time.Duration
@@ -120,6 +122,7 @@ func TestWaitForBillingStateStopsDuringRetry(t *testing.T) {
 }
 
 func TestWaitForBillingStateGivesEachTransitionItsOwnBudget(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		for _, want := range []ownsandv1.SandboxState{
 			ownsandv1.SandboxState_SANDBOX_STATE_PAUSED,
@@ -149,6 +152,7 @@ func TestWaitForBillingStateGivesEachTransitionItsOwnBudget(t *testing.T) {
 }
 
 func TestWaitForExportVerificationRejectsLateSuccess(t *testing.T) {
+	t.Parallel()
 	for _, stallDatabase := range []bool{true, false} {
 		name := "snapshot RPC"
 		if stallDatabase {
@@ -187,6 +191,7 @@ func TestWaitForExportVerificationRejectsLateSuccess(t *testing.T) {
 }
 
 func TestWaitForExportVerificationStopsDuringRetry(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name           string
 		initialRead    time.Duration
@@ -226,6 +231,7 @@ func TestWaitForExportVerificationStopsDuringRetry(t *testing.T) {
 }
 
 func TestWaitForExportVerificationPreservesReadResults(t *testing.T) {
+	t.Parallel()
 	readFailure := errors.New("read failed")
 	for _, tc := range []struct {
 		name     string
@@ -273,6 +279,7 @@ func (c deadlineWithoutTimer) Deadline() (time.Time, bool) {
 }
 
 func TestPollPhaseRejectsSuccessAtTheDeadlineBeforeTheContextTimerRuns(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		ctx := deadlineWithoutTimer{t.Context(), time.Now().Add(time.Millisecond)}
 		err := pollPhase(ctx, time.Second, func(ctx context.Context) (bool, error) {

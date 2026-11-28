@@ -136,6 +136,7 @@ func (s *stack) waitLocalSnapshotGone(t *testing.T, a agentProc, snapshotID stri
 // TestLifecycleSDK drives the full sandbox lifecycle through the Go SDK on
 // each forced transport.
 func TestLifecycleSDK(t *testing.T) {
+	t.Parallel()
 	s := newStack(t)
 	wantRestore := defaultSDKRestorePaths(s.processRuntime)
 	for _, tr := range transports {
@@ -159,6 +160,7 @@ func defaultSDKRestorePaths(processRuntime bool) []ownsandv1.SandboxRestorePath 
 }
 
 func TestDefaultSDKRestorePaths(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name           string
 		processRuntime bool
@@ -345,6 +347,7 @@ func testAttachExec(ctx context.Context, t *testing.T, sb *ownsand.Sandbox) {
 // TestLifecycleCLI drives the lifecycle through the CLI binary on each
 // forced transport.
 func TestLifecycleCLI(t *testing.T) {
+	t.Parallel()
 	s := newStack(t)
 	for _, tr := range transports {
 		t.Run(tr.String(), func(t *testing.T) { cliLifecycle(t, s, tr) })

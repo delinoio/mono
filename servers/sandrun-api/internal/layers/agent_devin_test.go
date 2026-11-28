@@ -78,6 +78,7 @@ func (w *devinWorld) full() {
 }
 
 func TestDevinOrganizationDeletionRecovery(t *testing.T) {
+	t.Parallel()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.full()
 	w.devin.AddSession("ses-org", true)
@@ -107,6 +108,7 @@ func TestDevinOrganizationDeletionRecovery(t *testing.T) {
 // releases the claim after the session terminated. The API token never
 // reaches the guest.
 func TestDevinSessionLifecycle(t *testing.T) {
+	t.Parallel()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_MACOS)
 	w.devin.AddSession("ses-1", true)
 	req := w.requestBySource(t, "ses-1")
@@ -182,6 +184,7 @@ func TestDevinSessionLifecycle(t *testing.T) {
 // new demand); after a user cancellation the same entry is not claimed
 // again; an entry that another acceptor takes ends the queued request.
 func TestDevinClaimRelease(t *testing.T) {
+	t.Parallel()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.full()
 	w.devin.AddSession("ses-wait", true)
@@ -274,6 +277,7 @@ func (w *devinWorld) assertNoRelease(t *testing.T, sessionID string) {
 }
 
 func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
+	t.Parallel()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	warm := w.warmRunner(t)
 	ctx := t.Context()
@@ -332,6 +336,7 @@ func TestDevinClaimLossAfterDispatchWins(t *testing.T) {
 }
 
 func TestDevinClaimLossWhileRunning(t *testing.T) {
+	t.Parallel()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	const sid = "ses-running"
 	w.devin.AddSession(sid, true)
@@ -365,6 +370,7 @@ func (w *devinWorld) finishDevinRequestAfterLoss(t *testing.T, id, sid string, r
 }
 
 func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		lost func(*devinfake.Fake, string)
@@ -403,6 +409,7 @@ func TestDevinClaimLossBeforeDispatchWins(t *testing.T) {
 }
 
 func TestDevinClaimLossRollsBack(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		table string
 		state int16
@@ -452,6 +459,7 @@ func TestDevinClaimLossRollsBack(t *testing.T) {
 // first request of a session, the next request of the session still gets
 // an unused source key.
 func TestDevinSourceKeyAfterRetention(t *testing.T) {
+	t.Parallel()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.full()
 	w.devin.AddSession("ses-keep", true)
@@ -476,6 +484,7 @@ func TestDevinSourceKeyAfterRetention(t *testing.T) {
 // and its release step), the session that returns to the queue is still
 // declined.
 func TestDevinCancelReleasedByPoller(t *testing.T) {
+	t.Parallel()
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.full()
 	w.devin.AddSession("ses-recover", true)
@@ -502,6 +511,7 @@ func TestDevinCancelReleasedByPoller(t *testing.T) {
 }
 
 func TestDevinLookupFailureReleaseGrace(t *testing.T) {
+	t.Parallel()
 	const sid = "ses-release-grace"
 	w := newDevinWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.full()
@@ -559,6 +569,7 @@ func TestDevinLookupFailureReleaseGrace(t *testing.T) {
 // entry of one STARTING session, it still marks the runner of another
 // session BUSY when that session runs (a missed watch event).
 func TestDevinStartCheckPartialFailure(t *testing.T) {
+	t.Parallel()
 	t.Run("missing entry", func(t *testing.T) {
 		testDevinStartCheckPartialFailure(t, (*devinfake.Fake).Forget, "DEVIN get_queue_entry: HTTP 404")
 	})
@@ -602,6 +613,7 @@ func testDevinStartCheckPartialFailure(t *testing.T, failLookup func(*devinfake.
 }
 
 func TestDevinWatchReconnect(t *testing.T) {
+	t.Parallel()
 	for _, protoMajor := range []int{1, 2} {
 		t.Run(fmt.Sprintf("HTTP%d", protoMajor), func(t *testing.T) {
 			const (
@@ -778,6 +790,7 @@ func receiveDevinWatchTime(t *testing.T, observations <-chan time.Time, what str
 }
 
 func TestDevinWatchDefaultPagination(t *testing.T) {
+	t.Parallel()
 	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")
 	sessionIDs := []string{"ses-1", "ses-2"}
 	for _, sid := range sessionIDs {
@@ -809,6 +822,7 @@ func TestDevinWatchDefaultPagination(t *testing.T) {
 }
 
 func TestDevinWatchRejectsMaintenancePages(t *testing.T) {
+	t.Parallel()
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() {
@@ -868,6 +882,7 @@ func TestDevinWatchRejectsMaintenancePages(t *testing.T) {
 }
 
 func TestDevinWatchPagination(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		pages       map[string]devinfake.QueuePage
@@ -991,6 +1006,7 @@ func TestDevinWatchPagination(t *testing.T) {
 }
 
 func TestDevinOutpostPagination(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		lastCursor string
@@ -1094,6 +1110,7 @@ func TestDevinOutpostPagination(t *testing.T) {
 }
 
 func TestDevinInstallScripts(t *testing.T) {
+	t.Parallel()
 	win := devin.InstallScript(sandrunv1.GuestOs_GUEST_OS_WINDOWS)
 	for _, want := range []string{"irm https://static.devin.ai/cli/setup.ps1 | iex", "$env:PROCESSOR_ARCHITECTURE -ne 'AMD64'", "git.exe"} {
 		if !strings.Contains(win, want) {

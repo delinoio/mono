@@ -14,6 +14,7 @@ import (
 )
 
 func TestInvitationToken(t *testing.T) {
+	t.Parallel()
 	token, hash, err := newInvitationToken()
 	if err != nil {
 		t.Fatal(err)
@@ -32,6 +33,7 @@ func TestInvitationToken(t *testing.T) {
 }
 
 func TestInvitationState(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	inv := invitation{ExpireTime: now.Add(time.Hour)}
 	if inv.state(now) != accountsv1.InvitationState_INVITATION_STATE_PENDING {
@@ -51,6 +53,7 @@ func TestInvitationState(t *testing.T) {
 }
 
 func TestPageSizeAndToken(t *testing.T) {
+	t.Parallel()
 	for in, want := range map[int32]int{0: 50, 1: 1, 200: 200, 201: 200} {
 		if got, err := pageSize(in); err != nil || got != want {
 			t.Errorf("pageSize(%d) = %d, %v", in, got, err)
@@ -90,6 +93,7 @@ func TestPageSizeAndToken(t *testing.T) {
 }
 
 func TestFieldRules(t *testing.T) {
+	t.Parallel()
 	if name, err := billingAccountName("  Team \t"); err != nil || name != "Team" {
 		t.Errorf("billingAccountName = %q, %v", name, err)
 	}
@@ -136,6 +140,7 @@ func TestFieldRules(t *testing.T) {
 }
 
 func TestUserIDField(t *testing.T) {
+	t.Parallel()
 	for _, ok := range []string{"a", "abc\x01", "user-1", "사용자", strings.Repeat("a", maxUserIDBytes)} {
 		if got, err := userIDField(ok); err != nil || got != ok {
 			t.Errorf("userIDField(%q) = %q, %v", ok, got, err)

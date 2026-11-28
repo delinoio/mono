@@ -51,6 +51,7 @@ func waitFor(t *testing.T, timeout time.Duration, o *observations, skip map[stri
 }
 
 func TestWaitDeviceOnlineWithoutReconciliationDoesNotReturn(t *testing.T) {
+	t.Parallel()
 	o := &observations{online: []string{"dev-1"}}
 	id, err := waitFor(t, 100*time.Millisecond, o, nil)
 	if err == nil {
@@ -64,6 +65,7 @@ func TestWaitDeviceOnlineWithoutReconciliationDoesNotReturn(t *testing.T) {
 }
 
 func TestWaitDeviceNotOnlineMessage(t *testing.T) {
+	t.Parallel()
 	o := &observations{}
 	_, err := waitFor(t, 50*time.Millisecond, o, nil)
 	if err == nil {
@@ -75,6 +77,7 @@ func TestWaitDeviceNotOnlineMessage(t *testing.T) {
 }
 
 func TestWaitDeviceIgnoresReconciliationOfOtherDevice(t *testing.T) {
+	t.Parallel()
 	o := &observations{online: []string{"dev-1", "dev-2"}, reconciled: map[string]bool{"dev-2": true}}
 	// dev-2 is known (an earlier agent), so only dev-1 counts.
 	_, err := waitFor(t, 100*time.Millisecond, o, map[string]bool{"dev-2": true})
@@ -84,6 +87,7 @@ func TestWaitDeviceIgnoresReconciliationOfOtherDevice(t *testing.T) {
 }
 
 func TestWaitDeviceReturnsAfterReconciliation(t *testing.T) {
+	t.Parallel()
 	o := &observations{online: []string{"dev-1"}, reconciled: map[string]bool{}}
 	go func() {
 		time.Sleep(30 * time.Millisecond)
@@ -96,6 +100,7 @@ func TestWaitDeviceReturnsAfterReconciliation(t *testing.T) {
 }
 
 func TestWaitDeviceListErrorIsReturned(t *testing.T) {
+	t.Parallel()
 	boom := errors.New("boom")
 	o := &observations{listErr: boom}
 	_, err := waitFor(t, 10*time.Second, o, nil)
@@ -105,6 +110,7 @@ func TestWaitDeviceListErrorIsReturned(t *testing.T) {
 }
 
 func TestLogSinkStateReportMatching(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	add := func(lines ...string) {
 		logs.mu.Lock()
@@ -138,6 +144,7 @@ func TestLogSinkStateReportMatching(t *testing.T) {
 }
 
 func TestWaitForFreshAgentStateReport(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
@@ -179,6 +186,7 @@ func TestWaitForFreshAgentStateReport(t *testing.T) {
 }
 
 func TestWaitForAgentChannelEventDeadline(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
@@ -196,6 +204,7 @@ func TestWaitForAgentChannelEventDeadline(t *testing.T) {
 }
 
 func TestWaitForAgentConfigurationMatchesProcessAndLimits(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		logs := &logSink{}
 		agent := &proc{name: "agent0", done: make(chan struct{})}
@@ -228,6 +237,7 @@ func TestWaitForAgentConfigurationMatchesProcessAndLimits(t *testing.T) {
 }
 
 func TestWaitForAgentConfigurationFailsWithoutMatch(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name    string
 		signal  func(context.CancelFunc, chan struct{})

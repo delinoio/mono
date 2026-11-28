@@ -20,6 +20,7 @@ import (
 )
 
 func TestOrganizationDeletionRecoversInterruptedLinkClaim(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	// The core-only instance holds the lease to keep background work from

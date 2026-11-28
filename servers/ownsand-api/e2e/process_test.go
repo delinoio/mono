@@ -45,6 +45,7 @@ const (
 // TestHelperProcess is the body of the child process, not a test. The final
 // line of each stream has no trailing newline.
 func TestHelperProcess(t *testing.T) {
+	t.Parallel()
 	mode := helperMode(os.Getenv(envHelperMode))
 	if mode == "" {
 		t.Skip("only runs as a helper process")
@@ -99,6 +100,7 @@ func helperArgs() (string, []string) {
 }
 
 func TestTypeScriptSDKLauncherSuccess(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	bin, args := helperArgs()
@@ -114,6 +116,7 @@ func TestTypeScriptSDKLauncherSuccess(t *testing.T) {
 }
 
 func TestTypeScriptSDKLauncherTimeout(t *testing.T) {
+	t.Parallel()
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -206,6 +209,7 @@ func assertNoScanners(t *testing.T, logs *logSink) {
 }
 
 func TestStartProcessExitReleasesLogs(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	bin, args := helperArgs()
 	var cleanupStarted time.Time
@@ -231,6 +235,7 @@ func TestStartProcessExitReleasesLogs(t *testing.T) {
 }
 
 func TestStartProcessCleanupStopsAndReleasesLogs(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	bin, args := helperArgs()
 	mode, ready := helperTerminate, "child: ready"
@@ -269,6 +274,7 @@ func TestStartProcessCleanupStopsAndReleasesLogs(t *testing.T) {
 }
 
 func TestStartProcessCrashReleasesLogs(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	bin, args := helperArgs()
 	var p *proc
@@ -289,6 +295,7 @@ func TestStartProcessCrashReleasesLogs(t *testing.T) {
 }
 
 func TestStartProcessDrainsInheritedLogs(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		kill bool
@@ -386,6 +393,7 @@ func TestStartProcessDrainsInheritedLogs(t *testing.T) {
 }
 
 func TestStartProcessFailureReleasesLogs(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	_, err := launchProcess(logs, "missing", nil, "/nonexistent/ownsand-e2e-binary")
 	if err == nil {
@@ -395,6 +403,7 @@ func TestStartProcessFailureReleasesLogs(t *testing.T) {
 }
 
 func TestLogSinkWriterRetainsFinalLine(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	w, done := logs.writer("p")
 	if _, err := w.Write([]byte("a\nb")); err != nil {
@@ -410,6 +419,7 @@ func TestLogSinkWriterRetainsFinalLine(t *testing.T) {
 }
 
 func TestLogSinkScanErrorDoesNotBlockWriter(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	w, done := logs.writer("p")
 	// A line above the scanner limit stops the scan with an error.
@@ -439,6 +449,7 @@ func TestLogSinkScanErrorDoesNotBlockWriter(t *testing.T) {
 // runtime when the base image is set and skips the test without it, instead
 // of failing every create with failed_precondition.
 func TestDefaultLinuxGuestRuntime(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		goos, kernel, rootfs string
 		want                 linuxGuestRuntime

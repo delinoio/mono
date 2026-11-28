@@ -21,6 +21,7 @@ import (
 )
 
 func TestInstallationDeactivationAndProfileDeletionLockOrder(t *testing.T) {
+	t.Parallel()
 	for _, action := range []string{"unlink", "suspend", "deleted"} {
 		for _, contention := range []string{"requests", "runners"} {
 			t.Run(action+"/"+contention, func(t *testing.T) {

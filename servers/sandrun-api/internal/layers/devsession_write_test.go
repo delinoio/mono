@@ -97,6 +97,7 @@ func (w *gatedFileWrite) Finish(ctx context.Context, offset int64, data []byte, 
 }
 
 func TestDevSessionFileWriteWaitHonorsContext(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		final bool
@@ -202,6 +203,7 @@ func TestDevSessionFileWriteWaitHonorsContext(t *testing.T) {
 }
 
 func TestDevSessionFileWriteRefreshesCredential(t *testing.T) {
+	t.Parallel()
 	provider := &gatedWriteProvider{
 		Fake: ownsandfake.New(), started: make(chan struct{}), resume: make(chan struct{}),
 	}
@@ -336,6 +338,7 @@ func TestDevSessionFileWriteRefreshesCredential(t *testing.T) {
 }
 
 func TestDevSessionReplaysLostWriteFinish(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	session, sandboxID := w.runningSession(t)
 	owner := w.env.User(w.org.Member)

@@ -19,6 +19,7 @@ import (
 // The CreateSnapshot and ExportSnapshot handlers move their committed
 // record to a failed state on exactly this error.
 func TestSendCommandEndedContextQueuesNothing(t *testing.T) {
+	t.Parallel()
 	s := &Service{Now: time.Now}
 	conn := hub.New().Register(context.Background(), "dev", "org")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -43,6 +44,7 @@ func TestSendCommandEndedContextQueuesNothing(t *testing.T) {
 // reconnect reconciliation owns the sandbox then. The service has no
 // database, so any attempt to fail the create would panic.
 func TestFailCreateSendNotQueuedKeepsClosedChannelToReconciliation(t *testing.T) {
+	t.Parallel()
 	s := &Service{Now: time.Now, Logger: slog.New(slog.DiscardHandler)}
 	conn := hub.New().Register(context.Background(), "dev", "org")
 	conn.Close(hub.ErrQueueFull)

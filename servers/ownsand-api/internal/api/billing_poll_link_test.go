@@ -37,6 +37,7 @@ func (f *linkAttemptFixture) cachedStatus(t *testing.T, orgID string) billing.St
 }
 
 func TestBillingPollDefersFirstLink(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "first-link-owner")
 	before := linkedOrg(t, f.env, f.fake, "before-owner", billingAccountB)
 	after := linkedOrg(t, f.env, f.fake, "after-owner", billingAccountC)
@@ -111,6 +112,7 @@ func TestBillingPollDefersFirstLink(t *testing.T) {
 }
 
 func TestBillingPollSkipsObsoleteFirstLink(t *testing.T) {
+	t.Parallel()
 	t.Run("different account", func(t *testing.T) {
 		f := newLinkAttemptFixture(t, "different-account-owner")
 		f.fake.AddAccount(billingAccountB, "Old account", map[string]accountsv1.BillingAccountRole{
@@ -174,6 +176,7 @@ func TestBillingPollSkipsObsoleteFirstLink(t *testing.T) {
 }
 
 func TestBillingPollAheadOfRepeatedLink(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "repeat-link-owner")
 	f.fake.SetAccountStatus(billingAccountA, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, f.env.Clock.Now())
 	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {

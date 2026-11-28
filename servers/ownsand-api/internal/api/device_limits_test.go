@@ -44,6 +44,7 @@ func deviceWriteCounts(t *testing.T, env *testenv.Env, orgID, deviceID string) (
 // turn is rejected with invalid_argument that names the field, before any
 // write.
 func TestReplaceDeviceLimitsRequiresEveryField(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -120,6 +121,7 @@ func TestReplaceDeviceLimitsRequiresEveryField(t *testing.T) {
 // each of vcpu_count, memory_mib and disk_gib is stored, over both codecs,
 // and that the device then cannot accept a sandbox that needs the resource.
 func TestReplaceDeviceLimitsAcceptsExplicitZero(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -180,6 +182,7 @@ func TestReplaceDeviceLimitsAcceptsExplicitZero(t *testing.T) {
 // and its response, configuration event, audit record and agent
 // configuration.
 func TestReplaceDeviceLimitsUpdatesAllFour(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -212,6 +215,7 @@ func TestReplaceDeviceLimitsUpdatesAllFour(t *testing.T) {
 // UpdateDeviceLimits still work, including an intentional zero and an
 // omitted value that reads as zero.
 func TestLegacyUpdateDeviceLimitsKeepsImplicitPresence(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

@@ -20,6 +20,7 @@ import (
 // TestFsErrorMapsWindowsDiskFull checks that the Win32 disk full errors map to
 // RESOURCE_EXHAUSTED, also when wrapped the way os functions wrap them.
 func TestFsErrorMapsWindowsDiskFull(t *testing.T) {
+	t.Parallel()
 	for _, errno := range []syscall.Errno{windows.ERROR_DISK_FULL, windows.ERROR_HANDLE_DISK_FULL} {
 		err := &os.PathError{Op: "write", Path: `C:\secret`, Err: errno}
 		got := fsError("write", err)
@@ -32,6 +33,7 @@ func TestFsErrorMapsWindowsDiskFull(t *testing.T) {
 // TestFsErrorKeepsOtherWindowsErrors checks that an error without a mapping
 // stays INTERNAL and does not name the path.
 func TestFsErrorKeepsOtherWindowsErrors(t *testing.T) {
+	t.Parallel()
 	err := &os.PathError{Op: "write", Path: `C:\secret`, Err: windows.ERROR_SHARING_VIOLATION}
 	got := fsError("write", err)
 	if got.code != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL || got.msg != "write: file system error" {
@@ -42,6 +44,7 @@ func TestFsErrorKeepsOtherWindowsErrors(t *testing.T) {
 // TestStartFailureMapsWindowsErrors checks the Win32 errors that CreateProcess
 // returns for a program that cannot run.
 func TestStartFailureMapsWindowsErrors(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		errno  syscall.Errno
@@ -70,6 +73,7 @@ func TestStartFailureMapsWindowsErrors(t *testing.T) {
 // Windows versions and with ERROR_EXE_MACHINE_TYPE_MISMATCH on newer ones; the
 // exec path reports both as PERMISSION_DENIED.
 func TestStartFailureForTextFileNamedExe(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "not-a-program.exe")
 	if err := os.WriteFile(path, []byte("this is not a PE image\n"), 0o755); err != nil {
 		t.Fatal(err)

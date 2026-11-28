@@ -240,6 +240,7 @@ func chunks(body []byte, n int, pause time.Duration) []uploadStep {
 // deadline with deadline_exceeded, and that a slow upload that completes in
 // time and a handler that outlives the deadline are not affected.
 func TestUnaryReadDeadline(t *testing.T) {
+	t.Parallel()
 	srv := deadlineServer(t)
 	body := requestBody(t)
 
@@ -298,6 +299,7 @@ func assertDeadline(t *testing.T, got outcome) {
 // TestUnaryReadDeadlineSkipsStreams checks that a stream that the handler
 // lists is not bounded: it stays open and usable long after the deadline.
 func TestUnaryReadDeadlineSkipsStreams(t *testing.T) {
+	t.Parallel()
 	srv := deadlineServer(t)
 	client := connect.NewClient[ownsandv1.GetIceServersRequest, ownsandv1.GetIceServersResponse](h2cClient(t), srv.URL+streamProcedure)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

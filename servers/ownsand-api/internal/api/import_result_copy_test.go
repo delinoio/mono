@@ -104,6 +104,7 @@ func importResultLogged(env *testenv.Env, cmdID, snapID, result string) bool {
 // connection, so the local copy that the deletion fanout could not know is
 // removed without a reconnect.
 func TestImportResultAfterSnapshotDeletionSendsDelete(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
@@ -138,6 +139,7 @@ func TestImportResultAfterSnapshotDeletionSendsDelete(t *testing.T) {
 // TestImportResultBeforeSnapshotDeletionIsInFanout checks that a result that
 // registers its copy first makes the deletion include the importer.
 func TestImportResultBeforeSnapshotDeletionIsInFanout(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
@@ -201,6 +203,7 @@ LIMIT 1`
 // result that arrives while a deletion holds the snapshot row waits for it
 // and, when the deletion commits, finds no snapshot.
 func TestImportResultWaitsForInFlightSnapshotDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -238,6 +241,7 @@ func TestImportResultWaitsForInFlightSnapshotDeletion(t *testing.T) {
 // existing snapshot records one copy row, creates the sandbox and sends no
 // delete command.
 func TestImportResultRecordsOneCopy(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -263,6 +267,7 @@ func TestImportResultRecordsOneCopy(t *testing.T) {
 // in flight; a row that exists before the create would skip the import, so
 // the result would never reach the registration path.
 func TestImportResultKeepsExistingCopyRow(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -298,6 +303,7 @@ func TestImportResultKeepsExistingCopyRow(t *testing.T) {
 // with CREATE_FAILED. The absence of side effects is asserted only after that,
 // so a result that the server dropped or did not match fails the test.
 func TestFailedImportRegistersNoCopy(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)

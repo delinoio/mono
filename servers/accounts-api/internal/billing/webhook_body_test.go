@@ -132,6 +132,7 @@ func (f *webhookRejectionFixture) serve(body io.ReadCloser) *httptest.ResponseRe
 }
 
 func TestWebhookBodyReadFailureIs400(t *testing.T) {
+	t.Parallel()
 	for name, readErr := range map[string]error{
 		"unexpected_eof":   io.ErrUnexpectedEOF,
 		"connection_reset": errors.New("connection reset by peer"),
@@ -154,6 +155,7 @@ func TestWebhookBodyReadFailureIs400(t *testing.T) {
 }
 
 func TestWebhookBodyOverLimitIs413(t *testing.T) {
+	t.Parallel()
 	f := newWebhookRejectionFixture(t)
 	rec := f.serve(io.NopCloser(bytes.NewReader(make([]byte, maxWebhookBytes+1))))
 	if rec.Code != http.StatusRequestEntityTooLarge {
@@ -171,6 +173,7 @@ func TestWebhookBodyOverLimitIs413(t *testing.T) {
 // A body of exactly maxWebhookBytes is read completely, so the request
 // reaches the signature check instead of a body rejection.
 func TestWebhookBodyAtLimitReachesSignatureCheck(t *testing.T) {
+	t.Parallel()
 	f := newWebhookRejectionFixture(t)
 	rec := f.serve(io.NopCloser(bytes.NewReader(make([]byte, maxWebhookBytes))))
 	if rec.Code != http.StatusUnauthorized {

@@ -98,6 +98,7 @@ func (s *stack) wantExportParts() int {
 // (which imports it with the hashes from the control plane) and deletes the
 // snapshot, which removes both local copies.
 func TestSnapshotExportImport(t *testing.T) {
+	t.Parallel()
 	s := newStack(t, stackOptions{agents: 2, objects: true})
 	ctx := s.ctx(5 * time.Minute)
 	c := s.apiKeyClient(ownsand.TransportRelay)
@@ -193,6 +194,7 @@ func TestSnapshotExportImport(t *testing.T) {
 // export tests apply to every runtime: a VM snapshot has many more parts
 // than the three of the process runtime.
 func TestCheckExportParts(t *testing.T) {
+	t.Parallel()
 	const size = 10
 	for _, tc := range []struct {
 		name  string

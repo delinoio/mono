@@ -173,6 +173,7 @@ func timedOutLeaderRequest(t *testing.T) *ownsandv1.ExecRequest {
 // The group SIGKILL must wait for the grace timer, and the terminal event must
 // not wait for the escalation.
 func TestExecTimeoutEscalationKillsGroupOnlyAfterGraceTimer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	p := newEscalationProbe(h, true)
 	evs := h.runExecWithin(timedOutLeaderRequest(t), 10*time.Second)
@@ -208,6 +209,7 @@ func TestExecTimeoutEscalationKillsGroupOnlyAfterGraceTimer(t *testing.T) {
 // A group that is gone when the grace timer fires gets no SIGKILL, because its
 // id can name an unrelated group by then.
 func TestExecTimeoutEscalationSkipsKillWhenGroupGoneAtGraceTimer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	p := newEscalationProbe(h, true)
 	evs := h.runExecWithin(timedOutLeaderRequest(t), 10*time.Second)

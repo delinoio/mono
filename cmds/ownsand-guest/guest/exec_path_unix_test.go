@@ -86,6 +86,7 @@ func TestLookPathIn(t *testing.T) {
 }
 
 func TestNewCommandResolvesBareNameWithRequestPath(t *testing.T) {
+	t.Parallel()
 	tool := writeTool(t, "mytool", "x")
 	reqEnv := map[string]string{"PATH": tool}
 	cmd := newCommand([]string{"mytool", "a", "b"}, reqEnv, commandEnv(reqEnv))
@@ -222,6 +223,7 @@ func TestExecBareNameUsesRequestPath(t *testing.T) {
 }
 
 func TestExecBareNameSkipsInaccessibleCandidate(t *testing.T) {
+	t.Parallel()
 	if os.Geteuid() == 0 {
 		t.Skip("root can execute the fixture using the other execute bit")
 	}

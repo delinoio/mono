@@ -19,6 +19,7 @@ import (
 )
 
 func TestControlBaselinePreservesLimitsDuringAcquisition(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: time.Hour, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := t.Context()
@@ -109,6 +110,7 @@ func TestControlBaselinePreservesLimitsDuringAcquisition(t *testing.T) {
 // connected agent through the event processor without another report,
 // reconnect or update.
 func TestControlBaselinePrecedesChannelAdmission(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 500 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()

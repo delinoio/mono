@@ -16,6 +16,7 @@ import (
 // RPC: the replacement character U+FFFD is ordinary text, and a C1 control
 // character fails with invalid_argument.
 func TestCreateOrganizationNameCharacters(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	alice := env.User("alice")

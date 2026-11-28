@@ -43,6 +43,7 @@ func countManifestInserts(t *testing.T, env *testenv.Env) func() int64 {
 }
 
 func TestExportResultWritesManifestInOneStatement(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		partCount   int

@@ -21,6 +21,7 @@ import (
 // meter. The row quantities, the row amounts and the account total are the
 // stored values.
 func TestListUsageSummaryMalformedStoredMeterKey(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)

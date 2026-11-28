@@ -52,6 +52,7 @@ func countLogs(env *testenv.Env, needle string) int { return strings.Count(env.L
 // the grace period after the channel closed and is gone after it, and a
 // repeated sequence does not grow the retained count.
 func TestUnansweredCommandsExpireAfterChannelClose(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	ctx := context.Background()
@@ -94,6 +95,7 @@ func TestUnansweredCommandsExpireAfterChannelClose(t *testing.T) {
 // replacement channel stays eligible for its result after the grace period
 // of the older commands passed.
 func TestClosingOldGenerationKeepsReplacementCommands(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	ctx := context.Background()
@@ -195,6 +197,7 @@ func sendPauseResult(agent *testenv.FakeAgent, commandID, sandboxID string) {
 // a replacement channel of the same device inside the grace period is
 // applied, and that a repeat of it is ignored.
 func TestLateResultWithinGraceAppliesOnce(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	org := env.NewOrg("alice")
@@ -218,6 +221,7 @@ func TestLateResultWithinGraceAppliesOnce(t *testing.T) {
 // after the grace period is ignored: no command failure is synthesized and
 // the durable sandbox state does not change.
 func TestLostResultAfterGraceChangesNothing(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	org := env.NewOrg("alice")
@@ -245,6 +249,7 @@ func TestLostResultAfterGraceChangesNothing(t *testing.T) {
 // pending command: the device that received the command still completes it
 // exactly once and its sandbox state is applied.
 func TestWrongDeviceResultKeepsPendingCommand(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	ctx := context.Background()

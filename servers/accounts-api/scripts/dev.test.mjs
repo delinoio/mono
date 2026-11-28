@@ -32,14 +32,35 @@ const Timeout = 60_000;
 // out" and the stdout/stderr diagnostic of waitFor is never printed.
 const WaitTimeout = 45_000;
 
+// freePort picks ports in [PortRangeStart, PortRangeEnd). The range is below
+// the ephemeral port ranges of Linux (32768-60999) and macOS (49152-65535).
+const PortRangeStart = 20_000;
+const PortRangeEnd = 32_768;
+const PortAttempts = 100;
+
 // Reserves a free loopback port number. The port is released before returning,
-// so a launcher started right after can bind it.
+// so a launcher started right after can bind it. The server binds the port only
+// after the launcher has built it, which can take seconds. A port number from
+// the ephemeral range (`listen(0)`) can go to another process in that time: the
+// Go tests that `turbo` runs at the same time in CI open many loopback
+// listeners and connections on ephemeral ports. A port below that range goes
+// only to a process that asks for that port number.
 async function freePort() {
-  const probe = createServer();
-  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
-  const { port } = probe.address();
-  await new Promise((resolve) => probe.close(resolve));
-  return port;
+  for (let attempt = 0; attempt < PortAttempts; attempt++) {
+    const port =
+      PortRangeStart +
+      Math.floor(Math.random() * (PortRangeEnd - PortRangeStart));
+    const probe = createServer();
+    const bound = await new Promise((resolve) => {
+      probe.once("error", () => resolve(false));
+      probe.listen(port, "127.0.0.1", () => resolve(true));
+    });
+    if (bound) {
+      await new Promise((resolve) => probe.close(resolve));
+      return port;
+    }
+  }
+  throw new Error(`no free loopback port after ${PortAttempts} attempts`);
 }
 
 // Accepts connections on port until closed; used to occupy a port.

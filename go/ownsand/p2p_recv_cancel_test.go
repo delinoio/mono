@@ -38,6 +38,7 @@ func (c *recvTestContext) Err() error {
 }
 
 func TestStreamRecvContextWinsAtHandoff(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		ready func(s *p2pSession, st *p2pStream)
@@ -73,6 +74,7 @@ func TestStreamRecvContextWinsAtHandoff(t *testing.T) {
 }
 
 func TestStreamRecvCancelWithReadyFrame(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		end  func(st *p2pStream)
@@ -107,6 +109,7 @@ func TestStreamRecvCancelWithReadyFrame(t *testing.T) {
 }
 
 func TestStreamRecvRejectsLatePeerEvents(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		payload proto.Message
@@ -193,6 +196,7 @@ func TestStreamRecvRejectsLatePeerEvents(t *testing.T) {
 // the queue still holds frames and when the stream has failed or the session
 // has ended.
 func TestStreamRecvCanceledContextSkipsQueuedFrames(t *testing.T) {
+	t.Parallel()
 	queued := func(st *p2pStream) {
 		st.ch <- datapath.MustNewFrame(st.id, "", &ownsandv1.ErrorDetail{Message: "queued"})
 	}
@@ -230,6 +234,7 @@ func TestStreamRecvCanceledContextSkipsQueuedFrames(t *testing.T) {
 // live context still receives the frames that were queued before a stream
 // failure or the end of the session, and then the failure or end error.
 func TestStreamRecvDrainsQueuedFramesForActiveContext(t *testing.T) {
+	t.Parallel()
 	failErr := errors.New("stream failed")
 	endErr := errors.New("session ended")
 	tests := []struct {
@@ -272,6 +277,7 @@ func TestStreamRecvDrainsQueuedFramesForActiveContext(t *testing.T) {
 // reads a queue which a producer keeps full stops at the next receive after
 // its context is canceled, instead of reading on while frames are available.
 func TestStreamRecvCancelStopsDrainingRefilledQueue(t *testing.T) {
+	t.Parallel()
 	_, st, _ := newDispatchSession(t)
 	refill := func() {
 		for len(st.ch) < cap(st.ch) {
@@ -311,6 +317,7 @@ func TestStreamRecvCancelStopsDrainingRefilledQueue(t *testing.T) {
 // whose caller cancels inside the event callback gets no further callback for
 // the events that are already queued on its stream.
 func TestExecPeerStopsDeliveringQueuedEventsAfterCancel(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	const first = "first\n"
 	var streamID atomic.Uint64
@@ -376,6 +383,7 @@ func TestExecPeerStopsDeliveringQueuedEventsAfterCancel(t *testing.T) {
 }
 
 func TestPeerCloseDuringOperationWakesDetachedReceive(t *testing.T) {
+	t.Parallel()
 	_, st, _ := newDispatchSession(t)
 	receiving := make(chan struct{})
 	d := newDataPath(nil)
@@ -397,6 +405,7 @@ func TestPeerCloseDuringOperationWakesDetachedReceive(t *testing.T) {
 }
 
 func TestPeerCloseQueuedReceiveChecksDeliveryBoundary(t *testing.T) {
+	t.Parallel()
 	for _, cancelCaller := range []bool{false, true} {
 		_, st, _ := newDispatchSession(t)
 		st.ch <- datapath.MustNewFrame(st.id, "", exitedEvent(0))
@@ -424,6 +433,7 @@ func TestPeerCloseQueuedReceiveChecksDeliveryBoundary(t *testing.T) {
 }
 
 func TestPeerExecCloseWithQueuedOutputAndExit(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportAuto, TransportPeerToPeer} {
 		for _, cc := range closeCases {
 			for _, attach := range []bool{false, true} {

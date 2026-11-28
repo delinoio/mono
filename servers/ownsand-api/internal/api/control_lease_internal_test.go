@@ -16,6 +16,7 @@ import (
 )
 
 func TestControlAdmittedDeliveryCannotAffectSuccessor(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []events.Kind{events.KindDeviceRemoved, events.KindAPIKeyRevoked} {
 		name := "device removal"
 		if kind == events.KindAPIKeyRevoked {
@@ -79,6 +80,7 @@ func TestControlAdmittedDeliveryCannotAffectSuccessor(t *testing.T) {
 }
 
 func TestControlRefusesDeliveryWhenOwnershipEndsBeforeLossCallback(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 2)
 	owner := &ownershipLease{held: true}
 	h.c.S.Lease = owner
@@ -92,6 +94,7 @@ func TestControlRefusesDeliveryWhenOwnershipEndsBeforeLossCallback(t *testing.T)
 }
 
 func TestControlLeaseLossWhileDeliveryWaitsForQueue(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		h := newCursorHarness(t, 2)
 		s := h.c.S

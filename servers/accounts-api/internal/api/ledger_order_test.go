@@ -49,6 +49,7 @@ func legacyLedgerToken(t *testing.T, rpc, scope, after string) string {
 // ledger_entry_id DESC), its page tokens and the compatibility with the
 // ID-only tokens that the previous release issued.
 func TestListLedgerEntriesOrder(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	other := createAccount(t, f.Owner, "Other").GetBillingAccountId()

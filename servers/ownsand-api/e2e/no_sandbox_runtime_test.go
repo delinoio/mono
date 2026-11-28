@@ -11,6 +11,7 @@ import (
 // is skipped only on hosts without the process runtime, so Linux and macOS
 // hosts still run it.
 func TestNoSandboxProcessRuntimeSkip(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		goos   string
 		reason string

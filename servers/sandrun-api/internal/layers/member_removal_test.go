@@ -65,6 +65,7 @@ func (g *membershipRemovalGate) TraceQueryStart(ctx context.Context, _ *pgx.Conn
 func (*membershipRemovalGate) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestMembershipRemovalRacesWarmDispatch(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		dispatchFirst bool
@@ -234,6 +235,7 @@ func TestMembershipRemovalRacesWarmDispatch(t *testing.T) {
 }
 
 func TestMembershipRemovalRetryExhaustionRollsBack(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	_, key := w.env.NewAPIKey(w.org.ID, w.org.Member)
 	member := w.env.Bearer(key)

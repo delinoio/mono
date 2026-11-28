@@ -85,6 +85,7 @@ func sumAmounts(rows []SummaryRow) int64 {
 // statement of UsageSummary ran, so that a read with several statements
 // would count the report in the rows but not in the total.
 func TestUsageSummaryIsOneSnapshot(t *testing.T) {
+	t.Parallel()
 	s := newSummaryFixture(t)
 	s.report("org-a", "ownsand.relay_egress", 1, 10, 3_000_000)
 	s.report("org-b", "ownsand.relay_egress", 1, 20, 4_000_000)
@@ -115,6 +116,7 @@ func TestUsageSummaryIsOneSnapshot(t *testing.T) {
 // Pages cover the rows in byte order, the total covers the rows beyond the
 // page, and an empty later page still returns the total.
 func TestUsageSummaryPagesKeepTheTotal(t *testing.T) {
+	t.Parallel()
 	s := newSummaryFixture(t)
 	// "Zeta" sorts before "alpha" in byte order. Two reports of one group
 	// are summed.
@@ -145,6 +147,7 @@ func TestUsageSummaryPagesKeepTheTotal(t *testing.T) {
 }
 
 func TestUsageSummaryEmptyPeriod(t *testing.T) {
+	t.Parallel()
 	s := newSummaryFixture(t)
 	rows, total := s.summary(nil, 2)
 	if rows == nil || len(rows) != 0 || total != 0 {
@@ -176,6 +179,7 @@ func TestUsageSummaryEmptyPeriod(t *testing.T) {
 
 // Sums above the int64 range saturate in the rows and in the total.
 func TestUsageSummarySaturates(t *testing.T) {
+	t.Parallel()
 	s := newSummaryFixture(t)
 	s.report("org-a", "ownsand.relay_egress", 1, math.MaxInt64, math.MaxInt64)
 	s.report("org-a", "ownsand.relay_egress", 2, math.MaxInt64, math.MaxInt64)

@@ -24,6 +24,7 @@ import (
 const renamedLabel = "sandrun-renamed"
 
 func TestRenamedProfileBeforeLabelPublication(t *testing.T) {
+	t.Parallel()
 	gate := &registrationLookupGate{entered: make(chan struct{}), release: make(chan struct{})}
 	release := sync.OnceFunc(func() { close(gate.release) })
 	w := newGHWorld(t, worldOpts{}, func(o *app.Options) {
@@ -98,6 +99,7 @@ func (g *registrationLookupGate) TraceQueryStart(ctx context.Context, _ *pgx.Con
 func (*registrationLookupGate) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestRenamedProfileWhileJITRegistrationIsPending(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	profileID := w.createProfile(t, ghProfile("linux", 0))
@@ -158,6 +160,7 @@ func TestRenamedProfileWhileJITRegistrationIsPending(t *testing.T) {
 }
 
 func TestRenamedProfileKeepsBusyAndOtherPool(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.link(t, 502, "beta")

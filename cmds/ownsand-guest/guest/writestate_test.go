@@ -105,6 +105,7 @@ func writePartialTo(t *testing.T, h *harness, target string) *ownsandv1.WriteFil
 }
 
 func TestWriteRecoveryExpiresStagingFileAfterRestart(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
@@ -159,6 +160,7 @@ func TestWriteRecoveryExpiresStagingFileAfterRestart(t *testing.T) {
 }
 
 func TestWriteExpiryOfLongStagingPath(t *testing.T) {
+	t.Parallel()
 	testWriteExpiryOfLongStagingPath(t, func(path string) string { return path })
 }
 
@@ -236,6 +238,7 @@ func testWriteExpiryOfLongStagingPath(t *testing.T, requestPath func(string) str
 }
 
 func TestWriteRecoveryTimestampRange(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		last   time.Time
@@ -316,6 +319,7 @@ func TestWriteRecoveryTimestampRange(t *testing.T) {
 }
 
 func TestWriteRecoveryUsesTimeOfLastChunk(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
@@ -341,6 +345,7 @@ func TestWriteRecoveryUsesTimeOfLastChunk(t *testing.T) {
 // A chunk that fails does not extend the lifetime of the write: the live
 // time and the recovery record both keep the last accepted chunk time.
 func TestWriteRejectedChunkDoesNotRefreshExpiry(t *testing.T) {
+	t.Parallel()
 	for _, restarted := range []bool{false, true} {
 		name := "live"
 		if restarted {
@@ -378,6 +383,7 @@ func TestWriteRejectedChunkDoesNotRefreshExpiry(t *testing.T) {
 // An accepted chunk refreshes the live time, and a finish that fails after an
 // accepted chunk keeps the refreshed time in the live state and the record.
 func TestWriteAcceptedChunkRefreshesExpiryBeforeFinish(t *testing.T) {
+	t.Parallel()
 	for _, restarted := range []bool{false, true} {
 		name := "live"
 		if restarted {
@@ -413,6 +419,7 @@ func TestWriteAcceptedChunkRefreshesExpiryBeforeFinish(t *testing.T) {
 }
 
 func TestWriteRecoveryClampsFutureLastChunk(t *testing.T) {
+	t.Parallel()
 	clock := &fakeClock{now: time.Date(2300, 1, 1, 0, 0, 0, 123456789, time.UTC)}
 	h := newHarness(t, func(c *Config) { c.Now = clock.Now })
 	h.clock = clock
@@ -437,6 +444,8 @@ func TestWriteRecoveryClampsFutureLastChunk(t *testing.T) {
 }
 
 func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
+	// that other tests read.
 	t.Run("canonical", func(t *testing.T) {
 		testWriteRecoveryKeepsReplacedFile(t, false)
 	})
@@ -501,6 +510,7 @@ func demoteRecordToTemp(t *testing.T, h *harness, req *ownsandv1.WriteFileReques
 }
 
 func TestWriteRecoveryPromotesFirstTempRecord(t *testing.T) {
+	t.Parallel()
 	clock := &fakeClock{now: time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)}
 	h := newHarness(t, func(c *Config) { c.Now = clock.Now })
 	h.clock = clock
@@ -595,6 +605,8 @@ func assertWriteNotFound(t *testing.T, h *harness, chunk *ownsandv1.WriteFileReq
 }
 
 func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
+	// that other tests read.
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	staging := tempPath(target, req.GetWriteId())
@@ -654,6 +666,8 @@ func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
 }
 
 func TestWriteRecoveryFailedPromotionRetriesOnRestart(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
+	// that other tests read.
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	canonical, temp := demoteRecordToTemp(t, h, req)
@@ -673,6 +687,7 @@ func TestWriteRecoveryFailedPromotionRetriesOnRestart(t *testing.T) {
 }
 
 func TestWriteRecoveryCanonicalRecordWinsOverTempRecord(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
@@ -722,6 +737,7 @@ func TestWriteRecoveryCanonicalRecordWinsOverTempRecord(t *testing.T) {
 }
 
 func TestWriteRecoveryRemovesInvalidTempRecords(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
@@ -808,6 +824,7 @@ func TestWriteRecoveryRemovesInvalidTempRecords(t *testing.T) {
 }
 
 func TestWriteRecoveryRejectsInvalidSplitTimestamp(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		fields string
@@ -833,6 +850,8 @@ func TestWriteRecoveryRejectsInvalidSplitTimestamp(t *testing.T) {
 }
 
 func TestWriteRecoveryDropsTempRecordWithoutStagingFile(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
+	// that other tests read.
 	t.Run("promoted", func(t *testing.T) {
 		testWriteRecoveryDropsTempRecordWithoutStagingFile(t, false)
 	})
@@ -868,6 +887,7 @@ func testWriteRecoveryDropsTempRecordWithoutStagingFile(t *testing.T, failPromot
 }
 
 func TestWriteRecoveryDropsRecordsWithoutStagingFile(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	releaseWriteFiles(h)
@@ -905,6 +925,8 @@ func TestWriteRecoveryDropsRecordsWithoutStagingFile(t *testing.T) {
 }
 
 func TestWriteRecoveryRetriesStaleRecordRemoval(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (promoteWriteRecord, removeRecordFile)
+	// that other tests read.
 	for _, recordType := range []string{"canonical", "temporary"} {
 		t.Run(recordType, func(t *testing.T) {
 			h := newHarness(t, nil)
@@ -991,6 +1013,7 @@ func TestWriteRecoveryRetriesStaleRecordRemoval(t *testing.T) {
 }
 
 func TestWriteFinishedUploadSurvivesRestartAndExpiry(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), "f")
 	releaseOnCleanup(t, h)
@@ -1015,6 +1038,7 @@ func TestWriteFinishedUploadSurvivesRestartAndExpiry(t *testing.T) {
 }
 
 func TestWriteFinishedRecordFailureIsRetriedBySweep(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), "f")
 	releaseOnCleanup(t, h)
@@ -1057,6 +1081,8 @@ func TestWriteFinishedRecordFailureIsRetriedBySweep(t *testing.T) {
 // gone. The record is kept and the write is registered, so the sweep retries
 // the cleanup after the lookup works again.
 func TestWriteRecoveryKeepsRecordWhenStagingLookupFails(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (lstatStaging)
+	// that other tests read.
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
@@ -1090,6 +1116,7 @@ func TestWriteRecoveryKeepsRecordWhenStagingLookupFails(t *testing.T) {
 }
 
 func TestWriteCleanupRetriesAfterFailure(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
@@ -1150,6 +1177,7 @@ func (b *syncBuffer) String() string {
 }
 
 func TestWriteRecordFailuresLogWriteIDWithoutPath(t *testing.T) {
+	t.Parallel()
 	var logs syncBuffer
 	h := newHarness(t, func(c *Config) { c.Logger = slog.New(slog.NewJSONHandler(&logs, nil)) })
 	// Without the record directory every save fails; the upload still works.
@@ -1175,6 +1203,7 @@ func TestWriteRecordFailuresLogWriteIDWithoutPath(t *testing.T) {
 }
 
 func TestSanitizedErrorOmitsPaths(t *testing.T) {
+	t.Parallel()
 	_, err := os.ReadFile(filepath.Join(t.TempDir(), "secret-name"))
 	got := sanitizedError(err)
 	if strings.Contains(got, "secret-name") || got == "" {
@@ -1186,6 +1215,7 @@ func TestSanitizedErrorOmitsPaths(t *testing.T) {
 }
 
 func TestFileIdentity(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "f")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

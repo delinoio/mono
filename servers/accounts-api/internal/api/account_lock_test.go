@@ -120,6 +120,7 @@ func execTx(t *testing.T, tx pgx.Tx, sql string, args ...any) {
 // the mutation must see the committed membership, not the one from before
 // the wait.
 func TestMutationUsesMembershipAfterLockWait(t *testing.T) {
+	t.Parallel()
 	demote := func(member func(f fixture) person) func(f fixture) func(tx pgx.Tx) {
 		return func(f fixture) func(tx pgx.Tx) {
 			return func(tx pgx.Tx) {
@@ -202,6 +203,7 @@ func TestMutationUsesMembershipAfterLockWait(t *testing.T) {
 // TestMutationUsesMembershipAfterLockWait: a caller whose membership does not
 // change while it waits for the account lock still succeeds.
 func TestMutationAfterUnrelatedLockWaitSucceeds(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	wantRole := func(userID string, want api.Role) {

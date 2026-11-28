@@ -51,6 +51,7 @@ func wantProfileLinkState(t *testing.T, admin *testenv.Clients, orgID string, st
 }
 
 func TestRunnerProfileTemplateErrorsRevokedKey(t *testing.T) {
+	t.Parallel()
 	for _, action := range []string{"create", "source", "guest_os"} {
 		t.Run(action, func(t *testing.T) {
 			w := newWorld(t)
@@ -140,6 +141,7 @@ func (c templateErrorClient) TemplateGuestOS(ctx context.Context, id string) (ow
 }
 
 func TestRunnerProfileTemplateErrorsOwnSandCodes(t *testing.T) {
+	t.Parallel()
 	const detail = "scripted OwnSand detail"
 	cases := []struct {
 		upstream connect.Code
@@ -186,6 +188,7 @@ func TestRunnerProfileTemplateErrorsOwnSandCodes(t *testing.T) {
 }
 
 func TestRunnerProfiles(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin)
@@ -300,6 +303,7 @@ func TestRunnerProfiles(t *testing.T) {
 // Two updates of different masked fields of one profile that overlap both
 // stay applied.
 func TestRunnerProfileWindowsWorkspacePath(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := t.Context()
 	admin := w.env.User(w.org.Admin).Profile
@@ -364,6 +368,7 @@ func TestRunnerProfileWindowsWorkspacePath(t *testing.T) {
 }
 
 func TestRunnerProfileConcurrentUpdates(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin)
@@ -399,6 +404,7 @@ func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 }
 
 func TestRunnerProfileResourceUpdates(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := t.Context()
 	admin := w.env.User(w.org.Admin)
@@ -470,6 +476,7 @@ func TestRunnerProfileResourceUpdates(t *testing.T) {
 }
 
 func TestRunnerProfileResourceLimitErrors(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := t.Context()
 	admin := w.env.User(w.org.Admin)
@@ -533,6 +540,7 @@ func TestRunnerProfileResourceLimitErrors(t *testing.T) {
 // Durations are stored in milliseconds, so a value with a smaller part is
 // rejected instead of being truncated.
 func TestRunnerProfileSubMillisecondDurations(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin)
@@ -564,6 +572,7 @@ func TestRunnerProfileSubMillisecondDurations(t *testing.T) {
 }
 
 func TestCreateRunnerProfileIntegrationDeletedDuringInsert(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := t.Context()
 	admin := w.env.User(w.org.Admin)
@@ -616,6 +625,7 @@ func TestCreateRunnerProfileIntegrationDeletedDuringInsert(t *testing.T) {
 // TestIntegrationDeleteBlockedByProfile checks that an integration cannot be
 // deleted while a runner profile names it.
 func TestIntegrationDeleteBlockedByProfile(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin)

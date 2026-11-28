@@ -13,6 +13,7 @@ import (
 )
 
 func TestConsumeFIFO(t *testing.T) {
+	t.Parallel()
 	grants := []grantBalance{{"a", 5}, {"b", 10}, {"c", 3}}
 	for _, tc := range []struct {
 		amount    int64
@@ -38,6 +39,7 @@ func TestConsumeFIFO(t *testing.T) {
 }
 
 func TestPayoffDebt(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ balance, amount, paid, kept int64 }{
 		{0, 10, 0, 10},
 		{7, 10, 0, 10},
@@ -58,6 +60,7 @@ func TestPayoffDebt(t *testing.T) {
 }
 
 func TestMonthlyCap(t *testing.T) {
+	t.Parallel()
 	const usd = MicrosPerUSD
 	for _, tc := range []struct {
 		mtd, amount, limit int64
@@ -81,6 +84,7 @@ func TestMonthlyCap(t *testing.T) {
 }
 
 func TestFailureShutoff(t *testing.T) {
+	t.Parallel()
 	n, off := nextFailureState(0, true)
 	if n != 1 || off {
 		t.Fatalf("first failure = %d, %v", n, off)
@@ -111,6 +115,7 @@ func TestFailureShutoff(t *testing.T) {
 }
 
 func TestMoney(t *testing.T) {
+	t.Parallel()
 	if v, err := CentsToMicros(2500); err != nil || v != 25*MicrosPerUSD {
 		t.Fatal(v, err)
 	}
@@ -142,6 +147,7 @@ func TestMoney(t *testing.T) {
 }
 
 func TestValidateTopUpAmount(t *testing.T) {
+	t.Parallel()
 	for amount, ok := range map[int64]bool{
 		MinTopUpUSDMicros:          true,
 		MinTopUpUSDMicros - 10_000: false,
@@ -157,6 +163,7 @@ func TestValidateTopUpAmount(t *testing.T) {
 }
 
 func TestValidateAutoTopUp(t *testing.T) {
+	t.Parallel()
 	const usd = MicrosPerUSD
 	valid := func() *accountsv1.AutoTopUpSettings {
 		return &accountsv1.AutoTopUpSettings{Enabled: true, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 25 * usd, MonthlyCapUsdMicros: 25 * usd}
@@ -197,6 +204,7 @@ func TestValidateAutoTopUp(t *testing.T) {
 }
 
 func TestMapPaddleStatus(t *testing.T) {
+	t.Parallel()
 	for in, want := range map[string]SubscriptionStatus{
 		"active": SubscriptionActive, "trialing": SubscriptionActive, "past_due": SubscriptionPastDue,
 		"paused": SubscriptionPastDue, "canceled": SubscriptionCanceled,
@@ -211,6 +219,7 @@ func TestMapPaddleStatus(t *testing.T) {
 }
 
 func TestServiceAndMeterKeys(t *testing.T) {
+	t.Parallel()
 	if key, ok := ServiceKey(accountsv1.ServiceId_SERVICE_ID_OWNSAND); !ok || key != "ownsand" {
 		t.Fatalf("ServiceKey(OWNSAND) = %q, %v", key, ok)
 	}
@@ -256,6 +265,7 @@ func TestServiceAndMeterKeys(t *testing.T) {
 }
 
 func TestDesiredStatus(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	if s := evaluateStanding(SubscriptionActive, 1); !s.Good || s.Reason != ReasonNone {
 		t.Fatalf("active with credit = %+v", s)

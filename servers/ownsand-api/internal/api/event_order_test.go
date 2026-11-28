@@ -24,6 +24,7 @@ import (
 // still receive the delete command and be able to report its completion on
 // the same channel, without a new state report.
 func TestDelayedDeleteEventIsDeliveredAfterALaterCommit(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 300 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()
@@ -72,6 +73,7 @@ func TestDelayedDeleteEventIsDeliveredAfterALaterCommit(t *testing.T) {
 // TestRolledBackEventDoesNotStallTheEventLoop checks that an event whose
 // transaction rolls back is never dispatched and that later events still are.
 func TestRolledBackEventDoesNotStallTheEventLoop(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 300 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	ctx := context.Background()

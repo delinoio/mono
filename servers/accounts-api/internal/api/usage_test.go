@@ -103,6 +103,7 @@ func usageReportCount(t *testing.T, env *testenv.Env) int {
 }
 
 func TestUsageServiceAuthorization(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	call := func(c accountsv1connect.UsageServiceClient) error {
 		_, err := c.ListBillingStatusChanges(ctx(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{Service: ownsand}))
@@ -143,6 +144,7 @@ func TestUsageServiceAuthorization(t *testing.T) {
 }
 
 func TestBillingUsageServiceRejectsMachineTokens(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	c := env.BillingUsageClient(env.Issuer.MachineToken(t, testenv.UsageClientID, auth.ScopeBilling, auth.ScopeReportUsage))
@@ -151,6 +153,7 @@ func TestBillingUsageServiceRejectsMachineTokens(t *testing.T) {
 }
 
 func TestReportUsageValidation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	c := env.Service()
 	org := newOrg(t)
@@ -207,6 +210,7 @@ func TestReportUsageValidation(t *testing.T) {
 // grant inline, which takes the balance below the alert threshold, so the
 // low-balance email is queued and sent once.
 func TestZeroAmountReportExpiringGrantQueuesLowBalance(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f) // a 10 USD grant, equal to the default alert threshold
@@ -252,6 +256,7 @@ func TestZeroAmountReportExpiringGrantQueuesLowBalance(t *testing.T) {
 }
 
 func TestReportUsageIdempotency(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f) // $10 of credit and an ACTIVE subscription
@@ -317,6 +322,7 @@ func TestReportUsageIdempotency(t *testing.T) {
 // every suspension time passed. The test server runs no worker, so the
 // replay itself records the suspensions, in more than one batch of accounts.
 func TestReportUsageReplaySuspendsMoreThanOneBatchOfAccounts(t *testing.T) {
+	t.Parallel()
 	const n = 101
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
@@ -379,6 +385,7 @@ func TestReportUsageReplaySuspendsMoreThanOneBatchOfAccounts(t *testing.T) {
 }
 
 func TestReportUsageConcurrentForOneBillingAccount(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
@@ -447,6 +454,7 @@ func TestReportUsageConcurrentForOneBillingAccount(t *testing.T) {
 }
 
 func TestReportUsageAttributionThroughLinkHistory(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	a := newFixture(t, env)
 	b := newFixture(t, env)
@@ -554,6 +562,7 @@ func emptyLink(t *testing.T, env *testenv.Env, org string) {
 }
 
 func TestReportUsageIgnoresEmptyLinkInterval(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	a := newFixture(t, env)
 	b := newFixture(t, env)
@@ -588,6 +597,7 @@ func TestReportUsageIgnoresEmptyLinkInterval(t *testing.T) {
 }
 
 func TestBillingStatusPollCursor(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subID := subscribe(t, env, f)
@@ -673,6 +683,7 @@ func TestBillingStatusPollCursor(t *testing.T) {
 }
 
 func TestBillingStatusPollRechecksSuspensionAfterLockWait(t *testing.T) {
+	t.Parallel()
 	const suspended = accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED
 	for _, tc := range []struct {
 		name     string
@@ -782,6 +793,7 @@ func TestBillingStatusPollRechecksSuspensionAfterLockWait(t *testing.T) {
 }
 
 func TestLinkOrganizationRoles(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	other := newFixture(t, env)
@@ -999,6 +1011,7 @@ func TestLinkOrganizationDoesNotLogRolledBackChanges(t *testing.T) {
 }
 
 func TestListManageableBillingAccounts(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	user := newPerson(env, "multi")
 	var ids []string
@@ -1075,6 +1088,7 @@ func TestListManageableBillingAccounts(t *testing.T) {
 }
 
 func TestGetOrganizationBillingAndUsageViews(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	// Keep both completed usage windows in the fixture clock's UTC month.
 	midMonth := time.Date(2026, time.November, 15, 12, 0, 0, 0, time.UTC)
@@ -1262,6 +1276,7 @@ func storedSum(t *testing.T, env *testenv.Env, column, org string, meter account
 // other meters, the paging and the total are unchanged, and ReportUsage and
 // the stored rows stay exact.
 func TestUsageQuantitySumSaturates(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	pinMidMonth(env)
 	f := newFixture(t, env)
@@ -1318,6 +1333,7 @@ func TestUsageQuantitySumSaturates(t *testing.T) {
 // including the total of ListUsageSummary. The rows are inserted directly,
 // because the ledger rejects a deduction that overflows the balance.
 func TestUsageAmountSumSaturates(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	pinMidMonth(env)
 	f := newFixture(t, env)

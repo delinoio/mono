@@ -82,6 +82,7 @@ func insertPending(t *testing.T, d *db.DB, id, transactionID, action string, amo
 // startup, and neither a second run nor a repeated payment delivery reverses
 // it again.
 func TestReconcilePendingAdjustmentsAfterOldReleaseGrant(t *testing.T) {
+	t.Parallel()
 	d, err := db.Open(ctx(), dbtest.NewURLAtVersion(t, 4))
 	if err != nil {
 		t.Fatal(err)
@@ -140,6 +141,7 @@ func TestReconcilePendingAdjustmentsAfterOldReleaseGrant(t *testing.T) {
 // applies the pending adjustments of the purchase, and that a replay of the
 // same event ID changes nothing.
 func TestPaymentDeliveryWithExistingGrantAppliesPending(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	if code := f.webhook(paddle.EventAdjustmentCreated,
@@ -172,6 +174,7 @@ func TestPaymentDeliveryWithExistingGrantAppliesPending(t *testing.T) {
 }
 
 func TestPaymentWebhookExpiresCreditBeforePendingAdjustment(t *testing.T) {
+	t.Parallel()
 	type grant struct {
 		transactionID string
 		kind          LedgerKind
@@ -310,6 +313,7 @@ func TestPaymentWebhookExpiresCreditBeforePendingAdjustment(t *testing.T) {
 // deleted, the cap of the purchase applies in arrival order, and a deleted
 // billing account keeps its rows.
 func TestReconcilePendingAdjustmentsIsExactlyOnce(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	now := f.clock.Now()
 	acct := f.account()
@@ -402,6 +406,7 @@ func (f *fixture) seedPendingPurchase(transactionID, action string, failing bool
 }
 
 func TestReconcilePendingAdjustmentsContinuesAfterPurchaseFailure(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	f.injectPendingAdjustmentFailures()
 	failed := f.seedPendingPurchase("txn_01", "refund", true)
@@ -435,6 +440,7 @@ func TestReconcilePendingAdjustmentsContinuesAfterPurchaseFailure(t *testing.T) 
 }
 
 func TestReconcilePendingAdjustmentsReachesHealthyPurchaseBeyondBatch(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	f.injectPendingAdjustmentFailures()
 	for i := range 100 {
@@ -457,6 +463,7 @@ func TestReconcilePendingAdjustmentsReachesHealthyPurchaseBeyondBatch(t *testing
 }
 
 func TestReconcilePendingAdjustmentsStopsOnCancellation(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	first := f.seedPendingPurchase("txn_01", "refund", false)
 	f.seedPendingPurchase("txn_02", "chargeback", false)

@@ -48,6 +48,7 @@ func timedOutManualTopUp(t *testing.T) (f *fixture, acct, noticeID string, compl
 }
 
 func TestStaleTopUpFailureNoticeIsSuppressedOnFirstDelivery(t *testing.T) {
+	t.Parallel()
 	f, _, noticeID, complete := timedOutManualTopUp(t)
 	complete()
 
@@ -68,6 +69,7 @@ func TestStaleTopUpFailureNoticeIsSuppressedOnFirstDelivery(t *testing.T) {
 }
 
 func TestStaleTopUpFailureNoticeIsSuppressedOnRetry(t *testing.T) {
+	t.Parallel()
 	f, _, noticeID, complete := timedOutManualTopUp(t)
 
 	// The first attempt fails for every recipient, so the notice waits for
@@ -98,6 +100,7 @@ func TestStaleTopUpFailureNoticeIsSuppressedOnRetry(t *testing.T) {
 // A notification queued by a release that did not record the top-up ID in its
 // details still names the top-up in its deduplication key.
 func TestStaleTopUpFailureNoticeWithoutTopUpIDDetail(t *testing.T) {
+	t.Parallel()
 	f, _, noticeID, complete := timedOutManualTopUp(t)
 	if _, err := f.db.Pool.Exec(ctx(), `UPDATE billing_notifications SET details = details - 'top_up_id' WHERE notification_id = $1`, noticeID); err != nil {
 		t.Fatal(err)
@@ -116,6 +119,7 @@ func TestStaleTopUpFailureNoticeWithoutTopUpIDDetail(t *testing.T) {
 }
 
 func TestFailedTopUpNoticeStillSends(t *testing.T) {
+	t.Parallel()
 	f, _, noticeID, _ := timedOutManualTopUp(t)
 
 	if err := f.s.DeliverNotifications(ctx()); err != nil {

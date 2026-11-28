@@ -80,6 +80,7 @@ func requireRejectedStateEpochLog(t *testing.T, logs, deviceID, epoch string) {
 }
 
 func TestInvalidInitialStateEpochClosesChannel(t *testing.T) {
+	t.Parallel()
 	for _, tc := range invalidStateEpochs {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testenv.New(t)
@@ -127,6 +128,7 @@ func TestInvalidInitialStateEpochClosesChannel(t *testing.T) {
 }
 
 func TestInvalidLaterStateEpochKeepsChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev, agent := setupAgent(t, env, org, nil)

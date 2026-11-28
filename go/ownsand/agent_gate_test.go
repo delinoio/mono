@@ -61,6 +61,7 @@ func (g *gateFailures) fail(format string, args ...any) {
 }
 
 func TestAwaitAgentGateAcceptsTheMatchingSignal(t *testing.T) {
+	t.Parallel()
 	hits := make(chan string, 1)
 	out := make(chan error, 1)
 	hits <- "read"
@@ -79,6 +80,7 @@ func TestAwaitAgentGateAcceptsTheMatchingSignal(t *testing.T) {
 }
 
 func TestAwaitAgentGateReportsEarlyCompletion(t *testing.T) {
+	t.Parallel()
 	hits := make(chan string, 1)
 	out := make(chan error, 1)
 	out <- errHandleClosed
@@ -97,6 +99,7 @@ func TestAwaitAgentGateReportsEarlyCompletion(t *testing.T) {
 }
 
 func TestAwaitAgentGateReportsEarlyCompletionWithoutError(t *testing.T) {
+	t.Parallel()
 	hits := make(chan string, 1)
 	out := make(chan error, 1)
 	out <- nil
@@ -110,6 +113,7 @@ func TestAwaitAgentGateReportsEarlyCompletionWithoutError(t *testing.T) {
 }
 
 func TestAwaitAgentGateReportsAWrongSignal(t *testing.T) {
+	t.Parallel()
 	hits := make(chan string, 1)
 	out := make(chan error, 1)
 	hits <- "write"
@@ -123,6 +127,7 @@ func TestAwaitAgentGateReportsAWrongSignal(t *testing.T) {
 }
 
 func TestAwaitAgentGateTimesOut(t *testing.T) {
+	t.Parallel()
 	hits := make(chan string, 1)
 	out := make(chan error, 1)
 	var f gateFailures

@@ -25,6 +25,7 @@ func longDrivePath(root string) string {
 }
 
 func TestExtendedPath(t *testing.T) {
+	t.Parallel()
 	longDrive := longDrivePath(`C:\ownsand`)
 	longUNC := `\\server\share` + strings.Repeat(`\`+strings.Repeat("u", 40), 6)
 	// 247 bytes is the longest path that stays unchanged, 248 is the first
@@ -77,6 +78,7 @@ func TestExtendedPathRelative(t *testing.T) {
 // The error of a failed stat names the path that the caller passed, not the
 // prefixed form that CreateFile received.
 func TestStatSourceErrorKeepsOriginalPath(t *testing.T) {
+	t.Parallel()
 	for _, path := range []string{
 		longDrivePath(filepath.Join(t.TempDir(), "missing")),
 		filepath.Join(t.TempDir(), "missing"),
@@ -118,6 +120,7 @@ func makeLongFile(t *testing.T, content string) string {
 // statSource and the os.Open that follows it must name the same file at a
 // path that is longer than the Win32 path limit.
 func TestStatSourceLongPath(t *testing.T) {
+	t.Parallel()
 	path := makeLongFile(t, "hello")
 	for name, p := range map[string]string{
 		"ordinary":     path,
@@ -150,6 +153,7 @@ func TestStatSourceLongPath(t *testing.T) {
 // The snapshot of a file at a long path takes the first stat and the open
 // through the same file, so it neither fails nor reports a swap.
 func TestMakeSnapshotLongPath(t *testing.T) {
+	t.Parallel()
 	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

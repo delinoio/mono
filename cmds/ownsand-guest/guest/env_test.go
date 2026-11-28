@@ -8,6 +8,7 @@ import (
 )
 
 func TestMergeEnvCaseInsensitiveFold(t *testing.T) {
+	t.Parallel()
 	inherited := []string{"OwnsandGuestTestVar=helper", "KEEP=1", "=C:=C:\\work"}
 	got := mergeEnv(inherited, map[string]string{"OWNSANDGUESTTESTVAR": "request"}, strings.ToLower)
 	want := []string{"=C:=C:\\work", "KEEP=1", "OWNSANDGUESTTESTVAR=request"}
@@ -17,6 +18,7 @@ func TestMergeEnvCaseInsensitiveFold(t *testing.T) {
 }
 
 func TestMergeEnvCaseSensitiveIdentity(t *testing.T) {
+	t.Parallel()
 	identity := func(k string) string { return k }
 	inherited := []string{"OwnsandGuestTestVar=helper", "KEEP=1"}
 	got := mergeEnv(inherited, map[string]string{"OWNSANDGUESTTESTVAR": "request"}, identity)

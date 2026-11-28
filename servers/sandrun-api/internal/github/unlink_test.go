@@ -17,6 +17,7 @@ import (
 )
 
 func TestUnlinkWaitsForJITRegistration(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusNoContent, http.StatusUnprocessableEntity, http.StatusServiceUnavailable, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			w := newGHWorld(t, worldOpts{})
@@ -140,6 +141,7 @@ func TestUnlinkWaitsForJITRegistration(t *testing.T) {
 }
 
 func TestJITRegistrationWaitsForUnlink(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	inst := w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -203,6 +205,7 @@ func TestJITRegistrationWaitsForUnlink(t *testing.T) {
 }
 
 func TestUnlinkRetiresRegisteredRunnersOnFailure(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		jobs bool
@@ -264,6 +267,7 @@ func TestUnlinkRetiresRegisteredRunnersOnFailure(t *testing.T) {
 }
 
 func TestUnlinkRetirementSurvivesFinalCommitFailure(t *testing.T) {
+	t.Parallel()
 	w, installationID, first, second := unlinkWorld(t, true)
 	ctx := t.Context()
 	if _, err := w.env.DB.Pool.Exec(ctx, `

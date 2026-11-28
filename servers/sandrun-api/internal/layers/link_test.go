@@ -23,6 +23,7 @@ import (
 )
 
 func TestOwnSandLink(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	osOrg, otherOS := api.NewID(), api.NewID()
@@ -113,6 +114,7 @@ func TestOwnSandLink(t *testing.T) {
 }
 
 func TestOwnSandLinkValidationRateLimit(t *testing.T) {
+	t.Parallel()
 	var env *testenv.Env
 	now := func() time.Time { return env.Clock.Now() }
 	limits := testenv.GenerousLimits(now)
@@ -137,6 +139,7 @@ func TestOwnSandLinkValidationRateLimit(t *testing.T) {
 // The production clock has sub-microsecond precision, and PostgreSQL stores
 // microseconds; setting and replacing the key must still succeed.
 func TestOwnSandLinkWithSubMicrosecondClock(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	osOrg := api.NewID()
 	w.fake.AddOrg(osOrg, ownsandKey('a'))
@@ -154,6 +157,7 @@ func TestOwnSandLinkWithSubMicrosecondClock(t *testing.T) {
 // A removal whose deletion transaction fails keeps the link and clears the
 // removal mark, so the link stays dispatchable and accepts a new key.
 func TestOwnSandLinkRemovalFailureClearsMark(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	osOrg := api.NewID()

@@ -89,6 +89,7 @@ func (f *fixture) orgEmails() []string {
 }
 
 func TestStatusStateMachine(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -131,7 +132,7 @@ func TestStatusStateMachine(t *testing.T) {
 
 	// The owner and the admin got each email once; the viewer got none.
 	kinds := strings.Join(f.orgEmails(), " ")
-	n := accountSeq.Load()
+	n := f.lastAccountSeq
 	want := fmt.Sprintf("organization_blocked>admin-%d@example.com organization_blocked>owner-%d@example.com "+
 		"organization_suspended>admin-%d@example.com organization_suspended>owner-%d@example.com", n, n, n, n)
 	if kinds != want {
@@ -164,6 +165,7 @@ func TestStatusStateMachine(t *testing.T) {
 }
 
 func TestStatusSubscriptionAndReasons(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	// Without a subscription the organization is blocked from the link on,
@@ -241,6 +243,7 @@ func TestStatusSubscriptionAndReasons(t *testing.T) {
 }
 
 func TestStatusEmailsAreDeduplicated(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	org := f.link(acct, "Org")
@@ -269,6 +272,7 @@ func TestStatusEmailsAreDeduplicated(t *testing.T) {
 }
 
 func TestStatusIgnoresUnlinkedOrganizations(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -314,6 +318,7 @@ func (f *fixture) captureLogs() *bytes.Buffer {
 }
 
 func TestListStatusChangesSuspendsMoreThanOneBatchOfAccounts(t *testing.T) {
+	t.Parallel()
 	// 101 accounts take two batches, 100 exactly one full batch and a second
 	// empty query, and 250 three batches.
 	for _, n := range []int{100, suspendBatchSize + 1, 250} {
@@ -351,6 +356,7 @@ func TestListStatusChangesSuspendsMoreThanOneBatchOfAccounts(t *testing.T) {
 }
 
 func TestSuspendDueFiltersStillSelectOnlyMatchingLinks(t *testing.T) {
+	t.Parallel()
 	const (
 		sandRunLinks = 5
 		ownsandLinks = suspendBatchSize + 3
@@ -435,6 +441,7 @@ func TestSuspendDueFiltersStillSelectOnlyMatchingLinks(t *testing.T) {
 }
 
 func TestSuspendDueWithoutDueLinksChangesNothing(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	f.dueLinks(3)
 	// The links are blocked but not due yet.
