@@ -237,16 +237,22 @@ function OwnerActions() {
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const terminalMembersError = isTerminalError(members.error);
-  if (terminalMembersError && (target !== null || confirmTransfer)) {
-    // Discard the selection and its confirmation when the list loses access.
+  const candidates = members.members.filter((m) => m.role !== Role.OWNER);
+  const selectedMember = candidates.find((m) => m.userId === target);
+  const hasCompleteRoster =
+    members.isLoaded &&
+    !members.isFetching &&
+    !members.isIncomplete &&
+    members.error === null;
+  if (
+    target !== null &&
+    (terminalMembersError ||
+      (hasCompleteRoster && selectedMember === undefined))
+  ) {
+    // A partial refresh can move the selected member to a page still loading.
     setTarget(null);
     setConfirmTransfer(false);
   }
-
-  const candidates = members.members.filter((m) => m.role !== Role.OWNER);
-  const selectedMember = candidates.find((m) => m.userId === target);
-  const targetName =
-    selectedMember?.displayName || selectedMember?.userId || "";
 
   return (
     <>
@@ -264,8 +270,11 @@ function OwnerActions() {
               <Select
                 label={t("ownership.newOwner")}
                 placeholder={t("ownership.chooseMember")}
-                value={target}
-                onValueChange={setTarget}
+                value={selectedMember?.userId ?? null}
+                onValueChange={(userId) => {
+                  setTarget(userId);
+                  setConfirmTransfer(false);
+                }}
               >
                 {candidates.map((m) => (
                   <SelectOption key={m.userId} value={m.userId}>
@@ -275,7 +284,7 @@ function OwnerActions() {
               </Select>
               <Button
                 variant={ButtonVariant.Secondary}
-                disabled={target === null}
+                disabled={selectedMember === undefined}
                 onClick={() => setConfirmTransfer(true)}
               >
                 {t("ownership.transfer")}
@@ -296,16 +305,26 @@ function OwnerActions() {
         </Button>
       </section>
       <ConfirmDialog
-        open={confirmTransfer}
+        open={
+          confirmTransfer &&
+          !terminalMembersError &&
+          selectedMember !== undefined
+        }
         onOpenChange={setConfirmTransfer}
-        title={t("ownership.dialog.title", { name: targetName })}
+        title={
+          selectedMember === undefined
+            ? t("ownership.title")
+            : t("ownership.dialog.title", {
+                name: selectedMember.displayName || selectedMember.userId,
+              })
+        }
         description={t("ownership.dialog.description")}
         confirmLabel={t("ownership.title")}
         onConfirm={async () => {
-          if (terminalMembersError || target === null) return;
+          if (terminalMembersError || selectedMember === undefined) return;
           await transfer.mutateAsync({
             organizationId,
-            userId: target,
+            userId: selectedMember.userId,
           });
         }}
       />

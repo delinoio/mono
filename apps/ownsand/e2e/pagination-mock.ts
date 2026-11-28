@@ -18,6 +18,7 @@ import {
   MemberService,
   type AcceptInvitationResponse,
   type ListInvitationsResponse,
+  type ListMembersResponse,
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
 import {
@@ -397,7 +398,8 @@ export function createMockTransport(): Transport {
         recordToken("ownsand-e2e-mutation-calls", method.name);
         if (
           method.name === "CreateSandbox" ||
-          method.name === "ReplaceDeviceLimits"
+          method.name === "ReplaceDeviceLimits" ||
+          method.name === "TransferOwnership"
         ) {
           recordToken(
             "ownsand-e2e-resource-mutation-inputs",
@@ -456,6 +458,27 @@ export function createMockTransport(): Transport {
             "Synthetic full refresh failure",
             Number(code) as Code,
           );
+        }
+      }
+      if (method.name === "ListMembers" && refreshList === "ListMembers") {
+        const excluded = sessionStorage.getItem("ownsand-e2e-excluded-member");
+        if (excluded !== null) {
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          const { members } = response.message as ListMembersResponse;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              members: members.filter(({ userId }) => userId !== excluded),
+            },
+          };
         }
       }
       if (credential && method.name === credential.create) {
