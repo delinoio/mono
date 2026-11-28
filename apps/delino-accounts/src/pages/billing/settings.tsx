@@ -262,7 +262,7 @@ function autoTopUpDraft(settings: AutoTopUpValues | undefined): AutoTopUpInput {
 
 interface AutoTopUpFormState {
   settingsKey: string;
-  confirmationKey?: string;
+  saveConfirmation?: { key: string; awaitingResponse: boolean };
   draft: AutoTopUpInput;
 }
 
@@ -282,13 +282,16 @@ function AutoTopUpForm({
   }));
   const [errors, setErrors] = useState<AutoTopUpErrors>({});
   if (form.settingsKey !== settingsKey) {
-    // A read that confirms this form's save keeps the current draft.
-    if (settingsKey === form.confirmationKey) {
-      setForm({ settingsKey, draft: form.draft });
-    } else {
-      setForm({ settingsKey, draft: autoTopUpDraft(settings) });
-      setErrors({});
-    }
+    const confirmsSave = settingsKey === form.saveConfirmation?.key;
+    setForm({
+      settingsKey,
+      // Keep identifying reads of the submission until its response arrives.
+      saveConfirmation: form.saveConfirmation?.awaitingResponse
+        ? form.saveConfirmation
+        : undefined,
+      draft: confirmsSave ? form.draft : autoTopUpDraft(settings),
+    });
+    if (!confirmsSave) setErrors({});
   }
   const { draft } = form;
   const editDraft = (edit: Partial<AutoTopUpInput>) => {
@@ -311,22 +314,41 @@ function AutoTopUpForm({
           return;
         }
         setErrors({});
-        const saved = await update.mutateAsync({
-          billingAccountId,
-          settings: checked.value,
-        });
-        const savedSettings = saved.settings ?? checked.value;
-        const savedKey = autoTopUpSettingsKey(savedSettings);
+        const pendingConfirmation = {
+          key: autoTopUpSettingsKey(checked.value),
+          awaitingResponse: true,
+        };
         setForm((current) => ({
           ...current,
-          confirmationKey:
-            savedKey === current.settingsKey ? undefined : savedKey,
-          // Each edit creates a new draft, even if it restores an earlier value.
-          draft:
-            current.draft === draft
-              ? autoTopUpDraft(savedSettings)
-              : current.draft,
+          saveConfirmation: pendingConfirmation,
         }));
+        try {
+          const saved = await update.mutateAsync({
+            billingAccountId,
+            settings: checked.value,
+          });
+          const savedSettings = saved.settings ?? checked.value;
+          const savedKey = autoTopUpSettingsKey(savedSettings);
+          setForm((current) => ({
+            ...current,
+            saveConfirmation:
+              savedKey === current.settingsKey
+                ? undefined
+                : { key: savedKey, awaitingResponse: false },
+            // Each edit creates a new draft, even if it restores an earlier value.
+            draft:
+              current.draft === draft
+                ? autoTopUpDraft(savedSettings)
+                : current.draft,
+          }));
+        } catch (error) {
+          setForm((current) =>
+            current.saveConfirmation === pendingConfirmation
+              ? { ...current, saveConfirmation: undefined }
+              : current,
+          );
+          throw error;
+        }
         await invalidateServices(queryClient, CreditService);
         toast.success("Automatic top-up is saved.");
       }}
