@@ -58,7 +58,7 @@ The frontend follows the React app rules of the [localization contract](reposito
 
 ## Storage
 
-The scaffold stores no app data other than the selected language tag in the webview's `localStorage` (`delino.language`). CEF keeps its Chromium profile (cookies, cache and persisted permission decisions) in the runtime's default cache directory under the user cache directory. The CEF binary distribution is cached per machine outside the repository: `~/.cache/tauri-cef` on Linux, `~/Library/Caches/tauri-cef` on macOS and `%LOCALAPPDATA%\tauri-cef` on Windows, or `CEF_PATH` when it is set. App icons are below the Git LFS threshold of 512 KiB.
+The scaffold stores the selected language tag in the webview's `localStorage` (`delino.language`). Windows release builds also store [native logs](#logging). CEF keeps its Chromium profile (cookies, cache and persisted permission decisions) in the runtime's default cache directory under the user cache directory. The CEF binary distribution is cached per machine outside the repository: `~/.cache/tauri-cef` on Linux, `~/Library/Caches/tauri-cef` on macOS and `%LOCALAPPDATA%\tauri-cef` on Windows, or `CEF_PATH` when it is set. App icons are below the Git LFS threshold of 512 KiB.
 
 ## Security
 
@@ -70,10 +70,11 @@ The scaffold stores no app data other than the selected language tag in the webv
 
 ## Logging
 
-- `src/logging.rs` installs a `tracing` subscriber that writes structured events to stderr.
-- `DELIDEV_LOG` holds `tracing` filter directives. The default is `info`, which is also used when the value is empty or not valid.
-- ANSI color is on by default. A non-empty `NO_COLOR` turns it off.
+- `src/logging.rs` installs a `tracing` subscriber that writes structured events to stderr. A Windows release build also writes to the local app log after Tauri resolves the log directory.
+- Both outputs use the `tracing` filter directives in `DELIDEV_LOG`. The default is `info`, which is also used when the value is empty or not valid.
+- Stderr uses ANSI color by default. A non-empty `NO_COLOR` turns it off. The file output always omits ANSI color.
 - `run()` logs one `starting delidev` event with the version, runtime, platform and operating system.
+- Windows release builds run without a console window. To retrieve native logs, open `%LOCALAPPDATA%\io.delino.delidev\logs` in File Explorer and open `delidev.log`. The app rotates the file at 1 MiB and keeps one previous file, `delidev.log.1`. A single event larger than 1 MiB is omitted from the file output. If the app cannot initialize file logging, it reports the error to stderr when available and continues to start.
 - iOS debug builds: the `tauri::mobile_entry_point` expansion calls `tauri::log_stdout()` before the app entry point, which redirects stdout and stderr into pipes. Tauri's Swift logger forwards each captured chunk to Apple unified logging with an `[stderr]` prefix, so the `tracing` output of `logging::init` reaches unified logging. The Swift logger is enabled only in debug builds.
 - iOS release builds: Tauri still installs the redirector, but its Swift logger is off by default, so the process stderr is not visible. Release builds emit nothing to unified logging by default.
 - Android does not show the process stderr. A platform log sink for Android is not part of the scaffold.

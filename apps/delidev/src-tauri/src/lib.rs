@@ -28,6 +28,26 @@ fn app_info() -> AppInfo {
 #[cfg_attr(desktop, tauri_runtime_cef::cef_entry_point)]
 pub fn run() {
     logging::init();
+    #[cfg(not(all(windows, not(debug_assertions))))]
+    log_startup();
+
+    let app = runtime_builder()
+        .invoke_handler(tauri::generate_handler![app_info])
+        .build(tauri::generate_context!())
+        .expect("error while running the delidev app");
+
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        use tauri::Manager;
+
+        logging::init_file(app.path().app_log_dir());
+        log_startup();
+    }
+
+    app.run(|_, _| {});
+}
+
+fn log_startup() {
     let info = AppInfo::current();
     tracing::info!(
         version = info.version,
@@ -36,11 +56,6 @@ pub fn run() {
         os = info.os,
         "starting delidev"
     );
-
-    runtime_builder()
-        .invoke_handler(tauri::generate_handler![app_info])
-        .run(tauri::generate_context!())
-        .expect("error while running the delidev app");
 }
 
 /// Selects the CEF runtime on desktop targets.
