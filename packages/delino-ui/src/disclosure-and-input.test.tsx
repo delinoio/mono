@@ -58,12 +58,25 @@ import {
 } from "./segmented-control.tsx";
 import { Skeleton } from "./skeleton.tsx";
 import { Slider } from "./slider.tsx";
-import { block, css, findRuleBlock } from "./stylesheet-source.ts";
+import {
+  block,
+  css,
+  findAtRuleBlock,
+  findRuleBlock,
+} from "./stylesheet-source.ts";
 import { Toggle, ToggleGroup } from "./toggle.tsx";
 
 afterEach(() => {
   cleanup();
 });
+
+const forcedColorsMedia = "@media (forced-colors: active)";
+
+function forcedColorsStyles(): string {
+  const body = findAtRuleBlock(css, forcedColorsMedia);
+  expect(body).not.toBeNull();
+  return body ?? "";
+}
 
 const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
   ["undefined", undefined],
@@ -1635,9 +1648,7 @@ describe("SegmentedControl", () => {
   // The forced-colors rules come after the default ones, so extract the media
   // block and search inside it.
   test("keeps the checked item visible in forced colors", () => {
-    const start = css.indexOf("@media (forced-colors: active)");
-    expect(start).toBeGreaterThan(-1);
-    const forced = css.slice(start);
+    const forced = forcedColorsStyles();
     const indicator = findRuleBlock(forced, ".dui-segmented-control-indicator");
     expect(indicator).toContain("border: 2px solid Highlight;");
     expect(indicator).toContain("background: Canvas;");
@@ -1657,17 +1668,15 @@ describe("SegmentedControl", () => {
 // stylesheet text of the single forced-colors block. The block comes after
 // the component rules, because it has the same specificity and wins by order.
 describe("Forced colors", () => {
-  const marker = "@media (forced-colors: active)";
-  const forced = css.slice(css.indexOf(marker));
-
   test("keeps one forced-colors block after the component rules", () => {
-    expect(css.split(marker)).toHaveLength(2);
-    expect(css.indexOf(marker)).toBeGreaterThan(
+    expect(css.split(forcedColorsMedia)).toHaveLength(2);
+    expect(css.indexOf(forcedColorsMedia)).toBeGreaterThan(
       css.indexOf(".dui-pagination-link[data-current] {"),
     );
   });
 
   test("draws the selected tab with Highlight and hides the idle ones", () => {
+    const forced = forcedColorsStyles();
     expect(findRuleBlock(forced, ".dui-tabs-tab")).toContain(
       "border-bottom-color: Canvas;",
     );
@@ -1691,6 +1700,7 @@ describe("Forced colors", () => {
   });
 
   test("outlines the Progress, Meter and Slider tracks and fills them", () => {
+    const forced = forcedColorsStyles();
     const track = findRuleBlock(
       forced,
       ".dui-progress-track, .dui-slider-track",
@@ -1709,6 +1719,7 @@ describe("Forced colors", () => {
   });
 
   test("tells the on Switch from the off Switch", () => {
+    const forced = forcedColorsStyles();
     const track = findRuleBlock(forced, ".dui-switch");
     expect(track).toContain("border: 2px solid CanvasText;");
     // The 2px border plus 1px padding keeps the 3px inset of the default.
@@ -1723,6 +1734,7 @@ describe("Forced colors", () => {
   });
 
   test("fills the pressed Toggle and the current page without a border", () => {
+    const forced = forcedColorsStyles();
     const filled = findRuleBlock(
       forced,
       ".dui-toggle[data-pressed], .dui-pagination-link[data-current]",

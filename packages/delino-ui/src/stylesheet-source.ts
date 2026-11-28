@@ -26,24 +26,16 @@ function normalizeSelector(selector: string): string {
   return compact(selector).replace(/ ?, ?/g, ", ");
 }
 
-/**
- * Returns the declarations of the first style rule in `source` whose complete
- * selector prelude is exactly `selector`, collapsed to one line, or `null`
- * when no rule matches.
- *
- * The source is scanned brace by brace instead of searched with a pattern, so
- * a query cannot match the tail of a longer descendant, compound or grouped
- * selector, and text inside comments is ignored. Rules nested in at-rules
- * (`@layer`, `@media`, `@keyframes`) are found; at-rule blocks themselves are
- * not style rules and never match. Rules are searched in source order.
- *
- * Limitation: braces or comment markers inside a CSS string or `url()` are not
- * recognized. `styles.css` has none; revisit this scanner if one is added.
- */
-export function findRuleBlock(source: string, selector: string): string | null {
+type OpenBlock = { prelude: string; bodyStart: number; hasChild: boolean };
+
+// This scanner treats braces and comment markers as syntax even inside CSS
+// strings and url(). styles.css does not use those characters in either place.
+function findBlock(
+  source: string,
+  matches: (block: OpenBlock) => boolean,
+): string | null {
   const text = source.replace(/\/\*[\s\S]*?\*\//g, " ");
-  const wanted = normalizeSelector(selector);
-  const open: { prelude: string; bodyStart: number; hasChild: boolean }[] = [];
+  const open: OpenBlock[] = [];
   let preludeStart = 0;
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
@@ -53,20 +45,15 @@ export function findRuleBlock(source: string, selector: string): string | null {
         parent.hasChild = true;
       }
       open.push({
-        prelude: normalizeSelector(text.slice(preludeStart, index)),
+        prelude: text.slice(preludeStart, index).trim(),
         bodyStart: index + 1,
         hasChild: false,
       });
       preludeStart = index + 1;
     } else if (char === "}") {
       const closed = open.pop();
-      if (
-        closed &&
-        !closed.hasChild &&
-        !closed.prelude.startsWith("@") &&
-        closed.prelude === wanted
-      ) {
-        return compact(text.slice(closed.bodyStart, index));
+      if (closed && matches(closed)) {
+        return text.slice(closed.bodyStart, index);
       }
       preludeStart = index + 1;
     } else if (char === ";") {
@@ -74,6 +61,35 @@ export function findRuleBlock(source: string, selector: string): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Returns the declarations of the first style rule with the complete selector.
+ * This includes style rules nested in at-rules. The declarations are collapsed
+ * to one line. Returns `null` when no rule matches.
+ */
+export function findRuleBlock(source: string, selector: string): string | null {
+  const wanted = normalizeSelector(selector);
+  const body = findBlock(
+    source,
+    ({ prelude, hasChild }) =>
+      !hasChild &&
+      !prelude.startsWith("@") &&
+      normalizeSelector(prelude) === wanted,
+  );
+  return body === null ? null : compact(body);
+}
+
+/**
+ * Returns the comment-free body of a complete at-rule with the given prelude,
+ * including its nested rules. Returns `null` when no complete block matches.
+ */
+export function findAtRuleBlock(source: string, atRule: string): string | null {
+  const wanted = compact(atRule);
+  return findBlock(
+    source,
+    ({ prelude }) => prelude.startsWith("@") && compact(prelude) === wanted,
+  );
 }
 
 /**
