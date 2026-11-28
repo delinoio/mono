@@ -7,7 +7,9 @@ tags: server, rsc, parallel-fetching, composition
 
 ## Parallel Data Fetching with Component Composition
 
-React Server Components execute sequentially within a tree. Restructure with composition to parallelize data fetching.
+When a parent Server Component awaits data before returning its children, requests started by those children wait until the parent returns. Returning independent components as siblings, directly or through a `children` prop, lets their requests overlap.
+
+Within a single component, starting one request after awaiting another makes the requests sequential, even when the requests are independent.
 
 **Incorrect (Sidebar waits for Page's fetch to complete):**
 
@@ -28,7 +30,7 @@ async function Sidebar() {
 }
 ```
 
-**Correct (both fetch simultaneously):**
+**Correct (independent fetches can overlap):**
 
 ```tsx
 async function Header() {
