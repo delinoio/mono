@@ -1,5 +1,4 @@
 ---
-"ownsand-sdk": patch
 "ownsand-cli": patch
 "sandrun-api": patch
 ---
