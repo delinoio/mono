@@ -114,6 +114,91 @@ describe("FakeApi stream scripts", () => {
     );
   });
 
+  describe.each([
+    ["EOF", Eof],
+    ["disconnect", Disconnect],
+  ] as const)("scripted %s", (_name, TerminalStep) => {
+    async function expectTerminalRead(
+      read: Promise<ReadableStreamReadResult<Uint8Array>>,
+    ) {
+      if (TerminalStep === Eof) {
+        await expect(read).resolves.toEqual({ done: true, value: undefined });
+      } else {
+        await expect(read).rejects.toBeInstanceOf(TypeError);
+        await expect(read).rejects.toMatchObject({
+          message: "terminated: other side closed",
+        });
+      }
+    }
+
+    test("closes the script without advancing past the terminal step", async () => {
+      const h = setup();
+      let advancedScript = false;
+      let cleanups = 0;
+      h.api.stream(RelayService, "Exec", function* () {
+        try {
+          yield execMsg(ev.accepted());
+          yield new TerminalStep();
+          advancedScript = true;
+        } finally {
+          cleanups++;
+        }
+      });
+      const { reader, readFrame } = await open(h);
+
+      expect((await h.clock.run(readFrame())).flags).toBe(0);
+      await expectTerminalRead(h.clock.run(reader.read()));
+      await h.clock.settle();
+
+      expect(advancedScript).toBe(false);
+      expect(cleanups).toBe(1);
+    });
+
+    test.each([
+      ["returns", false],
+      ["throws", true],
+    ] as const)(
+      "ends the body before an async finalizer %s",
+      async (_outcome, throws) => {
+        const h = setup();
+        const gate = Promise.withResolvers<void>();
+        let advancedScript = false;
+        let cleanups = 0;
+        h.api.stream(RelayService, "Exec", async function* () {
+          try {
+            yield execMsg(ev.accepted());
+            yield new TerminalStep();
+            advancedScript = true;
+          } finally {
+            await gate.promise;
+            cleanups++;
+            if (throws) throw new Error("script cleanup failed");
+          }
+        });
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        process.on("unhandledRejection", onUnhandled);
+        try {
+          const { reader, readFrame } = await open(h);
+          expect((await h.clock.run(readFrame())).flags).toBe(0);
+          await expectTerminalRead(h.clock.run(reader.read()));
+          expect(cleanups).toBe(0);
+
+          gate.resolve();
+          await h.clock.settle();
+
+          expect(advancedScript).toBe(false);
+          expect(cleanups).toBe(1);
+          await expectTerminalRead(h.clock.run(reader.read()));
+          expect(unhandled).toEqual([]);
+        } finally {
+          gate.resolve();
+          process.off("unhandledRejection", onUnhandled);
+        }
+      },
+    );
+  });
+
   test("turns a script error after consecutive Sleep steps into an end-of-stream error", async () => {
     const h = setup();
     h.api.stream(RelayService, "Exec", function* () {
@@ -129,12 +214,17 @@ describe("FakeApi stream scripts", () => {
   test("stops the sleep loop when the call is aborted during a Sleep", async () => {
     const h = setup();
     let reachedAfterSleeps = false;
+    let cleanups = 0;
     h.api.stream(RelayService, "Exec", function* () {
-      yield execMsg(ev.accepted());
-      yield new Sleep(100);
-      yield new Sleep(100);
-      reachedAfterSleeps = true;
-      yield execMsg(ev.exited(0));
+      try {
+        yield execMsg(ev.accepted());
+        yield new Sleep(100);
+        yield new Sleep(100);
+        reachedAfterSleeps = true;
+        yield execMsg(ev.exited(0));
+      } finally {
+        cleanups++;
+      }
     });
     const { controller, readFrame } = await open(h);
 
@@ -149,6 +239,7 @@ describe("FakeApi stream scripts", () => {
     // The script must not run past the sleeps once the call is aborted.
     await h.clock.advance(1_000);
     expect(reachedAfterSleeps).toBe(false);
+    expect(cleanups).toBe(1);
   });
 
   test("errors the body of an aborted Sleep for a later read too", async () => {

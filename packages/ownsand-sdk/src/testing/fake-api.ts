@@ -310,12 +310,16 @@ export class FakeApi {
               // wait for more data without calling pull again.
               continue;
             }
-            if (step instanceof Disconnect) {
-              controller.error(new TypeError("terminated: other side closed"));
-              return;
-            }
-            if (step instanceof Eof) {
-              controller.close();
+            if (step instanceof Eof || step instanceof Disconnect) {
+              if (step instanceof Eof) {
+                controller.close();
+              } else {
+                controller.error(
+                  new TypeError("terminated: other side closed"),
+                );
+              }
+              // Publish the terminal result before cleanup, which can wait or fail.
+              await steps.return(undefined).catch(() => {});
               return;
             }
             if (step instanceof Hang) {
