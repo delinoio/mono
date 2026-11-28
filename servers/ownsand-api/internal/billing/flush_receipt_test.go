@@ -228,15 +228,15 @@ func commitProxyWriterURL(t *testing.T, direct, proxyAddr string) string {
 	}
 	u.Host = proxyAddr
 
-	// pgx gives query settings precedence over the authority. Keep the
-	// remaining pairs verbatim and in order so the generated dbname stays
-	// last and pgx decodes other settings as it did for the direct URL.
+	// Remove host and port overrides so pgx uses the proxy listener.
+	// Keep the other pairs verbatim and in order to preserve their values
+	// and the generated database. The final sslmode overrides earlier TLS settings.
 	var query []string
 	for pair := range strings.SplitSeq(u.RawQuery, "&") {
 		rawKey, _, _ := strings.Cut(pair, "=")
 		key, _ := url.PathUnescape(strings.Trim(rawKey, " "))
 		switch key {
-		case "", "host", "port", "sslmode":
+		case "", "host", "port":
 			continue
 		}
 		query = append(query, pair)
@@ -291,6 +291,62 @@ func TestCommitProxyEndpoints(t *testing.T) {
 			}
 			if name := conn.RuntimeParams["application_name"]; name != "receipt+test" {
 				t.Fatalf("writer application_name = %q, want receipt+test", name)
+			}
+		})
+	}
+
+	const database = "ownsand_test_example"
+	const proxyAddr = "127.0.0.1:15432"
+	for _, test := range []struct {
+		name     string
+		query    string
+		appName  string
+		password string
+	}{
+		{
+			name: "preserve raw query",
+			query: "application_name=OwnSand%20billing+tests%2B&password=example%20phrase" +
+				"&sslmode=prefer&ssl=true&dbname=discarded&database=ignored&dbname=" + database,
+			appName:  "OwnSand billing+tests+",
+			password: "example phrase",
+		},
+		{name: "dbname only", query: "dbname=" + database},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			direct := "postgres://fixture@127.0.0.1:5432/" + database + "?" + test.query
+			writer := commitProxyWriterURL(t, direct, proxyAddr)
+			if want := "postgres://fixture@" + proxyAddr + "/" + database + "?" + test.query + "&sslmode=disable"; writer != want {
+				t.Fatalf("writer URL = %q, want %q", writer, want)
+			}
+
+			readerConfig, err := pgxpool.ParseConfig(direct)
+			if err != nil {
+				t.Fatalf("parse direct URL: %v", err)
+			}
+			writerConfig, err := pgxpool.ParseConfig(writer)
+			if err != nil {
+				t.Fatalf("parse writer URL: %v", err)
+			}
+			readerConn, writerConn := readerConfig.ConnConfig, writerConfig.ConnConfig
+			if readerConn.Host != "127.0.0.1" || readerConn.Port != 5432 {
+				t.Fatalf("reader host and port = %q and %d, want 127.0.0.1:5432", readerConn.Host, readerConn.Port)
+			}
+			if writerConn.Host != "127.0.0.1" || writerConn.Port != 15432 || writerConn.TLSConfig != nil {
+				t.Fatalf("writer host and port = %q and %d, TLS enabled = %t, want %s and plaintext",
+					writerConn.Host, writerConn.Port, writerConn.TLSConfig != nil, proxyAddr)
+			}
+			if readerConn.Database != database || writerConn.Database != database {
+				t.Fatalf("reader and writer databases = %q and %q, want %q", readerConn.Database, writerConn.Database, database)
+			}
+			if test.appName != "" {
+				readerName := readerConn.RuntimeParams["application_name"]
+				writerName := writerConn.RuntimeParams["application_name"]
+				if readerName != test.appName || writerName != readerName {
+					t.Fatalf("reader and writer application names = %q and %q, want %q", readerName, writerName, test.appName)
+				}
+				if readerConn.Password != test.password || writerConn.Password != readerConn.Password {
+					t.Fatal("reader and writer must both preserve the fixture password")
+				}
 			}
 		})
 	}
