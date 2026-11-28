@@ -58,6 +58,8 @@ const sandboxSelect = `SELECT s.sandbox_id::text, s.organization_id::text, s.dev
 	s.created_by_kind, s.created_by_id, s.create_time, s.end_time, COALESCE(d.state, 3)
 	FROM sandboxes s LEFT JOIN devices d ON d.device_id = s.device_id`
 
+const sandboxPointLookup = sandboxSelect + " WHERE s.organization_id = $1 AND s.sandbox_id = $2"
+
 func scanSandbox(row pgx.Row) (*sandboxRow, error) {
 	var r sandboxRow
 	var agentState, endReason, delReason, delKind, base, guest, host, arch, network, restore, createdKind, devState int16
@@ -95,7 +97,7 @@ func scanSandbox(row pgx.Row) (*sandboxRow, error) {
 // loadSandbox reads one sandbox of the organization; lock adds FOR UPDATE
 // OF the sandbox row.
 func loadSandbox(ctx context.Context, q db.Querier, orgID, sandboxID string, lock bool) (*sandboxRow, error) {
-	sql := sandboxSelect + " WHERE s.organization_id = $1 AND s.sandbox_id = $2"
+	sql := sandboxPointLookup
 	if lock {
 		sql += " FOR UPDATE OF s"
 	}

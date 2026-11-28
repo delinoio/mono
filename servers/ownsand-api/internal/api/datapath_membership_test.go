@@ -6,15 +6,18 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
@@ -243,7 +246,19 @@ func TestDelayedMembershipRevocation(t *testing.T) {
 
 func TestReauthorizeDataPathAfterMembershipReplacement(t *testing.T) {
 	t.Parallel()
-	env := testenv.New(t, func(o *app.Options) { o.Timing.EventPoll = time.Hour })
+	t.Run("ordinary", func(t *testing.T) { testDataPathMembershipReplacement(t, false) })
+	t.Run("with_billing_waiter", func(t *testing.T) { testDataPathMembershipReplacement(t, true) })
+}
+
+func testDataPathMembershipReplacement(t *testing.T, withBillingWaiter bool) {
+	t.Helper()
+	env := testenv.New(t, func(o *app.Options) {
+		o.Timing.EventPoll = time.Hour
+		if withBillingWaiter {
+			// The test starts its own pass so it can observe and join it.
+			o.BillingEnforceInterval = time.Hour
+		}
+	})
 	org, agent, sandboxID := runningSandbox(t, env)
 	peer := env.StartPeer()
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
@@ -255,10 +270,40 @@ func TestReauthorizeDataPathAfterMembershipReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background())
+	var billingResult chan error
+	defer func() {
+		_ = tx.Rollback(context.Background())
+		if billingResult != nil {
+			if err := <-billingResult; err != nil {
+				t.Errorf("billing enforcer pass: %v", err)
+			}
+		}
+	}()
 	if _, err := tx.Exec(ctx, "LOCK TABLE sandboxes IN ACCESS EXCLUSIVE MODE"); err != nil {
 		t.Fatal(err)
 	}
+
+	var billingPID int32
+	if withBillingWaiter {
+		billingResult = make(chan error, 1)
+		go func() { billingResult <- env.App.Enforcer.Pass(ctx) }()
+		testenv.Eventually(t, "billing suspension SELECT waiting for the holder", func() bool {
+			_, billingPIDs := blockedSandboxReads(t, ctx, tx)
+			if len(billingPIDs) != 1 {
+				return false
+			}
+			billingPID = billingPIDs[0]
+			return true
+		})
+	}
+	lookupWaiters := func() []int32 {
+		lookupPIDs, billingPIDs := blockedSandboxReads(t, ctx, tx)
+		if withBillingWaiter && !slices.Contains(billingPIDs, billingPID) {
+			t.Fatalf("billing suspension SELECT on backend %d stopped waiting for the holder", billingPID)
+		}
+		return lookupPIDs
+	}
+
 	member := env.User(org.Member)
 	sessionResult := make(chan error, 1)
 	grantResult := make(chan error, 1)
@@ -268,19 +313,26 @@ func TestReauthorizeDataPathAfterMembershipReplacement(t *testing.T) {
 		}))
 		sessionResult <- err
 	}()
+	var sessionPID int32
+	testenv.Eventually(t, "OpenSession waiting for the sandbox read", func() bool {
+		pids := lookupWaiters()
+		if len(pids) != 1 {
+			return false
+		}
+		sessionPID = pids[0]
+		return true
+	})
 	go func() {
 		_, err := member.DataPath.AuthorizeRelay(ctx, connect.NewRequest(membershipGrantRequest(newExec(org.ID, sandboxID))))
 		grantResult <- err
 	}()
 	testenv.Eventually(t, "both handlers waiting for the sandbox read", func() bool {
-		var waiters int
-		err := tx.QueryRow(ctx, `SELECT count(*) FROM pg_locks
-			WHERE relation = 'sandboxes'::regclass AND mode = 'AccessShareLock' AND NOT granted`).Scan(&waiters)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return waiters == 2
+		pids := lookupWaiters()
+		return len(pids) == 2 && slices.Contains(pids, sessionPID)
 	})
+	if withBillingWaiter {
+		t.Log("the billing SELECT stayed blocked while the probe observed one RPC, then both RPCs")
+	}
 	replaceMembership(t, peer, org)
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
@@ -296,4 +348,40 @@ func TestReauthorizeDataPathAfterMembershipReplacement(t *testing.T) {
 		t.Fatal("a rejected handler kept pending work or sent it to the agent")
 	}
 	t.Log("both HTTP/2 calls returned not_found without leaving a grant, session, or agent message")
+}
+
+func blockedSandboxReads(t *testing.T, ctx context.Context, holder pgx.Tx) (lookupPIDs, billingPIDs []int32) {
+	t.Helper()
+	// PostgreSQL caches activity for the transaction. Refresh it before each poll.
+	if _, err := holder.Exec(ctx, "SELECT pg_stat_clear_snapshot()"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := holder.Query(ctx, `SELECT DISTINCT a.pid, a.query
+		FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+		WHERE a.datname = current_database() AND a.state = 'active' AND a.wait_event_type = 'Lock'
+		  AND l.locktype = 'relation' AND l.relation = 'sandboxes'::regclass
+		  AND l.mode = 'AccessShareLock' AND NOT l.granted
+		  AND pg_backend_pid() = ANY(pg_blocking_pids(a.pid))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	const billingSuspensionSelect = "SELECT s.organization_id::text, s.sandbox_id::text, s.device_id::text, s.agent_state, s.delete_pending, false\n\t\tFROM sandboxes s JOIN organization_billing"
+	for rows.Next() {
+		var pid int32
+		var statement string
+		if err := rows.Scan(&pid, &statement); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case statement == api.SandboxPointLookupForTest:
+			lookupPIDs = append(lookupPIDs, pid)
+		case strings.HasPrefix(statement, billingSuspensionSelect):
+			billingPIDs = append(billingPIDs, pid)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return lookupPIDs, billingPIDs
 }
