@@ -1922,8 +1922,9 @@ function shellStub(bin, name, body = "") {
 const digest = `sha256:${"d".repeat(64)}`;
 
 // Runs deploy-targets.sh with stubbed `pnpm`, `docker`, `ssh`, guard and
-// provider. The guard fails once `withdrawn` exists, as when a changeset is
-// withdrawn on main. The `ssh` stub saves the remote script from standard
+// provider. The provider stub runs the local Pages ID parser and skips polling.
+// The guard fails once `withdrawn` exists, as when a changeset is withdrawn on
+// main. The `ssh` stub saves the remote script from standard
 // input to `remote-<n>.sh`. The script appends its job summary to `summary.md`
 // in the fixture directory, never to the `GITHUB_STEP_SUMMARY` file that this
 // process may inherit from a CI job; the content is returned as `summary`.
@@ -1936,7 +1937,19 @@ function runTargets(
   const bin = join(dir, "bin");
   mkdirSync(bin);
   writeFileSync(join(dir, "calls.log"), "");
-  shellStub(bin, "pnpm", pnpmBody);
+  shellStub(
+    bin,
+    "pnpm",
+    `if [[ "$1 $2 $3 $4" == "exec wrangler pages deploy" ]]; then
+  (
+    while (( $# > 0 )) && [[ "$1" != "--project-name" ]]; do shift; done
+    jq -nc --arg id "pages-\${2:?missing Pages project}" \\
+      '{type: "pages-deploy", version: 1, deployment_id: $id}' \\
+      > "\${WRANGLER_OUTPUT_FILE_PATH:?missing Wrangler output path}"
+  ) || exit 1
+fi
+${pnpmBody}`,
+  );
   shellStub(
     bin,
     "docker",
@@ -1957,7 +1970,11 @@ function runTargets(
   const providerStub = shellStub(
     bin,
     "provider",
-    'case "$1" in pages-id) echo pages ;; esac',
+    `case "$1" in
+  pages-id) exec "$REAL_DEPLOY_PROVIDER" "$@" ;;
+  wait-pages) exit 0 ;;
+  *) exit 2 ;;
+esac`,
   );
   mkdirSync(join(dir, "servers"));
   // Site outputs, relative to the working directory, as after a build.
@@ -1990,6 +2007,7 @@ function runTargets(
       SHA: "a".repeat(40),
       DEPLOY_GUARD: guardStub,
       DEPLOY_PROVIDER: providerStub,
+      REAL_DEPLOY_PROVIDER: provider,
       DROPLET_REGISTRY: "registry.digitalocean.com/delino",
       DROPLET_SSH_CONFIG: join(dir, "ssh_config"),
       SERVERS: JSON.stringify([
@@ -2040,22 +2058,33 @@ function runTargets(
 test("targets check the plan before each site upload", { skip }, (t) => {
   const result = runTargets(t, "static-sites");
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  // Command, subcommand and, for uploads and waits, the target.
-  const order = result.calls.map((call) => {
-    const words = call.split(" ").filter(Boolean);
-    const keep = words[0] === "pnpm" || words[1] === "wait-pages" ? 3 : 2;
-    return words.slice(0, keep).join(" ");
-  });
+  const docsOutput = join(result.dir, "wrangler-docs.ndjson");
+  const siteOutput = join(result.dir, "wrangler-site.ndjson");
+  const order = result.calls.map((call) =>
+    call.startsWith("pnpm exec wrangler ")
+      ? `pnpm exec wrangler ${call.match(/ --project-name (\S+)/)?.[1]}`
+      : call.trimEnd(),
+  );
   assert.deepEqual(order, [
     "guard",
-    "pnpm exec wrangler",
-    "provider pages-id",
-    "provider wait-pages docs",
+    "pnpm exec wrangler docs",
+    `provider pages-id ${docsOutput}`,
+    "provider wait-pages docs pages-docs",
     "guard",
-    "pnpm exec wrangler",
-    "provider pages-id",
-    "provider wait-pages site",
+    "pnpm exec wrangler site",
+    `provider pages-id ${siteOutput}`,
+    "provider wait-pages site pages-site",
   ]);
+  for (const [output, id] of [
+    [docsOutput, "pages-docs"],
+    [siteOutput, "pages-site"],
+  ]) {
+    assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), {
+      type: "pages-deploy",
+      version: 1,
+      deployment_id: id,
+    });
+  }
 });
 
 test("targets deploy site outputs from SITES_ROOT", { skip }, (t) => {
@@ -2082,8 +2111,8 @@ test("targets write the job summary to a fixture-local file", { skip }, (t) => {
     sites.summary,
     [
       "## Static sites",
-      "- docs@1.0.0: Cloudflare Pages project `docs`, deployment `pages`",
-      "- site@1.0.0: Cloudflare Pages project `site`, deployment `pages`",
+      "- docs@1.0.0: Cloudflare Pages project `docs`, deployment `pages-docs`",
+      "- site@1.0.0: Cloudflare Pages project `site`, deployment `pages-site`",
       "",
     ].join("\n"),
   );
