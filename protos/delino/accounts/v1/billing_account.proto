@@ -84,8 +84,9 @@ service BillingAccountService {
   rpc CreateBillingAccount(CreateBillingAccountRequest) returns (CreateBillingAccountResponse);
   // Read one billing account. Every member may call it.
   rpc GetBillingAccount(GetBillingAccountRequest) returns (GetBillingAccountResponse);
-  // List the billing accounts in which the caller has a membership, ordered
-  // by billing_account_id (creation order).
+  // List the caller's live billing accounts. New traversals order by stored
+  // create_time, then billing_account_id, both ascending. An ID-only page
+  // token continues in ascending billing_account_id order.
   rpc ListBillingAccounts(ListBillingAccountsRequest) returns (ListBillingAccountsResponse);
   // Rename a billing account. Owner and admin only.
   rpc UpdateBillingAccount(UpdateBillingAccountRequest) returns (UpdateBillingAccountResponse);
