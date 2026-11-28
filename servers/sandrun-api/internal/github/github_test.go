@@ -456,8 +456,15 @@ func TestCanceledJobSurplus(t *testing.T) {
 	// yet): GitHub refuses the removal, and the runner stays.
 	w.gh.SetBusy("sandrun-"+first.GetRunnerId(), true)
 	w.send(t, "workflow_job", job("completed", 501, 2, sandRunLinux, ""))
-	eventually(t, "GitHub runner removal refused", func() bool {
-		return strings.Contains(w.env.Logs.String(), "github_runner_removal_refused")
+	w.l.GitHub.Wait()
+	eventually(t, "GitHub runner removal refused for "+first.GetRunnerId(), func() bool {
+		for line := range strings.Lines(w.env.Logs.String()) {
+			if strings.Contains(line, `"msg":"github_runner_removal_refused"`) &&
+				strings.Contains(line, `"runner_id":"`+first.GetRunnerId()+`"`) {
+				return true
+			}
+		}
+		return false
 	})
 	stays(t, "refused runner", func() bool {
 		return w.runner(t, first.GetRunnerId()).GetState() == sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
