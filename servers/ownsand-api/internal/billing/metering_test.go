@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/tracelog"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
@@ -974,6 +976,146 @@ func TestRunSealsAndReportsOnTheLeaseHolderOnly(t *testing.T) {
 	})
 	if s, _ := f.outbox(t, org1, classA, t0); s.amount != 9 {
 		t.Fatalf("amount = %d", s.amount)
+	}
+}
+
+func TestRunTickChecksLeaseAfterSampling(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		loseLease    bool
+		rejectSample bool
+	}{
+		{name: "lease lost", loseLease: true},
+		{name: "lease retained"},
+		{name: "lease retained after sample error", rejectSample: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := t0.Add(7 * time.Minute)
+			window := billing.WindowStart(now)
+			f := newFixture(t, now)
+			ctx := t.Context()
+			m := f.metering(nil)
+			m.Add(org1, classA, t0, 2)
+			if err := m.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if tc.rejectSample {
+				// Reject the sample insert while leaving the seal transaction usable.
+				if _, err := f.db.Pool.Exec(ctx, "ALTER TABLE usage_storage_samples ADD CHECK (false) NOT VALID"); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			holder, err := f.db.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = holder.Rollback(ctx) }()
+			var initialCutoff time.Time
+			if err := holder.QueryRow(ctx, "SELECT sealed_before FROM usage_seal_state WHERE singleton FOR UPDATE").Scan(&initialCutoff); err != nil {
+				t.Fatal(err)
+			}
+			holderPID := holder.Conn().PgConn().PID()
+
+			metricsDone := make(chan struct{})
+			var firstRefresh sync.Once
+			var sealQueried atomic.Bool
+			cfg := f.db.Pool.Config()
+			cfg.ConnConfig.Tracer = &tracelog.TraceLog{
+				LogLevel: tracelog.LogLevelInfo,
+				Logger: tracelog.LoggerFunc(func(queryCtx context.Context, level tracelog.LogLevel, msg string, data map[string]any) {
+					if msg != "Query" {
+						return
+					}
+					sql, _ := data["sql"].(string)
+					switch {
+					case strings.Contains(sql, "FROM usage_seal_state WHERE singleton FOR UPDATE"):
+						sealQueried.Store(true)
+					case level == tracelog.LogLevelInfo && strings.Contains(sql, "FROM usage_outbox") && strings.Contains(sql, "array_agg(DISTINCT meter)"):
+						firstRefresh.Do(func() { close(metricsDone) })
+						// Stop the tick here so any queued tick cannot affect the assertions.
+						<-queryCtx.Done()
+					}
+				}),
+			}
+			pool, err := pgxpool.NewWithConfig(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(pool.Close)
+			timing := billing.DefaultTiming()
+			timing.Tick = 10 * time.Millisecond
+			var held atomic.Bool
+			held.Store(true)
+			m = f.metering(nil, func(o *billing.Options) {
+				o.DB = &db.DB{Pool: pool}
+				o.Timing = &timing
+				o.Held = held.Load
+			})
+			workerCtx, stop := context.WithCancel(ctx)
+			done := make(chan struct{})
+			go func() { m.Run(workerCtx); close(done) }()
+			defer func() { stop(); <-done }()
+
+			waitCtx, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+			defer cancelWait()
+			const waitingForSample = `
+				SELECT EXISTS (
+					SELECT 1 FROM pg_stat_activity
+					WHERE datname = current_database()
+						AND wait_event_type = 'Lock'
+						AND query LIKE '%FROM usage_seal_state%FOR SHARE%'
+						AND $1 = ANY(pg_blocking_pids(pid))
+				)`
+			eventually(t, "sample blocked by the seal-state row lock", func() bool {
+				var waiting bool
+				if err := f.db.Pool.QueryRow(waitCtx, waitingForSample, holderPID).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				return waiting
+			})
+			if tc.loseLease {
+				held.Store(false)
+			}
+			if err := holder.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-metricsDone:
+			case <-waitCtx.Done():
+				t.Fatal("tick did not reach the outbox metrics query")
+			}
+
+			var sampled bool
+			if err := f.db.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM usage_storage_samples WHERE window_start = $1)", window).Scan(&sampled); err != nil {
+				t.Fatal(err)
+			}
+			if want := !tc.rejectSample; sampled != want {
+				t.Errorf("sample committed = %v, want %v", sampled, want)
+			}
+			if want := !tc.loseLease; sealQueried.Load() != want {
+				t.Errorf("seal query ran = %v, want %v", sealQueried.Load(), want)
+			}
+			var cutoff time.Time
+			if err := f.db.Pool.QueryRow(ctx, "SELECT sealed_before FROM usage_seal_state WHERE singleton").Scan(&cutoff); err != nil {
+				t.Fatal(err)
+			}
+			var outboxRows, outboxQuantity, outboxAmount int64
+			if err := f.db.Pool.QueryRow(ctx, `SELECT count(*), COALESCE(sum(quantity), 0)::bigint, COALESCE(sum(amount_usd_micros), 0)::bigint
+				FROM usage_outbox`).Scan(&outboxRows, &outboxQuantity, &outboxAmount); err != nil {
+				t.Fatal(err)
+			}
+			counter := f.counter(t, org1, classA, t0)
+			if tc.loseLease {
+				if !cutoff.Equal(initialCutoff) || counter != 2 || outboxRows != 0 {
+					t.Errorf("after lease loss: cutoff=%v, counter=%d, outbox rows=%d, want %v, 2, 0", cutoff, counter, outboxRows, initialCutoff)
+				}
+			} else if !cutoff.Equal(window) || counter != 0 || outboxRows != 1 || outboxQuantity != 2 || outboxAmount != 9 {
+				t.Errorf("after seal: cutoff=%v, counter=%d, outbox rows=%d, quantity=%d, amount=%d, want %v, 0, 1, 2, 9",
+					cutoff, counter, outboxRows, outboxQuantity, outboxAmount, window)
+			}
+		})
 	}
 }
 

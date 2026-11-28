@@ -209,8 +209,11 @@ func (m *Metering) runTick(ctx context.Context) {
 			if window := WindowStart(m.now()); m.sampled.Load() != window.Unix() {
 				_, _ = m.SampleStorage(ctx)
 			}
-			if n, err := m.Seal(ctx); err == nil && n > 0 {
-				m.WakeReporter()
+			// Sampling can block while this instance loses the lease.
+			if m.held() {
+				if n, err := m.Seal(ctx); err == nil && n > 0 {
+					m.WakeReporter()
+				}
 			}
 		}
 		_ = m.RefreshMetrics(ctx)
