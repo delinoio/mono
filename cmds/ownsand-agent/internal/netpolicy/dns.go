@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -124,7 +125,7 @@ func (r *dnsRejectLog) note(logger *slog.Logger, transport DNSTransport, limit i
 type DNSForwarder struct {
 	udp      *net.UDPConn
 	tcp      *net.TCPListener
-	upstream string
+	upstream atomic.Pointer[string]
 	logger   *slog.Logger
 	wg       sync.WaitGroup
 	closed   chan struct{}
@@ -146,20 +147,29 @@ type DNSForwarder struct {
 // host:port (keeping the interface zone of a scoped IPv6 address, for
 // example [fe80::53%eth0]:53), or 127.0.0.53:53 (systemd-resolved) when none is listed.
 func HostResolver(path string) string {
+	if upstream := readHostResolver(path); upstream != "" {
+		return upstream
+	}
+	return "127.0.0.53:53"
+}
+
+// readHostResolver returns an empty address when no valid nameserver can be read.
+func readHostResolver(path string) string {
 	f, err := os.Open(path)
-	if err == nil {
-		defer f.Close()
-		sc := bufio.NewScanner(f)
-		for sc.Scan() {
-			fields := strings.Fields(sc.Text())
-			if len(fields) >= 2 && fields[0] == "nameserver" {
-				if a, err := netip.ParseAddr(fields[1]); err == nil {
-					return netip.AddrPortFrom(a, 53).String()
-				}
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) >= 2 && fields[0] == "nameserver" {
+			if a, err := netip.ParseAddr(fields[1]); err == nil {
+				return netip.AddrPortFrom(a, 53).String()
 			}
 		}
 	}
-	return "127.0.0.53:53"
+	return ""
 }
 
 // StartDNS listens on listen (UDP and TCP) and forwards to upstream.
@@ -186,12 +196,17 @@ func startDNS(listen netip.AddrPort, upstream string, logger *slog.Logger, limit
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	f := &DNSForwarder{udp: udp, tcp: tcp, upstream: upstream, logger: logger, closed: make(chan struct{}), ctx: ctx, cancel: cancel, conns: map[net.Conn]bool{},
+	f := &DNSForwarder{udp: udp, tcp: tcp, logger: logger, closed: make(chan struct{}), ctx: ctx, cancel: cancel, conns: map[net.Conn]bool{},
 		udpSlots: make(chan struct{}, limits.maxUDPQueries), tcpSlots: make(chan struct{}, limits.maxTCPConns), limits: limits}
+	f.setUpstream(upstream)
 	f.wg.Add(2)
 	go f.serveUDP()
 	go f.serveTCP()
 	return f, nil
+}
+
+func (f *DNSForwarder) setUpstream(upstream string) {
+	f.upstream.Store(&upstream)
 }
 
 // Addr returns the UDP listen address.
@@ -277,6 +292,7 @@ func (f *DNSForwarder) serveUDP() {
 			f.udpRej.note(f.logger, DNSTransportUDP, f.limits.maxUDPQueries)
 			continue
 		}
+		upstream := *f.upstream.Load()
 		query := append([]byte(nil), buf[:n]...)
 		f.wg.Add(1)
 		go func() {
@@ -291,7 +307,7 @@ func (f *DNSForwarder) serveUDP() {
 				var d net.Dialer
 				dial = d.DialContext
 			}
-			c, err := dial(ctx, "udp", f.upstream)
+			c, err := dial(ctx, "udp", upstream)
 			if err != nil {
 				return
 			}
@@ -339,6 +355,7 @@ func (f *DNSForwarder) serveTCP() {
 		// One absolute deadline bounds the whole connection, dial and copy
 		// together, counted from admission.
 		deadline := time.Now().Add(f.limits.tcpDeadline)
+		upstream := *f.upstream.Load()
 		if f.limits.afterAdmit != nil {
 			f.limits.afterAdmit()
 		}
@@ -375,7 +392,7 @@ func (f *DNSForwarder) serveTCP() {
 				var d net.Dialer
 				dial = d.DialContext
 			}
-			up, err := dial(ctx, "tcp", f.upstream)
+			up, err := dial(ctx, "tcp", upstream)
 			if err != nil {
 				return
 			}

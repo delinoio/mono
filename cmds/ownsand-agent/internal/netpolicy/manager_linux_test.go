@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -24,7 +25,7 @@ import (
 // Run refreshes the policy periodically only while a sandbox is attached
 // and returns when its context ends.
 func TestRunRefreshesWhileAttached(t *testing.T) {
-	m := NewManager(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	m, _ := newFakeManager(t)
 	var n atomic.Int32
 	m.interval = time.Millisecond
 	m.refresh = func() error { n.Add(1); return nil }
@@ -45,9 +46,8 @@ func TestRunRefreshesWhileAttached(t *testing.T) {
 	if got := n.Load(); got != 0 {
 		t.Fatalf("%d refreshes without an attached sandbox", got)
 	}
-	m.mu.Lock()
-	m.attached["s"] = &attachment{}
-	m.mu.Unlock()
+	mustAttach(t, m, "sandbox-a")
+	n.Store(0)
 	deadline := time.Now().Add(5 * time.Second)
 	for n.Load() < 2 {
 		if time.Now().After(deadline) {
@@ -85,6 +85,8 @@ type fakeDNS struct {
 	h *fakeHost
 }
 
+func (d fakeDNS) setUpstream(string) {}
+
 func (d fakeDNS) Close() {
 	d.h.mu.Lock()
 	closing, release := d.h.dnsClosing, d.h.dnsRelease
@@ -105,11 +107,12 @@ func newFakeManager(t *testing.T) (*Manager, *fakeHost) {
 	h := &fakeHost{taps: map[string]bool{}}
 	h.logger = slog.New(slog.NewJSONHandler(&lockedWriter{h: h}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	m := NewManager(h.logger)
+	m.resolvConf = filepath.Join(t.TempDir(), "resolv.conf")
 	m.refresh = func() error { return nil }
 	m.setForwarding = func() error { return nil }
 	m.run = h.run
 	m.tableState = func() (nftTableState, error) { return nftTablePresent, nil }
-	m.startDNS = func(listen netip.AddrPort, _ string, _ *slog.Logger) (dnsCloser, error) {
+	m.startDNS = func(listen netip.AddrPort, _ string, _ *slog.Logger) (dnsForwarder, error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.startDNSErr != nil {
@@ -621,6 +624,114 @@ func TestRefreshSkipsPresentTable(t *testing.T) {
 	if after := h.log(); after != before {
 		t.Fatalf("refresh of a present table logged %s", strings.TrimPrefix(after, before))
 	}
+}
+
+func TestRefreshDNSWhileAttached(t *testing.T) {
+	m, h := newFakeManager(t)
+	applied, setApplyErr := useRealRefresh(m)
+	first, second := startGatedUpstream(t), startGatedUpstream(t)
+	first.open()
+	second.open()
+	dial := func(ctx context.Context, network, upstream string) (net.Conn, error) {
+		var d net.Dialer
+		switch upstream {
+		case "192.0.2.53:53", "127.0.0.53:53":
+			return d.DialContext(ctx, network, first.addr)
+		case "192.0.2.54:53", "[fe80::53%eth-test]:53":
+			return d.DialContext(ctx, network, second.addr)
+		default:
+			return nil, fmt.Errorf("unexpected upstream %s", upstream)
+		}
+	}
+	m.startDNS = func(_ netip.AddrPort, upstream string, logger *slog.Logger) (dnsForwarder, error) {
+		return startTestDNS(t, upstream, logger, dnsLimits{
+			maxUDPQueries: DefaultDNSMaxUDPQueries, maxTCPConns: DefaultDNSMaxTCPConns,
+			dialUDP: dial, dial: dial,
+		}), nil
+	}
+	writeResolver := func(content string) {
+		t.Helper()
+		staged := m.resolvConf + ".new"
+		if err := os.WriteFile(staged, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(staged, m.resolvConf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attach := func(id string) *DNSForwarder {
+		t.Helper()
+		mustAttach(t, m, id)
+		t.Cleanup(func() { m.Detach(id) })
+		return m.attached[id].dns.(*DNSForwarder)
+	}
+	checkQueries := func(up *gatedUpstream, forwarders ...*DNSForwarder) {
+		t.Helper()
+		udpBefore, tcpBefore := up.udpQueries.Load(), up.tcpConns.Load()
+		for _, f := range forwarders {
+			udp := dnsUDPQuery(t, f, "probe")
+			buf := make([]byte, 16)
+			n, err := udp.Read(buf)
+			if err != nil || string(buf[:n]) != "ok:probe" {
+				t.Fatalf("UDP response %q, error %v", buf[:n], err)
+			}
+			requireDNSAnswer(t, dnsTCPConn(t, f, "probe"), "probe")
+		}
+		if udp, tcp := up.udpQueries.Load()-udpBefore, up.tcpConns.Load()-tcpBefore; udp != int32(len(forwarders)) || tcp != udp {
+			t.Fatalf("expected upstream got %d UDP queries and %d TCP connections, want %d of each", udp, tcp, len(forwarders))
+		}
+	}
+
+	writeResolver("nameserver invalid\nnameserver 192.0.2.53\nnameserver 192.0.2.54\n")
+	a, b := attach("sandbox-a"), attach("sandbox-b")
+	checkQueries(first, a, b)
+	before := applied()
+
+	writeResolver("nameserver 192.0.2.54\nnameserver 192.0.2.53\n")
+	m.poll()
+	checkQueries(second, a, b)
+	if !slices.Equal(applied(), before) {
+		t.Fatal("a DNS-only change reapplied the ruleset")
+	}
+
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) { return nil, nil, errors.New("read routes failed") }
+	writeResolver("nameserver 192.0.2.53\n")
+	m.poll()
+	checkQueries(first, a, b)
+
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) { return nil, nil, nil }
+	m.tableState = func() (nftTableState, error) { return nftTableAbsent, nil }
+	setApplyErr(errors.New("apply rules failed"))
+	writeResolver("nameserver fe80::53%eth-test\n")
+	m.poll()
+	checkQueries(second, a, b)
+	if !slices.Equal(applied(), before) || m.rules != before[len(before)-1] {
+		t.Fatal("route and apply failures changed the last successful ruleset")
+	}
+	if log := h.log(); !strings.Contains(log, "read routes failed") || !strings.Contains(log, "apply rules failed") {
+		t.Fatalf("expected both policy errors in the log, got %s", log)
+	}
+
+	m.tableState = func() (nftTableState, error) { return nftTablePresent, nil }
+	setApplyErr(nil)
+	writeResolver("nameserver invalid\n")
+	m.poll()
+	checkQueries(second, a, b)
+	if err := os.Remove(m.resolvConf); err != nil {
+		t.Fatal(err)
+	}
+	m.poll()
+	checkQueries(second, a, b)
+	fallback := attach("sandbox-fallback")
+	if got := *fallback.upstream.Load(); got != "127.0.0.53:53" {
+		t.Fatalf("startup fallback = %q", got)
+	}
+	checkQueries(first, fallback)
+	checkQueries(second, a, b)
+
+	writeResolver("nameserver 192.0.2.53\n")
+	m.poll()
+	checkQueries(first, a, b, fallback)
 }
 
 func TestRefreshReappliesWhenTableProbeFails(t *testing.T) {
