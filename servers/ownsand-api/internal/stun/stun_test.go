@@ -331,15 +331,14 @@ func TestRateLimitPerSource(t *testing.T) {
 	}
 }
 
-// waitForOutcomes polls stats until at least want outcomes (responses plus
-// limited drops) are recorded, or the timeout passes. Request receipt is not a
-// completion signal because the server records the outcome after it counts the
-// request. It returns the last snapshot so callers assert on one consistent sample.
+// waitForOutcomes polls stats until a single sample has at least want requests
+// and at least want outcomes (responses plus limited drops). At the deadline,
+// it returns the last sample so callers can check the exact counts.
 func waitForOutcomes(stats func() (int64, int64, int64), want int64, timeout time.Duration) (req, resp, limited int64) {
 	deadline := time.Now().Add(timeout)
 	for {
 		req, resp, limited = stats()
-		if resp+limited >= want || !time.Now().Before(deadline) {
+		if (req >= want && resp+limited >= want) || !time.Now().Before(deadline) {
 			return req, resp, limited
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -361,10 +360,25 @@ func TestWaitForOutcomes(t *testing.T) {
 	if req != 10 || resp != 6 || limited != 4 || calls != 3 {
 		t.Fatalf("got %d/%d/%d after %d calls", req, resp, limited, calls)
 	}
+
+	samples = [][3]int64{{9, 2, 8}, {10, 2, 8}}
+	calls = 0
+	req, resp, limited = waitForOutcomes(stats, 10, 5*time.Second)
+	if req != 10 || resp != 2 || limited != 8 || calls != 2 {
+		t.Errorf("stale request count: got %d/%d/%d after %d calls, want 10/2/8 after 2 calls", req, resp, limited, calls)
+	}
+
 	// Missing outcomes return the incomplete sample at the deadline.
 	req, resp, limited = waitForOutcomes(func() (int64, int64, int64) { return 10, 5, 4 }, 10, 30*time.Millisecond)
 	if resp+limited != 9 || req != 10 {
 		t.Fatalf("timeout sample %d/%d/%d", req, resp, limited)
+	}
+
+	timeout := 30 * time.Millisecond
+	start := time.Now()
+	req, resp, limited = waitForOutcomes(func() (int64, int64, int64) { return 9, 2, 8 }, 10, timeout)
+	if elapsed := time.Since(start); req != 9 || resp != 2 || limited != 8 || elapsed < timeout {
+		t.Errorf("stale request timeout: got %d/%d/%d after %s, want 9/2/8 after at least %s", req, resp, limited, elapsed, timeout)
 	}
 }
 
