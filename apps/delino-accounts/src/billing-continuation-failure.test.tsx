@@ -15,6 +15,7 @@ import {
   addLedgerEntries,
   addUsageRows,
   createFakeApi,
+  numbered,
   OWNER,
 } from "./testing/fake-api.ts";
 import { listRows } from "./testing/list-rows.ts";
@@ -68,15 +69,18 @@ function pageTokens(api: FakeApi, method: string) {
  * which costs tens of milliseconds, and `waitFor` and `findBy*` repeat it on
  * every DOM mutation while the lists render. On a loaded CI runner that made
  * the tests exceed the 5 s test timeout. See `testing/list-rows.ts`; the
- * usage table rows are the `tr` elements of the table.
+ * usage table rows are scoped to the body of the usage table.
  */
+function usageRows() {
+  const body = document.querySelector(
+    '[aria-labelledby="usage-table-caption"] > table > tbody',
+  );
+  if (body === null) throw new Error("no usage table body");
+  return Array.from(body.querySelectorAll<HTMLTableRowElement>(":scope > tr"));
+}
+
 function rowCount(list: string | undefined) {
-  if (list === undefined) {
-    const table = document.querySelector("table");
-    if (table === null) throw new Error("no table");
-    return table.querySelectorAll("tr").length - 1;
-  }
-  return listRows(list).length;
+  return list === undefined ? usageRows().length : listRows(list).length;
 }
 
 /**
@@ -98,35 +102,68 @@ const lists = [
     name: "invoices",
     method: "ListInvoices",
     tab: "Invoices",
-    list: "Invoices" as string | undefined,
+    list: "Invoices",
     more: "Show older invoices",
-    total: 201,
     firstPage: 200,
-    seed: (account: ReturnType<typeof accountOf>) =>
-      addInvoices(account, 201 - account.invoices.length),
+    readRowIdentities() {
+      return listRows(this.list).map(
+        (row) => row.querySelector("code")?.textContent,
+      );
+    },
+    seed(account: ReturnType<typeof accountOf>) {
+      addInvoices(account, 201 - account.invoices.length);
+      return account.invoices.map((invoice) => invoice.paddleTransactionId);
+    },
   },
   {
     name: "ledger",
     method: "ListLedgerEntries",
     tab: "Usage",
-    list: "Ledger entries" as string | undefined,
+    list: "Ledger entries",
     more: "Show older entries",
-    total: 61,
     firstPage: 50,
-    seed: (account: ReturnType<typeof accountOf>) =>
-      addLedgerEntries(account, 61 - account.ledger.length),
+    readRowIdentities() {
+      return listRows(this.list).map((row) =>
+        row
+          .querySelector(".list-main .muted")
+          ?.textContent?.split(" · ")
+          .slice(1)
+          .join(" · "),
+      );
+    },
+    seed(account: ReturnType<typeof accountOf>) {
+      const generatedCount = 61 - account.ledger.length;
+      addLedgerEntries(account, generatedCount);
+      // Newest first. The generated Nov 2 entries share a timestamp, so
+      // their IDs put them in descending order between the two seeded entries.
+      return [
+        "OwnSand · org-1 · Relay egress · 1,048,576 bytes",
+        ...Array.from(
+          { length: generatedCount },
+          (_, i) =>
+            `OwnSand · org-${numbered(generatedCount - i)} · Relay egress · 1 byte`,
+        ),
+        "Paddle txn_sub1",
+      ];
+    },
   },
   {
     name: "usage summary",
     method: "ListUsageSummary",
     tab: "Usage",
-    list: undefined as string | undefined,
+    list: undefined,
     more: "Show more usage",
-    total: 201,
     firstPage: 200,
-    seed: (account: ReturnType<typeof accountOf>) => {
+    readRowIdentities() {
+      return usageRows().map((row) => [
+        row.cells[1]?.textContent,
+        row.cells[2]?.textContent,
+      ]);
+    },
+    seed(account: ReturnType<typeof accountOf>) {
       account.usage.length = 0;
       addUsageRows(account, 201, 1_000_000n);
+      return account.usage.map((row) => [row.organizationId, "Relay egress"]);
     },
   },
 ];
@@ -138,22 +175,24 @@ async function openList(
 ) {
   const api = createFakeApi();
   api.userId = OWNER;
-  entry.seed(accountOf(api));
+  const expectedRows = entry.seed(accountOf(api));
   const { signIns } = renderApp(ACCOUNT_PATH, { api });
   await click(await screen.findByRole("tab", { name: entry.tab }));
   await screen.findByText(entry.more, { selector: "button" });
   await waitFor(() => expect(rowCount(entry.list)).toBe(entry.firstPage));
   if (failure !== undefined) api.failContinuation.set(entry.method, failure);
-  return { api, signIns };
+  return { api, expectedRows, signIns };
 }
 
 for (const entry of lists) {
   describe(`${entry.name}: a failed next page`, () => {
     test("keeps the rows, shows the notice and retries the failed cursor once", async () => {
-      const { api } = await openList(
+      const { api, expectedRows } = await openList(
         entry,
         new ConnectError("the page service is down", Code.Unavailable),
       );
+      const firstPageRows = expectedRows.slice(0, entry.firstPage);
+      expect(entry.readRowIdentities()).toEqual(firstPageRows);
       const isUsageSummary = entry.method === "ListUsageSummary";
       const usageTotal = () => screen.getByLabelText("Usage total").textContent;
       if (isUsageSummary) {
@@ -165,7 +204,7 @@ for (const entry of lists) {
       const notice = (await screen.findByText(UNAVAILABLE)).closest(
         '[role="alert"]',
       ) as HTMLElement;
-      expect(rowCount(entry.list)).toBe(entry.firstPage);
+      expect(entry.readRowIdentities()).toEqual(firstPageRows);
       if (isUsageSummary) expect(usageTotal()).toBe("$201.00");
       const requestsBeforeRetry = pageTokens(api, entry.method);
       expect(requestsBeforeRetry).toEqual(["", expect.stringMatching(/./)]);
@@ -174,12 +213,12 @@ for (const entry of lists) {
       expect(moreButton(entry.more)!.disabled).toBe(false);
 
       await click(within(notice).getByRole("button", { name: TRY_AGAIN }));
-      await waitFor(() => expect(rowCount(entry.list)).toBe(entry.total));
+      await waitFor(() =>
+        expect(rowCount(entry.list)).toBe(expectedRows.length),
+      );
       if (isUsageSummary) {
         expect(usageTotal()).toBe("$203.00");
-        expect(
-          screen.getByText("usage-org-0201").closest("tr")?.textContent,
-        ).toContain("$3.00");
+        expect(usageRows().at(-1)?.cells[4]?.textContent).toBe("$3.00");
       }
       // The retry sent the failed cursor, not a refetch of the first page.
       expect(pageTokens(api, entry.method)).toEqual([
@@ -188,6 +227,7 @@ for (const entry of lists) {
       ]);
       expect(screen.queryByText(UNAVAILABLE)).toBeNull();
       expect(moreButton(entry.more)).toBeNull();
+      expect(entry.readRowIdentities()).toEqual(expectedRows);
     });
 
     test("an ended session keeps the rows and offers the sign-in action", async () => {
