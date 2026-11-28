@@ -20,7 +20,7 @@ import { RequestSchema, RunnerSchema } from "@delino/sandrun-protos/v1/work_pb";
 import { WatchQueueEventKind } from "sandrun-sdk";
 import { nextSetupStep, SetupStep } from "./components/setup.tsx";
 import { AuthMode, DEFAULT_API_ORIGIN, readConsoleConfig } from "./config.ts";
-import { formatSpan, queueWaitMs } from "./format.ts";
+import { formatDuration, formatSpan, queueWaitMs } from "./format.ts";
 import {
   emptyProfileForm,
   formFromProfile,
@@ -877,6 +877,11 @@ describe("queue view", () => {
     expect(order).toEqual(["c-before-epoch", "a-missing", "b-epoch"]);
   });
 
+  test("rounds elapsed queue waits to whole seconds", () => {
+    expect(formatSpan(300, sourceLocalizer)).toBe("0 s");
+    expect(formatSpan(500, sourceLocalizer)).toBe("1 s");
+  });
+
   test("measures the queue wait until start, end or now", () => {
     expect(queueWaitMs({ queuedAt: timestampFromMs(1000) }, 61_000)).toBe(
       60_000,
@@ -894,6 +899,23 @@ describe("queue view", () => {
       ),
     ).toBe(4000);
     expect(formatSpan(3_900_000, sourceLocalizer)).toBe("1 h 5 min");
+  });
+});
+
+describe("configured durations", () => {
+  test.each([
+    [undefined, "—"],
+    [0, "0 s"],
+    [1, "1 ms"],
+    [300, "300 ms"],
+    [499, "499 ms"],
+    [500, "500 ms"],
+    [999, "999 ms"],
+    [1000, "1 s"],
+    [300_000, "5 min"],
+  ] as const)("formats %s milliseconds as %s", (ms, expected) => {
+    const duration = ms === undefined ? undefined : durationFromMs(ms);
+    expect(formatDuration(duration, sourceLocalizer)).toBe(expected);
   });
 });
 

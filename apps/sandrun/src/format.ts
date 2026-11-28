@@ -325,7 +325,14 @@ export function formatDuration(
   localizer: Localizer,
 ): string {
   const ms = durationMs(duration);
-  return ms === undefined ? "—" : formatSpan(ms, localizer);
+  if (ms === undefined) return "—";
+  if (ms > 0 && ms < 1000) {
+    return new Intl.NumberFormat(localizer.lang, {
+      style: "unit",
+      unit: "millisecond",
+    }).format(ms);
+  }
+  return formatSpan(ms, localizer);
 }
 
 /**

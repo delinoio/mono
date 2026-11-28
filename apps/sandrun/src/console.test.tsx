@@ -3297,6 +3297,33 @@ describe("runner profiles", () => {
     },
   );
 
+  test("shows a subsecond maximum queue wait in the profile row", async () => {
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        const response = await mock.unary(method, ...args);
+        if (
+          method.name === RunnerProfileService.method.listRunnerProfiles.name
+        ) {
+          const message = response.message as ListRunnerProfilesResponse;
+          message.profiles = message.profiles.map((profile) =>
+            profile.runnerProfileId === MOCK_IDS.linuxProfile
+              ? { ...profile, maxQueueWait: durationFromMs(300) }
+              : profile,
+          );
+        }
+        return response;
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, { transport });
+
+    const row = (
+      await screen.findByText("linux-build · GitHub job · Linux")
+    ).closest("li")!;
+    expect(row.textContent).toContain("queue wait at most 300 ms");
+  });
+
   test("follows the token after a full second page to an empty terminal page", async () => {
     const mock = createMockTransport({ runnerProfileCount: 400 });
     const pages: ListRunnerProfilesRequest[] = [];
