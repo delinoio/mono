@@ -1765,6 +1765,101 @@ func TestSyncWarnsWhenPendingUpdatesCannotBeRemoved(t *testing.T) {
 	checkPendingUpdates(t, ws)
 }
 
+func TestSyncApplyDirectoryMode(t *testing.T) {
+	needPOSIX(t)
+	tarBin, err := exec.LookPath("tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LC_ALL", "C")
+	t.Setenv("TAR_OPTIONS", "")
+	t.Setenv("SANDRUN_TEST_REAL_TAR", tarBin)
+
+	for _, tc := range []struct {
+		name            string
+		versionResponse string
+	}{
+		{name: "GNU tar"},
+		{name: "BSD version", versionResponse: "printf '%s\\n' 'bsdtar 3.7.2'; exit 0"},
+		{name: "failed version probe", versionResponse: "printf '%s\\n' 'tar (GNU tar) 1.35'; exit 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := "#!/bin/sh\numask 022\n"
+			if tc.versionResponse == "" {
+				if version, err := exec.Command(tarBin, "--version").Output(); err != nil || !bytes.HasPrefix(version, []byte("tar (GNU tar) ")) {
+					t.Skipf("requires GNU tar: %q (%v)", version, err)
+				}
+			} else {
+				script += `if [ "$1" = --version ]; then
+  ` + tc.versionResponse + `
+fi
+if [ "$#" -ne 5 ] || [ "$1 $2 $3 $4" != "-x -m -o -f" ]; then
+  printf 'unexpected extraction arguments: %s\n' "$*" >&2
+  exit 1
+fi
+`
+			}
+			script += "exec \"$SANDRUN_TEST_REAL_TAR\" \"$@\"\n"
+			bin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bin, "tar"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			ws := ds.GetWorkspacePath()
+			const tracked = "private/tracked.txt"
+			const tool = "new/nested/tool"
+			dir := newRepo(t, map[string]string{tracked: "old"}, nil, "")
+			params := SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}
+			if _, err := c.Sync(t.Context(), params); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(filepath.Join(ws, "private"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			const changed = "changed\x00\r\n"
+			if err := os.WriteFile(filepath.Join(dir, tracked), []byte(changed), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, tool)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			const executable = "#!/bin/sh\nprintf 'synced'\n"
+			toolPath := filepath.Join(dir, tool)
+			if err := os.WriteFile(toolPath, []byte(executable), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(toolPath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if res, err := c.Sync(t.Context(), params); err != nil || res.Uploaded != 2 {
+				t.Fatalf("incremental sync = %+v, %v, want two uploaded files", res, err)
+			}
+			if got := readGuest(t, ds, tracked); got != changed {
+				t.Errorf("updated file = %q, want %q", got, changed)
+			}
+			if got := readGuest(t, ds, tool); got != executable {
+				t.Errorf("new executable = %q, want %q", got, executable)
+			}
+			modes := map[string]fs.FileMode{"new": 0o755, "new/nested": 0o755, tool: 0o755}
+			if tc.versionResponse == "" {
+				modes["private"] = 0o700
+			}
+			for path, want := range modes {
+				info, err := os.Stat(filepath.Join(ws, path))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := info.Mode().Perm(); got != want {
+					t.Errorf("%s mode = %04o, want %04o", path, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestSyncRetryFileToDirectory(t *testing.T) {
 	needPOSIX(t)
 	// Exercise a nested archive parent with a leading dash and a newline.
@@ -2894,6 +2989,7 @@ func TestSyncApplyStreamLoss(t *testing.T) {
 			gate := t.TempDir()
 			script := `#!/bin/sh
 set -eu
+if [ "$1" = --version ]; then exec "$SANDRUN_TEST_REAL_TAR" "$@"; fi
 : > "$SANDRUN_TEST_GATE/started"
 while [ ! -f "$SANDRUN_TEST_GATE/release" ]; do sleep 0.02; done
 exec "$SANDRUN_TEST_REAL_TAR" "$@"
