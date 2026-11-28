@@ -1149,7 +1149,8 @@ func TestSyncManifestLimitGuest(t *testing.T) {
 				t.Fatal(err)
 			}
 			res, err := c.sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}, limit)
-			if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "guest manifest exceeds the size limit") {
+			if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition ||
+				!strings.Contains(err.Error(), "sync guest manifest exceeds the size limit of 200 bytes") {
 				t.Fatalf("oversized guest manifest = %+v, %v", res, err)
 			}
 			if writes, execs := srv.Calls(writeProc), srv.Calls(execProc); writes != 0 || execs != wantExecs {
@@ -1683,6 +1684,9 @@ func TestSyncStopsBeforeApplyOnPendingUpdateError(t *testing.T) {
 			res, err := c.sync(t.Context(), params, 512)
 			if res != nil || connect.CodeOf(err) != tc.code || !strings.Contains(err.Error(), "pending update") {
 				t.Fatalf("sync with pending update error = %+v, %v", res, err)
+			}
+			if tc.name == "oversized list" && !strings.Contains(err.Error(), "sync pending updates exceed the size limit of 512 bytes") {
+				t.Errorf("oversized guest pending list returned: %v", err)
 			}
 			if got := readGuest(t, ds, "a.txt"); got != "alpha" {
 				t.Fatalf("guest file changed after pending update error: %q", got)
@@ -3303,7 +3307,7 @@ func TestDownloadHardLinkFallback(t *testing.T) {
 			download := c.Download
 			if tc.extractor.link != nil {
 				download = func(ctx context.Context, p DownloadParams) (*DownloadResult, error) {
-					return c.download(ctx, p, tc.extractor)
+					return c.download(ctx, p, downloadLimits{file: DownloadFileLimit, total: DownloadTotalLimit}, tc.extractor)
 				}
 			}
 			res, err := download(ctx, params)

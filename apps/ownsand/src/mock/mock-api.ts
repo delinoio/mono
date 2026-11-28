@@ -764,18 +764,39 @@ function canonicalizeCreateSandbox(
   });
 }
 
-/** An explicit device is exclusive and its permanent rules precede availability. */
+/**
+ * An explicit device is exclusive and its permanent rules precede availability.
+ * Automatic placement uses the first compatible online device in fixture order.
+ * A compatible offline device makes a failed automatic placement retryable.
+ */
 function placeSandbox(
   devices: Device[],
   placement: Placement | undefined,
   source: ResolvedSandboxSource,
-): Device | undefined {
+): Device {
   const deviceId = placement?.deviceId;
   if (deviceId === undefined || deviceId === "") {
-    return devices.find(
+    const online = devices.find(
       (d) =>
         d.state === DeviceState.ONLINE &&
         placementMismatch(d, placement, source) === undefined,
+    );
+    if (online !== undefined) return online;
+    if (
+      devices.some(
+        (d) =>
+          d.state === DeviceState.OFFLINE &&
+          placementMismatch(d, placement, source) === undefined,
+      )
+    ) {
+      throw new ConnectError(
+        "a compatible device is offline",
+        Code.Unavailable,
+      );
+    }
+    throw new ConnectError(
+      "no device can run this sandbox",
+      Code.FailedPrecondition,
     );
   }
   const device = devices.find(
@@ -1752,12 +1773,6 @@ export function createMockTransport(
           );
         }
         const device = placeSandbox(org.devices, req.placement, source);
-        if (device === undefined) {
-          throw new ConnectError(
-            "no device can run this sandbox",
-            Code.FailedPrecondition,
-          );
-        }
         const createTime = timestampFromMs(nowMs);
         const sandbox = create(SandboxSchema, {
           sandboxId: newMockId(),
