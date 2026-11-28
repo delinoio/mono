@@ -31,5 +31,7 @@ export function useDevices(organizationId: string) {
       ),
     [data],
   );
-  return { devices, boundary, pages };
+  const isComplete =
+    query.isSuccess && query.fetchStatus === "idle" && !query.hasNextPage;
+  return { devices, boundary, pages, isComplete };
 }

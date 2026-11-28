@@ -224,6 +224,7 @@
   "sandboxes.filters.allStates": "모든 상태",
   "sandboxes.filters.device": "기기",
   "sandboxes.filters.allDevices": "모든 기기",
+  "sandboxes.filters.deviceMissing": "{device} 기기가 더 이상 기기 목록에 없습니다. 필터를 해제하려면 {allDevices}를 선택하세요.",
   "sandboxes.filters.showEnded": "종료된 샌드박스 표시",
   "sandboxes.loading": "샌드박스 불러오는 중",
   "sandboxes.empty.title": "조건에 맞는 샌드박스가 없습니다",

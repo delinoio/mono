@@ -224,6 +224,7 @@
   "sandboxes.filters.allStates": "Alle Status",
   "sandboxes.filters.device": "Gerät",
   "sandboxes.filters.allDevices": "Alle Geräte",
+  "sandboxes.filters.deviceMissing": "{device} ist nicht mehr in der Geräteübersicht. Wähle „{allDevices}“, um den Filter zu entfernen.",
   "sandboxes.filters.showEnded": "Beendete Sandboxes anzeigen",
   "sandboxes.loading": "Sandboxes werden geladen",
   "sandboxes.empty.title": "Keine passenden Sandboxes",

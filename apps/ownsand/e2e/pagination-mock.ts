@@ -61,6 +61,7 @@ import {
   lastKnownStateCases,
   withLastKnownState,
 } from "./sandbox-last-known-state-fixture.ts";
+import { sandboxDeviceFilterTransport } from "./sandbox-device-filter-fixture.ts";
 import { browserSandboxTransitionMock } from "./sandbox-transition-mock.ts";
 
 const lists = {
@@ -199,6 +200,9 @@ function billingUsageRefreshTransport(userId?: string): Transport {
 }
 
 export function createMockTransport(): Transport {
+  if (sessionStorage.getItem("ownsand-e2e-device-filter") === "true") {
+    return sandboxDeviceFilterTransport();
+  }
   const billingUsageRole = sessionStorage.getItem(
     "ownsand-e2e-billing-usage-role",
   );

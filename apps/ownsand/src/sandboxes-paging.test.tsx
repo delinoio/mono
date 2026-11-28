@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { SandboxState } from "@delino/ownsand-protos/v1/common_pb";
-import type {
-  ListSandboxesRequest,
-  ListSandboxesResponse,
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import {
+  type ListSandboxesRequest,
+  type ListSandboxesResponse,
+  SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
-import type { Transport } from "@connectrpc/connect";
+import {
+  Code,
+  ConnectError,
+  createClient,
+  type Transport,
+} from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
+import { QueryClient } from "@tanstack/react-query";
 import {
   afterEach,
   beforeEach,
@@ -23,7 +32,12 @@ import {
 import { toast } from "delino-ui/toast";
 import { POLL_INTERVAL_MS } from "./api.ts";
 import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
-import { TEST_SETUP_MS, renderConsole, settle } from "./test-support.tsx";
+import {
+  holdingTransport,
+  TEST_SETUP_MS,
+  renderConsole,
+  settle,
+} from "./test-support.tsx";
 
 /** The longest wait for one condition; a loaded CI runner needs more than one second. */
 const WAIT = { timeout: 10_000 };
@@ -189,3 +203,112 @@ describe("sandboxes page against the mock paging", () => {
     WAIT.timeout + TEST_SETUP_MS,
   );
 });
+
+test(
+  "a complete inventory controls the missing-device status without clearing the filter",
+  async () => {
+    const mock = createMockTransport();
+    const restored = createMockTransport();
+    let holdInventory = false;
+    let restoreDevice = false;
+    const requests: ListSandboxesRequest[] = [];
+    const recording: Transport = {
+      ...mock,
+      unary(method, ...args) {
+        if (method.name === "ListSandboxes") {
+          requests.push(args[3] as ListSandboxesRequest);
+        }
+        const inventory = method.name === "ListDevices" && restoreDevice;
+        return (inventory ? restored : mock).unary(method, ...args);
+      },
+    };
+    const { transport, calls } = holdingTransport(
+      ["ListDevices"],
+      () => holdInventory,
+      recording,
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const inventoryKey = createConnectQueryKey({
+      schema: DeviceService.method.listDevices,
+      cardinality: "infinite",
+    });
+    const sandboxesKey = createConnectQueryKey({
+      schema: SandboxService.method.listSandboxes,
+      cardinality: "infinite",
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+      transport,
+      queryClient,
+    });
+
+    const chooseDevice = async (name: string) => {
+      fireEvent.click(
+        await screen.findByRole("combobox", { name: "Device" }, WAIT),
+      );
+      fireEvent.click(await screen.findByRole("option", { name }, WAIT));
+    };
+    const missing =
+      "build-box-1 is no longer in the device inventory. Select All devices to clear the filter.";
+    await screen.findAllByRole("cell", { name: "build-box-1" }, WAIT);
+    await chooseDevice("build-box-1");
+    const devices = createClient(DeviceService, mock);
+    await devices.removeDevice({
+      organizationId: MOCK_IDS.acme,
+      deviceId: MOCK_IDS.buildBox,
+    });
+
+    holdInventory = true;
+    void queryClient.refetchQueries({ queryKey: inventoryKey });
+    await settle();
+    expect(calls.ListDevices).toHaveLength(1);
+    expect(screen.queryByText(missing)).toBeNull();
+    calls.ListDevices![0]!.settle(
+      new ConnectError("Inventory timeout", Code.Unavailable),
+    );
+    await screen.findByRole("button", { name: "Try again" }, WAIT);
+    expect(screen.queryByText(missing)).toBeNull();
+
+    holdInventory = false;
+    await act(async () =>
+      queryClient.refetchQueries({ queryKey: inventoryKey }),
+    );
+    expect(
+      (await screen.findByText(missing, {}, WAIT)).getAttribute("role"),
+    ).toBe("status");
+    await act(async () =>
+      queryClient.refetchQueries({ queryKey: sandboxesKey, type: "active" }),
+    );
+    expect(requests.at(-1)?.deviceId).toBe(MOCK_IDS.buildBox);
+    await screen.findByText("No sandboxes match", {}, WAIT);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Show ended sandboxes" }),
+    );
+    await waitFor(() => expect(rows()).toHaveLength(3), WAIT);
+    expect(requests.at(-1)).toMatchObject({
+      deviceId: MOCK_IDS.buildBox,
+      includeEnded: true,
+    });
+
+    restoreDevice = true;
+    await act(async () =>
+      queryClient.refetchQueries({ queryKey: inventoryKey }),
+    );
+    await waitFor(() => expect(screen.queryByText(missing)).toBeNull(), WAIT);
+    expect(screen.getByRole("combobox", { name: "Device" }).textContent).toBe(
+      "build-box-1",
+    );
+
+    restoreDevice = false;
+    await act(async () =>
+      queryClient.refetchQueries({ queryKey: inventoryKey }),
+    );
+    await screen.findByText(missing, {}, WAIT);
+    await chooseDevice("All devices");
+    await screen.findByRole("cell", { name: "studio-mac" }, WAIT);
+    expect(screen.queryByText(missing)).toBeNull();
+    expect(requests.at(-1)?.deviceId).toBeUndefined();
+  },
+  12 * WAIT.timeout + TEST_SETUP_MS,
+);

@@ -99,7 +99,10 @@ export function SandboxesPage() {
   const i18n = useI18n();
   const { t } = i18n;
   const [state, setState] = useState<string>(ALL);
-  const [deviceId, setDeviceId] = useState<string>(ALL);
+  const [deviceFilter, setDeviceFilter] = useState<{
+    id: string;
+    name: string | undefined;
+  } | null>(null);
   const [includeEnded, setIncludeEnded] = useState(false);
   const [creating, setCreating] = useState(false);
   const deviceList = useDevices(organizationId);
@@ -108,6 +111,17 @@ export function SandboxesPage() {
     () => new Map(devices.map((d) => [d.deviceId, d.name])),
     [devices],
   );
+  const deviceId = deviceFilter?.id;
+  const deviceName =
+    deviceId === undefined ? undefined : deviceNames.get(deviceId);
+  // Keep the last name shown for the selected device across inventory refreshes.
+  if (deviceFilter && deviceName && deviceName !== deviceFilter.name) {
+    setDeviceFilter({ id: deviceFilter.id, name: deviceName });
+  }
+  const missingDeviceLabel =
+    deviceFilter && deviceList.isComplete && !deviceNames.has(deviceFilter.id)
+      ? deviceFilter.name || deviceFilter.id
+      : undefined;
   const transport = useTransport();
   const listOptions = createInfiniteQueryOptions(
     SandboxService.method.listSandboxes,
@@ -116,7 +130,7 @@ export function SandboxesPage() {
       pageSize: 50,
       pageToken: "",
       state: state === ALL ? undefined : (Number(state) as SandboxState),
-      deviceId: deviceId === ALL ? undefined : deviceId,
+      deviceId,
       includeEnded,
     },
     {
@@ -205,8 +219,14 @@ export function SandboxesPage() {
         </Select>
         <Select
           label={t("sandboxes.filters.device")}
-          value={deviceId}
-          onValueChange={(v) => setDeviceId(v ?? ALL)}
+          value={deviceId ?? ALL}
+          onValueChange={(id) =>
+            setDeviceFilter(
+              id === null || id === ALL
+                ? null
+                : { id, name: deviceNames.get(id) },
+            )
+          }
         >
           <SelectOption value={ALL}>
             {t("sandboxes.filters.allDevices")}
@@ -222,6 +242,14 @@ export function SandboxesPage() {
           checked={includeEnded}
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
+      </div>
+      <div className="muted device-filter-status" role="status">
+        {missingDeviceLabel
+          ? t("sandboxes.filters.deviceMissing", {
+              device: missingDeviceLabel,
+              allDevices: t("sandboxes.filters.allDevices"),
+            })
+          : null}
       </div>
       {creating ? null : <DeviceListNotice list={deviceList} />}
       <QueryBoundary query={boundaryQuery} loading={t("sandboxes.loading")}>

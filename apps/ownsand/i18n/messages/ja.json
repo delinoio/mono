@@ -224,6 +224,7 @@
   "sandboxes.filters.allStates": "すべての状態",
   "sandboxes.filters.device": "デバイス",
   "sandboxes.filters.allDevices": "すべてのデバイス",
+  "sandboxes.filters.deviceMissing": "{device} はデバイス一覧に表示されなくなりました。フィルターを解除するには、{allDevices}を選択してください。",
   "sandboxes.filters.showEnded": "終了済みのサンドボックスを表示",
   "sandboxes.loading": "サンドボックスを読み込み中",
   "sandboxes.empty.title": "条件に一致するサンドボックスがありません",
