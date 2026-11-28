@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
@@ -29,18 +30,133 @@ func pendingFinals(c *Conn) int {
 	return c.pendingFinals
 }
 
+const (
+	closeAssertionTimeout     = time.Second
+	relayWorkerCleanupTimeout = 2 * time.Second
+)
+
+func waitForRelayTestWorker(done <-chan struct{}, timeout time.Duration) bool {
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+	}
+	// The timer and the completion signal can both be ready.
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
 // closeReturnsPromptly runs s.Close and fails when it blocks.
 func closeReturnsPromptly(t *testing.T, s *Stream, sendClose bool) {
 	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		s.Close(sendClose)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
+	if !runCloseTestWorker(func() { s.Close(sendClose) }, t.Cleanup, func() {
+		t.Error("Stream.Close worker was still running at the cleanup deadline")
+	}) {
 		t.Fatal("Stream.Close blocked while the outbound queue was full")
+	}
+}
+
+func runCloseTestWorker(closeStream func(), registerCleanup func(func()), reportStuck func()) bool {
+	deadline := time.Now().Add(closeAssertionTimeout)
+	done := make(chan struct{})
+	registerCleanup(func() {
+		if !waitForRelayTestWorker(done, relayWorkerCleanupTimeout) {
+			reportStuck()
+		}
+	})
+
+	var returnedPromptly bool
+	go func() {
+		defer close(done)
+		// Check the deadline here too in case this worker starts after
+		// the assertion times out.
+		if time.Now().Before(deadline) {
+			closeStream()
+			returnedPromptly = time.Now().Before(deadline)
+		}
+	}()
+	return waitForRelayTestWorker(done, time.Until(deadline)) && returnedPromptly
+}
+
+func TestCloseWorkerSkipsExpiredInvocation(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		called := make(chan struct{})
+		var cleanup func()
+		if runCloseTestWorker(func() { close(called) }, func(fn func()) {
+			cleanup = fn
+			time.Sleep(closeAssertionTimeout)
+		}, func() {
+			t.Error("cleanup timed out waiting for the pending close worker")
+		}) {
+			t.Error("close reported success after its deadline")
+		}
+		cleanup()
+		select {
+		case <-called:
+			t.Error("close callback started after its deadline")
+		default:
+		}
+	})
+}
+
+func TestCloseWorkerCleanupAfterTimeout(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		wantStuck bool
+	}{
+		{name: "released during cleanup"},
+		{name: "blocked past cleanup deadline", wantStuck: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				entered := make(chan struct{})
+				release := make(chan struct{})
+				finished := make(chan struct{})
+				releaseClose := sync.OnceFunc(func() { close(release) })
+				defer releaseClose()
+
+				var cleanup func()
+				stuck := false
+				if runCloseTestWorker(func() {
+					close(entered)
+					<-release
+					close(finished)
+				}, func(fn func()) { cleanup = fn }, func() { stuck = true }) {
+					t.Error("close reported success while its callback was blocked")
+				}
+				select {
+				case <-entered:
+				default:
+					t.Fatal("close callback did not start")
+				}
+				if !tc.wantStuck {
+					go func() {
+						time.Sleep(relayWorkerCleanupTimeout / 2)
+						releaseClose()
+					}()
+				}
+
+				cleanup()
+				if stuck != tc.wantStuck {
+					t.Errorf("cleanup reported a stuck worker = %t, want %t", stuck, tc.wantStuck)
+				}
+				if !tc.wantStuck {
+					select {
+					case <-finished:
+					default:
+						t.Error("cleanup returned before the close callback finished")
+					}
+				}
+				releaseClose()
+				<-finished
+			})
+		})
 	}
 }
 
