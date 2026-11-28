@@ -48,6 +48,24 @@ func raceWaitForToken(t *testing.T, reached <-chan struct{}) {
 	}
 }
 
+func startQueueTestWorker(t *testing.T, name string, work func(context.Context)) (reached, done <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	probe := &doneProbeContext{Context: ctx, reached: make(chan struct{})}
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		if !waitForRelayTestWorker(finished, relayWorkerCleanupTimeout) {
+			t.Errorf("%s worker was still running at the cleanup deadline", name)
+		}
+	})
+	go func() {
+		defer close(finished)
+		work(probe)
+	}()
+	return probe.reached, finished
+}
+
 // raceDrain starts the writer, waits until it sent n frames and returns the
 // recorder. The caller closes the connection with the returned function.
 func raceDrain(t *testing.T, c *Conn, n int) (*sentFrames, func()) {
@@ -92,12 +110,11 @@ func TestLateSendAfterCloseIsRejected(t *testing.T) {
 	filler := fillOutbound(c)
 
 	var written atomic.Int64
-	probe := &doneProbeContext{Context: t.Context(), reached: make(chan struct{})}
 	errCh := make(chan error, 1)
-	go func() {
-		errCh <- s.SendMetered(probe, raceKeepalive(), func(int64) { written.Add(1) })
-	}()
-	raceWaitForToken(t, probe.reached)
+	reached, _ := startQueueTestWorker(t, "SendMetered", func(ctx context.Context) {
+		errCh <- s.SendMetered(ctx, raceKeepalive(), func(int64) { written.Add(1) })
+	})
+	raceWaitForToken(t, reached)
 
 	closeReturnsPromptly(t, s, true)
 	raceFreeOneToken(t, c)
@@ -176,13 +193,10 @@ func TestLateWindowUpdateAfterCloseIsRejected(t *testing.T) {
 	}
 	filler := fillOutbound(c)
 
-	probe := &doneProbeContext{Context: t.Context(), reached: make(chan struct{})}
-	done := make(chan struct{})
-	go func() {
-		s.Consumed(probe, fc)
-		close(done)
-	}()
-	raceWaitForToken(t, probe.reached)
+	reached, done := startQueueTestWorker(t, "Consumed", func(ctx context.Context) {
+		s.Consumed(ctx, fc)
+	})
+	raceWaitForToken(t, reached)
 
 	closeReturnsPromptly(t, s, true)
 	raceFreeOneToken(t, c)
@@ -200,6 +214,56 @@ func TestLateWindowUpdateAfterCloseIsRejected(t *testing.T) {
 	got := raceStreamFrames(rec.snapshot(), s.ID)
 	if len(got) != 1 || got[0].GetRelayStreamClose() == nil {
 		t.Fatalf("frames of the closed stream = %d, want only its close frame", len(got))
+	}
+}
+
+func TestFullQueueCloseFixtureJoinsQueueWorkers(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"SendMetered", "Consumed"} {
+		t.Run(name, func(t *testing.T) {
+			c := NewConn(t.Context(), "device", 1, closeTestLimits)
+			s, err := c.Open(t.Context(), "grant-a", "sandbox")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fillOutbound(c)
+
+			var done <-chan struct{}
+			errCh := make(chan error, 1)
+			if !t.Run("exit with a full queue", func(t *testing.T) {
+				var reached <-chan struct{}
+				if name == "SendMetered" {
+					reached, done = startQueueTestWorker(t, name, func(ctx context.Context) {
+						errCh <- s.SendMetered(ctx, raceKeepalive(), nil)
+					})
+				} else {
+					fc := raceCreditFrame(s)
+					if err := s.recv.Receive(datapath.FrameCost(fc)); err != nil {
+						t.Fatal(err)
+					}
+					reached, done = startQueueTestWorker(t, name, func(ctx context.Context) {
+						s.Consumed(ctx, fc)
+					})
+				}
+				raceWaitForToken(t, reached)
+			}) {
+				return
+			}
+
+			select {
+			case <-done:
+			default:
+				t.Fatal("fixture cleanup returned before the queue worker finished")
+			}
+			if name == "SendMetered" {
+				if err := <-errCh; !errors.Is(err, context.Canceled) {
+					t.Errorf("SendMetered after fixture cleanup = %v, want context canceled", err)
+				}
+			}
+			if got := len(c.slots); got != outboundQueue {
+				t.Errorf("tokens in use after cleanup = %d, want %d", got, outboundQueue)
+			}
+		})
 	}
 }
 
