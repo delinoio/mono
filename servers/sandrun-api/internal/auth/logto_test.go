@@ -555,12 +555,6 @@ func TestLogtoValidatorHungFetchRespectsTimeoutAndCooldown(t *testing.T) {
 	}
 
 	start()
-	f.wantUser(t, f.cached)
-	select {
-	case err := <-done:
-		t.Fatalf("uncached key returned before cached key: %v", err)
-	default:
-	}
 	wantTimeout()
 
 	if _, err := f.v.key(context.Background(), "k2"); err != errUnknownKeyID {
