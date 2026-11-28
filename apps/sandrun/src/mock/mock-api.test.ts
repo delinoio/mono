@@ -2054,6 +2054,105 @@ test("a rejected combined update preserves the integration and its audit history
   }
 });
 
+test("credential-only and settings-only edits add one audit event each", async () => {
+  const clock = rs.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 0, 1));
+  try {
+    const transport = createMockTransport();
+    const integrations = createClient(AgentIntegrationService, transport);
+    const audit = createClient(AuditService, transport);
+    const organizationId = MOCK_IDS.acme;
+    const { integration: created } = await integrations.createAgentIntegration({
+      organizationId,
+      vendor: AgentVendor.CURSOR,
+      name: "cursor-team",
+      settings: { case: "cursor", value: { poolName: "pool-before" } },
+      credentials: {
+        case: "cursorCredentials",
+        value: { serviceAccountApiKey: "synthetic-cursor-before" },
+      },
+    });
+    if (created === undefined) throw new Error("Expected an integration");
+    const id = {
+      organizationId,
+      agentIntegrationId: created.agentIntegrationId,
+    };
+    const before = structuredClone(created);
+    const { events: priorEvents } = structuredClone(
+      await audit.listAuditEvents({ organizationId }),
+    );
+
+    const replacementAt = Date.UTC(2026, 0, 2);
+    const replacementTime = timestampFromMs(replacementAt);
+    clock.mockReturnValue(replacementAt);
+    const { integration: replaced } = await integrations.updateAgentIntegration(
+      {
+        ...id,
+        updateMask: { paths: ["credentials"] },
+        credentials: {
+          case: "cursorCredentials",
+          value: { serviceAccountApiKey: "synthetic-cursor-after" },
+        },
+      },
+    );
+    const afterReplacement = {
+      ...before,
+      updateTime: replacementTime,
+      credentials: before.credentials.map((state) => ({
+        ...state,
+        credentialSetAt: replacementTime,
+      })),
+    };
+    expect(replaced).toEqual(afterReplacement);
+    expect((await integrations.getAgentIntegration(id)).integration).toEqual(
+      afterReplacement,
+    );
+
+    const { events: replacementEvents } = structuredClone(
+      await audit.listAuditEvents({ organizationId }),
+    );
+    const target = {
+      targetKind: AuditTargetKind.AGENT_INTEGRATION,
+      targetId: id.agentIntegrationId,
+    };
+    expect(replacementEvents).toEqual([
+      expect.objectContaining({
+        ...target,
+        action: AuditAction.AGENT_INTEGRATION_CREDENTIALS_REPLACED,
+        createTime: replacementTime,
+      }),
+      ...priorEvents,
+    ]);
+
+    const settingsAt = Date.UTC(2026, 0, 3);
+    const settingsTime = timestampFromMs(settingsAt);
+    clock.mockReturnValue(settingsAt);
+    const settings = {
+      case: "cursor" as const,
+      value: { poolName: "pool-after" },
+    };
+    const { integration: updated } = await integrations.updateAgentIntegration({
+      ...id,
+      updateMask: { paths: ["settings"] },
+      settings,
+    });
+    expect(updated).toMatchObject({
+      ...afterReplacement,
+      settings,
+      updateTime: settingsTime,
+    });
+    expect((await audit.listAuditEvents({ organizationId })).events).toEqual([
+      expect.objectContaining({
+        ...target,
+        action: AuditAction.AGENT_INTEGRATION_UPDATED,
+        createTime: settingsTime,
+      }),
+      ...replacementEvents,
+    ]);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 test("a partial credential replacement preserves omitted credential metadata", async () => {
   const createdAt = Date.UTC(2026, 0, 1);
   const replacementAt = Date.UTC(2026, 0, 2, 0, 0, 0, 123);

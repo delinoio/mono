@@ -1692,8 +1692,9 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         const i = findIntegration(org, req.agentIntegrationId);
+        const updateName = hasPath(req.updateMask, "name");
         let name = i.name;
-        if (hasPath(req.updateMask, "name")) {
+        if (updateName) {
           name = req.name.trim();
           if (!isNameLengthValid(name, AGENT_INTEGRATION_NAME_LIMIT))
             throw new ConnectError(
@@ -1708,9 +1709,8 @@ export function createMockTransport(
               Code.AlreadyExists,
             );
         }
-        const settings = hasPath(req.updateMask, "settings")
-          ? req.settings
-          : i.settings;
+        const updateSettings = hasPath(req.updateMask, "settings");
+        const settings = updateSettings ? req.settings : i.settings;
         const replaceCredentials = hasPath(req.updateMask, "credentials");
         const credentials = replaceCredentials
           ? credentialStates(i.vendor, req, i.credentials)
@@ -1726,12 +1726,14 @@ export function createMockTransport(
           );
         }
         i.updateTime = ts();
-        audit(
-          org,
-          AuditAction.AGENT_INTEGRATION_UPDATED,
-          AuditTargetKind.AGENT_INTEGRATION,
-          i.agentIntegrationId,
-        );
+        if (updateName || updateSettings) {
+          audit(
+            org,
+            AuditAction.AGENT_INTEGRATION_UPDATED,
+            AuditTargetKind.AGENT_INTEGRATION,
+            i.agentIntegrationId,
+          );
+        }
         return { integration: i };
       },
       deleteAgentIntegration(req) {
