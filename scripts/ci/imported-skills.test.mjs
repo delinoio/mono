@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { hash } from "node:crypto";
 import {
   cpSync,
   mkdirSync,
@@ -122,9 +123,9 @@ test("the checked-in skills match their lock entries and manifest", () => {
 
 test("the manifest of the checked-in skills is the one that --write-manifest builds", () => {
   const manifest = buildManifest(repositoryRoot);
-  assert.deepEqual(
-    JSON.parse(readFileSync(join(repositoryRoot, ManifestFile), "utf8")),
-    manifest,
+  assert.equal(
+    readFileSync(join(repositoryRoot, ManifestFile), "utf8"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
   );
 });
 
@@ -206,6 +207,21 @@ test("a file named like an inherited property needs an explicit manifest entry",
   assert.deepEqual(otherProblems, []);
 
   f.write(ManifestFile, JSON.stringify(buildManifest(f.root)));
+  assert.deepEqual(verifyImportedSkills(f.root), []);
+});
+
+test("a file named __proto__ round-trips through the manifest", (t) => {
+  const f = fixture(t);
+  f.write(`${SkillsDirectory}/demo/__proto__`, "extra\r\n");
+  const [problem, ...otherProblems] = verifyImportedSkills(f.root);
+  assert.equal(problem?.kind, ProblemKind.FileUnexpected);
+  assert.equal(problem.path, "__proto__");
+  assert.deepEqual(otherProblems, []);
+
+  f.write(ManifestFile, JSON.stringify(buildManifest(f.root)));
+  const { files } = JSON.parse(f.read(ManifestFile)).skills.demo;
+  assert.ok(Object.hasOwn(files, "__proto__"));
+  assert.equal(files.__proto__, hash("sha256", "extra\n"));
   assert.deepEqual(verifyImportedSkills(f.root), []);
 });
 
