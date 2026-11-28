@@ -82,10 +82,14 @@ func TestQueueExpiryNoticesQueuesOneNoticeForFutureExpiry(t *testing.T) {
 	if err := <-result; err != nil {
 		t.Fatal(err)
 	}
+	if notices, marked := f.expiryNoticeState(grantID); notices != 1 || !marked {
+		t.Fatalf("after the lock-waiting run: got %d notices and marked=%v, want 1 notice and marked=true", notices, marked)
+	}
+
 	if err := f.s.QueueExpiryNotices(ctx()); err != nil {
 		t.Fatal(err)
 	}
 	if notices, marked := f.expiryNoticeState(grantID); notices != 1 || !marked {
-		t.Fatalf("future grant: %d notices, marked %v; want 1 and marked", notices, marked)
+		t.Fatalf("after the second run: got %d notices and marked=%v, want 1 notice and marked=true", notices, marked)
 	}
 }
