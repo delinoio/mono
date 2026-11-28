@@ -3,11 +3,15 @@
 package sandrunv1_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 )
@@ -139,22 +143,118 @@ func TestResponsesCarryNoCredentials(t *testing.T) {
 	}
 }
 
-// Every RPC except the three documented ones takes an organization_id.
+// Every RPC except the three documented ones takes a singular string organization_id.
 func TestRPCsTakeOrganizationID(t *testing.T) {
-	without := map[protoreflect.FullName]bool{
-		"delino.sandrun.v1.OrganizationService.CreateOrganization": true,
-		"delino.sandrun.v1.OrganizationService.ListOrganizations":  true,
-		"delino.sandrun.v1.MemberService.AcceptInvitation":         true,
-	}
 	for _, service := range services(t) {
 		for i := 0; i < service.Methods().Len(); i++ {
-			method := service.Methods().Get(i)
-			has := method.Input().Fields().ByName("organization_id") != nil
-			if has == without[method.FullName()] {
-				t.Errorf("%s: organization_id present = %v", method.FullName(), has)
+			if err := validateRPCOrganizationID(service.Methods().Get(i)); err != nil {
+				t.Error(err)
 			}
 		}
 	}
+}
+
+func validateRPCOrganizationID(method protoreflect.MethodDescriptor) error {
+	name := method.FullName()
+	field := method.Input().Fields().ByName("organization_id")
+	switch name {
+	case "delino.sandrun.v1.OrganizationService.CreateOrganization",
+		"delino.sandrun.v1.OrganizationService.ListOrganizations",
+		"delino.sandrun.v1.MemberService.AcceptInvitation":
+		if field != nil {
+			return fmt.Errorf("%s: request must omit organization_id", name)
+		}
+		return nil
+	}
+	if field == nil {
+		return fmt.Errorf("%s: request is missing organization_id", name)
+	}
+	if field.Kind() != protoreflect.StringKind || field.Cardinality() == protoreflect.Repeated {
+		return fmt.Errorf("%s: organization_id must be a singular string (got %s %s)", name, field.Cardinality(), field.Kind())
+	}
+	return nil
+}
+
+func TestValidateRPCOrganizationID(t *testing.T) {
+	field := func(kind descriptorpb.FieldDescriptorProto_Type, label descriptorpb.FieldDescriptorProto_Label) *descriptorpb.FieldDescriptorProto {
+		return &descriptorpb.FieldDescriptorProto{
+			Name:   proto.String("organization_id"),
+			Number: proto.Int32(1),
+			Type:   kind.Enum(),
+			Label:  label.Enum(),
+		}
+	}
+	singularString := field(descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL)
+	singularInt64 := field(descriptorpb.FieldDescriptorProto_TYPE_INT64, descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL)
+	repeatedString := field(descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_LABEL_REPEATED)
+
+	check := func(t *testing.T, service, method string, field *descriptorpb.FieldDescriptorProto, wantError string) {
+		t.Helper()
+		request := &descriptorpb.DescriptorProto{Name: proto.String("Request")}
+		if field != nil {
+			request.Field = []*descriptorpb.FieldDescriptorProto{field}
+		}
+		file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+			Name:        proto.String("organization_id_test.proto"),
+			Package:     proto.String(packageName),
+			Syntax:      proto.String("proto3"),
+			MessageType: []*descriptorpb.DescriptorProto{request, {Name: proto.String("Response")}},
+			Service: []*descriptorpb.ServiceDescriptorProto{{
+				Name: proto.String(service),
+				Method: []*descriptorpb.MethodDescriptorProto{{
+					Name:       proto.String(method),
+					InputType:  proto.String("." + packageName + ".Request"),
+					OutputType: proto.String("." + packageName + ".Response"),
+				}},
+			}},
+		}, nil)
+		if err != nil {
+			t.Fatalf("create descriptor for %s.%s: %v", service, method, err)
+		}
+		var gotError string
+		if err := validateRPCOrganizationID(file.Services().Get(0).Methods().Get(0)); err != nil {
+			gotError = err.Error()
+		}
+		if gotError != wantError {
+			t.Errorf("validation error = %q, want %q", gotError, wantError)
+		}
+	}
+
+	for _, test := range []struct {
+		name      string
+		field     *descriptorpb.FieldDescriptorProto
+		wantError string
+	}{
+		{"singular_string", singularString, ""},
+		{"missing", nil, "delino.sandrun.v1.OrganizationService.GetOrganization: request is missing organization_id"},
+		{"numeric", singularInt64, "delino.sandrun.v1.OrganizationService.GetOrganization: organization_id must be a singular string (got optional int64)"},
+		{"repeated", repeatedString, "delino.sandrun.v1.OrganizationService.GetOrganization: organization_id must be a singular string (got repeated string)"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			check(t, "OrganizationService", "GetOrganization", test.field, test.wantError)
+		})
+	}
+
+	for _, test := range []struct {
+		service string
+		method  string
+	}{
+		{"OrganizationService", "CreateOrganization"},
+		{"OrganizationService", "ListOrganizations"},
+		{"MemberService", "AcceptInvitation"},
+	} {
+		t.Run(test.method+"/absent", func(t *testing.T) {
+			check(t, test.service, test.method, nil, "")
+		})
+		t.Run(test.method+"/present", func(t *testing.T) {
+			wantError := packageName + "." + test.service + "." + test.method + ": request must omit organization_id"
+			check(t, test.service, test.method, singularString, wantError)
+		})
+	}
+	t.Run("same_method_name_in_another_service", func(t *testing.T) {
+		check(t, "OtherService", "CreateOrganization", nil,
+			"delino.sandrun.v1.OtherService.CreateOrganization: request is missing organization_id")
+	})
 }
 
 // The DevSessionExecEvent oneof has the documented events.
