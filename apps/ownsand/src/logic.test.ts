@@ -867,6 +867,7 @@ describe("billing amounts", () => {
       "-$9,223,372,036,854.78",
     );
     expect(formatUsdMicros(9_007_199_254_745_000n)).toBe("$9,007,199,254.75");
+    expect(formatUsdMicros(9_007_199_254_744_999n)).toBe("$9,007,199,254.74");
   });
 
   test("shows usage costs below $0.01 with up to 6 decimals", () => {
