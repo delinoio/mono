@@ -457,6 +457,7 @@
   "templates.createDialog.title": "템플릿 만들기",
   "templates.createDialog.submit": "템플릿 만들기",
   "templates.createDialog.name": "템플릿 이름",
+  "templates.createDialog.sourceUnavailable": "원본 스냅샷을 더 이상 템플릿에 사용할 수 없습니다.",
   "templates.deleteDialog.title": "템플릿 {name}을(를) 삭제하시겠습니까?",
   "templates.deleteDialog.description": "원본 스냅샷은 삭제되지 않습니다.",
   "templates.deleteDialog.confirm": "템플릿 삭제",

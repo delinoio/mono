@@ -457,6 +457,7 @@
   "templates.createDialog.title": "テンプレートを作成",
   "templates.createDialog.submit": "テンプレートを作成",
   "templates.createDialog.name": "テンプレート名",
+  "templates.createDialog.sourceUnavailable": "元のスナップショットはテンプレートに使用できなくなりました。",
   "templates.deleteDialog.title": "テンプレート {name} を削除しますか？",
   "templates.deleteDialog.description": "元のスナップショットは削除されません。",
   "templates.deleteDialog.confirm": "テンプレートを削除",

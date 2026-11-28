@@ -457,6 +457,7 @@
   "templates.createDialog.title": "Criar um modelo",
   "templates.createDialog.submit": "Criar modelo",
   "templates.createDialog.name": "Nome do modelo",
+  "templates.createDialog.sourceUnavailable": "O snapshot de origem não pode mais ser usado para criar modelos.",
   "templates.deleteDialog.title": "Excluir o modelo {name}?",
   "templates.deleteDialog.description": "O snapshot associado não será excluído.",
   "templates.deleteDialog.confirm": "Excluir modelo",

@@ -29,6 +29,7 @@ import {
   Role,
   SandboxState,
   SnapshotExportState,
+  SnapshotState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import type { GetDeviceResponse } from "@delino/ownsand-protos/v1/device_pb";
 import type {
@@ -47,6 +48,7 @@ import type {
   CreateTemplateRequest,
   ListSnapshotsResponse,
   ListTemplatesResponse,
+  Snapshot,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
 import {
   createMockTransport as createBaseMock,
@@ -297,6 +299,10 @@ export function createMockTransport(): Transport {
     sessionStorage.getItem("ownsand-e2e-restore-devices") === "true";
   const pageInvitations = methodName === "ListInvitations";
   const pageSources = methodName === "SnapshotSources";
+  const templateSourceStateKey = "ownsand-e2e-template-source-state";
+  const refreshTemplateSource =
+    sessionStorage.getItem(templateSourceStateKey) !== null;
+  let templateSource: Snapshot | undefined;
   const pageBilling = methodName === "ListLinkableBillingAccounts";
   const holdTemplateFirstPage =
     sessionStorage.getItem("ownsand-e2e-template-first-page") === "hold";
@@ -357,7 +363,7 @@ export function createMockTransport(): Transport {
         sessionStorage.getItem("ownsand-e2e-extra-members") ?? 0,
       ),
       extraSnapshots: pageSources ? 200 : 0,
-      extraTemplates: pageSources ? 200 : 0,
+      extraTemplates: pageSources && !refreshTemplateSource ? 200 : 0,
       linkableBillingAccounts: pageBilling
         ? Array.from({ length: 201 }, (_, i) => {
             const index = 201 - i;
@@ -1031,6 +1037,19 @@ export function createMockTransport(): Transport {
         ) {
           await failContinuationIfConfigured();
         }
+        const sourceState =
+          refreshTemplateSource && method.name === "ListSnapshots"
+            ? sessionStorage.getItem(templateSourceStateKey)
+            : null;
+        if (sourceState === "transient") {
+          throw new ConnectError("Snapshot refresh failed", Code.Unavailable);
+        }
+        if (sourceState === "terminal") {
+          throw new ConnectError(
+            "Snapshot access removed",
+            Code.PermissionDenied,
+          );
+        }
         const response = await base.unary(
           method,
           signal,
@@ -1039,6 +1058,45 @@ export function createMockTransport(): Transport {
           input,
           contextValues,
         );
+        if (sourceState !== null) {
+          const page = response.message as unknown as ListSnapshotsResponse;
+          if (pageToken !== "") {
+            if (!templateSource) throw new Error("Missing fixture snapshot");
+            return {
+              ...response,
+              message: {
+                ...response.message,
+                snapshots: [templateSource],
+                nextPageToken: "",
+              },
+            };
+          }
+          const [source, companion] = page.snapshots;
+          if (!source || !companion)
+            throw new Error("Missing fixture snapshots");
+          templateSource = source;
+          // A settling row makes the management page poll while the form is open.
+          const pollingRow = { ...companion, state: SnapshotState.CREATING };
+          const snapshots =
+            sourceState === "partial"
+              ? [pollingRow]
+              : sourceState === "missing"
+                ? []
+                : sourceState === "non-ready"
+                  ? [{ ...source, state: SnapshotState.FAILED }]
+                  : sourceState === "ready"
+                    ? [source]
+                    : [source, pollingRow];
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              snapshots,
+              nextPageToken:
+                sourceState === "partial" ? page.nextPageToken : "",
+            },
+          };
+        }
         if (pageToken === "") return response;
         if (method.name === "ListTemplates") {
           const { templates } =

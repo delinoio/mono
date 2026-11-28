@@ -71,18 +71,32 @@ export function SnapshotsPage() {
   const deleteTemplate = useMutation(SnapshotService.method.deleteTemplate, {
     onSuccess: refresh,
   });
-  const [templateFrom, setTemplateFrom] = useState<Snapshot>();
+  const [templateFrom, setTemplateFrom] = useState<{
+    snapshotId: string;
+    unavailable: boolean;
+  }>();
   const [templateName, setTemplateName] = useState("");
   const [deletingSnapshot, setDeletingSnapshot] = useState<Snapshot>();
   const [deletingTemplate, setDeletingTemplate] = useState<Template>();
 
+  const terminalSnapshotError = isTerminalError(snapshots.boundary.error);
+  const sourceSnapshot = templateFrom
+    ? snapshots.rows.find((row) => row.snapshotId === templateFrom.snapshotId)
+    : undefined;
+  // A missing row only confirms unavailability after a complete read.
+  const sourceUnavailable = sourceSnapshot
+    ? sourceSnapshot.state !== SnapshotState.READY
+    : snapshots.isComplete || templateFrom?.unavailable === true;
+
   // An open action belongs to its list. Discard it when access to that list ends.
-  if (isTerminalError(snapshots.boundary.error)) {
+  if (terminalSnapshotError) {
     if (templateFrom) {
       setTemplateFrom(undefined);
       setTemplateName("");
     }
     if (deletingSnapshot) setDeletingSnapshot(undefined);
+  } else if (templateFrom && templateFrom.unavailable !== sourceUnavailable) {
+    setTemplateFrom({ ...templateFrom, unavailable: sourceUnavailable });
   }
   if (deletingTemplate && isTerminalError(templates.boundary.error)) {
     setDeletingTemplate(undefined);
@@ -178,7 +192,12 @@ export function SnapshotsPage() {
                           aria-label={t("snapshots.makeTemplateNamed", {
                             id: shortIdText(s.snapshotId),
                           })}
-                          onClick={() => setTemplateFrom(s)}
+                          onClick={() =>
+                            setTemplateFrom({
+                              snapshotId: s.snapshotId,
+                              unavailable: false,
+                            })
+                          }
                         >
                           {t("snapshots.makeTemplate")}
                         </Button>
@@ -254,11 +273,20 @@ export function SnapshotsPage() {
           }
         }}
         title={t("templates.createDialog.title")}
+        description={
+          sourceUnavailable ? (
+            <span role="alert">
+              {t("templates.createDialog.sourceUnavailable")}
+            </span>
+          ) : undefined
+        }
         submitLabel={t("templates.createDialog.submit")}
+        submitDisabled={sourceUnavailable}
         onSubmit={async (opening) => {
+          if (!templateFrom || sourceUnavailable) return;
           await createTemplate.mutateAsync({
             organizationId,
-            snapshotId: templateFrom!.snapshotId,
+            snapshotId: templateFrom.snapshotId,
             name: templateName.trim(),
           });
           // The list refreshes either way (`onSuccess`). A request of a
