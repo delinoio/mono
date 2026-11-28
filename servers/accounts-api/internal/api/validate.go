@@ -3,6 +3,7 @@
 package api
 
 import (
+	"net"
 	"net/mail"
 	"strings"
 	"unicode"
@@ -50,15 +51,29 @@ func billingAccountName(value string) (string, error) {
 // end is removed, and the rest is a plain `local@domain` address of at most
 // 254 bytes.
 func invitationEmail(value string) (string, error) {
+	const invalidEmail = "email must be an email address such as name@example.com"
 	addr := strings.TrimSpace(value)
 	if addr == "" || len(addr) > maxEmailBytes {
 		return "", invalidArgument("email must be an email address of at most 254 bytes")
 	}
-	parsed, err := mail.ParseAddress(addr)
 	local, domain, ok := strings.Cut(addr, "@")
-	if err != nil || parsed.Name != "" || parsed.Address != addr || !ok || local == "" || domain == "" ||
-		strings.Contains(domain, "@") {
-		return "", invalidArgument("email must be an email address such as name@example.com")
+	if !ok || local == "" || domain == "" || strings.Contains(domain, "@") {
+		return "", invalidArgument(invalidEmail)
+	}
+
+	parseInput := addr
+	if strings.HasPrefix(domain, "[") {
+		ip, closed := strings.CutSuffix(domain[1:], "]")
+		if !closed || net.ParseIP(ip) == nil {
+			return "", invalidArgument(invalidEmail)
+		}
+		// Validate the local part with an ordinary domain so that Go version
+		// changes to mail.ParseAddress's domain-literal grammar do not affect it.
+		parseInput = local + "@example.com"
+	}
+	parsed, err := mail.ParseAddress(parseInput)
+	if err != nil || parsed.Name != "" || parsed.Address != parseInput {
+		return "", invalidArgument(invalidEmail)
 	}
 	return addr, nil
 }

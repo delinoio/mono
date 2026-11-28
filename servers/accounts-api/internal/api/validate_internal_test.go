@@ -93,14 +93,35 @@ func TestFieldRules(t *testing.T) {
 	if name, err := billingAccountName("  Team \t"); err != nil || name != "Team" {
 		t.Errorf("billingAccountName = %q, %v", name, err)
 	}
-	for _, ok := range []string{"a@b", "first.last+tag@example.co.uk", " A@B.COM "} {
-		if _, err := invitationEmail(ok); err != nil {
-			t.Errorf("invitationEmail(%q) error = %v", ok, err)
+	const ipv6Domain = "@[2001:db8::1]"
+	maxLengthAddress := strings.Repeat("é", (maxEmailBytes-len(ipv6Domain))/2) + ipv6Domain
+	for _, ok := range []string{
+		"a@b",
+		"first.last+tag@example.co.uk",
+		" A@B.COM ",
+		"a@[192.0.2.1]",
+		"a@[2001:db8::1]",
+		"a@[::ffff:c000:201]",
+		" \tA@[2001:DB8::AB] ",
+		maxLengthAddress,
+	} {
+		if got, err := invitationEmail(ok); err != nil || got != strings.TrimSpace(ok) {
+			t.Errorf("invitationEmail(%q) = %q, %v", ok, got, err)
 		}
 	}
-	for _, bad := range []string{"a", "a@", "@b", "a@b@c", "<a@b>", "x <a@b>", "a b@c", strings.Repeat("a", 64) + "@" + strings.Repeat("b", 190) + ".com"} {
-		if _, err := invitationEmail(bad); err == nil {
-			t.Errorf("invitationEmail(%q) accepted", bad)
+	for _, bad := range []string{
+		"a", "a@", "@b", "a@b@c", "<a@b>", "x <a@b>", "a b@c",
+		strings.Repeat("a", 64) + "@" + strings.Repeat("b", 190) + ".com",
+		"a@[IPv6:2001:db8::1]",
+		"a@[2001:db8::x]",
+		"a@[fe80::1%eth0]",
+		"a@[2001:db8::1",
+		"a..b" + ipv6Domain,
+		"a@b" + ipv6Domain,
+		"x" + maxLengthAddress,
+	} {
+		if _, err := invitationEmail(bad); connect.CodeOf(err) != connect.CodeInvalidArgument {
+			t.Errorf("invitationEmail(%q) error = %v, want invalid_argument", bad, err)
 		}
 	}
 	if emailKey("Ä.User@Example.COM") != "Ä.user@example.com" {
