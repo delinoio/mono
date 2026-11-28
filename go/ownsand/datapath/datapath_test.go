@@ -8,6 +8,7 @@ import (
 	"errors"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -59,10 +60,24 @@ func frameFor(t testing.TB, payload proto.Message) *ownsandv1.DataFrame {
 }
 
 func TestNewFrameCoversEveryKind(t *testing.T) {
+	unspecified := ownsandv1.DataFrameKind_DATA_FRAME_KIND_UNSPECIFIED
+	values := unspecified.Descriptor().Values()
+	wantKinds := make([]ownsandv1.DataFrameKind, 0, values.Len())
+	for i := range values.Len() {
+		kind := ownsandv1.DataFrameKind(values.Get(i).Number())
+		if kind != unspecified {
+			wantKinds = append(wantKinds, kind)
+		}
+	}
+	slices.Sort(wantKinds)
+	if got := AllKinds(); !slices.Equal(got, wantKinds) {
+		t.Errorf("AllKinds() = %v, want %v", got, wantKinds)
+	}
+
 	seen := map[ownsandv1.DataFrameKind]bool{}
 	for _, payload := range samplePayloads() {
 		f := frameFor(t, payload)
-		if f.GetKind() == ownsandv1.DataFrameKind_DATA_FRAME_KIND_UNSPECIFIED {
+		if f.GetKind() == unspecified {
 			t.Fatalf("%T gave no kind", payload)
 		}
 		if err := ValidateFrame(f); err != nil {
@@ -70,14 +85,10 @@ func TestNewFrameCoversEveryKind(t *testing.T) {
 		}
 		seen[f.GetKind()] = true
 	}
-	for _, kind := range AllKinds() {
+	for _, kind := range wantKinds {
 		if !seen[kind] {
 			t.Errorf("kind %s not produced", kind)
 		}
-	}
-	// AllKinds matches the enum descriptor.
-	if got, want := len(AllKinds()), ownsandv1.DataFrameKind(0).Descriptor().Values().Len()-1; got != want {
-		t.Fatalf("AllKinds has %d kinds, enum has %d", got, want)
 	}
 	if _, err := NewFrame(1, sandboxID, &ownsandv1.Sandbox{}); !errors.Is(err, ErrMalformedFrame) {
 		t.Fatalf("non-payload type: %v", err)
