@@ -5,6 +5,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -26,6 +27,8 @@ const (
 	outcomeTestCallBudget    = 300 * time.Millisecond
 	outcomeTestLockHold      = 600 * time.Millisecond
 	outcomeTestOutcomeBudget = 5 * time.Second
+	outcomeTestSetupBudget   = outcomeTestCallBudget / 2
+	outcomeTestCleanupBudget = time.Second
 )
 
 // lockOnCharge is an HTTP transport that, when a one-time charge is sent,
@@ -42,33 +45,102 @@ type lockOnCharge struct {
 	finalize string
 
 	next http.RoundTripper
-	wg   sync.WaitGroup
+
+	mu       sync.Mutex
+	releases []<-chan error
 }
 
 func (l *lockOnCharge) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/charge") {
-		tx, err := l.f.db.Pool.Begin(ctx())
-		if err != nil {
+		if err := l.holdAccount(req.Context()); err != nil {
+			l.f.t.Error(err)
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
 			return nil, err
 		}
-		if _, err := lockAccount(ctx(), tx, l.acct); err != nil {
-			_ = tx.Rollback(ctx())
-			return nil, err
-		}
-		l.wg.Add(1)
-		time.AfterFunc(l.hold, func() {
-			defer l.wg.Done()
-			if l.finalize != "" {
-				if _, err := tx.Exec(ctx(), `UPDATE top_ups SET status = $2 WHERE billing_account_id = $1`, l.acct, l.finalize); err != nil {
-					l.f.t.Errorf("finalize top-up: %v", err)
-				}
-			}
-			if err := tx.Commit(ctx()); err != nil {
-				l.f.t.Errorf("release the account lock: %v", err)
-			}
-		})
 	}
 	return l.next.RoundTrip(req)
+}
+
+func (l *lockOnCharge) holdAccount(chargeCtx context.Context) error {
+	setupBudget := outcomeTestSetupBudget
+	// Reserve time to reach fake Paddle even if the transport starts late.
+	if deadline, ok := chargeCtx.Deadline(); ok {
+		setupBudget = min(setupBudget, time.Until(deadline)/2)
+	}
+	setupCtx, cancel := context.WithTimeout(chargeCtx, setupBudget)
+	defer cancel()
+
+	tx, err := l.f.db.Pool.Begin(setupCtx)
+	if err != nil {
+		return fmt.Errorf("charge lock fixture: begin transaction: %w", err)
+	}
+	if _, err := lockAccount(setupCtx, tx, l.acct); err != nil {
+		return errors.Join(fmt.Errorf("charge lock fixture: lock billing account: %w", err), rollbackChargeLock(tx))
+	}
+
+	released := make(chan error, 1)
+	l.mu.Lock()
+	l.releases = append(l.releases, released)
+	l.mu.Unlock()
+	time.AfterFunc(l.hold, func() {
+		released <- l.releaseAccount(tx)
+	})
+	return nil
+}
+
+func (l *lockOnCharge) releaseAccount(tx pgx.Tx) error {
+	// The simulated webhook and commit run after the Paddle call can expire.
+	releaseCtx, cancel := context.WithTimeout(context.Background(), outcomeTestCleanupBudget)
+	defer cancel()
+	if l.finalize != "" {
+		if _, err := tx.Exec(releaseCtx, `UPDATE top_ups SET status = $2 WHERE billing_account_id = $1`, l.acct, l.finalize); err != nil {
+			return errors.Join(fmt.Errorf("charge lock fixture: finalize top-up: %w", err), rollbackChargeLock(tx))
+		}
+	}
+	if err := tx.Commit(releaseCtx); err != nil {
+		return fmt.Errorf("charge lock fixture: release the account lock: %w", err)
+	}
+	return nil
+}
+
+func rollbackChargeLock(tx pgx.Tx) error {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), outcomeTestCleanupBudget)
+	defer cancel()
+	// A canceled query can close the connection. Rollback still returns it
+	// to pgxpool, which discards the closed connection.
+	closed := tx.Conn().IsClosed()
+	if err := tx.Rollback(rollbackCtx); err != nil && !closed {
+		return fmt.Errorf("charge lock fixture: roll back transaction: %w", err)
+	}
+	return nil
+}
+
+func (l *lockOnCharge) waitForRelease() error {
+	l.mu.Lock()
+	releases := l.releases
+	l.releases = nil
+	l.mu.Unlock()
+	if len(releases) == 0 {
+		return nil
+	}
+
+	// Allow the hold, the release and a possible rollback, with time for
+	// scheduling delays.
+	waitBudget := l.hold + 3*outcomeTestCleanupBudget
+	timer := time.NewTimer(waitBudget)
+	defer timer.Stop()
+	var releaseErr error
+	for _, released := range releases {
+		select {
+		case err := <-released:
+			releaseErr = errors.Join(releaseErr, err)
+		case <-timer.C:
+			return errors.Join(releaseErr, fmt.Errorf("charge lock fixture: timed out waiting for release after %v", waitBudget))
+		}
+	}
+	return releaseErr
 }
 
 // outcomeFixture returns a fixture with an active subscription whose Paddle
@@ -89,7 +161,11 @@ func outcomeFixture(t *testing.T, hold time.Duration, outcomeBudget time.Duratio
 	})
 	f.s.paddleCallTimeout = outcomeTestCallBudget
 	f.s.outcomeTimeout = outcomeBudget
-	t.Cleanup(lock.wg.Wait)
+	t.Cleanup(func() {
+		if err := lock.waitForRelease(); err != nil {
+			t.Error(err)
+		}
+	})
 	return f, acct, lock
 }
 
@@ -194,7 +270,9 @@ func TestTopUpOutcomeDeadlineStillReturnsTheDatabaseError(t *testing.T) {
 		t.Fatalf("CreateTopUp error = %v, want a deadline error", err)
 	}
 	// Wait for the lock holder before reading the state.
-	lock.wg.Wait()
+	if err := lock.waitForRelease(); err != nil {
+		t.Fatal(err)
+	}
 	wantStatuses(t, "after the database timeout", f.topUpStatuses(acct), "charging")
 	if n := len(f.paddle.Charges()); n != 1 {
 		t.Fatalf("charges = %d, want 1", n)
