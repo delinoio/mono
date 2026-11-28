@@ -545,6 +545,82 @@ test("entitlements symlink discovery stops at cycles and repository escapes", (t
   assert.deepEqual(declaredReleaseInputs(f.cwd), new Set([link, middle]));
 });
 
+test("license inputs include parent links and the physical license path", async (t) => {
+  const f = fixture(t);
+  const declared = "license-alias/NOTICE";
+  const destination = "licenses/NOTICE";
+  const intermediate = "license-directory";
+  writeReleasePackage(f, { licenseFiles: [declared] });
+  f.write(destination);
+  try {
+    symlinkSync(intermediate, join(f.cwd, "license-alias"), "dir");
+    symlinkSync("licenses", join(f.cwd, intermediate), "dir");
+  } catch (error) {
+    if (error?.code !== "EPERM") throw error;
+    t.skip("cannot create a symlink on this system");
+    return;
+  }
+  f.git("config", "core.symlinks", "true");
+  const base = f.commit();
+  assert.deepEqual(
+    declaredReleaseInputs(f.cwd),
+    new Set([
+      "cmds/ownsand-agent/entitlements.plist",
+      declared,
+      "license-alias",
+      intermediate,
+      destination,
+    ]),
+  );
+
+  for (const [name, change] of [
+    ["edit the physical license", () => f.write(destination, "updated\n")],
+    ["delete the physical license", () => f.git("rm", "--quiet", destination)],
+    ["rename the physical license", () => f.git("mv", destination, "NOTICE")],
+    [
+      "retarget the intermediate link",
+      () => {
+        rmSync(join(f.cwd, intermediate));
+        symlinkSync("missing-licenses", join(f.cwd, intermediate), "dir");
+      },
+    ],
+    [
+      "remove the intermediate link",
+      () => f.git("rm", "--quiet", intermediate),
+    ],
+    [
+      "replace the intermediate link",
+      () => {
+        rmSync(join(f.cwd, intermediate));
+        f.write(intermediate);
+      },
+    ],
+  ]) {
+    await t.test(name, () => {
+      change();
+      const result = plan(f.cwd, base, f.commit());
+      assert.equal(result.fixtures, true);
+      assert.equal(result.quality, true);
+      f.git("reset", "--hard", base);
+    });
+  }
+
+  await t.test("stop at a license leaf symlink", () => {
+    f.git("mv", destination, "real-notice");
+    mkdirSync(join(f.cwd, "licenses"), { recursive: true });
+    symlinkSync("../real-notice", join(f.cwd, destination), "file");
+    const leafBase = f.commit();
+    const inputs = declaredReleaseInputs(f.cwd);
+    assert.ok(inputs.has(destination));
+    assert.equal(inputs.has("real-notice"), false);
+
+    f.write("real-notice", "updated\n");
+    const result = plan(f.cwd, leafBase, f.commit());
+    assert.equal(result.fixtures, false);
+    assert.equal(result.quality, false);
+  });
+});
+
 test("release file selection ignores files that no release declares", async (t) => {
   await t.test("an unreferenced asset beside the declared files", (t) => {
     const f = fixture(t);
