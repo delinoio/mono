@@ -83,20 +83,34 @@ func TestWarmRunnersAndReclaim(t *testing.T) {
 	w := newWorkWorld(t, devsession.Timing{})
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.MaxSandboxes = 2 })
 	warmID := w.createProfile(t, devProfileProto("warm", 1, sandrunv1.Priority_PRIORITY_LOW))
-	countWarm := func() int {
+	listWarm := func() []*sandrunv1.Runner {
 		resp, err := w.env.User(w.org.Owner).Work.ListRunners(context.Background(), connect.NewRequest(&sandrunv1.ListRunnersRequest{OrganizationId: w.org.ID,
 			States: []sandrunv1.RunnerState{sandrunv1.RunnerState_RUNNER_STATE_WARM}}))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return len(resp.Msg.GetRunners())
+		return resp.Msg.GetRunners()
 	}
-	eventually(t, "a warm runner", func() bool { return countWarm() == 1 })
-	stays(t, "one warm runner", func() bool { return countWarm() == 1 && w.fake.Active(w.osOrg) == 1 })
+	var originalRunnerID string
+	eventually(t, "a warm runner", func() bool {
+		runners := listWarm()
+		if len(runners) != 1 {
+			return false
+		}
+		originalRunnerID = runners[0].GetRunnerId()
+		return true
+	})
+	stays(t, "one warm runner", func() bool { return len(listWarm()) == 1 && w.fake.Active(w.osOrg) == 1 })
 	// The session takes the warm runner; a new warm runner replaces it.
 	s := w.createSession(t, w.env.User(w.org.Member), warmID)
 	s = w.waitState(t, s.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
-	eventually(t, "a new warm runner", func() bool { return countWarm() == 1 && w.fake.Active(w.osOrg) == 2 })
+	if got := s.GetRunnerId(); got != originalRunnerID {
+		t.Fatalf("session runner ID = %q, want original warm runner ID %q", got, originalRunnerID)
+	}
+	eventually(t, "a new warm runner", func() bool {
+		runners := listWarm()
+		return len(runners) == 1 && runners[0].GetRunnerId() != originalRunnerID && w.fake.Active(w.osOrg) == 2
+	})
 
 	// The pool is full (busy session and warm runner). A HIGH priority
 	// session reclaims the LOW priority warm runner and starts.
