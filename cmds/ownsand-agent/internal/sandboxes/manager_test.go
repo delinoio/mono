@@ -2790,11 +2790,24 @@ func TestCreateYieldsToConcurrentTTLEnd(t *testing.T) {
 func TestAcksDropEndedRecords(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
-	del, _ := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+	ctx := context.Background()
+	del, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := e.st.Path(store.SandboxesDir, id+".json")
 	// A stale acknowledgement keeps the record.
 	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: &ownsandv1.SandboxRevision{Epoch: e.m.Epoch(), Counter: del.GetRevision().GetCounter() - 1}})
 	if _, ok := e.m.State(id); !ok {
 		t.Fatal("record dropped by a stale ack")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("record file after a stale ack: %v", err)
+	}
+	count := e.out.count()
+	e.m.Tick(ctx, true)
+	if e.out.count() != count+1 || !proto.Equal(e.out.lastEntry(id), del) {
+		t.Fatal("stale ack suppressed the current revision's resend")
 	}
 	report := e.m.StateReport(1, nil)
 	if len(report.GetSandboxes()) != 1 || report.GetStateEpoch() != e.m.Epoch() {
@@ -2804,8 +2817,128 @@ func TestAcksDropEndedRecords(t *testing.T) {
 	if _, ok := e.m.State(id); ok {
 		t.Fatal("ended record kept after the acknowledgement")
 	}
-	if _, err := os.Stat(e.st.Path(store.SandboxesDir, id+".json")); !os.IsNotExist(err) {
-		t.Fatal("ended record file kept")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("ended record file should be absent: %v", err)
+	}
+}
+
+// blockRecordRemoval moves the saved file aside and blocks its path with a
+// nonempty directory. The fault also works when the tests run as root.
+func blockRecordRemoval(t *testing.T, st *store.Store, id string) func() {
+	t.Helper()
+	path := st.Path(store.SandboxesDir, id+".json")
+	saved := filepath.Join(t.TempDir(), "record.json")
+	if err := os.Rename(path, saved); err != nil {
+		t.Fatal(err)
+	}
+	blockRecord(t, st, id)
+	return func() {
+		unblockRecord(t, st, id)
+		if err := os.Rename(saved, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAcksDropEndedRecordsRetryRemoval(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ackReport bool
+		missing   bool
+	}{
+		{name: "update ack"},
+		{name: "full report ack", ackReport: true},
+		{name: "file already missing at retry", missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			e := newEnv(t)
+			id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+			end, err := e.m.Delete(ctx, &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.m.StateReport(1, nil)
+			restore := blockRecordRemoval(t, e.st, id)
+			if tc.ackReport {
+				e.m.AckStateReport(&ownsandv1.StateReportAck{ReportSequence: 1})
+			} else {
+				e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: end.GetRevision()})
+			}
+
+			count := e.out.count()
+			e.m.Tick(ctx, true)
+			if e.out.count() != count || len(e.m.Entries()) != 0 || len(e.m.StateReport(2, nil).GetSandboxes()) != 0 {
+				t.Fatal("acknowledged terminal record remains visible while removal is pending")
+			}
+			if _, ok := e.m.recordRemovals[id]; !ok {
+				t.Fatal("a second removal error lost the retry")
+			}
+
+			restore()
+			path := e.st.Path(store.SandboxesDir, id+".json")
+			if tc.missing {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.m.Tick(ctx, false)
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("terminal record should be absent after the retry: %v", err)
+			}
+			if _, ok := e.m.recordRemovals[id]; ok {
+				t.Fatal("completed removal is still pending")
+			}
+			e.restart()
+			if len(e.m.StateReport(1, nil).GetSandboxes()) != 0 {
+				t.Fatal("removed terminal record returned after restart")
+			}
+		})
+	}
+}
+
+func TestAcksDropEndedRecordsPreserveReplacementMarker(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	cmd := e.createCmd(1, time.Hour, 2*time.Hour)
+	id := cmd.GetSandboxId()
+	if _, err := e.m.Create(ctx, cmd); err != nil {
+		t.Fatal(err)
+	}
+	deleteCmd := &ownsandv1.DeleteSandboxCommand{SandboxId: id}
+	end, err := e.m.Delete(ctx, deleteCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.m.StateReport(1, nil)
+	restore := blockRecordRemoval(t, e.st, id)
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: end.GetRevision()})
+
+	_, err = e.m.Delete(ctx, deleteCmd)
+	requireInternal(t, err)
+	if _, ok := e.m.recordRemovals[id]; !ok {
+		t.Fatal("a failed replacement save canceled the removal")
+	}
+	restore()
+	marker, err := e.m.Delete(ctx, deleteCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.m.recordRemovals[id]; ok {
+		t.Fatal("the saved replacement marker did not cancel the removal")
+	}
+	e.m.AckStateReport(&ownsandv1.StateReportAck{ReportSequence: 1})
+	count := e.out.count()
+	e.m.Tick(ctx, true)
+	if e.out.count() != count+1 || !proto.Equal(e.out.lastEntry(id), marker) {
+		t.Fatal("old full-report acknowledgement suppressed the replacement revision")
+	}
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: marker.GetRevision()})
+	e.m.Tick(ctx, false)
+	e.restart()
+	var createErr *CommandError
+	if _, err := e.m.Create(ctx, cmd); !errors.As(err, &createErr) || createErr.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("late create should be rejected by the saved delete marker: %v", err)
 	}
 }
 
