@@ -19,7 +19,6 @@ import (
 func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	t0 := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
-	ctx := t.Context()
 	f.addOrg(t, org1)
 	f.link(t, org1, accountA)
 	f.addPendingUnlink(t, org1)
@@ -27,12 +26,13 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 
 	// attempt 1: the call takes 2 seconds, the delay is 1 second.
 	gate := f.fake.Hold(accountstest.MethodUnlinkOrganization)
-	t.Cleanup(gate.Release)
-	done := goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
-	gate.WaitForEntry(t, done)
+	worker := startStatusWorker(t, "UnlinkPending", gate, func(ctx context.Context) error {
+		return f.statuses.UnlinkPending(ctx, org1)
+	})
+	gate.WaitForEntry(t, worker.results)
 	f.clock.Advance(2 * time.Second)
 	gate.Release()
-	if err := gate.WaitForResult(t, done); err != nil {
+	if err := gate.WaitForResult(t, worker.results); err != nil {
 		t.Fatal(err)
 	}
 	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 1 || !next.Equal(t0.Add(3*time.Second)) {
@@ -42,12 +42,13 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	// attempt 2 (due at t0+3s): the call takes 5 seconds, the delay is 2 seconds.
 	f.clock.Advance(time.Second)
 	gate = f.fake.Hold(accountstest.MethodUnlinkOrganization)
-	t.Cleanup(gate.Release)
-	done = goErr(func() error { return f.statuses.UnlinkPending(ctx, org1) })
-	gate.WaitForEntry(t, done)
+	worker = startStatusWorker(t, "UnlinkPending", gate, func(ctx context.Context) error {
+		return f.statuses.UnlinkPending(ctx, org1)
+	})
+	gate.WaitForEntry(t, worker.results)
 	f.clock.Advance(5 * time.Second)
 	gate.Release()
-	if err := gate.WaitForResult(t, done); err != nil {
+	if err := gate.WaitForResult(t, worker.results); err != nil {
 		t.Fatal(err)
 	}
 	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 2 || !next.Equal(t0.Add(10*time.Second)) {
@@ -75,8 +76,9 @@ func TestPendingUnlinkBackoffAfterLockWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	holderPID := holder.Conn().PgConn().PID()
-	done := make(chan error, 1)
-	go func() { done <- f.statuses.UnlinkPending(ctx, org1) }()
+	worker := startStatusWorker(t, "UnlinkPending", nil, func(ctx context.Context) error {
+		return f.statuses.UnlinkPending(ctx, org1)
+	})
 	// Wait on a separate connection until the attempt blocks on the holder.
 	const waitingForHolder = `
 		SELECT EXISTS (
@@ -108,7 +110,7 @@ func TestPendingUnlinkBackoffAfterLockWait(t *testing.T) {
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err != nil {
+	if err := worker.waitForResult(t); err != nil {
 		t.Fatal(err)
 	}
 	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 1 || !next.Equal(t0.Add(11*time.Second)) {
