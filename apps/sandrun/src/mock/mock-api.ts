@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  clone,
   create,
   type DescEnum,
   type MessageInitShape,
@@ -2150,13 +2151,18 @@ export function createMockTransport(
         watchers.set(req.organizationId, set);
         set.add(watcher);
         try {
-          for (const r of org.requests) {
-            if (!TERMINAL_REQUEST_STATES.has(r.state))
-              yield { event: { case: "request", value: r } };
+          // Capture both collections before a yield lets another RPC mutate them.
+          const requests = org.requests
+            .filter((r) => !TERMINAL_REQUEST_STATES.has(r.state))
+            .map((r) => clone(RequestSchema, r));
+          const runners = org.runners
+            .filter((r) => !TERMINAL_RUNNER_STATES.has(r.state))
+            .map((r) => clone(RunnerSchema, r));
+          for (const request of requests) {
+            yield { event: { case: "request", value: request } };
           }
-          for (const r of org.runners) {
-            if (!TERMINAL_RUNNER_STATES.has(r.state))
-              yield { event: { case: "runner", value: r } };
+          for (const runner of runners) {
+            yield { event: { case: "runner", value: runner } };
           }
           yield { event: { case: "snapshotComplete", value: {} } };
           const endAt =
