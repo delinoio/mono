@@ -1039,6 +1039,48 @@ describe("settings", () => {
     });
   });
 
+  test("locks the settings while a save is pending", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transport: Transport = {
+      ...base,
+      async unary(method, ...rest) {
+        if (method.name === "UpdateOrganizationSettings") await held;
+        return base.unary(method, ...rest);
+      },
+    };
+    renderConsole(`/orgs/${ACME}/settings/organization`, { transport });
+    const delay = await screen.findByRole("textbox", {
+      name: "Pause delay in minutes",
+    });
+    await type(delay, "20");
+    await act(async () => fireEvent.blur(delay));
+    await click(screen.getByRole("button", { name: "Save settings" }));
+    const controls = () => [
+      screen.getByRole("textbox", { name: "Pause delay in minutes" }),
+      screen.getByRole("combobox", { name: "Paused-session retention" }),
+      ...screen.getAllByRole("checkbox"),
+    ];
+    for (const control of controls()) {
+      expect(
+        control.matches(":disabled, [aria-disabled='true'], [data-disabled]"),
+      ).toBe(true);
+    }
+    await act(async () => release());
+    await waitFor(() =>
+      expect(
+        (
+          screen.getByRole("textbox", {
+            name: "Pause delay in minutes",
+          }) as HTMLInputElement
+        ).disabled,
+      ).toBe(false),
+    );
+  });
+
   test("requires a pause delay", async () => {
     renderConsole(`/orgs/${ACME}/settings/organization`);
     const delay = await screen.findByRole("textbox", {

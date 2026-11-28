@@ -209,6 +209,9 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
     },
   );
   const change = settingsUpdate(saved, draft);
+  // A successful save reloads the settings and remounts the form with the
+  // saved values, so edits made while a save is pending would be lost.
+  const saving = update.isPending;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -256,6 +259,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
               profiles={list}
               allowed={draft.allowedRunnerProfileIds}
               onToggle={toggleProfile}
+              disabled={saving}
             />
           )}
         </QueryBoundary>
@@ -272,6 +276,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
           }}
           min={PAUSE_DELAY_MIN_MINUTES}
           max={PAUSE_DELAY_MAX_MINUTES}
+          disabled={saving}
           error={
             errors.pauseDelay === undefined
               ? undefined
@@ -282,6 +287,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
           label={t("orgSettings.retention")}
           description={t("orgSettings.retentionHelp")}
           value={draft.retention}
+          disabled={saving}
           onValueChange={(v) => {
             if (v === null) return;
             setDraft((d) => ({
@@ -311,6 +317,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
             }}
             min={RETENTION_MIN_DAYS}
             max={RETENTION_MAX_DAYS}
+            disabled={saving}
             error={
               errors.retentionDays === undefined
                 ? undefined
@@ -321,10 +328,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
       </section>
       {update.error ? <ErrorNotice error={update.error} /> : null}
       <div className="form-actions">
-        <Button
-          type="submit"
-          disabled={change === undefined || update.isPending}
-        >
+        <Button type="submit" disabled={change === undefined || saving}>
           {t("orgSettings.save")}
         </Button>
       </div>
@@ -336,10 +340,12 @@ function ProfileChoices({
   profiles,
   allowed,
   onToggle,
+  disabled,
 }: {
   profiles: readonly RunnerProfile[];
   allowed: readonly string[];
   onToggle: (id: string, on: boolean) => void;
+  disabled: boolean;
 }) {
   const i18n = useI18n();
   const { t, lang } = i18n;
@@ -370,7 +376,7 @@ function ProfileChoices({
             }
             checked={checked}
             // A profile that is not selectable can still be removed.
-            disabled={!p.selectable && !checked}
+            disabled={disabled || (!p.selectable && !checked)}
             onCheckedChange={(on) => onToggle(p.runnerProfileId, on === true)}
           />
         );
@@ -381,6 +387,7 @@ function ProfileChoices({
           label={t("orgSettings.missingProfile", { id })}
           description={t("orgSettings.missingProfileHelp")}
           checked
+          disabled={disabled}
           onCheckedChange={(on) => onToggle(id, on === true)}
         />
       ))}
