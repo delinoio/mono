@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -380,7 +382,8 @@ func TestRejectsNonBinding(t *testing.T) {
 
 func TestRejectsReservedHeaderBits(t *testing.T) {
 	src := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5}
-	req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest, pionstun.Fingerprint)
+	// Changing the header would also invalidate a request fingerprint.
+	req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest)
 	if resp, err := Respond(req.Raw, src); err != nil {
 		t.Fatalf("valid request rejected: %v", err)
 	} else {
@@ -392,7 +395,7 @@ func TestRejectsReservedHeaderBits(t *testing.T) {
 		}
 	}
 	for _, bits := range []byte{0x40, 0x80, 0xC0} {
-		raw := append([]byte(nil), req.Raw...)
+		raw := bytes.Clone(req.Raw)
 		raw[0] |= bits
 		if resp, err := Respond(raw, src); err == nil || resp != nil {
 			t.Fatalf("bits %#x answered: %v %v", bits, resp, err)
@@ -416,19 +419,39 @@ func TestServeCountsReservedHeaderBitsInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest, pionstun.Fingerprint)
-	req.Raw[0] |= 0x80
+	req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest)
 	if _, err := client.WriteTo(req.Raw, pc.LocalAddr()); err != nil {
 		t.Fatal(err)
 	}
-	_ = client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-	if n, _, err := client.ReadFrom(make([]byte, 1500)); err == nil {
-		t.Fatalf("got %d response bytes", n)
+	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1500)
+	n, _, err := client.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &pionstun.Message{Raw: buf[:n]}
+	if err := resp.Decode(); err != nil || resp.Type != pionstun.BindingSuccess || resp.TransactionID != req.TransactionID {
+		t.Fatalf("bad control response %v %v", resp, err)
+	}
+	wantInvalid := s.invalid.Load() + 1
+
+	raw := bytes.Clone(req.Raw)
+	raw[0] |= 0x80
+	if _, err := client.WriteTo(raw, pc.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := client.ReadFrom(buf); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected read timeout, got %d response bytes, error %v", n, err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for s.invalid.Load() != 1 {
+	for s.invalid.Load() != wantInvalid {
 		if time.Now().After(deadline) {
-			t.Fatalf("invalid = %d, want 1", s.invalid.Load())
+			t.Fatalf("invalid = %d, want %d", s.invalid.Load(), wantInvalid)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
