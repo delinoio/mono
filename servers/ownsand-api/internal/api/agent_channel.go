@@ -527,9 +527,13 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 		}
 		return nil
 	}
+	initial := !conn.Reconciled()
+	if initial && s.control != nil {
+		s.control.beginInitialReport(conn)
+	}
 	res, err := s.reconcileStateReport(ctx, conn.DeviceID, conn.ID, r)
 	if err != nil {
-		if !conn.Reconciled() && ctx.Err() == nil {
+		if initial && ctx.Err() == nil {
 			// No acknowledgement is sent and the channel stays not
 			// reconciled. Close it so that the agent connects again and
 			// sends a new full report once the database recovers. A failed
@@ -552,6 +556,11 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 		conn.Close(errDeviceRemoved)
 		return nil
 	}
+	if initial {
+		if hook := s.afterInitialReportCommit.Load(); hook != nil {
+			(*hook)(conn)
+		}
+	}
 	ack := &ownsandv1.StateReportAck{ReportSequence: r.GetReportSequence()}
 	for _, e := range r.GetSandboxes() {
 		ack.Sandboxes = append(ack.Sandboxes, &ownsandv1.SandboxUpdateAck{SandboxId: e.GetSandboxId(), Revision: e.GetRevision()})
@@ -561,7 +570,13 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 	}}}); err != nil {
 		return err
 	}
-	conn.SetReconciled()
+	if initial {
+		if s.control == nil {
+			conn.SetReconciled()
+		} else {
+			s.control.finishInitialReport(conn, res)
+		}
+	}
 	s.Logger.InfoContext(ctx, "agent_state_report", slog.String("device_id", conn.DeviceID), slog.Int("sandboxes", len(r.GetSandboxes())),
 		slog.Int("snapshots", len(r.GetSnapshots())), slog.Int("changed", len(res.changed)), slog.Int("deletes", len(res.deletes)),
 		slog.Int("recovered_copies", res.recoveredCopies))

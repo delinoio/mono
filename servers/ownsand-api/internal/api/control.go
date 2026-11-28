@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -40,6 +41,9 @@ type Control struct {
 	// retryBaseline allows polling to establish the baseline after the
 	// acquisition read has failed in this lease period.
 	retryBaseline bool
+	// deferredDeletes also marks channels applying their first report, even
+	// when they have no queued deletes yet. mu guards the handoff to ready.
+	deferredDeletes map[*hub.Conn][]events.Event
 
 	// Seams of the event processor. NewControl sets them to the database
 	// functions; tests replace them to interleave lease transitions with a
@@ -67,6 +71,7 @@ func NewControl(s *Service) *Control {
 	c.loadDeleteTarget = func(ctx context.Context, orgID, sandboxID string) (*sandboxRow, error) {
 		return loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
 	}
+	s.control = c
 	s.Notify = c.Kick
 	s.BaselineReady = c.baselineReady
 	return c
@@ -110,6 +115,7 @@ func (c *Control) LeaseAcquired(ctx context.Context) {
 	c.firstChannelGen = c.S.Hub.LastGeneration() + 1
 	c.cursor = -1
 	c.retryBaseline = false
+	c.deferredDeletes = nil
 	c.mu.Unlock()
 
 	id, err := c.readBaseline(ctx)
@@ -178,6 +184,7 @@ func (c *Control) LeaseLost() {
 	c.cursor = -1
 	c.retryBaseline = false
 	c.cursorGen++
+	c.deferredDeletes = nil
 	c.mu.Unlock()
 	c.S.Hub.CloseAll(errLeaseLost)
 }
@@ -260,6 +267,7 @@ func (c *Control) processEvents(ctx context.Context) {
 		return
 	}
 	for {
+		c.drainDeferredDeletes(ctx, gen)
 		if ctx.Err() != nil || !c.cursorCurrent(gen) {
 			return
 		}
@@ -380,33 +388,10 @@ func (c *Control) handle(ctx context.Context, e events.Event, channels channelGe
 			}
 		}
 		return retryErr
-	case events.KindSandboxDeleteRequested:
-		conn := s.Hub.Live(e.DeviceID)
-		if !channels.includes(conn) {
-			return nil
-		}
-		c.mu.Lock()
-		load := c.loadDeleteTarget
-		c.mu.Unlock()
-		sb, err := load(ctx, e.OrganizationID, e.SandboxID)
-		if err != nil {
-			if connect.CodeOf(err) == connect.CodeNotFound {
-				// The row is gone: the delete is obsolete and must not
-				// block later events.
-				return nil
-			}
-			// Any other lookup error is transient (for example a database
-			// error): keep the event pending for another poll so delivery
-			// can recover without another request or a reconnect.
-			return err
-		}
-		if isTerminal(sb.AgentState) || !sb.DeletePending {
-			return nil
-		}
-		s.sendDelete(ctx, conn, e.OrganizationID, pendingDelete{sandboxID: sb.ID, reason: sb.DeleteEndReason})
-	case events.KindSnapshotDeleted:
-		if conn := s.Hub.Live(e.DeviceID); channels.includes(conn) {
-			s.sendDeleteSnapshot(ctx, conn, e.OrganizationID, e.SnapshotID)
+	case events.KindSandboxDeleteRequested, events.KindSnapshotDeleted:
+		conn := s.Hub.Get(e.DeviceID)
+		if channels.includes(conn) && c.readyForDelete(conn, e) {
+			return c.deliverDelete(ctx, conn, e)
 		}
 	case events.KindDeviceRemoved:
 		if s.DataPath != nil {
@@ -428,6 +413,145 @@ func (c *Control) handle(ctx context.Context, e events.Event, channels channelGe
 		case events.KindAPIKeyRevoked, events.KindMembershipEnded, events.KindSandboxDeleted, events.KindOrganizationDeleted:
 			s.DataPath.HandleEvent(ctx, e, channels)
 		}
+	}
+	return nil
+}
+
+// beginInitialReport publishes that the first report is about to read
+// inventory. A delete skipped before this point is already committed and
+// visible to the report.
+func (c *Control) beginInitialReport(conn *hub.Conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cursor < 0 || conn.Generation < c.firstChannelGen || conn.Context().Err() != nil {
+		return
+	}
+	if c.deferredDeletes == nil {
+		c.deferredDeletes = make(map[*hub.Conn][]events.Event)
+	}
+	c.deferredDeletes[conn] = nil
+}
+
+// readyForDelete either admits immediate delivery or leaves the event with
+// the channel applying its first report. Both decisions use the same lock
+// as the readiness transition.
+func (c *Control) readyForDelete(conn *hub.Conn, e events.Event) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if conn.Reconciled() {
+		return true
+	}
+	if pending, applying := c.deferredDeletes[conn]; applying {
+		c.deferredDeletes[conn] = append(pending, e)
+	}
+	return false
+}
+
+// finishInitialReport publishes readiness after the acknowledgement enters
+// the outbound queue. The report handler sends the deletes it found, so only
+// other deferred deletes need to go through the worker.
+func (c *Control) finishInitialReport(conn *hub.Conn, res reconcileResult) {
+	sandboxes := make(map[string]struct{}, len(res.deletes))
+	for _, d := range res.deletes {
+		sandboxes[d.sandboxID] = struct{}{}
+	}
+	snapshots := make(map[string]struct{}, len(res.snapshotDeletes))
+	for _, id := range res.snapshotDeletes {
+		snapshots[id] = struct{}{}
+	}
+
+	c.mu.Lock()
+	pending := slices.DeleteFunc(c.deferredDeletes[conn], func(e events.Event) bool {
+		if e.Kind == events.KindSandboxDeleteRequested {
+			_, covered := sandboxes[e.SandboxID]
+			return covered
+		}
+		_, covered := snapshots[e.SnapshotID]
+		return covered
+	})
+	if len(pending) == 0 {
+		delete(c.deferredDeletes, conn)
+	} else {
+		c.deferredDeletes[conn] = pending
+	}
+	conn.SetReconciled()
+	c.mu.Unlock()
+
+	if len(pending) != 0 {
+		c.Kick()
+	}
+}
+
+// drainDeferredDeletes claims ready queues between cursor reads. A failed
+// lookup stays pending on its original channel while the cursor and other
+// deferred deletes can advance.
+func (c *Control) drainDeferredDeletes(ctx context.Context, gen uint64) {
+	if ctx.Err() != nil {
+		return
+	}
+	c.mu.Lock()
+	var ready map[*hub.Conn][]events.Event
+	if c.cursorGen == gen {
+		for conn, pending := range c.deferredDeletes {
+			switch {
+			case c.S.Hub.Get(conn.DeviceID) != conn:
+				delete(c.deferredDeletes, conn)
+			case conn.Reconciled():
+				if ready == nil {
+					ready = make(map[*hub.Conn][]events.Event)
+				}
+				ready[conn] = pending
+				delete(c.deferredDeletes, conn)
+			}
+		}
+	}
+	c.mu.Unlock()
+
+	for conn, pending := range ready {
+		retry := pending[:0]
+		for _, e := range pending {
+			if ctx.Err() != nil || !c.cursorCurrent(gen) {
+				return
+			}
+			if c.S.Hub.Get(conn.DeviceID) != conn {
+				break
+			}
+			if err := c.deliverDelete(ctx, conn, e); err != nil {
+				c.S.Logger.WarnContext(ctx, "control_deferred_delete_retry",
+					slog.Int64("event_id", e.ID), slog.String("sandbox_id", e.SandboxID),
+					slog.String("device_id", e.DeviceID), slog.Any("error", err))
+				retry = append(retry, e)
+			}
+		}
+		if len(retry) != 0 {
+			clear(pending[len(retry):])
+			c.mu.Lock()
+			if c.cursorGen == gen && c.S.Hub.Get(conn.DeviceID) == conn {
+				c.deferredDeletes[conn] = retry
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+
+func (c *Control) deliverDelete(ctx context.Context, conn *hub.Conn, e events.Event) error {
+	if e.Kind == events.KindSnapshotDeleted {
+		c.S.sendDeleteSnapshot(ctx, conn, e.OrganizationID, e.SnapshotID)
+		return nil
+	}
+	c.mu.Lock()
+	load := c.loadDeleteTarget
+	c.mu.Unlock()
+	sb, err := load(ctx, e.OrganizationID, e.SandboxID)
+	if err != nil {
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			// The row is gone and the delete is obsolete.
+			return nil
+		}
+		return err
+	}
+	if !isTerminal(sb.AgentState) && sb.DeletePending {
+		c.S.sendDelete(ctx, conn, e.OrganizationID, pendingDelete{sandboxID: sb.ID, reason: sb.DeleteEndReason})
 	}
 	return nil
 }
