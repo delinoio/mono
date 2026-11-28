@@ -589,10 +589,14 @@ func TestCreateContextEndedReapsSurvivingProcessOnEarlyExit(t *testing.T) {
 		{name: "in_flight", receiveResult: false},
 	}
 	for _, tc := range cases {
+		// Keep the VM root alive until the parent checks what Close removed.
+		vmsDir := t.TempDir()
 		var f *createFixture
 		var pid int
-		if t.Run(tc.name, func(t *testing.T) {
+		if ok := t.Run(tc.name, func(t *testing.T) {
 			f = newCreateFixture(t, loadBlock)
+			f.r.opts.VMsDir = vmsDir
+			f.spec.Dir = filepath.Join(vmsDir, f.spec.SandboxID)
 			var done <-chan error
 			// Observe the state after the Create cleanup and before Close.
 			t.Cleanup(func() {
@@ -603,6 +607,9 @@ func TestCreateContextEndedReapsSurvivingProcessOnEarlyExit(t *testing.T) {
 					}
 				default:
 					t.Error("create still running before runtime close")
+				}
+				if _, err := os.Stat(f.spec.Dir); err != nil {
+					t.Errorf("VM directory before runtime close: %v", err)
 				}
 				if n := f.registered(); n != 1 {
 					t.Errorf("%d VMs registered before runtime close, want 1", n)
@@ -625,9 +632,17 @@ func TestCreateContextEndedReapsSurvivingProcessOnEarlyExit(t *testing.T) {
 			// Run the same cleanup as a fatal assertion and let the parent
 			// check the child after this subtest returns.
 			t.SkipNow()
-		}) {
+		}); ok && f != nil {
 			requireProcessGone(t, pid)
-			requireReleased(t, f)
+			if n := f.registered(); n != 0 {
+				t.Errorf("%s: %d VMs still registered after runtime close", tc.name, n)
+			}
+			if _, err := os.Stat(vmsDir); err != nil {
+				t.Errorf("%s: VM root after runtime close: %v", tc.name, err)
+			}
+			if _, err := os.Stat(f.spec.Dir); !os.IsNotExist(err) {
+				t.Errorf("%s: VM directory after runtime close: want absence, stat error = %v", tc.name, err)
+			}
 		}
 	}
 }
