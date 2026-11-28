@@ -54,7 +54,10 @@ func TestSealOpenRoundTrip(t *testing.T) {
 		t.Fatalf("truncated: %v", err)
 	}
 	// Two seals of the same value differ (random nonce).
-	s2, _ := ring.Seal([]byte("osk_secret"), ad)
+	s2, err := ring.Seal([]byte("osk_secret"), ad)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if bytes.Equal(s.Ciphertext, s2.Ciphertext) {
 		t.Fatal("nonce reused")
 	}
