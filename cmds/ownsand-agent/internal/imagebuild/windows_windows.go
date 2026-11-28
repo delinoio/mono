@@ -158,6 +158,9 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 		return fmt.Errorf("imagebuild: generate the Windows build VM ID: %w", err)
 	}
 	logger.Info("booting the image once; Windows Setup finishes the specialize and OOBE passes")
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("imagebuild: before first boot of the Windows image: %w", err)
+	}
 	vm, err := hcsrt.StartBuildVM(hcsrt.BuildVMOptions{ID: "ownsand-image-build-windows-" + id, Disk: disk, Dir: build, VCPUs: cpus, MemoryMiB: memory, Logger: logger})
 	if err != nil {
 		return err
