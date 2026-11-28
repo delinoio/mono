@@ -116,6 +116,69 @@ async function readSnapshot(stream: ReturnType<typeof openWatch>["stream"]) {
   }
 }
 
+test("captures requests and runners before yielding the initial snapshot", async () => {
+  const organizationId = MOCK_IDS.acme;
+  const request = { organizationId, requestId: MOCK_IDS.queuedAgent };
+  const runner = { organizationId, runnerId: MOCK_IDS.warmRunner };
+  const { stream, work } = openWatch(organizationId);
+  const originalRequest = structuredClone(
+    (await work.getRequest(request)).request,
+  );
+  const originalRunner = structuredClone((await work.getRunner(runner)).runner);
+
+  try {
+    await expect(stream.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        event: {
+          case: "request",
+          value: { requestId: MOCK_IDS.queuedJob, state: RequestState.QUEUED },
+        },
+      },
+    });
+
+    await work.cancelRequest(request);
+    await work.deleteRunner(runner);
+
+    expect(await readSnapshot(stream)).toEqual([
+      { case: "request", value: originalRequest },
+      {
+        case: "request",
+        value: expect.objectContaining({ requestId: MOCK_IDS.queuedDev }),
+      },
+      {
+        case: "request",
+        value: expect.objectContaining({ requestId: MOCK_IDS.runningJob }),
+      },
+      {
+        case: "runner",
+        value: expect.objectContaining({ runnerId: MOCK_IDS.busyRunner }),
+      },
+      { case: "runner", value: originalRunner },
+    ]);
+    await expect(stream.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        event: {
+          case: "request",
+          value: { requestId: request.requestId, state: RequestState.CANCELED },
+        },
+      },
+    });
+    await expect(stream.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        event: {
+          case: "runner",
+          value: { runnerId: runner.runnerId, state: RunnerState.DELETED },
+        },
+      },
+    });
+  } finally {
+    await stream.return?.();
+  }
+});
+
 test.each([RunnerState.DELETED, RunnerState.DELETING, RunnerState.FAILED])(
   "deleting a runner in state %s preserves history and publishes no update",
   async (state) => {
