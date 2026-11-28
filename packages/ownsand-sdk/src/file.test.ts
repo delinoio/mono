@@ -6,6 +6,7 @@ import { MAX_FILE_CHUNK_SIZE } from "./codec.ts";
 import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
 import type { Clock } from "./clock.ts";
 import { DataPathError, OwnSandValidationError } from "./errors.ts";
+import { LogEvent, type LogRecord } from "./logger.ts";
 import { Timing } from "./relay/context.ts";
 import {
   AcceptanceDeadlineError,
@@ -35,6 +36,82 @@ import { validateGuestPath } from "./validate.ts";
 const MIN = 60_000;
 
 describe("file read", () => {
+  test.each([
+    ["an Error", new Error("consumer stopped")],
+    [
+      "an Unavailable error",
+      new ConnectError("consumer stopped", Code.Unavailable),
+    ],
+    ["undefined", undefined],
+  ])(
+    "closes the relay stream when the caller throws %s",
+    async (_label, error) => {
+      const records: LogRecord[] = [];
+      const h = setup({ logger: (record) => records.push(record) });
+      let closed = 0;
+      h.api.stream(RelayService, "ReadFile", function* ({ offset }) {
+        try {
+          yield file.accepted();
+          if (offset === 0n) {
+            yield file.chunk(0, "A");
+            yield new Hang();
+          }
+          yield file.chunk(1, "B");
+          yield file.end(2);
+        } finally {
+          closed++;
+        }
+      });
+      const iterator = h.client
+        .sandbox(SANDBOX)
+        .readFile("/f")
+        [Symbol.asyncIterator]();
+      expect(await h.clock.run(iterator.next())).toEqual({
+        done: false,
+        value: Uint8Array.of(65),
+      });
+      expect(closed).toBe(0);
+      const beforeThrow = h.clock.now();
+      await expect(h.clock.run(iterator.throw!(error))).rejects.toBe(error);
+      expect(await iterator.next()).toEqual({ done: true, value: undefined });
+      expect(closed).toBe(1);
+      expect(h.api.callsOf("ReadFile")).toHaveLength(1);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+      expect(h.clock.now()).toBe(beforeThrow);
+      expect(
+        records.some((record) => record.event === LogEvent.RelayRecovery),
+      ).toBe(false);
+    },
+  );
+
+  test("closes the relay stream when the caller returns after a chunk", async () => {
+    const h = setup();
+    let closed = 0;
+    h.api.stream(RelayService, "ReadFile", function* () {
+      try {
+        yield file.accepted();
+        yield file.chunk(0, "A");
+        yield new Hang();
+      } finally {
+        closed++;
+      }
+    });
+    const iterator = h.client
+      .sandbox(SANDBOX)
+      .readFile("/f")
+      [Symbol.asyncIterator]();
+    expect((await h.clock.run(iterator.next())).done).toBe(false);
+    expect(closed).toBe(0);
+    expect(await h.clock.run(iterator.return!())).toEqual({
+      done: true,
+      value: undefined,
+    });
+    expect(await iterator.next()).toEqual({ done: true, value: undefined });
+    expect(closed).toBe(1);
+    expect(h.api.callsOf("ReadFile")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+  });
+
   test("streams chunks with the read_id, path and salt and checks the final size", async () => {
     const h = setup();
     h.api.stream(RelayService, "ReadFile", function* () {

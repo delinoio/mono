@@ -249,7 +249,10 @@ export class Sandbox {
     };
   }
 
-  /** Streams a guest file in chunks, from `offset`. */
+  /**
+   * Streams a guest file in chunks, from `offset`. Calling `throw(value)`
+   * on the iterator after a chunk closes the read and rejects with `value`.
+   */
   readFile(
     path: string,
     options: { offset?: bigint; signal?: AbortSignal } = {},

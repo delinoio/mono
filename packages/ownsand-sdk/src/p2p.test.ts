@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { runInNewContext } from "node:vm";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -1536,6 +1537,56 @@ describe("peer-to-peer data path", () => {
     expect(written.sizeBytes).toBe(5n);
     expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
   });
+
+  test.each([
+    ["an Error", new Error("consumer stopped")],
+    [
+      "an Unavailable error",
+      new ConnectError("consumer stopped", Code.Unavailable),
+    ],
+  ])(
+    "closes the peer stream when the caller throws %s",
+    async (_label, error) => {
+      const { h, rtc } = p2pSetup((frame, peer) => {
+        if (frame.payload.case !== "fileReadRequest") return;
+        const { offset } = frame.payload.value;
+        peer.send({
+          streamId: frame.streamId,
+          sandboxId: SANDBOX,
+          kind: DataFrameKind.FILE_READ_EVENT,
+          payload: {
+            case: "fileReadEvent",
+            value: {
+              event: {
+                case: "chunk",
+                value: { offset, data: Uint8Array.of(offset === 0n ? 65 : 66) },
+              },
+            },
+          },
+        });
+      });
+      const { signal } = new AbortController();
+      const iterator = h.client
+        .sandbox(SANDBOX)
+        .readFile("/f", { signal })
+        [Symbol.asyncIterator]();
+      expect(await h.clock.run(iterator.next())).toEqual({
+        done: false,
+        value: Uint8Array.of(65),
+      });
+      expect(getEventListeners(signal, "abort")).toHaveLength(1);
+      const beforeThrow = h.clock.now();
+      await expect(h.clock.run(iterator.throw!(error))).rejects.toBe(error);
+      expect(await iterator.next()).toEqual({ done: true, value: undefined });
+      expect(getEventListeners(signal, "abort")).toHaveLength(0);
+      expect(
+        rtc.frames.filter((frame) => frame.payload.case === "fileReadRequest"),
+      ).toHaveLength(1);
+      expect(h.api.callsOf("ReadFile")).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(h.clock.now()).toBe(beforeThrow);
+    },
+  );
 
   test("checks the final size on the data channel without retrying or falling back", async () => {
     const writes: bigint[] = [];

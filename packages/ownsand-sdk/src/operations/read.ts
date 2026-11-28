@@ -91,6 +91,7 @@ export async function* runReadFile(
     }
 
     let accepted = false;
+    let yieldingChunk = false;
     let failure: unknown;
     try {
       for await (const event of events) {
@@ -113,7 +114,9 @@ export async function* runReadFile(
               const fresh = data.subarray(Number(next - offset));
               next = end;
               window.end();
+              yieldingChunk = true;
               yield fresh;
+              yieldingChunk = false;
             }
             break;
           }
@@ -142,7 +145,9 @@ export async function* runReadFile(
       );
     } catch (error) {
       if (onRelay) grants.streamEnded();
-      if (error instanceof DataPathError) {
+      // An iterator.throw() at the chunk yield closes the event stream before
+      // reaching this catch. Propagate the caller's value before classifying it.
+      if (yieldingChunk || error instanceof DataPathError) {
         throw error;
       }
       failure = error;
