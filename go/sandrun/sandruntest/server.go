@@ -73,8 +73,8 @@ type Server struct {
 	// PromoteAfterGets moves a QUEUED or STARTING dev session to RUNNING
 	// after this many GetDevSession calls for it. Zero never promotes.
 	PromoteAfterGets int
-	// BeforeExec, when it is set, is called with a copy of each
-	// ExecDevSession request before the fake guest starts the command.
+	// BeforeExec, when set, is called with a copy of the ExecDevSession
+	// request after request validation and before exec admission.
 	// Tests use it to change the guest between the commands of a sync, for
 	// example to act as another client.
 	BeforeExec func(*sandrunv1.ExecDevSessionRequest)
