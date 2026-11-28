@@ -20,12 +20,13 @@ import (
 type attachment struct {
 	link Link
 	tap  string
-	dns  dnsCloser
+	dns  dnsForwarder
 }
 
-// dnsCloser is the part of a DNS forwarder that the manager needs after the
+// dnsForwarder is the part of a DNS forwarder that the manager needs after the
 // start; tests replace the forwarder.
-type dnsCloser interface {
+type dnsForwarder interface {
+	setUpstream(string)
 	Close()
 }
 
@@ -66,11 +67,13 @@ type Manager struct {
 	// them.
 	interval time.Duration
 	refresh  func() error
+	// resolvConf is the host resolver file. Tests use a temporary file.
+	resolvConf string
 	// Tests replace these host operations so that the manager runs without
 	// root.
 	run           func(name string, args ...string) error
 	listTaps      func() ([]string, error)
-	startDNS      func(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsCloser, error)
+	startDNS      func(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsForwarder, error)
 	setForwarding func() error
 	tapExists     func(tap string) bool
 	hostRoutes    func() ([]Route, []netip.Prefix, error)
@@ -86,6 +89,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		used:          map[int]bool{},
 		gateways:      map[string]TapGateway{},
 		interval:      RefreshInterval,
+		resolvConf:    "/etc/resolv.conf",
 		run:           run,
 		listTaps:      listTapDevices,
 		startDNS:      startDNSForwarder,
@@ -99,9 +103,9 @@ func NewManager(logger *slog.Logger) *Manager {
 	return m
 }
 
-// startDNSForwarder is StartDNS behind the dnsCloser interface. It returns a
+// startDNSForwarder is StartDNS behind the dnsForwarder interface. It returns a
 // nil interface, not a nil pointer, when the start fails.
-func startDNSForwarder(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsCloser, error) {
+func startDNSForwarder(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsForwarder, error) {
 	f, err := StartDNS(listen, upstream, logger)
 	if err != nil {
 		return nil, err
@@ -321,11 +325,15 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	if err := m.refresh(); err != nil {
 		return fail(err)
 	}
-	dns, err := m.startDNS(netip.AddrPortFrom(link.Gateway, 53), HostResolver("/etc/resolv.conf"), m.logger)
+	// Hold the lock from resolver selection through attachment publication.
+	// A poll can then never update the existing forwarders and miss a new
+	// forwarder that started with an older address.
+	m.mu.Lock()
+	dns, err := m.startDNS(netip.AddrPortFrom(link.Gateway, 53), HostResolver(m.resolvConf), m.logger)
 	if err != nil {
+		m.mu.Unlock()
 		return fail(fmt.Errorf("netpolicy: start DNS forwarder: %w", err))
 	}
-	m.mu.Lock()
 	m.attached[sandboxID] = &attachment{link: link, tap: tap, dns: dns}
 	m.mu.Unlock()
 	m.logger.Info("network setup finished", "sandbox_id", sandboxID, "tap", tap)
@@ -383,7 +391,32 @@ func (m *Manager) removeTap(sandboxID, tap string, idx int) {
 	m.mu.Unlock()
 }
 
-// Run refreshes the policy every RefreshInterval while sandboxes are
+// refreshDNS updates running forwarders and reports whether any sandboxes
+// are attached. An unreadable file or an invalid nameserver list leaves
+// their upstreams intact.
+func (m *Manager) refreshDNS() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.attached) == 0 {
+		return false
+	}
+	if upstream := readHostResolver(m.resolvConf); upstream != "" {
+		for _, a := range m.attached {
+			a.dns.setUpstream(upstream)
+		}
+	}
+	return true
+}
+
+func (m *Manager) poll() {
+	if m.refreshDNS() {
+		if err := m.refresh(); err != nil {
+			m.logger.Error("network policy refresh failed", "error", err)
+		}
+	}
+}
+
+// Run refreshes DNS and the policy every RefreshInterval while sandboxes are
 // attached, until ctx ends. The runtime that owns the manager runs it for
 // its lifetime.
 func (m *Manager) Run(ctx context.Context) {
@@ -394,14 +427,7 @@ func (m *Manager) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			m.mu.Lock()
-			n := len(m.attached)
-			m.mu.Unlock()
-			if n > 0 {
-				if err := m.refresh(); err != nil {
-					m.logger.Error("network policy refresh failed", "error", err)
-				}
-			}
+			m.poll()
 		}
 	}
 }

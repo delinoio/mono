@@ -65,6 +65,7 @@ func TestHostResolver(t *testing.T) {
 	for _, c := range []struct{ conf, want string }{
 		{"nameserver fe80::53%eth-test\nnameserver 192.0.2.54\n", "[fe80::53%eth-test]:53"},
 		{"nameserver 2001:db8::53\nnameserver 192.0.2.54\n", "[2001:db8::53]:53"},
+		{"nameserver invalid\nnameserver 192.0.2.54\n", "192.0.2.54:53"},
 	} {
 		os.WriteFile(p, []byte(c.conf), 0o644)
 		if got := HostResolver(p); got != c.want {
@@ -74,6 +75,42 @@ func TestHostResolver(t *testing.T) {
 	if got := HostResolver(filepath.Join(t.TempDir(), "missing")); got != "127.0.0.53:53" {
 		t.Fatalf("fallback %s", got)
 	}
+}
+
+func TestDNSForwarderKeepsAdmittedUpstream(t *testing.T) {
+	first, second := startGatedUpstream(t), startGatedUpstream(t)
+	second.open()
+	hook, paused, resume := pauseAfterAdmit()
+	f := startTestDNS(t, first.addr, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{
+		maxUDPQueries: 2, maxTCPConns: 2, afterAdmit: hook,
+	})
+	t.Cleanup(f.Close)
+	t.Cleanup(resume)
+
+	udp := dnsUDPQuery(t, f, "old-udp")
+	waitForCount(t, "first upstream UDP queries", &first.udpQueries, 1)
+	tcp := dnsTCPConn(t, f, "old-tcp")
+	requireClosedWithin(t, "first TCP admission", paused, 5*time.Second)
+	f.setUpstream(second.addr)
+	resume()
+	waitForCount(t, "first upstream TCP connections", &first.tcpConns, 1)
+
+	checkUDP := func(c net.Conn, want string) {
+		t.Helper()
+		buf := make([]byte, 32)
+		n, err := c.Read(buf)
+		if err != nil || string(buf[:n]) != want {
+			t.Fatalf("UDP response = %q, %v, want %q", buf[:n], err, want)
+		}
+	}
+	checkUDP(dnsUDPQuery(t, f, "new-udp"), "ok:new-udp")
+	requireDNSAnswer(t, dnsTCPConn(t, f, "new-tcp"), "new-tcp")
+	waitForCount(t, "second upstream UDP queries", &second.udpQueries, 1)
+	waitForCount(t, "second upstream TCP connections", &second.tcpConns, 1)
+
+	first.open()
+	checkUDP(udp, "ok:old-udp")
+	requireDNSAnswer(t, tcp, "old-tcp")
 }
 
 // gatedUpstream is a fake upstream whose UDP and TCP handlers block until
