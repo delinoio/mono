@@ -1344,7 +1344,9 @@ getUser(params)  // Cache hit (same reference)
 
 **Next.js-Specific Note:**
 
-In Next.js, the `fetch` API is automatically extended with request memoization. Requests with the same URL and options are automatically deduplicated within a single request, so you don't need `React.cache()` for `fetch` calls. However, `React.cache()` is still essential for other async tasks:
+In Next.js 15, React request memoization applies only to `GET` calls to `fetch`. Calls with the same URL and options can reuse a result within a single render of the React component tree. Route Handlers are outside that tree and therefore outside React request memoization. [Next.js 15 request memoization guide](https://nextjs.org/docs/15/app/guides/caching#request-memoization)
+
+Other async tasks that can benefit from memoization include the following.
 
 - Database queries (Prisma, Drizzle, etc.)
 
