@@ -18,8 +18,17 @@ afterEach(() => {
 
 const ERROR_MESSAGE = "This field is required.";
 
+const FIELD_CONTROLS = {
+  TextField: "input",
+  Textarea: "textarea",
+  PasswordInput: "input",
+  NumberInput: "input",
+  Select: 'button[role="combobox"]',
+  RadioGroup: 'div[role="radiogroup"]',
+};
+
 type FieldCase = {
-  name: string;
+  name: keyof typeof FIELD_CONTROLS;
   /** Renders the field with the given extra props. */
   field: (props: {
     error?: React.ReactNode;
@@ -99,11 +108,21 @@ describe.each(FIELD_CASES)(
       }
     });
 
-    test("renders the error message in the markup", () => {
-      const markup = renderToStaticMarkup(
+    test("renders the error slot and references its id on the control", () => {
+      const container = document.createElement("div");
+      container.innerHTML = renderToStaticMarkup(
         fieldCase.field({ error: ERROR_MESSAGE }),
       );
-      expect(markup).toContain(ERROR_MESSAGE);
+
+      const error = container.querySelector('[data-slot="field-error"]');
+      expect(error?.textContent).toBe(ERROR_MESSAGE);
+      expect(error?.id).toBeTruthy();
+
+      const control = container.querySelector(FIELD_CONTROLS[fieldCase.name]);
+      expect(control).not.toBeNull();
+      expect(control?.getAttribute("aria-describedby")?.split(/\s+/)).toContain(
+        error?.id,
+      );
     });
 
     test("shows and hides the error message on the client", async () => {
@@ -209,8 +228,8 @@ describe.each([
 
 type DescriptionCase = {
   name: string;
-  /** Matches the opening tag of the element that carries `aria-describedby`. */
-  control: RegExp;
+  /** Selects the element that carries `aria-describedby`. */
+  control: string;
   /** Renders the component with the given description. */
   field: (description: React.ReactNode) => React.ReactElement;
 };
@@ -218,33 +237,33 @@ type DescriptionCase = {
 const DESCRIPTION_CASES: DescriptionCase[] = [
   {
     name: "TextField",
-    control: /<input[^>]*>/,
+    control: FIELD_CONTROLS.TextField,
     field: (description) => (
       <TextField label="Name" description={description} />
     ),
   },
   {
     name: "Textarea",
-    control: /<textarea[^>]*>/,
+    control: FIELD_CONTROLS.Textarea,
     field: (description) => <Textarea label="Bio" description={description} />,
   },
   {
     name: "PasswordInput",
-    control: /<input[^>]*>/,
+    control: FIELD_CONTROLS.PasswordInput,
     field: (description) => (
       <PasswordInput label="Password" description={description} />
     ),
   },
   {
     name: "NumberInput",
-    control: /<input[^>]*>/,
+    control: FIELD_CONTROLS.NumberInput,
     field: (description) => (
       <NumberInput label="Tickets" description={description} />
     ),
   },
   {
     name: "Select",
-    control: /<button[^>]*role="combobox"[^>]*>/,
+    control: FIELD_CONTROLS.Select,
     field: (description) => (
       <Select label="Role" description={description}>
         <SelectOption value="admin">Admin</SelectOption>
@@ -253,7 +272,7 @@ const DESCRIPTION_CASES: DescriptionCase[] = [
   },
   {
     name: "RadioGroup",
-    control: /<div[^>]*role="radiogroup"[^>]*>/,
+    control: FIELD_CONTROLS.RadioGroup,
     field: (description) => (
       <RadioGroup label="Plan" description={description}>
         <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
@@ -262,14 +281,14 @@ const DESCRIPTION_CASES: DescriptionCase[] = [
   },
   {
     name: "Slider",
-    control: /<input[^>]*role="slider"[^>]*>/,
+    control: 'input[role="slider"]',
     field: (description) => (
       <Slider label="Volume" defaultValue={40} description={description} />
     ),
   },
   {
     name: "Switch",
-    control: /<button[^>]*role="switch"[^>]*>/,
+    control: 'button[role="switch"]',
     field: (description) => <Switch label="Alerts" description={description} />,
   },
 ];
@@ -317,9 +336,11 @@ describe.each(DESCRIPTION_CASES)(
       expect(element).not.toContain("hidden");
       const descriptionId = element?.match(/\sid="([^"]+)"/)?.[1];
       expect(descriptionId).toBeTruthy();
-      const control = markup.match(descriptionCase.control)?.[0];
-      expect(control).toBeDefined();
-      const describedBy = control?.match(/\saria-describedby="([^"]*)"/)?.[1];
+      const container = document.createElement("div");
+      container.innerHTML = markup;
+      const control = container.querySelector(descriptionCase.control);
+      expect(control).not.toBeNull();
+      const describedBy = control?.getAttribute("aria-describedby");
       expect(describedBy?.split(/\s+/)).toContain(descriptionId);
       expect(danglingDescribedByIds(markup)).toEqual([]);
     });
