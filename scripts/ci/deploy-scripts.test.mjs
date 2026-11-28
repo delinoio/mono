@@ -208,7 +208,13 @@ test("deploy.yml keeps pending runs in the concurrency queue", () => {
     .map((line) => line.trim());
   assert.ok(keys.includes("queue: max"));
   assert.ok(keys.includes("cancel-in-progress: false"));
-  assert.ok(keys.some((key) => key.startsWith("group: ")));
+  assert.deepEqual(
+    keys.filter((key) => key.startsWith("group:")),
+    [
+      "group: ${{ github.ref == 'refs/heads/main' && 'deploy' || format('deploy-rejected-{0}', github.run_id) }}",
+    ],
+    "Main dispatches share the deploy group and each non-main dispatch has its own group",
+  );
   // actionlint v1.7.12 rejects `queue`; the exception must name only that
   // diagnostic and only this workflow.
   const lint = readYamlFixture(".github/actionlint.yaml");
