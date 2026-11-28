@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create, isMessage } from "@bufbuild/protobuf";
-import { durationFromMs, timestampMs } from "@bufbuild/protobuf/wkt";
+import {
+  durationFromMs,
+  timestampFromMs,
+  timestampMs,
+} from "@bufbuild/protobuf/wkt";
 import {
   afterEach,
   beforeEach,
@@ -4245,6 +4249,83 @@ describe("audit", () => {
 });
 
 describe("work", () => {
+  test("updates queue wait from the local clock without refetching requests", async () => {
+    rs.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      const organizationId = MOCK_IDS.acme;
+      const now = Date.now();
+      const mock = createMockTransport({
+        workFixtures: [
+          {
+            organizationId,
+            requests: [
+              {
+                requestId: "canceled-before-start",
+                sourceKey: "Canceled fixture",
+                state: RequestState.CANCELED,
+                queuedAt: timestampFromMs(now - 15 * 60_000),
+                endedAt: timestampFromMs(now - 13 * 60_000),
+              },
+              {
+                requestId: "missing-queue-timestamp",
+                sourceKey: "Undated fixture",
+                state: RequestState.QUEUED,
+              },
+            ],
+          },
+        ],
+      });
+      const calls: DescMethodUnary[] = [];
+      const transport: Transport = {
+        ...mock,
+        unary(method, ...args) {
+          calls.push(method);
+          return mock.unary(method, ...args);
+        },
+      };
+      renderConsole(`/orgs/${organizationId}/requests`, { transport });
+      await screen.findByRole("table", { name: "Requests" });
+      await click(
+        screen.getByRole("checkbox", { name: "Show ended requests" }),
+      );
+
+      const table = within(
+        await screen.findByRole("table", { name: "Requests" }),
+      );
+      const queueWaitColumn = table
+        .getAllByRole("columnheader")
+        .indexOf(table.getByRole("columnheader", { name: "Queue wait" }));
+      const queueWait = (name: RegExp) =>
+        within(table.getByRole("row", { name })).getAllByRole("cell")[
+          queueWaitColumn
+        ].textContent;
+      const readWaits = () => [
+        queueWait(/test \(ubuntu\)/),
+        queueWait(/build \(ubuntu\)/),
+        queueWait(/Canceled fixture/),
+        queueWait(/Undated fixture/),
+      ];
+      expect(readWaits()).toEqual(["4 min", "1 min", "2 min", "—"]);
+      const callsBeforeTick = calls.length;
+      expect(
+        calls.filter((method) => method === WorkService.method.listRequests),
+      ).toHaveLength(2);
+
+      await act(async () => rs.advanceTimersByTime(59_999));
+      expect(readWaits()).toEqual(["4 min", "1 min", "2 min", "—"]);
+      await act(async () => rs.advanceTimersByTime(1));
+      expect(readWaits()).toEqual(["5 min", "1 min", "2 min", "—"]);
+      expect(calls).toHaveLength(callsBeforeTick);
+
+      expect(rs.getTimerCount()).toBe(1);
+      cleanup();
+      expect(rs.getTimerCount()).toBe(0);
+    } finally {
+      cleanup();
+      rs.useRealTimers();
+    }
+  });
+
   test("shows active requests in queue order and can include ended requests", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
     const table = await screen.findByRole("table", { name: "Requests" });
