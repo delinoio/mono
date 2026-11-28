@@ -1854,6 +1854,137 @@ async function readSnapshotRunnerIds(
   }
 }
 
+test.each([
+  { state: RequestState.STARTING, runnerState: RunnerState.PREPARING },
+  { state: RequestState.RUNNING, runnerState: RunnerState.BUSY },
+])(
+  "deleting a started dev session ends its paired runner ($runnerState)",
+  async ({ state, runnerState }) => {
+    const organizationId = MOCK_IDS.acme;
+    const devSessionId = "active-dev";
+    const runnerId = "dev-runner";
+    const ownsandDeviceId = MOCK_IDS.macDevice;
+    const transport = createMockTransport({
+      workFixtures: [
+        {
+          organizationId,
+          devSessions: [
+            {
+              devSessionId,
+              ownerUserId: MOCK_USER,
+              state,
+              runnerId: state === RequestState.RUNNING ? runnerId : "",
+            },
+          ],
+          requests: [
+            {
+              requestId: devSessionId,
+              kind: WorkloadKind.DEV_SESSION,
+              state,
+              runnerId: state === RequestState.STARTING ? runnerId : "",
+            },
+          ],
+          runners: [
+            {
+              runnerId,
+              requestId: devSessionId,
+              kind: WorkloadKind.DEV_SESSION,
+              state: runnerState,
+              ownsandDeviceId,
+            },
+          ],
+        },
+      ],
+    });
+    const work = createClient(WorkService, transport);
+    const sessions = createClient(DevSessionService, transport);
+    const org = { organizationId };
+    const capacity = async () =>
+      (await work.getCapacity(org)).devices.find(
+        (device) => device.ownsandDeviceId === ownsandDeviceId,
+      )?.runners;
+    expect(await capacity()).toMatchObject([{ state: runnerState, count: 1 }]);
+    expect((await work.listRunners(org)).runners).toContainEqual(
+      expect.objectContaining({ runnerId, state: runnerState }),
+    );
+
+    const stream = work
+      .watchQueue(org, { timeoutMs: 2000 })
+      [Symbol.asyncIterator]();
+    try {
+      expect(await readSnapshotRunnerIds(stream)).toContain(runnerId);
+      const { devSession } = await sessions.deleteDevSession({
+        ...org,
+        devSessionId,
+      });
+      const { request } = await work.getRequest({
+        ...org,
+        requestId: devSessionId,
+      });
+      const terminal = {
+        state: RequestState.ENDED,
+        endReason: RequestEndReason.SESSION_DELETED,
+        endedAt: expect.any(Object),
+      };
+      expect(devSession).toMatchObject(terminal);
+      expect(request).toMatchObject(terminal);
+      expect(devSession?.endedAt).toEqual(request?.endedAt);
+
+      const { runner } = await work.getRunner({ ...org, runnerId });
+      expect(runner).toMatchObject({
+        state: RunnerState.DELETED,
+        endReason: RunnerEndReason.DELETED_BY_USER,
+        endedAt: expect.any(Object),
+      });
+      expect(
+        (await work.listRunners(org)).runners.map((r) => r.runnerId),
+      ).not.toContain(runnerId);
+      expect(
+        (await work.listRunners({ ...org, includeEnded: true })).runners,
+      ).toContainEqual(runner);
+      expect(await capacity()).toEqual([]);
+      await expect(stream.next()).resolves.toMatchObject({
+        done: false,
+        value: { event: { case: "request", value: request } },
+      });
+      await expect(stream.next()).resolves.toMatchObject({
+        done: false,
+        value: { event: { case: "runner", value: runner } },
+      });
+    } finally {
+      await stream.return?.();
+    }
+  },
+);
+
+test("deleting a queued dev session cancels its request and leaves runners alone", async () => {
+  const transport = createMockTransport();
+  const sessions = createClient(DevSessionService, transport);
+  const work = createClient(WorkService, transport);
+  const org = { organizationId: MOCK_IDS.acme };
+  const runnerList = { ...org, includeEnded: true };
+  const runnersBefore = await work.listRunners(runnerList);
+  const capacityBefore = await work.getCapacity(org);
+
+  const { devSession } = await sessions.deleteDevSession({
+    ...org,
+    devSessionId: MOCK_IDS.queuedDev,
+  });
+  const { request } = await work.getRequest({
+    ...org,
+    requestId: MOCK_IDS.queuedDev,
+  });
+  const canceled = {
+    state: RequestState.CANCELED,
+    endReason: RequestEndReason.CANCELED_BY_USER,
+    endedAt: expect.any(Object),
+  };
+  expect(devSession).toMatchObject(canceled);
+  expect(request).toMatchObject(canceled);
+  expect(await work.listRunners(runnerList)).toEqual(runnersBefore);
+  expect(await work.getCapacity(org)).toEqual(capacityBefore);
+});
+
 test("GitHub unlink sends a terminal runner event and omits the runner from fresh queue snapshots", async () => {
   const transport = createMockTransport();
   const github = createClient(GitHubService, transport);
