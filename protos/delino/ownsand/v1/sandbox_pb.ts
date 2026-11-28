@@ -150,7 +150,9 @@ export type Sandbox = Message<"delino.ownsand.v1.Sandbox"> & {
   source?: SandboxSource | undefined;
 
   /**
-   * Set for a template source: the snapshot that the template referenced.
+   * For a direct snapshot source, this is the selected snapshot ID.
+   * For a template source, this is the snapshot ID resolved at sandbox creation.
+   * For a base image source, this is an empty string.
    *
    * @generated from field: string source_snapshot_id = 8;
    */
