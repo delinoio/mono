@@ -590,6 +590,8 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	// and nothing is reserved for a rejected request, so the same
 	// authorization_id still works with the lowercase spelling.
 	upperReq := newExec(org.ID, sandboxID)
+	// Use a UUID with a hex letter so uppercasing always changes it.
+	upperReq.ExecId = "01991234-5678-7000-8000-00000000000a"
 	upperAuthID, _ := uuidv7.NewString()
 	upperExec := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
 		OperationId: strings.ToUpper(upperReq.GetExecId()), RequestDigest: relaybinding.ExecDigest(upperReq), AuthorizationId: upperAuthID}
