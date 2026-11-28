@@ -88,11 +88,17 @@ function useWatchSessions(
       // may have missed changes.
       let reconciled = watchedKey.current !== key;
       watchedKey.current = key;
-      onLive();
+      let live = false;
       for await (const response of client.watchSessions(
         { organizationId },
         { signal },
       )) {
+        // Only a response confirms the subscription; marking the stream
+        // live earlier would reset the reconnect backoff on every attempt.
+        if (!live) {
+          live = true;
+          onLive();
+        }
         if (!reconciled) {
           reconciled = true;
           void queryClient.invalidateQueries({

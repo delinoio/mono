@@ -313,6 +313,26 @@ describe("session list", () => {
     });
   });
 
+  test("backs off while its change stream fails before a response", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    let watches = 0;
+    const transport: Transport = {
+      ...base,
+      async stream(method, ...rest) {
+        if (method.name !== "WatchSessions")
+          return base.stream(method, ...rest);
+        watches++;
+        throw new ConnectError("unavailable", Code.Unavailable);
+      },
+    };
+    renderConsole(`/orgs/${ACME}/sessions`, { transport });
+    await screen.findByRole("list", { name: "Sessions" });
+    await waitFor(() => expect(watches).toBe(1));
+    // Attempts at 0, 1 and 3 seconds; without backoff, one every second.
+    await new Promise((resolve) => setTimeout(resolve, 4_500));
+    expect(watches).toBe(3);
+  }, 10_000);
+
   test("keeps a failed first load recoverable", async () => {
     renderConsole(`/orgs/${ACME}/sessions`, {
       mock: { failFirstSessionList: true },
