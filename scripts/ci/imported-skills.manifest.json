@@ -73,7 +73,7 @@
         "installMode": "copy"
       },
       "files": {
-        "AGENTS.md": "ccac4cfb3e0449d8768ab7a3fa675c9accd60f495f5802f06f0d5df218009d1b",
+        "AGENTS.md": "28f3e16ecad85429cf129c2bd3787087b88f3d7706a2e6164773bbc04138294f",
         "NOTICE": "9c36e263d0dca62d704612f037ff0b0cffc80cc395604f2eaf900191699e90cc",
         "README.md": "8d9f8517adee6028be8ba0a9cd8869cf27d3dbc3ca56d1414c8ed4751afbe516",
         "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
@@ -93,7 +93,7 @@
         "rules/bundle-barrel-imports.md": "e648f6d54525f07a691357040ca5bff6ea3424788a91ff63812adb29622a671b",
         "rules/bundle-conditional.md": "09c8259c3efb04fc0abb8e412ccbda217c222ae8118516283e571c995fe3a7d4",
         "rules/bundle-defer-third-party.md": "3dd76efed1f2d2bb0c6d37adaf3618ffc5eb9a83386bed5f8356cf7fd5dc7876",
-        "rules/bundle-dynamic-imports.md": "401817a7369f315fc5a68a1095742ff7d53d0461906880dc9d64a41495ee1986",
+        "rules/bundle-dynamic-imports.md": "c3a6977b7611d63d9c99516d5f83c938b77e436c17fac57ebdc3a8ca6045aa8d",
         "rules/bundle-preload.md": "ed606ad34f9e5573573a833f498e7b938fd1a445b43e16c5d437c2a071864b5f",
         "rules/client-event-listeners.md": "30a3141a17f4b8853d4a440633d8106f2cf53914ab2ee8cf96e6b667ad642c6f",
         "rules/client-localstorage-schema.md": "50b3a54bc30ace7e9925d55ed801a3318d713ea22529af4f45a506d175bbc5e5",
