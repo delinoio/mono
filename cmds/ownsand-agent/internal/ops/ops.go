@@ -54,8 +54,8 @@ type Sandboxes interface {
 	Guest(sandboxID string) (*guestclient.Client, bool)
 	// Touch records sandbox activity, which restarts the idle clock.
 	Touch(sandboxID string)
-	// WithRunning calls fn only while the sandbox is RUNNING and no end of
-	// it has started, and returns whether it called fn. The sandbox cannot
+	// WithRunning calls fn only when the sandbox is RUNNING, has a VM, and
+	// is not ending. It reports whether it called fn. The sandbox cannot
 	// start to end until fn returns, so an end that starts later sees what fn
 	// registered with the dispatcher. fn runs with the sandbox state locked:
 	// it may take dispatcher locks, because the sandbox manager already calls

@@ -1977,6 +1977,45 @@ func TestRestartPendingCleanupRejectsVMOperations(t *testing.T) {
 	}
 }
 
+func TestWithRunningRejectsRestartPendingCleanup(t *testing.T) {
+	e := newEnv(t)
+	entry := e.create(time.Hour, 2*time.Hour)
+	id, deadline := entry.GetSandboxId(), entry.GetIdleDeadline().AsTime()
+	e.rt = newFakeRuntime()
+	e.rt.files[id] = true
+	e.rt.deleteFails = 1
+	e.restart()
+
+	if state, ok := e.m.State(id); !ok || state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("retained state = %v, present = %v, want RUNNING", state, ok)
+	}
+	if e.m.WithRunning(id, func() { t.Error("called WithRunning callback without a VM") }) {
+		t.Error("WithRunning admitted a sandbox without a VM")
+	}
+
+	e.clk.Advance(30 * time.Minute)
+	e.m.Touch(id)
+	sb := e.m.sandboxes[id]
+	if !sb.rec.IdleDeadline.Equal(deadline) || sb.idleDirty {
+		t.Errorf("Touch left deadline = %v, dirty = %v, want %v and clean", sb.rec.IdleDeadline, sb.idleDirty, deadline)
+	}
+
+	e.ex.running[id] = true
+	e.clk.Advance(30*time.Minute + time.Second)
+	e.m.Tick(context.Background(), false)
+	e.m.bg.Wait()
+	if !sb.rec.IdleDeadline.Equal(deadline) || sb.idleDirty {
+		t.Errorf("Tick left deadline = %v, dirty = %v, want %v and clean", sb.rec.IdleDeadline, sb.idleDirty, deadline)
+	}
+	if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_DELETED ||
+		endReason(e.m, id) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Errorf("state after Tick = %v, reason = %v, want DELETED/IDLE_TTL_EXPIRED", state, endReason(e.m, id))
+	}
+	if calls := e.rt.deleteCallCount(); calls != 2 || e.rt.hasFiles(id) {
+		t.Errorf("Delete calls = %d, files remain = %v, want two calls and no files", calls, e.rt.hasFiles(id))
+	}
+}
+
 func TestSurvivingVMIsStoppedAtStart(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
