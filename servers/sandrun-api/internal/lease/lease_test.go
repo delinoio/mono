@@ -202,7 +202,7 @@ func TestHeldEndsAtConfirmedExpiry(t *testing.T) {
 	// The result of the ended period cannot restore it, and a second
 	// expiry check does not run OnLose again.
 	l.applyRenewal(epoch, true, "", clock.Now().Add(TTL))
-	l.expireIfDue()
+	l.expireIfDue(nil)
 	if l.Held() || lost.Load() != 1 {
 		t.Fatalf("held %v, OnLose ran %d times", l.Held(), lost.Load())
 	}
@@ -351,6 +351,225 @@ func TestWaitIgnoresExpiredAcquisition(t *testing.T) {
 	})
 }
 
+func TestWaitEndsDuringExpiryCleanup(t *testing.T) {
+	for _, wantErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				clock := newTestClock()
+				l, _ := newTestLease()
+				l.DeadlineNow = clock.Now
+				cleanupStarted := make(chan struct{})
+				cleanupGate := make(chan struct{})
+				defer close(cleanupGate)
+				l.OnLose = func() {
+					close(cleanupStarted)
+					<-cleanupGate
+				}
+				acquireFor(t, l, clock.Now().Add(TTL))
+				clock.Advance(TTL)
+
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				done := make(chan error, 1)
+				go func() { done <- l.Wait(ctx) }()
+				<-cleanupStarted
+				if wantErr == context.Canceled {
+					cancel()
+				} else {
+					time.Sleep(time.Second)
+				}
+				synctest.Wait()
+				select {
+				case err := <-done:
+					if !errors.Is(err, wantErr) {
+						t.Fatalf("Wait during OnLose: got %v, want %v", err, wantErr)
+					}
+				default:
+					t.Fatal("Wait still blocked on OnLose after its context ended")
+				}
+			})
+		})
+	}
+}
+
+func TestWaitSharesExpiryWhileTransitionIsBlocked(t *testing.T) {
+	clock := newTestClock()
+	expireAt := clock.Now().Add(TTL)
+	l, lost := newTestLease()
+	observedExpiry := make(chan struct{}, 3)
+	l.DeadlineNow = func() time.Time {
+		now := clock.Now()
+		if now.Equal(expireAt) {
+			select {
+			case observedExpiry <- struct{}{}:
+			default:
+			}
+		}
+		return now
+	}
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	acquireStarted := make(chan struct{})
+	acquireGate := make(chan struct{})
+	finishAcquire := sync.OnceFunc(func() { close(acquireGate) })
+	defer finishAcquire()
+	cleanupStarted := make(chan struct{})
+	cleanupGate := make(chan struct{})
+	finishCleanup := sync.OnceFunc(func() { close(cleanupGate) })
+	defer finishCleanup()
+	cleanupFinished := make(chan struct{})
+	acquiredAfterCleanup := make(chan bool, 1)
+	firstAcquire := true
+	l.OnAcquire = func(context.Context) {
+		if firstAcquire {
+			firstAcquire = false
+			close(acquireStarted)
+			<-acquireGate
+			return
+		}
+		select {
+		case <-cleanupFinished:
+			acquiredAfterCleanup <- true
+		default:
+			acquiredAfterCleanup <- false
+		}
+	}
+	l.OnLose = func() {
+		if lost.Add(1) == 1 {
+			close(cleanupStarted)
+			<-cleanupGate
+			close(cleanupFinished)
+		}
+	}
+
+	waitFor := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	workers.Go(func() { l.applyRenewal(0, true, "", expireAt) })
+	waitFor(acquireStarted, "OnAcquire")
+	clock.Advance(TTL)
+
+	cancelCtx, cancelWaiter := context.WithCancel(ctx)
+	defer cancelWaiter()
+	canceled := make(chan error, 1)
+	workers.Go(func() { canceled <- l.Wait(cancelCtx) })
+	waitFor(observedExpiry, "the first waiter to observe expiry")
+	l.mu.Lock()
+	request := l.pendingExpiry
+	l.mu.Unlock()
+	if request == nil {
+		t.Fatal("the first waiter did not request expiry")
+	}
+	live := make(chan error, 2)
+	for range cap(live) {
+		workers.Go(func() { live <- l.Wait(ctx) })
+	}
+	for range cap(live) {
+		waitFor(observedExpiry, "another waiter to observe expiry")
+	}
+
+	l.mu.Lock()
+	sharedRequest := l.pendingExpiry
+	l.mu.Unlock()
+	if sharedRequest != request {
+		t.Fatal("later waiters did not share the first expiry request")
+	}
+
+	cancelWaiter()
+	select {
+	case err := <-canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Wait during OnAcquire: got %v, want context.Canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Wait still blocked on the transition lock after cancellation")
+	}
+
+	finishAcquire()
+	waitFor(cleanupStarted, "OnLose")
+	epoch, _, _ := l.snapshot()
+	workers.Go(func() { l.applyRenewal(epoch, true, "", clock.Now().Add(TTL)) })
+	select {
+	case err := <-live:
+		t.Fatalf("Wait during cleanup returned %v", err)
+	default:
+	}
+	finishCleanup()
+	select {
+	case afterCleanup := <-acquiredAfterCleanup:
+		if !afterCleanup {
+			t.Fatal("OnAcquire ran before OnLose finished")
+		}
+	case <-ctx.Done():
+		t.Fatal("OnAcquire did not run after OnLose finished")
+	}
+	for range cap(live) {
+		if err := <-live; err != nil {
+			t.Fatalf("Wait after reacquisition: %v", err)
+		}
+	}
+	if got := lost.Load(); got != 1 {
+		t.Fatalf("OnLose ran %d times, want 1", got)
+	}
+}
+
+func TestExpiryRequestRechecksPeriodAndDeadline(t *testing.T) {
+	clock := newTestClock()
+	l, lost := newTestLease()
+	l.DeadlineNow = clock.Now
+	acquireFor(t, l, clock.Now().Add(TTL))
+
+	newRequest := func() chan struct{} {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.pendingExpiry = make(chan struct{})
+		return l.pendingExpiry
+	}
+	request := newRequest()
+	l.expireIfDue(request)
+	select {
+	case <-request:
+	default:
+		t.Fatal("a request that found a valid deadline did not wake waiters")
+	}
+	if !l.Held() || lost.Load() != 0 {
+		t.Fatal("the request expired a valid lease")
+	}
+
+	oldRequest := newRequest()
+	l.lose(reasonReleased)
+	select {
+	case <-oldRequest:
+	default:
+		t.Fatal("release did not notify the expired period's waiters")
+	}
+	acquireFor(t, l, clock.Now().Add(TTL))
+	clock.Advance(TTL)
+	currentRequest := newRequest()
+
+	l.expireIfDue(oldRequest)
+	if got := lost.Load(); got != 1 {
+		t.Fatalf("the old request recorded an extra loss: got %d loss callbacks, want 1", got)
+	}
+	select {
+	case <-currentRequest:
+		t.Fatal("the old request completed the current period's expiry request")
+	default:
+	}
+
+	l.expireIfDue(currentRequest)
+	if got := lost.Load(); got != 2 {
+		t.Fatalf("OnLose ran %d times, want 2", got)
+	}
+}
+
 func TestWaitRechecksOwnershipAfterWake(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		l, _ := newTestLease()
@@ -435,7 +654,7 @@ func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
 	// expiry; OnLose runs right after, well before the 10 second I/O bound.
 	begin := time.Now()
 	time.Sleep(time.Until(expireAt) + 10*time.Millisecond)
-	l.expireIfDue()
+	l.expireIfDue(nil)
 	<-applied
 	if took := time.Since(begin); took > 2*time.Second {
 		t.Fatalf("the loss transition took %v after the acquisition started, want about the expiry", took)
@@ -632,8 +851,8 @@ func TestRenewalErrorKeepsLeaseUntilConfirmedExpiry(t *testing.T) {
 	fail = true
 	l.renewOnce(context.Background())
 	clock.Advance(time.Second)
-	l.expireIfDue()
-	l.expireIfDue()
+	l.expireIfDue(nil)
+	l.expireIfDue(nil)
 	if l.Held() || lost.Load() != 1 {
 		t.Fatalf("held %v, OnLose ran %d times, want released once", l.Held(), lost.Load())
 	}
