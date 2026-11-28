@@ -166,6 +166,7 @@ func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 }
 
 func TestNotificationDeadlineResumesAfterLastStartedRecipient(t *testing.T) {
+	t.Parallel()
 	for _, boundary := range []string{"pending", "removed", "recorded"} {
 		t.Run(boundary, func(t *testing.T) {
 			f := newFixture(t)

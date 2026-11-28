@@ -158,6 +158,7 @@ func TestRetryPendingUnlinksStopsWithoutLease(t *testing.T) {
 // TestPendingUnlinkGateWaitFailure covers a pending unlink that cannot reach
 // the gate because its next attempt is still in the future.
 func TestPendingUnlinkGateWaitFailure(t *testing.T) {
+	t.Parallel()
 	due := time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, due)
 	f.addOrg(t, org1)
@@ -211,6 +212,7 @@ func TestPendingUnlinkGateWaitFailure(t *testing.T) {
 }
 
 func TestPendingUnlinkGateWaitReportsWorkerError(t *testing.T) {
+	t.Parallel()
 	fake := accountstest.New(t, nil)
 	const method = accountstest.MethodUnlinkOrganization
 	gate := fake.Hold(method)
@@ -224,6 +226,7 @@ func TestPendingUnlinkGateWaitReportsWorkerError(t *testing.T) {
 }
 
 func TestStatusWorkerCleanupTimeout(t *testing.T) {
+	t.Parallel()
 	unblock := make(chan struct{})
 	defer close(unblock)
 	worker := startStatusWorker(t, "stalled status worker", nil, func(ctx context.Context) error {

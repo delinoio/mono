@@ -271,6 +271,7 @@ func TestConcurrentCreateRPCAndOrganizationDeletion(t *testing.T) {
 // TestPlacementLocksDevicesInAscendingIDOrder checks that the locking query
 // takes the lower device lock first, even when a heap scan sees it last.
 func TestPlacementLocksDevicesInAscendingIDOrder(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	lower, higher := setupPlacementDevices(t, env, org, nil)
@@ -334,6 +335,7 @@ func TestPlacementLocksDevicesInAscendingIDOrder(t *testing.T) {
 }
 
 func TestConcurrentPlacementReservesCapacityAcrossDevices(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	limits := &ownsandv1.DeviceLimits{VcpuCount: 2, MemoryMib: 1024, DiskGib: 10, VcpuOvercommitPercent: 100}

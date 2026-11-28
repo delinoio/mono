@@ -359,6 +359,7 @@ func enableWarmProfiles(t *testing.T, w *workWorld, ids ...string) {
 }
 
 func TestWarmCreateRejectionDoesNotSpin(t *testing.T) {
+	t.Parallel()
 	for _, code := range []connect.Code{connect.CodeInvalidArgument, connect.CodeNotFound, connect.CodePermissionDenied} {
 		t.Run(code.String(), func(t *testing.T) {
 			t.Parallel()
@@ -1194,6 +1195,7 @@ func TestDeleteSandboxAttemptTimeout(t *testing.T) {
 }
 
 func TestTeardownSandboxDeleteAttemptTimeout(t *testing.T) {
+	t.Parallel()
 	for _, rpc := range []string{"DeleteRunnerProfile", "RemoveOwnSandLink", "DeleteOrganization"} {
 		for _, scenario := range []struct {
 			name         string
@@ -2033,6 +2035,7 @@ const (
 )
 
 func TestWatchQueueCommitOrder(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		runner   bool

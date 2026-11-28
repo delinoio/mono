@@ -196,6 +196,7 @@ func TestInvitations(t *testing.T) {
 }
 
 func TestInvitationsRevokedWhenCreatorLosesMemberManagement(t *testing.T) {
+	t.Parallel()
 	for _, change := range []string{"remove", "leave", "demote"} {
 		t.Run(change, func(t *testing.T) {
 			env := testenv.New(t)
@@ -329,6 +330,7 @@ func TestInvitationsRevokedWhenCreatorLosesMemberManagement(t *testing.T) {
 }
 
 func TestInvitationRevocationRollsBackWithMembershipChange(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
