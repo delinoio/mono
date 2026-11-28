@@ -235,8 +235,7 @@ func freeLoopbackPort(t *testing.T) int {
 // startLauncher runs the real Node launcher in the package directory. The
 // environment carries the generated database URL as DATABASE_URL and never
 // the administration URL, so the launched server cannot reach the
-// administration database. It sets LOG_LEVEL to info explicitly instead of
-// inheriting the parent's value.
+// administration database.
 func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 	t.Helper()
 	packageDir, err := filepath.Abs(filepath.Join("..", ".."))
@@ -245,15 +244,23 @@ func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 	}
 	cmd := exec.Command("node", filepath.Join("scripts", "dev.mjs"))
 	cmd.Dir = packageDir
+	cmd.Env = launcherEnv(os.Environ(), databaseURL, port)
+	return newLauncherProc(t, cmd)
+}
+
+func launcherEnv(parent []string, databaseURL string, port int) []string {
 	var env []string
-	for _, kv := range os.Environ() {
+	for _, kv := range parent {
 		name, _, _ := strings.Cut(kv, "=")
-		if name == "DATABASE_URL" || name == dbtest.EnvTestDatabaseURL || name == "LOG_LEVEL" {
+		// The metrics listener and OTLP exporters have separate settings.
+		// Keep the fixture's telemetry local even when the parent exports it.
+		if name == "DATABASE_URL" || name == dbtest.EnvTestDatabaseURL || name == "LOG_LEVEL" ||
+			strings.HasPrefix(name, "OTEL_") {
 			continue
 		}
 		env = append(env, kv)
 	}
-	cmd.Env = append(env,
+	return append(env,
 		"ADDR="+net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
 		"DATABASE_URL="+databaseURL,
 		"LOGTO_ISSUER=http://127.0.0.1:9/oidc",
@@ -266,7 +273,39 @@ func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 		// must not inherit a LOG_LEVEL of warn or error from the parent.
 		"LOG_LEVEL=info",
 	)
-	return newLauncherProc(t, cmd)
+}
+
+func TestLauncherEnv(t *testing.T) {
+	t.Parallel()
+	parent := []string{
+		"PATH=/fixture/bin",
+		"FIXTURE_VALUE=OTEL_RESOURCE_ATTRIBUTES=unchanged",
+		"DATABASE_URL=postgres://localhost/parent",
+		dbtest.EnvTestDatabaseURL + "=postgres://localhost/admin",
+		"LOG_LEVEL=warn",
+		"OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:0",
+		"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:0",
+		"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:0",
+		"OTEL_EXPORTER_OTLP_HEADERS=key=synthetic",
+		"OTEL_RESOURCE_ATTRIBUTES=service.name=fixture",
+	}
+	original := slices.Clone(parent)
+	want := []string{
+		"PATH=/fixture/bin",
+		"FIXTURE_VALUE=OTEL_RESOURCE_ATTRIBUTES=unchanged",
+		"ADDR=127.0.0.1:8080",
+		"DATABASE_URL=postgres://localhost/generated",
+		"LOGTO_ISSUER=http://127.0.0.1:9/oidc",
+		"STUN_ADDR=127.0.0.1:0",
+		"METRICS_ADDR=",
+		"LOG_LEVEL=info",
+	}
+	if got := launcherEnv(parent, "postgres://localhost/generated", 8080); !slices.Equal(got, want) {
+		t.Errorf("launcher environment = %q, want %q", got, want)
+	}
+	if !slices.Equal(parent, original) {
+		t.Errorf("parent environment = %q, want %q", parent, original)
+	}
 }
 
 // waitHealthy polls /healthz until the server reports ok, the launcher exits
@@ -295,6 +334,30 @@ func (p *launcherProc) waitHealthy(t *testing.T, port int) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("the server did not become healthy within %s:\n%s", launcherHealthTimeout, p.output)
+}
+
+func assertLauncherTelemetryDisabled(t *testing.T, output string) {
+	t.Helper()
+	for line := range strings.SplitSeq(output, "\n") {
+		var record struct {
+			Message       string  `json:"msg"`
+			LogsExport    *bool   `json:"otlp_logs_export"`
+			MetricsExport *bool   `json:"otlp_metrics_export"`
+			MetricsAddr   *string `json:"metrics_addr"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil || record.Message != "server_started" {
+			continue
+		}
+		if record.LogsExport == nil || *record.LogsExport ||
+			record.MetricsExport == nil || *record.MetricsExport ||
+			record.MetricsAddr == nil || *record.MetricsAddr != "" {
+			t.Fatalf("expected both OTLP exports and the metrics listener to be disabled: %s", line)
+		}
+		t.Logf("server_started: otlp_logs_export=%t otlp_metrics_export=%t metrics_addr=%q",
+			*record.LogsExport, *record.MetricsExport, *record.MetricsAddr)
+		return
+	}
+	t.Fatalf("the output has no server_started JSON record:\n%s", output)
 }
 
 // adminSnapshot lists the user tables of the administration database and the
@@ -358,6 +421,11 @@ func TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase(t *testing.T) {
 			t.Skipf("%s is not on the path; skipping the launcher test", tool)
 		}
 	}
+	const syntheticEndpoint = "http://127.0.0.1:0"
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", syntheticEndpoint)
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", syntheticEndpoint)
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", syntheticEndpoint)
+	t.Setenv("METRICS_ADDR", "127.0.0.1:0")
 	before := takeAdminSnapshot(t, admin)
 
 	// The fixture registers its database drop first, so the launcher cleanup
@@ -388,6 +456,7 @@ func TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase(t *testing.T) {
 		t.Fatalf("the administration database changed: tables %v -> %v, goose_db_version rows %d -> %d",
 			before.tables, after.tables, before.migrationsRows, after.migrationsRows)
 	}
+	assertLauncherTelemetryDisabled(t, launcher.output.String())
 }
 
 // processAlive reports whether pid is a live process. A zombie that nobody has
