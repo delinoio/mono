@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -910,9 +911,11 @@ func TestMembers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListMembers page %d: %v", page, err)
 		}
-		for _, m := range resp.Msg.GetMembers() {
-			paged = append(paged, m.GetUserId())
+		members := resp.Msg.GetMembers()
+		if len(members) != 1 {
+			t.Fatalf("ListMembers page %d has %d members, want 1", len(paged)+1, len(members))
 		}
+		paged = append(paged, members[0].GetUserId())
 		if token = resp.Msg.GetNextPageToken(); token == "" {
 			break
 		}
@@ -927,8 +930,9 @@ func TestMembers(t *testing.T) {
 		_, err = f.Owner.Client.ListInvitations(ctx(), connect.NewRequest(&accountsv1.ListInvitationsRequest{BillingAccountId: f.AccountID, PageToken: token}))
 		wantCode(t, err, connect.CodeInvalidArgument)
 	}
-	if len(paged) != 4 || paged[0] != f.Owner.ID || paged[3] != f.Viewer2.ID {
-		t.Fatalf("paged members = %v", paged)
+	wantPaged := []string{f.Owner.ID, f.Admin.ID, f.Viewer.ID, f.Viewer2.ID}
+	if !slices.Equal(paged, wantPaged) {
+		t.Fatalf("paged member IDs = %v, want %v (join order)", paged, wantPaged)
 	}
 
 	// Display names are empty while Logto is unavailable.
