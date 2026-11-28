@@ -5,6 +5,7 @@ package api_test
 import (
 	"context"
 	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -83,14 +84,37 @@ func TestDelayedMembershipRevocation(t *testing.T) {
 		}
 		return resp.Msg.GetGrantId()
 	}
-	execWith := func(grantID string, req *ownsandv1.ExecRequest) error {
+	execWith := func(grantID string, req *ownsandv1.ExecRequest) ([]*ownsandv1.ExecEvent, error) {
 		c := env.ClientsWith(testenv.UserToken(org.Member), grantHeader(grantID))
 		stream, err := c.Relay.Exec(ctx, connect.NewRequest(req))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		_, err = collectExec(t, stream)
-		return err
+		return collectExec(t, stream)
+	}
+	requireSuccessfulExec := func(phase, grantID string, req *ownsandv1.ExecRequest) {
+		t.Helper()
+		events, err := execWith(grantID, req)
+		if err != nil {
+			t.Fatalf("%s: relay exec RPC: %v", phase, err)
+		}
+		events = slices.DeleteFunc(events, func(event *ownsandv1.ExecEvent) bool {
+			return event.GetKeepalive() != nil
+		})
+		want := []*ownsandv1.ExecEvent{
+			{Event: &ownsandv1.ExecEvent_Accepted{Accepted: &ownsandv1.RequestAccepted{}}},
+			{Event: &ownsandv1.ExecEvent_Started{Started: &ownsandv1.ExecStarted{ExecId: req.GetExecId()}}},
+			{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: 0, Data: []byte("secret-output\n")}}},
+			{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}}},
+		}
+		if len(events) != len(want) {
+			t.Fatalf("%s: got %d relay exec events %v, want %d %v", phase, len(events), events, len(want), want)
+		}
+		for i, event := range events {
+			if !proto.Equal(event, want[i]) {
+				t.Fatalf("%s: relay exec event %d = %v, want %v", phase, i+1, event, want[i])
+			}
+		}
 	}
 
 	oldSession := open(member)
@@ -99,9 +123,7 @@ func TestDelayedMembershipRevocation(t *testing.T) {
 	oldRequest := membershipGrantRequest(oldExec)
 	oldGrant := issueGrant(member, oldRequest)
 	ownerGrant := issueGrant(org.OwnerClient, membershipGrantRequest(newExec(org.ID, sandboxID)))
-	if err := execWith(oldGrant, oldExec); err != nil {
-		t.Fatalf("original membership cannot use its grant: %v", err)
-	}
+	requireSuccessfulExec("original membership", oldGrant, oldExec)
 
 	pendingRequest := membershipGrantRequest(newExec(org.ID, sandboxID))
 	agent.SetOnOffer(func(o *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer {
@@ -141,7 +163,7 @@ func TestDelayedMembershipRevocation(t *testing.T) {
 	if cursor, ok := env.App.Control.ProcessedCursor(); !ok || cursor >= eventID {
 		t.Fatalf("membership event %d was not paused: cursor = %d, initialized = %t", eventID, cursor, ok)
 	}
-	if err := execWith(oldGrant, oldExec); testenv.Code(err) != connect.CodeUnavailable ||
+	if _, err := execWith(oldGrant, oldExec); testenv.Code(err) != connect.CodeUnavailable ||
 		errDetail(err).GetSessionEndReason() != ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID {
 		t.Fatalf("replacement membership used the original grant: %v", err)
 	}
@@ -205,9 +227,7 @@ func TestDelayedMembershipRevocation(t *testing.T) {
 	if err := <-grantResult; testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("pending grant returned %v, want unavailable", err)
 	}
-	if err := execWith(newGrant, oldExec); err != nil {
-		t.Fatalf("replacement membership grant failed after revocation: %v", err)
-	}
+	requireSuccessfulExec("replacement membership after revocation", newGrant, oldExec)
 	nextRequest := proto.CloneOf(newRequest)
 	nextRequest.AuthorizationId, _ = uuidv7.NewString()
 	nextRequest.ReplacesGrantId = &newGrant
