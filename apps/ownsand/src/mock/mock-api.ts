@@ -86,6 +86,7 @@ import {
   type CreateSandboxRequest,
   type Sandbox,
   CreateSandboxRequestSchema,
+  type Placement,
   SandboxSchema,
   type SandboxSource,
   SandboxService,
@@ -702,8 +703,20 @@ type ResolvedSandboxSource = {
 
 function placementMismatch(
   device: Device,
+  placement: Placement | undefined,
   source: ResolvedSandboxSource,
 ): string | undefined {
+  const { hostOs, arch } = placement ?? {};
+  if (
+    hostOs !== undefined &&
+    hostOs !== HostOs.UNSPECIFIED &&
+    device.hostOs !== hostOs
+  ) {
+    return "host OS does not match";
+  }
+  if (arch !== undefined && arch !== Arch.UNSPECIFIED && device.arch !== arch) {
+    return "architecture does not match";
+  }
   const caps = device.capabilities;
   const { guestOs, baseImage, snapshot } = source;
   if (
@@ -754,14 +767,15 @@ function canonicalizeCreateSandbox(
 /** An explicit device is exclusive and its permanent rules precede availability. */
 function placeSandbox(
   devices: Device[],
-  deviceId: string | undefined,
+  placement: Placement | undefined,
   source: ResolvedSandboxSource,
 ): Device | undefined {
+  const deviceId = placement?.deviceId;
   if (deviceId === undefined || deviceId === "") {
     return devices.find(
       (d) =>
         d.state === DeviceState.ONLINE &&
-        placementMismatch(d, source) === undefined,
+        placementMismatch(d, placement, source) === undefined,
     );
   }
   const device = devices.find(
@@ -770,7 +784,7 @@ function placeSandbox(
   if (device === undefined) {
     throw new ConnectError("device not found", Code.NotFound);
   }
-  const mismatch = placementMismatch(device, source);
+  const mismatch = placementMismatch(device, placement, source);
   if (mismatch !== undefined) {
     throw new ConnectError(mismatch, Code.FailedPrecondition);
   }
@@ -1737,11 +1751,7 @@ export function createMockTransport(
             Code.InvalidArgument,
           );
         }
-        const device = placeSandbox(
-          org.devices,
-          req.placement?.deviceId,
-          source,
-        );
+        const device = placeSandbox(org.devices, req.placement, source);
         if (device === undefined) {
           throw new ConnectError(
             "no device can run this sandbox",

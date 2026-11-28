@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { type Code, ConnectError, createClient } from "@connectrpc/connect";
-import { BaseImage } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  type Arch,
+  BaseImage,
+  type HostOs,
+} from "@delino/ownsand-protos/v1/common_pb";
 import {
   type ListSandboxesRequest,
+  type Placement,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { createMockTransport, MOCK_IDS } from "../src/mock/mock-api.ts";
@@ -91,6 +96,30 @@ async function createSandboxWithTtls(
   }
 }
 
+async function createSandboxWithPlacement(
+  idempotencyKey: string,
+  placement?: Pick<Placement, "deviceId" | "hostOs" | "arch">,
+): Promise<
+  | { sandboxId: string; deviceId: string; hostOs: HostOs; arch: Arch }
+  | { code: Code }
+> {
+  try {
+    const { sandbox } = await client.createSandbox({
+      ...createRequest,
+      idempotencyKey,
+      idleTtl: { seconds: 600n },
+      maxTtl: { seconds: 3600n },
+      placement,
+    });
+    if (!sandbox) throw new Error("CreateSandbox returned no sandbox");
+    const { sandboxId, deviceId, hostOs, arch } = sandbox;
+    return { sandboxId, deviceId, hostOs, arch };
+  } catch (error) {
+    if (error instanceof ConnectError) return { code: error.code };
+    throw error;
+  }
+}
+
 async function listSandboxIds() {
   const { sandboxes } = await client.listSandboxes({ organizationId });
   return sandboxes.map((sandbox) => sandbox.sandboxId);
@@ -127,6 +156,7 @@ declare global {
   interface Window {
     createSandboxForIdempotencyTest: typeof createSandbox;
     createSandboxWithTtls: typeof createSandboxWithTtls;
+    createSandboxWithPlacement: typeof createSandboxWithPlacement;
     listSandboxIds: typeof listSandboxIds;
     listSandboxesForFilterTest: typeof listSandboxesForFilterTest;
   }
@@ -134,6 +164,7 @@ declare global {
 
 window.createSandboxForIdempotencyTest = createSandbox;
 window.createSandboxWithTtls = createSandboxWithTtls;
+window.createSandboxWithPlacement = createSandboxWithPlacement;
 window.listSandboxIds = listSandboxIds;
 window.listSandboxesForFilterTest = listSandboxesForFilterTest;
 
