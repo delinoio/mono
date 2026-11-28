@@ -8,7 +8,9 @@ tags: postgres, schema, primary-keys, data-types, foreign-keys, naming
 
 ## Primary Keys
 
-Prefer `BIGINT GENERATED ALWAYS AS IDENTITY`. Avoid random UUIDs (UUIDv4) as primary keys; use `uuidv7()` when you need UUIDs.
+Prefer `BIGINT GENERATED ALWAYS AS IDENTITY`. Avoid random UUIDs (UUIDv4) as primary keys. When you need a UUID primary key, use the built-in `uuidv7()` on PostgreSQL 18 or later. [PostgreSQL 18 UUID functions](https://www.postgresql.org/docs/18/functions-uuid.html)
+
+For Mono code that targets PostgreSQL 17, generate the ID in Go with `uuidv7.NewString()` from `go/uuidv7`. Define the column as `id uuid PRIMARY KEY` and supply the generated ID when you insert the row. This follows Mono's UUID v7 default for new persisted entities. [Mono repository defaults](../../../../docs/repository-defaults.md#default-technology-choices) · [PostgreSQL 17 UUID type](https://www.postgresql.org/docs/17/datatype-uuid.html)
 
 ```sql
 CREATE TABLE user_account (
