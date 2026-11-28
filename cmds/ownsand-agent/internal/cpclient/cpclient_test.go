@@ -240,6 +240,91 @@ func TestAuthenticateKeepsExpiredCallerDeadline(t *testing.T) {
 	}
 }
 
+type recordedAuthRPC struct {
+	procedure   string
+	deadline    time.Time
+	hasDeadline bool
+}
+
+type authRPCRecorder struct {
+	ownsandv1connect.AgentServiceClient
+	calls []recordedAuthRPC
+}
+
+func (r *authRPCRecorder) record(ctx context.Context, procedure string) {
+	deadline, hasDeadline := ctx.Deadline()
+	r.calls = append(r.calls, recordedAuthRPC{procedure, deadline, hasDeadline})
+}
+
+func (r *authRPCRecorder) CreateChallenge(ctx context.Context, req *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
+	r.record(ctx, ownsandv1connect.AgentServiceCreateChallengeProcedure)
+	return r.AgentServiceClient.CreateChallenge(ctx, req)
+}
+
+func (r *authRPCRecorder) Authenticate(ctx context.Context, req *connect.Request[ownsandv1.AuthenticateRequest]) (*connect.Response[ownsandv1.AuthenticateResponse], error) {
+	r.record(ctx, ownsandv1connect.AgentServiceAuthenticateProcedure)
+	return r.AgentServiceClient.Authenticate(ctx, req)
+}
+
+func (r *authRPCRecorder) ConfirmRemoval(ctx context.Context, req *connect.Request[ownsandv1.ConfirmRemovalRequest]) (*connect.Response[ownsandv1.ConfirmRemovalResponse], error) {
+	r.record(ctx, ownsandv1connect.AgentServiceConfirmRemovalProcedure)
+	return r.AgentServiceClient.ConfirmRemoval(ctx, req)
+}
+
+func TestAuthAttemptSharesDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		procedure string
+		run       func(*testing.T, *testcp.Server, *Client, string, *identity.Key)
+	}{
+		{
+			name:      "Authenticate",
+			procedure: ownsandv1connect.AgentServiceAuthenticateProcedure,
+			run: func(t *testing.T, _ *testcp.Server, c *Client, id string, key *identity.Key) {
+				res, err := c.Authenticate(context.Background(), id, key, "")
+				if err != nil {
+					t.Fatalf("Authenticate: %v", err)
+				}
+				if res.Session == nil || res.Session.Credential == "" {
+					t.Fatalf("Authenticate returned no session: %+v", res)
+				}
+			},
+		},
+		{
+			name:      "ConfirmRemoval",
+			procedure: ownsandv1connect.AgentServiceConfirmRemovalProcedure,
+			run: func(t *testing.T, cp *testcp.Server, c *Client, id string, key *identity.Key) {
+				cp.MarkRemoved(id)
+				if err := c.ConfirmRemoval(context.Background(), id, key); err != nil {
+					t.Fatalf("ConfirmRemoval: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp, c, id, key := enrolled(t)
+			c.AuthTimeout = authTestMaxElapsed
+			recorder := &authRPCRecorder{AgentServiceClient: c.Agent}
+			c.Agent = recorder
+
+			tc.run(t, cp, c, id, key)
+
+			calls := recorder.calls
+			if len(calls) != 2 || calls[0].procedure != ownsandv1connect.AgentServiceCreateChallengeProcedure || calls[1].procedure != tc.procedure {
+				t.Fatalf("RPC calls = %+v, want CreateChallenge followed by %s", calls, tc.name)
+			}
+			for _, call := range calls {
+				if !call.hasDeadline {
+					t.Fatalf("%s has no deadline", call.procedure)
+				}
+			}
+			if !calls[0].deadline.Equal(calls[1].deadline) {
+				t.Fatalf("CreateChallenge deadline = %v, %s deadline = %v, want the same deadline", calls[0].deadline, tc.name, calls[1].deadline)
+			}
+		})
+	}
+}
+
 func TestAuthenticateEndsWhenTheControlPlaneStalls(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
