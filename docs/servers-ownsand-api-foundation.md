@@ -45,7 +45,9 @@ Layout, following the `accounts-api` server conventions:
 
 ### Shutdown
 
-A termination signal or a permanent error from the public HTTP or configured metrics listener starts shutdown. The process stops the workers and releases the instance lease before giving active public requests up to 10 seconds to finish. At the deadline, it closes the remaining public connections. It then [finishes usage metering](#metering), closes the metrics server if enabled, and collects its serve result. A listener error that overlaps a termination signal remains in the `server_exited` log, along with any cleanup or usage error. A listener failure exits with status 1. A clean signal shutdown can exit successfully.
+After database and application setup, the process checks for a termination signal before each socket bind and before it starts the workers and listeners. If it observes the signal at one of those checks, it closes any sockets it has bound without starting workers or serve loops or logging `server_started`. The process still closes the database, releases the signal registration, and shuts down telemetry. Socket close errors are reported as startup failures.
+
+Once the workers and listeners are active, a termination signal or a permanent error from the public HTTP or configured metrics listener starts shutdown. The process stops the workers and releases the instance lease before giving active public requests up to 10 seconds to finish. At the deadline, it closes the remaining public connections. It then [finishes usage metering](#metering), closes the metrics server if enabled, and collects its serve result. A listener error that overlaps a termination signal remains in the `server_exited` log, along with any cleanup or usage error. A listener failure exits with status 1. A clean signal shutdown can exit successfully.
 
 ### Authentication
 

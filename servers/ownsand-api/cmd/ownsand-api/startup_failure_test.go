@@ -16,12 +16,14 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/servers/internal/telemetry"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
@@ -146,6 +148,114 @@ func TestLogServerExitedCarriesTheReasonAndTheError(t *testing.T) {
 	}
 	if m["error"] != other.Error() {
 		t.Errorf("error = %v, want %q", m["error"], other.Error())
+	}
+}
+
+func TestStartupCancellationClosesBoundSockets(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		metrics bool
+		binds   []string
+	}{
+		{name: "before first bind"},
+		{name: "before first bind with metrics", metrics: true},
+		{name: "after public HTTP", binds: []string{"tcp"}},
+		{name: "after public HTTP with metrics", metrics: true, binds: []string{"tcp"}},
+		{name: "after STUN", binds: []string{"tcp", "udp"}},
+		{name: "after STUN with metrics", metrics: true, binds: []string{"tcp", "udp"}},
+		{name: "after metrics", metrics: true, binds: []string{"tcp", "udp", "tcp"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			const loopback = "127.0.0.1:0"
+			cfg := config.Config{Addr: loopback, STUNAddr: loopback}
+			if tc.metrics {
+				cfg.MetricsAddr = loopback
+			}
+			if len(tc.binds) == 0 {
+				cancel()
+			}
+
+			var networks []string
+			var addresses []string
+			bound := func(network string, addr net.Addr) {
+				networks = append(networks, network)
+				addresses = append(addresses, addr.String())
+				if len(networks) == len(tc.binds) {
+					cancel()
+				}
+			}
+			listen := func(network, addr string) (net.Listener, error) {
+				listener, err := net.Listen(network, addr)
+				if err == nil {
+					t.Cleanup(func() { _ = listener.Close() })
+					bound(network, listener.Addr())
+				}
+				return listener, err
+			}
+			listenPacket := func(network, addr string) (net.PacketConn, error) {
+				conn, err := net.ListenPacket(network, addr)
+				if err == nil {
+					t.Cleanup(func() { _ = conn.Close() })
+					bound(network, conn.LocalAddr())
+				}
+				return conn, err
+			}
+			err := withStartupSockets(ctx, cfg, listen, listenPacket, func(net.Listener, net.PacketConn, net.Listener) error {
+				t.Error("startup activated after cancellation")
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("canceled startup returned %v", err)
+			}
+			if !slices.Equal(networks, tc.binds) {
+				t.Errorf("binds = %v, want %v", networks, tc.binds)
+			}
+			for i, network := range networks {
+				switch network {
+				case "tcp":
+					listener, err := net.Listen(network, addresses[i])
+					if err != nil {
+						t.Errorf("rebind closed TCP socket: %v", err)
+						continue
+					}
+					_ = listener.Close()
+				case "udp":
+					conn, err := net.ListenPacket(network, addresses[i])
+					if err != nil {
+						t.Errorf("rebind closed UDP socket: %v", err)
+						continue
+					}
+					_ = conn.Close()
+				}
+			}
+		})
+	}
+}
+
+func TestStartupPreservesBindAndCleanupErrors(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	closeErr := errors.New("close failed")
+	httpListener := closeErrorListener{Listener: shutdownTestListener(t), err: closeErr}
+	listen := func(string, string) (net.Listener, error) { return httpListener, nil }
+	bindErr := bindError(syscall.EADDRINUSE)
+	if runtime.GOOS == "windows" {
+		bindErr = bindError(10048)
+	}
+	listenPacket := func(string, string) (net.PacketConn, error) {
+		cancel()
+		return nil, bindErr
+	}
+	got := withStartupSockets(ctx, config.Config{}, listen, listenPacket, func(net.Listener, net.PacketConn, net.Listener) error {
+		t.Error("startup activated after a bind failure")
+		return nil
+	})
+	if !errors.Is(got, bindErr) || !errors.Is(got, closeErr) || startupFailureReasonOf(got) != startupFailureReasonAddressInUse {
+		t.Errorf("startup error = %v, want classified STUN bind error and close error", got)
 	}
 }
 
