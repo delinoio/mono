@@ -215,11 +215,13 @@ async function* iterateSource(
       }
     }
   } else {
-    const iterable = source as Iterable<Uint8Array> | AsyncIterable<Uint8Array>;
-    const iterator: Iterator<Uint8Array> | AsyncIterator<Uint8Array> =
-      Symbol.asyncIterator in iterable
-        ? iterable[Symbol.asyncIterator]()
-        : (iterable as Iterable<Uint8Array>)[Symbol.iterator]();
+    const asyncIterator = (source as Partial<AsyncIterable<Uint8Array>>)[
+      Symbol.asyncIterator
+    ];
+    const iterator =
+      asyncIterator === undefined || asyncIterator === null
+        ? (source as Iterable<Uint8Array>)[Symbol.iterator]()
+        : Reflect.apply(asyncIterator, source, []);
     let finished = false;
     try {
       for (;;) {
