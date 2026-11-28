@@ -249,6 +249,10 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.profile-workspace-path {
+  overflow-wrap: anywhere;
+}
+
 .list-actions {
   display: flex;
   align-items: center;

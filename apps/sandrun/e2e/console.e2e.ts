@@ -1655,6 +1655,42 @@ describe("integrations", () => {
   });
 });
 
+function measureProfileWorkspace(profileName: string) {
+  const list = document.querySelector('ul[aria-label="Runner profiles"]');
+  const title = Array.from(list?.querySelectorAll(".list-title") ?? []).find(
+    (element) => element.textContent?.startsWith(profileName + " ·"),
+  );
+  const text = title?.closest(".list-main");
+  const code = text?.querySelector("code");
+  if (!list || !text || !code) {
+    throw new Error("Missing runner profile workspace for " + profileName);
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(code);
+  const fragments = Array.from(range.getClientRects()).filter(
+    (rect) => rect.width > 0 && rect.height > 0,
+  );
+  const fits = (bounds: DOMRect) =>
+    fragments.every(
+      (rect) =>
+        rect.left >= bounds.left &&
+        rect.right <= bounds.right &&
+        rect.top >= bounds.top &&
+        rect.bottom <= bounds.bottom,
+    );
+  const root = document.documentElement;
+
+  return {
+    path: code.textContent,
+    display: getComputedStyle(code).display,
+    fragmentCount: fragments.length,
+    fitsTextColumn: fits(text.getBoundingClientRect()),
+    fitsList: fits(list.getBoundingClientRect()),
+    documentFits: root.scrollWidth === root.clientWidth,
+  };
+}
+
 describe("runner profiles", () => {
   for (const { organizationId, mode, nextAction, scenario } of [
     {
@@ -1722,6 +1758,60 @@ describe("runner profiles", () => {
       }
     });
   }
+  test("wraps a long dev workspace path for a member at 320 px", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await browser.setViewport({ width: 320, height: 844 });
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${NORTHWIND}/profiles`);
+
+    const row = screen
+      .getByRole("list", "Runner profiles")
+      .getByRole("listitem")
+      .filter({ hasText: "linux-dev ·" });
+    await expect(row).toBeVisible();
+    await expect(row.getByRole("button", "Edit")).toBeHidden();
+    await expect(row.getByRole("button", "Delete")).toBeHidden();
+
+    const layout = await browser.evaluate(measureProfileWorkspace, "linux-dev");
+    expect(layout.path).toBe("/home/dev/" + "x".repeat(180) + "/sentinel");
+    expect(layout.fragmentCount).toBeGreaterThan(1);
+    expect(layout.fitsTextColumn).toBe(true);
+    expect(layout.fitsList).toBe(true);
+    expect(layout.documentFits).toBe(true);
+  });
+
+  test("keeps a short workspace path inline with owner actions at 1024 px", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await browser.setViewport({ width: 1024, height: 844 });
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+
+    const row = screen
+      .getByRole("list", "Runner profiles")
+      .getByRole("listitem")
+      .filter({ hasText: "windows-dev ·" });
+    await expect(row.getByRole("button", "Edit")).toBeVisible();
+    await expect(row.getByRole("button", "Delete")).toBeVisible();
+
+    expect(
+      await browser.evaluate(measureProfileWorkspace, "windows-dev"),
+    ).toEqual({
+      path: "C:\\work",
+      display: "inline",
+      fragmentCount: 1,
+      fitsTextColumn: true,
+      fitsList: true,
+      documentFits: true,
+    });
+  });
 
   for (const mode of ["create", "edit"] as const) {
     test(`blocks ${mode} when no OpenAI Codex guest OS is verified`, async ({
