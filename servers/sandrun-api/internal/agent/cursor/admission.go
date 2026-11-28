@@ -19,8 +19,8 @@ type demandKey struct {
 	marker int64
 }
 
-func (a pendingAdmission) key() demandKey {
-	return demandKey{id: a.request.ID, marker: a.request.CreatedAtMs}
+func (r PendingRequest) key() demandKey {
+	return demandKey{id: r.ID, marker: r.CreatedAtMs}
 }
 
 // admissionQueue bounds the work of one watcher and coalesces copies of
@@ -42,7 +42,7 @@ func newAdmissionQueue(size int) *admissionQueue {
 // demand again if it is still pending at Cursor.
 func (q *admissionQueue) offer(client *vendorhttp.Client, request PendingRequest) bool {
 	a := pendingAdmission{client: client, request: request}
-	key := a.key()
+	key := request.key()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if _, exists := q.active[key]; exists {
@@ -68,7 +68,7 @@ func (q *admissionQueue) run(ctx context.Context, admit func(pendingAdmission)) 
 			}
 			admit(a)
 			q.mu.Lock()
-			delete(q.active, a.key())
+			delete(q.active, a.request.key())
 			q.mu.Unlock()
 		}
 	}
