@@ -81,6 +81,7 @@ export function Select({
     description !== "";
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
+  const options = withBigintOptionLabels(children);
 
   return (
     <Field
@@ -93,7 +94,22 @@ export function Select({
         <SelectTrigger
           className={className ? `dui-select ${className}` : "dui-select"}
         >
-          <SelectValue className="dui-select-value" />
+          <SelectValue className="dui-select-value">
+            {rootProps.itemToLabel
+              ? undefined
+              : (state) => {
+                  if (state.placeholder) {
+                    return rootProps.placeholder ?? null;
+                  }
+                  // The SDK can remember an older label while the list is closed.
+                  // Use the current JSX until the SDK refreshes closed-item labels.
+                  const option =
+                    typeof state.value === "string"
+                      ? findSelectOption(options, state.value)
+                      : undefined;
+                  return (option && getOptionText(option).label) || state.label;
+                }}
+          </SelectValue>
           <svg
             aria-hidden="true"
             className="dui-select-icon"
@@ -109,9 +125,7 @@ export function Select({
             />
           </svg>
         </SelectTrigger>
-        <SelectContent className="dui-select-content">
-          {withBigintOptionLabels(children)}
-        </SelectContent>
+        <SelectContent className="dui-select-content">{options}</SelectContent>
       </SelectRoot>
       {/* Workaround: the UI SDK Field predicts the description id in
           aria-describedby before the field binds on the client, so static
@@ -203,6 +217,38 @@ function withBigintOptionLabels(node: React.ReactNode): React.ReactNode {
     : React.cloneElement(node, { children: nested });
 }
 
+function findSelectOption(
+  node: React.ReactNode,
+  value: string,
+): SelectOptionProps | undefined {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const match = findSelectOption(child, value);
+      if (match) return match;
+    }
+    return undefined;
+  }
+
+  if (!React.isValidElement<SelectOptionProps>(node)) {
+    return undefined;
+  }
+  if (node.type === SelectOption) {
+    return node.props.value === value ? node.props : undefined;
+  }
+  return findSelectOption(node.props.children, value);
+}
+
+function getOptionText({
+  children,
+  label,
+  value,
+}: Pick<SelectOptionProps, "children" | "label" | "value">) {
+  const childText = label == null ? nodeText(children) : undefined;
+  const fallback =
+    childText?.trim() === "" && typeof value === "string" ? value : undefined;
+  return { label: label ?? fallback ?? (childText || undefined), fallback };
+}
+
 /** One option of a `Select`. A check marks the selected option. */
 export function SelectOption({
   children,
@@ -211,16 +257,18 @@ export function SelectOption({
   value,
   ...props
 }: SelectOptionProps) {
-  const childText = label == null ? nodeText(children) : undefined;
-  const fallback =
-    childText?.trim() === "" && typeof value === "string" ? value : undefined;
+  const { label: optionLabel, fallback } = getOptionText({
+    children,
+    label,
+    value,
+  });
   // The UI SDK gives string children priority over the item label.
   // Pass the override as item text so the list and trigger agree.
   const itemText = label || fallback;
   return (
     <SelectItem
       className={mergeClassName("dui-select-option", className)}
-      label={label ?? fallback ?? (childText || undefined)}
+      label={optionLabel}
       value={value}
       {...props}
     >
