@@ -226,32 +226,24 @@ func TestDeleteCancelsEveryReceivedCreateOfTheSnapshot(t *testing.T) {
 	requireNoSnapshotTrace(t, e, snapID)
 }
 
-// TestDuplicateClaimedCreatesPublishOneSnapshot checks that two create
-// commands of one snapshot that wait for the sandbox lock both succeed with
-// the one snapshot, as a duplicate create did before the claims existed.
+// TestDuplicateClaimedCreatesPublishOneSnapshot checks that two creates
+// waiting for the same sandbox lock return one published snapshot after a
+// single runtime capture.
 func TestDuplicateClaimedCreatesPublishOneSnapshot(t *testing.T) {
 	e := newEnv(t)
 	sandboxID := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	snapID, _ := uuidv7.NewString()
-	unlock := lockSandbox(t, e, sandboxID)
-	done := make(chan claimedCreateResult, 2)
-	claims := []*SnapshotCreateClaim{e.m.ClaimSnapshotCreate(snapID), e.m.ClaimSnapshotCreate(snapID)}
-	for _, claim := range claims {
-		defer claim.Release()
-		go func() {
-			entry, err := e.m.CreateClaimedSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}, claim)
-			done <- claimedCreateResult{entry, err}
-		}()
-	}
-	unlock()
-	for range claims {
+	cmd := &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}
+	finish, done := startSnapshotCreatesWaitingForLock(t, e, cmd, 2)
+	finish()
+	for range 2 {
 		res := <-done
 		if res.err != nil || res.entry.GetSnapshotId() != snapID || res.entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
-			t.Fatalf("duplicate create = %v, %v; want the ready snapshot", res.entry, res.err)
+			t.Errorf("duplicate create = %v, %v; want the ready snapshot", res.entry, res.err)
 		}
 	}
-	for _, claim := range claims {
-		claim.Release()
+	if calls := e.rt.snapshotCallCount(); calls != 1 {
+		t.Errorf("runtime Snapshot calls = %d, want 1", calls)
 	}
 	if !e.m.HasSnapshot(snapID) {
 		t.Fatal("snapshot is not published")

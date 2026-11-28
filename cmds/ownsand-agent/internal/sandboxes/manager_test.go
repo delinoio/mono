@@ -68,6 +68,8 @@ type fakeRuntime struct {
 	paused    map[string]bool
 	createErr error
 	block     chan struct{}
+
+	snapshotCalls int
 	// snapStarted and snapBlock, when set, make Snapshot signal that the
 	// capture started and wait until snapBlock is closed.
 	snapStarted chan struct{}
@@ -117,6 +119,12 @@ func (r *fakeRuntime) startCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.starts
+}
+
+func (r *fakeRuntime) snapshotCallCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshotCalls
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -179,6 +187,9 @@ func (r *fakeRuntime) Resume(_ context.Context, vm vmruntime.VM) error {
 	return nil
 }
 func (r *fakeRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	r.mu.Lock()
+	r.snapshotCalls++
+	r.mu.Unlock()
 	if r.snapStarted != nil {
 		close(r.snapStarted)
 		<-r.snapBlock
