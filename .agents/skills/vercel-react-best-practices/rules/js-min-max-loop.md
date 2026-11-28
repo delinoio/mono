@@ -19,6 +19,8 @@ interface Project {
 }
 
 function getLatestProject(projects: Project[]) {
+  if (projects.length === 0) return null
+
   const sorted = [...projects].sort((a, b) => b.updatedAt - a.updatedAt)
   return sorted[0]
 }
@@ -30,6 +32,8 @@ Sorts the entire array just to find the maximum value.
 
 ```typescript
 function getOldestAndNewest(projects: Project[]) {
+  if (projects.length === 0) return { oldest: null, newest: null }
+
   const sorted = [...projects].sort((a, b) => a.updatedAt - b.updatedAt)
   return { oldest: sorted[0], newest: sorted[sorted.length - 1] }
 }
@@ -71,6 +75,8 @@ function getOldestAndNewest(projects: Project[]) {
 ```
 
 Single pass through the array, no copying, no sorting.
+
+When you switch from sorting to a loop, preserve the result your existing callers expect for an empty array.
 
 **Alternative (Math.min/Math.max for small arrays):**
 
