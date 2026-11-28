@@ -105,10 +105,10 @@ func TestCleanupAndExportVerificationRetryInvalidR2Listings(t *testing.T) {
 				failureRequests = append(failureRequests, "list "+page.token)
 			}
 			t.Run("cleanup", func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
 				env := testenv.New(t)
 				org := env.NewOrg("alice")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
 				if _, err := org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org.ID})); err != nil {
 					t.Fatal(err)
 				}
