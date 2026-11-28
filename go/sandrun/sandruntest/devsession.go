@@ -607,14 +607,15 @@ type sessionExecs struct {
 }
 
 type guest struct {
-	s        *Server
-	ctx      context.Context
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	closed   bool
-	execs    map[string]*proc
-	writes   map[writeKey]*pendingWrite
-	requests []*sandrunv1.ExecDevSessionRequest
+	s                *Server
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mu               sync.Mutex
+	closed           bool
+	execs            map[string]*proc
+	activeExecGroups map[*execGroup]struct{}
+	writes           map[writeKey]*pendingWrite
+	requests         []*sandrunv1.ExecDevSessionRequest
 	// snapshots holds the first snapshot bound to each read_id.
 	snapshots map[string]readSnapshot
 	reads     []*sandrunv1.ReadDevSessionFileRequest
@@ -626,14 +627,23 @@ type guest struct {
 
 func newGuest(s *Server) *guest {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[writeKey]*pendingWrite{}, snapshots: map[string]readSnapshot{}}
+	return &guest{
+		s: s, ctx: ctx, cancel: cancel,
+		execs:            map[string]*proc{},
+		activeExecGroups: map[*execGroup]struct{}{},
+		writes:           map[writeKey]*pendingWrite{},
+		snapshots:        map[string]readSnapshot{},
+	}
 }
 
 func (g *guest) close() {
 	g.mu.Lock()
 	g.closed = true
-	g.mu.Unlock()
+	for group := range g.activeExecGroups {
+		group.close()
+	}
 	g.cancel()
+	g.mu.Unlock()
 	g.wg.Wait()
 }
 
@@ -744,11 +754,13 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
 	cmd := newExecCommand(ctx, req.GetCommand(), req.GetEnv())
+	group := new(execGroup)
 	var timedOut bool
-	cancelCommand := cmd.Cancel
 	cmd.Cancel = func() error {
+		g.mu.Lock()
+		defer g.mu.Unlock()
 		deadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
-		err := cancelCommand()
+		err := group.cancel(deadline)
 		timedOut = deadline && err == nil
 		return err
 	}
@@ -756,7 +768,15 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 	cmd.Stdout = writerFunc(func(b []byte) (int, error) { p.append(0, b); return len(b), nil })
 	cmd.Stderr = writerFunc(func(b []byte) (int, error) { p.append(1, b); return len(b), nil })
 	cmd.WaitDelay = time.Second
-	if err := cmd.Start(); err != nil {
+	// Close either sees the started group or cancels its context before Start.
+	g.mu.Lock()
+	err = group.start(ctx, cmd)
+	if err == nil {
+		g.activeExecGroups[group] = struct{}{}
+	}
+	g.mu.Unlock()
+	if err != nil {
+		group.release()
 		cancel()
 		switch {
 		case errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist):
@@ -769,8 +789,12 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 	go func() {
 		defer done()
 		defer cancel()
-		// Wait joins the cancellation callback before it drains the output.
+		// Wait joins Cmd.Cancel, but Close can still signal during output drain.
 		_ = cmd.Wait()
+		g.mu.Lock()
+		delete(g.activeExecGroups, group)
+		g.mu.Unlock()
+		group.release()
 		ex := &sandrunv1.DevSessionExecExited{TimedOut: timedOut, EndTime: timestamppb.Now()}
 		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 			ex.Status = &sandrunv1.DevSessionExecExited_Signal{Signal: int32(ws.Signal())}
