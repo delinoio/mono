@@ -1006,6 +1006,25 @@ test("workspace aliases order the aliased package first", () => {
   );
 });
 
+test("workspace aliases fall back to the dependency key for missing targets", () => {
+  const servers = [
+    pkg("servers/a", {
+      name: "a",
+      dependencies: { z: "workspace:@scope/missing@*" },
+      deploy: droplet("a"),
+    }),
+    pkg("servers/z", {
+      name: "z",
+      deploy: droplet("z"),
+    }),
+  ];
+  const result = plan(status(["a", "1.0.0"], ["z", "1.0.0"]), servers);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["z", "a"],
+  );
+});
+
 test("relative workspace aliases order the linked package first", () => {
   const sites = [
     pkg("apps/accounts", {

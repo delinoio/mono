@@ -23,6 +23,7 @@ import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   entitlementsPath,
+  namedWorkspaceAlias,
   readWorkspacePackages,
   relativePath,
 } from "./workspace-packages.mjs";
@@ -565,8 +566,8 @@ function workspaceTarget(
     );
     return pkg?.manifest.name;
   }
-  const alias = /^(@?[^@]+)@/.exec(target);
-  if (alias && packagesByName.has(alias[1])) return alias[1];
+  const alias = namedWorkspaceAlias(target);
+  if (alias && packagesByName.has(alias)) return alias;
   return key;
 }
 

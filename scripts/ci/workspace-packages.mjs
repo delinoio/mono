@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Workspace package discovery and release input paths that the change planner
-// (`plan.mjs`) and the deploy planner (`deploy-plan.mjs`) share. This module
-// imports neither of them, so both can import it without a module cycle.
+// Workspace package discovery, named alias parsing, and release input paths
+// shared by the CI and deploy planners and their tests.
 import {
   existsSync,
   lstatSync,
@@ -57,6 +56,13 @@ export function readWorkspacePackages(
     }
   }
   return packages;
+}
+
+// Reads the package name from the target portion of a named workspace alias,
+// for example `@scope/package` from `@scope/package@*`.
+export function namedWorkspaceAlias(target) {
+  if (target.startsWith("./") || target.startsWith("../")) return undefined;
+  return /^(@?[^@]+)@/.exec(target)?.[1];
 }
 
 // Control characters and backslashes break the tab- and line-separated
