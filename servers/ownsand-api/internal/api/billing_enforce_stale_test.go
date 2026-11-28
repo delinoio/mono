@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -151,10 +152,32 @@ func (f *staleFixture) setPhase(t *testing.T, org *testenv.Org, phase ownsandv1.
 	}
 }
 
-// startPass starts an enforcement pass in the background.
-func (f *staleFixture) startPass() {
+type stalePassTargets struct {
+	pause, resume []string
+}
+
+// startPass starts an enforcement pass and waits for its target lists.
+func (f *staleFixture) startPass(t *testing.T, targetList string) stalePassTargets {
+	t.Helper()
+	selected := make(chan stalePassTargets, 1)
 	f.passDone = make(chan error, 1)
-	go func() { f.passDone <- f.env.App.Enforcer.Pass(context.Background()) }()
+	go func() {
+		defer close(selected)
+		f.passDone <- f.env.App.Enforcer.PassWithTargetsForTest(t.Context(), func(pause, resume []string) {
+			selected <- stalePassTargets{pause: pause, resume: resume}
+		})
+	}()
+	var targets stalePassTargets
+	select {
+	case lists, ok := <-selected:
+		if !ok {
+			t.Fatalf("did not observe the %s target list for sandbox %s: enforcement pass returned %v", targetList, f.victimSandbox, <-f.passDone)
+		}
+		targets = lists
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for the %s target list for sandbox %s", targetList, f.victimSandbox)
+	}
+	return targets
 }
 
 func (f *staleFixture) waitForHeldReplies(t *testing.T, hold *slotHolder) {
@@ -188,7 +211,10 @@ func TestBillingPauseDroppedAfterRecoveryWhileQueued(t *testing.T) {
 	f.setPhase(t, f.hog, billing.PhaseSuspended)
 	f.setPhase(t, f.victim, billing.PhaseSuspended)
 
-	f.startPass()
+	targets := f.startPass(t, "pause")
+	if !slices.Contains(targets.pause, f.victimSandbox) {
+		t.Fatalf("pause target list %v is missing sandbox %s", targets.pause, f.victimSandbox)
+	}
 	f.waitForHeldReplies(t, hold)
 	// The victim's target was selected while it was suspended; its recovery
 	// commits before the sandbox reaches a slot.
@@ -245,7 +271,10 @@ func TestBillingResumeDroppedAfterSuspensionWhileQueued(t *testing.T) {
 	f.setPhase(t, f.hog, billing.PhaseAllowed)
 	f.setPhase(t, f.victim, billing.PhaseAllowed)
 
-	f.startPass()
+	targets := f.startPass(t, "resume")
+	if !slices.Contains(targets.resume, f.victimSandbox) {
+		t.Fatalf("resume target list %v is missing sandbox %s", targets.resume, f.victimSandbox)
+	}
 	f.waitForHeldReplies(t, hold)
 	f.setPhase(t, f.victim, billing.PhaseSuspended)
 	hold.Release()
