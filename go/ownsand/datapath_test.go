@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 const (
@@ -570,48 +572,118 @@ func TestLateDataChannelOpen(t *testing.T) {
 	}
 }
 
-// A control plane that applies the caller's deadline (Connect sends the time
-// left as a timeout header) can answer deadline_exceeded slightly before the
-// caller's own timer fires. The test makes that order deterministic: the held
-// request fails with deadline_exceeded at once, while the caller's context
-// still has time left and the skew is larger than that time.
-func TestControlPlaneDeadlineStatusBeforeCallerTimerIsTheCallerDeadline(t *testing.T) {
-	t.Parallel()
-	type tc struct {
-		stage stalledStage
-		code  connect.Code
-	}
-	var cases []tc
-	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
-		for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeUnavailable} {
-			cases = append(cases, tc{stage, code})
+type setupDeadlineContext struct {
+	*manualDeadlineCtx
+	deadline time.Time
+	armed    atomic.Bool
+	waiting  chan struct{}
+}
+
+func (ctx *setupDeadlineContext) Deadline() (time.Time, bool) {
+	return ctx.deadline, true
+}
+
+func (ctx *setupDeadlineContext) Done() <-chan struct{} {
+	if ctx.armed.Load() {
+		// Relay recovery can also call Done after setup. Only the classifier's
+		// call proves that it reached the wait while the context was live.
+		pc, _, _, ok := runtime.Caller(1)
+		if ok && strings.HasSuffix(runtime.FuncForPC(pc).Name(), ".callerDeadlineEnded") && ctx.armed.Swap(false) {
+			close(ctx.waiting)
 		}
 	}
-	for _, tt := range cases {
-		stage := tt.stage
-		t.Run(string(stage)+"/"+tt.code.String(), func(t *testing.T) {
-			cp := newFakeCP(t)
-			cp.agent.run = lineRun(3, 0)
-			stallSetup(t, cp, stage)
-			cp.gateErr = connect.NewError(tt.code, errors.New("control plane ended the request"))
-			c := cp.client(t, TransportAuto)
-			c.timing.p2pOpenTimeout = 5 * time.Second
-			c.timing.callerDeadlineSkew = 10 * time.Second
-			s := cp.handle(t, c)
+	return ctx.manualDeadlineCtx.Done()
+}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-			defer cancel()
-			r := waitExec(t, startExec(ctx, s))
-			if !errors.Is(r.err, context.DeadlineExceeded) {
-				t.Fatalf("exec error: %v", r.err)
-			}
-			if len(cp.authRequests()) != 0 {
-				t.Fatal("relay recovery started after the caller's deadline")
-			}
-			if s.Transport() == relayTransport {
-				t.Fatal("the handle moved to the relay on a caller deadline")
-			}
-		})
+// Connect can return a control-plane status within the caller's deadline skew
+// before the caller's context ends. Keep the context live until the SDK enters
+// the deadline wait so this test exercises that response order.
+func TestControlPlaneDeadlineStatusBeforeCallerTimerIsTheCallerDeadline(t *testing.T) {
+	t.Parallel()
+	for _, stage := range []struct {
+		name      stalledStage
+		gate      string
+		procedure string
+	}{
+		{stageGetIceServers, "ice", ownsandv1connect.DataPathServiceGetIceServersProcedure},
+		{stageOpenSession, "open", ownsandv1connect.DataPathServiceOpenSessionProcedure},
+	} {
+		for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeUnavailable} {
+			t.Run(string(stage.name)+"/"+code.String(), func(t *testing.T) {
+				cp := newFakeCP(t)
+				cp.agent.run = lineRun(3, 0)
+				stallSetup(t, cp, stage.name)
+				injected := connect.NewError(code, errors.New("control plane ended the request"))
+				cp.gateErr = injected
+				c := cp.client(t, TransportAuto)
+				c.timing.p2pOpenTimeout = 10 * time.Second
+				c.timing.callerDeadlineSkew = 30 * time.Second
+				s := cp.handle(t, c)
+				initialTransport := s.Transport()
+
+				var wireErr error
+				observeStatus := connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+					return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+						res, err := next(ctx, req)
+						if req.Spec().Procedure == stage.procedure {
+							wireErr = err
+						}
+						return res, err
+					}
+				})
+				c.dataPath = ownsandv1connect.NewDataPathServiceClient(c.httpClient, c.baseURL,
+					connect.WithInterceptors(&authInterceptor{client: c}, observeStatus))
+
+				ctx := &setupDeadlineContext{
+					manualDeadlineCtx: newManualDeadlineCtx(t.Context()),
+					deadline:          time.Now().Add(20 * time.Second),
+					waiting:           make(chan struct{}),
+				}
+				defer ctx.cancel()
+				setupStatus := make(chan error, 1)
+				c.p2p.setupDone = func() {
+					// Setup calls the interceptor and this hook on the Exec goroutine.
+					ctx.armed.Store(true)
+					setupStatus <- wireErr
+				}
+				watchdog := time.NewTimer(10 * time.Second)
+				defer watchdog.Stop()
+				result := startExec(ctx, s)
+
+				waitGate(t, cp, stage.gate)
+				select {
+				case err := <-setupStatus:
+					var status *connect.Error
+					if !errors.As(err, &status) || !connect.IsWireError(err) || status.Code() != code || status.Message() != injected.Message() {
+						t.Fatalf("%s returned %v, want wire error %v", stage.procedure, err, injected)
+					}
+				case <-watchdog.C:
+					t.Fatalf("setup did not complete after the %s gate was reached", stage.gate)
+				}
+
+				select {
+				case <-ctx.waiting:
+				case r := <-result:
+					t.Fatalf("Exec returned before the caller deadline wait: %v", r.err)
+				case <-watchdog.C:
+					t.Fatal("classifier did not reach the caller deadline wait")
+				}
+				if err := ctx.Err(); err != nil {
+					t.Fatalf("caller context ended before the deadline wait was observed: %v", err)
+				}
+				ctx.expire()
+
+				if r := waitExec(t, result); !errors.Is(r.err, context.DeadlineExceeded) {
+					t.Fatalf("Exec error = %v, want context.DeadlineExceeded", r.err)
+				}
+				if got := len(cp.authRequests()); got != 0 {
+					t.Fatalf("AuthorizeRelay calls = %d, want 0", got)
+				}
+				if got := s.Transport(); got != initialTransport {
+					t.Fatalf("handle transport = %v, want %v", got, initialTransport)
+				}
+			})
+		}
 	}
 }
 
