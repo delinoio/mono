@@ -19,14 +19,19 @@ import {
   type AcceptInvitationResponse,
   type ListInvitationsResponse,
   type ListMembersResponse,
+  type RemoveMemberRequest,
   type RevokeInvitationRequest,
 } from "@delino/ownsand-protos/v1/member_pb";
 import {
+  Role,
   SandboxState,
   SnapshotExportState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import type { GetDeviceResponse } from "@delino/ownsand-protos/v1/device_pb";
-import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
+import type {
+  CreateOrganizationResponse,
+  GetOrganizationResponse,
+} from "@delino/ownsand-protos/v1/organization_pb";
 import {
   CreateSandboxRequestSchema,
   SandboxSourceSchema,
@@ -42,6 +47,7 @@ import type {
 import {
   createMockTransport as createBaseMock,
   MOCK_IDS,
+  MOCK_USER,
   MockBillingState,
 } from "../src/mock/mock-api.ts";
 import { apiKeyCollisionTransport } from "./api-key-collision-fixture.ts";
@@ -628,6 +634,47 @@ export function createMockTransport(): Transport {
         const { billingAccountId } =
           input as unknown as LinkBillingAccountRequest;
         recordToken("ownsand-e2e-billing-link-requests", billingAccountId);
+      }
+      const leaveRole = sessionStorage.getItem("ownsand-e2e-leave-role");
+      if (leaveRole !== null && method.name === "GetOrganization") {
+        const response = await base.unary(
+          method,
+          signal,
+          timeout,
+          header,
+          input,
+          contextValues,
+        );
+        const { organization } = response.message as GetOrganizationResponse;
+        if (organization?.organizationId !== MOCK_IDS.northwind)
+          return response;
+        return {
+          ...response,
+          message: {
+            ...response.message,
+            organization: {
+              ...organization,
+              callerRole: Number(leaveRole) as Role,
+            },
+          },
+        };
+      }
+      if (leaveRole !== null && method.name === "RemoveMember") {
+        const { organizationId, userId } = input as RemoveMemberRequest;
+        recordToken(
+          "ownsand-e2e-leave-requests",
+          JSON.stringify({ organizationId, userId }),
+        );
+        if (
+          Number(leaveRole) === Role.OWNER &&
+          organizationId === MOCK_IDS.northwind &&
+          userId === MOCK_USER
+        ) {
+          throw new ConnectError(
+            "the owner must transfer ownership before leaving",
+            Code.FailedPrecondition,
+          );
+        }
       }
       if (method.name === "ListOrganizations") {
         await failOrganizationListIfConfigured();

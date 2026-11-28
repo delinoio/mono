@@ -31,6 +31,7 @@ import {
   BaseImage,
   type DeviceLimitsInput,
   type Resources,
+  Role,
   SandboxState,
   SnapshotState,
 } from "@delino/ownsand-protos/v1/common_pb";
@@ -40,9 +41,13 @@ import {
   type LinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
-import type { AcceptInvitationRequest } from "@delino/ownsand-protos/v1/member_pb";
+import type {
+  AcceptInvitationRequest,
+  RemoveMemberRequest,
+} from "@delino/ownsand-protos/v1/member_pb";
 import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
+  type GetOrganizationResponse,
   ListOrganizationsResponseSchema,
   OrganizationService,
 } from "@delino/ownsand-protos/v1/organization_pb";
@@ -3932,6 +3937,95 @@ describe("leaving and deleting an organization", () => {
     });
     return dialog;
   };
+
+  test.each([Role.MEMBER, Role.ADMIN])(
+    "dismisses Leave when the caller with role %s becomes the owner",
+    async (initialRole) => {
+      const organizationId = MOCK_IDS.northwind;
+      const path = `/orgs/${organizationId}/members`;
+      const mock = createMockTransport();
+      const queryClient = createQueryClient();
+      let callerRole = initialRole;
+      const removals: Pick<RemoveMemberRequest, "organizationId" | "userId">[] =
+        [];
+      const refreshPaths: string[] = [];
+      const transport: Transport = {
+        ...mock,
+        async unary(method, ...args) {
+          if (method.name === "RemoveMember") {
+            const { organizationId, userId } = args[3] as RemoveMemberRequest;
+            removals.push({ organizationId, userId });
+          }
+          if (method.name === "ListOrganizations" && removals.length > 0) {
+            refreshPaths.push(window.location.pathname);
+          }
+          const response = await mock.unary(method, ...args);
+          if (method.name !== "GetOrganization") return response;
+          const { organization } = response.message as GetOrganizationResponse;
+          if (organization?.organizationId !== organizationId) return response;
+          return {
+            ...response,
+            message: {
+              ...response.message,
+              organization: { ...organization, callerRole },
+            },
+          };
+        },
+      };
+      const refetchRole = async (role: Role) => {
+        callerRole = role;
+        await act(async () => {
+          await queryClient.refetchQueries({
+            queryKey: createConnectQueryKey({
+              schema: OrganizationService.method.getOrganization,
+              input: { organizationId },
+              cardinality: "finite",
+            }),
+          });
+        });
+      };
+
+      renderConsole(path, { transport, queryClient });
+      const leave = { name: "Leave organization" };
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("button", leave));
+      });
+      await screen.findByRole("alertdialog", {
+        name: "Leave this organization?",
+      });
+
+      await refetchRole(Role.OWNER);
+      await screen.findByText("· Owner");
+      await waitFor(() => {
+        expect(
+          screen.queryByRole("alertdialog", {
+            name: "Leave this organization?",
+          }),
+        ).toBeNull();
+        expect(screen.queryByRole("button", leave)).toBeNull();
+      });
+      expect(
+        screen.getByRole("heading", { name: "Members", level: 1 }),
+      ).toBeTruthy();
+      expect(window.location.pathname).toBe(path);
+      expect(removals).toEqual([]);
+
+      await refetchRole(Role.ADMIN);
+      const opener = await screen.findByRole("button", leave);
+      expect(
+        screen.queryByRole("alertdialog", { name: "Leave this organization?" }),
+      ).toBeNull();
+      await act(async () => fireEvent.click(opener));
+      await confirmIn("Leave organization");
+
+      await waitFor(() => expect(refreshPaths).toContain("/"));
+      expect(refreshPaths.every((refreshPath) => refreshPath === "/")).toBe(
+        true,
+      );
+      expect(window.location.pathname).toBe("/");
+      expect(removals).toEqual([{ organizationId, userId: MOCK_USER }]);
+    },
+  );
 
   test("leaving as a member never shows the not-found notice and ends at /", async () => {
     renderConsole(`/orgs/${MOCK_IDS.northwind}/members`, {

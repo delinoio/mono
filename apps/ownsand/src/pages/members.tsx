@@ -76,6 +76,11 @@ export function MembersPage() {
   const leave = useMutation(MemberService.method.removeMember);
   const [removing, setRemoving] = useState<Member>();
   const [leaving, setLeaving] = useState(false);
+  const canLeave = can(role, Permission.LeaveOrganization);
+
+  if (!canLeave && leaving) {
+    setLeaving(false);
+  }
 
   if (isTerminalError(members.error) && removing !== undefined) {
     setRemoving(undefined);
@@ -87,7 +92,7 @@ export function MembersPage() {
         title={t("members.title")}
         description={t("members.description")}
         action={
-          can(role, Permission.LeaveOrganization) ? (
+          canLeave ? (
             <Button
               variant={ButtonVariant.Secondary}
               onClick={() => setLeaving(true)}
@@ -191,12 +196,13 @@ export function MembersPage() {
         }}
       />
       <ConfirmDialog
-        open={leaving}
+        open={canLeave && leaving}
         onOpenChange={setLeaving}
         title={t("members.leaveDialog.title")}
         description={t("members.leaveDialog.description")}
         confirmLabel={t("members.leave")}
         onConfirm={async (opening) => {
+          if (!canLeave) return;
           await leave.mutateAsync({
             organizationId,
             userId: userId ?? "",
