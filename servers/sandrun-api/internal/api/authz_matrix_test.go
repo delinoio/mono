@@ -4,6 +4,8 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/api"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/auth"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
 )
@@ -185,26 +188,120 @@ func TestAPIKeyFailureRateLimit(t *testing.T) {
 	var env *testenv.Env
 	clock := func() time.Time { return env.Clock.Now() }
 	env = testenv.New(t, withFakeDevSessions(), testenv.WithLimits(tightLimits(clock)))
-	org := env.NewOrg("alice")
-	_, secret := env.NewAPIKey(org.ID, org.Member)
+	orgID, secret := newRateLimitTestKey(t, env)
 	// Successes take no tokens.
 	for i := 0; i < 20; i++ {
-		if err := listProfiles(env.Bearer(secret), org.ID); err != nil {
+		if err := listProfiles(env.Bearer(secret), orgID); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Failures with the same display prefix take tokens; the 11th is
-	// rejected before validation, even with the valid key.
-	bad := secret[:len("sandrun_")+4] + "AAAA"
+	prefix := auth.DisplayPrefix(auth.SecretAPIKey, secret)
+	bad := prefix + "AAAA"
 	for i := 0; i < 10; i++ {
-		wantCode(t, "bad key", listProfiles(env.Bearer(bad), org.ID), connect.CodeUnauthenticated)
+		wantCode(t, "bad key", listProfiles(env.Bearer(bad), orgID), connect.CodeUnauthenticated)
 	}
-	wantCode(t, "11th failure", listProfiles(env.Bearer(bad), org.ID), connect.CodeResourceExhausted)
-	wantCode(t, "valid key with an exhausted prefix", listProfiles(env.Bearer(secret), org.ID), connect.CodeResourceExhausted)
+	err := listProfiles(env.Bearer(bad), orgID)
+	wantCode(t, "11th failure", err, connect.CodeResourceExhausted)
+	if err == nil || err.Error() != "resource_exhausted: rate limit exceeded; retry in 6 s" {
+		t.Errorf("prefix limit retry: %v", err)
+	}
+	wantCode(t, "valid key with an exhausted prefix", listProfiles(env.Bearer(secret), orgID), ok)
+	wantCode(t, "bare display prefix", listProfiles(env.Bearer(prefix), orgID), connect.CodeResourceExhausted)
 	env.Clock.Advance(6 * time.Second)
-	if err := listProfiles(env.Bearer(secret), org.ID); err != nil {
-		t.Fatalf("after refill: %v", err)
+	wantCode(t, "failure after prefix refill", listProfiles(env.Bearer(bad), orgID), connect.CodeUnauthenticated)
+	wantCode(t, "rejection within the warning interval", listProfiles(env.Bearer(bad), orgID), connect.CodeResourceExhausted)
+	env.Clock.Advance(4 * time.Second)
+	wantCode(t, "bare display prefix after warning interval", listProfiles(env.Bearer(prefix), orgID), connect.CodeResourceExhausted)
+
+	logs := env.Logs.String()
+	if strings.Contains(logs, bad) || strings.Contains(logs, secret) {
+		t.Fatal("RPC logs contain a presented key value")
 	}
+	var warnings []string
+	var warningRPCs []string
+	var limitedRPCs []string
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		var record struct {
+			Message   string `json:"msg"`
+			Level     string `json:"level"`
+			KeyPrefix string `json:"key_prefix"`
+			RPCID     string `json:"rpc_id"`
+			Code      string `json:"code"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case record.Message == "api_key_prefix_rate_limited":
+			if record.Level != "WARN" || record.RPCID == "" {
+				t.Fatal("prefix warning must have WARN level and an RPC ID")
+			}
+			warnings = append(warnings, record.KeyPrefix)
+			warningRPCs = append(warningRPCs, record.RPCID)
+		case record.Message == "rpc" && record.Code == "resource_exhausted":
+			limitedRPCs = append(limitedRPCs, record.RPCID)
+		}
+	}
+	if len(warnings) != 2 || warnings[0] != prefix || warnings[1] != "[redacted]" {
+		t.Fatal("expected one display prefix warning and one redacted warning 10 seconds later")
+	}
+	if len(limitedRPCs) != 4 || warningRPCs[0] != limitedRPCs[0] || warningRPCs[1] != limitedRPCs[3] {
+		t.Fatal("prefix warnings must correlate with the first and last rate-limited RPCs")
+	}
+}
+
+func TestValidAPIKeyTakesNoRateLimitToken(t *testing.T) {
+	var env *testenv.Env
+	clock := func() time.Time { return env.Clock.Now() }
+	limits := tightLimits(clock)
+	limits.PerClient = ratelimit.New(10.0/60, 10, clock)
+	env = testenv.New(t, withFakeDevSessions(), testenv.WithLimits(limits))
+	orgID, secret := newRateLimitTestKey(t, env)
+
+	for i := 0; i < 20; i++ {
+		wantCode(t, "valid key", listProfiles(env.Bearer(secret), orgID), ok)
+	}
+	prefix := auth.DisplayPrefix(auth.SecretAPIKey, secret)
+	for i := 0; i < 10; i++ {
+		wantCode(t, "bad key", listProfiles(env.Bearer(prefix+"AAAA"), orgID), connect.CodeUnauthenticated)
+	}
+}
+
+func TestAPIKeyFailureWithExhaustedPrefixTakesClientToken(t *testing.T) {
+	var env *testenv.Env
+	clock := func() time.Time { return env.Clock.Now() }
+	limits := tightLimits(clock)
+	limits.PerPrefix = ratelimit.New(10.0/60, 2, clock)
+	limits.PerClient = ratelimit.New(10.0/60, 5, clock)
+	env = testenv.New(t, withFakeDevSessions(), testenv.WithLimits(limits))
+	orgID, secret := newRateLimitTestKey(t, env)
+
+	// Change the hash while keeping a well-formed value with the same prefix.
+	bad := secret[:len(secret)-2] + "AA"
+	if bad == secret {
+		bad = secret[:len(secret)-2] + "BA"
+	}
+	for i := 0; i < 2; i++ {
+		wantCode(t, "unknown key", listProfiles(env.Bearer(bad), orgID), connect.CodeUnauthenticated)
+	}
+	for i := 0; i < 3; i++ {
+		wantCode(t, "unknown key with exhausted prefix", listProfiles(env.Bearer(bad), orgID), connect.CodeResourceExhausted)
+	}
+	wantCode(t, "different prefix from the same client", listProfiles(env.Bearer("sandrun_"), orgID), connect.CodeResourceExhausted)
+}
+
+func newRateLimitTestKey(t *testing.T, env *testenv.Env) (orgID, secret string) {
+	t.Helper()
+	// An owner-only organization keeps invitation acceptance from charging the client bucket.
+	const owner = "alice"
+	resp, err := env.User(owner).Organization.CreateOrganization(t.Context(),
+		connect.NewRequest(&sandrunv1.CreateOrganizationRequest{Name: "Rate limit test"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orgID = resp.Msg.GetOrganization().GetOrganizationId()
+	_, secret = env.NewAPIKey(orgID, owner)
+	return orgID, secret
 }
 
 func TestClientAddressLimit(t *testing.T) {

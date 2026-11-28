@@ -1404,9 +1404,17 @@ test(
   },
 );
 
-// Writes the GitHub API answers for an annotated tag on a version commit
-// whose parent is `parent`.
-function tagApi(f, tag, { type = "tag", parent = sha } = {}) {
+// Writes the GitHub API answers for a tag ref and its target.
+function tagApi(
+  f,
+  tag,
+  {
+    type = "tag",
+    targetType = "commit",
+    targetSha = `${targetType}-${tag}`,
+    parent = sha,
+  } = {},
+) {
   const api = join(f.dir, "gh-api");
   const file = (path) => join(api, `${path.replaceAll("/", "_")}.json`);
   write(
@@ -1415,12 +1423,14 @@ function tagApi(f, tag, { type = "tag", parent = sha } = {}) {
   );
   write(
     file(`repos/owner/repo/git/tags/tagobj-${tag}`),
-    JSON.stringify({ object: { type: "commit", sha: `commit-${tag}` } }),
+    JSON.stringify({ object: { type: targetType, sha: targetSha } }),
   );
-  write(
-    file(`repos/owner/repo/commits/commit-${tag}`),
-    JSON.stringify({ parents: [{ sha: parent }] }),
-  );
+  if (targetType === "commit" && targetSha) {
+    write(
+      file(`repos/owner/repo/commits/${targetSha}`),
+      JSON.stringify({ parents: [{ sha: parent }] }),
+    );
+  }
 }
 
 function assembled(f) {
@@ -1756,6 +1766,47 @@ test(
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, message);
         assert.doesNotMatch(result.log, /gh release (create|upload)/);
+      });
+    }
+  },
+);
+
+test(
+  "github-releases rejects an annotated tag without a commit SHA",
+  { skip },
+  async (t) => {
+    const tag = "ownsand-agent@0.1.0";
+    for (const [label, target] of [
+      ["tree", { targetType: "tree" }],
+      ["blob", { targetType: "blob" }],
+      ["nested tag", { targetType: "tag" }],
+      ["empty commit SHA", { targetSha: "" }],
+    ]) {
+      await t.test(label, (t) => {
+        const f = fixture(t);
+        tagApi(f, tag, target);
+        if (target.targetType === "tree") {
+          // Model a commits endpoint that treats the empty SHA as a list request.
+          write(
+            join(f.dir, "gh-api/repos_owner_repo_commits_.json"),
+            JSON.stringify([{ sha: "abc", parents: [{ sha }] }]),
+          );
+        }
+        const result = f.run(
+          ["github-releases", assembled(f), prepared(f)],
+          {},
+          [agent],
+        );
+        assert.equal(result.status, 1, result.stderr);
+        assert.equal(
+          result.stderr.trimEnd(),
+          `::error::Tag ${tag} is not on the version commit of the deployed revision ${sha} (commit none, parent none).`,
+        );
+        assert.doesNotMatch(
+          result.log,
+          /^gh api repos\/owner\/repo\/commits\//m,
+        );
+        assert.doesNotMatch(result.log, releaseWrites);
       });
     }
   },

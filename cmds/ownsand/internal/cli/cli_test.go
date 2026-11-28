@@ -798,6 +798,72 @@ func TestMemberAcceptReadsSecretFromStdinOrFile(t *testing.T) {
 	}
 }
 
+func TestDeviceSetLimitsValidatesBeforeSetup(t *testing.T) {
+	const id = "01900000-0000-7000-8000-000000000001"
+	const required = "--vcpu, --memory and --disk are required"
+	const invalidPercent = "--vcpu-overcommit: invalid limits.vcpu_overcommit_percent: must be 100 to 400 in steps of 25"
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"invalid device ID", []string{"invalid-id", "--vcpu", "-1"}, "invalid device-id:"},
+		{"missing vCPU", []string{id, "--memory", "-1", "--disk", "1"}, required},
+		{"missing memory", []string{id, "--vcpu", "1", "--disk", "1"}, required},
+		{"missing disk", []string{id, "--vcpu", "1", "--memory", "1"}, required},
+		{"negative vCPU", []string{"--vcpu", "-1", id, "--memory", "1", "--disk", "1"}, "--vcpu: invalid limits.vcpu_count: must not be negative"},
+		{"negative memory", []string{id, "--vcpu", "1", "--memory", "-512", "--disk", "1"}, "--memory: invalid limits.memory_mib: must not be negative"},
+		{"negative disk", []string{id, "--vcpu", "1", "--memory", "1", "--disk", "-10"}, "--disk: invalid limits.disk_gib: must not be negative"},
+		{"negative vCPU with overcommit", []string{id, "--vcpu", "-1", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "100"}, "--vcpu: invalid limits.vcpu_count: must not be negative"},
+		{"negative memory with overcommit", []string{id, "--vcpu", "1", "--memory", "-512", "--disk", "1", "--vcpu-overcommit", "100"}, "--memory: invalid limits.memory_mib: must not be negative"},
+		{"negative disk with overcommit", []string{id, "--vcpu", "1", "--memory", "1", "--disk", "-10", "--vcpu-overcommit", "100"}, "--disk: invalid limits.disk_gib: must not be negative"},
+		{"negative overcommit", []string{"--vcpu", "1", "--vcpu-overcommit=-25", id, "--memory", "1", "--disk", "1"}, invalidPercent},
+		{"zero overcommit", []string{id, "--vcpu", "1", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "0"}, invalidPercent},
+		{"overcommit between steps", []string{"--vcpu", "1", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "110", id}, invalidPercent},
+		{"overcommit above maximum", []string{id, "--vcpu", "1", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "425"}, invalidPercent},
+	}
+	for _, setup := range []struct {
+		name      string
+		configure func(*runner)
+	}{
+		{"configured", func(*runner) {}},
+		{"no organization", func(r *runner) { delete(r.env, ownsand.EnvOrganization) }},
+		{"invalid organization", func(r *runner) { r.env[ownsand.EnvOrganization] = "not-a-uuid" }},
+		{"no credentials", func(r *runner) { delete(r.env, ownsand.EnvAPIKey) }},
+	} {
+		t.Run(setup.name, func(t *testing.T) {
+			r := newRunner(t)
+			setup.configure(r)
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					res := r.run(append([]string{"device", "set-limits"}, tc.args...)...)
+					if res.code != ExitUsage || !strings.Contains(res.stderr, tc.want) {
+						t.Errorf("exit %d, stderr %q, want exit %d and %q", res.code, res.stderr, ExitUsage, tc.want)
+					}
+					if calls := r.f.callNames(); len(calls) != 0 {
+						t.Errorf("unexpected calls: %v", calls)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDeviceSetLimitsRejectsInvalidStoredOvercommit(t *testing.T) {
+	r := newRunner(t)
+	r.f.mu.Lock()
+	r.f.deviceOvercommitPercent = 0
+	r.f.mu.Unlock()
+	res := r.run("device", "set-limits", r.f.dev, "--vcpu", "4", "--memory", "1", "--disk", "1")
+	if res.code != ExitUsage || !strings.Contains(res.stderr, "--vcpu-overcommit: invalid limits.vcpu_overcommit_percent: must be 100 to 400 in steps of 25") {
+		t.Errorf("expected a usage error for the stored overcommit: %+v", res)
+	}
+	if calls := r.f.callNames(); !slices.Equal(calls, []string{"GetDevice"}) {
+		t.Errorf("calls %v, want only GetDevice", calls)
+	}
+}
+
 func TestDeviceSetLimitsKeepsCurrentOvercommit(t *testing.T) {
 	r := newRunner(t)
 	if res := r.run("device", "set-limits", r.f.dev, "--vcpu", "8", "--memory", "16384", "--disk", "200"); res.code != 0 {
@@ -880,13 +946,16 @@ func TestDeviceSetLimitsOvercommitFlag(t *testing.T) {
 // the request is present.
 func TestDeviceSetLimitsSendsExplicitZero(t *testing.T) {
 	r := newRunner(t)
-	if res := r.run("device", "set-limits", r.f.dev, "--vcpu", "0", "--memory", "0", "--disk", "0", "--vcpu-overcommit", "100"); res.code != 0 {
+	if res := r.run("device", "set-limits", "--vcpu", "0", r.f.dev, "--memory", "0", "--disk", "0", "--vcpu-overcommit", "100"); res.code != 0 {
 		t.Fatalf("%+v", res)
+	}
+	if calls := r.f.callNames(); !slices.Equal(calls, []string{"ReplaceDeviceLimits"}) {
+		t.Fatalf("calls %v, want only ReplaceDeviceLimits", calls)
 	}
 	r.f.mu.Lock()
 	l := r.f.limit
 	r.f.mu.Unlock()
-	if l.VcpuCount == nil || l.MemoryMib == nil || l.DiskGib == nil || l.VcpuOvercommitPercent == nil {
+	if l == nil || l.VcpuCount == nil || l.MemoryMib == nil || l.DiskGib == nil || l.VcpuOvercommitPercent == nil {
 		t.Fatalf("a field is missing in %v", l)
 	}
 	if l.GetVcpuCount() != 0 || l.GetMemoryMib() != 0 || l.GetDiskGib() != 0 || l.GetVcpuOvercommitPercent() != 100 {

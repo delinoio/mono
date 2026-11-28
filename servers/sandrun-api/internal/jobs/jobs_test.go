@@ -55,13 +55,21 @@ func TestAuditRetention(t *testing.T) {
 		t.Fatalf("deleted %d, %v", n, err)
 	}
 	var left []string
-	rows, _ := d.Pool.Query(ctx, "SELECT audit_event_id::text FROM audit_events")
+	rows, err := d.Pool.Query(ctx, "SELECT audit_event_id::text FROM audit_events")
+	if err != nil {
+		t.Fatalf("query audit retention survivors: %v", err)
+	}
+	defer rows.Close()
 	for rows.Next() {
 		var id string
-		_ = rows.Scan(&id)
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan audit retention survivor: %v", err)
+		}
 		left = append(left, id)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate audit retention survivors: %v", err)
+	}
 	if len(left) != 1 || left[0] != recent || left[0] == old {
 		t.Fatalf("left %v", left)
 	}

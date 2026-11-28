@@ -61,6 +61,11 @@ describe("home", () => {
     browser,
   }) => {
     await app.open("/");
+    // The development server renders the page in the browser after
+    // `app.open` returns, so wait for the cards before reading their titles.
+    await expect(
+      browser.locator(".rp-home-feature__title").first(),
+    ).toBeVisible();
 
     // Rspress keys the feature cards by title, so a repeated title makes React
     // report duplicate keys in the development console and can drop a card.

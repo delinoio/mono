@@ -3,6 +3,7 @@
 package metrics_test
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -145,6 +148,120 @@ func TestServeAndShutdown(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("/healthz on the metrics listener = %d, want 404", resp.StatusCode)
+	}
+}
+
+type closeObservedListener struct {
+	net.Listener
+	closed chan struct{}
+}
+
+func (l closeObservedListener) Close() error {
+	err := l.Listener.Close()
+	close(l.closed)
+	return err
+}
+
+func TestServeDrainsActiveScrape(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		expires bool
+	}{
+		{name: "deadline expires", expires: true},
+		{name: "scrape finishes during drain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			draining := make(chan struct{})
+			started := make(chan struct{})
+			release := make(chan struct{})
+			releaseHandler := sync.OnceFunc(func() { close(release) })
+			const metricsBody = "probe_metric 1\n"
+			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				close(started)
+				<-release
+				_, _ = io.WriteString(w, metricsBody)
+			})
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			var serveErr error
+			go func() {
+				serveErr = metrics.Serve(ctx, closeObservedListener{listener, draining}, handler, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+				close(done)
+			}()
+			defer func() {
+				releaseHandler()
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(serveStopTimeout):
+					t.Error("metrics Serve did not stop during cleanup")
+				}
+			}()
+
+			conn, err := net.DialTimeout("tcp", listener.Addr().String(), requestTimeout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(serveStopTimeout)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(conn, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-started:
+			case <-time.After(requestTimeout):
+				t.Fatal("scrape did not enter the handler")
+			}
+
+			cancel()
+			select {
+			case <-draining:
+			case <-time.After(requestTimeout):
+				t.Fatal("metrics listener did not close at the start of the drain")
+			}
+			if !tc.expires {
+				releaseHandler()
+			}
+			select {
+			case <-done:
+			case <-time.After(serveStopTimeout):
+				t.Fatal("metrics Serve did not return after cancellation")
+			}
+
+			if tc.expires {
+				if !errors.Is(serveErr, context.DeadlineExceeded) {
+					t.Errorf("metrics Serve error = %v, want the drain deadline error", serveErr)
+				}
+				if err := conn.SetReadDeadline(time.Now().Add(requestTimeout)); err != nil {
+					t.Fatal(err)
+				}
+				var byteRead [1]byte
+				if n, err := conn.Read(byteRead[:]); n != 0 || (!errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET)) {
+					t.Fatalf("scrape read after Serve returned = (%d, %v), want EOF or connection reset", n, err)
+				}
+				return
+			}
+
+			if serveErr != nil {
+				t.Errorf("metrics Serve error = %v, want nil", serveErr)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusOK || string(body) != metricsBody {
+				t.Fatalf("scrape response = (%d, %q, %v), want (200, %q, nil)", resp.StatusCode, body, err, metricsBody)
+			}
+		})
 	}
 }
 

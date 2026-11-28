@@ -183,17 +183,27 @@ func TestSaturatedCloseKeepsReplacement(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	replacement := h.Register(context.Background(), "device", "org")
-	// The replacement already closed the old channel, so Send reports the
-	// close and keeps that cause.
-	if err := old.Send(context.Background(), ack(0)); !errors.Is(err, ErrChannelClosed) {
-		t.Fatalf("send on the replaced channel = %v", err)
+	if err := old.Send(context.Background(), ack(outboundQueue)); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("send on a full queue = %v, want ErrQueueFull", err)
 	}
+	if cause := context.Cause(old.Context()); !errors.Is(cause, ErrQueueFull) {
+		t.Fatalf("close cause before replacement = %v, want ErrQueueFull", cause)
+	}
+
+	replacement := h.Register(context.Background(), "device", "org")
 	if h.Unregister(old) {
 		t.Fatal("the old channel counted as current")
 	}
 	if h.Get("device") != replacement {
 		t.Fatal("the replacement is not current")
+	}
+	select {
+	case <-replacement.Done():
+		t.Fatalf("the replacement closed: %v", context.Cause(replacement.Context()))
+	default:
+	}
+	if cause := context.Cause(old.Context()); !errors.Is(cause, ErrQueueFull) {
+		t.Fatalf("close cause after stale unregister = %v, want ErrQueueFull", cause)
 	}
 }
 

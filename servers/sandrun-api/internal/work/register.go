@@ -233,7 +233,7 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 			if err := api.CheckTeardown(ctx); err != nil {
 				return err
 			}
-			if _, err := client.DeleteSandbox(ctx, id); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
+			if err := e.deleteSandboxAttempt(ctx, client, id); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
 				// A key that OwnSand no longer accepts cannot delete the
 				// sandbox; its idle_ttl ends it.
 				errs = append(errs, fmt.Errorf("delete sandbox of runner %s: %w", r.ID, err))

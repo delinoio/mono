@@ -12,7 +12,7 @@ import { constants, tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "@tauri-apps/cli";
-import { debianCli } from "./tauri-debian-cli.mjs";
+import { linuxCefCli } from "./tauri-debian-cli.mjs";
 
 const args = process.argv.slice(2);
 const commandIndex = args.findIndex((arg) => !arg.startsWith("-"));
@@ -165,7 +165,7 @@ function resolveConfig(platformName) {
   }
 }
 
-function embeddedNoticeConfig() {
+function resolveBundleConfig() {
   if (
     (command !== "build" && command !== "bundle") ||
     tauriOptions.some(
@@ -195,28 +195,40 @@ function embeddedNoticeConfig() {
     return;
   }
 
-  const includesNotices = (formats) =>
-    formats.some(
-      (format) =>
-        typeof format === "string" &&
-        noticeFormats.includes(format.toLowerCase()),
-    );
-  const formats = requestedBundles(tauriOptions);
-  if (formats && !includesNotices(formats)) return;
+  const supportedFormats =
+    platformName === "linux" ? ["deb", "rpm", "appimage"] : noticeFormats;
+  const includesFormat = (formats, candidates) =>
+    formats.some((format) => candidates.includes(format));
+  const explicitFormats = requestedBundles(tauriOptions)?.map((format) =>
+    format.toLowerCase(),
+  );
+  if (explicitFormats && !includesFormat(explicitFormats, supportedFormats)) {
+    return;
+  }
 
   const resolved = resolveConfig(platformName);
   const bundle = resolved.config?.bundle;
-  if (bundle?.cef?.embed === false) return;
-  if (!formats && command === "build" && bundle?.active !== true) return;
-  const targets = bundle?.targets ?? "all";
-  if (
-    !formats &&
-    !(typeof targets === "string" && targets.toLowerCase() === "all") &&
-    !includesNotices([targets].flat())
-  ) {
+  if (!explicitFormats && command === "build" && bundle?.active !== true) {
     return;
   }
-  return { ...resolved, platformName };
+  const targets = bundle?.targets ?? "all";
+  const selectedFormats =
+    explicitFormats ??
+    (typeof targets === "string" && targets.toLowerCase() === "all"
+      ? supportedFormats
+      : [targets]
+          .flat()
+          .filter((target) => typeof target === "string")
+          .map((target) => target.toLowerCase()));
+  if (!includesFormat(selectedFormats, supportedFormats)) return;
+  const embedsCef = bundle?.cef?.embed !== false;
+  const stageNotices =
+    embedsCef && includesFormat(selectedFormats, noticeFormats);
+  // On Linux, DeliDev links CEF for both shared and embedded bundles.
+  const usePatchedCli =
+    platformName === "linux" &&
+    (embedsCef || includesFormat(selectedFormats, ["deb", "rpm"]));
+  return { ...resolved, platformName, stageNotices, usePatchedCli };
 }
 
 function shellQuote(value) {
@@ -241,7 +253,7 @@ function preserveClears(base, override, additions) {
   return patch;
 }
 
-async function runDebianCli(cli, args, options) {
+async function runPatchedCli(cli, args, options) {
   const child = spawn(cli, args, options);
   let interrupted;
   const onSignal = (signal) => {
@@ -268,14 +280,10 @@ async function runDebianCli(cli, args, options) {
   }
 }
 
-async function runNoticeBuild({
-  config,
-  baseConfig,
-  overrides,
-  configIndex,
-  platformName,
-}) {
-  const cli = platformName === "linux" ? await debianCli() : process.execPath;
+async function runNoticeBuild(
+  { config, baseConfig, overrides, configIndex, platformName },
+  cli,
+) {
   // Tauri reads its file mappings before Cargo downloads CEF. Stage the files
   // in a private directory after the download and before Tauri bundles the app.
   const noticeDir = mkdtempSync(join(tmpdir(), "delidev-cef-"));
@@ -332,11 +340,11 @@ async function runNoticeBuild({
       stdio: "inherit",
       shell: false,
     };
-    if (platformName === "linux") {
-      process.exitCode = await runDebianCli(cli, args, options);
+    if (cli) {
+      process.exitCode = await runPatchedCli(cli, args, options);
     } else {
       const cliArgs = [require.resolve("@tauri-apps/cli/tauri.js"), ...args];
-      const { error, status } = spawnSync(cli, cliArgs, options);
+      const { error, status } = spawnSync(process.execPath, cliArgs, options);
       if (error) throw error;
       process.exitCode = status ?? 1;
     }
@@ -346,9 +354,12 @@ async function runNoticeBuild({
 }
 
 try {
-  const resolved = embeddedNoticeConfig();
-  if (resolved) {
-    await runNoticeBuild(resolved);
+  const resolved = resolveBundleConfig();
+  const cli = resolved?.usePatchedCli ? await linuxCefCli() : undefined;
+  if (resolved?.stageNotices) {
+    await runNoticeBuild(resolved, cli);
+  } else if (cli) {
+    process.exitCode = await runPatchedCli(cli, args, { stdio: "inherit" });
   } else {
     await run(args, "pnpm tauri");
   }

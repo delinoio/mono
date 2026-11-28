@@ -100,9 +100,7 @@ func TestRunSlowPollIsSingleFlight(t *testing.T) {
 			held.Store(true)
 			timing := billing.DefaultStatusTiming()
 			timing.Tick, timing.Poll = tick, tc.poll
-			statuses, stop, _ := f.runStatuses(timing, f.fake.Client(), func() (uint64, bool) { return 0, held.Load() })
-			defer stop()
-			defer gate.Release()
+			statuses, _ := f.runStatuses(t, timing, f.fake.Client(), func() (uint64, bool) { return 0, held.Load() }, gate)
 			eventually(t, "the first poll at the Accounts endpoint", func() bool { return len(gate.Entered) == 1 })
 
 			if tc.kick {

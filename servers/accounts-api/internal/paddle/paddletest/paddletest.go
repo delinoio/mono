@@ -126,8 +126,10 @@ func (s *Server) FailCharges(f *Failure) {
 	s.chargeFailure = f
 }
 
-// Fail makes every following request whose `<method> <path prefix>` matches
-// key fail with f, for example `POST /transactions`; nil removes it.
+// Fail makes requests matching key fail with f. Use `<method> <path prefix>`
+// as the key, for example `POST /transactions`. Of the failure rules that
+// match the request method, the longest matching literal path prefix wins.
+// A nil failure removes the rule.
 func (s *Server) Fail(key string, f *Failure) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -138,11 +140,12 @@ func (s *Server) Fail(key string, f *Failure) {
 	s.failures[key] = f
 }
 
-// Respond makes every following request whose `<method> <path prefix>`
-// matches key answer with the status and the verbatim body, for example
-// `POST /transactions` with `{"data":null}`, to exercise malformed success
-// answers. A failure set with Fail or FailCharges takes precedence. An empty
-// body removes the override.
+// Respond returns the given status and verbatim body for requests matching key.
+// Use `<method> <path prefix>` as the key, for example `POST /transactions`
+// with `{"data":null}` as the body to exercise malformed success responses.
+// Of the response rules that match the request method, the longest matching
+// literal path prefix wins. A failure set with Fail or FailCharges takes
+// precedence. An empty body removes the override.
 func (s *Server) Respond(key string, status int, body string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -198,6 +201,21 @@ func writeError(w http.ResponseWriter, r *http.Request, f *Failure) {
 	})
 }
 
+func longestMatchingRule[T any](rules map[string]T, requestMethod, path string) (T, bool) {
+	var best T
+	bestKeyLength := -1
+	for key, rule := range rules {
+		method, prefix, _ := strings.Cut(key, " ")
+		// Matching keys share a method. Comparing key lengths also prefers
+		// an explicit empty prefix over a bare method.
+		if method == requestMethod && len(key) > bestKeyLength && strings.HasPrefix(path, prefix) {
+			best = rule
+			bestKeyLength = len(key)
+		}
+	}
+	return best, bestKeyLength >= 0
+}
+
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Authorization") != "Bearer "+APIKey || r.Header.Get("Paddle-Version") != "1" {
 		writeError(w, r, &Failure{Status: http.StatusForbidden, Code: "forbidden"})
@@ -209,32 +227,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.requests = append(s.requests, Request{Method: r.Method, Path: r.URL.Path, Body: body})
-	var failure *Failure
-	for key, f := range s.failures {
-		method, prefix, _ := strings.Cut(key, " ")
-		if method == r.Method && strings.HasPrefix(r.URL.Path, prefix) {
-			failure = f
-		}
-	}
+	failure, _ := longestMatchingRule(s.failures, r.Method, r.URL.Path)
 	if failure == nil && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/charge") {
 		failure = s.chargeFailure
 	}
-	var override *rawResponse
+	var override rawResponse
+	var hasOverride bool
 	if failure == nil {
-		for key, o := range s.raw {
-			method, prefix, _ := strings.Cut(key, " ")
-			if method == r.Method && strings.HasPrefix(r.URL.Path, prefix) {
-				o := o
-				override = &o
-			}
-		}
+		override, hasOverride = longestMatchingRule(s.raw, r.Method, r.URL.Path)
 	}
 	s.mu.Unlock()
 	if failure != nil {
 		writeError(w, r, failure)
 		return
 	}
-	if override != nil {
+	if hasOverride {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(override.status)
 		_, _ = io.WriteString(w, override.body)

@@ -40,29 +40,84 @@ func newStateReportLockFixture(t *testing.T) *stateReportLockFixture {
 	return &stateReportLockFixture{env: env, org: org, dev: dev, agent: agent, sandboxID: id}
 }
 
-// hold starts a transaction that runs lockQuery (with the device ID as $1)
-// and keeps its locks until the returned function rolls it back.
+const stateReportLockCleanupTimeout = 5 * time.Second
+
+func closeStateReportLockConn(t *testing.T, conn *pgx.Conn) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), stateReportLockCleanupTimeout)
+	defer cancel()
+	if err := conn.Close(ctx); err != nil {
+		t.Errorf("close fixture lock connection: %v", err)
+	}
+}
+
+// hold locks the row on a dedicated connection so the report and removal
+// can each use one application connection while the fixture holds the lock.
 func (f *stateReportLockFixture) hold(t *testing.T, lockQuery string) (release func()) {
 	t.Helper()
-	ctx := context.Background()
-	tx, err := f.env.DB.Pool.Begin(ctx)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, f.env.DB.Pool.Config().ConnConfig)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("connect fixture lock holder")
+	}
+	t.Cleanup(func() { closeStateReportLockConn(t, conn) })
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin fixture lock transaction: %v", err)
 	}
 	if _, err := tx.Exec(ctx, lockQuery, f.dev.ID); err != nil {
-		_ = tx.Rollback(ctx)
-		t.Fatal(err)
+		t.Fatalf("acquire fixture lock: %v", err)
 	}
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			_ = tx.Rollback(ctx)
-		}
-	})
 	return func() {
-		released = true
+		ctx, cancel := context.WithTimeout(context.Background(), stateReportLockCleanupTimeout)
+		defer cancel()
 		if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
-			t.Fatal(err)
+			t.Errorf("release fixture lock: %v", err)
+		}
+	}
+}
+
+// waitForLockWait observes the expected statement even when both application
+// connections are busy. One deadline covers the connection, reads and polling.
+func (f *stateReportLockFixture) waitForLockWait(t *testing.T, fragments ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, f.env.DB.Pool.Config().ConnConfig)
+	if err != nil {
+		if ctx.Err() != nil {
+			t.Fatalf("connect observer for lock wait on statement containing %q: %v", fragments, ctx.Err())
+		}
+		t.Fatalf("connect observer for lock wait on statement containing %q", fragments)
+	}
+	defer closeStateReportLockConn(t, conn)
+
+	const query = `SELECT EXISTS (
+		SELECT 1 FROM pg_catalog.pg_stat_activity
+		WHERE datname = current_database() AND pid <> pg_backend_pid()
+			AND wait_event_type = 'Lock' AND query LIKE ALL($1::text[])
+	)`
+	patterns := make([]string, len(fragments))
+	for i, fragment := range fragments {
+		patterns[i] = "%" + fragment + "%"
+	}
+
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := conn.QueryRow(ctx, query, patterns).Scan(&waiting); err != nil {
+			t.Fatalf("observe lock wait on statement containing %q: %v", fragments, err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("observe lock wait on statement containing %q: %v", fragments, ctx.Err())
+		case <-ticker.C:
 		}
 	}
 }
@@ -83,14 +138,32 @@ type reportOutcome struct {
 	err     error
 }
 
-// reportAsync runs the report transaction and delivers its outcome.
-func (f *stateReportLockFixture) reportAsync(report *ownsandv1.StateReport) <-chan reportOutcome {
-	done := make(chan reportOutcome, 1)
+// startStateReportLockWorker joins the worker during cleanup if an observation
+// fails before the test reads its result. The test context is canceled first.
+func startStateReportLockWorker[T any](t *testing.T, name string, run func(context.Context) T) <-chan T {
+	t.Helper()
+	done := make(chan T, 1)
+	ctx := t.Context()
 	go func() {
-		removed, err := f.env.App.Service.ReconcileStateReportForTest(context.Background(), f.dev.ID, report)
-		done <- reportOutcome{removed: removed, err: err}
+		defer close(done)
+		done <- run(ctx)
 	}()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(stateReportLockCleanupTimeout):
+			t.Errorf("%s did not finish during cleanup", name)
+		}
+	})
 	return done
+}
+
+// reportAsync runs the report transaction and delivers its outcome.
+func (f *stateReportLockFixture) reportAsync(t *testing.T, report *ownsandv1.StateReport) <-chan reportOutcome {
+	return startStateReportLockWorker(t, "state report", func(ctx context.Context) reportOutcome {
+		removed, err := f.env.App.Service.ReconcileStateReportForTest(ctx, f.dev.ID, report)
+		return reportOutcome{removed: removed, err: err}
+	})
 }
 
 func waitReport(t *testing.T, done <-chan reportOutcome) reportOutcome {
@@ -108,15 +181,13 @@ func waitReport(t *testing.T, done <-chan reportOutcome) reportOutcome {
 }
 
 // removeAsync calls RemoveDevice and delivers its error.
-func (f *stateReportLockFixture) removeAsync() <-chan error {
-	done := make(chan error, 1)
-	go func() {
-		_, err := f.org.OwnerClient.Device.RemoveDevice(context.Background(), connect.NewRequest(&ownsandv1.RemoveDeviceRequest{
+func (f *stateReportLockFixture) removeAsync(t *testing.T) <-chan error {
+	return startStateReportLockWorker(t, "RemoveDevice", func(ctx context.Context) error {
+		_, err := f.org.OwnerClient.Device.RemoveDevice(ctx, connect.NewRequest(&ownsandv1.RemoveDeviceRequest{
 			OrganizationId: f.org.ID, DeviceId: f.dev.ID,
 		}))
-		done <- err
-	}()
-	return done
+		return err
+	})
 }
 
 func (f *stateReportLockFixture) waitRemoval(t *testing.T, done <-chan error) {
@@ -171,12 +242,13 @@ func (f *stateReportLockFixture) requireNoDeadlockLog(t *testing.T) {
 func TestStateReportAfterDeviceRemovalWins(t *testing.T) {
 	f := newStateReportLockFixture(t)
 	release := f.hold(t, "SELECT 1 FROM device_sessions WHERE device_id = $1 FOR UPDATE")
-	removal := f.removeAsync()
-	waitForLockWaiter(t, f.env, "DELETE FROM device_sessions")
+	defer release()
+	removal := f.removeAsync(t)
+	f.waitForLockWait(t, "DELETE FROM device_sessions")
 
 	report := f.report(t)
-	reported := f.reportAsync(report)
-	waitForLockWaiter(t, f.env, "FROM devices WHERE device_id = $1 FOR UPDATE")
+	reported := f.reportAsync(t, report)
+	f.waitForLockWait(t, "FROM devices WHERE device_id = $1 FOR UPDATE")
 	release()
 	f.waitRemoval(t, removal)
 
@@ -195,12 +267,13 @@ func TestStateReportAfterDeviceRemovalWins(t *testing.T) {
 func TestRemovalAfterStateReportWins(t *testing.T) {
 	f := newStateReportLockFixture(t)
 	release := f.hold(t, "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE")
+	defer release()
 
 	report := f.report(t)
-	reported := f.reportAsync(report)
-	waitForLockWaiter(t, f.env, "FROM devices WHERE device_id = $1 FOR UPDATE")
-	removal := f.removeAsync()
-	waitForLockWaiter(t, f.env, "FROM devices d WHERE", "FOR UPDATE OF d")
+	reported := f.reportAsync(t, report)
+	f.waitForLockWait(t, "FROM devices WHERE device_id = $1 FOR UPDATE")
+	removal := f.removeAsync(t)
+	f.waitForLockWait(t, "FROM devices d WHERE", "FOR UPDATE OF d")
 	release()
 	f.waitRemoval(t, removal)
 

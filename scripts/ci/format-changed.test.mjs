@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -33,7 +33,7 @@ import {
   UnavailablePathPolicy,
 } from "./format-changed.mjs";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
-import { killProcessGroup } from "./fixture-process.mjs";
+import { startProcessGroup } from "./fixture-process.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -2481,24 +2481,21 @@ function standInEnv(f, state, mode, extra = {}) {
 // waits (bounded) until all of them are gone; `reap()` runs the same cleanup on
 // demand and is idempotent.
 function startFormatter({ f, lines, registerReaper, args, env }) {
-  const parent = spawn(
+  const {
+    child: parent,
+    done: closed,
+    reap: reapGroup,
+  } = startProcessGroup(
     process.execPath,
     [join(f.cwd, "scripts/ci/format-changed.mjs"), ...args],
-    { cwd: f.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+    { cwd: f.cwd, env },
   );
-  let stderr = "";
-  parent.stdout.resume();
-  parent.stderr.on("data", (chunk) => (stderr += chunk));
-  const closed = new Promise((done) =>
-    parent.once("close", (code, closeSignal) => done({ code, closeSignal })),
-  );
-  let reaped = null;
+  parent.stdin.end();
+  let reaped;
   const reap = () =>
     (reaped ??= (async () => {
-      // Stop the group even if a stand-in did not finish writing its PID.
-      killProcessGroup(parent);
       await within(
-        closed,
+        reapGroup(),
         StandInDeadlineMs.Reap,
         "the formatter to be reaped",
       );
@@ -2510,7 +2507,7 @@ function startFormatter({ f, lines, registerReaper, args, env }) {
         );
     })());
   registerReaper(reap);
-  return { parent, closed, reap, stderr: () => stderr };
+  return { parent, closed, reap };
 }
 
 // Starts a signal-mode run, waits for the first batch and returns the run plus
@@ -2559,7 +2556,7 @@ async function stopWithSignal(run, signal) {
     StandInDeadlineMs.Stop,
     `the formatter to stop after ${signal}`,
   );
-  assert.equal(result.closeSignal, null, "the parent must exit by itself");
+  assert.equal(run.parent.signalCode, null, "the parent must exit by itself");
   return result;
 }
 
@@ -2569,8 +2566,8 @@ for (const { signal, exitCode } of signalCases) {
     { skip: process.platform === "win32" },
     async (t) => {
       const { run, lines, child } = await startReadyRun(t, RunKind.Forwarded);
-      const { code } = await stopWithSignal(run, signal);
-      assert.equal(code, exitCode);
+      const { status, stderr } = await stopWithSignal(run, signal);
+      assert.equal(status, exitCode);
       assert.deepEqual(lines("signals.log"), [`${child} ${signal}`]);
       assert.equal(isAlive(child), false, "the child must be dead");
       assert.equal(lines("batches.log").length, 1, "no further batch starts");
@@ -2580,7 +2577,7 @@ for (const { signal, exitCode } of signalCases) {
         "the child must not run to the end",
       );
       assert.match(
-        run.stderr(),
+        stderr,
         new RegExp(`"event":"ci_format_signal","signal":"${signal}"`),
       );
     },
@@ -2596,14 +2593,14 @@ for (const { signal, exitCode } of signalCases) {
     { skip: process.platform === "win32" },
     async (t) => {
       const { run, lines } = await startReadyRun(t, RunKind.PathspecStaged);
-      const { code } = await stopWithSignal(run, signal);
-      assert.equal(code, exitCode, run.stderr());
+      const { status, stderr } = await stopWithSignal(run, signal);
+      assert.equal(status, exitCode, stderr);
       assert.equal(lines("batches.log").length, 1, "no further batch starts");
       assert.match(
-        run.stderr(),
+        stderr,
         new RegExp(`"event":"ci_format_signal","signal":"${signal}"`),
       );
-      assert.doesNotMatch(run.stderr(), /ci_format_error/u);
+      assert.doesNotMatch(stderr, /ci_format_error/u);
     },
   );
 }
@@ -2629,8 +2626,8 @@ test(
       assert.deepEqual(lines("marker"), []);
       assert.deepEqual(lines("signals.log"), []);
       assert.equal(lines("batches.log").length, 1);
-      const { code } = await stopWithSignal(run, "SIGTERM");
-      assert.equal(code, 143);
+      const { status } = await stopWithSignal(run, "SIGTERM");
+      assert.equal(status, 143);
       assert.deepEqual(lines("signals.log"), [`${child} SIGTERM`]);
       assert.equal(isAlive(child), false, "the child must be dead");
     }

@@ -171,7 +171,7 @@ func TestNewServerLogsHeaderReadTimeout(t *testing.T) {
 				t.Errorf("connection closed after %v, want it to wait for ReadHeaderTimeout", elapsed)
 			}
 
-			records := rejectedRecords(t, logs)
+			records := waitForRejectedRecords(t, logs, 1)
 			if len(records) != 1 {
 				t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
 			}
@@ -190,13 +190,10 @@ func TestNewServerLogsHeaderReadTimeout(t *testing.T) {
 // head it cannot parse.
 const netHTTPBadRequest = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
 
-// TestNewServerLogsTheBadRequestAfterAHeaderTimeoutInAMalformedPartialLine
-// stalls a connection inside a partial line that net/http cannot accept as the
-// start of a line. net/http parses the line as if it were complete when the
-// header timeout expires, so it answers with a 400, and the log says the same
-// instead of a header read timeout without a response. Valid partial lines and
-// line boundaries still close without a response.
-func TestNewServerLogsTheBadRequestAfterAHeaderTimeoutInAMalformedPartialLine(t *testing.T) {
+// TestNewServerLogsTheOutcomeOfAHeaderReadTimeout checks the log against the
+// client's response. net/http can detect a malformed line after the deadline,
+// even when the client stalled at a line boundary.
+func TestNewServerLogsTheOutcomeOfAHeaderReadTimeout(t *testing.T) {
 	const headerTimeout = 200 * time.Millisecond
 	for _, tc := range []struct {
 		name string
@@ -215,6 +212,7 @@ func TestNewServerLogsTheBadRequestAfterAHeaderTimeoutInAMalformedPartialLine(t 
 		{"colon without a name", "GET / HTTP/1.1\r\nHost: test\r\n:", true},
 		{"empty line with a lone CR", "GET / HTTP/1.1\r\nHost: test\r\n\r", true},
 		{"complete request line", "GET / HTTP/1.1", false},
+		{"line boundary after a malformed header", "GET /healthz HTTP/1.1\r\nHost: test\r\nX-Test: bad\x01value\r\n", true},
 		{"line boundary after a header", "GET / HTTP/1.1\r\nHost: test\r\n", false},
 		{"valid header line without its end", "GET / HTTP/1.1\r\nHost: test\r\nX: y", false},
 		{"nothing sent", "", false},
@@ -320,9 +318,9 @@ func TestNewServerLogsOneHeaderTimeoutForAPartialLineDuringShutdown(t *testing.T
 }
 
 // waitForRejectedRecords returns the http_request_rejected records once at
-// least want of them are logged, or after a short wait. A header read timeout
-// inside a partial line is logged when the connection closes, which can be a
-// moment after the client saw it close.
+// least want of them are logged, or after a short wait. A silent header read
+// timeout is logged when the close hook runs, which can be a moment after the
+// client sees the connection close.
 func waitForRejectedRecords(t *testing.T, logs *syncBuffer, want int) []map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
