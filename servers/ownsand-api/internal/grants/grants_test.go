@@ -612,7 +612,7 @@ func TestGrantFailedRetryKeepsRequestBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Ack(original.ID, accepted, "")
-	c.t = c.t.Add(Lifetime + AdmissionTolerance)
+	c.t = original.ExpireAt.Add(AdmissionTolerance + time.Nanosecond)
 
 	var last *Grant
 	for i := 1; i < MaxPerPrincipal; i++ {
@@ -621,19 +621,74 @@ func TestGrantFailedRetryKeepsRequestBinding(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := r.Reserve(request, newID); !errors.Is(err, ErrLimit) {
-		t.Fatalf("identical retry at the limit: %v", err)
+	before := r.Len()
+	if g, existing, err := r.Reserve(request, newID); g != nil || existing || !errors.Is(err, ErrLimit) {
+		t.Fatalf("identical retry at the limit: grant = %v, existing = %t, error = %v", g, existing, err)
+	}
+	if r.byAuth[request.AuthorizationID] != original || r.Get(original.ID) != original || r.Len() != before {
+		t.Fatal("retry at the limit changed the original registration or grant count")
 	}
 	r.Release(last.ID, request.DeviceID)
 	conflict := request
 	conflict.OperationID = "other"
-	if _, _, err := r.Reserve(conflict, newID); !errors.Is(err, ErrReuse) {
-		t.Fatalf("conflict after a failed retry: %v", err)
+	if g, existing, err := r.Reserve(conflict, newID); g != nil || existing || !errors.Is(err, ErrReuse) {
+		t.Fatalf("conflict after a failed retry: grant = %v, existing = %t, error = %v", g, existing, err)
 	}
-	if r.byAuth[request.AuthorizationID] != original || r.Get(original.ID) != original {
-		t.Fatal("failed retries changed the original registration")
+	if r.byAuth[request.AuthorizationID] != original || r.Get(original.ID) != original || r.Len() != before-1 {
+		t.Fatal("conflicting retry changed the original registration or grant count")
 	}
-	if g, existing, err := r.Reserve(request, newID); err != nil || existing || g == original {
-		t.Fatalf("identical retry with room: grant = %v, existing = %t, error = %v", g, existing, err)
+	requireGrantRetrySurvivesRelease(t, r, request, original)
+}
+
+func TestGrantRetryWithActiveReplacementKeepsRequestBinding(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, original := installedWithReplacement(t, r)
+	request := original.Request
+	// An acknowledgement that names no predecessor leaves both grants installed.
+	r.Ack(original.ID, accepted, "")
+	c.t = original.ExpireAt.Add(AdmissionTolerance + time.Nanosecond)
+
+	other := request
+	other.AuthorizationID = "other-replacement"
+	pending, existing, err := r.Reserve(other, newID)
+	if err != nil || existing || pending == nil || pred.Successor != pending.ID {
+		t.Fatalf("reserve competing replacement: grant = %v, existing = %t, error = %v", pending, existing, err)
+	}
+	before := r.Len()
+	if g, existing, err := r.Reserve(request, newID); g != nil || existing || !errors.Is(err, ErrReplaceActive) {
+		t.Fatalf("retry with an active replacement: grant = %v, existing = %t, error = %v", g, existing, err)
+	}
+	if r.byAuth[request.AuthorizationID] != original || r.Get(original.ID) != original || r.Len() != before {
+		t.Fatal("retry with an active replacement changed the original registration or grant count")
+	}
+	if pred.Successor != pending.ID || r.Get(pending.ID) != pending {
+		t.Fatal("failed retry changed the predecessor's pending replacement")
+	}
+	if !r.RemoveUndelivered(pending.ID) {
+		t.Fatal("could not remove the competing replacement")
+	}
+	requireGrantRetrySurvivesRelease(t, r, request, original)
+}
+
+func requireGrantRetrySurvivesRelease(t *testing.T, r *Registry, request Request, original *Grant) {
+	t.Helper()
+	before := r.Len()
+	fresh, existing, err := r.Reserve(request, newID)
+	if err != nil || existing || fresh == nil || fresh.ID == original.ID || fresh.State != Pending {
+		t.Fatalf("retry after clearing the blocker: grant = %v, existing = %t, error = %v", fresh, existing, err)
+	}
+	if r.byAuth[request.AuthorizationID] != fresh || r.Get(fresh.ID) != fresh ||
+		r.Get(original.ID) != original || r.Len() != before+1 {
+		t.Fatal("successful retry did not index the fresh grant alongside the original")
+	}
+
+	r.Release(original.ID, original.DeviceID)
+	if r.byAuth[request.AuthorizationID] != fresh || r.Get(fresh.ID) != fresh ||
+		r.Get(original.ID) != nil || r.Len() != before {
+		t.Fatal("releasing the original grant did not preserve the fresh registration")
+	}
+	if g, existing, err := r.Reserve(request, newID); err != nil || !existing || g != fresh {
+		t.Fatalf("retry after releasing the original: grant = %v, existing = %t, error = %v", g, existing, err)
 	}
 }
