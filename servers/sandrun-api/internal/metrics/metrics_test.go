@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -39,8 +40,9 @@ func TestWorkGaugeLease(t *testing.T) {
 			t.Fatalf("scrape HTTP status = %d", recorder.Code)
 		}
 		body := recorder.Body.String()
+		lines := strings.Split(body, "\n")
 		for _, line := range want {
-			if !strings.Contains(body, line) {
+			if !slices.Contains(lines, line) {
 				t.Errorf("scrape lacks %q", line)
 			}
 		}
