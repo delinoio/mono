@@ -21,6 +21,7 @@ import (
 // still possible, and that a complete manifest in any reported order reaches
 // EXPORTED with its parts stored in ascending order.
 func TestExportPartNumbersMustBeContiguous(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient

@@ -21,6 +21,7 @@ import (
 // timing: the second must recover the sandbox of the first instead of
 // failing with unavailable because the first took the slot.
 func TestConcurrentCreateIdempotencyForLastSlot(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

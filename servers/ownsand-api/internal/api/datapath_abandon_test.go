@@ -95,6 +95,7 @@ func requireAbandonedSessionRevoked(t *testing.T, env *testenv.Env, agent *teste
 // the session revoked on the originating channel, although the request
 // context is canceled.
 func TestOpenSessionCancelRevokesSession(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	agent.SetAckRevocations(false)
@@ -137,6 +138,7 @@ func (c endOnAnswerContext) Err() error {
 }
 
 func TestOpenSessionEndedContextOnSuccessfulAnswer(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		cause       error
@@ -227,6 +229,7 @@ func TestOpenSessionEndedContextOnSuccessfulAnswer(t *testing.T) {
 // An OpenSession whose agent does not answer within the signaling wait
 // revokes the session as well.
 func TestOpenSessionSignalingTimeoutRevokesSession(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, shortSignaling(50*time.Millisecond))
 	org, agent, sandboxID := runningSandbox(t, env)
 	agent.SetAckRevocations(false)
@@ -243,6 +246,7 @@ func TestOpenSessionSignalingTimeoutRevokesSession(t *testing.T) {
 // and an agent error answer, a channel that closes while the offer waits and a
 // failure before the offer is dispatched have nothing to revoke.
 func TestOpenSessionEndsWithoutRevocation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	key := env.Clients(org.APIKey)
@@ -300,6 +304,7 @@ func TestOpenSessionEndsWithoutRevocation(t *testing.T) {
 // A session that a revocation event already removed was revoked by the event
 // handler, so canceling its OpenSession later sends no second revocation.
 func TestOpenSessionCancelAfterRevocationEventSendsNoSecondRevocation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	silentAgent(agent)

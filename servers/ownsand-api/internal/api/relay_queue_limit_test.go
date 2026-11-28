@@ -22,6 +22,7 @@ import (
 )
 
 func TestRelayExecQueueLimitEndsLikeRotation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		accepted bool
@@ -167,6 +168,7 @@ func TestRelayExecQueueLimitEndsLikeRotation(t *testing.T) {
 }
 
 func TestRelayWriteFileQueueLimitBeforeCredit(t *testing.T) {
+	t.Parallel()
 	limits := relay.DefaultLimits()
 	limits.MaxQueuedFrames = 1
 	c := startWriteCall(t, 15*time.Second, 0, func(o *app.Options) {

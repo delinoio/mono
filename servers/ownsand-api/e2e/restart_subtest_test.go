@@ -52,6 +52,7 @@ func copyRestartStandIn(t *testing.T, dir, name string) {
 }
 
 func TestLifecycleHyperVRestartDiagnostics(t *testing.T) {
+	t.Parallel()
 	const testName = "TestLifecycleHyperVRestartDiagnostics"
 	const scenarioEnv = "OWNSAND_E2E_RESTART_SCENARIO"
 	if scenario := os.Getenv(scenarioEnv); scenario != "" {
@@ -195,6 +196,7 @@ func requireRestartCaseOutput(t *testing.T, output, name, status, diagnostic str
 }
 
 func TestLifecycleHyperVReplacementCleanup(t *testing.T) {
+	t.Parallel()
 	bins := t.TempDir()
 	copyRestartStandIn(t, bins, "ownsand-agent")
 	stateDir := t.TempDir()

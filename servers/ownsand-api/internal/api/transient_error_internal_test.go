@@ -13,6 +13,7 @@ import (
 )
 
 func TestIsTransientDBError(t *testing.T) {
+	t.Parallel()
 	pg := func(code string) error { return fmt.Errorf("apply: %w", &pgconn.PgError{Code: code}) }
 	cases := []struct {
 		name string

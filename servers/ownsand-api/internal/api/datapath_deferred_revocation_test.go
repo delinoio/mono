@@ -17,6 +17,7 @@ import (
 )
 
 func TestOpenSessionDeferredRevocation(t *testing.T) {
+	t.Parallel()
 	env := testenv.NewWithoutPeriodicRevocationSweep(t, shortSignaling(time.Minute))
 	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -153,6 +154,7 @@ func logHasRevocationSent(logs, id string) bool {
 }
 
 func TestOpenSessionRevocationPastNominalExpiry(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	org, agent, sandboxID := runningSandbox(t, env)

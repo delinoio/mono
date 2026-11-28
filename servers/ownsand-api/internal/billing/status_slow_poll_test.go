@@ -20,6 +20,7 @@ import (
 )
 
 func TestRunSlowPollDoesNotDelayMaintenance(t *testing.T) {
+	t.Parallel()
 	f := newStatusFixture(t, time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC))
 	f.addOrg(t, org2)
 	f.clock.Advance(billing.SuspendAfter - time.Second)
@@ -84,6 +85,7 @@ func TestRunSlowPollDoesNotDelayMaintenance(t *testing.T) {
 }
 
 func TestRunSlowPollIsSingleFlight(t *testing.T) {
+	t.Parallel()
 	const tick = 20 * time.Millisecond
 	for _, tc := range []struct {
 		name string
@@ -158,6 +160,7 @@ func (c cancelingPollClient) ListBillingStatusChanges(ctx context.Context, req *
 }
 
 func TestRunCancelsAndJoinsSlowPoll(t *testing.T) {
+	t.Parallel()
 	f := newStatusFixture(t, time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC))
 	gate := f.fake.Hold(accountstest.MethodListBillingStatusChanges)
 	defer gate.Release()
@@ -200,6 +203,7 @@ func TestRunCancelsAndJoinsSlowPoll(t *testing.T) {
 }
 
 func TestRunMaintainsLocalStatusWithoutAccounts(t *testing.T) {
+	t.Parallel()
 	f := newStatusFixture(t, time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC))
 	f.addOrg(t, org1)
 	f.link(t, org1, accountA)

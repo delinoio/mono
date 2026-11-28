@@ -15,6 +15,7 @@ import (
 )
 
 func TestMembershipRevocationCursor(t *testing.T) {
+	t.Parallel()
 	e := events.Event{Kind: events.KindMembershipEnded, ID: 2, OrganizationID: "org", UserID: "user"}
 	for _, tc := range []struct {
 		name       string

@@ -139,6 +139,7 @@ func saturate(t *testing.T, env *testenv.Env, agent *testenv.FakeAgent) {
 // for ever: the channel closes with the queue-full cause, the device goes
 // OFFLINE and its sandboxes show UNREACHABLE.
 func TestSaturatedChannelHeartbeatClosesChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
 	ctx := context.Background()
@@ -184,6 +185,7 @@ func TestSaturatedChannelHeartbeatClosesChannel(t *testing.T) {
 // and returns. The server sets no write timeout, so only that abort ends
 // the write; the agent stays stalled and connected throughout.
 func TestSaturatedChannelEndsStalledWrite(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
 	env.App.Service.Timing.WriterDrainTimeout = saturationQueueFullWait
@@ -212,6 +214,7 @@ func TestSaturatedChannelEndsStalledWrite(t *testing.T) {
 // for a device whose agent stopped reading does not hold back the event of
 // a healthy device, and that the saturated channel closes.
 func TestSaturatedChannelDoesNotBlockOtherDevices(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
 	ctx := context.Background()
@@ -285,6 +288,7 @@ func assertImportCreateFailed(t *testing.T, org *testenv.Org, sandboxID, deviceI
 // saturated, still connected channel cannot take before the import deadline
 // fails the create and releases its capacity.
 func TestImportSendDeadlineFailsCreate(t *testing.T) {
+	t.Parallel()
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: 400 * time.Millisecond}
 	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
 	env.App.Service.Hub.QueueFullWait = 30 * time.Second
@@ -308,6 +312,7 @@ func TestImportSendDeadlineFailsCreate(t *testing.T) {
 // only after it observed that wait, so it does not depend on how long the
 // saturation takes.
 func TestImportCreateSendDeadlineFailsCreate(t *testing.T) {
+	t.Parallel()
 	// ImportWait is far longer than the test: the import flow context is
 	// replaced below and only the test expires it.
 	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Hour}

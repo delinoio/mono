@@ -342,6 +342,7 @@ func assertCleanupKeepsJobUntil(t *testing.T, env *testenv.Env, gate *gateStore,
 // waits for the signer that holds the snapshot row, then records its job
 // after the signer's last expiry.
 func TestSnapshotDeletionWaitsForSigner(t *testing.T) {
+	t.Parallel()
 	env, gate := signingRaceEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -409,6 +410,7 @@ func forShareLockWaiters(t testing.TB, env *testenv.Env) int {
 // waits behind the deleting transaction finds no row and returns no URL, and
 // so does every later request.
 func TestSnapshotDeletionBeforeSigner(t *testing.T) {
+	t.Parallel()
 	env, gate := signingRaceEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -446,6 +448,7 @@ func TestSnapshotDeletionBeforeSigner(t *testing.T) {
 // TestSignedURLRequestAfterSnapshotDeletion: a request after DeleteSnapshot
 // gets no URL.
 func TestSignedURLRequestAfterSnapshotDeletion(t *testing.T) {
+	t.Parallel()
 	env, gate := signingRaceEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -467,6 +470,7 @@ func TestSignedURLRequestAfterSnapshotDeletion(t *testing.T) {
 // DeleteOrganization, whose cascade deletes the snapshot row. Every job of
 // the deletion is recorded after the signer's last expiry.
 func TestOrganizationDeletionWaitsForSigner(t *testing.T) {
+	t.Parallel()
 	env, gate := signingRaceEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -501,6 +505,7 @@ func TestOrganizationDeletionWaitsForSigner(t *testing.T) {
 // TestOrganizationDeletionBeforeSigner: deletion wins the race against the
 // signer, which waits behind the cascade and returns no URL.
 func TestOrganizationDeletionBeforeSigner(t *testing.T) {
+	t.Parallel()
 	env, gate := signingRaceEnv(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

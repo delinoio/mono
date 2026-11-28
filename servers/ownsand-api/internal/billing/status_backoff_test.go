@@ -17,6 +17,7 @@ import (
 // failed pending unlink starts when the delino-accounts call failed, not when
 // the attempt began: the time that the call takes does not consume the delay.
 func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	f.addOrg(t, org1)
@@ -59,6 +60,7 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 // TestPendingUnlinkBackoffAfterLockWait checks that the wait for the
 // organization lock does not consume the back-off either.
 func TestPendingUnlinkBackoffAfterLockWait(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
@@ -122,6 +124,7 @@ func TestPendingUnlinkBackoffAfterLockWait(t *testing.T) {
 // the guard of a pending unlink sends nothing and keeps the row untouched,
 // and that a worker at the guard sends the unlink and deletes the row.
 func TestPendingUnlinkGuardAndSuccess(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()

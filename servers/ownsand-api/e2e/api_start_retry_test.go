@@ -21,6 +21,7 @@ const (
 var errExitedBeforeHealthy = fmt.Errorf("%w before it became healthy", errProcessExited)
 
 func TestShouldRetryAPIStart(t *testing.T) {
+	t.Parallel()
 	timeout := fmt.Errorf("not healthy within 1m0s: %w", errors.New("unexpected status 503"))
 	cases := []struct {
 		name    string

@@ -105,6 +105,7 @@ func enrollRequestOfSize(t *testing.T, size int) []byte {
 // failure, no rate limit token and no RPC log record. The limit holds for the
 // binary and the JSON codec and for the inflated size of a compressed body.
 func TestRequestSizeLimit(t *testing.T) {
+	t.Parallel()
 	const (
 		enroll      = ownsandv1connect.AgentServiceEnrollProcedure
 		listDevices = ownsandv1connect.DeviceServiceListDevicesProcedure
@@ -191,6 +192,7 @@ func TestRequestSizeLimit(t *testing.T) {
 // TestRequestSizeLimitAllowsMaxima checks that the largest legitimate request
 // of each kind stays under the limit.
 func TestRequestSizeLimitAllowsMaxima(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -317,6 +319,7 @@ func stateReportOf(t *testing.T, agent *testenv.FakeAgent, sequence uint64, coun
 // pass, a state report of 5,000 sandboxes passes, and one message over the
 // limit ends the stream with resource_exhausted.
 func TestAgentChannelMessageLimit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	_, agent := setupAgent(t, env, org, nil)

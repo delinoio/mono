@@ -32,6 +32,7 @@ func failOnce(h *cursorHarness, id int64) (clear func()) {
 }
 
 func TestControlRetryStopsAtFailedEventAndResumesThere(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 5)
 	h.acquire(0, nil)
 	clear := failOnce(h, 3)
@@ -61,6 +62,7 @@ func TestControlRetryStopsAtFailedEventAndResumesThere(t *testing.T) {
 }
 
 func TestControlRetryFirstEventKeepsCursor(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 3)
 	h.acquire(0, nil)
 	failOnce(h, 1)
@@ -74,6 +76,7 @@ func TestControlRetryFirstEventKeepsCursor(t *testing.T) {
 }
 
 func TestControlRetryOnLaterPageStoresEarlierPages(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 1200)
 	h.acquire(0, nil)
 	clear := failOnce(h, 700)
@@ -97,6 +100,7 @@ func TestControlRetryOnLaterPageStoresEarlierPages(t *testing.T) {
 }
 
 func TestControlRetryGenerationChangeKeepsNewCursor(t *testing.T) {
+	t.Parallel()
 	// A lease transition during the failed delivery means the batch belongs
 	// to an earlier period: its partial cursor must not replace the cursor
 	// that the new period stored.
@@ -119,6 +123,7 @@ func TestControlRetryGenerationChangeKeepsNewCursor(t *testing.T) {
 }
 
 func TestControlRetryLeaseLostLeavesCursorUnset(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 3)
 	h.acquire(0, nil)
 	h.onHandle = func(id int64) {
@@ -134,6 +139,7 @@ func TestControlRetryLeaseLostLeavesCursorUnset(t *testing.T) {
 }
 
 func TestControlRetryLogsEventAndSandbox(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 2)
 	// processEvents runs on this goroutine, so the buffer needs no lock.
 	var logs bytes.Buffer
@@ -154,6 +160,7 @@ func TestControlRetryLogsEventAndSandbox(t *testing.T) {
 // TestControlHandleDeleteLookup checks which outcomes of the sandbox lookup
 // of a delete event are retried and which are skipped.
 func TestControlHandleDeleteLookup(t *testing.T) {
+	t.Parallel()
 	errDB := errors.New("injected database failure")
 	for _, tc := range []struct {
 		name    string
@@ -195,6 +202,7 @@ func TestControlHandleDeleteLookup(t *testing.T) {
 // the real handler: a delete event whose sandbox is gone is skipped, and the
 // events after it are delivered and stored.
 func TestControlObsoleteDeleteDoesNotBlockLaterEvents(t *testing.T) {
+	t.Parallel()
 	h := newCursorHarness(t, 0)
 	h.acquire(0, nil)
 	h.c.S.Hub.Register(context.Background(), "dev-1", "org-1").SetReconciled()

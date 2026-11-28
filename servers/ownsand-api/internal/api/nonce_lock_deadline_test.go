@@ -32,6 +32,7 @@ func consumedNonceCount(t *testing.T, env *testenv.Env) int {
 // consumed, and a nonce that is still valid at the locked point is consumed
 // exactly once.
 func TestNonceDeadlineIsEnforcedAtTheDeviceRowLock(t *testing.T) {
+	t.Parallel()
 	type rpc func(env *testenv.Env, d *testenv.Device, nonce []byte) error
 	authenticate := func(env *testenv.Env, d *testenv.Device, nonce []byte) error {
 		_, err := env.Clients("").Agent.Authenticate(context.Background(), connect.NewRequest(&ownsandv1.AuthenticateRequest{
@@ -126,6 +127,7 @@ func TestNonceDeadlineIsEnforcedAtTheDeviceRowLock(t *testing.T) {
 // a fresh, correctly signed nonce valid for one use and that a replay is still
 // reported as a used nonce.
 func TestFreshNonceIsValidExactlyOnce(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

@@ -17,6 +17,7 @@ func closed(ch <-chan struct{}) bool {
 }
 
 func TestWatchLastUnregisterRemovesKey(t *testing.T) {
+	t.Parallel()
 	var w sandboxWatch
 	_, u1 := w.watch("a")
 	_, u2 := w.watch("a")
@@ -35,6 +36,7 @@ func TestWatchLastUnregisterRemovesKey(t *testing.T) {
 }
 
 func TestWatchUnregisterAfterFireIsNoop(t *testing.T) {
+	t.Parallel()
 	var w sandboxWatch
 	ch, u := w.watch("a")
 	other, uo := w.watch("b")
@@ -54,6 +56,7 @@ func TestWatchUnregisterAfterFireIsNoop(t *testing.T) {
 }
 
 func TestWatchUnregisterKeepsOtherWaiterNotified(t *testing.T) {
+	t.Parallel()
 	var w sandboxWatch
 	c1, u1 := w.watch("a")
 	c2, u2 := w.watch("a")
@@ -72,6 +75,7 @@ func TestWatchUnregisterKeepsOtherWaiterNotified(t *testing.T) {
 }
 
 func TestWatchConcurrentFireAndUnregister(t *testing.T) {
+	t.Parallel()
 	var w sandboxWatch
 	const n = 200
 	var wg sync.WaitGroup

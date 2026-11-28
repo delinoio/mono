@@ -16,6 +16,7 @@ import (
 )
 
 func TestCodeString(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		err  error
 		want string
@@ -34,6 +35,7 @@ func TestCodeString(t *testing.T) {
 }
 
 func TestClientAddress(t *testing.T) {
+	t.Parallel()
 	const peer = "198.51.100.7:4242"
 	forward := func(values ...string) http.Header { return http.Header{"X-Forwarded-For": values} }
 	for _, tc := range []struct {

@@ -15,6 +15,7 @@ import (
 )
 
 func TestControlLeaseHandoverCancelsBlockedLookup(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	env := testenv.New(t)

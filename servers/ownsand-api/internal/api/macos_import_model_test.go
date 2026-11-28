@@ -145,6 +145,7 @@ func importModel(a *testenv.FakeAgent) []byte {
 // it, because it reports the model only after the import. The agent keeps
 // the native check before the download.
 func TestMacOSFirstImportWithUnreportedModel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -193,6 +194,7 @@ func TestMacOSFirstImportWithUnreportedModel(t *testing.T) {
 // uses a Mac that reports the hardware model before a less loaded Mac that
 // does not report it, and uses the unreporting Mac when no other qualifies.
 func TestMacOSPlacementPrefersReportedModel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -226,6 +228,7 @@ func TestMacOSPlacementPrefersReportedModel(t *testing.T) {
 // that does not report the hardware model runs the snapshot when no Mac that
 // reports it can.
 func TestMacOSPlacementUsesUnreportedModelWhenNoneQualifies(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	devA, agentA := macAgent(t, env, org, macModelA)

@@ -205,6 +205,7 @@ func testCallerPauseAdoptsBillingPause(t *testing.T, poolMaxConns int32) {
 // for an API key of the organization, and that a caller of another
 // organization neither adopts nor learns anything.
 func TestCallerPauseAdoptionByEveryCaller(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	byMember, byKey, other := f.create(t), f.create(t), f.create(t)
 	f.suspendAll(t, byMember, byKey, other)
@@ -246,6 +247,7 @@ func TestCallerPauseAdoptionByEveryCaller(t *testing.T) {
 // the worker's own pause keeps its mark, and a sandbox that is not
 // RUNNING or PAUSED keeps its error and its mark.
 func TestCallerPauseKeepsRunningPathAndErrors(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	running, viaWorker, deleting := f.create(t), f.create(t), f.create(t)
 	ctx := context.Background()
@@ -305,6 +307,7 @@ func TestCallerPauseKeepsRunningPathAndErrors(t *testing.T) {
 // internal, leave the mark and send no command, on the already-PAUSED path
 // and on the dispatching path.
 func TestCallerPauseFailsWhenTheMarkCannotBeCleared(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	paused, running := f.create(t), f.create(t)
 	ctx := context.Background()
@@ -407,6 +410,7 @@ func (h *resumeHold) sendResult(id string, res *ownsandv1.AgentCommandResult) {
 // then send no resume, while the billing-only paused control sandbox
 // resumes.
 func TestCallerPauseCancelsSelectedResumeAcrossInstances(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	// The sandbox IDs are time ordered and the pass starts its targets in ID
 	// order, so the hogs take the 8 slots and the adopted sandbox and the
@@ -555,6 +559,7 @@ func waitOutcome(t *testing.T, name string, out chan pauseOutcome) pauseOutcome 
 // sandbox actually resumed, it then pauses it through the normal pause
 // path, and no recovery command can undo the pause afterwards.
 func TestCallerPauseWaitsForResumeInFlight(t *testing.T) {
+	t.Parallel()
 	f := newResumeInFlightFixture(t)
 	adopted, control, hold, passDone := startResumeInFlight(t, f)
 
@@ -599,6 +604,7 @@ func TestCallerPauseWaitsForResumeInFlight(t *testing.T) {
 // that the resume produced, so it reports unavailable and never a success
 // that a resume undid; the retry on the instance with the channel pauses.
 func TestCallerPauseThroughSecondInstanceWaitsForResumeInFlight(t *testing.T) {
+	t.Parallel()
 	f := newResumeInFlightFixture(t)
 	adopted, _, hold, passDone := startResumeInFlight(t, f)
 	peer := f.env.StartPeer()
@@ -635,6 +641,7 @@ func TestCallerPauseThroughSecondInstanceWaitsForResumeInFlight(t *testing.T) {
 // recovers billing. The adopted sandbox stays paused, and the control
 // sandbox that only billing paused resumes.
 func TestCallerPauseSurvivesControlPlaneReplacement(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	adopted, control := f.create(t), f.create(t)
 	f.suspendAll(t, adopted, control)
@@ -666,6 +673,7 @@ func TestCallerPauseSurvivesControlPlaneReplacement(t *testing.T) {
 }
 
 func TestCallerPauseRejectsUnresolvedBillingResume(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		restart bool
@@ -771,6 +779,7 @@ func TestCallerPauseRejectsUnresolvedBillingResume(t *testing.T) {
 }
 
 func TestBillingResumeQueueRejectionClearsAttempt(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	id := f.create(t)
 	f.suspendAll(t, id)
@@ -947,6 +956,7 @@ func holdSandboxOrderLock(t *testing.T, env *testenv.Env, sandboxID string) (int
 }
 
 func TestSandboxOrderLockQueryFailureClosesConnection(t *testing.T) {
+	t.Parallel()
 	const (
 		childEnv   = "OWNSAND_TEST_SANDBOX_ORDER_LOCK_FAILURE"
 		poolClosed = "sandbox ordering lock fixture pool closed"
@@ -1021,6 +1031,7 @@ func TestSandboxOrderLockQueryFailureClosesConnection(t *testing.T) {
 }
 
 func TestSandboxOrderLockQuerySuccessReleasesConnection(t *testing.T) {
+	t.Parallel()
 	database := dbtest.New(t)
 	env := &testenv.Env{DB: database}
 	const sandboxID = "lock-query-success"
@@ -1057,6 +1068,7 @@ func TestSandboxOrderLockQuerySuccessReleasesConnection(t *testing.T) {
 // rechecks the mark afterwards and sends nothing when a caller pause cleared
 // the mark in the meantime.
 func TestCallerPauseWaitsForTheSandboxOrderLock(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	adopted, control := f.create(t), f.create(t)
 	f.suspendAll(t, adopted, control)

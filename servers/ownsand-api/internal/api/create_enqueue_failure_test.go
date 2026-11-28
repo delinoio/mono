@@ -20,6 +20,7 @@ import (
 // caused the failure is done, the channel stays open, and a replay of the
 // idempotency key returns the failed record and queues no command.
 func TestCreateSandboxEnqueueFailureFailsCreate(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = 30 * time.Second
 	ctx := context.Background()

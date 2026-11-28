@@ -27,6 +27,7 @@ const typeScriptSDKPipeDrainDelay = 2 * time.Second
 // the real control plane and agent over the relay. It needs the workspace
 // dependencies (`pnpm install`) and is skipped when pnpm is not on PATH.
 func TestTypeScriptSDKRelay(t *testing.T) {
+	t.Parallel()
 	requireE2E(t)
 	pnpm, err := exec.LookPath("pnpm")
 	if err != nil {

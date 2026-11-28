@@ -150,6 +150,7 @@ func waitForBillingState(parent context.Context, want ownsandv1.SandboxState, re
 // data path, the recovery resumes it, and an unlink blocks with
 // ACCOUNT_REQUIRED.
 func TestBillingBlockSuspendRecover(t *testing.T) {
+	t.Parallel()
 	s := newStack(t)
 	ctx := s.ctx(5 * time.Minute)
 	sb, err := s.apiKeyClient(ownsand.TransportRelay).CreateSandbox(ctx, createParams())

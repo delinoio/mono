@@ -111,6 +111,7 @@ func deleteInternalError() *ownsandv1.AgentCommandResult {
 }
 
 func TestDeleteSandboxRetryAfterAgentError(t *testing.T) {
+	t.Parallel()
 	env, org, _, agent, id := setupDeleteRetry(t)
 	deleting := ownsandv1.SandboxState_SANDBOX_STATE_DELETING
 	deleted := ownsandv1.SandboxState_SANDBOX_STATE_DELETED
@@ -181,6 +182,7 @@ func TestDeleteSandboxRetryAfterAgentError(t *testing.T) {
 }
 
 func TestDeleteSandboxRetryKeepsReplacementCommand(t *testing.T) {
+	t.Parallel()
 	env, org, device, original, id := setupDeleteRetry(t)
 	running := ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
 	deleting := ownsandv1.SandboxState_SANDBOX_STATE_DELETING

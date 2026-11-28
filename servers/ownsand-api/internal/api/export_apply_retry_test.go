@@ -91,6 +91,7 @@ func uploadedParts(t *testing.T, agent *testenv.FakeAgent, snapID, requestID str
 // applies the original result on the same channel without a second export
 // command.
 func TestExportResultAppliesAfterTransientDatabaseError(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -135,6 +136,7 @@ func TestExportResultAppliesAfterTransientDatabaseError(t *testing.T) {
 // with a clean-up job, and that an explicit retry sends a new command and
 // reaches EXPORTED.
 func TestExportResultAbandonedClosesChannelAndRetries(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, retryTiming(400*time.Millisecond, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -183,6 +185,7 @@ func TestExportResultAbandonedClosesChannelAndRetries(t *testing.T) {
 // abandoned attempt with a clean-up job, and that an explicit retry of the
 // export sends a new command and reaches EXPORTED.
 func TestExportResultPermanentErrorIsNotRetried(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -236,6 +239,7 @@ func TestExportResultPermanentErrorIsNotRetried(t *testing.T) {
 // the snapshot was deleted stores no manifest and ends without closing the
 // channel.
 func TestExportResultRetryStopsWhenSnapshotIsDeleted(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	snapID, agent := exportingSnapshot(t, env, org)

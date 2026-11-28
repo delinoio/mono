@@ -115,6 +115,7 @@ func sendImportResult(agent *testenv.FakeAgent, commandID string) {
 // an assigned import gets an error grant and no URL, and that the signer is
 // never called.
 func TestDownloadURLsNeedAssignedImport(t *testing.T) {
+	t.Parallel()
 	env, store := importSigningEnv(t, 10*time.Second)
 	org := env.NewOrg("alice")
 	snapID, _, agentB := importFixture(t, env, org)
@@ -138,6 +139,7 @@ func TestDownloadURLsNeedAssignedImport(t *testing.T) {
 // import gets URLs (and fresh URLs for a refresh), that another device of the
 // organization does not, and that the channel gets none after the result.
 func TestDownloadURLsDuringAssignedImport(t *testing.T) {
+	t.Parallel()
 	env, store := importSigningEnv(t, 10*time.Second)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -180,6 +182,7 @@ func TestDownloadURLsDuringAssignedImport(t *testing.T) {
 // TestDownloadURLsDeniedToReplacementChannel checks that a new channel of the
 // importing device gets no URL without a new assignment.
 func TestDownloadURLsDeniedToReplacementChannel(t *testing.T) {
+	t.Parallel()
 	env, store := importSigningEnv(t, 10*time.Second)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -212,6 +215,7 @@ func TestDownloadURLsDeniedToReplacementChannel(t *testing.T) {
 // TestDownloadURLsDeniedAfterImportTimeout checks that the assignment ends
 // with the import wait.
 func TestDownloadURLsDeniedAfterImportTimeout(t *testing.T) {
+	t.Parallel()
 	env, store := importSigningEnv(t, 300*time.Millisecond)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

@@ -122,6 +122,7 @@ func (f *exportVerifyFixture) wantFailed(t *testing.T, reason, key string) {
 // verified once, never lists R2 before export_verify_after and never lists a
 // verified row again, even when an object is replaced later.
 func TestExportVerificationPassesMatchingParts(t *testing.T) {
+	t.Parallel()
 	f := newExportVerifyFixture(t)
 	if state, verified, after := f.verification(t); state != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED || verified || after == nil || !after.Equal(f.exportedAt.Add(verifyDelay)) {
 		t.Fatalf("after the export: state %v, verified %v, verify_after %v; want EXPORTED, unverified, %v", state, verified, after, f.exportedAt.Add(verifyDelay))
@@ -157,6 +158,7 @@ func TestExportVerificationPassesMatchingParts(t *testing.T) {
 // an unlisted object and a missing part each fail the export, delete the
 // manifest, start the attempt prefix clean-up and allow a new export.
 func TestExportVerificationFailsMismatchingParts(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		reason string
@@ -218,6 +220,7 @@ func TestExportVerificationFailsMismatchingParts(t *testing.T) {
 // TestExportVerificationRetriesAfterR2Failure checks that an R2 listing error
 // preserves the export and that a later pass verifies it.
 func TestExportVerificationRetriesAfterR2Failure(t *testing.T) {
+	t.Parallel()
 	f := newExportVerifyFixture(t)
 	f.env.Objects.SetListFail(errors.New("r2 is down"))
 	f.run(verifyDelay)
@@ -243,6 +246,7 @@ func TestExportVerificationRetriesAfterR2Failure(t *testing.T) {
 // TestExportVerificationWithoutObjectStore checks that a control plane
 // without R2 changes nothing.
 func TestExportVerificationWithoutObjectStore(t *testing.T) {
+	t.Parallel()
 	f := newExportVerifyFixture(t)
 	f.env.App.Service.Objects = nil
 	f.run(verifyDelay)
@@ -256,6 +260,7 @@ func TestExportVerificationWithoutObjectStore(t *testing.T) {
 // does not set it) is first scheduled for the upload URL lifetime after it is
 // seen, and verified only then.
 func TestExportVerificationSchedulesRowsWithoutTime(t *testing.T) {
+	t.Parallel()
 	f := newExportVerifyFixture(t)
 	if _, err := f.env.DB.Pool.Exec(context.Background(), "UPDATE snapshots SET export_verified = false, export_verify_after = NULL WHERE snapshot_id = $1", f.snapID); err != nil {
 		t.Fatal(err)
@@ -312,6 +317,7 @@ func (f *exportVerifyFixture) allowVerificationUpdate(t *testing.T) {
 }
 
 func TestExportVerificationScheduleCommitFailure(t *testing.T) {
+	t.Parallel()
 	f := newExportVerifyFixture(t)
 	if _, err := f.env.DB.Pool.Exec(t.Context(), "UPDATE snapshots SET export_verify_after = NULL WHERE snapshot_id = $1", f.snapID); err != nil {
 		t.Fatal(err)
@@ -348,6 +354,7 @@ func TestExportVerificationScheduleCommitFailure(t *testing.T) {
 }
 
 func TestExportVerificationScheduleBatchRollback(t *testing.T) {
+	t.Parallel()
 	f := newExportVerifyFixture(t)
 	due := f.seedOlderExportVerifications(t, 1)[0]
 	_, _, originalDue := due.verification(t)
@@ -374,6 +381,7 @@ func TestExportVerificationScheduleBatchRollback(t *testing.T) {
 }
 
 func TestExportVerificationApplyCommitFailure(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		missingPart bool
@@ -485,6 +493,7 @@ func (f *exportVerifyFixture) seedOlderExportVerifications(t *testing.T, count i
 }
 
 func TestExportVerificationRotatesRetries(t *testing.T) {
+	t.Parallel()
 	for _, reason := range []string{"r2_list_failed", "database_error"} {
 		t.Run(reason, func(t *testing.T) {
 			ctx := context.Background()
@@ -562,6 +571,7 @@ func TestExportVerificationRotatesRetries(t *testing.T) {
 }
 
 func TestExportVerificationIgnoresStaleWork(t *testing.T) {
+	t.Parallel()
 	for _, action := range []string{"replace after listing error", "replace before apply", "verify before apply", "delete before apply"} {
 		t.Run(action, func(t *testing.T) {
 			f := newExportVerifyFixture(t)

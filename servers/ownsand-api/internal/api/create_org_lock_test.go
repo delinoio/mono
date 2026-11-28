@@ -94,6 +94,7 @@ var createRPCs = []createRPC{
 // surfaces as an internal error. The RPC has to lock the organization row
 // first and commit before the deletion, which then deletes the new row.
 func TestCreateRPCCommitsBeforeOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	for _, rpc := range createRPCs {
 		t.Run(rpc.name, func(t *testing.T) {
 			env := testenv.New(t)
@@ -155,6 +156,7 @@ func TestCreateRPCCommitsBeforeOrganizationDeletion(t *testing.T) {
 // and expects not_found. The RPC has to wait on the organization row before
 // any child row.
 func TestCreateRPCAfterOrganizationDeletionCommits(t *testing.T) {
+	t.Parallel()
 	for _, rpc := range createRPCs {
 		t.Run(rpc.name, func(t *testing.T) {
 			env := testenv.New(t)
@@ -211,6 +213,7 @@ func TestCreateRPCAfterOrganizationDeletionCommits(t *testing.T) {
 // deletion together and expects a serial outcome without a deadlock: the RPC
 // either commits first, or the deletion wins and the RPC gets not_found.
 func TestConcurrentCreateRPCAndOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	for _, rpc := range createRPCs {
 		t.Run(rpc.name, func(t *testing.T) {
 			env := testenv.New(t)

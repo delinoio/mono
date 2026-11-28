@@ -20,6 +20,7 @@ import (
 // with failed_precondition and sends no create command, and that a NONE
 // sandbox still runs there.
 func TestOutboundNetworkCheckPlacement(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -104,6 +105,7 @@ func TestOutboundNetworkCheckPlacement(t *testing.T) {
 }
 
 func TestWindowsGuestOutboundPlacement(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

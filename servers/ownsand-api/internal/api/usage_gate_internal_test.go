@@ -25,6 +25,7 @@ func (c countingUsage) Add(_ string, _ ownsandv1.BillingMeter, _ time.Time, q in
 // after a billed unary RPC recorded its usage and ended, and that an RPC that
 // never ends makes it return ErrUsageDrainIncomplete when its context ends.
 func TestDrainUsageWaitsForRecordingRequest(t *testing.T) {
+	t.Parallel()
 	s := &Service{Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), Now: time.Now}
 	usage := countingUsage{added: make(chan int64, 1)}
 	s.Usage = usage
@@ -103,6 +104,7 @@ func TestDrainUsageWaitsForRecordingRequest(t *testing.T) {
 // TestDrainUsageIgnoresUnbilledRPC checks that an RPC that records no usage,
 // such as the agent channel, does not hold the drain.
 func TestDrainUsageIgnoresUnbilledRPC(t *testing.T) {
+	t.Parallel()
 	s := &Service{Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), Now: time.Now, Usage: countingUsage{added: make(chan int64, 1)}}
 	m := &meterInterceptor{s: s}
 	entered := make(chan struct{})
@@ -130,6 +132,7 @@ func TestDrainUsageIgnoresUnbilledRPC(t *testing.T) {
 // TestUsageGateWithoutMetering checks that a service without metering never
 // blocks the drain.
 func TestUsageGateWithoutMetering(t *testing.T) {
+	t.Parallel()
 	s := &Service{}
 	leave := s.enterBilledRPC(ownsandv1connect.SandboxServiceListSandboxesProcedure)
 	defer leave()

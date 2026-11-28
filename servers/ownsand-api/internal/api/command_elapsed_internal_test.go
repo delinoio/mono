@@ -11,6 +11,7 @@ import (
 // follows CommandElapsed and not the wall clock, and that its default is the
 // process monotonic clock.
 func TestCommandRetentionNowUsesElapsedSource(t *testing.T) {
+	t.Parallel()
 	wall := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	var elapsed time.Duration
 	s := &Service{Now: func() time.Time { return wall }, CommandElapsed: func() time.Duration { return elapsed }}

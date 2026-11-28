@@ -13,6 +13,7 @@ import (
 )
 
 func TestCommandStoreExpiry(t *testing.T) {
+	t.Parallel()
 	h := hub.New()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	grace := 2 * time.Minute
@@ -66,6 +67,7 @@ func TestCommandStoreExpiry(t *testing.T) {
 // leaves the live record in place and that the expected device consumes it
 // exactly once.
 func TestCommandStoreTakeChecksDevice(t *testing.T) {
+	t.Parallel()
 	h := hub.New()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	grace := 2 * time.Minute
@@ -117,6 +119,7 @@ func TestCommandStoreTakeChecksDevice(t *testing.T) {
 // the command exactly once. The failing result of a pause command needs no
 // database, so the service has none.
 func TestHandleCommandResultWrongDeviceKeepsPendingCommand(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	s := &Service{Now: func() time.Time { return now }, Logger: slog.New(slog.DiscardHandler), Hub: hub.New()}
 	owner := s.Hub.Register(context.Background(), "owner", "org")

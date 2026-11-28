@@ -211,6 +211,7 @@ func (f *exportClaimCommitFault) wantOutcome(t *testing.T, want string) {
 }
 
 func TestExportClaimCommitRecovery(t *testing.T) {
+	t.Parallel()
 	const (
 		notExported = ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_NOT_EXPORTED
 		exporting   = ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING

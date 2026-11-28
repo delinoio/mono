@@ -69,6 +69,7 @@ func removeDevice(org *testenv.Org, deviceID string) error {
 // Both succeed, and the removal runs once: one audit event and one control
 // event.
 func TestConcurrentRemoveDeviceWritesOneRemoval(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -110,6 +111,7 @@ func TestConcurrentRemoveDeviceWritesOneRemoval(t *testing.T) {
 // TestRemoveDeviceRepeatKeepsTombstone checks that a repeated removal of a
 // visible tombstone succeeds, returns the tombstone and writes nothing.
 func TestRemoveDeviceRepeatKeepsTombstone(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
@@ -136,6 +138,7 @@ func TestRemoveDeviceRepeatKeepsTombstone(t *testing.T) {
 // must return not_found and must neither write a device removal audit event
 // nor overwrite the tombstone timestamps the deletion wrote.
 func TestRemoveDeviceAfterOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -214,6 +217,7 @@ func snapshotRow(t *testing.T, env *testenv.Env, snapshotID string) (deviceID *s
 // snapshot, without a local copy and without a clean-up job. A snapshot that
 // was never exported is deleted with the device.
 func TestRemoveDevicePreservesSnapshotExportedDuringRemoval(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

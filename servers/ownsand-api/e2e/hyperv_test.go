@@ -29,6 +29,7 @@ import (
 // no compute system is left, and the removal leaves the state directory
 // empty.
 func TestLifecycleHyperV(t *testing.T) {
+	t.Parallel()
 	requireE2E(t)
 	kernel, rootfs := os.Getenv("OWNSAND_HV_TEST_KERNEL"), os.Getenv("OWNSAND_HV_TEST_ROOTFS")
 	if runtime.GOOS != "windows" || kernel == "" || rootfs == "" {
@@ -181,6 +182,7 @@ func TestRequireNoComputeSystemCancelsCommand(t *testing.T) {
 }
 
 func TestRequireNoComputeSystemStopsPollingAtDeadline(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		const budget = 1500 * time.Millisecond
 		start := time.Now()
@@ -205,6 +207,7 @@ func TestRequireNoComputeSystemStopsPollingAtDeadline(t *testing.T) {
 }
 
 func TestRequireNoComputeSystemReturnsWhenAbsent(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		for _, outputs := range [][]string{{"other compute system"}, {"running SANDBOX-ID", "other compute system"}} {
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)

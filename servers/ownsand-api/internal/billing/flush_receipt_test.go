@@ -313,6 +313,7 @@ func (f *proxiedFixture) receipts(t *testing.T) int {
 // caller sees a connection error, and the retry adds nothing more. Counts
 // that arrive while the batch is pending reach the counter exactly once.
 func TestFlushLostCommitResponseCountsOnce(t *testing.T) {
+	t.Parallel()
 	f := newProxiedFixture(t, t0.Add(time.Minute))
 	m := f.meteringViaProxy()
 	ctx := context.Background()
@@ -362,6 +363,7 @@ func TestFlushLostCommitResponseCountsOnce(t *testing.T) {
 // and fails before the commit, so nothing and no receipt stays; the retry
 // applies the whole batch once, together with the counts of the meantime.
 func TestFlushRolledBackBatchAppliesOnce(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Minute))
 	m := f.metering(nil)
 	ctx := context.Background()
@@ -406,6 +408,7 @@ func TestFlushRolledBackBatchAppliesOnce(t *testing.T) {
 // its window is sealed before the retry, and the retry must not add the
 // quantity to the oldest open window.
 func TestFlushLostCommitThenSealAddsNothingToTheOpenWindow(t *testing.T) {
+	t.Parallel()
 	f := newProxiedFixture(t, t0.Add(time.Minute))
 	m := f.meteringViaProxy()
 	ctx := context.Background()
@@ -439,6 +442,7 @@ func TestFlushLostCommitThenSealAddsNothingToTheOpenWindow(t *testing.T) {
 // back and the window is sealed before the retry, so the whole batch goes to
 // the oldest open window and the sealed quantity stays what it was.
 func TestFlushRolledBackBatchAfterSealMovesLateCounts(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Minute))
 	m := f.metering(nil)
 	ctx := context.Background()
@@ -474,6 +478,7 @@ func TestFlushRolledBackBatchAfterSealMovesLateCounts(t *testing.T) {
 // flush leaves the batch pending, and a repeated final flush applies nothing
 // twice. A count after the close is dropped.
 func TestFlushFinalRetriesTheLostBatchOnce(t *testing.T) {
+	t.Parallel()
 	f := newProxiedFixture(t, t0.Add(time.Minute))
 	m := f.meteringViaProxy()
 	ctx := context.Background()
@@ -497,6 +502,7 @@ func TestFlushFinalRetriesTheLostBatchOnce(t *testing.T) {
 // TestFlushLostCommitsWithConcurrentAdds: usage recorded from many goroutines
 // while commit responses are lost reaches the counter exactly once.
 func TestFlushLostCommitsWithConcurrentAdds(t *testing.T) {
+	t.Parallel()
 	f := newProxiedFixture(t, t0.Add(time.Minute))
 	m := f.meteringViaProxy()
 	ctx := context.Background()
@@ -550,6 +556,7 @@ func TestFlushLostCommitsWithConcurrentAdds(t *testing.T) {
 // receipt retention runs without the protection of a receipt that the janitor
 // may have deleted, and is logged.
 func TestFlushLogsAStaleBatchRetry(t *testing.T) {
+	t.Parallel()
 	f := newProxiedFixture(t, t0.Add(time.Minute))
 	m := f.meteringViaProxy()
 	ctx := context.Background()

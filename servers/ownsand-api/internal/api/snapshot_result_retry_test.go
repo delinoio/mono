@@ -85,6 +85,7 @@ func waitSnapshotState(t *testing.T, org *testenv.Org, snapID string, want ownsa
 // the agent reported (READY for a success, FAILED for an error) on the same
 // channel, without a second create command.
 func TestSnapshotResultAppliesAfterTransientError(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		fault func(*testing.T, *testenv.Env) *updateFault
@@ -128,6 +129,7 @@ func TestSnapshotResultAppliesAfterTransientError(t *testing.T) {
 // closes the channel that owns it, and that the state report of the
 // replacement channel then applies the agent's report of the snapshot.
 func TestSnapshotResultAbandonedClosesChannelAndReconciles(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		code    string
@@ -183,6 +185,7 @@ func TestSnapshotResultAbandonedClosesChannelAndReconciles(t *testing.T) {
 // deleted stays deleted, and a snapshot that left CREATING keeps its state.
 // Neither ends with a close of the channel.
 func TestSnapshotResultRetryKeepsOtherWriters(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		act   func(t *testing.T, env *testenv.Env, snapID string)
@@ -261,6 +264,7 @@ func snapshotResultLogged(logs, event, commandID, channelID string) bool {
 // channel ends its retry and that the replacement's initial state report
 // makes the snapshot ready.
 func TestSnapshotResultRetryStopsOnReplacedChannel(t *testing.T) {
+	t.Parallel()
 	env, org, sandboxID, agent, conn := snapshotResultEnv(t, 10*time.Second, 300*time.Millisecond)
 	fault := snapshotReadyFault(t, env)
 	fault.on("40001", 1<<30)

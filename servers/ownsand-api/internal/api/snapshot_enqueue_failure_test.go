@@ -59,6 +59,7 @@ func snapshotCreateFailsAfterCommit(t *testing.T, c *testenv.Clients, orgID, san
 // cancels the request only after it observed the committed CREATING record,
 // so the outcome does not depend on how fast the request commits.
 func TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	ctx := context.Background()
@@ -89,6 +90,7 @@ func TestCreateSnapshotEnqueueFailureLeavesNoCreatingRow(t *testing.T) {
 // EXPORT_FAILED, so a later call on the same live channel starts a new
 // attempt instead of returning the stranded EXPORTING state.
 func TestExportSnapshotEnqueueFailureAllowsRetry(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	ctx := context.Background()

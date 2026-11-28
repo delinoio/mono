@@ -68,6 +68,7 @@ func awaitDone(t *testing.T, what string, done <-chan struct{}) {
 // after the server acknowledged the replacement's own state report and the
 // replacement channel is the live channel of the device.
 func TestConnectOfReplacementWaitsForItsOwnReconcile(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev, original := setupAgent(t, env, org, nil)
@@ -133,6 +134,7 @@ func TestConnectOfReplacementWaitsForItsOwnReconcile(t *testing.T) {
 // earlier channel is ready after Connect: its own state report was
 // acknowledged and its channel is live.
 func TestConnectOfFirstChannelBecomesReady(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
@@ -150,6 +152,7 @@ func TestConnectOfFirstChannelBecomesReady(t *testing.T) {
 }
 
 func TestFakeAgentReadStallEndsOnClose(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	_, agent := setupAgent(t, env, org, nil)
@@ -193,6 +196,7 @@ func TestFakeAgentReadStallEndsOnClose(t *testing.T) {
 // channel without an acknowledgement, and Connect fails when it sees the
 // close.
 func TestConnectWithoutAcknowledgementFails(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)

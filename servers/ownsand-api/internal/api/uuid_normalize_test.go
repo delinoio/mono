@@ -5,6 +5,7 @@ package api
 import "testing"
 
 func TestNormalizeID(t *testing.T) {
+	t.Parallel()
 	const lower = "01900000-0000-7abc-8def-0123456789ab"
 	const upper = "01900000-0000-7ABC-8DEF-0123456789AB"
 	for _, in := range []string{lower, upper} {
@@ -21,6 +22,7 @@ func TestNormalizeID(t *testing.T) {
 }
 
 func TestAgentLimiterKey(t *testing.T) {
+	t.Parallel()
 	const a = "01900000-0000-7abc-8def-0123456789ab"
 	const b = "01900000-0000-7abc-8def-0123456789ac"
 	for _, op := range []string{"challenge", "authenticate", "confirm-removal"} {

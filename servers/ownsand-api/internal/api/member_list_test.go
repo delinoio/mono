@@ -84,6 +84,7 @@ func listInvitations(t *testing.T, owner *testenv.Clients, orgID, token string, 
 // an expiry while a page is read does not turn a selected invitation into an
 // EXPIRED one: the state of every row comes from the cutoff of the query.
 func TestListInvitationsStateUsesQueryCutoff(t *testing.T) {
+	t.Parallel()
 	clock := &tickingClock{}
 	env := testenv.New(t, func(o *app.Options) {
 		clock.next = o.Now
@@ -110,6 +111,7 @@ func TestListInvitationsStateUsesQueryCutoff(t *testing.T) {
 // TestListInvitationsExpiryBoundary checks that an invitation is listed only
 // while its expiry is after the cutoff.
 func TestListInvitationsExpiryBoundary(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	now := env.Clock.Now()
@@ -134,6 +136,7 @@ func TestListInvitationsExpiryBoundary(t *testing.T) {
 // TestListInvitationsPaginationExcludesNonPending checks the page order and
 // the exclusion of accepted, revoked and expired invitations across pages.
 func TestListInvitationsPaginationExcludesNonPending(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	ctx := context.Background()
