@@ -70,8 +70,12 @@ func TestHelperProcess(t *testing.T) {
 			os.Exit(2)
 		}
 	}
-	os.Stdout.WriteString("out-1\nout-final")
-	os.Stderr.WriteString("err-1\nerr-final")
+	if _, err := os.Stdout.WriteString("out-1\nout-final"); err != nil {
+		t.Fatalf("write helper stdout: %v", err)
+	}
+	if _, err := os.Stderr.WriteString("err-1\nerr-final"); err != nil {
+		t.Fatalf("write helper stderr: %v", err)
+	}
 	if mode == helperBlock {
 		time.Sleep(time.Minute)
 	}

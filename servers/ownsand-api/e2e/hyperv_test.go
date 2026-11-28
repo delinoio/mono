@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -157,26 +158,51 @@ func waitForNoComputeSystem(ctx context.Context, sandboxID string, list func(con
 }
 
 func TestRequireNoComputeSystemCancelsCommand(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	const readinessTimeout = 10 * time.Second
+	const cancellationTimeout = 10 * time.Second
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	t.Setenv(envHelperMode, string(helperBlock))
+	t.Setenv(envHelperMode, string(helperHoldOutput))
+	t.Setenv(envHelperOutputHoldAddr, listener.Addr().String())
 	bin, args := helperArgs()
+	if err := listener.SetDeadline(time.Now().Add(readinessTimeout)); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() {
 		done <- waitForNoComputeSystem(ctx, "sandbox-id", func(ctx context.Context) ([]byte, error) {
 			return hcsListOutput(ctx, bin, args...)
 		})
 	}()
+
+	conn, readinessErr := listener.Accept()
+	if readinessErr != nil {
+		t.Errorf("helper did not signal readiness: %v", readinessErr)
+	} else {
+		// Keep the helper blocked on this connection until the poller returns.
+		defer conn.Close()
+	}
+	cancel()
+
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.DeadlineExceeded) ||
+		if readinessErr != nil {
+			return
+		}
+		if !errors.Is(err, context.Canceled) ||
 			!strings.Contains(err.Error(), "sandbox-id") ||
 			!strings.Contains(err.Error(), "out-final") ||
 			!strings.Contains(err.Error(), "err-final") {
-			t.Fatalf("waitForNoComputeSystem = %v, want deadline, sandbox ID, and both output streams", err)
+			t.Fatalf("waitForNoComputeSystem = %v, want cancellation, sandbox ID, and both output streams", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the blocked helper process did not return after the deadline")
+	case <-time.After(cancellationTimeout):
+		t.Fatal("the helper process did not return after cancellation")
 	}
 }
 
