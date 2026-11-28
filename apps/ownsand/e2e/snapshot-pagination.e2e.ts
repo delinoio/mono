@@ -210,6 +210,10 @@ describe("snapshot and template pagination", () => {
       await expect(templates).toHaveCount(200);
       await expect(browser.locator(".dui-dialog-backdrop")).toHaveCount(0);
 
+      const laterSnapshotId = await sources.value("later-snapshot");
+      expect(laterSnapshotId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
       await snapshots
         .last()
         .getByRole("button", "Make template", { exact: false })
@@ -220,6 +224,9 @@ describe("snapshot and template pagination", () => {
       await expect(
         templates.filter({ hasText: "From snapshot 201" }),
       ).toHaveCount(1);
+      expect(await sources.value("template-source-snapshot")).toBe(
+        laterSnapshotId,
+      );
     },
   );
 

@@ -41,6 +41,7 @@ import {
   type ListSandboxesResponse,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type {
+  CreateTemplateRequest,
   ListSnapshotsResponse,
   ListTemplatesResponse,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
@@ -856,6 +857,13 @@ export function createMockTransport(): Transport {
         sessionStorage.setItem(
           "ownsand-e2e-created-source",
           JSON.stringify(source?.source),
+        );
+      }
+      if (pageSources && method.name === "CreateTemplate") {
+        const { snapshotId } = input as unknown as CreateTemplateRequest;
+        sessionStorage.setItem(
+          "ownsand-e2e-template-source-snapshot",
+          snapshotId,
         );
       }
       if (createResponse !== null && method.name === "CreateSandbox") {
