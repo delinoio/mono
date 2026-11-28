@@ -109,6 +109,101 @@ func TestWaitDeviceListErrorIsReturned(t *testing.T) {
 	}
 }
 
+func TestWaitDeviceReadinessDeadline(t *testing.T) {
+	t.Parallel()
+	const timeout = time.Second
+	noOnline := []string{"no new device is ONLINE"}
+	noReport := []string{"dev-1", "ONLINE", "could not confirm its agent_state_report within the wait", "process api"}
+	for _, tc := range []struct {
+		name                string
+		cancelBeforeWait    bool
+		withoutTimer        bool
+		lateList            bool
+		lateReconciliation  bool
+		wantID              string
+		wantErr             error
+		wantDiagnosticParts []string
+		wantListCalls       int
+		wantReconcileCalls  int
+	}{
+		{name: "late list", lateList: true, wantErr: context.DeadlineExceeded, wantDiagnosticParts: noOnline, wantListCalls: 1},
+		{name: "list at deadline before timer", withoutTimer: true, lateList: true, wantErr: context.DeadlineExceeded, wantDiagnosticParts: noOnline, wantListCalls: 1},
+		{name: "late reconciliation", lateReconciliation: true, wantErr: context.DeadlineExceeded, wantDiagnosticParts: noReport, wantListCalls: 1, wantReconcileCalls: 1},
+		{name: "reconciliation at deadline before timer", withoutTimer: true, lateReconciliation: true, wantErr: context.DeadlineExceeded, wantDiagnosticParts: noReport, wantListCalls: 1, wantReconcileCalls: 1},
+		{name: "already canceled", cancelBeforeWait: true, wantErr: context.Canceled, wantDiagnosticParts: noOnline},
+		{name: "timely success", wantID: "dev-1", wantListCalls: 1, wantReconcileCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), timeout)
+				defer cancel()
+				if tc.withoutTimer {
+					ctx = deadlineWithoutTimer{t.Context(), time.Now().Add(timeout)}
+				}
+				if tc.cancelBeforeWait {
+					cancel()
+				}
+				waitForDeadline := func() {
+					if tc.withoutTimer {
+						time.Sleep(timeout)
+						return
+					}
+					<-ctx.Done()
+				}
+				listCalls, reconcileCalls := 0, 0
+				id, err := awaitDeviceReconciled(ctx, time.Millisecond, nil,
+					func(context.Context) ([]string, error) {
+						listCalls++
+						if tc.lateList {
+							waitForDeadline()
+						}
+						return []string{"dev-1"}, nil
+					},
+					func(string) bool {
+						reconcileCalls++
+						if tc.lateReconciliation {
+							waitForDeadline()
+						}
+						return true
+					}, "api")
+				if id != tc.wantID || !errors.Is(err, tc.wantErr) {
+					t.Errorf("got ID %q, error %v, want ID %q and error %v", id, err, tc.wantID, tc.wantErr)
+				}
+				for _, part := range tc.wantDiagnosticParts {
+					if err == nil || !strings.Contains(err.Error(), part) {
+						t.Errorf("error %v does not contain %q", err, part)
+					}
+				}
+				if listCalls != tc.wantListCalls || reconcileCalls != tc.wantReconcileCalls {
+					t.Errorf("got %d list and %d reconciliation calls, want %d and %d", listCalls, reconcileCalls, tc.wantListCalls, tc.wantReconcileCalls)
+				}
+			})
+		})
+	}
+}
+
+func TestWaitDeviceRemembersOnlineObservation(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 1500*time.Millisecond)
+		defer cancel()
+		listCalls := 0
+		id, err := awaitDeviceReconciled(ctx, time.Second, nil, func(context.Context) ([]string, error) {
+			listCalls++
+			if listCalls == 1 {
+				return []string{"dev-1"}, nil
+			}
+			return nil, nil
+		}, func(string) bool { return false }, "api")
+		if id != "" || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "device dev-1 was observed ONLINE") {
+			t.Errorf("got ID %q, error %v, want timeout that names the previously online device", id, err)
+		}
+		if listCalls != 2 {
+			t.Errorf("got %d list calls, want 2", listCalls)
+		}
+	})
+}
+
 func TestLogSinkStateReportMatching(t *testing.T) {
 	t.Parallel()
 	logs := &logSink{}
