@@ -786,30 +786,36 @@ describe("mock createSandbox placement", () => {
   });
 
   test.each([
-    { hostOs: HostOs.WINDOWS },
-    { arch: Arch.ARM64 },
-    { hostOs: HostOs.LINUX, arch: Arch.ARM64 },
-  ])("automatic placement rejects unmatched filters %j", async (placement) => {
-    const client = createClient(SandboxService, createMockTransport());
-    const before = await client.listSandboxes({ organizationId });
-    const rejected = request(placement);
-    await expect(client.createSandbox(rejected)).rejects.toMatchObject({
+    { placement: { hostOs: HostOs.WINDOWS }, code: Code.FailedPrecondition },
+    { placement: { arch: Arch.ARM64 }, code: Code.Unavailable },
+    {
+      placement: { hostOs: HostOs.LINUX, arch: Arch.ARM64 },
       code: Code.FailedPrecondition,
-    });
-    expect(await client.listSandboxes({ organizationId })).toEqual(before);
+    },
+  ])(
+    "automatic placement checks filters and device availability %j",
+    async ({ placement, code }) => {
+      const client = createClient(SandboxService, createMockTransport());
+      const before = await client.listSandboxes({ organizationId });
+      const rejected = request(placement);
+      await expect(client.createSandbox(rejected)).rejects.toMatchObject({
+        code,
+      });
+      expect(await client.listSandboxes({ organizationId })).toEqual(before);
 
-    const retry = {
-      ...rejected,
-      placement: { hostOs: HostOs.LINUX, arch: Arch.AMD64 },
-    };
-    const created = await client.createSandbox(retry);
-    expect(created.sandbox).toMatchObject({
-      deviceId: MOCK_IDS.buildBox,
-      hostOs: HostOs.LINUX,
-      arch: Arch.AMD64,
-    });
-    expect(await client.createSandbox(retry)).toEqual(created);
-  });
+      const retry = {
+        ...rejected,
+        placement: { hostOs: HostOs.LINUX, arch: Arch.AMD64 },
+      };
+      const created = await client.createSandbox(retry);
+      expect(created.sandbox).toMatchObject({
+        deviceId: MOCK_IDS.buildBox,
+        hostOs: HostOs.LINUX,
+        arch: Arch.AMD64,
+      });
+      expect(await client.createSandbox(retry)).toEqual(created);
+    },
+  );
 
   test.each([
     { deviceId: MOCK_IDS.buildBox, arch: Arch.ARM64 },
@@ -903,7 +909,7 @@ describe("mock createSandbox base image placement", () => {
     maxTtl: { seconds: 3600n },
     placement: deviceId === undefined ? undefined : { deviceId },
   });
-  // Another build box that runs every guest, next to the Linux-only seeded one.
+  // The offline device can advertise every guest for placement tests.
   const allGuests = {
     [MOCK_IDS.studioMac]: {
       guestOses: [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS],
@@ -911,38 +917,48 @@ describe("mock createSandbox base image placement", () => {
     },
   };
 
-  test.each([BaseImage.MACOS, BaseImage.WINDOWS])(
-    "the default fixture has no online device for base image %s",
-    async (image) => {
+  test.each([
+    [BaseImage.MACOS, Code.Unavailable],
+    [BaseImage.WINDOWS, Code.FailedPrecondition],
+  ])(
+    "the default fixture rejects automatic placement for base image %s with code %s",
+    async (image, code) => {
       const client = createClient(SandboxService, createMockTransport());
-      const before = await client.listSandboxes({ organizationId });
       await expect(client.createSandbox(request(image))).rejects.toMatchObject({
-        code: Code.FailedPrecondition,
+        code,
       });
       await expect(
         client.createSandbox(request(image, MOCK_IDS.buildBox)),
       ).rejects.toMatchObject({ code: Code.FailedPrecondition });
-      const after = await client.listSandboxes({ organizationId });
-      expect(after.sandboxes).toHaveLength(before.sandboxes.length);
     },
   );
 
-  test("a rejected create stores no idempotency key", async () => {
-    const client = createClient(SandboxService, createMockTransport());
-    const key = uuidV7();
-    await expect(
-      client.createSandbox({
-        ...request(BaseImage.WINDOWS),
-        idempotencyKey: key,
-      }),
-    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
-    // The same key with another request is a new request, not a conflict.
-    const { sandbox } = await client.createSandbox({
-      ...request(BaseImage.LINUX),
-      idempotencyKey: key,
-    });
-    expect(sandbox?.guestOs).toBe(GuestOs.LINUX);
-  });
+  test.each([
+    [Code.FailedPrecondition, undefined],
+    [Code.Unavailable, allGuests],
+  ])(
+    "automatic rejection with code %s changes no sandboxes and leaves the key reusable",
+    async (code, deviceCapabilities) => {
+      const client = createClient(
+        SandboxService,
+        createMockTransport({ deviceCapabilities }),
+      );
+      const listRequest = { organizationId, includeEnded: true };
+      const before = await client.listSandboxes(listRequest);
+      const windows = request(BaseImage.WINDOWS);
+
+      await expect(client.createSandbox(windows)).rejects.toMatchObject({
+        code,
+      });
+      expect(await client.listSandboxes(listRequest)).toEqual(before);
+
+      const { sandbox } = await client.createSandbox({
+        ...request(BaseImage.LINUX),
+        idempotencyKey: windows.idempotencyKey,
+      });
+      expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+    },
+  );
 
   test("a Linux create is unchanged", async () => {
     const client = createClient(SandboxService, createMockTransport());
@@ -962,7 +978,10 @@ describe("mock createSandbox base image placement", () => {
       const client = createClient(
         SandboxService,
         createMockTransport({
-          deviceCapabilities: { [MOCK_IDS.buildBox]: caps },
+          deviceCapabilities: {
+            [MOCK_IDS.buildBox]: caps,
+            [MOCK_IDS.studioMac]: caps,
+          },
         }),
       );
       await expect(
@@ -978,14 +997,16 @@ describe("mock createSandbox base image placement", () => {
         }),
       ).rejects.toMatchObject({ code: Code.FailedPrecondition });
     }
+  });
+
+  test("automatic placement prefers a compatible online device to an offline one", async () => {
+    const platform = { hostOs: HostOs.LINUX, arch: Arch.AMD64 };
     const client = createClient(
       SandboxService,
       createMockTransport({
         deviceCapabilities: {
-          [MOCK_IDS.buildBox]: {
-            guestOses: [GuestOs.LINUX, GuestOs.WINDOWS],
-            builtBaseImages: [BaseImage.LINUX, BaseImage.WINDOWS],
-          },
+          ...allGuests,
+          [MOCK_IDS.buildBox]: allGuests[MOCK_IDS.studioMac],
         },
       }),
     );
@@ -996,15 +1017,22 @@ describe("mock createSandbox base image placement", () => {
     expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
   });
 
-  test("automatic placement ignores an offline device that can run the image", async () => {
-    // Only the offline studio-mac advertises Windows; it must not host it.
-    const client = createClient(
-      SandboxService,
-      createMockTransport({ deviceCapabilities: allGuests }),
-    );
-    await expect(
-      client.createSandbox(request(BaseImage.WINDOWS)),
-    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+  test("removal turns an offline-only rejection into a permanent rejection", async () => {
+    const transport = createMockTransport({ deviceCapabilities: allGuests });
+    const devices = createClient(DeviceService, transport);
+    const client = createClient(SandboxService, transport);
+    const windows = request(BaseImage.WINDOWS);
+
+    await expect(client.createSandbox(windows)).rejects.toMatchObject({
+      code: Code.Unavailable,
+    });
+    await devices.removeDevice({
+      organizationId,
+      deviceId: MOCK_IDS.studioMac,
+    });
+    await expect(client.createSandbox(windows)).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+    });
   });
 
   test("an explicit incompatible device fails even when another device could run it", async () => {
