@@ -279,6 +279,37 @@ describe("session list", () => {
     expect(window.localStorage.getItem("sandcrew.session-filter")).toBe("all");
   });
 
+  test("reloads the list after its change stream reconnects", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    const { transport: recorded, calls } = recording(base);
+    let watches = 0;
+    const transport: Transport = {
+      ...recorded,
+      async stream(method, ...rest) {
+        const response = await base.stream(method, ...rest);
+        if (method.name !== "WatchSessions" || ++watches > 1) return response;
+        // The first stream fails after its first response.
+        return {
+          ...response,
+          message: (async function* () {
+            for await (const message of response.message) {
+              yield message;
+              throw new ConnectError("connection reset", Code.Unavailable);
+            }
+          })(),
+        };
+      },
+    };
+    const lists = () => calls.filter((c) => c.method === "ListSessions").length;
+    renderConsole(`/orgs/${ACME}/sessions`, { transport });
+    await screen.findByRole("list", { name: "Sessions" });
+    const before = lists();
+    await waitFor(() => expect(watches).toBe(2), { timeout: 3000 });
+    await waitFor(() => expect(lists()).toBeGreaterThan(before), {
+      timeout: 3000,
+    });
+  });
+
   test("keeps a failed first load recoverable", async () => {
     renderConsole(`/orgs/${ACME}/sessions`, {
       mock: { failFirstSessionList: true },

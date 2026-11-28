@@ -17,7 +17,7 @@ import {
   SegmentedControl,
   SegmentedControlItem,
 } from "delino-ui/segmented-control";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invalidateServices, SESSION_PAGE_SIZE } from "../api.ts";
 import {
   scheduledDeletionText,
@@ -66,6 +66,9 @@ export function updateSessionPages(
 /**
  * Keeps the cached session lists of an organization current with
  * WatchSessions while the page is visible. A new session reloads the list.
+ * WatchSessions has no replay cursor, so each reopened stream (after a
+ * failure, a server rotation or a hidden page) reloads the list once its
+ * first response confirms the subscription.
  */
 function useWatchSessions(
   organizationId: string,
@@ -75,14 +78,29 @@ function useWatchSessions(
   const transport = useTransport();
   const queryClient = useQueryClient();
   const visible = usePageVisible();
+  const key = `${organizationId}:${filter}`;
+  const watchedKey = useRef<string>(undefined);
   return useStream(
     async (signal, onLive) => {
       const client = createClient(SessionService, transport);
+      // The first stream of a list starts with the list load; later streams
+      // may have missed changes.
+      let reconciled = watchedKey.current !== key;
+      watchedKey.current = key;
       onLive();
       for await (const response of client.watchSessions(
         { organizationId },
         { signal },
       )) {
+        if (!reconciled) {
+          reconciled = true;
+          void queryClient.invalidateQueries({
+            queryKey: createConnectQueryKey({
+              schema: SessionService.method.listSessions,
+              cardinality: "infinite",
+            }),
+          });
+        }
         const event = response.event;
         if (event.case !== "session" && event.case !== "sessionDeleted") {
           continue;
@@ -112,7 +130,7 @@ function useWatchSessions(
         }
       }
     },
-    { enabled: visible, key: `${organizationId}:${filter}` },
+    { enabled: visible, key },
   );
 }
 
