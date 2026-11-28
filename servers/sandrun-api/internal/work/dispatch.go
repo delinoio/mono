@@ -42,23 +42,19 @@ func (e *Engine) RunDispatcher(ctx context.Context) error {
 }
 
 func (e *Engine) passAll(ctx context.Context) {
-	rows, err := e.svc.DB.Pool.Query(ctx, `SELECT organization_id::text FROM requests WHERE state = $1
+	rows, err := e.queryWorkIDs(ctx, `SELECT organization_id::text FROM requests WHERE state = $1
 		UNION SELECT organization_id::text FROM runner_profiles WHERE warm_count > 0
 		UNION SELECT organization_id::text FROM runners WHERE state = $2`, int16(reqQueued), int16(runWarm))
+	var orgs []string
+	if err == nil {
+		orgs, err = pgx.CollectRows(rows, pgx.RowTo[string])
+	}
 	if err != nil {
 		if ctx.Err() == nil {
 			e.svc.Logger.WarnContext(ctx, "dispatcher_list_failed", slog.Any("error", err))
 		}
 		return
 	}
-	var orgs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			orgs = append(orgs, id)
-		}
-	}
-	rows.Close()
 	for _, org := range orgs {
 		if ctx.Err() != nil {
 			return
@@ -224,19 +220,15 @@ func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, 
 
 // expire ends the QUEUED requests whose maximum queue wait ended.
 func (e *Engine) expire(ctx context.Context, orgID string) error {
-	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT request_id::text FROM requests WHERE organization_id = $1 AND state = $2 AND queue_deadline <= $3",
+	rows, err := e.queryWorkIDs(ctx, "SELECT request_id::text FROM requests WHERE organization_id = $1 AND state = $2 AND queue_deadline <= $3",
 		orgID, int16(reqQueued), e.svc.NowUTC())
 	if err != nil {
 		return err
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
-		}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
 	}
-	rows.Close()
 	for _, id := range ids {
 		var ended *Request
 		err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
