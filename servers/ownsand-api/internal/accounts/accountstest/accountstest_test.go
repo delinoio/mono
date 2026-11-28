@@ -5,6 +5,7 @@ package accountstest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync/atomic"
@@ -384,6 +385,79 @@ func TestReportUsageFailureInjectionPrecedesValidation(t *testing.T) {
 	}
 	if calls, clockReads := f.Calls(MethodReportUsage), reads.Load(); calls != 1 || clockReads != 0 {
 		t.Fatalf("ReportUsage calls = %d and clock reads = %d, want 1 and 0", calls, clockReads)
+	}
+}
+
+func TestListBillingStatusChangesPagination(t *testing.T) {
+	t.Parallel()
+	f := New(t, nil)
+	const (
+		account = "ba-1"
+		user    = "user-1"
+		service = accountsv1.ServiceId_SERVICE_ID_OWNSAND
+	)
+	f.AddAccount(account, "Account", map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	client := f.Client()
+	link := func(sequence int) {
+		t.Helper()
+		org := fmt.Sprintf("org-%d", sequence)
+		if _, err := client.LinkOrganization(t.Context(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+			Service: service, BillingAccountId: account, OrganizationId: org, UserId: user,
+		})); err != nil {
+			t.Fatalf("link %s: %v", org, err)
+		}
+	}
+	link(1)
+	for _, size := range []int32{-1, math.MinInt32} {
+		resp, err := client.ListBillingStatusChanges(t.Context(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
+			Service: service, PageSize: size,
+		}))
+		var rpcErr *connect.Error
+		if resp != nil || !errors.As(err, &rpcErr) || rpcErr.Code() != connect.CodeInvalidArgument || rpcErr.Message() != "page_size must not be negative" {
+			t.Errorf("poll with page size %d returned response %v and error %v, want no response and invalid_argument: page_size must not be negative", size, resp, err)
+		}
+	}
+	for sequence := 2; sequence <= 201; sequence++ {
+		link(sequence)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		after    int64
+		size     int32
+		count    int
+		wantNext int64
+	}{
+		{name: "default", count: 50, wantNext: 50},
+		{name: "one", size: 1, count: 1, wantNext: 1},
+		{name: "maximum", size: 200, count: 200, wantNext: 200},
+		{name: "capped", size: 201, count: 200, wantNext: 200},
+		{name: "last page", after: 200, size: 200, count: 1, wantNext: 201},
+		{name: "empty page", after: 201, size: 200, wantNext: 201},
+		{name: "cursor beyond last status", after: 202, size: 200, wantNext: 202},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := client.ListBillingStatusChanges(t.Context(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
+				Service: service, AfterSequence: tc.after, PageSize: tc.size,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := resp.Msg.GetNextSequence(); got != tc.wantNext {
+				t.Errorf("next sequence = %d, want %d", got, tc.wantNext)
+			}
+			statuses := resp.Msg.GetStatuses()
+			if len(statuses) != tc.count {
+				t.Fatalf("status count = %d, want %d", len(statuses), tc.count)
+			}
+			for i, status := range statuses {
+				sequence := tc.after + int64(i) + 1
+				org := fmt.Sprintf("org-%d", sequence)
+				if status.GetSequence() != sequence || status.GetOrganizationId() != org {
+					t.Fatalf("status %d = %v, want sequence %d for %s", i, status, sequence, org)
+				}
+			}
+		})
 	}
 }
 
