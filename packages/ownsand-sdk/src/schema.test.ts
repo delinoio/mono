@@ -43,7 +43,7 @@ const files: DescFile[] = [
   file_delino_ownsand_v1_snapshot,
 ];
 
-const generatedDir = fileURLToPath(
+const protoDir = fileURLToPath(
   new URL("../../../protos/delino/ownsand/v1/", import.meta.url),
 );
 
@@ -61,23 +61,37 @@ function enumsOf(file: DescFile): DescEnum[] {
 
 describe("generated TypeScript bindings", () => {
   test("cover every schema file of delino.ownsand.v1", () => {
-    // The expected inventory comes from the generated files on disk, not from
-    // a second hand-maintained list, so a new schema file that is not
-    // registered in `files` fails here and names the missing file.
-    const generated = readdirSync(generatedDir)
-      .filter((name) => name.endsWith("_pb.ts"))
-      .map((name) => `delino/ownsand/v1/${name.slice(0, -"_pb.ts".length)}`)
+    const fileNames = readdirSync(protoDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
       .sort();
-    const registered = files.map((f) => f.name).sort();
-    const duplicated = registered.filter((n, i) => registered.indexOf(n) !== i);
-    const missing = generated.filter((n) => !registered.includes(n));
-    const extra = registered.filter((n) => !generated.includes(n));
-    expect({ missing, extra, duplicated }).toEqual({
-      missing: [],
-      extra: [],
-      duplicated: [],
+    const prefix = "delino/ownsand/v1/";
+    const expected = fileNames
+      .filter((name) => name.endsWith(".proto"))
+      .map((name) => prefix + name.slice(0, -".proto".length));
+    const bindings = fileNames
+      .filter((name) => name.endsWith("_pb.ts"))
+      .map((name) => prefix + name.slice(0, -"_pb.ts".length));
+    const registered = files.map((file) => file.name).sort();
+    const duplicateDescriptors = [
+      ...new Set(
+        registered.filter((name, index) => registered.indexOf(name) !== index),
+      ),
+    ];
+
+    expect({
+      missingBindings: expected.filter((name) => !bindings.includes(name)),
+      unexpectedBindings: bindings.filter((name) => !expected.includes(name)),
+      missingDescriptors: expected.filter((name) => !registered.includes(name)),
+      extraDescriptors: registered.filter((name) => !expected.includes(name)),
+      duplicateDescriptors,
+    }).toEqual({
+      missingBindings: [],
+      unexpectedBindings: [],
+      missingDescriptors: [],
+      extraDescriptors: [],
+      duplicateDescriptors: [],
     });
-    expect(registered).toEqual(generated);
   });
 
   test("every enum has the zero value <ENUM>_UNSPECIFIED", () => {
