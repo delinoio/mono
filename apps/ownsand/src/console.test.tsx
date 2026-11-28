@@ -97,6 +97,16 @@ import {
 /** The seeded Acme invitation, which the mock user cannot accept: already a member. */
 const MOCK_ACME_INVITATION_SECRET = "osi_7f3a_unused";
 
+/**
+ * The timeout of a test that renders a list of more than one page. The
+ * 5-second default is too short for such a list in happy-dom on a busy CI
+ * runner; paged-lists.test.tsx uses the same value.
+ */
+const LONG_LIST_TEST_TIMEOUT_MS = 60_000;
+
+/** Waits for a row of such a list longer than the 1-second findBy default. */
+const LONG_LIST_WAIT = { timeout: 20_000 };
+
 const config = {
   apiOrigin: "https://api.test",
   authMode: AuthMode.Mock,
@@ -2967,37 +2977,47 @@ describe("invitations", () => {
     expect(trigger.textContent).toContain("Contoso Research");
   });
 
-  test("lists organizations past the first page of the mock and refreshes them after a membership change", async () => {
-    const mock = createMockTransport();
-    const client = createClient(OrganizationService, mock);
-    // 2 seeded organizations and 200 more fill the first page and leave a
-    // second one.
-    for (let i = 0; i < 200; i++) {
-      await client.createOrganization({ name: `Extra ${i}` });
-    }
-    const { transport, state } = listOrganizationsProbe(mock);
-    renderConsole("/", { transport, queryClient: createQueryClient() });
-    expect(await screen.findByRole("link", { name: /Extra 199/ })).toBeTruthy();
-    expect(state.tokens).toHaveLength(2);
-    expect(state.tokens[0]).toBe("");
-    expect(state.tokens[1]).not.toBe("");
-    // Joining Contoso refreshes the shared list from the first page.
-    await joinContosoFromOrganizations();
-    await settle(100);
-    expect(window.location.pathname).toBe(
-      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
-    );
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("combobox", { name: "Organization" }),
+  test(
+    "lists organizations past the first page of the mock and refreshes them after a membership change",
+    async () => {
+      const mock = createMockTransport();
+      const client = createClient(OrganizationService, mock);
+      // 2 seeded organizations and 200 more fill the first page and leave a
+      // second one.
+      for (let i = 0; i < 200; i++) {
+        await client.createOrganization({ name: `Extra ${i}` });
+      }
+      const { transport, state } = listOrganizationsProbe(mock);
+      renderConsole("/", { transport, queryClient: createQueryClient() });
+      expect(
+        await screen.findByRole("link", { name: /Extra 199/ }, LONG_LIST_WAIT),
+      ).toBeTruthy();
+      expect(state.tokens).toHaveLength(2);
+      expect(state.tokens[0]).toBe("");
+      expect(state.tokens[1]).not.toBe("");
+      // Joining Contoso refreshes the shared list from the first page.
+      await joinContosoFromOrganizations();
+      await settle(100);
+      expect(window.location.pathname).toBe(
+        `/orgs/${MOCK_IDS.contoso}/sandboxes`,
       );
-    });
-    expect(
-      await screen.findByRole("option", { name: "Contoso Research" }),
-    ).toBeTruthy();
-    expect(screen.getByRole("option", { name: "Extra 199" })).toBeTruthy();
-    expect(state.tokens.length).toBeGreaterThan(2);
-  });
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("combobox", { name: "Organization" }),
+        );
+      });
+      expect(
+        await screen.findByRole(
+          "option",
+          { name: "Contoso Research" },
+          LONG_LIST_WAIT,
+        ),
+      ).toBeTruthy();
+      expect(screen.getByRole("option", { name: "Extra 199" })).toBeTruthy();
+      expect(state.tokens.length).toBeGreaterThan(2);
+    },
+    LONG_LIST_TEST_TIMEOUT_MS,
+  );
 
   test("refreshes the organizations when an earlier accept succeeds after the user left the page", async () => {
     const { transport, release } = delayedAcceptTransport();
