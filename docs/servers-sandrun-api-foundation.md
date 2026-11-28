@@ -676,6 +676,8 @@ The Logto endpoint URLs and the OwnSand, public and GitHub origins require a hos
 
 ### CORS origin format
 
+When the server reads an unset, empty or ASCII-whitespace-only `CORS_ORIGINS` value, it uses the default console origin. An explicit list replaces the default, and the server ignores empty entries. If no entries remain after trimming, the server stops before opening a listener and reports `CORS_ORIGINS must list at least one origin`. This includes a list of only commas and spaces or a value of only U+00A0.
+
 The server stores each `CORS_ORIGINS` entry in the form that browsers use in the `Origin` header. It lowercases host names, writes IPv4 addresses in dotted decimal and writes IPv6 addresses in compressed form within brackets. It removes the default port for the scheme and keeps other ports. For example, `HTTPS://SandRun.Delino.io:443` matches `https://sandrun.delino.io`, and `http://127.1:3000` matches `http://127.0.0.1:3000`. Use Punycode for internationalized host names.
 
 Each entry requires a host and permits an optional port. Startup fails if an entry includes user information, a path, a query or a fragment, including a bare `?` or `#`. Startup also fails for invalid hosts such as `1.2.3.4.5`, IPv6 addresses with a zone identifier or decoded hostnames that contain a percent sign.
