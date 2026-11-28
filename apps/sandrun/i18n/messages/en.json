@@ -203,6 +203,7 @@
   "githubSetup.description": "Link the GitHub organization where you installed the SandRun GitHub App.",
   "githubSetup.missingDetails": "The address has no GitHub installation details. Start the installation again from the integrations of your organization.",
   "githubSetup.singleUse": "The installation link is single-use. Start the installation again from the integrations of your organization.",
+  "githubSetup.organizationMismatch": "Choose the SandRun organization where you started the GitHub installation.",
   "githubSetup.linking": "Linking the GitHub installation",
   "githubSetup.loadingOrganizations": "Loading your organizations",
   "githubSetup.notAdmin": "Only an owner or admin of a SandRun organization can link a GitHub installation.",

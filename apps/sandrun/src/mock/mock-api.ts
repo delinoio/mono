@@ -66,6 +66,7 @@ import {
 import {
   type GitHubInstallation,
   GitHubInstallationSchema,
+  GitHubInstallOrganizationMismatchSchema,
   GitHubService,
 } from "@delino/sandrun-protos/v1/github_pb";
 import {
@@ -121,6 +122,7 @@ import {
   ORGANIZATION_NAME_LIMIT,
 } from "../name.ts";
 import { compareQueueOrder } from "../queue.ts";
+import { can, Permission } from "../roles.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -1506,15 +1508,27 @@ export function createMockTransport(
         // The development server and the e2e suite can use the fixed
         // "mock-state" fixture. Issued states are single-use.
         const issued = issuedStates.get(req.state);
-        if (
-          req.state !== "mock-state" &&
-          (issued?.organizationId !== req.organizationId ||
-            now() >= issued.expiresAtMs)
-        )
-          throw new ConnectError(
-            "the installation state is not valid or has expired",
-            Code.FailedPrecondition,
-          );
+        if (req.state !== "mock-state") {
+          const invalidState =
+            "the installation state is not valid or has expired";
+          if (issued === undefined || now() >= issued.expiresAtMs) {
+            throw new ConnectError(invalidState, Code.FailedPrecondition);
+          }
+          if (issued.organizationId !== req.organizationId) {
+            const issuerRole = orgs
+              .get(issued.organizationId)
+              ?.members.find((member) => member.userId === userId)?.role;
+            if (can(issuerRole, Permission.ManageIntegrations)) {
+              throw new ConnectError(
+                invalidState,
+                Code.InvalidArgument,
+                undefined,
+                [{ desc: GitHubInstallOrganizationMismatchSchema, value: {} }],
+              );
+            }
+            throw new ConnectError(invalidState, Code.FailedPrecondition);
+          }
+        }
         issuedStates.delete(req.state);
         for (const linkedOrg of orgs.values()) {
           if (

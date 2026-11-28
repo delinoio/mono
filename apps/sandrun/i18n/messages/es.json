@@ -203,6 +203,7 @@
   "githubSetup.description": "Vincula la organización de GitHub en la que instalaste la aplicación de GitHub de SandRun.",
   "githubSetup.missingDetails": "La URL no contiene los datos de instalación de GitHub. Vuelve a iniciar la instalación desde las integraciones de tu organización.",
   "githubSetup.singleUse": "El enlace de instalación solo se puede usar una vez. Vuelve a iniciar la instalación desde las integraciones de tu organización.",
+  "githubSetup.organizationMismatch": "Elige la organización de SandRun en la que iniciaste la instalación de GitHub.",
   "githubSetup.linking": "Vinculando la instalación de GitHub",
   "githubSetup.loadingOrganizations": "Cargando tus organizaciones",
   "githubSetup.notAdmin": "Solo los propietarios o administradores de una organización de SandRun pueden vincular una instalación de GitHub.",

@@ -66,6 +66,7 @@ import {
 } from "@delino/sandrun-protos/v1/member_pb";
 import {
   GetOrganizationResponseSchema,
+  ListOrganizationsResponseSchema,
   type Organization,
   OrganizationService,
 } from "@delino/sandrun-protos/v1/organization_pb";
@@ -2534,6 +2535,74 @@ describe("GitHub setup callback", () => {
       },
     };
   }
+
+  test("a GitHub organization mismatch requires another explicit choice with the same callback", async () => {
+    const mock = createMockTransport();
+    const github = createClient(GitHubService, mock);
+    const { url } = await github.createGitHubInstallUrl({
+      organizationId: MOCK_IDS.globex,
+    });
+    const state = new URL(url).searchParams.get("state");
+    if (!state) throw new Error("Expected issued state");
+    const linkRequest = rs.fn();
+    let onlyIssuer = false;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...args) {
+        if (method.name === GitHubService.method.linkGitHubInstallation.name) {
+          linkRequest(args[3]);
+        }
+        const response = await mock.unary(method, ...args);
+        if (
+          onlyIssuer &&
+          method.name === OrganizationService.method.listOrganizations.name &&
+          isMessage(response.message, ListOrganizationsResponseSchema)
+        ) {
+          Object.assign(response.message, {
+            organizations: response.message.organizations.filter(
+              (org) => org.organizationId === MOCK_IDS.globex,
+            ),
+          });
+        }
+        return response;
+      },
+    };
+
+    const queryClient = renderConsole(
+      `/github/setup?installation_id=51000001&code=gh_code&state=${encodeURIComponent(state)}`,
+      { transport },
+    );
+    const historyLength = window.history.length;
+    await chooseOrganization("Acme Robotics (owner)");
+    await click(submitButton());
+    expect(
+      await screen.findByText(/Choose the SandRun organization/),
+    ).toBeTruthy();
+    expect(screen.queryByText(restartNotice)).toBeNull();
+    expect(picker().textContent?.trim()).toBe("");
+    expect(submitButton().disabled).toBe(true);
+    expect(window.location.search).toBe("");
+
+    onlyIssuer = true;
+    await refetch(queryClient);
+    expect(linkRequest).toHaveBeenCalledTimes(1);
+    expect(submitButton().disabled).toBe(true);
+
+    await submitToGlobex();
+    expect(await screen.findByText(installationName)).toBeTruthy();
+    expect(window.location.pathname).toBe(integrationsPath);
+    expect(window.history.length).toBe(historyLength);
+    expect(linkRequest.mock.calls).toEqual(
+      [MOCK_IDS.acme, MOCK_IDS.globex].map((organizationId) => [
+        expect.objectContaining({
+          organizationId,
+          githubInstallationId: 51000001n,
+          code: "gh_code",
+          state,
+        }),
+      ]),
+    );
+  });
 
   test("clears a choice that loses eligibility and waits for another choice", async () => {
     const fixture = await setupRefreshFixture();

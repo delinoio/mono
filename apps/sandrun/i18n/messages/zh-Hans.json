@@ -203,6 +203,7 @@
   "githubSetup.description": "关联已安装 SandRun GitHub 应用的 GitHub 组织。",
   "githubSetup.missingDetails": "此链接缺少 GitHub 安装信息。请从组织的集成设置中重新开始安装。",
   "githubSetup.singleUse": "安装链接只能使用一次。请从组织的集成设置中重新开始安装。",
+  "githubSetup.organizationMismatch": "请选择开始安装 GitHub 的 SandRun 组织。",
   "githubSetup.linking": "正在关联 GitHub 应用安装",
   "githubSetup.loadingOrganizations": "正在加载你的组织",
   "githubSetup.notAdmin": "只有 SandRun 组织的所有者或管理员才能关联 GitHub 应用安装。",
