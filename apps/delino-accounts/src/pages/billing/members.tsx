@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
@@ -342,6 +343,12 @@ function Invitations() {
                       toast.success(t("invitations.revoked"));
                     } catch (error) {
                       revokeFailure.report(error);
+                      if (
+                        error instanceof ConnectError &&
+                        error.code === Code.FailedPrecondition
+                      ) {
+                        list.refetch();
+                      }
                     }
                   }}
                 >
