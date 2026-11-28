@@ -385,7 +385,8 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
-	fmt.Fprintf(stdout, "%s %s (device %s, organization %s)\n", c.bold("Enrollment:"), c.ok("enrolled"), id.DeviceID, id.OrganizationID)
+	report := &statusOutput{writer: stdout}
+	fmt.Fprintf(report, "%s %s (device %s, organization %s)\n", c.bold("Enrollment:"), c.ok("enrolled"), id.DeviceID, id.OrganizationID)
 	a, agentErr := st.LoadAgent()
 	var s *agent.Status
 	statusErr := st.LoadStatus(&s)
@@ -393,12 +394,12 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		statusErr = errors.New("expected a status object, got null")
 	}
 	if statusErr == nil && s.APIURL != "" {
-		fmt.Fprintf(stdout, "%s %s\n", c.bold("Control plane:"), s.APIURL)
+		fmt.Fprintf(report, "%s %s\n", c.bold("Control plane:"), s.APIURL)
 	} else if agentErr == nil {
-		fmt.Fprintf(stdout, "%s %s\n", c.bold("Control plane:"), a.APIURL)
+		fmt.Fprintf(report, "%s %s\n", c.bold("Control plane:"), a.APIURL)
 	}
 	if agentErr == nil && a.Removal.NoticeReceived {
-		fmt.Fprintf(stdout, "%s %s\n", c.bold("Removal:"), c.bad("in progress"))
+		fmt.Fprintf(report, "%s %s\n", c.bold("Removal:"), c.bad("in progress"))
 	}
 	// Only an absent status.json means the agent has not run. A file that
 	// cannot be read or decoded is an error: the report is skipped, the other
@@ -406,7 +407,7 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 	code := exitOK
 	switch {
 	case errors.Is(statusErr, store.ErrNotFound):
-		fmt.Fprintf(stdout, "%s unknown (the agent has not run)\n", c.bold("Connection:"))
+		fmt.Fprintf(report, "%s unknown (the agent has not run)\n", c.bold("Connection:"))
 	case statusErr != nil:
 		fmt.Fprintln(stderr, "ownsand-agent: read status.json:", statusErr)
 		code = exitError
@@ -415,10 +416,10 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		if s.Connected {
 			conn = c.ok("connected")
 		}
-		fmt.Fprintf(stdout, "%s %s (status of %s)\n", c.bold("Connection:"), conn, s.UpdatedAt.Format("2006-01-02 15:04:05"))
-		fmt.Fprintf(stdout, "%s %s, runtime %s\n", c.bold("Agent:"), s.AgentVersion, s.Runtime)
-		fmt.Fprintf(stdout, "%s %s %s\n", c.bold("Update:"), s.UpdateState, s.UpdateTarget)
-		printCapabilities(stdout, *s, c)
+		fmt.Fprintf(report, "%s %s (status of %s)\n", c.bold("Connection:"), conn, s.UpdatedAt.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(report, "%s %s, runtime %s\n", c.bold("Agent:"), s.AgentVersion, s.Runtime)
+		fmt.Fprintf(report, "%s %s %s\n", c.bold("Update:"), s.UpdateState, s.UpdateTarget)
+		printCapabilities(report, *s, c)
 	}
 	// A failed inventory read is an error, never a smaller count: the partial
 	// result is discarded, the line shows the count as unavailable, the
@@ -429,27 +430,48 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		sandboxes = append(sandboxes, string(b))
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stdout, "%s %s\n", c.bold("Sandboxes:"), c.bad(fmt.Sprintf("unavailable (%v)", err)))
+		fmt.Fprintf(report, "%s %s\n", c.bold("Sandboxes:"), c.bad(fmt.Sprintf("unavailable (%v)", err)))
 		fmt.Fprintln(stderr, "ownsand-agent: read sandbox records:", err)
 		code = exitError
 	} else {
-		fmt.Fprintf(stdout, "%s %d records\n", c.bold("Sandboxes:"), len(sandboxes))
+		fmt.Fprintf(report, "%s %d records\n", c.bold("Sandboxes:"), len(sandboxes))
 	}
 	entries, err := os.ReadDir(st.Path(store.SnapshotsDir))
 	if err != nil {
-		fmt.Fprintf(stdout, "%s %s\n", c.bold("Snapshots:"), c.bad("unavailable"))
+		fmt.Fprintf(report, "%s %s\n", c.bold("Snapshots:"), c.bad("unavailable"))
 		fmt.Fprintln(stderr, "ownsand-agent: read snapshots:", err)
-		return exitError
-	}
-	var snaps []string
-	for _, e := range entries {
-		if e.IsDir() {
-			snaps = append(snaps, e.Name())
+		code = exitError
+	} else {
+		var snaps []string
+		for _, e := range entries {
+			if e.IsDir() {
+				snaps = append(snaps, e.Name())
+			}
 		}
+		sort.Strings(snaps)
+		fmt.Fprintf(report, "%s %d\n", c.bold("Snapshots:"), len(snaps))
 	}
-	sort.Strings(snaps)
-	fmt.Fprintf(stdout, "%s %d\n", c.bold("Snapshots:"), len(snaps))
+	if report.err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: write status:", report.err)
+		code = exitError
+	}
 	return code
+}
+
+// statusOutput stops writing after the first error so the status command can
+// finish checking local state without emitting later sections of a broken report.
+type statusOutput struct {
+	writer io.Writer
+	err    error
+}
+
+func (w *statusOutput) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	n, err := w.writer.Write(p)
+	w.err = err
+	return n, err
 }
 
 // printCapabilities prints the capabilities of the last capability report

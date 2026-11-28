@@ -781,6 +781,91 @@ func TestStatusEmptyInventories(t *testing.T) {
 	}
 }
 
+func TestStatusOutputWrite(t *testing.T) {
+	const wantDiagnostic = "ownsand-agent: write status: stdout is full\n"
+	args := []string{"status", "--no-color"}
+	writeErr := errors.New("stdout is full")
+	st := statusFixture(t)
+
+	t.Run("first write", func(t *testing.T) {
+		stdout := &cliOutputErrorWriter{err: writeErr}
+		var stderr bytes.Buffer
+		code := run(args, nil, stdout, &stderr)
+		if code != exitError || stdout.output.Len() != 0 || stderr.String() != wantDiagnostic {
+			t.Fatalf("status: exit %d, stdout %q, stderr %q", code, stdout.output.String(), stderr.String())
+		}
+	})
+
+	at := time.Date(2026, 11, 22, 14, 25, 28, 0, time.UTC)
+	if err := st.SaveStatus(&agent.Status{
+		Connected:      true,
+		UpdatedAt:      at,
+		APIURL:         "https://ownsand.example.com",
+		AgentVersion:   "1.2.3",
+		Runtime:        "process",
+		UpdateState:    "available",
+		UpdateTarget:   "1.2.4",
+		GuestOSes:      []string{"GUEST_OS_LINUX"},
+		BaseImages:     []string{"BASE_IMAGE_LINUX"},
+		CapabilitiesAt: at,
+		Checks:         []agent.StatusCheck{{ID: "outbound-network", Passed: true, Detail: "available"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const wantReport = "Enrollment: enrolled (device dev-1, organization org-1)\n" +
+		"Control plane: https://ownsand.example.com\n" +
+		"Connection: connected (status of 2026-11-22 14:25:28)\n" +
+		"Agent: 1.2.3, runtime process\n" +
+		"Update: available 1.2.4\n" +
+		"Capabilities: guest OSes GUEST_OS_LINUX; base images BASE_IMAGE_LINUX (report of 2026-11-22 14:25:28)\n" +
+		"  outbound-network: passed (available)\n" +
+		"Sandboxes: 0 records\n" +
+		"Snapshots: 0\n"
+	var stdout, stderr bytes.Buffer
+	if code := run(args, nil, &stdout, &stderr); code != exitOK || stdout.String() != wantReport || stderr.Len() != 0 {
+		t.Fatalf("status: exit %d, stdout %q, stderr %q; want exit 0, stdout %q and empty stderr", code, stdout.String(), stderr.String(), wantReport)
+	}
+
+	for _, prefix := range []string{"Capabilities:", "  outbound-network:", "Snapshots:"} {
+		t.Run(strings.TrimSpace(prefix), func(t *testing.T) {
+			stdout := &statusLineErrorWriter{prefix: prefix, err: writeErr}
+			var stderr bytes.Buffer
+			code := run(args, nil, stdout, &stderr)
+			wantPrefix, _, _ := strings.Cut(wantReport, prefix)
+			if code != exitError || stdout.output.String() != wantPrefix || stderr.String() != wantDiagnostic {
+				t.Fatalf("status: exit %d, stdout %q, stderr %q; want exit 1, stdout %q and stderr %q", code, stdout.output.String(), stderr.String(), wantPrefix, wantDiagnostic)
+			}
+		})
+	}
+
+	t.Run("with an inventory read error", func(t *testing.T) {
+		if err := os.Remove(st.Path(store.SnapshotsDir)); err != nil {
+			t.Fatal(err)
+		}
+		stdout := &cliOutputErrorWriter{err: writeErr}
+		var stderr bytes.Buffer
+		code := run(args, nil, stdout, &stderr)
+		if code != exitError || !strings.Contains(stderr.String(), "ownsand-agent: read snapshots:") ||
+			strings.Count(stderr.String(), wantDiagnostic) != 1 {
+			t.Fatalf("status: exit %d, stderr %q; want exit 1 and both diagnostics", code, stderr.String())
+		}
+	})
+}
+
+type statusLineErrorWriter struct {
+	output bytes.Buffer
+	prefix string
+	err    error
+}
+
+func (w *statusLineErrorWriter) Write(p []byte) (int, error) {
+	if w.prefix != "" && bytes.HasPrefix(p, []byte(w.prefix)) {
+		w.prefix = ""
+		return 0, w.err
+	}
+	return w.output.Write(p)
+}
+
 // Readable inventories keep their counts and exit 0, and only directory
 // entries count as snapshots.
 func TestStatusInventoryCounts(t *testing.T) {
