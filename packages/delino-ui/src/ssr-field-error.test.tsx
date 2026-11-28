@@ -17,6 +17,7 @@ afterEach(() => {
 });
 
 const ERROR_MESSAGE = "This field is required.";
+const HELP_TEXT = "Help text.";
 
 const FIELD_CONTROLS = {
   TextField: "input",
@@ -29,8 +30,10 @@ const FIELD_CONTROLS = {
 
 type FieldCase = {
   name: keyof typeof FIELD_CONTROLS;
+  invalidBorder: string;
   /** Renders the field with the given extra props. */
   field: (props: {
+    description?: React.ReactNode;
     error?: React.ReactNode;
     disabled?: boolean;
   }) => React.ReactElement;
@@ -39,18 +42,21 @@ type FieldCase = {
 const FIELD_CASES: FieldCase[] = [
   {
     name: "TextField",
+    invalidBorder: ".dui-text-field[data-invalid] .dui-text-field-input",
     field: (props) => (
       <TextField label="Name" description="Your full name." {...props} />
     ),
   },
   {
     name: "Textarea",
+    invalidBorder: ".dui-text-field[data-invalid] .dui-textarea",
     field: (props) => (
       <Textarea label="Bio" description="A short bio." {...props} />
     ),
   },
   {
     name: "PasswordInput",
+    invalidBorder: ".dui-text-field[data-invalid] .dui-password-input",
     field: (props) => (
       <PasswordInput
         label="Password"
@@ -61,12 +67,14 @@ const FIELD_CASES: FieldCase[] = [
   },
   {
     name: "NumberInput",
+    invalidBorder: ".dui-text-field[data-invalid] .dui-number-input-group",
     field: (props) => (
       <NumberInput label="Tickets" description="At most four." {...props} />
     ),
   },
   {
     name: "Select",
+    invalidBorder: ".dui-text-field[data-invalid] .dui-select",
     field: (props) => (
       <Select label="Role" description="Pick one." {...props}>
         <SelectOption value="admin">Admin</SelectOption>
@@ -75,6 +83,7 @@ const FIELD_CASES: FieldCase[] = [
   },
   {
     name: "RadioGroup",
+    invalidBorder: ".dui-radio-field[data-invalid] .dui-radio",
     field: (props) => (
       <RadioGroup label="Plan" description="Billed monthly." {...props}>
         <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
@@ -143,63 +152,80 @@ describe.each(FIELD_CASES)(
   },
 );
 
-describe.each([
-  ["TextField", TextField],
-  ["Textarea", Textarea],
-] as const)("%s error state when disabled", (_name, Component) => {
-  test.each(["", ERROR_MESSAGE])(
-    "keeps the description and suppresses the invalid state before and after hydration (%j)",
-    (error) => {
-      const field = (
-        <Component
-          label="Name"
-          description="Help text."
-          error={error}
-          disabled
-        />
-      );
+function expectFieldErrorState(
+  container: HTMLElement,
+  fieldCase: FieldCase,
+  { disabled, invalid }: { disabled: boolean; invalid: boolean },
+) {
+  const control = container.querySelector(FIELD_CONTROLS[fieldCase.name]);
+  expect(control).not.toBeNull();
+  expect(control?.matches('[disabled], [aria-disabled="true"]')).toBe(disabled);
+  expect(control?.getAttribute("aria-invalid") === "true").toBe(invalid);
+  const root = control?.closest('[data-slot="field"]');
+  expect(root).not.toBeNull();
+  expect(root?.hasAttribute("data-invalid")).toBe(invalid);
+  expect(container.querySelector(fieldCase.invalidBorder) !== null).toBe(
+    invalid,
+  );
+
+  const description = container.querySelector(
+    '[data-slot="field-description"]',
+  );
+  expect(description?.textContent).toBe(HELP_TEXT);
+  expect(description?.id).toBeTruthy();
+
+  const error = container.querySelector('[data-slot="field-error"]');
+  const expectedDescriptionIds = [description?.id];
+  if (invalid) {
+    expect(error?.textContent).toBe(ERROR_MESSAGE);
+    expect(error?.id).toBeTruthy();
+    expectedDescriptionIds.push(error?.id);
+  } else {
+    expect(error).toBeNull();
+  }
+  expect(control?.getAttribute("aria-describedby")?.split(/\s+/)).toEqual(
+    expectedDescriptionIds,
+  );
+  expect(danglingDescribedByIds(container.innerHTML)).toEqual([]);
+}
+
+describe.each(FIELD_CASES)("$name supplied error state", (fieldCase) => {
+  test.each([
+    { disabled: false, error: ERROR_MESSAGE, invalid: true },
+    { disabled: true, error: ERROR_MESSAGE, invalid: false },
+    { disabled: true, error: "", invalid: false },
+  ])(
+    "keeps its description before and after hydration (disabled=$disabled, error=$error)",
+    ({ disabled, error, invalid }) => {
+      const field = fieldCase.field({
+        description: HELP_TEXT,
+        disabled,
+        error,
+      });
       const container = document.createElement("div");
       container.innerHTML = renderToString(field);
 
-      function expectDisabledField() {
-        const control = container.querySelector("input, textarea");
-        expect(control?.hasAttribute("disabled")).toBe(true);
-        expect(control?.getAttribute("aria-invalid")).not.toBe("true");
-        expect(
-          control?.closest(".dui-text-field")?.hasAttribute("data-invalid"),
-        ).toBe(false);
-        expect(container.textContent).not.toContain(ERROR_MESSAGE);
-        const description = container.querySelector(
-          ".dui-text-field-description",
-        );
-        expect(description?.textContent).toBe("Help text.");
-        expect(
-          control?.getAttribute("aria-describedby")?.split(/\s+/),
-        ).toContain(description?.id);
-        expect(danglingDescribedByIds(container.innerHTML)).toEqual([]);
-      }
-
-      expectDisabledField();
+      expectFieldErrorState(container, fieldCase, { disabled, invalid });
       render(field, { container, hydrate: true });
-      expectDisabledField();
+      expectFieldErrorState(container, fieldCase, { disabled, invalid });
     },
   );
 
   test("restores the supplied error when reenabled", () => {
-    const field = (disabled: boolean) => (
-      <Component label="Name" error={ERROR_MESSAGE} disabled={disabled} />
-    );
-    const { container, getByRole, rerender } = render(field(false));
-    const control = getByRole("textbox", { name: "Name" });
-    const root = control.closest(".dui-text-field");
+    const field = (disabled: boolean) =>
+      fieldCase.field({
+        description: HELP_TEXT,
+        error: ERROR_MESSAGE,
+        disabled,
+      });
+    const { container, rerender } = render(field(false));
 
     for (const disabled of [false, true, false]) {
       rerender(field(disabled));
-      expect(control.hasAttribute("disabled")).toBe(disabled);
-      expect(control.getAttribute("aria-invalid") === "true").toBe(!disabled);
-      expect(root?.hasAttribute("data-invalid")).toBe(!disabled);
-      expect(container.textContent?.includes(ERROR_MESSAGE)).toBe(!disabled);
-      expect(danglingDescribedByIds(container.innerHTML)).toEqual([]);
+      expectFieldErrorState(container, fieldCase, {
+        disabled,
+        invalid: !disabled,
+      });
     }
   });
 });
