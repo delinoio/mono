@@ -1081,12 +1081,13 @@ const fontData = readFileSync(
 const logoData = readFileSync(
   join(process.cwd(), 'public/images/logo.png')
 )
+const logoArrayBuffer = Uint8Array.from(logoData).buffer
 
 export async function GET(request: Request) {
   return new ImageResponse(
     <div style={{ fontFamily: 'Inter' }}>
-      {/* @ts-expect-error Satori accepts ArrayBuffer/typed arrays for <img src> at runtime */}
-      <img src={logoData} />
+      {/* @ts-expect-error Satori accepts an ArrayBuffer for <img src> at runtime */}
+      <img src={logoArrayBuffer} />
       Hello World
     </div>,
     { fonts: [{ name: 'Inter', data: fontData }] }
