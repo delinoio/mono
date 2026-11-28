@@ -12,11 +12,92 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 var errMetricsAccept = errors.New("permanent metrics accept failure")
+
+type startupListener struct {
+	net.Listener
+	accepts atomic.Int32
+	closes  atomic.Int32
+}
+
+func bindStartupListener(t *testing.T) *startupListener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return &startupListener{Listener: listener}
+}
+
+func (l *startupListener) Accept() (net.Conn, error) {
+	l.accepts.Add(1)
+	return nil, errors.New("unexpected Accept during canceled startup")
+}
+
+func (l *startupListener) Close() error {
+	l.closes.Add(1)
+	return l.Listener.Close()
+}
+
+func (l *startupListener) checkClosedWithoutServing(t *testing.T) {
+	t.Helper()
+	if accepts := l.accepts.Load(); accepts != 0 {
+		t.Errorf("listener %s Accept calls = %d, want 0", l.Addr(), accepts)
+	}
+	if closes := l.closes.Load(); closes != 1 {
+		t.Errorf("listener %s Close calls = %d, want 1", l.Addr(), closes)
+	}
+	if conn, err := net.DialTimeout("tcp", l.Addr().String(), time.Second); err == nil {
+		_ = conn.Close()
+		t.Errorf("listener %s still accepts connections", l.Addr())
+	}
+}
+
+func TestCanceledServingEntry(t *testing.T) {
+	for _, mode := range []string{"serve", "runServers without metrics", "runServers with metrics"} {
+		t.Run(mode, func(t *testing.T) {
+			public := bindStartupListener(t)
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			srv := newServer(http.NotFoundHandler(), logger)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			var steps []string
+			stop := func() { steps = append(steps, "stop") }
+			beforeDrain := func() { steps = append(steps, "beforeDrain") }
+
+			var err error
+			switch mode {
+			case "serve":
+				err = serve(ctx, stop, srv, public, logger, time.Second, beforeDrain)
+			case "runServers without metrics":
+				err = runServers(ctx, stop, srv, public, logger, time.Second, beforeDrain, nil, nil)
+			case "runServers with metrics":
+				metrics := bindStartupListener(t)
+				err = runServers(ctx, stop, srv, public, logger, time.Second, beforeDrain,
+					&http.Server{Handler: http.NotFoundHandler()}, metrics)
+				metrics.checkClosedWithoutServing(t)
+			}
+
+			if err != nil {
+				t.Errorf("canceled serving entry returned %v, want nil", err)
+			}
+			if got := strings.Join(steps, ", "); got != "stop, beforeDrain" {
+				t.Errorf("cleanup steps = %q, want stop, beforeDrain", got)
+			}
+			if strings.Contains(logs.String(), "server_shutdown_started") {
+				t.Errorf("logged HTTP drain before serving: %s", &logs)
+			}
+			public.checkClosedWithoutServing(t)
+		})
+	}
+}
 
 type failingMetricsListener struct {
 	net.Listener
