@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -67,14 +68,13 @@ func assertRejectedRecord(t *testing.T, record map[string]any, reason server.Rej
 // can observe both timeouts.
 func startRejectLogServer(t *testing.T, headerTimeout, idleTimeout time.Duration) (string, *syncBuffer) {
 	t.Helper()
-	addr, logs, _ := startRejectLogServerWithShutdown(t, headerTimeout, idleTimeout)
+	addr, logs, _, _ := startRejectLogServerWithShutdown(t, headerTimeout, idleTimeout, nil)
 	return addr, logs
 }
 
-// startRejectLogServerWithShutdown is startRejectLogServer that also returns a
-// function that starts the graceful shutdown and waits until serve returned. It
-// is safe to call more than once; the test cleanup calls it too.
-func startRejectLogServerWithShutdown(t *testing.T, headerTimeout, idleTimeout time.Duration) (string, *syncBuffer, func()) {
+// startRejectLogServerWithShutdown lets the test configure the server and wrap
+// its listener before serving. It returns the shutdown trigger and serve result.
+func startRejectLogServerWithShutdown(t *testing.T, headerTimeout, idleTimeout time.Duration, configure func(*http.Server, net.Listener) net.Listener) (string, *syncBuffer, context.CancelFunc, <-chan error) {
 	t.Helper()
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
@@ -83,18 +83,24 @@ func startRejectLogServerWithShutdown(t *testing.T, headerTimeout, idleTimeout t
 	srv.IdleTimeout = idleTimeout
 
 	listener := newTestListener(t)
+	if configure != nil {
+		listener = configure(srv, listener)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, noStop, srv, listener, logger, time.Second) }()
-	var once sync.Once
-	shutdown := func() {
-		once.Do(func() {
-			cancel()
-			<-done
-		})
-	}
-	t.Cleanup(shutdown)
-	return listener.Addr().String(), logs, shutdown
+	go func() {
+		defer close(done)
+		done <- serve(ctx, noStop, srv, listener, logger, time.Second)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("serve did not return during cleanup")
+		}
+	})
+	return listener.Addr().String(), logs, cancel, done
 }
 
 func TestNewServerLogsRequestsRejectedBeforeTheHandler(t *testing.T) {
@@ -288,33 +294,107 @@ func TestNewServerLogsTheBadRequestAfterAHeaderTimeoutOnAKeepAliveConnection(t *
 // sends no response during a shutdown, whatever the line is, so the log holds
 // one header read timeout without a response.
 func TestNewServerLogsOneHeaderTimeoutForAPartialLineDuringShutdown(t *testing.T) {
-	const headerTimeout = 300 * time.Millisecond
-	addr, logs, shutdown := startRejectLogServerWithShutdown(t, headerTimeout, time.Minute)
+	const prefix = "GET /hea"
+	const guardTimeout = 5 * time.Second
+	readBlocked := make(chan struct{})
+	releaseRead := make(chan struct{})
+	unblockRead := sync.OnceFunc(func() { close(releaseRead) })
+	defer unblockRead()
+	connClosed := make(chan struct{})
+
+	// The header deadline must outlast the test guards. Only the shutdown
+	// callback releases the read on the success path.
+	addr, logs, shutdown, serveDone := startRejectLogServerWithShutdown(t, time.Minute, time.Minute, func(srv *http.Server, listener net.Listener) net.Listener {
+		srv.RegisterOnShutdown(unblockRead)
+		connState := srv.ConnState
+		srv.ConnState = func(conn net.Conn, state http.ConnState) {
+			connState(conn, state)
+			if state == http.StateClosed {
+				close(connClosed)
+			}
+		}
+		return shutdownHeaderListener{Listener: listener, prefixLen: len(prefix), readBlocked: readBlocked, releaseRead: releaseRead}
+	})
 	conn := dialRaw(t, addr)
-	if _, err := io.WriteString(conn, "GET /hea"); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(guardTimeout)); err != nil {
+		t.Fatalf("set client deadline: %v", err)
+	}
+	if _, err := io.WriteString(conn, prefix); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	// Let the server read the partial line before the shutdown starts.
-	time.Sleep(50 * time.Millisecond)
-	shutdownDone := make(chan struct{})
-	go func() {
-		defer close(shutdownDone)
-		shutdown()
-	}()
-	_, response := expectClosedWithin(t, conn, 5*time.Second)
-	if response != "" {
-		t.Errorf("response = %q, want none: net/http sends no response during a shutdown", response)
+	select {
+	case <-readBlocked:
+	case <-time.After(guardTimeout):
+		t.Fatal("server did not request more bytes after reading the partial line")
+	}
+	shutdown()
+
+	response, err := io.ReadAll(conn)
+	if err != nil || len(response) != 0 {
+		t.Errorf("read = %q, %v; want a silent EOF during shutdown", response, err)
 	}
 	select {
-	case <-shutdownDone:
-	case <-time.After(5 * time.Second):
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("shutdown failed: %v", err)
+		}
+	case <-time.After(guardTimeout):
 		t.Fatal("shutdown did not complete")
 	}
-	records := waitForRejectedRecords(t, logs, 1)
+	// The client can see EOF before ConnState finishes writing the log.
+	select {
+	case <-connClosed:
+	case <-time.After(guardTimeout):
+		t.Fatal("connection close callback did not complete")
+	}
+	records := rejectedRecords(t, logs)
 	if len(records) != 1 {
 		t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
 	}
 	assertRejectedRecord(t, records[0], server.RejectionHeaderReadTimeout, 0)
+}
+
+// shutdownHeaderListener wraps the loopback connection before serve adds the
+// rejection observer. Only the shutdown test uses this listener.
+type shutdownHeaderListener struct {
+	net.Listener
+	prefixLen   int
+	readBlocked chan<- struct{}
+	releaseRead <-chan struct{}
+}
+
+func (l shutdownHeaderListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &shutdownHeaderConn{Conn: conn, remaining: l.prefixLen, readBlocked: l.readBlocked, releaseRead: l.releaseRead}, nil
+}
+
+type shutdownHeaderConn struct {
+	net.Conn
+	remaining   int
+	readBlocked chan<- struct{}
+	releaseRead <-chan struct{}
+}
+
+func (c *shutdownHeaderConn) Read(p []byte) (int, error) {
+	if c.remaining > 0 {
+		n, err := c.Conn.Read(p[:min(len(p), c.remaining)])
+		c.remaining -= n
+		return n, err
+	}
+	if c.readBlocked != nil {
+		close(c.readBlocked)
+		c.readBlocked = nil
+		<-c.releaseRead
+		// Expire the TCP deadline directly. The observer excludes past
+		// deadlines it sees because net/http uses those to interrupt reads.
+		if err := c.Conn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+			return 0, err
+		}
+	}
+	return c.Conn.Read(p)
 }
 
 // waitForRejectedRecords returns the http_request_rejected records once at
