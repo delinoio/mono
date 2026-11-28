@@ -868,17 +868,44 @@ describe("pending subscription polling", () => {
 
   test("an unpaid closed checkout stays pending with reads only", async () => {
     const checkout = fakeCheckout();
-    const api = await renderPending(SubscriptionStatus.PENDING, { checkout });
+    const api = await renderPending(SubscriptionStatus.NONE, { checkout });
+    const startingBalance = balanceNow();
+    expect(startingBalance).toBe("$12.35");
+
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Start subscription" }),
+      );
+    });
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    expect(calls(api, "StartSubscription")).toEqual([
+      expect.objectContaining({ billingAccountId: ACCOUNT_ID }),
+    ]);
+    expect(checkout.opened).toEqual(["txn_checkout1"]);
+
+    // Check the close refresh before the first poll is due.
     api.calls.length = 0;
-    await advance(POLL_MS * 5);
+    await act(async () => checkout.close());
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    expect(calls(api, "GetSubscription")).toContainEqual(
+      expect.objectContaining({ billingAccountId: ACCOUNT_ID }),
+    );
+
+    api.calls.length = 0;
+    for (let interval = 0; interval < 5; interval++) {
+      await advance(POLL_MS);
+      expect(api.calls).toHaveLength(interval + 1);
+      expect(api.calls[interval]).toEqual({
+        method: "GetSubscription",
+        request: expect.objectContaining({ billingAccountId: ACCOUNT_ID }),
+      });
+    }
     expect(screen.getByText("Waiting for payment")).toBeTruthy();
     expect(topUpDisabled()).toBe(true);
-    const methods = new Set(api.calls.map((c) => c.method));
-    expect(methods).toEqual(new Set(["GetSubscription"]));
-    expect(calls(api, "GetSubscription")).toHaveLength(5);
-    expect(calls(api, "StartSubscription")).toHaveLength(0);
-    expect(calls(api, "CreateTopUp")).toHaveLength(0);
-    expect(checkout.opened).toEqual([]);
+    expect(balanceNow()).toBe(startingBalance);
+    expect(checkout.opened).toEqual(["txn_checkout1"]);
   });
 
   test("unmounting stops the polling", async () => {
