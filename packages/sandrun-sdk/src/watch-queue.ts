@@ -115,6 +115,10 @@ export async function* watchQueue(
             // Keepalives and events of a newer schema carry no state.
             break;
         }
+        // The caller can abort while the generator is paused at a yield.
+        if (abortedBy(signal)) {
+          return;
+        }
       }
     } catch (error) {
       if (abortedBy(signal)) {
