@@ -2486,9 +2486,23 @@ if (mode !== ${JSON.stringify(StandInMode.Signal)} && mode !== ${JSON.stringify(
   process.exit(${StandInInvalidModeStatus});
 }
 const ignoreSignals = process.env.STANDIN_IGNORE_SIGNALS === "1";
+const probe = process.argv.indexOf("--stdin-filepath");
+if (probe !== -1) {
+  fs.appendFileSync(dir + "/probes.log", JSON.stringify({
+    name: process.argv[probe + 1],
+    input: fs.readFileSync(0, "utf8"),
+  }) + "\\n");
+}
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"])
   process.on(signal, () => {
     fs.appendFileSync(dir + "/signals.log", process.pid + " " + signal + "\\n");
+    if (probe !== -1) {
+      // Leave the child alive until the observer has checked the wrapper.
+      setInterval(() => {
+        if (fs.existsSync(dir + "/release-probe")) process.exit(17);
+      }, 20);
+      return;
+    }
     if (!ignoreSignals) process.exit(0);
   });
 fs.appendFileSync(dir + "/batches.log", process.pid + "\\n");
@@ -2715,6 +2729,81 @@ for (const { signal, exitCode } of signalCases) {
       assert.doesNotMatch(stderr, /ci_format_error/u);
     },
   );
+}
+
+for (const selection of ["staged", "pathspec", "explicit"]) {
+  for (const { signal, exitCode } of signalCases) {
+    test(
+      `${signal} cancels an exclusion probe during ${selection} selection`,
+      { skip: process.platform === "win32" },
+      async (t) => {
+        const standInRun = standInFixture(t, 0);
+        const { f, state, lines } = standInRun;
+        const names = ["a-missing.ts", "b-missing.ts", "c-regular.ts"];
+        const source = "const   value = 1;\n";
+        for (const name of names) f.write(name, source);
+        const base = f.git("rev-parse", "HEAD");
+        let args = ["--staged", "--write"];
+        if (selection === "explicit") {
+          const head = f.commit();
+          args = ["--base", base, "--head", head];
+        } else {
+          f.git("add", "--", ...names);
+        }
+        for (const name of names.slice(0, 2)) rmSync(join(f.cwd, name));
+
+        const env = standInEnv(f, state, StandInMode.Signal);
+        const index = join(f.cwd, ".git", "index");
+        const throwaway = join(f.cwd, ".git", "next-index-1.lock");
+        if (selection === "pathspec") {
+          copyFileSync(index, throwaway);
+          env.GIT_INDEX_FILE = throwaway;
+        }
+        const indexes = selection === "pathspec" ? [index, throwaway] : [index];
+        const before = indexes.map((path) => readFileSync(path));
+        const run = startFormatter({ ...standInRun, args, env });
+        await waitFor(() => lines("batches.log").length > 0, "the probe");
+        assert.deepEqual(lines("probes.log").map(JSON.parse), [
+          { name: "./a-missing.ts", input: "\n\n\n" },
+        ]);
+        const child = Number(lines("batches.log")[0]);
+        run.parent.kill(signal);
+        await waitFor(() => lines("signals.log").length > 0, "signal receipt");
+        assert.deepEqual(lines("signals.log"), [`${child} ${signal}`]);
+
+        // A later signal must neither replace the first exit status nor emit
+        // a second cancellation event while the first probe is still open.
+        run.parent.kill(signal === "SIGTERM" ? "SIGINT" : "SIGTERM");
+        await assert.rejects(
+          within(run.closed, 150, "the formatter to stop"),
+          /Timed out waiting for the formatter to stop/u,
+        );
+        assert.equal(isAlive(child), true);
+        writeFileSync(join(state, "release-probe"), "");
+        const { status, stdout, stderr } = await within(
+          run.closed,
+          StandInDeadlineMs.Stop,
+          "the formatter to stop after the probe closes",
+        );
+        assert.equal(run.parent.signalCode, null);
+        assert.equal(status, exitCode, stderr);
+        assert.equal(stdout, "");
+        assert.deepEqual(stderr.trim().split("\n").map(JSON.parse), [
+          { event: "ci_format_signal", signal },
+        ]);
+        assert.equal(isAlive(child), false);
+        assert.deepEqual(lines("batches.log"), [String(child)]);
+        assert.deepEqual(
+          indexes.map((path) => readFileSync(path)),
+          before,
+        );
+        for (const name of names.slice(0, 2)) {
+          assert.equal(existsSync(join(f.cwd, name)), false);
+        }
+        assert.equal(readFileSync(join(f.cwd, names[2]), "utf8"), source);
+      },
+    );
+  }
 }
 
 // The stand-in used to exit on a fixed 5 s timer, so an observer that was slower

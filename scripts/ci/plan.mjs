@@ -334,7 +334,8 @@ export function plan(cwd, base, head) {
   // planner runs without installed dependencies and cannot evaluate the Rstack
   // exclusions. A formattable path with a non-UTF-8 name or a missing or
   // non-regular working-tree entry selects formatting. The `quality`
-  // job's formatter checks the exclusions and gives the verdict.
+  // job's formatter checks the exclusions and gives the verdict. Both Defer
+  // policies let this selection finish synchronously without an Rstack child.
   const format =
     changedFormatFiles(
       cwd,
