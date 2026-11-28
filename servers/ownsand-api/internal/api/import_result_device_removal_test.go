@@ -28,6 +28,7 @@ func removeDeviceRPCForCopyTest(t *testing.T, org *testenv.Org, deviceID string)
 // removal commits, registers no copy row for the removed device and sends no
 // delete_snapshot command.
 func TestImportResultWaitsForInFlightDeviceRemoval(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -79,6 +80,7 @@ func TestImportResultWaitsForInFlightDeviceRemoval(t *testing.T) {
 // after it may reach the server before or after the channel closes, and
 // neither order may leave a row.
 func TestImportResultAfterDeviceRemovalRegistersNoCopy(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
@@ -102,6 +104,7 @@ func TestImportResultAfterDeviceRemovalRegistersNoCopy(t *testing.T) {
 // order of removeDeviceTx, so the channel stays open and the result is
 // handled; it is the window between the commit and the channel closure.
 func TestImportResultOnOpenChannelAfterRemovalCommitRegistersNoCopy(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -127,6 +130,7 @@ func TestImportResultOnOpenChannelAfterRemovalCommitRegistersNoCopy(t *testing.T
 // TestCopyRowRegisteredBeforeDeviceRemovalIsCleared checks that a copy row
 // that an import registered before the removal is deleted by the removal.
 func TestCopyRowRegisteredBeforeDeviceRemovalIsCleared(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient

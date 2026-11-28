@@ -25,6 +25,7 @@ import (
 )
 
 func TestOwnSandRemovalLeaseRecovery(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		call teardownRPC
@@ -75,6 +76,7 @@ func TestOwnSandRemovalLeaseRecovery(t *testing.T) {
 }
 
 func TestOwnSandRemovalLeaseFailedRelease(t *testing.T) {
+	t.Parallel()
 	w := newRemovalLeaseWorld(t, 2*time.Second, false)
 	ctx := t.Context()
 	pool := w.env.DB.Pool
@@ -114,6 +116,7 @@ func TestOwnSandRemovalLeaseFailedRelease(t *testing.T) {
 }
 
 func TestOwnSandRemovalLeaseLegacyGate(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		call teardownRPC
@@ -145,6 +148,7 @@ func TestOwnSandRemovalLeaseLegacyGate(t *testing.T) {
 }
 
 func TestOwnSandRemovalLeaseRenewsAndCancelsAfterLoss(t *testing.T) {
+	t.Parallel()
 	w := newRemovalLeaseWorld(t, 3*time.Second, false)
 	var replicaLayers layers.Layers
 	replica := w.replica(t, &replicaLayers, false)
@@ -216,6 +220,7 @@ func TestOwnSandRemovalLeaseRenewsAndCancelsAfterLoss(t *testing.T) {
 }
 
 func TestOwnSandRemovalLeaseFinalization(t *testing.T) {
+	t.Parallel()
 	for _, rpc := range removalFinalizationRPCs {
 		t.Run(rpc.name, func(t *testing.T) {
 			for _, outcome := range []struct {
@@ -359,6 +364,7 @@ func TestOwnSandRemovalLeaseFinalization(t *testing.T) {
 }
 
 func TestOwnSandRemovalLeaseRejectsBeforeFinalization(t *testing.T) {
+	t.Parallel()
 	for _, rpc := range removalFinalizationRPCs {
 		t.Run(rpc.name, func(t *testing.T) {
 			for _, tc := range []struct {

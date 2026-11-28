@@ -52,6 +52,7 @@ func startStreamH2C(t *testing.T, handler http.Handler, window int) (*http.Clien
 }
 
 func TestDevSessionStalledResponse(t *testing.T) {
+	t.Parallel()
 	const relayLimit = 600 * time.Millisecond
 	const writeGrace = 300 * time.Millisecond
 	w := newWorkWorld(t, devsession.Timing{
@@ -179,6 +180,7 @@ func TestDevSessionStalledResponse(t *testing.T) {
 }
 
 func TestDevSessionFileReadPath(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	session, sandboxID := w.runningSession(t)
 	client := w.env.User(w.org.Member).DevSession
@@ -248,6 +250,7 @@ func TestDevSessionFileReadPath(t *testing.T) {
 }
 
 func TestDevSessionFileReadRotation(t *testing.T) {
+	t.Parallel()
 	const relayLimit = 200 * time.Millisecond
 	w := newWorkWorld(t, devsession.Timing{StreamLimit: relayLimit, WriteGracePeriod: 2 * time.Second})
 	session, sandboxID := w.runningSession(t)

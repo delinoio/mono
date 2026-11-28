@@ -29,6 +29,7 @@ import (
 )
 
 func TestCursorAdmissionCommitOutcome(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		fault admissionFault
@@ -82,6 +83,7 @@ func TestCursorAdmissionCommitOutcome(t *testing.T) {
 }
 
 func TestDevinAdmissionConfirmedRollback(t *testing.T) {
+	t.Parallel()
 	proxy := newAdmissionProxy(t, admissionDelayRollback)
 	var kicks atomic.Int32
 	fake := devinfake.New(t, devinAPIToken, "sandrun-outpost")

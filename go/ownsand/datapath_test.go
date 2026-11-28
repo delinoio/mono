@@ -130,6 +130,7 @@ func (s *Sandbox) installedSession() *p2pSession {
 }
 
 func TestCloseDuringSetupReleasesTheSetup(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.iceGate = make(chan struct{})
@@ -162,6 +163,7 @@ func TestCloseDuringSetupReleasesTheSetup(t *testing.T) {
 }
 
 func TestCloseDuringFailedSetupPreventsFallback(t *testing.T) {
+	t.Parallel()
 	for _, cc := range closeCases {
 		t.Run(cc.name, func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -196,6 +198,7 @@ func TestCloseDuringFailedSetupPreventsFallback(t *testing.T) {
 }
 
 func TestCloseAfterSetupBeforeInstallClosesTheSession(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	c := cp.client(t, TransportAuto)
@@ -219,6 +222,7 @@ func TestCloseAfterSetupBeforeInstallClosesTheSession(t *testing.T) {
 }
 
 func TestCloseClosesTheInstalledSession(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	s := cp.handle(t, cp.client(t, TransportAuto))
@@ -246,6 +250,7 @@ func TestCloseClosesTheInstalledSession(t *testing.T) {
 }
 
 func TestWaitingOperationCancelsWithoutEndingTheSetup(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.iceGate = make(chan struct{})
@@ -300,6 +305,7 @@ func TestWaitingOperationCancelsWithoutEndingTheSetup(t *testing.T) {
 // the operation that runs the setup ends first, a waiting operation runs the
 // setup itself.
 func TestWaiterRunsTheSetupWhenTheOpenerEnds(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.iceGate = make(chan struct{})
@@ -375,6 +381,7 @@ func stallSetup(t *testing.T, cp *fakeCP, stage stalledStage) {
 }
 
 func TestStalledSetupFallsBackToRelayWithinTheSetupWindow(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageGathering, stageOpenSession, stageChannelOpen} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -419,6 +426,7 @@ func TestStalledSetupFallsBackToRelayWithinTheSetupWindow(t *testing.T) {
 }
 
 func TestStalledSetupOnForcedPeerToPeerReturnsTheSetupError(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageGathering, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -441,6 +449,7 @@ func TestStalledSetupOnForcedPeerToPeerReturnsTheSetupError(t *testing.T) {
 }
 
 func TestCallerDeadlineEndsStalledSetupWithoutRelayRecovery(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageGathering, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -471,6 +480,7 @@ func TestCallerDeadlineEndsStalledSetupWithoutRelayRecovery(t *testing.T) {
 }
 
 func TestLateDataChannelOpen(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		transport     Transport
@@ -566,6 +576,7 @@ func TestLateDataChannelOpen(t *testing.T) {
 // request fails with deadline_exceeded at once, while the caller's context
 // still has time left and the skew is larger than that time.
 func TestControlPlaneDeadlineStatusBeforeCallerTimerIsTheCallerDeadline(t *testing.T) {
+	t.Parallel()
 	type tc struct {
 		stage stalledStage
 		code  connect.Code
@@ -607,6 +618,7 @@ func TestControlPlaneDeadlineStatusBeforeCallerTimerIsTheCallerDeadline(t *testi
 // A deadline_exceeded status without a nearby caller deadline is a control
 // plane failure: automatic routing uses the relay.
 func TestControlPlaneDeadlineStatusWithoutCallerDeadlineFallsBackToRelay(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	stallSetup(t, cp, stageGetIceServers)
@@ -715,6 +727,7 @@ func requireHandleClosed(t *testing.T, err error) {
 }
 
 func TestCloseOperationErrorNormalizesSessionMarker(t *testing.T) {
+	t.Parallel()
 	for _, op := range []func(error) error{
 		func(err error) error { return (&execOp{}).dpErr(err, false) },
 		(&readOp{}).dpErr,
@@ -747,6 +760,7 @@ var closeCases = []struct {
 // operation with errHandleClosed. The close is not a channel failure, so the
 // handle stays on peer-to-peer, asks for no relay grant and logs no fall back.
 func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
+	t.Parallel()
 	for _, op := range heldOps {
 		for _, cc := range closeCases {
 			t.Run(op.name+"/"+cc.name, func(t *testing.T) {
@@ -800,6 +814,7 @@ func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
 // TestCloseDuringOperationOnForcedPeerToPeer checks that forced
 // peer-to-peer ends the operation with errHandleClosed too.
 func TestCloseDuringOperationOnForcedPeerToPeer(t *testing.T) {
+	t.Parallel()
 	for _, op := range heldOps {
 		for _, cc := range closeCases {
 			t.Run(op.name+"/"+cc.name, func(t *testing.T) {
@@ -844,6 +859,7 @@ func failedPrecondition() error {
 // operation succeeds on the relay and the handle moves to the relay, so a
 // later operation does not call GetIceServers again.
 func TestGetIceServersFailedPreconditionMovesToRelay(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.iceGate = make(chan struct{})
@@ -879,6 +895,7 @@ func TestGetIceServersFailedPreconditionMovesToRelay(t *testing.T) {
 // failed_precondition from OpenSession (a sandbox that is not RUNNING) still
 // uses the relay for that attempt only: the next operation sets up again.
 func TestOpenSessionFailedPreconditionUsesRelayOnce(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.mu.Lock()
@@ -907,6 +924,7 @@ func TestOpenSessionFailedPreconditionUsesRelayOnce(t *testing.T) {
 // peer-to-peer handle returns the failed_precondition of either setup step
 // with its status code and asks for no relay grant.
 func TestForcedPeerToPeerFailedPreconditionReturnsTheError(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -956,6 +974,7 @@ func failSetupStage(cp *fakeCP, stage stalledStage, err error) {
 // control plane like any other: the operation succeeds on the relay and the
 // handle moves to the relay.
 func TestWireCanceledStatusMovesToRelay(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -984,6 +1003,7 @@ func TestWireCanceledStatusMovesToRelay(t *testing.T) {
 // peer-to-peer handle returns the canceled status of either setup step with
 // its code and asks for no relay grant.
 func TestForcedPeerToPeerWireCanceledStatusReturnsTheError(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -1009,6 +1029,7 @@ func TestForcedPeerToPeerWireCanceledStatusReturnsTheError(t *testing.T) {
 // the caller while GetIceServers or OpenSession is in flight stays terminal:
 // the operation returns the context error and asks for no relay grant.
 func TestCallerCanceledDuringSetupEndsTheOperation(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -1038,6 +1059,7 @@ func TestCallerCanceledDuringSetupEndsTheOperation(t *testing.T) {
 // TestGetIceServersTerminalErrorsEndTheOperation checks that the errors that
 // are terminal for OpenSession are terminal for GetIceServers too.
 func TestGetIceServersTerminalErrorsEndTheOperation(t *testing.T) {
+	t.Parallel()
 	billing := billingErr(ownsandv1.BillingReason_BILLING_REASON_SUSPENDED)
 	for _, err := range []error{
 		connect.NewError(connect.CodeUnauthenticated, errors.New("bad credential")),

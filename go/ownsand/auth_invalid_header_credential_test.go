@@ -91,6 +91,7 @@ func requireInvalidCredentialError(t *testing.T, err error) {
 }
 
 func TestInvalidHeaderCredentialFailsBeforeTransport(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		// build returns the client options and a function that reports the
@@ -157,6 +158,7 @@ func TestInvalidHeaderCredentialFailsBeforeTransport(t *testing.T) {
 }
 
 func TestCheckBearerAcceptsOnlyValidHeaderValues(t *testing.T) {
+	t.Parallel()
 	for _, tok := range []string{"osk_test-secret-key-value", "a b", " tab\there ", "café", "eyJhbGciOi.eyJzdWIi.c2ln"} {
 		if err := checkBearer(tok); err != nil {
 			t.Errorf("a valid credential was rejected: %v", err)
@@ -179,6 +181,7 @@ type stubStreamConn struct {
 func (s *stubStreamConn) RequestHeader() http.Header { return s.header }
 
 func TestInvalidHeaderCredentialFailsStreamingInterceptor(t *testing.T) {
+	t.Parallel()
 	rt := &forbiddenTransport{}
 	ts := &countingTokenSource{script: []string{badCredential}}
 	c, err := New(Options{BaseURL: "https://127.0.0.1:1", TokenSource: ts.fn, OrganizationID: mustID(t), HTTPClient: &http.Client{Transport: rt}})
@@ -200,6 +203,7 @@ func TestInvalidHeaderCredentialFailsStreamingInterceptor(t *testing.T) {
 }
 
 func TestInvalidHeaderCredentialEndsRelayAuthorization(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	ts := &countingTokenSource{script: []string{badCredential}}
 	c, err := New(Options{BaseURL: cp.srv.URL, TokenSource: ts.fn, OrganizationID: cp.orgID, Transport: TransportRelay})
@@ -228,6 +232,7 @@ func TestInvalidHeaderCredentialEndsRelayAuthorization(t *testing.T) {
 }
 
 func TestInvalidHeaderCredentialKeepsAutomaticHandleEligibleForPeerSetup(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = func(_ []string, e *fakeExec) { e.finish(exitedEvent(3)) }
 	// The first call (GetIceServers) is invalid; every later call is valid.
@@ -278,6 +283,7 @@ func TestInvalidHeaderCredentialKeepsAutomaticHandleEligibleForPeerSetup(t *test
 }
 
 func TestValidCredentialStillRetriesAfterTransportInterruption(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	// The control plane drops the response of the first CreateSandbox.
 	cp.dropCreates = 1

@@ -87,6 +87,7 @@ func (f *fixture) noticeState(id string) noticeState {
 // email, defers the notification without counting an attempt, lets a newer
 // due notification run first and resumes with the unfinished recipient only.
 func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	interrupted, key := f.queueNotice(acct)
@@ -313,6 +314,7 @@ func TestNotificationDeadlineResumesAfterLastStartedRecipient(t *testing.T) {
 // A pass that ends after the claim and before the first send defers the
 // notification, too.
 func TestNotificationCanceledPassDefers(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	id, _ := f.queueNotice(acct)
@@ -337,6 +339,7 @@ func TestNotificationCanceledPassDefers(t *testing.T) {
 // Two workers never process one notification at the same time: while the
 // first worker is in a send, the second finds nothing due.
 func TestNotificationConcurrentWorkersSkipLeased(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	id, _ := f.queueNotice(acct)
@@ -473,6 +476,7 @@ func TestNotificationConcurrentWorkersSkipLeased(t *testing.T) {
 // A worker that died after the claim releases the notification when the lease
 // ends, and the retry skips the recipients that are recorded.
 func TestNotificationLeaseExpiryRetries(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	id, _ := f.queueNotice(acct)
@@ -494,6 +498,7 @@ func TestNotificationLeaseExpiryRetries(t *testing.T) {
 // An ordinary failure of the first recipient keeps the retry backoff and
 // still sends to the later recipient with its key.
 func TestNotificationOrdinaryFailureKeepsBackoff(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	id, key := f.queueNotice(acct)

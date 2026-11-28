@@ -85,6 +85,21 @@ func waitForExportVerification(parent context.Context, deadline time.Time, readV
 	return nil
 }
 
+func waitForExportCleanup(parent context.Context, deadline time.Time, keys func() []string) error {
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	defer cancel()
+
+	var lastKeys []string
+	err := pollPhase(ctx, time.Second, func(context.Context) (bool, error) {
+		lastKeys = keys()
+		return len(lastKeys) == 0, nil
+	})
+	if err != nil {
+		return fmt.Errorf("wait for failed export object cleanup (last keys: %v): %w", lastKeys, err)
+	}
+	return nil
+}
+
 // TestSnapshotExportVerification exports two snapshots with the real agent
 // and the fake S3 store. The control plane verifies the parts of the first
 // against the store and keeps it EXPORTED; the second has a part replaced by
@@ -94,6 +109,7 @@ func waitForExportVerification(parent context.Context, deadline time.Time, readV
 // the verification (15 minutes after the export) is skipped by moving
 // export_verify_after into the past in the database.
 func TestSnapshotExportVerification(t *testing.T) {
+	t.Parallel()
 	s := newStack(t, stackOptions{agents: 1, objects: true})
 	ctx := s.ctx(8 * time.Minute)
 	c := s.apiKeyClient(ownsand.TransportRelay)
@@ -181,15 +197,15 @@ func TestSnapshotExportVerification(t *testing.T) {
 		t.Fatalf("the failed export keeps %d manifest parts, want none (they would still be billed)", parts)
 	}
 	// The clean-up worker deletes the failed attempt's objects.
-	for len(s.objects.keys(badPrefix)) != 0 {
-		if time.Now().After(deadline.Add(exportVerifyWait)) {
-			t.Fatalf("objects of the failed attempt remain: %v", s.objects.keys(badPrefix))
-		}
-		time.Sleep(time.Second)
+	if err := waitForExportCleanup(ctx, deadline.Add(exportVerifyWait), func() []string {
+		return s.objects.keys(badPrefix)
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestWaitForExportVerificationCancelsPostgresQuery(t *testing.T) {
+	t.Parallel()
 	parent, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	conn, err := pgx.Connect(parent, dbtest.URL(t))

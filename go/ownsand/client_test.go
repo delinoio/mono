@@ -26,6 +26,7 @@ func envOf(m map[string]string) func(string) (string, bool) {
 }
 
 func TestNewReadsEnvironment(t *testing.T) {
+	t.Parallel()
 	c, err := New(Options{LookupEnv: envOf(map[string]string{EnvAPIKey: "osk_x", EnvOrganization: "org"})})
 	if err != nil {
 		t.Fatal(err)
@@ -49,6 +50,7 @@ func TestNewReadsEnvironment(t *testing.T) {
 }
 
 func TestOrganizationRequiredBeforeSend(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c, err := New(Options{BaseURL: cp.srv.URL, APIKey: testAPIKey, LookupEnv: envOf(nil)})
 	if err != nil {
@@ -78,6 +80,7 @@ func TestOrganizationRequiredBeforeSend(t *testing.T) {
 }
 
 func TestTokenSource(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	calls := 0
 	c, err := New(Options{BaseURL: cp.srv.URL, OrganizationID: cp.orgID, TokenSource: func(context.Context) (string, error) {
@@ -96,6 +99,7 @@ func TestTokenSource(t *testing.T) {
 }
 
 func TestCredentialsOnlyToConfiguredOrigin(t *testing.T) {
+	t.Parallel()
 	var mu sync.Mutex
 	var leaked []string
 	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +125,7 @@ func TestCredentialsOnlyToConfiguredOrigin(t *testing.T) {
 }
 
 func TestCredentialRedactedInErrors(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.mu.Lock()
 	cp.echoToken = true
@@ -154,6 +159,7 @@ func validParams() CreateSandboxParams {
 }
 
 func TestCreateSandboxValidatesBeforeRequest(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)
 	cases := map[string]func(*CreateSandboxParams){
@@ -182,6 +188,7 @@ func TestCreateSandboxValidatesBeforeRequest(t *testing.T) {
 }
 
 func TestCreateSandboxRetriesLostResponseWithSameKey(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.mu.Lock()
 	cp.dropCreates = 2
@@ -207,6 +214,7 @@ func TestCreateSandboxRetriesLostResponseWithSameKey(t *testing.T) {
 }
 
 func TestCreateSandboxStalledRetryEndsWithWindow(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.mu.Lock()
 	cp.dropCreates = 1
@@ -273,6 +281,7 @@ func awaitCreateCalls(ctx context.Context, cp *fakeCP, n int) bool {
 }
 
 func TestAwaitCreateCallsStopsWhenTheCallNeverArrives(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -289,6 +298,7 @@ func TestAwaitCreateCallsStopsWhenTheCallNeverArrives(t *testing.T) {
 }
 
 func TestCreateSandboxCancelDuringStalledRetryIsTerminal(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.mu.Lock()
 	cp.dropCreates = 1
@@ -331,6 +341,7 @@ func TestCreateSandboxCancelDuringStalledRetryIsTerminal(t *testing.T) {
 }
 
 func TestSandboxLifecycle(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)
 	s := cp.handle(t, c)
@@ -347,6 +358,7 @@ func TestSandboxLifecycle(t *testing.T) {
 }
 
 func TestParseTransport(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportAuto, TransportPeerToPeer, TransportRelay} {
 		got, err := ParseTransport(tr.String())
 		if err != nil || got != tr {
@@ -359,6 +371,7 @@ func TestParseTransport(t *testing.T) {
 }
 
 func TestRedactKeepsWireProvenance(t *testing.T) {
+	t.Parallel()
 	c := &Client{}
 	detail, err := connect.NewErrorDetail(&ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE})
 	if err != nil {
@@ -399,6 +412,7 @@ func TestRedactKeepsWireProvenance(t *testing.T) {
 }
 
 func TestOrganizationDefaultKeepsCallerRequestUnchanged(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	newClient := func(org string) *Client {
 		c, err := New(Options{BaseURL: cp.srv.URL, APIKey: testAPIKey, OrganizationID: org, LookupEnv: func(string) (string, bool) { return "", false }})
@@ -447,6 +461,7 @@ func mixedUUID(id string) string {
 }
 
 func TestSandboxHandleStoresCanonicalLowercaseID(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)
 	for name, spelling := range map[string]string{
@@ -467,6 +482,7 @@ func TestSandboxHandleStoresCanonicalLowercaseID(t *testing.T) {
 }
 
 func TestSandboxHandleKeepsInvalidID(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)
 	for _, bad := range []string{"x", "", upperUUID(cp.sandboxID) + "0", "0190A5B2-0000-4000-8000-000000000000"} {
@@ -490,6 +506,7 @@ func TestSandboxHandleKeepsInvalidID(t *testing.T) {
 // handle that sent the given spelling would fail the peer-to-peer frame check
 // or the relay digest check.
 func TestSandboxHandleUppercaseIDUsesCanonicalSpellingOnEveryPath(t *testing.T) {
+	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
 			cp := newFakeCP(t)

@@ -111,6 +111,7 @@ func holdOrganizationDeletion(t *testing.T, env *testenv.Env, orgID string) func
 // left no record and no audit or control event. UpdateAgentVersionPolicy
 // runs with and without a stored policy row.
 func TestCreateRPCAfterInFlightOrganizationDeletionCommits(t *testing.T) {
+	t.Parallel()
 	rpcs := append([]orgMutationRPC{}, orgMutationRPCs...)
 	rpcs = append(rpcs, policyRPC("UpdateAgentVersionPolicyWithExistingRow", ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD))
 	for _, rpc := range rpcs {
@@ -165,6 +166,7 @@ func TestCreateRPCAfterInFlightOrganizationDeletionCommits(t *testing.T) {
 // permission_denied or not_found, without waiting for the deletion: the
 // authorization runs before the lock.
 func TestCreateRPCKeepsAuthorizationPrecedenceDuringDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	commit := holdOrganizationDeletion(t, env, org.ID)
@@ -205,6 +207,7 @@ func TestCreateRPCKeepsAuthorizationPrecedenceDuringDeletion(t *testing.T) {
 // TestCreateRPCWithoutDeletionIsUnchanged runs every RPC against an
 // organization that nobody deletes and expects success and its record.
 func TestCreateRPCWithoutDeletionIsUnchanged(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	for _, rpc := range orgMutationRPCs {
@@ -231,6 +234,7 @@ func TestCreateRPCWithoutDeletionIsUnchanged(t *testing.T) {
 // transaction, and expects only success or not_found: never an internal
 // error from a foreign key violation or a deadlock.
 func TestConcurrentCreateRPCAndInFlightDeletion(t *testing.T) {
+	t.Parallel()
 	for _, rpc := range orgMutationRPCs {
 		t.Run(rpc.name, func(t *testing.T) {
 			env := testenv.New(t)

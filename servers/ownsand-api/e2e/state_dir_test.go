@@ -14,6 +14,7 @@ import (
 // reported with its path, and a directory that cannot be read is an error
 // instead of an empty result. It needs no Hyper-V host.
 func TestRemainingStatePaths(t *testing.T) {
+	t.Parallel()
 	t.Run("empty directory", func(t *testing.T) {
 		left, err := remainingStatePaths(t.TempDir())
 		if err != nil || len(left) != 0 {

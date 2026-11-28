@@ -19,6 +19,7 @@ const (
 // live process are found, and a record under the literal first-attempt name
 // api (the dead first attempt) is not a substitute.
 func TestRequireAPILogMessagesReadsTheLiveControlPlane(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	appendLines(logs,
 		"api: "+`{"level":"ERROR","msg":"server_exited","startup_failure_reason":"address_in_use"}`,
@@ -42,6 +43,7 @@ func TestRequireAPILogMessagesReadsTheLiveControlPlane(t *testing.T) {
 // Without a retry the process is api and the behavior is the one of the
 // literal name.
 func TestRequireAPILogMessagesWithoutRetry(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	appendLines(logs, "api"+pausedLine, "api"+resumedLine, "api-attempt2"+pausedLine)
 	s := &stack{logs: logs, api: &proc{name: "api"}}

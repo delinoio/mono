@@ -58,6 +58,7 @@ func unlinkAuditTimes(t *testing.T, env *testenv.Env, accountID string) []time.T
 // it holds the lock, so the window that started during the wait still
 // belongs to the account, and a later window is not attributed.
 func TestUnlinkTimeFollowsAccountLockWait(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
@@ -116,6 +117,7 @@ func TestUnlinkTimeFollowsAccountLockWait(t *testing.T) {
 // same link: it finds the row closed after the wait and keeps the unlink
 // time of the first unlink and the audit log as they are.
 func TestUnlinkOfClosedLinkAfterLockWaitChangesNothing(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	org := newOrg(t)

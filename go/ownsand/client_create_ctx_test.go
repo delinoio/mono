@@ -107,6 +107,7 @@ func newFailingCreateClient(t *testing.T, hook func(attempt int)) (*Client, *fai
 // ended during that RPC, whichever error the RPC itself reported, and that no
 // further attempt follows.
 func TestCreateSandboxReturnsCallerContextErrorAfterFailedAttempt(t *testing.T) {
+	t.Parallel()
 	t.Run("initial attempt canceled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -146,6 +147,7 @@ func TestCreateSandboxReturnsCallerContextErrorAfterFailedAttempt(t *testing.T) 
 // uses the same idempotency key. The window of one nanosecond has ended once
 // the first failure is recorded, so the test waits for nothing.
 func TestCreateSandboxRetryWindowEndsWithLastFailureForLiveCaller(t *testing.T) {
+	t.Parallel()
 	c, f := newFailingCreateClient(t, nil)
 	c.timing.createRetryWindow = 1
 	sb, err := c.CreateSandbox(context.Background(), validParams())
@@ -174,6 +176,7 @@ func TestCreateSandboxRetryWindowEndsWithLastFailureForLiveCaller(t *testing.T) 
 // succeeds, and that a live caller context never turns them into a context
 // error.
 func TestCreateSandboxRetriesWithOneKeyWithinWindow(t *testing.T) {
+	t.Parallel()
 	c, _ := newFailingCreateClient(t, nil)
 	f := &succeedingAfterCreateClient{failures: 2}
 	c.sandboxes = f
@@ -238,6 +241,7 @@ func (f *scriptedCreateClient) checkRequests(t *testing.T, count int) {
 }
 
 func TestCreateSandboxRejectsSuccessAfterCallerEnds(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		attempts  int
@@ -284,6 +288,7 @@ func TestCreateSandboxRejectsSuccessAfterCallerEnds(t *testing.T) {
 }
 
 func TestCreateSandboxChecksRetryWindowAtSettlement(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		attempts int
@@ -360,6 +365,7 @@ func (c *createSettlementContext) Err() error {
 }
 
 func TestCreateSandboxChecksElapsedTimeWithoutTimerCancellation(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		c := newCreateContextClient(t)
 		caller := &createSettlementContext{Context: context.Background()}

@@ -79,6 +79,7 @@ func r2RetryControl(t *testing.T, env *testenv.Env, prefix string, pages []r2Lis
 }
 
 func TestCleanupAndExportVerificationRetryInvalidR2Listings(t *testing.T) {
+	t.Parallel()
 	const truncatedPage = `<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>`
 	for _, tc := range []struct {
 		name  string

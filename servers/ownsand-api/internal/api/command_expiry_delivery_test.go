@@ -19,6 +19,7 @@ import (
 // A one-time snapshot of the received commands at that point is empty, while
 // the bounded wait finds the command once the agent reads again.
 func TestPauseCommandIDCapturedAfterRPCReturns(t *testing.T) {
+	t.Parallel()
 	timing := commandExpiryTiming()
 	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
 	ctx := context.Background()

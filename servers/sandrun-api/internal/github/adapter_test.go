@@ -25,6 +25,7 @@ func (c prepareExecClient) Exec(ctx context.Context, _ string, p ownsand.ExecPar
 }
 
 func TestPrepareResult(t *testing.T) {
+	t.Parallel()
 	zero, nonzero, signal := int64(0), int64(1), int32(15)
 	transportErr := errors.New("connection lost")
 	const timedOut = "the GitHub Actions runner installation timed out"
@@ -75,6 +76,7 @@ func TestPrepareResult(t *testing.T) {
 }
 
 func TestPrepareDeadline(t *testing.T) {
+	t.Parallel()
 	const timeout = time.Minute
 	const contextTimeout = timeout + 30*time.Second
 	a := &Adapter{l: &Layer{gh: &githubapi.Client{}, timing: Timing{PrepareTimeout: timeout}}}

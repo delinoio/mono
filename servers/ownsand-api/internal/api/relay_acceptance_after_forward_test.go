@@ -172,6 +172,7 @@ func (c *acceptanceCall) wait(t *testing.T, within time.Duration) acceptanceResu
 // frame waits 1.6 s behind a blocked writer (longer than the 1 s acceptance
 // timeout), and the agent's prompt answer after the release is accepted.
 func TestRelayAcceptanceStartsAfterTheRequestWasWritten(t *testing.T) {
+	t.Parallel()
 	c := startStalledExec(t, 20*time.Second, serveExec)
 	c.holdWriter(t, 1600*time.Millisecond)
 	c.relay.ResumeReads()
@@ -186,6 +187,7 @@ func TestRelayAcceptanceStartsAfterTheRequestWasWritten(t *testing.T) {
 // with deadline_exceeded (not unavailable from the acceptance timeout, which
 // has not started) and that the agent sees the stream close.
 func TestRelayForwardingDeadlineHoldsBehindBlockedWriter(t *testing.T) {
+	t.Parallel()
 	c := startStalledExec(t, bodyDelay+1500*time.Millisecond, serveExec)
 	r := c.wait(t, 5*time.Second)
 	if testenv.Code(r.err) != connect.CodeDeadlineExceeded {
@@ -216,6 +218,7 @@ func (c *acceptanceCall) fillerStream() uint64 {
 // unavailable one acceptance timeout after the write, not after the call
 // started.
 func TestRelayAcceptanceTimeoutAfterWrittenRequest(t *testing.T) {
+	t.Parallel()
 	c := startStalledExec(t, 20*time.Second, func(*testenv.RelayStream, *ownsandv1.DataFrame) {})
 	c.holdWriter(t, 600*time.Millisecond)
 	c.relay.ResumeReads()

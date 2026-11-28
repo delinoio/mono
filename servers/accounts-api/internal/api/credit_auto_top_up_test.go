@@ -40,6 +40,7 @@ func storedAutoTopUp(t *testing.T, env *testenv.Env, accountID string) (enabled 
 }
 
 func TestUpdateAutoTopUpSettingsUsesMonthAfterAccountLock(t *testing.T) {
+	t.Parallel()
 	midnight := time.Date(2027, time.January, 1, 0, 0, 0, 0, time.UTC)
 	requestTime := midnight.Add(-100 * time.Millisecond)
 	for _, tc := range []struct {
@@ -121,6 +122,7 @@ func TestUpdateAutoTopUpSettingsUsesMonthAfterAccountLock(t *testing.T) {
 // the settings change nor its audit event behind, because the response is
 // read before the commit.
 func TestUpdateAutoTopUpSettingsReadFailureRollsBack(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
@@ -174,6 +176,7 @@ func TestUpdateAutoTopUpSettingsReadFailureRollsBack(t *testing.T) {
 // with distinct caps. Each response must hold the settings that its own
 // request wrote, not those of a writer that committed after it.
 func TestUpdateAutoTopUpSettingsResponsesMatchOwnWrites(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)

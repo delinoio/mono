@@ -83,6 +83,7 @@ func holdAndBlockForShare(t *testing.T, pool *pgxpool.Pool) {
 // statement in one database of a server and then in a second one, and checks
 // that each database counts only its own waiter.
 func TestForShareLockWaitersAreScopedToTheDatabase(t *testing.T) {
+	t.Parallel()
 	a := dbtest.New(t)
 	b := dbtest.New(t)
 	ctx := context.Background()
@@ -106,6 +107,7 @@ func TestForShareLockWaitersAreScopedToTheDatabase(t *testing.T) {
 // TestForShareLockWaitersReportQueryError checks that a failing activity
 // query surfaces its error instead of reading as zero waiters.
 func TestForShareLockWaitersReportQueryError(t *testing.T) {
+	t.Parallel()
 	d := dbtest.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -122,6 +124,7 @@ const (
 )
 
 func TestForShareLockWaitersCleanUpAfterFailure(t *testing.T) {
+	t.Parallel()
 	if failure := os.Getenv(signingLockFailureEnv); failure != "" {
 		failSigningLockFixture(t, failure)
 		return

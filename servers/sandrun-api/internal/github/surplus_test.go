@@ -24,6 +24,7 @@ import (
 )
 
 func TestSurplusLeaseRecovery(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		warm  int32
@@ -278,6 +279,7 @@ func TestSurplusAcknowledgesBusyRenamedRunner(t *testing.T) {
 }
 
 func TestSurplusAcknowledgmentPreservesNewerGeneration(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -331,6 +333,7 @@ func TestSurplusAcknowledgmentPreservesNewerGeneration(t *testing.T) {
 }
 
 func TestSurplusLocksOrganizationBeforeInstallation(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))

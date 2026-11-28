@@ -18,6 +18,7 @@ import (
 )
 
 func TestApplyRemoteAfterBlockStartMigration(t *testing.T) {
+	t.Parallel()
 	localStart := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
 	oldDeadline := localStart.Add(72 * time.Hour)
 	firstRemote := localStart.Add(time.Hour)

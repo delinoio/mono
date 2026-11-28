@@ -10,6 +10,7 @@ import (
 
 // The tombstone set takes an explicit clock, so these tests never wait.
 func TestTombstoneTakeConsumes(t *testing.T) {
+	t.Parallel()
 	var ts tombstones
 	now := time.Unix(1000, 0)
 	ts.add("a", now)
@@ -25,6 +26,7 @@ func TestTombstoneTakeConsumes(t *testing.T) {
 }
 
 func TestTombstoneExpiresAfterSessionLifetime(t *testing.T) {
+	t.Parallel()
 	var ts tombstones
 	now := time.Unix(1000, 0)
 	ts.add("a", now)
@@ -45,6 +47,7 @@ func TestTombstoneExpiresAfterSessionLifetime(t *testing.T) {
 }
 
 func TestTombstoneCapDropsOldest(t *testing.T) {
+	t.Parallel()
 	var ts tombstones
 	now := time.Unix(1000, 0)
 	for i := 0; i < maxTombstones+3; i++ {
@@ -64,6 +67,7 @@ func TestTombstoneCapDropsOldest(t *testing.T) {
 }
 
 func TestTombstoneTakeRemovesQueueEntryOutOfOrder(t *testing.T) {
+	t.Parallel()
 	var ts tombstones
 	now := time.Unix(1000, 0)
 	for i := 0; i < maxTombstones; i++ {
@@ -89,6 +93,7 @@ func TestTombstoneTakeRemovesQueueEntryOutOfOrder(t *testing.T) {
 }
 
 func TestTombstoneReaddAfterTake(t *testing.T) {
+	t.Parallel()
 	var ts tombstones
 	now := time.Unix(1000, 0)
 	ts.add("head", now)

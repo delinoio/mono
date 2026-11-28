@@ -240,6 +240,7 @@ func (f *stateReportLockFixture) requireNoDeadlockLog(t *testing.T) {
 // removal must finish without a deadlock, and the report, which waits for
 // the device row first, must find the removed device and change nothing.
 func TestStateReportAfterDeviceRemovalWins(t *testing.T) {
+	t.Parallel()
 	f := newStateReportLockFixture(t)
 	release := f.hold(t, "SELECT 1 FROM device_sessions WHERE device_id = $1 FOR UPDATE")
 	defer release()
@@ -265,6 +266,7 @@ func TestStateReportAfterDeviceRemovalWins(t *testing.T) {
 // device row lock first. The removal waits, then ends the sandbox with
 // DEVICE_REMOVED. The report is applied before it.
 func TestRemovalAfterStateReportWins(t *testing.T) {
+	t.Parallel()
 	f := newStateReportLockFixture(t)
 	release := f.hold(t, "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE")
 	defer release()
@@ -296,6 +298,7 @@ func TestRemovalAfterStateReportWins(t *testing.T) {
 // database instead of calling RemoveDevice, which would close the channel
 // itself.
 func TestStateReportOfRemovedDeviceChangesNothing(t *testing.T) {
+	t.Parallel()
 	f := newStateReportLockFixture(t)
 	ctx := context.Background()
 	if _, err := f.env.DB.Pool.Exec(ctx, "UPDATE devices SET state = $2 WHERE device_id = $1", f.dev.ID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED)); err != nil {

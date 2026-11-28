@@ -22,6 +22,7 @@ import (
 // without any other order, so without the per-channel configuration lock the
 // older limits reach the agent last and the agent keeps them.
 func TestConfigurationSendsKeepTheNewestLimitsLast(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

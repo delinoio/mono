@@ -48,6 +48,7 @@ func offersReceived(agent *testenv.FakeAgent) (n int) {
 // The event found no session to end, so the check after the registration must
 // reject the call: no offer reaches the agent and no session stays behind.
 func TestOpenSessionRevokedKeyBeforeRegistration(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	plane := env.App.Plane
@@ -79,6 +80,7 @@ func TestOpenSessionRevokedKeyBeforeRegistration(t *testing.T) {
 // counterpart: the revoked key gets no grant, a grant that an earlier call of
 // the same authorization registered stays, and a user caller is unchanged.
 func TestAuthorizeRelayRevokedKeyBeforeRegistration(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	plane := env.App.Plane
@@ -132,6 +134,7 @@ func TestAuthorizeRelayRevokedKeyBeforeRegistration(t *testing.T) {
 // reach that step after the deletion removed its sandboxes, so the test calls
 // the step itself. A live key passes and a user is checked by membership.
 func TestReauthorizeAPIKeyOrganizationDeleted(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	svc := env.App.Service

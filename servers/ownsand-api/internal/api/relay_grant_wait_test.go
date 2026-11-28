@@ -36,6 +36,7 @@ func awaitRelayGrant(grants <-chan *ownsandv1.RelayGrant, rpcResult <-chan error
 }
 
 func TestAwaitRelayGrant(t *testing.T) {
+	t.Parallel()
 	closed := make(chan time.Time)
 	close(closed)
 	never := make(chan time.Time)

@@ -153,6 +153,7 @@ const (
 	notifyDetailBalance                           = "balance_usd_micros"
 	notifyDetailExpireTime                        = "expire_time"
 	notifyDetailPaymentScope                      = "scope"
+	notifyDetailSubscriptionID                    = "paddle_subscription_id"
 	notifyScopeSubscription                       = "subscription"
 	notifyScopeTopUp                              = "top_up"
 	notifyDetailService                           = "service"

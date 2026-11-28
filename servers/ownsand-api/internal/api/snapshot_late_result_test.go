@@ -47,6 +47,7 @@ func (g *snapshotCreateCommitGate) TraceQueryEnd(ctx context.Context, _ *pgx.Con
 }
 
 func TestLateCreateSnapshotResultAfterDelete(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		failCreate bool
@@ -180,6 +181,7 @@ func TestLateCreateSnapshotResultAfterDelete(t *testing.T) {
 }
 
 func TestSnapshotResultForExistingSnapshotKeepsCopy(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name            string
 		settledByReport bool

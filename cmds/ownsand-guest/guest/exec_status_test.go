@@ -31,6 +31,7 @@ func requireExplicitZeroExit(ev *ownsandv1.ExecEvent, wantTimedOut bool) error {
 }
 
 func TestRequireExplicitSuccess(t *testing.T) {
+	t.Parallel()
 	exited := func(x *ownsandv1.ExecExited) *ownsandv1.ExecEvent {
 		return &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: x}}
 	}

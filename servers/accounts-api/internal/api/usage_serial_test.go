@@ -157,6 +157,7 @@ func usageLedgerEntries(t *testing.T, env *testenv.Env, accountID string) int {
 // link and charges its billing account once, instead of storing the report
 // as unattributed.
 func TestReportUsageWaitsForConcurrentFirstLink(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
@@ -197,6 +198,7 @@ func TestReportUsageWaitsForConcurrentFirstLink(t *testing.T) {
 // organization without any link: it is stored as unattributed, and a retry
 // returns the stored row.
 func TestReportUsageWithoutLinkStaysUnattributed(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := newOrg(t)
 	start := alignToWindowEnd(env)
@@ -221,6 +223,7 @@ func TestReportUsageWithoutLinkStaysUnattributed(t *testing.T) {
 // back into the window of the stored unattributed report, which a retry
 // replays.
 func TestFirstLinkTimeFollowsCommittedUnattributedReport(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
@@ -270,6 +273,7 @@ func TestFirstLinkTimeFollowsCommittedUnattributedReport(t *testing.T) {
 // starts before the end of the window. The retry replays the stored
 // unattributed result and the later link is not charged.
 func TestFirstLinkStartsInsideWindowOfEarlyUnattributedReport(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)
@@ -316,6 +320,7 @@ func TestFirstLinkStartsInsideWindowOfEarlyUnattributedReport(t *testing.T) {
 // holds the organization lock and then fails. The report that waited for the
 // lock finds no link and is stored as unattributed.
 func TestReportUsageIgnoresFirstLinkThatRollsBack(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	subscribe(t, env, f)

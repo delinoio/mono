@@ -25,6 +25,7 @@ const (
 )
 
 func TestWindowStart(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ in, want string }{
 		{"2026-11-21T10:00:00Z", "2026-11-21T10:00:00Z"},
 		{"2026-11-21T10:04:59.999Z", "2026-11-21T10:00:00Z"},
@@ -42,6 +43,7 @@ func TestWindowStart(t *testing.T) {
 }
 
 func TestSealCutoff(t *testing.T) {
+	t.Parallel()
 	base := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
 	cases := []struct {
 		now  time.Duration
@@ -61,6 +63,7 @@ func TestSealCutoff(t *testing.T) {
 }
 
 func TestAmount(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		meter ownsandv1.BillingMeter
@@ -113,6 +116,7 @@ func TestAmount(t *testing.T) {
 }
 
 func TestCeilMulDiv(t *testing.T) {
+	t.Parallel()
 	if q, ok := ceilMulDiv(math.MaxUint64, math.MaxUint64, 1); ok || q != 0 {
 		t.Fatalf("overflowing quotient: %d %v", q, ok)
 	}
@@ -125,6 +129,7 @@ func TestCeilMulDiv(t *testing.T) {
 }
 
 func TestMeterMappings(t *testing.T) {
+	t.Parallel()
 	want := map[ownsandv1.BillingMeter]struct {
 		accounts accountsv1.Meter
 		id       string
@@ -151,6 +156,7 @@ func TestMeterMappings(t *testing.T) {
 }
 
 func TestRecorder(t *testing.T) {
+	t.Parallel()
 	r := NewRecorder(slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	org := "0190f3a4-0000-7000-8000-000000000001"
 	at := time.Date(2026, 11, 21, 10, 2, 0, 0, time.UTC)
@@ -202,6 +208,7 @@ func takeBatch(t *testing.T, r *Recorder) map[counterKey]int64 {
 // ID and counters until it is acknowledged, and that counts recorded
 // meanwhile form a separate live batch instead of joining it.
 func TestRecorderBatchSurvivesAFailedFlush(t *testing.T) {
+	t.Parallel()
 	r := NewRecorder(slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	org := "0190f3a4-0000-7000-8000-000000000001"
 	at := time.Date(2026, 11, 21, 10, 2, 0, 0, time.UTC)

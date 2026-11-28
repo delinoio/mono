@@ -75,6 +75,7 @@ func calledFromCreateSandbox() bool {
 // sees as expired stays reusable by the write, and an active key still
 // replays.
 func TestCreateIdempotencyExpiryBoundary(t *testing.T) {
+	t.Parallel()
 	script := &createSandboxClock{}
 	env := testenv.New(t, func(o *app.Options) {
 		script.base = o.Now

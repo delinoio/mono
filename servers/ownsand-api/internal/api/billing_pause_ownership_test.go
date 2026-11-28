@@ -144,6 +144,7 @@ func (f *lateFixture) resumeLatePause(t *testing.T, c *testenv.Clients, sandboxI
 // revision. The sandbox must stay owned by billing, so the next pass resumes
 // it. The resume must not retire the ownership either.
 func TestLateBillingPauseKeepsOwnershipAfterRecovery(t *testing.T) {
+	t.Parallel()
 	f := newLateFixture(t)
 	c := f.org.OwnerClient
 	id := f.create(t)
@@ -169,6 +170,7 @@ func TestLateBillingPauseKeepsOwnershipAfterRecovery(t *testing.T) {
 }
 
 func TestBillingPauseChannelLostBeforeConfirmation(t *testing.T) {
+	t.Parallel()
 	f := newLateFixture(t, func(o *app.Options) { o.Timing.CommandWait = 30 * time.Second })
 	id := f.create(t)
 	setOrgPhase(t, f.env, f.org, billing.PhaseSuspended)
@@ -202,6 +204,7 @@ func TestBillingPauseChannelLostBeforeConfirmation(t *testing.T) {
 }
 
 func TestBillingPauseExplicitRejection(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	id := f.create(t)
 	f.agent.SetOnCommand(func(a *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
@@ -230,6 +233,7 @@ func TestBillingPauseExplicitRejection(t *testing.T) {
 // through a sandbox update, not a command result, after the channel of the
 // command was replaced and the record of the command expired.
 func TestLateBillingPauseUpdateAfterChannelReplacement(t *testing.T) {
+	t.Parallel()
 	f := newLateFixture(t)
 	c := f.org.OwnerClient
 	id := f.create(t)
@@ -313,6 +317,7 @@ func (f *lateFixture) invokeCallerPause(ctx context.Context, sandboxID string) e
 }
 
 func TestCallerPauseEnqueueFailureKeepsBillingOwnership(t *testing.T) {
+	t.Parallel()
 	for _, closeChannel := range []bool{true, false} {
 		name := "request canceled"
 		if closeChannel {
@@ -371,6 +376,7 @@ func TestCallerPauseEnqueueFailureKeepsBillingOwnership(t *testing.T) {
 }
 
 func TestCallerPauseCommitSurvivesRequestCancellation(t *testing.T) {
+	t.Parallel()
 	f := newTracedLateFixture(t)
 	id := f.create(t)
 	f.suspendedPass(t, id)
@@ -396,6 +402,7 @@ func TestCallerPauseCommitSurvivesRequestCancellation(t *testing.T) {
 }
 
 func TestCallerPauseCommitFailurePreservesResultReconciliation(t *testing.T) {
+	t.Parallel()
 	f := newLateFixture(t)
 	id := f.create(t)
 	f.suspendedPass(t, id)
@@ -438,6 +445,7 @@ func TestCallerPauseCommitFailurePreservesResultReconciliation(t *testing.T) {
 // command record is gone, and checks that the persisted mark alone makes the
 // recovery resume the late PAUSED state.
 func TestLateBillingPauseUpdateAfterControlPlaneReplacement(t *testing.T) {
+	t.Parallel()
 	f := newLateFixture(t)
 	id := f.create(t)
 	f.suspendedPass(t, id)
@@ -467,6 +475,7 @@ func TestLateBillingPauseUpdateAfterControlPlaneReplacement(t *testing.T) {
 // two pauses while the sandbox stays RUNNING, and finishes them on opposite
 // sides of the recovery's resume. Both resulting pauses are resumed.
 func TestTwoInFlightBillingPausesKeepOwnership(t *testing.T) {
+	t.Parallel()
 	f := newLateFixture(t)
 	c := f.org.OwnerClient
 	id := f.create(t)
@@ -497,6 +506,7 @@ func TestTwoInFlightBillingPausesKeepOwnership(t *testing.T) {
 // passes and a second suspension and recovery. A sandbox that a caller paused
 // before the suspension never gets a mark.
 func TestCallerPauseAfterRecoveryTakesOwnership(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	c := f.org.OwnerClient
 	owned, callerFirst := f.create(t), f.create(t)
@@ -551,6 +561,7 @@ func TestCallerPauseAfterRecoveryTakesOwnership(t *testing.T) {
 // the idempotent caller pause clears the mark without another command, so the
 // recovery leaves it paused.
 func TestCallerPauseOfLateBillingPauseTakesOwnership(t *testing.T) {
+	t.Parallel()
 	f := newLateFixture(t)
 	c := f.org.OwnerClient
 	id := f.create(t)
@@ -581,6 +592,7 @@ func TestCallerPauseOfLateBillingPauseTakesOwnership(t *testing.T) {
 // sandbox without a pending delete resumes and keeps its mark. Nothing clears
 // a mark while the organization stays suspended.
 func TestBillingOwnershipBoundaries(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	c := f.org.OwnerClient
 	callerPaused, resumable, deleting, deleted, failed := f.create(t), f.create(t), f.create(t), f.create(t), f.create(t)
@@ -642,6 +654,7 @@ func TestBillingOwnershipBoundaries(t *testing.T) {
 // pauses it again, with the mark it already has, when the organization is
 // suspended again.
 func TestBillingOwnershipSurvivesOfflineAndResuspension(t *testing.T) {
+	t.Parallel()
 	f := newMarkerFixture(t)
 	c := f.org.OwnerClient
 	id := f.create(t)

@@ -31,6 +31,7 @@ func forgedPageToken(t *testing.T, rpc, scope, after string, afterTime int64) st
 // client chose: an out-of-range time or a NUL byte is invalid_argument and
 // never reaches Postgres, while the positions that the server issues work.
 func TestForgedPageTokenPositions(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	org := newOrg(t)

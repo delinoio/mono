@@ -133,6 +133,7 @@ func TestBillingLinkCleanupTimesOut(t *testing.T) {
 }
 
 func TestBillingLinkCompletesAfterCallerCancellation(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "canceled-after-commit")
 	gate := f.fake.Hold(accountstest.MethodLinkOrganization)
 	t.Cleanup(gate.Release)

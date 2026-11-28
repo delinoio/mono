@@ -223,6 +223,7 @@ func (b *gatedBody) Close() error { return nil }
 // replacement's receive timeout and echo probe keep their own bytes. A read
 // of the active response, also a partial frame, still refreshes its own clock.
 func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
+	t.Parallel()
 	// A fixed monotonic clock makes the refresh visible and deterministic.
 	const readAt = 2 * time.Hour
 	clock := func() time.Duration { return readAt }
@@ -302,6 +303,7 @@ func TestRelayLateReadOfRetiredResponseKeepsReplacementClock(t *testing.T) {
 // the Connect request to the connection that it installs, so the byte
 // counting of its response reaches that connection.
 func TestRelayConnectBindsResponseBodyToConnection(t *testing.T) {
+	t.Parallel()
 	var bound atomic.Pointer[rconn]
 	e := newRelayEnvWrapped(t, Timing{}, RelayLimits{}, func(base http.RoundTripper) http.RoundTripper {
 		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -325,6 +327,7 @@ func TestRelayConnectBindsResponseBodyToConnection(t *testing.T) {
 // exec whose caller closed the stream is released when the exec ends, not
 // only after the 60-second idle time.
 func TestRelayGrantReleasedWhenDetachedExecEnds(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/sh", "-c", "sleep 1; echo done")
 	g := e.execGrant(req)
@@ -348,6 +351,7 @@ func TestRelayGrantReleasedWhenDetachedExecEnds(t *testing.T) {
 // second stream attaches under it and gets the retained exit event, and the
 // grant is released only after that attach ended.
 func TestRelayEmptyStreamKeepsAttachGrantOfEndedExec(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/sh", "-c", "echo done")
 	g := e.execGrant(req)
@@ -400,6 +404,7 @@ func TestRelayEmptyStreamKeepsAttachGrantOfEndedExec(t *testing.T) {
 // TestRelayUnusedAttachGrantReleasedAtIdle checks that a grant that no
 // request used still releases at its idle time.
 func TestRelayUnusedAttachGrantReleasedAtIdle(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	g, _ := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC, newID(t), nil, 15*time.Minute, 30*time.Minute, "")
 	e.dp.relay.sweep(time.Now())
@@ -417,6 +422,7 @@ func TestRelayUnusedAttachGrantReleasedAtIdle(t *testing.T) {
 // the agent sends no frame back and does not mark the grant done, so the exec
 // continues and its grant is released only when the exec ends.
 func TestRelayErrorFrameFromControlPlaneEndsTheStreamQuietly(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/sh", "-c", "sleep 1; echo done")
 	g := e.execGrant(req)
@@ -452,6 +458,7 @@ func TestRelayErrorFrameFromControlPlaneEndsTheStreamQuietly(t *testing.T) {
 }
 
 func TestRelayExecAndRelease(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/echo", "hi")
 	g := e.execGrant(req)
@@ -498,6 +505,7 @@ func TestRelayExecAndRelease(t *testing.T) {
 }
 
 func TestRelayGrantChecksCapsReplacementCloseAndRevocation(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{MaxStreamsPerGrant: 1, MaxGrants: 2})
 	long := e.execReq("/bin/sh", "-c", "sleep 30")
 	g1 := e.execGrant(long)
@@ -569,6 +577,7 @@ func TestRelayGrantChecksCapsReplacementCloseAndRevocation(t *testing.T) {
 }
 
 func TestRelayWindows(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/sh", "-c", "head -c 400000 /dev/zero")
 	g := e.execGrant(req)
@@ -609,6 +618,7 @@ collect:
 }
 
 func TestRelayChannelLossAndNewCredential(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/sh", "-c", "sleep 30")
 	g := e.execGrant(req)
@@ -650,6 +660,7 @@ func TestRelayChannelLossAndNewCredential(t *testing.T) {
 }
 
 func TestRelayExpiryAndDeadline(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{AdmissionTolerance: 100 * time.Millisecond}, RelayLimits{})
 	req := e.execReq("/bin/sh", "-c", "sleep 30")
 	expired, _ := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, req.GetExecId(), relaybinding.ExecDigest(req), 300*time.Millisecond, time.Hour, "")
@@ -678,6 +689,7 @@ func TestRelayExpiryAndDeadline(t *testing.T) {
 }
 
 func TestRelayReceiveTimeoutProbeAndIdle(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReceiveTimeout: 700 * time.Millisecond, KeepaliveInterval: time.Hour, ProbeIdle: time.Hour}, RelayLimits{})
 	e.execGrant(e.execReq("/bin/true"))
 	e.conn()
@@ -733,6 +745,7 @@ func newManualConn(t *testing.T, timing Timing, queue int) (*relay, *rconn) {
 // while recent inbound bytes keep the connection, and a free slot gets the
 // keepalive once it is due.
 func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
+	t.Parallel()
 	r, c := newManualConn(t, Timing{KeepaliveInterval: time.Second, ReceiveTimeout: time.Minute}, 2)
 	mono := time.Hour
 	c.clock = func() time.Duration { return mono }
@@ -793,6 +806,7 @@ func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
 // interval follows monotonic time and ignores wall-clock steps, that a
 // successful send resets it, and that a full queue skips it without waiting.
 func TestRelayWatchdogKeepaliveUsesMonotonicClock(t *testing.T) {
+	t.Parallel()
 	r, c := newManualConn(t, Timing{KeepaliveInterval: 30 * time.Second, ReceiveTimeout: time.Hour}, 2)
 	var mono time.Duration
 	c.clock = func() time.Duration { return mono }
@@ -848,6 +862,7 @@ func TestRelayWatchdogKeepaliveUsesMonotonicClock(t *testing.T) {
 // either direction cannot move the decision. A received byte, also one of an
 // incomplete frame (noteRecv), restarts the interval.
 func TestRelayReceiveTimeoutUsesMonotonicClock(t *testing.T) {
+	t.Parallel()
 	r, c := newManualConn(t, Timing{KeepaliveInterval: time.Hour, ReceiveTimeout: time.Minute}, 2)
 	mono := time.Hour
 	c.clock = func() time.Duration { return mono }
@@ -881,6 +896,7 @@ func TestRelayReceiveTimeoutUsesMonotonicClock(t *testing.T) {
 // as an answer exactly when it arrived at or after the probe on the same
 // clock. An unanswered probe cancels the connection after ProbeTimeout.
 func TestRelayProbeUsesMonotonicClock(t *testing.T) {
+	t.Parallel()
 	r, c := newManualConn(t, Timing{ProbeIdle: 30 * time.Second, ProbeTimeout: 10 * time.Millisecond}, 2)
 	mono := time.Hour
 	c.clock = func() time.Duration { return mono }
@@ -943,6 +959,7 @@ func TestRelayProbeUsesMonotonicClock(t *testing.T) {
 // timeout, so a missing precondition fails the test with its own message
 // instead of passing on the redial.
 func TestRelayWatchdogRedialsWhenWriterIsBlocked(t *testing.T) {
+	t.Parallel()
 	const (
 		keepalive      = 100 * time.Millisecond
 		receiveTimeout = 2 * time.Second
@@ -1087,6 +1104,7 @@ func TestRelayWatchdogRedialsWhenWriterIsBlocked(t *testing.T) {
 // running loop dials for the new channel, whether the old attempt fails
 // (and backs off) or succeeds after the channel changed.
 func TestRelayLoopFollowsNewChannel(t *testing.T) {
+	t.Parallel()
 	for _, authFails := range []bool{true, false} {
 		t.Run(fmt.Sprintf("auth_fails=%v", authFails), func(t *testing.T) {
 			e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
@@ -1133,6 +1151,7 @@ func TestRelayLoopFollowsNewChannel(t *testing.T) {
 // channel closes, so a grant of the next channel gets a fresh credential
 // request and a connection without waiting for the old response.
 func TestRelayCancelsPendingCredentialOnChannelLoss(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
 	var calls atomic.Int32
 	entered := make(chan struct{}, 1)
@@ -1176,6 +1195,7 @@ func TestRelayCancelsPendingCredentialOnChannelLoss(t *testing.T) {
 // A credential that arrives after its channel closed cannot start a
 // connection, and a new channel without a live grant makes no dial.
 func TestRelayDropsCredentialOfClosedChannel(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
 	var calls atomic.Int32
 	waitForRelease, entered, release := newRelayCredentialGate(t)
@@ -1220,6 +1240,7 @@ func (e *relayEnv) noConn(d time.Duration) {
 // A relay endpoint that fails every connection at once gets attempts with
 // back-off, not an unthrottled reconnect loop.
 func TestRelayErrorKeepsBackoff(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: time.Second}, RelayLimits{})
 	var attempts atomic.Int32
 	e.cp.SetRelayHandler(func(context.Context, string, *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
@@ -1329,6 +1350,7 @@ func (f *revokeFixture) streamCount() int {
 // loop calls revoke before it acknowledges the revocation, so the return
 // of revoke is what keeps the channel available.
 func TestRelayRevokeWithFullQueueClosesConnection(t *testing.T) {
+	t.Parallel()
 	f := newRevokeFixture(t, 2)
 	g, streams := f.grant(time.Hour, time.Now(), 1, 2)
 	_, other := f.grant(time.Hour, time.Now(), 3)
@@ -1380,6 +1402,7 @@ func TestRelayRevokeWithFullQueueClosesConnection(t *testing.T) {
 // not change the normal path: the revoked stream gets its REVOKED frame
 // and the connection and an unrelated grant stay in use.
 func TestRelayRevokeWithQueueSpaceSendsRevoked(t *testing.T) {
+	t.Parallel()
 	f := newRevokeFixture(t, 4)
 	g, streams := f.grant(time.Hour, time.Now(), 1)
 	_, other := f.grant(time.Hour, time.Now(), 3)
@@ -1410,6 +1433,7 @@ func TestRelayRevokeWithQueueSpaceSendsRevoked(t *testing.T) {
 // slot the stream ends with EXPIRED, with a full queue the sweep returns
 // and closes the connection.
 func TestRelayDeadlineSweepWithQueueSpaceAndFullQueue(t *testing.T) {
+	t.Parallel()
 	past := time.Now().Add(-time.Hour)
 	t.Run("queue space", func(t *testing.T) {
 		f := newRevokeFixture(t, 4)
@@ -1445,6 +1469,7 @@ func TestRelayDeadlineSweepWithQueueSpaceAndFullQueue(t *testing.T) {
 // relay connection: the named grant's stream gets REVOKED and an exec of an
 // unrelated grant on the same connection continues to its result.
 func TestRelayRevokeKeepsUnrelatedGrantRunning(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	long := e.execReq("/bin/sh", "-c", "sleep 30")
 	g1 := e.execGrant(long)
@@ -1511,6 +1536,7 @@ func newRelayCredentialGate(t *testing.T) (func(context.Context) error, <-chan s
 }
 
 func TestRelayCredentialGate(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name            string
 		explicitRelease bool
@@ -1571,6 +1597,7 @@ func (e *relayEnv) revokeGrant(g *ownsandv1.RelayGrant) {
 // A grant that is revoked while the credential is requested leaves no live
 // grant, so the loop makes no dial and stops; a later grant starts again.
 func TestRelayNoDialWhenOnlyGrantRevokedDuringCredentialRequest(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
 	g, release := e.gatedGrant(t)
 	e.revokeGrant(g)
@@ -1590,6 +1617,7 @@ func TestRelayNoDialWhenOnlyGrantRevokedDuringCredentialRequest(t *testing.T) {
 
 // Another live grant of the same channel keeps the one relay connection.
 func TestRelayDialsWhenAnotherGrantLiveAfterCredentialRequest(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
 	g, release := e.gatedGrant(t)
 	g2 := e.execGrant(e.execReq("/bin/true"))
@@ -1606,6 +1634,7 @@ func TestRelayDialsWhenAnotherGrantLiveAfterCredentialRequest(t *testing.T) {
 // still ends a connection that receives no byte, while a received byte keeps
 // the connection.
 func TestRelayProbeWithFullQueueSkipsEchoAndKeepsTimeout(t *testing.T) {
+	t.Parallel()
 	timing := Timing{ProbeIdle: 50 * time.Millisecond, ProbeTimeout: 200 * time.Millisecond}
 	for _, answered := range []bool{false, true} {
 		f := newRevokeFixture(t, 2)
@@ -1660,6 +1689,7 @@ func closeFrame(id uint64) *ownsandv1.DataFrame {
 // queue drains, and that no frame of the closed stream is queued afterwards,
 // while the connection keeps serving other streams.
 func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
+	t.Parallel()
 	f, _, st := blockedSendFixture(t)
 	frame := datapath.MustNewFrame(1, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("payload")}}})
 	result := make(chan error, 1)
@@ -1746,6 +1776,7 @@ func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
 // because nothing cancels the connection. Every wait has a bound that only
 // guards against a hang.
 func TestRelayStreamCloseCancelsBlockedRequestAccepted(t *testing.T) {
+	t.Parallel()
 	const bound = 10 * time.Second
 	f, g, st := blockedSendFixture(t)
 	f.r.mu.Lock()
@@ -1840,6 +1871,7 @@ func (e *relayEnv) waitNoStreams(g *ownsandv1.RelayGrant) {
 // and the control plane then agree on which grants can still admit a first
 // request frame.
 func TestRelayIdleGrantWaitsForAdmissionToleranceAfterExpiry(t *testing.T) {
+	t.Parallel()
 	const expiry = 15 * time.Minute
 	for _, tc := range []string{"never_opened", "stream_closed_before_expiry", "request_accepted_then_closed"} {
 		t.Run(tc, func(t *testing.T) {
@@ -1890,6 +1922,7 @@ func TestRelayIdleGrantWaitsForAdmissionToleranceAfterExpiry(t *testing.T) {
 // without waiting for the admission tolerance, and that an open stream keeps
 // the grant.
 func TestRelayGrantWhoseLastStreamEndedAfterExpiryReleasesAtOnce(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 30 * time.Second}, RelayLimits{})
 	g, _ := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, newID(t), nil, 15*time.Minute, time.Hour, "")
 	received := e.grantReceived(g)
@@ -1920,6 +1953,7 @@ func TestRelayGrantWhoseLastStreamEndedAfterExpiryReleasesAtOnce(t *testing.T) {
 // request 2.2 seconds after its installation, without a release message, and
 // is released as soon as that stream ends after the expiry.
 func TestRelayExpiredGrantAdmitsStreamWithinToleranceInRealTime(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 8 * time.Second}, RelayLimits{})
 	req := e.execReq("/bin/sh", "-c", "sleep 30")
 	start := time.Now()
@@ -1955,6 +1989,7 @@ func TestRelayExpiredGrantAdmitsStreamWithinToleranceInRealTime(t *testing.T) {
 // blocks), and when the writer took the marker but its request close never
 // returns, the connection is still canceled at the deadline.
 func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T) {
+	t.Parallel()
 	const deadline = 300 * time.Millisecond
 	for _, tc := range []string{"marker_never_dequeued", "marker_taken_close_request_stalls", "queue_full"} {
 		t.Run(tc, func(t *testing.T) {
@@ -2024,6 +2059,7 @@ func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T)
 // connection that ends before the deadline is not canceled again: the timer
 // stops with the connection's context.
 func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
+	t.Parallel()
 	_, c := newManualConn(t, Timing{}, 4)
 	c.flushDeadline = 200 * time.Millisecond
 	canceled := make(chan struct{}, 2)
@@ -2046,6 +2082,7 @@ func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
 // agent must still cancel the connection at the shutdown deadline while
 // the old peer drains. A live grant on the new channel gets a connection.
 func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
+	t.Parallel()
 	const flush = time.Second
 	e := newRelayEnv(t, Timing{FlushDeadline: flush, ReceiveTimeout: time.Hour, KeepaliveInterval: time.Hour, ProbeIdle: time.Hour}, RelayLimits{})
 	var (
@@ -2204,6 +2241,7 @@ func (e *relayEnv) loseChannelWithBufferedPeer(s *session) {
 // leaves before the request side closes, and the connection ends by that
 // request close, well before the shutdown deadline.
 func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
+	t.Parallel()
 	const flush = 10 * time.Second
 	e := newRelayEnv(t, Timing{FlushDeadline: flush}, RelayLimits{})
 	type event struct {
@@ -2335,6 +2373,7 @@ func waitAttempts(t *testing.T, get func() []relayAttempt, n int) []relayAttempt
 // failures had raised it to ReconnectMax, and that the delay of a streak of
 // short connections keeps growing.
 func TestRelayLongLivedConnectionRestartsBackoff(t *testing.T) {
+	t.Parallel()
 	// Three connections that fail at once raise the back-off to 800 ms; the
 	// fourth lives longer than the reset time; the fifth is the redial.
 	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
@@ -2354,6 +2393,7 @@ func TestRelayLongLivedConnectionRestartsBackoff(t *testing.T) {
 // TestRelayRepeatedLongLivedConnectionsStayAtFirstStep checks that every
 // connection that lives for the reset time starts its own back-off.
 func TestRelayRepeatedLongLivedConnectionsStayAtFirstStep(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
 	get := scriptedRelay(e, 400*time.Millisecond)
 	e.execGrant(e.execReq("/bin/true"))
@@ -2370,6 +2410,7 @@ func TestRelayRepeatedLongLivedConnectionsStayAtFirstStep(t *testing.T) {
 // end before the reset time never restart the back-off, even when each of
 // them lived for a while.
 func TestRelayShortConnectionsKeepBackoffGrowing(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
 	get := scriptedRelay(e, 100*time.Millisecond)
 	e.execGrant(e.execReq("/bin/true"))
@@ -2384,6 +2425,7 @@ func TestRelayShortConnectionsKeepBackoffGrowing(t *testing.T) {
 // before any connection opened counts as no open time, so even a very short
 // reset time never restarts the back-off of a failing credential request.
 func TestRelayCredentialFailureKeepsBackoffAtShortReset(t *testing.T) {
+	t.Parallel()
 	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 20 * time.Millisecond}, RelayLimits{})
 	var attempts atomic.Int32
 	hook := func(context.Context) error {

@@ -143,6 +143,7 @@ func hasImportCommand(agent *testenv.FakeAgent, snapID string) bool {
 // row creates the row once, so a targeted create uses the copy without an
 // import and DeleteSnapshot reaches the device.
 func TestStateReportRecoversImportedSnapshotCopy(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -202,6 +203,7 @@ func TestStateReportRecoversImportedSnapshotCopy(t *testing.T) {
 // TestStateReportOmittedCopyLosesRow checks that a tracked copy that a
 // report omits still loses its row.
 func TestStateReportOmittedCopyLosesRow(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	_, _ = setupAgent(t, env, org, nil)
@@ -225,6 +227,7 @@ func TestStateReportOmittedCopyLosesRow(t *testing.T) {
 // is not recovered: a snapshot of another organization, a removed device,
 // an incompatible host, and a snapshot that is not exported.
 func TestStateReportCreatesNoCopyRow(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -319,6 +322,7 @@ func waitLockWaiters(t *testing.T, env *testenv.Env, want int) {
 // test transaction and queues a state report and a snapshot deletion behind
 // it in both orders.
 func TestStateReportCopyRecoveryCommitOrder(t *testing.T) {
+	t.Parallel()
 	setup := func(t *testing.T) (*testenv.Env, *testenv.Org, *testenv.FakeAgent, string, pgx.Tx) {
 		env := testenv.New(t)
 		org := env.NewOrg("alice")
@@ -450,6 +454,7 @@ func waitSnapshotReport(t *testing.T, done <-chan snapshotReportOutcome) snapsho
 // so that the report and the deletion queue behind it, releases it, and
 // expects both to finish without a deadlock.
 func TestStateReportCopyRecoveryWithOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -502,6 +507,7 @@ func TestStateReportCopyRecoveryWithOrganizationDeletion(t *testing.T) {
 // the report finds no organization and changes nothing, like a report of a
 // removed device.
 func TestStateReportAfterOrganizationDeletionCommits(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

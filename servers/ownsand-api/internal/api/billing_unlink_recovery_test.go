@@ -53,6 +53,7 @@ func (f *linkAttemptFixture) wantAccountRequired(t *testing.T, blockedSince time
 }
 
 func TestBillingOwnerUnlinkRecovery(t *testing.T) {
+	t.Parallel()
 	outage := connect.NewError(connect.CodeUnavailable, errors.New("injected Accounts outage"))
 	for _, fault := range []struct {
 		name string
@@ -125,6 +126,7 @@ func TestBillingOwnerUnlinkRecovery(t *testing.T) {
 }
 
 func TestBillingLinkPresenceSerializesRelink(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "ivy", func(o *app.Options) { o.WriteOwnerUnlinks = false })
 	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
 		t.Fatal(err)
@@ -165,6 +167,7 @@ func TestBillingLinkPresenceSerializesRelink(t *testing.T) {
 }
 
 func TestBillingOwnerUnlinkSerializesRelink(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "ivy")
 	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
 		t.Fatal(err)
@@ -193,6 +196,7 @@ func TestBillingOwnerUnlinkSerializesRelink(t *testing.T) {
 }
 
 func TestBillingOwnerUnlinkSurvivesCancellation(t *testing.T) {
+	t.Parallel()
 	f := newLinkAttemptFixture(t, "ivy")
 	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
 		t.Fatal(err)

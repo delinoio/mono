@@ -56,6 +56,7 @@ func (tr *agentPolicyLookupTracer) TraceQueryStart(ctx context.Context, _ *pgx.C
 func (*agentPolicyLookupTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestControlRetryAgentUpdatePolicy(t *testing.T) {
+	t.Parallel()
 	const (
 		hold = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD
 		pin  = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_PIN

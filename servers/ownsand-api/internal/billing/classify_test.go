@@ -82,6 +82,7 @@ func generatedProcedures(t *testing.T) map[string][2]string {
 // TestClassifyEveryGeneratedProcedure fails when a generated RPC is not
 // classified, or is classified differently from the contract table.
 func TestClassifyEveryGeneratedProcedure(t *testing.T) {
+	t.Parallel()
 	procedures := generatedProcedures(t)
 	for procedure, names := range procedures {
 		t.Run(procedure, func(t *testing.T) {
@@ -115,6 +116,7 @@ func TestClassifyEveryGeneratedProcedure(t *testing.T) {
 }
 
 func TestRPCClassMeter(t *testing.T) {
+	t.Parallel()
 	if m, ok := RPCClassA.Meter(); !ok || m != classA {
 		t.Errorf("class A meter = %v %v", m, ok)
 	}

@@ -46,6 +46,7 @@ func countRows(t *testing.T, env *testenv.Env, query string, args ...any) int {
 // enrollment token is still unused: the same token then enrolls a device
 // with valid values.
 func TestEnrollRejectsNULBeforeTheTransaction(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	f := newEnrollOrgLockFixture(t, env)
@@ -76,6 +77,7 @@ func TestEnrollRejectsNULBeforeTheTransaction(t *testing.T) {
 // TestUpdateAgentVersionPolicyRejectsNUL pins a version with a NUL byte and
 // expects invalid_argument and no stored policy; a valid pin still works.
 func TestUpdateAgentVersionPolicyRejectsNUL(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -99,6 +101,7 @@ func TestUpdateAgentVersionPolicyRejectsNUL(t *testing.T) {
 // invalid_argument and no sandbox. A connected device makes the unfixed
 // server reach the insert, where the jsonb column fails.
 func TestCreateSandboxRejectsNULInLabels(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -130,6 +133,7 @@ func TestCreateSandboxRejectsNULInLabels(t *testing.T) {
 // their roles stay unchanged. A user_id with another control character is
 // still an ordinary unknown member.
 func TestMemberRPCsRejectNULUserID(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

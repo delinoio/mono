@@ -28,6 +28,7 @@ func (p presenceClient) GetOrganizationBilling(ctx context.Context, req *connect
 }
 
 func TestLinkPresenceRotatesPastErrorsAndStopsOnLeaseLoss(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	start := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, start)
@@ -112,6 +113,7 @@ func TestLinkPresenceRotatesPastErrorsAndStopsOnLeaseLoss(t *testing.T) {
 }
 
 func TestOwnerUnlinkIntentCannotRemoveSameAccountReplacement(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	f := newStatusFixture(t, time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC))
 	f.addOrg(t, org1)

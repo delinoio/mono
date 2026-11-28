@@ -109,6 +109,7 @@ func requireStreamRejected(t *testing.T, c *caller, id uint64) {
 // frame, registers nothing and reaches no dispatcher; the session stays open
 // and takes a request again once a stream ended.
 func TestSessionStreamLimit(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	_, disp, c, s := limitedSession(t, w, SessionLimits{MaxStreamsPerSession: 2}, Timing{})
 	c.send(datapath.MustNewFrame(1, w.sandbox, w.execReq("/bin/true")))
@@ -139,6 +140,7 @@ func TestSessionStreamLimit(t *testing.T) {
 // A rejected stream holds no slot, so it does not keep the session out of the
 // idle rule.
 func TestSessionStreamLimitKeepsIdleRule(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	_, disp, c, s := limitedSession(t, w, SessionLimits{MaxStreamsPerSession: 1}, Timing{SessionIdle: time.Hour})
 	c.send(datapath.MustNewFrame(1, w.sandbox, w.execReq("/bin/true")))
@@ -179,6 +181,7 @@ func requireSessionCapacityAnswer(t *testing.T, a *ownsandv1.SignalingAnswer, id
 // an SDP body and leaves no session; the sessions that exist stay open and
 // the slot of an ended session is free again.
 func TestOfferSessionLimit(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp, _, c, s := limitedSession(t, w, SessionLimits{MaxSessions: 1}, Timing{})
 	ch := newChannel(1)
@@ -208,6 +211,7 @@ func TestOfferSessionLimit(t *testing.T) {
 // A session whose offer still gathers candidates counts against the limit,
 // and the rejected offer creates no session.
 func TestOfferSessionLimitCountsSessionsInSetup(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := New(Options{Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), SessionLimits: SessionLimits{MaxSessions: 1}, IncludeLoopback: true, InterfaceFilter: loopbackOnly})
 	dp.Configure([]string{silentSTUN(t)})
@@ -230,6 +234,7 @@ func TestOfferSessionLimitCountsSessionsInSetup(t *testing.T) {
 }
 
 func TestOfferSessionReservationDuringConstruction(t *testing.T) {
+	t.Parallel()
 	revoke := func(dp *DataPlane, ch *fakeChannel, id string) {
 		dp.Revoke(ch, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: id}})
 	}

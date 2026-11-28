@@ -151,6 +151,8 @@ func (f *reopenFixture) stageAndFailClose(t *testing.T) {
 }
 
 func TestWriteCloseClosesModeFile(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (closeStagingFile)
+	// that other tests read.
 	if runtime.GOOS == "windows" {
 		t.Skip("the finish path keeps a duplicate staging handle on Unix")
 	}
@@ -189,6 +191,8 @@ func TestWriteCloseClosesModeFile(t *testing.T) {
 }
 
 func TestWriteFinishRetryReopensStagingFileAfterFailedClose(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (closeStagingFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0)
 	f.stageAndFailClose(t)
 
@@ -204,6 +208,8 @@ func TestWriteFinishRetryReopensStagingFileAfterFailedClose(t *testing.T) {
 }
 
 func TestWriteChunkReopensStagingFileAfterFailedClose(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (closeStagingFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0o444)
 	f.stageAndFailClose(t)
 
@@ -257,6 +263,8 @@ func (f *reopenFixture) stageAndFailFinish(t *testing.T) {
 }
 
 func TestWriteFinishRetryReopensStagingFileAfterFailedReopen(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0o444)
 	f.stageAndFailFinish(t)
 
@@ -284,6 +292,8 @@ func TestWriteFinishRetryReopensStagingFileAfterFailedReopen(t *testing.T) {
 }
 
 func TestWriteChunkReopensStagingFileAfterFailedReopen(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0)
 	f.stageAndFailFinish(t)
 
@@ -310,6 +320,8 @@ func TestWriteChunkReopensStagingFileAfterFailedReopen(t *testing.T) {
 }
 
 func TestWriteReopenFailureStaysRetryable(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0)
 	f.stageAndFailFinish(t)
 
@@ -332,6 +344,8 @@ func TestWriteReopenFailureStaysRetryable(t *testing.T) {
 }
 
 func TestWriteRetiresWriteWhenStagingFileIsGone(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0)
 	f.stageAndFailFinish(t)
 	tmp := tempPath(f.target, f.id)
@@ -370,6 +384,8 @@ func TestWriteRetiresWriteWhenStagingFileIsGone(t *testing.T) {
 }
 
 func TestWriteRetiresWriteWhenReopenReportsMissingFile(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0)
 	f.stageAndFailFinish(t)
 	failReopen(t, 1, fs.ErrNotExist)
@@ -382,6 +398,8 @@ func TestWriteRetiresWriteWhenReopenReportsMissingFile(t *testing.T) {
 }
 
 func TestWriteDoesNotReopenReplacedStagingFile(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
+	// that other tests read.
 	f := newReopenFixture(t, 0)
 	f.stageAndFailFinish(t)
 	if f.entry(t).identity == nil {
@@ -393,6 +411,8 @@ func TestWriteDoesNotReopenReplacedStagingFile(t *testing.T) {
 }
 
 func TestWriteDoesNotReopenReplacedStagingFileDuringModeRestore(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (chmodStagingFile, openStagingFile, renameFile)
+	// that other tests read.
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not restore staging permissions")
 	}
@@ -474,6 +494,8 @@ func (f *reopenFixture) checkRejectedReplacement(t *testing.T) {
 }
 
 func TestWriteFinishRetryWithoutOwnerReadOrWriteMode(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
+	// that other tests read.
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows ignores the finish mode")
 	}

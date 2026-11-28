@@ -55,6 +55,7 @@ func waitHeartbeatAck(agent *testenv.FakeAgent, seq uint64) {
 // is not eligible, and that the replacement channel of the agent reconciles,
 // is acknowledged and becomes eligible for placement.
 func TestFailedInitialStateReportClosesChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
@@ -119,6 +120,7 @@ func TestFailedInitialStateReportClosesChannel(t *testing.T) {
 // that applies keeps the channel open, is acknowledged once and leaves the
 // device eligible.
 func TestHealthyInitialStateReportKeepsChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev, agent := setupAgent(t, env, org, nil)
@@ -144,6 +146,7 @@ func TestHealthyInitialStateReportKeepsChannel(t *testing.T) {
 // an already reconciled channel is only logged: the channel stays open and
 // eligible, no acknowledgement is sent for the report and heartbeats continue.
 func TestFailedLaterStateReportKeepsChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	dev, agent := setupAgent(t, env, org, nil)

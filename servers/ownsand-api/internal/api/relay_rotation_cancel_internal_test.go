@@ -229,6 +229,7 @@ func stdout(data string) *ownsandv1.ExecEvent {
 // queued. The call is logged as canceled, the queued frame stays unsent, and
 // the agent receives a stream close frame.
 func TestRotationAfterRequestCancelReturnsContextError(t *testing.T) {
+	t.Parallel()
 	h := newRotationHarness(t, pastRotation, nil)
 	h.feed(&ownsandv1.RequestAccepted{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -273,6 +274,7 @@ func (c *expiringContext) Err() error {
 // TestRotationAfterRequestDeadlineReturnsDeadlineExceeded is the same check
 // for a request context that ended with its deadline.
 func TestRotationAfterRequestDeadlineReturnsDeadlineExceeded(t *testing.T) {
+	t.Parallel()
 	h := newRotationHarness(t, pastRotation, nil)
 	h.feed(&ownsandv1.RequestAccepted{})
 	ctx := &expiringContext{Context: context.Background()}
@@ -295,6 +297,7 @@ func TestRotationAfterRequestDeadlineReturnsDeadlineExceeded(t *testing.T) {
 // TestRotationWithEmptyQueueAfterRequestCancel checks cancellation at
 // rotation with no queued frame after the accepted event.
 func TestRotationWithEmptyQueueAfterRequestCancel(t *testing.T) {
+	t.Parallel()
 	timing := pastRotation
 	timing.Keepalive = 4 * time.Millisecond // the handler wakes every millisecond
 	h := newRotationHarness(t, timing, nil)
@@ -316,6 +319,7 @@ func TestRotationWithEmptyQueueAfterRequestCancel(t *testing.T) {
 // deadline is not forwarded, no extra event is sent and the agent still gets
 // its stream close frame.
 func TestRotationWithLiveContextReturnsOK(t *testing.T) {
+	t.Parallel()
 	h := newRotationHarness(t, pastRotation, nil)
 	h.feed(&ownsandv1.RequestAccepted{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -340,6 +344,7 @@ func TestRotationWithLiveContextReturnsOK(t *testing.T) {
 // request acceptance, so returning credit for delivered output must wait
 // for room. Rotation still returns OK and reserves a close frame.
 func TestRotationWhileReturningRelayCredit(t *testing.T) {
+	t.Parallel()
 	timing := pastRotation
 	timing.Rotation = time.Second
 	writerBlocked := make(chan struct{})
@@ -429,6 +434,7 @@ func (c *queuedReplyContext) Err() error {
 }
 
 func TestRotationInFutureWithQueuedTerminalReply(t *testing.T) {
+	t.Parallel()
 	timing := pastRotation
 	timing.Rotation = 2 * time.Hour // the harness sets Started one hour in the past
 	for _, tc := range []struct {

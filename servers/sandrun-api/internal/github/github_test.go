@@ -43,6 +43,7 @@ type githubClients = sandrunv1connect.GitHubServiceClient
 // TestJobLifecycle runs one GITHUB_JOB from the queued event to the
 // completed event with the fake GitHub API and the fake OwnSand.
 func TestJobLifecycle(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	inst := w.link(t, 501, "acme")
 	if inst.GetState() != sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_ACTIVE || inst.GetGithubRunnerGroupId() != 1 || inst.GetRunnerGroupName() != "Default" ||
@@ -147,6 +148,7 @@ func TestJobLifecycle(t *testing.T) {
 }
 
 func TestJITRegistrationSkipsStartWhenWindowsACLPreparationFails(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	guest := sandrunv1.GuestOs_GUEST_OS_WINDOWS
 	w.os.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
@@ -178,6 +180,7 @@ func TestJITRegistrationSkipsStartWhenWindowsACLPreparationFails(t *testing.T) {
 }
 
 func TestJITRegistrationSkipsStartWhenPreparationTimesOutWithZeroExit(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	install := github.InstallCommand(sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.os.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
@@ -209,6 +212,7 @@ func TestJITRegistrationSkipsStartWhenPreparationTimesOutWithZeroExit(t *testing
 }
 
 func TestJobNoEligibleDevice(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -244,6 +248,7 @@ func TestJobNoEligibleDevice(t *testing.T) {
 }
 
 func TestJobSandboxCreateRejected(t *testing.T) {
+	t.Parallel()
 	for _, code := range []connect.Code{connect.CodeUnavailable, connect.CodeInvalidArgument, connect.CodeNotFound, connect.CodePermissionDenied} {
 		t.Run(code.String(), func(t *testing.T) {
 			w := newGHWorld(t, worldOpts{manualDispatch: true})
@@ -277,6 +282,7 @@ func TestJobSandboxCreateRejected(t *testing.T) {
 }
 
 func TestJobCanceledDuringNoEligibleDeviceCreate(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	// Keep the in-flight runner through the completion webhook's surplus check.
@@ -333,6 +339,7 @@ func TestJobCanceledDuringNoEligibleDeviceCreate(t *testing.T) {
 // of an existing GITHUB_JOB profile (optionally with self-hosted) create
 // requests.
 func TestJobMatching(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -360,6 +367,7 @@ func TestJobMatching(t *testing.T) {
 }
 
 func TestMatchProfileName(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		labels []string
 		want   string
@@ -382,6 +390,7 @@ func TestMatchProfileName(t *testing.T) {
 // TestPoolsPerInstallation: each installation is its own runner pool; a
 // runner of one pool never takes the request of another.
 func TestPoolsPerInstallation(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.link(t, 502, "beta")
@@ -419,6 +428,7 @@ func TestPoolsPerInstallation(t *testing.T) {
 // newest surplus runner loses its registration and its sandbox, and a
 // runner whose removal GitHub refuses (it took a job) stays.
 func TestCanceledJobSurplus(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -456,8 +466,15 @@ func TestCanceledJobSurplus(t *testing.T) {
 	// yet): GitHub refuses the removal, and the runner stays.
 	w.gh.SetBusy("sandrun-"+first.GetRunnerId(), true)
 	w.send(t, "workflow_job", job("completed", 501, 2, sandRunLinux, ""))
-	eventually(t, "GitHub runner removal refused", func() bool {
-		return strings.Contains(w.env.Logs.String(), "github_runner_removal_refused")
+	w.l.GitHub.Wait()
+	eventually(t, "GitHub runner removal refused for "+first.GetRunnerId(), func() bool {
+		for line := range strings.Lines(w.env.Logs.String()) {
+			if strings.Contains(line, `"msg":"github_runner_removal_refused"`) &&
+				strings.Contains(line, `"runner_id":"`+first.GetRunnerId()+`"`) {
+				return true
+			}
+		}
+		return false
 	})
 	stays(t, "refused runner", func() bool {
 		return w.runner(t, first.GetRunnerId()).GetState() == sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
@@ -468,6 +485,7 @@ func TestCanceledJobSurplus(t *testing.T) {
 }
 
 func TestCanceledJobSurplusReserve(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		failLookup bool
@@ -595,6 +613,7 @@ func TestCanceledJobSurplusReserve(t *testing.T) {
 // took a job), and a runner deleted before its registration was recorded
 // removes the registration and never starts the runner program.
 func TestSurplusWhileStarting(t *testing.T) {
+	t.Parallel()
 	waitFor := func(t *testing.T, what string, ch <-chan string) {
 		t.Helper()
 		select {
@@ -687,6 +706,7 @@ func TestSurplusWhileStarting(t *testing.T) {
 // runner BUSY before Start returned keeps the program exec ID, so SandRun
 // follows the program and deletes the sandbox when it exits.
 func TestInProgressBeforeStartReturns(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -729,6 +749,7 @@ func TestInProgressBeforeStartReturns(t *testing.T) {
 // TestWarmRunnerPerPool: a warm count keeps idle runners per ACTIVE
 // installation, and the surplus rule keeps them.
 func TestWarmRunnerPerPool(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 1))
@@ -743,6 +764,7 @@ func TestWarmRunnerPerPool(t *testing.T) {
 }
 
 func TestWarmPoolCooldownDoesNotDelayGitHubDemand(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.os.Update(w.osOrg, func(o *ownsandfake.Org) {
@@ -768,6 +790,7 @@ func TestWarmPoolCooldownDoesNotDelayGitHubDemand(t *testing.T) {
 // warm runner whose registration removal GitHub refuses took a job and
 // stays.
 func TestWarmRunnerReclaim(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.os.Update(w.osOrg, func(o *ownsandfake.Org) { o.MaxSandboxes = 1 })
 	w.link(t, 501, "acme")
@@ -812,6 +835,7 @@ func TestWarmRunnerReclaim(t *testing.T) {
 // TestRenamedProfile: after a profile rename, the runners that wait with
 // the old label are replaced, so a job with the new label starts.
 func TestRenamedProfile(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	profileID := w.createProfile(t, ghProfile("linux", 1))
@@ -843,6 +867,7 @@ func TestRenamedProfile(t *testing.T) {
 // TestLostDeliveries: a delivery that GitHub could not deliver is
 // redelivered by the redelivery job and then processed once.
 func TestLostDeliveries(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -882,6 +907,7 @@ func TestLostDeliveries(t *testing.T) {
 }
 
 func TestLostDeliveriesBeyondPage100(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -913,6 +939,7 @@ func TestLostDeliveriesBeyondPage100(t *testing.T) {
 }
 
 func TestLostDeliveriesIncompleteListing(t *testing.T) {
+	t.Parallel()
 	f := githubfake.New(nil)
 	t.Cleanup(f.Server.Close)
 	for _, mode := range []string{"http error", "canceled"} {
@@ -972,6 +999,7 @@ func TestLostDeliveriesIncompleteListing(t *testing.T) {
 // ended request, so the late queued and in_progress deliveries start
 // nothing.
 func TestCompletedBeforeQueued(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -998,6 +1026,7 @@ func TestCompletedBeforeQueued(t *testing.T) {
 // deactivation of the installation holds the link waits for it and then
 // stores no request for the inactive installation.
 func TestJobWaitsForDeactivation(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -1072,6 +1101,7 @@ func waitForDeactivationLookup(t *testing.T, w *ghWorld, blocker uint32, done <-
 }
 
 func TestJobWaitsForProfileChange(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, action, change string
 	}{
@@ -1135,6 +1165,7 @@ func TestJobWaitsForProfileChange(t *testing.T) {
 }
 
 func TestQueuedJobsShareProfileLock(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	profileID := w.createProfile(t, ghProfile("linux", 0))
@@ -1188,6 +1219,7 @@ func TestQueuedJobsShareProfileLock(t *testing.T) {
 // inactive, cancel its queued requests and delete its waiting runners;
 // unsuspend makes it ACTIVE again.
 func TestInstallationSuspendedAndDeleted(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -1249,6 +1281,7 @@ func TestInstallationSuspendedAndDeleted(t *testing.T) {
 // TestWebhookSignature: deliveries without a valid signature get 401 and
 // change nothing; oversized and malformed deliveries are rejected.
 func TestWebhookSignature(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -1302,6 +1335,7 @@ func TestWebhookSignature(t *testing.T) {
 // TestNotConfigured: without a GitHub App, the RPCs that need GitHub fail
 // with failed_precondition and the webhook answers 503.
 func TestNotConfigured(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{unconfigured: true})
 	ctx := context.Background()
 	_, err := w.env.User(w.org.Admin).GitHub.CreateGitHubInstallUrl(ctx, connect.NewRequest(&sandrunv1.CreateGitHubInstallUrlRequest{OrganizationId: w.org.ID}))
@@ -1327,6 +1361,7 @@ func TestNotConfigured(t *testing.T) {
 // TestLinkFlow covers the state, the code exchange and the installation
 // checks of LinkGitHubInstallation, the runner group update and the unlink.
 func TestLinkFlow(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin).GitHub
@@ -1438,6 +1473,7 @@ func TestLinkFlow(t *testing.T) {
 }
 
 func TestUpdateGitHubInstallationAfterLifecycleChange(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		action    string
 		wantCode  connect.Code
@@ -1527,6 +1563,7 @@ func TestUpdateGitHubInstallationAfterLifecycleChange(t *testing.T) {
 // TestAuthz: installation management needs owner or admin; members read
 // the links; personal API keys and outsiders get nothing.
 func TestAuthz(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	inst := w.link(t, 501, "acme")
 	ctx := context.Background()
@@ -1580,6 +1617,7 @@ func TestAuthz(t *testing.T) {
 // registrations of its runners before the sandboxes go, and the links with
 // the organization.
 func TestOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))

@@ -121,6 +121,7 @@ func requireNoDeadlock(t *testing.T, what string, err error) {
 // the deletion, which has to wait for that lock, and lets the Enroll commit.
 // The deletion must list the new device and remove it.
 func TestEnrollCommitsBeforeOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	f := newEnrollOrgLockFixture(t, env)
@@ -183,6 +184,7 @@ func TestEnrollCommitsBeforeOrganizationDeletion(t *testing.T) {
 // lock so that an Enroll waits for it, commits the deletion and expects the
 // Enroll to fail like an unknown token and to create no device.
 func TestEnrollAfterOrganizationDeletionCommits(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	f := newEnrollOrgLockFixture(t, env)
@@ -226,6 +228,7 @@ func TestEnrollAfterOrganizationDeletionCommits(t *testing.T) {
 // first and the deletion removes the device, or the deletion wins and the
 // Enroll is refused. No active device remains for the deleted organization.
 func TestConcurrentEnrollAndOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	var enrolledFirst, deletedFirst int

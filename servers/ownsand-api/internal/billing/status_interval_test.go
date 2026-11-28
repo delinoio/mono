@@ -35,6 +35,7 @@ func (f *statusFixture) poll(t *testing.T) {
 // status (BLOCKED with the new start), and the 3-day suspension clock of the
 // new interval runs from that start instead of from the earlier one.
 func TestRecoveryAndNewBlockBetweenPollsRestartsTheClock(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	f.addOrg(t, org1)
@@ -78,6 +79,7 @@ func TestRecoveryAndNewBlockBetweenPollsRestartsTheClock(t *testing.T) {
 // same status is reported again and when a status without a block start
 // arrives.
 func TestContinuingBlockKeepsItsStart(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
@@ -122,6 +124,7 @@ func TestContinuingBlockKeepsItsStart(t *testing.T) {
 // status of the same remote interval nor a repeated poll moves it. Only a
 // new remote interval after the link restarts the clock.
 func TestLinkAfterUnlinkKeepsEarlierStartAndLaterPollsDoNotReset(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	f.addOrg(t, org1)
@@ -173,6 +176,7 @@ func TestLinkAfterUnlinkKeepsEarlierStartAndLaterPollsDoNotReset(t *testing.T) {
 // status, an unlink and a link to another billing account clear the stored
 // reported start, so it never classifies a status of a later link.
 func TestRemoteBlockStartIsForgottenWithTheLinkState(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 11, 7, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	f.addOrg(t, org1)

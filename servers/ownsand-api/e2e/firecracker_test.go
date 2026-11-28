@@ -16,6 +16,7 @@ import (
 // cmds/ownsand-agent/images/linux/build-rootfs.sh. It needs /dev/kvm
 // access but no root.
 func TestLifecycleFirecracker(t *testing.T) {
+	t.Parallel()
 	requireE2E(t)
 	binary, kernel, rootfs := os.Getenv("OWNSAND_FC_TEST_BINARY"), os.Getenv("OWNSAND_FC_TEST_KERNEL"), os.Getenv("OWNSAND_FC_TEST_ROOTFS")
 	if binary == "" || kernel == "" || rootfs == "" {

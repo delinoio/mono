@@ -19,6 +19,7 @@ import (
 // boots such a sandbox cold), and a create with a smaller disk stays an
 // invalid argument.
 func TestMemoryRestoreNeedsSnapshotDiskSize(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

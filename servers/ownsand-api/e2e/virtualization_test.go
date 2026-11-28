@@ -43,6 +43,7 @@ func virtualizationAgentEnv(t *testing.T, kernel, rootfs string) []string {
 // Virtualization.framework runtime on a macOS host when the opt-in
 // variables of the agent's integration test name the base image.
 func TestLifecycleVirtualization(t *testing.T) {
+	t.Parallel()
 	requireE2E(t)
 	kernel, rootfs := os.Getenv(envVZKernel), os.Getenv(envVZRootfs)
 	if runtime.GOOS != "darwin" || kernel == "" || rootfs == "" {

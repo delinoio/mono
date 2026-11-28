@@ -19,6 +19,7 @@ import (
 // largest representable size passes the validation and, with a device that
 // has less disk, fails the capacity check instead.
 func TestCreateSandboxRejectsDiskGibOverflow(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

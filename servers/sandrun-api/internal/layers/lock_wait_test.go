@@ -14,6 +14,7 @@ import (
 )
 
 func TestLockWaitObserverMatchesHolderAndStatement(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	holder := holdTx(t, env, "SELECT pg_advisory_xact_lock(101), pg_advisory_xact_lock(102)")
 	other := holdTx(t, env, "SELECT pg_advisory_xact_lock(103)")
@@ -61,6 +62,7 @@ func TestLockWaitObserverMatchesHolderAndStatement(t *testing.T) {
 }
 
 func TestLockWaitObserverDeadline(t *testing.T) {
+	t.Parallel()
 	t.Run("pool acquisition", func(t *testing.T) {
 		env := testenv.New(t)
 		config := env.DB.Pool.Config()

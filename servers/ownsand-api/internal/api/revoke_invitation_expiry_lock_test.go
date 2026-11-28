@@ -21,6 +21,7 @@ import (
 )
 
 func TestRevokeInvitationExpiryAfterLockWait(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheDescribe, pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeCacheStatement} {
 		t.Run(mode.String(), func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)

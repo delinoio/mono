@@ -166,6 +166,7 @@ func (f *staleFixture) finishPass(t *testing.T) {
 // checks that the pass neither marks nor pauses that sandbox, while the
 // sandboxes of the organization that stays suspended are enforced.
 func TestBillingPauseDroppedAfterRecoveryWhileQueued(t *testing.T) {
+	t.Parallel()
 	f := newStaleFixture(t)
 	c := f.victim.OwnerClient
 	hold := holdSlots(f.hogAgent, billingEnforceSlots, func(cmd *ownsandv1.AgentCommand) bool { return cmd.GetPauseSandbox() != nil })
@@ -206,6 +207,7 @@ func TestBillingPauseDroppedAfterRecoveryWhileQueued(t *testing.T) {
 // it keeps its mark so the next recovery resumes it; the other sandboxes
 // resume and keep theirs.
 func TestBillingResumeDroppedAfterSuspensionWhileQueued(t *testing.T) {
+	t.Parallel()
 	f := newStaleFixture(t)
 	c := f.victim.OwnerClient
 	// First suspension: every sandbox is paused and marked.

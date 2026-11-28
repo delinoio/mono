@@ -156,7 +156,11 @@ function start(t, env, buildTmp) {
 
 test("skips without DATABASE_URL", { timeout: Timeout }, async (t) => {
   const env = { ...process.env };
-  delete env.DATABASE_URL;
+  // Windows looks up environment variables without regard to case.
+  for (const key of Object.keys(env)) {
+    const name = process.platform === "win32" ? key.toUpperCase() : key;
+    if (name === "DATABASE_URL") delete env[key];
+  }
   const run = start(t, env);
   const { code } = await run.closed;
   assert.equal(code, 0);

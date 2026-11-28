@@ -548,11 +548,30 @@ func TestExecReportsLostOutput(t *testing.T) {
 	srv.OutputKeepBytes = 8
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	const firstLine = "first\n"
+	const ackFile = ".first-stdout-accepted"
+	ackPath := filepath.Join(ds.GetWorkspacePath(), ackFile)
 	var got collected
 	res, err := c.Exec(ctx, ExecParams{
 		OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
-		Command: []string{"sh", "-c", `echo first; sleep 0.2; echo 0123456789abcdefghij; sleep 0.2; echo end`},
-		OnEvent: got.on,
+		Command: []string{"sh", "-c", `
+			printf 'first\n'
+			while [ ! -f "$1" ]; do sleep 0.01; done
+			echo 0123456789abcdefghij
+			sleep 0.2
+			echo end
+		`, "sh", ackFile},
+		OnEvent: func(ev ExecEvent) error {
+			if err := got.on(ev); err != nil {
+				return err
+			}
+			// Allow overflow only after the callback has collected the full line,
+			// even when it arrives in multiple events.
+			if ev.Kind == ExecEventStdout && got.stdout.String() == firstLine {
+				return os.WriteFile(ackPath, nil, 0o600)
+			}
+			return nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -561,11 +580,11 @@ func TestExecReportsLostOutput(t *testing.T) {
 		t.Fatalf("result = %+v, truncation = %v", res, got.truncated)
 	}
 	tr := got.truncated[0].MissingStdout
-	if tr.Empty() || tr.From < int64(len("first\n")) {
+	if tr.Empty() || tr.From < int64(len(firstLine)) {
 		t.Fatalf("missing range %+v", tr)
 	}
-	if !strings.HasSuffix(got.stdout.String(), "end\n") {
-		t.Fatalf("stdout %q", got.stdout.String())
+	if stdout := got.stdout.String(); !strings.HasPrefix(stdout, firstLine) || !strings.HasSuffix(stdout, "end\n") {
+		t.Fatalf("stdout %q, want prefix %q and suffix %q", stdout, firstLine, "end\n")
 	}
 	if n := srv.Calls(sandrunv1connect.DevSessionServiceAttachDevSessionExecProcedure); n == 0 {
 		t.Fatal("expected an attach after rotation")

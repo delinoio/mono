@@ -55,6 +55,7 @@ func readSandboxRecord(t *testing.T, env *testenv.Env, id string) sandboxRecord 
 // epoch wins over an earlier one whatever the case, and the stored epoch is
 // lowercase. A sandbox that the report omits still ends as lost.
 func TestStateReportMatchesSandboxIDsAndEpochsByValue(t *testing.T) {
+	t.Parallel()
 	f := newStateReportLockFixture(t)
 	ctx := context.Background()
 	created, err := f.org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(f.org.ID)))
@@ -103,6 +104,7 @@ func TestStateReportMatchesSandboxIDsAndEpochsByValue(t *testing.T) {
 // of another device, while a snapshot that the report omits keeps the
 // existing omission rules.
 func TestStateReportMatchesSnapshotIDsByValue(t *testing.T) {
+	t.Parallel()
 	f := newStateReportLockFixture(t)
 	ctx := context.Background()
 	c := f.org.OwnerClient
@@ -177,6 +179,7 @@ func TestStateReportMatchesSnapshotIDsByValue(t *testing.T) {
 // with the sandbox ID in canonical case, an uppercase spelling of a later
 // epoch still wins, and an uppercase spelling of an earlier epoch still loses.
 func TestStateReportOrdersRevisionEpochsByValue(t *testing.T) {
+	t.Parallel()
 	f := newStateReportLockFixture(t)
 	ctx := context.Background()
 	older := epochAt(t, 0x01aa00000000)
@@ -212,6 +215,7 @@ func TestStateReportOrdersRevisionEpochsByValue(t *testing.T) {
 // spelling unchanged) is compared by value: a retried report with the same
 // epoch and a lower counter must not roll the sandbox back.
 func TestStateReportOrdersStoredUppercaseEpochsByValue(t *testing.T) {
+	t.Parallel()
 	f := newStateReportLockFixture(t)
 	ctx := context.Background()
 	epoch := epochAt(t, 0x01ab00000000)

@@ -65,6 +65,7 @@ func tokenOf(t *testing.T, msg email.Message) string {
 // no committed membership next to an internal error and a missing creation
 // audit. The address can be invited again once the audit works.
 func TestInvitationCreationAuditFailureRollsBackInvitation(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -111,6 +112,7 @@ func TestInvitationCreationAuditFailureRollsBackInvitation(t *testing.T) {
 // audit write after the send could not undo the acceptance and left the sender
 // with an internal error; the audit write cannot fail at this point any more.
 func TestInvitationAcceptedDuringSendKeepsCreationAudit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()

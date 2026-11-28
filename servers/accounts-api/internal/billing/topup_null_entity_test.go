@@ -26,6 +26,7 @@ func wantChargeAcceptance(t *testing.T, f *fixture, acct string, want bool) {
 }
 
 func TestManualTopUpRecordsUnknownForUnconfirmedChargeResponse(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ name, body string }{
 		{"null entity", `{"data":null}`},
 		{"omitted ID", `{"data":{}}`},
@@ -78,6 +79,7 @@ func TestManualTopUpRecordsUnknownForUnconfirmedChargeResponse(t *testing.T) {
 }
 
 func TestManualTopUpRecordsAcceptanceForMatchingSubscription(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -90,6 +92,7 @@ func TestManualTopUpRecordsAcceptanceForMatchingSubscription(t *testing.T) {
 }
 
 func TestAutoTopUpKeepsUnknownForMismatchedSubscription(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -113,6 +116,7 @@ func TestAutoTopUpKeepsUnknownForMismatchedSubscription(t *testing.T) {
 }
 
 func TestTopUpOutcomeKeepsFinalizedTopUpForUnconfirmedChargeResponse(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ name, body string }{
 		{"null entity", `{"data":null}`},
 		{"different ID", `{"data":{"id":"sub_other"}}`},

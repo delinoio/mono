@@ -115,6 +115,7 @@ func TestLookPathInWindows(t *testing.T) {
 }
 
 func TestRequestSetsPathFoldsKeyCase(t *testing.T) {
+	t.Parallel()
 	for _, key := range []string{"PATH", "Path", "path"} {
 		if !requestSetsPath(map[string]string{key: `C:\x`}) {
 			t.Errorf("key %q not recognized", key)

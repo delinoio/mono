@@ -8,6 +8,7 @@ import (
 )
 
 func TestNewRejectsPortWithoutHostname(t *testing.T) {
+	t.Parallel()
 	for _, bad := range []string{"http://:18300", "https://:443", "http://:", "https://:0"} {
 		c, err := New(Options{BaseURL: bad, APIKey: "osk_x", LookupEnv: envOf(nil)})
 		if err == nil {
@@ -26,6 +27,7 @@ func TestNewRejectsPortWithoutHostname(t *testing.T) {
 }
 
 func TestNewRejectsOutOfRangeOriginPorts(t *testing.T) {
+	t.Parallel()
 	const want = "ownsand: invalid base URL: want an http or https origin"
 	for _, authority := range []string{"http://127.0.0.1", "https://example.test", "http://[::1]"} {
 		for _, port := range []string{"65536", "999999999999999999999999"} {
@@ -39,6 +41,7 @@ func TestNewRejectsOutOfRangeOriginPorts(t *testing.T) {
 }
 
 func TestNewAcceptsOriginsWithHostname(t *testing.T) {
+	t.Parallel()
 	for _, good := range []string{
 		"http://127.0.0.1:18300",
 		"http://127.0.0.1:65535",

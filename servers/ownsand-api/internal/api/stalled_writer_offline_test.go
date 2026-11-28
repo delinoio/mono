@@ -76,6 +76,7 @@ func closeSaturatedChannelUnderLock(t *testing.T, env *testenv.Env, dev *testenv
 // of the offline write, a delayed offline write kept the blocked write, the
 // handler and the outbound queue for as long as the lock was held.
 func TestStalledWriterAbortedBeforeOfflineUpdate(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
 	env.App.Service.Timing.WriterDrainTimeout = stalledWriterDrainTimeout
@@ -115,6 +116,7 @@ func TestStalledWriterAbortedBeforeOfflineUpdate(t *testing.T) {
 // while the offline write waits for the device row lock keeps the device
 // from going OFFLINE.
 func TestStalledWriterReplacementChannelKeepsDeviceOnline(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
 	env.App.Service.Timing.WriterDrainTimeout = stalledWriterDrainTimeout
@@ -166,6 +168,7 @@ func TestStalledWriterReplacementChannelKeepsDeviceOnline(t *testing.T) {
 // writer is not blocked drains without an abort: the offline write runs and
 // no stalled-writer record appears.
 func TestGracefulChannelCloseDoesNotAbortWriter(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Timing.WriterDrainTimeout = stalledWriterDrainTimeout
 	org := env.NewOrg("alice")

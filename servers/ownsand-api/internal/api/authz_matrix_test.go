@@ -196,6 +196,7 @@ func linkMatrixBilling(t *testing.T, fake *accountstest.Server, org *testenv.Org
 // organization, member, API key, device and billing services with each
 // principal kind, including cross-organization access.
 func TestAuthorizationMatrix(t *testing.T) {
+	t.Parallel()
 	fake := accountstest.New(t, nil)
 	env := testenv.New(t, testenv.WithAccounts(fake))
 	org := env.NewOrg("alice")
@@ -247,6 +248,7 @@ func TestAuthorizationMatrix(t *testing.T) {
 // TestRPCsWithoutOrganization checks the three RPCs that accept only Logto
 // users.
 func TestRPCsWithoutOrganization(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	ctx := context.Background()

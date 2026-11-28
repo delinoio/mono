@@ -27,6 +27,7 @@ func requireRefusedOffer(t *testing.T, a *ownsandv1.SignalingAnswer) {
 // is remembered: the offer is refused, no session or peer connection remains
 // and the tombstone is consumed.
 func TestRevokeBeforeOfferRefusesTheOffer(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newPlane(w, Timing{})
 	ch := newChannel(1)
@@ -58,6 +59,7 @@ func (f statesFunc) State(sandboxID string) (ownsandv1.SandboxState, bool) { ret
 // A revocation while Offer reads the sandbox state cancels the reservation
 // before Offer constructs a peer connection.
 func TestRevokeWhileCheckingSandboxState(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	var dp *DataPlane
 	var ch *fakeChannel

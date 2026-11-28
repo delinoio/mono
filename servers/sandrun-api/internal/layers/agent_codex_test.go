@@ -106,6 +106,7 @@ func (w *codexWorld) expectDelivery(t *testing.T, id string, body []byte, wantCo
 }
 
 func TestCreateDirectDuringProfileChange(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, change string
 		args         []any
@@ -160,6 +161,7 @@ func TestCreateDirectDuringProfileChange(t *testing.T) {
 // exit ends the request. No webhook secret or API key reaches the guest,
 // and no secret or body reaches the log.
 func TestCodexSessionLifecycle(t *testing.T) {
+	t.Parallel()
 	w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	const remoteURL = "https://Relay.openai.test:443/v1/agents/%61pi?mode=connect"
 	w.openai.AddSession("sess_1", "ccarenv_1")
@@ -310,6 +312,7 @@ func TestCodexSessionLifecycle(t *testing.T) {
 }
 
 func TestCodexIgnoresInvalidRemote(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		url  string
@@ -350,6 +353,7 @@ func TestCodexIgnoresInvalidRemote(t *testing.T) {
 // and creates nothing; a delivery signed with any listed v1 signature is
 // accepted; deliveries that SandRun does not act on are recorded as ignored.
 func TestCodexWebhookSignature(t *testing.T) {
+	t.Parallel()
 	w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_MACOS)
 	w.openai.AddSession("sess_sig", "ccarenv_sig")
 	body := codexfake.ActionRequired("sess_sig")
@@ -409,6 +413,7 @@ func TestCodexWebhookSignature(t *testing.T) {
 }
 
 func TestCodexWebhookCredentialLookup(t *testing.T) {
+	t.Parallel()
 	reader := sdkmetric.NewManualReader(sdkmetric.WithTemporalitySelector(func(sdkmetric.InstrumentKind) metricdata.Temporality {
 		return metricdata.DeltaTemporality
 	}))
@@ -497,6 +502,7 @@ func TestCodexWebhookCredentialLookup(t *testing.T) {
 // records nothing, so OpenAI's retry of the same delivery ID creates the
 // request; a deleted session is ignored.
 func TestCodexLookupFailureRedelivers(t *testing.T) {
+	t.Parallel()
 	w := newCodexWebhookWorld(t)
 	w.openai.AddSession("sess_retry", "ccarenv_retry")
 	const deliveryID = "wh_retry"
@@ -543,6 +549,7 @@ func TestCodexLookupFailureRedelivers(t *testing.T) {
 // session that is still failed ends its request and deletes its runner;
 // a queued request ends with CANCELED.
 func TestCodexSessionFailedReleasesCompute(t *testing.T) {
+	t.Parallel()
 	w := newCodexWebhookWorld(t)
 	w.openai.AddSession("sess_f", "ccarenv_f")
 	if code := w.deliver(t, "wh_f1", codexfake.ActionRequired("sess_f")); code != http.StatusOK {
@@ -608,6 +615,7 @@ func TestCodexSessionFailedReleasesCompute(t *testing.T) {
 // TestCodexMaxTTLEndsSession: the executor does not exit by itself, so a
 // max_ttl end of the sandbox ends the request with SESSION_TTL_EXPIRED.
 func TestCodexMaxTTLEndsSession(t *testing.T) {
+	t.Parallel()
 	w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.openai.AddSession("sess_ttl", "ccarenv_ttl")
 	if code := w.deliver(t, "wh_ttl", codexfake.ActionRequired("sess_ttl")); code != http.StatusOK {
@@ -637,6 +645,7 @@ func TestCodexMaxTTLEndsSession(t *testing.T) {
 // rejects every OPENAI_CODEX profile; the queue wait stays at most 5
 // minutes.
 func TestCodexProfileGuestOS(t *testing.T) {
+	t.Parallel()
 	w := newAgentWorld(t, layers.Options{})
 	id := w.createIntegration(t, &sandrunv1.CreateAgentIntegrationRequest{
 		Vendor: sandrunv1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, Name: "codex",

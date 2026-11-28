@@ -148,6 +148,7 @@ func sendExportResult(agent *testenv.FakeAgent, commandID string, parts []*ownsa
 // attempt's objects are cleaned up, and that a retry sends one command and
 // reaches EXPORTED.
 func TestInterruptedExportFailsOnReplacementChannelAndRetries(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -214,6 +215,7 @@ func TestInterruptedExportFailsOnReplacementChannelAndRetries(t *testing.T) {
 // command, fails the lost export when the device reconnects, and that a
 // retry reaches EXPORTED.
 func TestInterruptedExportFailsAfterControlPlaneRestart(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	snapID, agent := exportingSnapshot(t, env, org)
@@ -253,6 +255,7 @@ func TestInterruptedExportFailsAfterControlPlaneRestart(t *testing.T) {
 // attempts' upload URLs address different objects, and that the download
 // URLs address the objects of the successful attempt.
 func TestStaleExportResultCannotChangeRetry(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -348,6 +351,7 @@ func TestStaleExportResultCannotChangeRetry(t *testing.T) {
 // TestHealthyExportRepeatDispatchesOnce checks that a repeat ExportSnapshot
 // and a state report on the owning channel leave a healthy export alone.
 func TestHealthyExportRepeatDispatchesOnce(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
@@ -386,6 +390,7 @@ func TestHealthyExportRepeatDispatchesOnce(t *testing.T) {
 // TestUploadURLsNeedOwningChannel checks that a channel that does not own the
 // export gets no upload URL.
 func TestUploadURLsNeedOwningChannel(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -406,6 +411,7 @@ func TestUploadURLsNeedOwningChannel(t *testing.T) {
 // job, stores no manifest, and leaves the snapshot free for a retry that
 // reaches EXPORTED with unique parts.
 func TestDuplicateExportPartNumbersFailTheExport(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org := env.NewOrg("alice")
 	c := org.OwnerClient

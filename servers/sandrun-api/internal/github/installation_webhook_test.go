@@ -19,6 +19,7 @@ import (
 )
 
 func TestInstallationWebhookIgnoresStaleSuspension(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -53,6 +54,7 @@ func TestInstallationWebhookIgnoresStaleSuspension(t *testing.T) {
 }
 
 func TestInstallationWebhookLookupFailureCanRetry(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))
@@ -122,6 +124,7 @@ func TestInstallationWebhookLookupFailureCanRetry(t *testing.T) {
 }
 
 func TestInstallationWebhookConcurrentOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	for _, deletionFirst := range []bool{true, false} {
 		name := "webhook first"
 		if deletionFirst {
@@ -233,6 +236,7 @@ func TestInstallationWebhookConcurrentOrganizationDeletion(t *testing.T) {
 }
 
 func TestInstallationWebhookRechecksLockedLink(t *testing.T) {
+	t.Parallel()
 	const (
 		active  = sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_ACTIVE
 		deleted = sandrunv1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_DELETED
@@ -310,6 +314,7 @@ func TestInstallationWebhookRechecksLockedLink(t *testing.T) {
 }
 
 func TestInstallationWebhookRedeliversAfterLockFailure(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	w.createProfile(t, ghProfile("linux", 0))

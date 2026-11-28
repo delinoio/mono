@@ -162,11 +162,12 @@ const expectedPassThroughEnv = {
 };
 
 // Workspace directories named by the patterns of `pnpm-workspace.yaml`.
-function workspaceDirectories(base) {
-  const manifest = readFileSync(join(base, "pnpm-workspace.yaml"), "utf8");
+function workspaceDirectories(base, manifest) {
   const parents = [
-    ...manifest.matchAll(/^\s*-\s*["']?([^*"'\s]+)\/\*["']?\s*$/gm),
-  ].map((match) => match[1]);
+    ...manifest.matchAll(
+      /^[ \t]*-[ \t]*(["']?)([^*"'\s]+)\/\*\1(?:[ \t]+#.*)?[ \t]*\r?$/gm,
+    ),
+  ].map((match) => match[2]);
   assert.ok(parents.length > 0, "pnpm-workspace.yaml lists no workspace globs");
   return parents.flatMap((parent) =>
     existsSync(join(base, parent))
@@ -180,7 +181,10 @@ function workspaceDirectories(base) {
 // Copy only the files that define the workspace graph and the task
 // configuration, so the dry run neither needs installed dependencies nor can
 // touch the checkout.
-function copyTurboConfiguration(t) {
+function copyTurboConfiguration(
+  t,
+  manifest = readFileSync(join(root, "pnpm-workspace.yaml"), "utf8"),
+) {
   const cwd = mkdtempSync(join(tmpdir(), "turbo-env-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const copy = (path) => {
@@ -190,15 +194,11 @@ function copyTurboConfiguration(t) {
     mkdirSync(dirname(join(cwd, path)), { recursive: true });
     copyFileSync(join(root, path), join(cwd, path));
   };
-  for (const path of [
-    "package.json",
-    "turbo.json",
-    "pnpm-workspace.yaml",
-    "pnpm-lock.yaml",
-  ]) {
+  for (const path of ["package.json", "turbo.json", "pnpm-lock.yaml"]) {
     copy(path);
   }
-  for (const directory of workspaceDirectories(root)) {
+  writeFileSync(join(cwd, "pnpm-workspace.yaml"), manifest);
+  for (const directory of workspaceDirectories(root, manifest)) {
     copy(`${directory}/package.json`);
     copy(`${directory}/turbo.json`);
   }
@@ -296,7 +296,40 @@ function devTaskProblems(cwd) {
 
 test("dev tasks pass only their documented variables through strict mode", (t) => {
   const cwd = copyTurboConfiguration(t);
+  assert.ok(existsSync(join(cwd, "protos/delino/accounts/package.json")));
   assert.deepEqual(devTaskProblems(cwd), []);
+});
+
+test("workspace glob comments preserve the app configs and dev tasks", async (t) => {
+  const manifest = readFileSync(join(root, "pnpm-workspace.yaml"), "utf8");
+  const appsEntry = /^  - (["']?)apps\/\*\1(?:[ \t]+#.*)?[ \t]*\r?$/m;
+  assert.match(manifest, appsEntry);
+  for (const glob of ["apps/*", '"apps/*"']) {
+    await t.test(glob, (t) => {
+      const cwd = copyTurboConfiguration(
+        t,
+        manifest.replace(appsEntry, `  - ${glob} # user-facing applications`),
+      );
+      for (const directory of [
+        "apps/delidev",
+        "apps/delino-accounts",
+        "apps/delino-docs",
+        "apps/delino-site",
+        "apps/ownsand",
+        "apps/sandrun",
+      ]) {
+        for (const file of ["package.json", "turbo.json"]) {
+          const path = `${directory}/${file}`;
+          assert.deepEqual(
+            readFileSync(join(cwd, path)),
+            readFileSync(join(root, path)),
+            path,
+          );
+        }
+      }
+      assert.deepEqual(devTaskProblems(cwd), []);
+    });
+  }
 });
 
 test("adding a global pass-through entry fails and names the root setting", (t) => {

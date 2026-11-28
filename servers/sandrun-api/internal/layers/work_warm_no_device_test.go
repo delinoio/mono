@@ -23,6 +23,7 @@ import (
 )
 
 func TestWarmNoDeviceCooldownAndRecovery(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
@@ -83,6 +84,7 @@ func TestWarmNoDeviceCooldownAndRecovery(t *testing.T) {
 }
 
 func TestWarmNoDeviceRejectionFromOldRevision(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		change func(*testing.T, *workWorld, string)
@@ -131,6 +133,7 @@ func TestWarmNoDeviceRejectionFromOldRevision(t *testing.T) {
 }
 
 func TestNoDeviceRejectionForQueuedDemand(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		kind   sandrunv1.WorkloadKind

@@ -16,6 +16,7 @@ func appendLines(logs *logSink, lines ...string) {
 }
 
 func TestWaitLogMessagesDelayedRecords(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	appendLines(logs, `api: {"level":"INFO","msg":"billing_sandbox_paused"}`)
 	done := make(chan []string, 1)
@@ -44,6 +45,7 @@ func TestWaitLogMessagesDelayedRecords(t *testing.T) {
 }
 
 func TestWaitLogMessagesReportsMissing(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	appendLines(logs,
 		`api: {"level":"INFO","msg":"billing_sandbox_paused"}`,
@@ -62,6 +64,7 @@ func TestWaitLogMessagesReportsMissing(t *testing.T) {
 }
 
 func TestWaitLogMessagesContextCancelEndsWait(t *testing.T) {
+	t.Parallel()
 	logs := &logSink{}
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(100*time.Millisecond, cancel)
@@ -76,6 +79,7 @@ func TestWaitLogMessagesContextCancelEndsWait(t *testing.T) {
 }
 
 func TestWaitLogMessagesNoMessages(t *testing.T) {
+	t.Parallel()
 	if missing := (&logSink{}).waitForLogMessages(context.Background(), "api", time.Second); len(missing) != 0 {
 		t.Fatalf("missing = %q, want none", missing)
 	}

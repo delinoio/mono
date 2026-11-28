@@ -250,6 +250,7 @@ func (f *fixture) outbox(t *testing.T, org string, meter ownsandv1.BillingMeter,
 var t0 = time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
 
 func TestFlushSealAndReport(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Minute))
 	accounts, client := newFakeAccounts(t)
 	accounts.statuses = []*accountsv1.OrganizationBillingStatus{{Service: accountsv1.ServiceId_SERVICE_ID_OWNSAND, OrganizationId: org1, Status: accountsv1.BillingStatus_BILLING_STATUS_ALLOWED, Sequence: 7}}
@@ -389,6 +390,7 @@ func gauge(t *testing.T, reg *testMeter, name string) float64 {
 // outage with exponential back-off and across a process restart: no window
 // is lost and none is reported with another amount.
 func TestReportSurvivesOutageAndRestart(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(2*time.Minute))
 	accounts, client := newFakeAccounts(t)
 	ctx := context.Background()
@@ -461,6 +463,7 @@ func TestReportSurvivesOutageAndRestart(t *testing.T) {
 }
 
 func TestBackoffCapsAtFiveMinutes(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(10*time.Minute))
 	accounts, client := newFakeAccounts(t)
 	accounts.setFailing(connect.NewError(connect.CodeInternal, errors.New("boom")))
@@ -479,6 +482,7 @@ func TestBackoffCapsAtFiveMinutes(t *testing.T) {
 }
 
 func TestReportBatchesAndRejectsMismatchedResults(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(24*time.Hour))
 	accounts, client := newFakeAccounts(t)
 	m := f.metering(client)
@@ -512,6 +516,7 @@ func TestReportBatchesAndRejectsMismatchedResults(t *testing.T) {
 // batch is sent, and the unsent row stays due and unchanged for the next
 // holder.
 func TestReportStopsAfterTheLeaseIsLost(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(24*time.Hour))
 	accounts, client := newFakeAccounts(t)
 	ctx := context.Background()
@@ -602,6 +607,7 @@ func TestReportStopsAfterTheLeaseIsLost(t *testing.T) {
 // TestReportDrainsAllBatchesWhileTheLeaseIsHeld checks that continuous
 // ownership still drains every due batch in one pass: 500 rows, then 1.
 func TestReportDrainsAllBatchesWhileTheLeaseIsHeld(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(24*time.Hour))
 	accounts, client := newFakeAccounts(t)
 	ctx := context.Background()
@@ -637,6 +643,7 @@ func (f *fixture) seedOutbox(t *testing.T, org string, meter ownsandv1.BillingMe
 // not an OwnSand meter: it must not fail the supported rows of its batch,
 // and it must stay unchanged and unreported.
 func TestReportSkipsUnknownMeterRows(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Hour))
 	accounts, client := newFakeAccounts(t)
 	reg := newTestMeter(t)
@@ -701,6 +708,7 @@ func TestReportSkipsUnknownMeterRows(t *testing.T) {
 // unknown-meter rows that sort before a supported row: the supported row is
 // still reported, and the idle reporter does not spin on the unknown rows.
 func TestReportUnknownMeterRowsDoNotStarveSupportedRows(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Hour))
 	accounts, client := newFakeAccounts(t)
 	m := f.metering(client)
@@ -739,6 +747,7 @@ func TestReportUnknownMeterRowsDoNotStarveSupportedRows(t *testing.T) {
 // wake up at every back-off interval for an unknown-meter row that is due but
 // is never reported.
 func TestRunDoesNotSpinOnUnknownMeterRows(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Hour))
 	_, client := newFakeAccounts(t)
 	timing := billing.Timing{Flush: time.Hour, Tick: 10 * time.Millisecond, Report: time.Hour, BackoffMin: 10 * time.Millisecond, BackoffMax: time.Hour}
@@ -764,6 +773,7 @@ func TestRunDoesNotSpinOnUnknownMeterRows(t *testing.T) {
 }
 
 func TestReportingDisabledKeepsTheOutbox(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Minute))
 	m := f.metering(nil)
 	ctx := context.Background()
@@ -797,6 +807,7 @@ func TestReportingDisabledKeepsTheOutbox(t *testing.T) {
 }
 
 func TestFlushFailureKeepsCounts(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0)
 	m := f.metering(nil)
 	m.Add(org1, classA, t0, 3)
@@ -817,6 +828,7 @@ func TestFlushFailureKeepsCounts(t *testing.T) {
 }
 
 func TestConcurrentFlushes(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0)
 	ctx := context.Background()
 	instances := make([]*billing.Metering, 4)
@@ -846,6 +858,7 @@ func TestConcurrentFlushes(t *testing.T) {
 }
 
 func TestSealConflictKeepsTheSealedAmount(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(11*time.Minute))
 	m := f.metering(nil)
 	ctx := context.Background()
@@ -891,6 +904,7 @@ func insertSnapshot(t *testing.T, d *db.DB, org, snapshot string, exportState ow
 }
 
 func TestSampleStorage(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(30*time.Second))
 	ctx := context.Background()
 	insertSnapshot(t, f.db, org1, "0190f3a4-0000-7000-8000-0000000000a1", ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED, gib, gib/2)
@@ -931,6 +945,7 @@ func TestSampleStorage(t *testing.T) {
 }
 
 func TestRunSealsAndReportsOnTheLeaseHolderOnly(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t, t0.Add(time.Minute))
 	accounts, client := newFakeAccounts(t)
 	timing := billing.Timing{Flush: 10 * time.Millisecond, Tick: 10 * time.Millisecond, Report: time.Hour, BackoffMin: 10 * time.Millisecond, BackoffMax: time.Second}

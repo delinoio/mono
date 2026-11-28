@@ -15,6 +15,7 @@ import (
 )
 
 func TestListFilterEnums(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	client := w.env.User(w.org.Member)
 	// A list query would wait on one of these tables until its context expires.

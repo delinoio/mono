@@ -17,6 +17,7 @@ import (
 )
 
 func TestCreateInvitationUsesTimeAfterRateLimitLocks(t *testing.T) {
+	t.Parallel()
 	for _, limit := range []struct {
 		name   string
 		prefix string
@@ -89,6 +90,7 @@ func TestCreateInvitationUsesTimeAfterRateLimitLocks(t *testing.T) {
 }
 
 func TestCreateInvitationKeepsPendingDuplicateErrorAtRecipientLimit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -106,6 +108,7 @@ func TestCreateInvitationKeepsPendingDuplicateErrorAtRecipientLimit(t *testing.T
 }
 
 func TestCreateInvitationReplacesInvitationThatExpiredWhileWaitingForRecipientLock(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()

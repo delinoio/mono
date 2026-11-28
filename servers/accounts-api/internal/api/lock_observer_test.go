@@ -68,6 +68,7 @@ func rollbackLockHolder(t *testing.T, tx pgx.Tx) {
 }
 
 func TestLockObserverWithPostgres(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	const shortTimeout = time.Second
 	expectOne := func(waiting int) (bool, error) { return waiting == 1, nil }

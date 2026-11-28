@@ -16,6 +16,7 @@ import (
 )
 
 func TestListInvitationsCreationTimePagination(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	admin := newPerson(env, "admin")

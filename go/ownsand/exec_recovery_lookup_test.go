@@ -153,6 +153,7 @@ func TestExecRecoveryLookupCancellation(t *testing.T) {
 }
 
 func TestExecRecoveryLookupTimelyTerminal(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	scriptRecoveryLookup(cp, false, true)
 	cp.beforeGetSandbox = func(context.Context) error {
@@ -170,6 +171,7 @@ func TestExecRecoveryLookupTimelyTerminal(t *testing.T) {
 }
 
 func TestExecRecoveryLookupTimelyPause(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	scriptRecoveryLookup(cp, false, false)
 	cp.agent.run = lineRun(1, 0)
@@ -253,6 +255,7 @@ func TestExecRecoveryLookupIgnoresLateState(t *testing.T) {
 }
 
 func TestExecRecoveryLookupExpiredOrInactive(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	c := recoveryDeadlineClient(t, cp, 5*time.Millisecond)
 	lookup := &recoveryLookupReply{state: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING}

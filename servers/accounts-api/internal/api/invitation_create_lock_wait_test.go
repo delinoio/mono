@@ -31,6 +31,7 @@ func invitationEmailCount(env *testenv.Env, addr string) int {
 // the stored times, the audit event, the email and the response all use the
 // time after the wait.
 func TestCreateInvitationReplacesInvitationThatExpiredWhileWaitingForAccountLock(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -108,6 +109,7 @@ func TestCreateInvitationReplacesInvitationThatExpiredWhileWaitingForAccountLock
 // A pending invitation that is still valid after the lock wait keeps blocking
 // the new invitation: one row, one email.
 func TestCreateInvitationStillConflictsWhenInvitationPendingAfterAccountLockWait(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()

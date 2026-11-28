@@ -128,6 +128,7 @@ func waitRPCCode(t *testing.T, env *testenv.Env, procedure string, code connect.
 // expiry of the connection wait itself, or a device without any relay
 // connection, keeps unavailable.
 func TestRelayAdmissionDeviceConnectionWait(t *testing.T) {
+	t.Parallel()
 	const connWait = 700 * time.Millisecond
 	env := testenv.New(t, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
@@ -223,6 +224,8 @@ func waitRelayAdmissionOpen(want relayAdmissionWait, within time.Duration) bool 
 // TestRelayAdmissionStreamOpenWait checks the Connect status of a ReadFile
 // waiting for queue capacity or for another open to release the gate.
 func TestRelayAdmissionStreamOpenWait(t *testing.T) {
+	// Not parallel: the test reads the stacks of every goroutine in the
+	// process, so goroutines of a parallel test would change its result.
 	const (
 		waitWithin     = 2 * time.Second
 		serverDeadline = 3 * time.Second

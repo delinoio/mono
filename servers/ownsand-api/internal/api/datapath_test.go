@@ -106,6 +106,7 @@ func errDetail(err error) *ownsandv1.ErrorDetail {
 }
 
 func TestGetIceServersAndOpenSession(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -151,6 +152,7 @@ func TestGetIceServersAndOpenSession(t *testing.T) {
 }
 
 func TestRelayExecReadWrite(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -313,6 +315,7 @@ func authorize(t *testing.T, c *testenv.Clients, orgID, sandboxID string, kind o
 // match the grant) takes a token from one failures bucket per caller, that a
 // valid grant takes none, and that the bucket refills.
 func TestRelayGrantFailureLimit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -425,6 +428,7 @@ func TestRelayGrantFailureLimit(t *testing.T) {
 }
 
 func TestRelayAuthentication(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -499,6 +503,7 @@ func TestRelayAuthentication(t *testing.T) {
 }
 
 func TestAuthorizeRelayRules(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -632,6 +637,7 @@ func TestAuthorizeRelayRules(t *testing.T) {
 }
 
 func TestAuthorizeRelayRequestBindingAfterAdmissionExpiry(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		// Keep the device online when the test advances the grant clock.
 		o.Timing.OfflineSweep = time.Hour
@@ -684,6 +690,7 @@ func TestAuthorizeRelayRequestBindingAfterAdmissionExpiry(t *testing.T) {
 // channel removes its pending grant and ends the RPC with unavailable and
 // no retry delay.
 func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		// Give grant delivery, channel shutdown, and the RPC response time
 		// to complete before the acknowledgement timer can fire.
@@ -730,6 +737,7 @@ func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 }
 
 func TestRelayConnectionRules(t *testing.T) {
+	t.Parallel()
 	limits := relay.Limits{StreamBuffer: 2 << 20, MaxStreamsPerConn: 64, MaxStreamsPerGrant: 4, Keepalive: 100 * time.Millisecond, IdleTimeout: 400 * time.Millisecond}
 	env := testenv.New(t, func(o *app.Options) { o.RelayLimits = &limits })
 	ctx := context.Background()
@@ -843,6 +851,7 @@ func stalledExecCaller(t *testing.T, env *testenv.Env, org *testenv.Org, sandbox
 }
 
 func TestRelayBoundsFramesWithoutCredit(t *testing.T) {
+	t.Parallel()
 	limits := relay.Limits{StreamBuffer: 48 << 20, MaxStreamsPerConn: 64, MaxStreamsPerGrant: 4, Keepalive: time.Second, IdleTimeout: time.Minute,
 		MaxQueuedControlFrames: 4, MaxQueuedControlBytes: 64 << 10}
 	env := testenv.New(t, func(o *app.Options) { o.RelayLimits = &limits })
@@ -916,6 +925,7 @@ func TestRelayBoundsFramesWithoutCredit(t *testing.T) {
 // error frame on it, no stream close frame, and the RPC returns unimplemented,
 // while another stream of the same connection continues.
 func TestRelayUnknownFrameKind(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	org, agent, sandboxID := runningSandbox(t, env)
 	r := agent.ConnectRelay(serveExec)
@@ -1038,6 +1048,7 @@ func keepAlive(r *testenv.FakeRelay) func() {
 }
 
 func TestRelayStreamTimers(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -1166,6 +1177,7 @@ func grantsReceived(agent *testenv.FakeAgent) (ids []string) {
 // agent acknowledges it; the failure is logged with the grant ID and an error
 // category.
 func TestAuthorizeRelayEnqueueFailure(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -1212,6 +1224,7 @@ func TestAuthorizeRelayEnqueueFailure(t *testing.T) {
 // grant cannot be queued: the predecessor stays live and can be replaced
 // again, and the retry of the replacement succeeds.
 func TestAuthorizeRelayReplacementEnqueueFailure(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -1307,6 +1320,7 @@ func installPredecessorReleaseHook(env *testenv.Env, agent *testenv.FakeAgent, p
 // queued: the queued grant keeps its original replaces_grant_id, and the
 // registry has already freed the predecessor.
 func TestAuthorizeRelayKeepsPredecessorAfterRelease(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -1350,6 +1364,7 @@ func TestAuthorizeRelayKeepsPredecessorAfterRelease(t *testing.T) {
 // goroutine, the grant takes the enqueue failure path, and the diagnostic
 // reaches the test goroutine.
 func TestAuthorizeRelayReportsPredecessorReleaseTimeout(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, _, sandboxID := runningSandbox(t, env)
@@ -1385,6 +1400,7 @@ func TestAuthorizeRelayReportsPredecessorReleaseTimeout(t *testing.T) {
 // replacement that does not name the predecessor: the predecessor stays
 // installed and a later replacement of it succeeds instead of aborting.
 func TestAuthorizeRelayAckWithoutReplacedGrant(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -1427,6 +1443,7 @@ func TestAuthorizeRelayAckWithoutReplacedGrant(t *testing.T) {
 // tells a woken waiter from an acknowledgement timeout or a second enqueue
 // attempt by the exact message and the count of sender calls.
 func TestAuthorizeRelayEnqueueFailureWakesWaiters(t *testing.T) {
+	t.Parallel()
 	const barrierTimeout = 10 * time.Second
 	env := testenv.New(t)
 	ctx := context.Background()
@@ -1512,6 +1529,7 @@ func TestAuthorizeRelayEnqueueFailureWakesWaiters(t *testing.T) {
 // first of them, and neither that frame nor the exit event behind it is
 // forwarded.
 func TestRelayRotationWithQueuedFrames(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t, func(o *app.Options) {
 		o.RelayTiming = &api.RelayTiming{Rotation: 2 * time.Second, Keepalive: 30 * time.Second, Acceptance: 30 * time.Second,
 			RequestDeadline: 10 * time.Second, GrantAck: time.Second, Signaling: 2 * time.Second}
@@ -1561,6 +1579,7 @@ func sweepRevocationsNow(env *testenv.Env) int {
 // revocation that the agent never acknowledges is deleted at the absolute
 // expiry of the session, and not before, while the channel stays open.
 func TestUnacknowledgedSessionRevocationExpires(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)
@@ -1597,6 +1616,7 @@ func TestUnacknowledgedSessionRevocationExpires(t *testing.T) {
 // plus the delivery margin), and OpenSession sweeps it without the periodic
 // worker.
 func TestUnacknowledgedGrantRevocationExpires(t *testing.T) {
+	t.Parallel()
 	env := testenv.NewWithoutPeriodicRevocationSweep(t)
 	ctx := context.Background()
 	org, agent, sandboxID := runningSandbox(t, env)

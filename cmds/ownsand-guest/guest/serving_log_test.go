@@ -101,6 +101,7 @@ func servingEvent(t *testing.T, events []map[string]any) map[string]any {
 }
 
 func TestServingEventOmitsUnixSocketPath(t *testing.T) {
+	t.Parallel()
 	l := newFakeUnixListener("/fixture/guest.sock")
 	events := runServingEvent(t, l)
 	ev := servingEvent(t, events)
@@ -119,6 +120,7 @@ func TestServingEventOmitsUnixSocketPath(t *testing.T) {
 }
 
 func TestServingEventReportsTCPNetwork(t *testing.T) {
+	t.Parallel()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

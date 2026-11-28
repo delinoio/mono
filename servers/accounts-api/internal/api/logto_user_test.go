@@ -23,6 +23,7 @@ import (
 // This test uses the HTTP directory client in the API and the billing worker
 // so a null profile passes through the same decoder in both flows.
 func TestLogtoUserNullProfile(t *testing.T) {
+	t.Parallel()
 	const ownerEmail = "owner@example.com"
 	const inviteeEmail = "invitee@example.com"
 	var ownerLookups, inviteeLookups atomic.Int32

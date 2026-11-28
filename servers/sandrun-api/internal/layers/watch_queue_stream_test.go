@@ -35,6 +35,7 @@ func (w watchFlushObserver) Flush() {
 }
 
 func TestWatchQueueStalledResponse(t *testing.T) {
+	t.Parallel()
 	const procedure = sandrunv1connect.WorkServiceWatchQueueProcedure
 	snapshotComplete := &sandrunv1.WatchQueueResponse{
 		Event: &sandrunv1.WatchQueueResponse_SnapshotComplete{SnapshotComplete: &sandrunv1.WatchQueueSnapshotComplete{}},
@@ -128,6 +129,7 @@ func TestWatchQueueStalledResponse(t *testing.T) {
 }
 
 func TestWatchQueueRotationAndReconnect(t *testing.T) {
+	t.Parallel()
 	timing := work.WatchQueueTiming{
 		Lifetime: 600 * time.Millisecond, WriteGrace: 250 * time.Millisecond,
 		Poll: 20 * time.Millisecond, Keepalive: 100 * time.Millisecond,

@@ -20,6 +20,7 @@ func revocationTestPlane(now func() time.Time) *DataPlane {
 }
 
 func TestDeferredRevocationInitialEnqueueInFlight(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		p := revocationTestPlane(time.Now)
 		ctx := t.Context()
@@ -68,6 +69,7 @@ func TestDeferredRevocationInitialEnqueueInFlight(t *testing.T) {
 }
 
 func TestDeferredRevocationTerminalCleanup(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		end  func(t *testing.T, p *DataPlane, conn *hub.Conn, now *time.Time, expireAt time.Time)
@@ -114,6 +116,7 @@ func TestDeferredRevocationTerminalCleanup(t *testing.T) {
 }
 
 func TestPeerSessionPeriodicSweep(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	p := revocationTestPlane(func() time.Time { return now })
 	conn := p.S.Hub.Register(t.Context(), "device", "org")

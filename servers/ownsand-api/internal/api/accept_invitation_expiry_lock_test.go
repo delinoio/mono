@@ -73,6 +73,7 @@ func acceptWhileInvitationLocked(t *testing.T, advance time.Duration) (env *test
 // acceptance has to reject it and write no membership, acceptance or audit
 // event.
 func TestAcceptInvitationRejectsInvitationExpiredDuringLockWait(t *testing.T) {
+	t.Parallel()
 	// The invitation lives 7 days; the lock wait crosses its expiry.
 	env, orgID, invID, err := acceptWhileInvitationLocked(t, 7*24*time.Hour+time.Second)
 	if code := testenv.Code(err); code != connect.CodeNotFound {
@@ -86,6 +87,7 @@ func TestAcceptInvitationRejectsInvitationExpiredDuringLockWait(t *testing.T) {
 // TestAcceptInvitationSucceedsAfterLockWaitBeforeExpiry is the control: the
 // same lock wait with the clock still before the expiry accepts normally.
 func TestAcceptInvitationSucceedsAfterLockWaitBeforeExpiry(t *testing.T) {
+	t.Parallel()
 	env, orgID, invID, err := acceptWhileInvitationLocked(t, time.Hour)
 	if err != nil {
 		t.Fatalf("acceptance after a lock wait before the expiry: %v", err)

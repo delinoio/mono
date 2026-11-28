@@ -25,6 +25,7 @@ const (
 // The "spawn" mode starts a "sleep" child that inherits both output pipes
 // and exits after recording the child's PID for liveness checks.
 func TestHelperProcess(t *testing.T) {
+	t.Parallel()
 	mode := os.Getenv(helperModeEnv)
 	if mode == "" {
 		return
@@ -115,6 +116,7 @@ func execSurvivorFiles(t *testing.T) (pidFile, stopFile string) {
 }
 
 func TestExecHelperExitsAtDeadline(t *testing.T) {
+	t.Parallel()
 	const lifetime = 100 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

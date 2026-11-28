@@ -53,6 +53,7 @@ func getSnapshotErr(c *testenv.Clients, orgID, snapshotID string) (*ownsandv1.Sn
 // the first report that omits it and stays FAILED, with the same ID, at the
 // following reports that omit it.
 func TestStateReportOmittingCreatingSnapshotKeepsFailedRecord(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -97,6 +98,7 @@ func TestStateReportOmittingCreatingSnapshotKeepsFailedRecord(t *testing.T) {
 // the compensation of a CreateSnapshot whose command never reached the agent
 // leaves behind survives a state report that omits it.
 func TestStateReportKeepsFailedCreateRecord(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	ctx := context.Background()
@@ -146,6 +148,7 @@ func TestStateReportKeepsFailedCreateRecord(t *testing.T) {
 // does not list is deleted, and an exported one keeps its record without a
 // device.
 func TestStateReportOmittingReadySnapshot(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")

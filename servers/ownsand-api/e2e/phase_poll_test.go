@@ -51,6 +51,7 @@ func pollPhase(ctx context.Context, interval time.Duration, poll func(context.Co
 }
 
 func TestWaitForBillingStateRejectsLateSuccess(t *testing.T) {
+	t.Parallel()
 	for _, want := range []ownsandv1.SandboxState{
 		ownsandv1.SandboxState_SANDBOX_STATE_PAUSED,
 		ownsandv1.SandboxState_SANDBOX_STATE_RUNNING,
@@ -76,6 +77,7 @@ func TestWaitForBillingStateRejectsLateSuccess(t *testing.T) {
 }
 
 func TestWaitForBillingStateStopsDuringRetry(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		parentEnds time.Duration
@@ -120,6 +122,7 @@ func TestWaitForBillingStateStopsDuringRetry(t *testing.T) {
 }
 
 func TestWaitForBillingStateGivesEachTransitionItsOwnBudget(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		for _, want := range []ownsandv1.SandboxState{
 			ownsandv1.SandboxState_SANDBOX_STATE_PAUSED,
@@ -149,6 +152,7 @@ func TestWaitForBillingStateGivesEachTransitionItsOwnBudget(t *testing.T) {
 }
 
 func TestWaitForExportVerificationRejectsLateSuccess(t *testing.T) {
+	t.Parallel()
 	for _, stallDatabase := range []bool{true, false} {
 		name := "snapshot RPC"
 		if stallDatabase {
@@ -187,6 +191,7 @@ func TestWaitForExportVerificationRejectsLateSuccess(t *testing.T) {
 }
 
 func TestWaitForExportVerificationStopsDuringRetry(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name           string
 		initialRead    time.Duration
@@ -226,6 +231,7 @@ func TestWaitForExportVerificationStopsDuringRetry(t *testing.T) {
 }
 
 func TestWaitForExportVerificationPreservesReadResults(t *testing.T) {
+	t.Parallel()
 	readFailure := errors.New("read failed")
 	for _, tc := range []struct {
 		name     string
@@ -263,6 +269,88 @@ func TestWaitForExportVerificationPreservesReadResults(t *testing.T) {
 	}
 }
 
+func TestWaitForExportCleanupStopsDuringRetry(t *testing.T) {
+	const cutoff = 300 * time.Millisecond
+	for _, tc := range []struct {
+		name          string
+		parentTimeout time.Duration
+		cleanupBudget time.Duration
+		cancelParent  bool
+		wantErr       error
+	}{
+		{"cleanup deadline", 2 * time.Second, cutoff, false, context.DeadlineExceeded},
+		{"earlier parent deadline", cutoff, 2 * time.Second, false, context.DeadlineExceeded},
+		{"parent cancellation", 2 * time.Second, 2 * time.Second, true, context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				parent, cancel := context.WithTimeout(t.Context(), tc.parentTimeout)
+				defer cancel()
+				if tc.cancelParent {
+					time.AfterFunc(cutoff, cancel)
+				}
+				calls := 0
+				err := waitForExportCleanup(parent, start.Add(tc.cleanupBudget), func() []string {
+					calls++
+					if time.Since(start) >= 400*time.Millisecond {
+						return nil
+					}
+					return []string{"part-1", "extra"}
+				})
+				if !errors.Is(err, tc.wantErr) || !strings.Contains(err.Error(), "[part-1 extra]") {
+					t.Fatalf("wait returned %v, want %v with the last keys", err, tc.wantErr)
+				}
+				if elapsed := time.Since(start); elapsed != cutoff || calls != 1 {
+					t.Fatalf("after %v and %d reads, want %v and 1 read", elapsed, calls, cutoff)
+				}
+			})
+		})
+	}
+}
+
+func TestWaitForExportCleanupRejectsLateEmptyPrefix(t *testing.T) {
+	const cutoff = 300 * time.Millisecond
+	for _, tc := range []struct {
+		name      string
+		readDelay time.Duration
+	}{
+		{"at the deadline", cutoff},
+		{"after the deadline", cutoff + time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				err := waitForExportCleanup(t.Context(), time.Now().Add(cutoff), func() []string {
+					time.Sleep(tc.readDelay)
+					return nil
+				})
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("wait returned %v, want deadline error", err)
+				}
+			})
+		})
+	}
+}
+
+func TestWaitForExportCleanupAcceptsTimelyEmptyPrefix(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		parent, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		calls := 0
+		err := waitForExportCleanup(parent, start.Add(2*time.Second), func() []string {
+			calls++
+			if calls == 1 {
+				return []string{"part-1"}
+			}
+			return nil
+		})
+		if elapsed := time.Since(start); err != nil || calls != 2 || elapsed != time.Second {
+			t.Fatalf("after %v and %d reads, wait returned %v, want success after 1 second and 2 reads", elapsed, calls, err)
+		}
+	})
+}
+
 type deadlineWithoutTimer struct {
 	context.Context
 	deadline time.Time
@@ -273,6 +361,7 @@ func (c deadlineWithoutTimer) Deadline() (time.Time, bool) {
 }
 
 func TestPollPhaseRejectsSuccessAtTheDeadlineBeforeTheContextTimerRuns(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		ctx := deadlineWithoutTimer{t.Context(), time.Now().Add(time.Millisecond)}
 		err := pollPhase(ctx, time.Second, func(ctx context.Context) (bool, error) {

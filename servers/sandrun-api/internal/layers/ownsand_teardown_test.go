@@ -35,6 +35,7 @@ func deleteSandRunOrg(ctx context.Context, env *testenv.Env, org testenv.Org) er
 }
 
 func TestOwnSandTeardownContention(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name             string
 		first, competing teardownRPC

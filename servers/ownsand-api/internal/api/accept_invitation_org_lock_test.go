@@ -47,6 +47,7 @@ func deleteOrganization(org *testenv.Org) error {
 // (40P01) that surfaces as an internal error. The acceptance has to lock the
 // organization row first, commit before the deletion, and be deleted with it.
 func TestAcceptInvitationCommitsBeforeOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -91,6 +92,7 @@ func TestAcceptInvitationCommitsBeforeOrganizationDeletion(t *testing.T) {
 // row lock as a deletion does, lets the acceptance wait for it, commits the
 // deletion and expects the invitation error (not_found) and no membership.
 func TestAcceptInvitationAfterOrganizationDeletionCommits(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
@@ -135,6 +137,7 @@ func TestAcceptInvitationAfterOrganizationDeletionCommits(t *testing.T) {
 // first and is deleted with the organization, or the deletion wins and the
 // acceptance gets not_found.
 func TestConcurrentAcceptInvitationAndOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	ctx := context.Background()
 	var committedFirst, deletedFirst int
