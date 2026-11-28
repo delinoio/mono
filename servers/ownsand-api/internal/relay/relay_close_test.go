@@ -165,7 +165,9 @@ func TestPendingClosesCountAgainstAdmission(t *testing.T) {
 	}
 	// Both connection slots are held by pending closes, so no stream is admitted
 	// (also not for a grant without streams).
-	if _, err := c.Open(context.Background(), "grant-c", "sandbox"); !errors.Is(err, ErrTooManyStreams) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := c.Open(ctx, "grant-c", "sandbox"); !errors.Is(err, ErrTooManyStreams) {
 		t.Fatalf("Open while two closes are pending = %v, want ErrTooManyStreams", err)
 	}
 	if got := perGrantCount(c, "grant-a"); got != 1 {
@@ -175,7 +177,10 @@ func TestPendingClosesCountAgainstAdmission(t *testing.T) {
 	// Drain the queue like the writer: the open frames, the fillers, then the
 	// two close frames; each close releases its slots.
 	for i := 0; i < 2+filler; i++ {
-		f := takeOut(c)
+		f, ok := tryTakeOut(c)
+		if !ok {
+			t.Fatalf("missing queued frame %d before the close frames", i)
+		}
 		if f.GetRelayStreamClose() != nil {
 			t.Fatalf("stream close frame at %d, before the queued frames", i)
 		}
@@ -185,7 +190,10 @@ func TestPendingClosesCountAgainstAdmission(t *testing.T) {
 	}
 	closed := map[uint64]bool{}
 	for i := 0; i < 2; i++ {
-		f := takeOut(c)
+		f, ok := tryTakeOut(c)
+		if !ok {
+			t.Fatalf("missing close frame %d after the queued frames", i)
+		}
 		if f.GetRelayStreamClose() == nil {
 			t.Fatalf("frame %d after the queued frames = %v, want a stream close", i, datapath.PayloadKind(f))
 		}
@@ -214,7 +222,9 @@ func TestPendingCloseCountsAgainstGrantLimit(t *testing.T) {
 	}
 	fillOutbound(c)
 	closeReturnsPromptly(t, s, true)
-	if _, err := c.Open(context.Background(), "grant-a", "sandbox"); !errors.Is(err, ErrTooManyStreams) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := c.Open(ctx, "grant-a", "sandbox"); !errors.Is(err, ErrTooManyStreams) {
 		t.Fatalf("Open on a grant with a pending close = %v, want ErrTooManyStreams", err)
 	}
 }
