@@ -243,7 +243,9 @@ type Sandbox struct {
 	// Set only when state is DELETED or FAILED.
 	EndReason *SandboxEndReason `protobuf:"varint,6,opt,name=end_reason,json=endReason,proto3,enum=delino.ownsand.v1.SandboxEndReason,oneof" json:"end_reason,omitempty"`
 	Source    *SandboxSource    `protobuf:"bytes,7,opt,name=source,proto3" json:"source,omitempty"`
-	// Set for a template source: the snapshot that the template referenced.
+	// For a direct snapshot source, this is the selected snapshot ID.
+	// For a template source, this is the snapshot ID resolved at sandbox creation.
+	// For a base image source, this is an empty string.
 	SourceSnapshotId string     `protobuf:"bytes,8,opt,name=source_snapshot_id,json=sourceSnapshotId,proto3" json:"source_snapshot_id,omitempty"`
 	Resources        *Resources `protobuf:"bytes,9,opt,name=resources,proto3" json:"resources,omitempty"`
 	GuestOs          GuestOs    `protobuf:"varint,10,opt,name=guest_os,json=guestOs,proto3,enum=delino.ownsand.v1.GuestOs" json:"guest_os,omitempty"`

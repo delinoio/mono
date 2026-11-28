@@ -60,7 +60,9 @@ message Sandbox {
   // Set only when state is DELETED or FAILED.
   optional SandboxEndReason end_reason = 6;
   SandboxSource source = 7;
-  // Set for a template source: the snapshot that the template referenced.
+  // For a direct snapshot source, this is the selected snapshot ID.
+  // For a template source, this is the snapshot ID resolved at sandbox creation.
+  // For a base image source, this is an empty string.
   string source_snapshot_id = 8;
   Resources resources = 9;
   GuestOs guest_os = 10;
