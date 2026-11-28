@@ -7209,6 +7209,7 @@ const skipProxyLock =
 async function waitForLockWait(run, what) {
   await waitFor(
     () =>
+      run.child.pid !== undefined &&
       spawnSync("pgrep", ["-P", String(run.child.pid), "-x", "flock"])
         .status === 0,
     what,

@@ -560,7 +560,7 @@ for (const { signal, group } of [
         join(dir, "node_modules", "turbo", "cli.mjs"),
         signalCountingTurbo,
       );
-      const { child, done } = spawnProcessGroup(
+      const { child, done, signalGroup } = spawnProcessGroup(
         t,
         process.execPath,
         [join(dir, "scripts", "dev", launcher), "--filter=web"],
@@ -570,7 +570,8 @@ for (const { signal, group } of [
       const options = { signal: t.signal };
       assert.deepEqual(await once(lines, "line", options), ["ready"]);
 
-      process.kill(group ? -child.pid : child.pid, signal);
+      if (group) signalGroup(signal);
+      else child.kill(signal);
       assert.deepEqual(await once(lines, "line", options), [signal]);
       assert.equal(child.exitCode, null);
       assert.equal(child.signalCode, null);
