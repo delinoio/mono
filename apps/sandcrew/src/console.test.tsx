@@ -666,6 +666,27 @@ describe("chat view", () => {
     expect(await screen.findByText("The command finished.")).toBeTruthy();
   });
 
+  test("offers sign-in when a permission answer is unauthenticated", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    const transport: Transport = {
+      ...base,
+      async unary(method, ...rest) {
+        if (method.name === "AnswerPermission") {
+          throw new ConnectError("expired", Code.Unauthenticated);
+        }
+        return base.unary(method, ...rest);
+      },
+    };
+    renderConsole(chatPath, { transport });
+    const request = await screen.findByRole("article", {
+      name: "Permission request for go test ./...",
+    });
+    await click(within(request).getByRole("button", { name: "Allow once" }));
+    expect(
+      await screen.findByRole("button", { name: "Sign in with Delino" }),
+    ).toBeTruthy();
+  });
+
   test("sends a message, shows the reply and stops a running turn", async () => {
     const { transport, calls } = recording(
       createMockTransport({ agentStepMs: 200 }),

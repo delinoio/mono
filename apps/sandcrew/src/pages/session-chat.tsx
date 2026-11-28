@@ -44,7 +44,7 @@ import {
   Loading,
   PageHeader,
   QueryBoundary,
-  toastError,
+  useActionSignInNotice,
 } from "../components/ui.tsx";
 import {
   formatTime,
@@ -160,6 +160,9 @@ function OwnerChat({ session }: { session: Session }) {
   const ended = session.state === SessionState.ENDED;
   const [deleting, setDeleting] = useState(false);
   const [optionsOpen, setOptionsOpen] = useState(false);
+  // An expired login fails these actions while the page and its stream stay
+  // open: show a lasting sign-in notice instead of a toast.
+  const { signInError, reportActionError } = useActionSignInNotice();
 
   const onSessionChange = (res: { session?: Session }) => {
     if (res.session) transcriptState.updateSession(res.session);
@@ -209,9 +212,10 @@ function OwnerChat({ session }: { session: Session }) {
         onResume={() =>
           resume
             .mutateAsync({ organizationId, sessionId })
-            .catch((e: unknown) => toastError(e, t))
+            .catch(reportActionError)
         }
       />
+      {signInError ? <ErrorNotice error={signInError} /> : null}
       {transcriptState.stream.status === StreamStatus.Reconnecting ? (
         <p className="muted" role="status">
           {t("chat.reconnecting")}
@@ -240,7 +244,7 @@ function OwnerChat({ session }: { session: Session }) {
                     permissionRequestId,
                     optionId,
                   })
-                  .catch((e: unknown) => toastError(e, t))
+                  .catch(reportActionError)
         }
       />
       {ended ? (
@@ -250,6 +254,7 @@ function OwnerChat({ session }: { session: Session }) {
           session={session}
           transcript={transcript}
           onSessionChange={onSessionChange}
+          onActionError={reportActionError}
         />
       )}
       {!ended ? (
@@ -445,10 +450,12 @@ function Composer({
   session,
   transcript,
   onSessionChange,
+  onActionError,
 }: {
   session: Session;
   transcript: Transcript;
   onSessionChange: (res: { session?: Session }) => void;
+  onActionError: (error: unknown) => void;
 }) {
   const { organizationId } = useOrg();
   const { t } = useI18n();
@@ -542,7 +549,7 @@ function Composer({
                   sessionId: session.sessionId,
                   clientMessageId: uuidV7(),
                 })
-                .catch((e: unknown) => toastError(e, t))
+                .catch(onActionError)
             }
           >
             {t("chat.composer.stop")}
