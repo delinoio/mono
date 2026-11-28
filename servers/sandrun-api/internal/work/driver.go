@@ -416,6 +416,7 @@ func ownsandReasonLabel(reason ownsandv1.SandboxEndReason) string {
 // (lifecycle step 6).
 func (e *Engine) sandboxEnded(ctx context.Context, runnerID string, reason ownsandv1.SandboxEndReason) {
 	var ended *Request
+	var release bool
 	var orgID string
 	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		r, err := e.lockRunner(ctx, tx, runnerID)
@@ -437,7 +438,9 @@ func (e *Engine) sandboxEnded(ctx context.Context, runnerID string, reason ownsa
 			return err
 		}
 		if req != nil && !out.KeepRequest {
-			ended, _, err = e.endRequestTx(ctx, tx, req.ID, out.Request)
+			var previousState sandrunv1.RequestState
+			ended, previousState, err = e.endRequestTx(ctx, tx, req.ID, out.Request)
+			release = r.Kind == sandrunv1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION && r.State == runWaiting && previousState == reqStarting
 		}
 		return err
 	})
@@ -448,6 +451,9 @@ func (e *Engine) sandboxEnded(ctx context.Context, runnerID string, reason ownsa
 	if ended != nil {
 		e.svc.Logger.InfoContext(ctx, "runner_sandbox_ended", slog.String("runner_id", runnerID), slog.String("request_id", ended.ID),
 			slog.String("ownsand_end_reason", ownsandReasonLabel(reason)))
+		if release {
+			e.releaseClaim(ctx, ended)
+		}
 	}
 	if orgID != "" {
 		e.Kick(orgID)

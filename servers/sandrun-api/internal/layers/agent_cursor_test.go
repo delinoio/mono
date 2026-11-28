@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/go/ownsand"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/cursor"
@@ -257,6 +258,108 @@ func TestCursorRequestLifecycle(t *testing.T) {
 	}
 	if strings.Contains(w.env.Logs.String(), cursorKey) {
 		t.Fatal("the API key reached the log")
+	}
+}
+
+func TestCursorSandboxLossReleasesWaitingClaim(t *testing.T) {
+	t.Parallel()
+	const (
+		waiting       = sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+		starting      = sandrunv1.RequestState_REQUEST_STATE_STARTING
+		runnerFailed  = sandrunv1.RunnerState_RUNNER_STATE_FAILED
+		requestFailed = sandrunv1.RequestState_REQUEST_STATE_FAILED
+		runnerLost    = sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_LOST
+		vendorID      = "bc-sandbox-lost"
+	)
+	for _, scenario := range []string{"waiting", "vendor_unavailable", "busy", "already_terminal", "rollback"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := t.Context()
+			timing := fastAgentTiming()
+			timing.PollInterval = time.Hour // Run claim polls only at the steps that need them.
+			w := newCursorWorldTiming(t, sandrunv1.GuestOs_GUEST_OS_LINUX, timing)
+			w.cursor.AddRequest(vendorID, true)
+			requestID := w.requestBySource(t, vendorID).GetRequestId()
+			req := w.waitRequest(t, requestID, starting)
+			runnerID := req.GetRunnerId()
+			runner := w.waitRunner(t, runnerID, waiting)
+
+			checkClaim := func(state agent.ClaimState, failures, releases int) {
+				t.Helper()
+				if c, err := w.l.Agents.Claim(ctx, requestID); err != nil || c.State != state {
+					t.Fatalf("claim = %+v, %v, want state %v", c, err, state)
+				}
+				if f, r := w.cursor.FailAttempts(vendorID), w.cursor.ReleaseAttempts(vendorID); f != failures || r != releases {
+					t.Fatalf("Cursor fail/release attempts = %d/%d, want %d/%d", f, r, failures, releases)
+				}
+			}
+			checkClaim(agent.ClaimHeld, 0, 0)
+			wantRequestReason := runnerLost
+			var restoreCommits func()
+			switch scenario {
+			case "vendor_unavailable":
+				w.cursor.FailClaimCalls(true)
+			case "busy":
+				w.cursor.Connect("sandrun-" + requestID)
+				w.l.Agents.Poll(ctx)
+				w.waitRunner(t, runnerID, sandrunv1.RunnerState_RUNNER_STATE_BUSY)
+				w.waitRequest(t, requestID, sandrunv1.RequestState_REQUEST_STATE_RUNNING)
+			case "already_terminal":
+				// Model a terminal request with a held claim and an active runner.
+				wantRequestReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED
+				if _, err := w.env.DB.Pool.Exec(ctx, `UPDATE requests SET state = $2, end_reason = $3, end_time = now()
+					WHERE request_id = $1`, requestID, int16(requestFailed), int16(wantRequestReason)); err != nil {
+					t.Fatal(err)
+				}
+			case "rollback":
+				restoreCommits = rejectWorkTransitionCommit(t, w.workWorld, "runners", int16(waiting), int16(runnerFailed))
+			}
+
+			w.fake.EndSandbox(w.osOrg, runner.GetOwnsandSandboxId(), ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE,
+				ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+			if scenario == "rollback" {
+				waitForRejectedWorkCommit(t, w.workWorld)
+				if r := w.runner(t, runnerID); r.GetState() != waiting {
+					t.Fatalf("runner state after rollback = %v, want %v", r.GetState(), waiting)
+				}
+				if r := w.request(t, requestID); r.GetState() != starting {
+					t.Fatalf("request state after rollback = %v, want %v", r.GetState(), starting)
+				}
+				checkClaim(agent.ClaimHeld, 0, 0)
+				restoreCommits()
+			}
+
+			runner = w.waitRunner(t, runnerID, runnerFailed)
+			if runner.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_SANDBOX_ENDED || runner.GetOwnsandEndReason() != "LOST_ON_DEVICE" {
+				t.Fatalf("runner end reasons = %v / %q", runner.GetEndReason(), runner.GetOwnsandEndReason())
+			}
+			req = w.waitRequest(t, requestID, requestFailed)
+			if req.GetEndReason() != wantRequestReason {
+				t.Fatalf("request end reason = %v, want %v", req.GetEndReason(), wantRequestReason)
+			}
+			switch scenario {
+			case "vendor_unavailable":
+				eventually(t, "logged immediate release failure", func() bool {
+					return strings.Contains(w.env.Logs.String(), "request_claim_release_failed")
+				})
+				checkClaim(agent.ClaimHeld, 1, 0)
+				w.cursor.FailClaimCalls(false)
+				w.l.Agents.Poll(ctx)
+				checkClaim(agent.ClaimReleased, 2, 0)
+			case "busy", "already_terminal":
+				w.env.Stop() // Drain the sandbox driver before checking that it made no call.
+				checkClaim(agent.ClaimHeld, 0, 0)
+				if scenario == "busy" {
+					w.l.Agents.Poll(ctx)
+					checkClaim(agent.ClaimReleased, 0, 1)
+				}
+			default:
+				eventually(t, "the sandbox check releases the claim without a claim poll", func() bool {
+					c, err := w.l.Agents.Claim(ctx, requestID)
+					return err == nil && c.State == agent.ClaimReleased
+				})
+				checkClaim(agent.ClaimReleased, 1, 0)
+			}
+		})
 	}
 }
 
