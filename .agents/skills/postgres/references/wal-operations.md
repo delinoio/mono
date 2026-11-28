@@ -41,7 +41,7 @@ PG17+ moved checkpoint stats from `pg_stat_bgwriter` to `pg_stat_checkpointer` a
 
 `SELECT num_timed, num_requested, write_time, sync_time, buffers_written FROM pg_stat_checkpointer;`
 
-Backend-direct writes (formerly `buffers_backend` in `pg_stat_bgwriter`) are now tracked in `pg_stat_io`: `SELECT writes FROM pg_stat_io WHERE backend_type = 'client backend' AND object = 'relation';`
+To inspect write operations by I/O context on PostgreSQL 17+, run `SELECT context, writes FROM pg_stat_io WHERE backend_type = 'client backend' AND object = 'relation' ORDER BY context;` The query covers only `client backend` writes to permanent relations, excluding temporary relations and other backend types such as `autovacuum worker` and `background worker`. Read `context = 'normal'` for shared-buffer writes and `bulkread`, `bulkwrite`, and `vacuum` for ring-buffer I/O. PostgreSQL 18 can also return an `init` row. Use `sum(writes)` with the same filters for a total across contexts. PostgreSQL 17 removed the cluster-wide `buffers_backend` and `buffers_backend_fsync` counters from `pg_stat_bgwriter` in favor of similar metrics in `pg_stat_io`. In PostgreSQL 17, `writes` counts operations of size `op_bytes` (`BLCKSZ`, 8192 bytes by default). PostgreSQL 18 removed `op_bytes` and added `write_bytes` for the total bytes written.
 
 ## Crash Recovery
 

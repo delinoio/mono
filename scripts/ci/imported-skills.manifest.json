@@ -34,7 +34,7 @@
         "references/replication.md": "c042b121410adb3f0bfb4cec1a5d124ce5fb283dc32ea56d277aaba9ca5fb63b",
         "references/schema-design.md": "ee1e64db6746208c19201e22237d567271d2786cc55da0b02be9d0defc7a0f2f",
         "references/storage-layout.md": "77af9a9d6afea9e4294da88dd1040098b13e5e2db826d87264627b70e0f0ae63",
-        "references/wal-operations.md": "772b2768ae649a95af5e79ba710235ff0ccc93a3ba7db44e973c2a5df6378578"
+        "references/wal-operations.md": "f344603fbcb161ed62f8d736f8d9a73c7d455c381b14834044412337a828da0e"
       }
     },
     "vercel-composition-patterns": {
