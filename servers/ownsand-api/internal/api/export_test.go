@@ -11,6 +11,9 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
+// SandboxPointLookupForTest is the unlocked statement that loadSandbox uses.
+const SandboxPointLookupForTest = sandboxPointLookup
+
 // ReconcileStateReportForTest applies a full state report of the device
 // without an agent channel, so a test controls when the transaction runs.
 // It reports whether the device was already removed when the report took
