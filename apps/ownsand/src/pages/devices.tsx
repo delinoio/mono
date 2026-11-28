@@ -29,6 +29,7 @@ import {
   DeviceStateBadge,
   Empty,
   ErrorNotice,
+  ListNoun,
   Loading,
   MorePagesNotice,
   PageHeader,
@@ -44,63 +45,88 @@ import {
   effectiveVcpuLimit,
   formatBytes,
   formatMib,
+  formatPercent,
+  formatPlainNumber,
   formatTime,
   labels,
   OVERCOMMIT_PERCENTAGES,
 } from "../format.ts";
 import { DeviceLimitField, deviceLimitsInput } from "../forms.ts";
+import { useI18n } from "../i18n.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import { enumText, type Text } from "../text.ts";
 
-function vcpuSummary(d: Device): string {
+function vcpuSummary(d: Device, text: Text): string {
   const l = d.limits;
   if (l === undefined) return "—";
-  const ratio = l.vcpuOvercommitPercent / 100;
-  return `${deviceAllocatedVcpu(d)} of ${d.effectiveVcpuLimitCount} (${l.vcpuCount} × ${ratio})`;
+  return text.t("devices.vcpuSummary", {
+    allocated: formatPlainNumber(deviceAllocatedVcpu(d), text.lang),
+    effective: formatPlainNumber(d.effectiveVcpuLimitCount, text.lang),
+    limit: formatPlainNumber(l.vcpuCount, text.lang),
+    ratio: formatPlainNumber(l.vcpuOvercommitPercent / 100, text.lang),
+  });
+}
+
+/** The host OS and architecture of a device, for example `Linux x86-64`. */
+function platformText(d: Device, text: Text): string {
+  return text.t("devices.platformValue", {
+    os: enumText(text, labels.hostOs, d.hostOs),
+    arch: enumText(text, labels.arch, d.arch),
+  });
+}
+
+/** The agent version and its update state. */
+function agentText(d: Device, text: Text): string {
+  return text.t("devices.agentValue", {
+    version: d.agentVersion,
+    state: enumText(text, labels.updateState, d.updateState),
+  });
 }
 
 /** Route `devices`: devices with state, limits, allocation and agent version. */
 export function DevicesPage() {
   const { organizationId, role } = useOrg();
   const { devices, boundary, pages } = useDevices(organizationId);
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   return (
     <>
       <PageHeader
-        title="Devices"
-        description="Your own machines that run sandboxes. A new device runs nothing until an admin sets its limits."
+        title={t("devices.title")}
+        description={t("devices.description")}
         action={
           can(role, Permission.ManageEnrollmentTokens) ? (
             <Link
               className="button-link"
               to={routePath({ id: RouteId.EnrollmentTokens, organizationId })}
             >
-              Add a device
+              {t("devices.add")}
             </Link>
           ) : undefined
         }
       />
       {showsFullError(boundary) ? null : (
-        <MorePagesNotice noun="devices" pages={pages} />
+        <MorePagesNotice noun={ListNoun.Devices} pages={pages} />
       )}
-      <QueryBoundary query={boundary} loading="Loading devices">
+      <QueryBoundary query={boundary} loading={t("devices.loading")}>
         {() =>
           devices.length === 0 ? (
-            <Empty title="No devices yet">
-              An admin creates an enrollment token and installs the agent on a
-              device.
+            <Empty title={t("devices.empty.title")}>
+              {t("devices.empty.description")}
             </Empty>
           ) : (
-            <TableRegion label="Device list">
+            <TableRegion label={t("devices.table.label")}>
               <table className="table">
                 <thead>
                   <tr>
-                    <th scope="col">Device</th>
-                    <th scope="col">State</th>
-                    <th scope="col">Platform</th>
-                    <th scope="col">vCPUs allocated</th>
-                    <th scope="col">Memory allocated</th>
-                    <th scope="col">Disk allocated</th>
-                    <th scope="col">Agent</th>
+                    <th scope="col">{t("devices.table.device")}</th>
+                    <th scope="col">{t("devices.table.state")}</th>
+                    <th scope="col">{t("devices.table.platform")}</th>
+                    <th scope="col">{t("devices.table.vcpus")}</th>
+                    <th scope="col">{t("devices.table.memory")}</th>
+                    <th scope="col">{t("devices.table.disk")}</th>
+                    <th scope="col">{t("devices.table.agent")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -120,21 +146,30 @@ export function DevicesPage() {
                       <td>
                         <DeviceStateBadge state={d.state} />
                       </td>
+                      <td>{platformText(d, i18n)}</td>
+                      <td>{vcpuSummary(d, i18n)}</td>
                       <td>
-                        {labels.hostOs[d.hostOs]} {labels.arch[d.arch]}
-                      </td>
-                      <td>{vcpuSummary(d)}</td>
-                      <td>
-                        {formatMib(d.allocation?.memoryMib ?? 0n)} of{" "}
-                        {formatMib(d.limits?.memoryMib ?? 0n)}
-                      </td>
-                      <td>
-                        {String(d.allocation?.diskGib ?? 0n)} of{" "}
-                        {String(d.limits?.diskGib ?? 0n)} GiB
+                        {t("devices.memoryAllocated", {
+                          allocated: formatMib(
+                            d.allocation?.memoryMib ?? 0n,
+                            lang,
+                          ),
+                          limit: formatMib(d.limits?.memoryMib ?? 0n, lang),
+                        })}
                       </td>
                       <td>
-                        {d.agentVersion} · {labels.updateState[d.updateState]}
+                        {t("devices.diskAllocated", {
+                          allocated: formatPlainNumber(
+                            d.allocation?.diskGib ?? 0n,
+                            lang,
+                          ),
+                          limit: formatPlainNumber(
+                            d.limits?.diskGib ?? 0n,
+                            lang,
+                          ),
+                        })}
                       </td>
+                      <td>{agentText(d, i18n)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -164,6 +199,8 @@ interface DeviceLimitsDraft {
  */
 export function DevicePage({ deviceId }: { deviceId: string }) {
   const { organizationId, role } = useOrg();
+  const i18n = useI18n();
+  const { t, lang, rich } = i18n;
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const transport = useTransport();
@@ -221,7 +258,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   const saving = useRef(false);
   const pending = update.isPending;
 
-  if (query.isPending) return <Loading label="Loading the device" />;
+  if (query.isPending) return <Loading label={t("device.loading")} />;
   if (query.data === undefined || showsFullError(query))
     return (
       <ErrorNotice error={query.error} onRetry={() => void query.refetch()} />
@@ -258,12 +295,15 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     if (saving.current) return;
     // ReplaceDeviceLimits needs every value. A blank field is not zero: the
     // form asks for the value instead of sending a silent zero.
-    const input = deviceLimitsInput({
-      vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
-      memoryMib: memory,
-      diskGib: disk,
-      overcommitPercent: Number(overcommit),
-    });
+    const input = deviceLimitsInput(
+      {
+        vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
+        memoryMib: memory,
+        diskGib: disk,
+        overcommitPercent: Number(overcommit),
+      },
+      i18n,
+    );
     if ("error" in input) {
       setFieldError({ field: input.field, message: input.error });
       toast.error(input.error);
@@ -287,10 +327,10 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
         overcommit:
           current.overcommit === overcommit ? undefined : current.overcommit,
       }));
-      toast.success("The device limits are saved.");
+      toast.success(t("device.limitsSaved"));
     } catch (error) {
       // The draft stays as the user left it and the form is usable again.
-      toastError(error);
+      toastError(error, i18n);
     } finally {
       saving.current = false;
     }
@@ -300,41 +340,50 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     <>
       {query.error ? <RefreshFailedNotice query={query} /> : null}
       <PageHeader
-        title={d.name || "Device"}
+        title={d.name || t("device.title")}
         description={<DeviceStateBadge state={d.state} />}
       />
       <dl className="details">
-        <Detail term="Platform">
-          {labels.hostOs[d.hostOs]} {labels.arch[d.arch]}
+        <Detail term={t("device.details.platform")}>
+          {platformText(d, i18n)}
         </Detail>
-        <Detail term="Agent">
-          {d.agentVersion} · {labels.updateState[d.updateState]}
+        <Detail term={t("device.details.agent")}>{agentText(d, i18n)}</Detail>
+        <Detail term={t("device.details.lastSeen")}>
+          {formatTime(d.lastSeenTime, lang)}
         </Detail>
-        <Detail term="Last seen">{formatTime(d.lastSeenTime)}</Detail>
-        <Detail term="Host capacity">
+        <Detail term={t("device.details.capacity")}>
           {d.capabilities
-            ? `${d.capabilities.logicalCpuCount} CPUs · ${formatMib(d.capabilities.memoryMib)} memory · ${formatBytes(d.capabilities.freeDiskBytes)} free disk`
+            ? t("device.capacityValue", {
+                cpus: formatPlainNumber(d.capabilities.logicalCpuCount, lang),
+                memory: formatMib(d.capabilities.memoryMib, lang),
+                disk: formatBytes(d.capabilities.freeDiskBytes, lang),
+              })
             : "—"}
         </Detail>
-        <Detail term="Guests">
-          {d.capabilities?.guestOses.map((g) => labels.guestOs[g]).join(", ") ||
-            "—"}
+        <Detail term={t("device.details.guests")}>
+          {new Intl.ListFormat(lang, { type: "unit", style: "short" }).format(
+            d.capabilities?.guestOses.map((g) =>
+              enumText(i18n, labels.guestOs, g),
+            ) ?? [],
+          ) || "—"}
         </Detail>
-        <Detail term="Allocated">
-          {`${deviceAllocatedVcpu(d)} vCPU · ${formatMib(d.allocation?.memoryMib ?? 0n)} · ${d.allocation?.diskGib ?? 0n} GiB disk`}
+        <Detail term={t("device.details.allocated")}>
+          {t("sandboxes.resourcesValue", {
+            vcpu: formatPlainNumber(deviceAllocatedVcpu(d), lang),
+            memory: formatMib(d.allocation?.memoryMib ?? 0n, lang),
+            disk: formatPlainNumber(d.allocation?.diskGib ?? 0n, lang),
+          })}
         </Detail>
       </dl>
       <section className="section" aria-labelledby="limits-title">
-        <h2 id="limits-title">Limits</h2>
-        <p className="muted">
-          The sandboxes on this device share these limits. vCPU overcommit lets
-          the scheduler allocate more vCPUs than the limit; memory and disk are
-          never overcommitted.
-        </p>
+        <h2 id="limits-title">{t("device.limits.title")}</h2>
+        <p className="muted">{t("device.limits.description")}</p>
         <form className="form" onSubmit={save}>
           <div className="field-row">
             <NumberInput
-              label="vCPU limit"
+              label={t("device.limits.vcpu")}
+              decrementLabel={t("common.decrease")}
+              incrementLabel={t("common.increase")}
               value={vcpu}
               onValueChange={edit(DeviceLimitField.Vcpu, "vcpu")}
               draftRef={vcpuDraft}
@@ -343,7 +392,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
               disabled={!admin || pending}
             />
             <TextField
-              label="Memory limit (MiB)"
+              label={t("device.limits.memory")}
               value={memory}
               onValueChange={edit(DeviceLimitField.Memory, "memory")}
               inputMode="numeric"
@@ -351,7 +400,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
               disabled={!admin || pending}
             />
             <TextField
-              label="Disk limit (GiB)"
+              label={t("device.limits.disk")}
               value={disk}
               onValueChange={edit(DeviceLimitField.Disk, "disk")}
               inputMode="numeric"
@@ -360,7 +409,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
             />
           </div>
           <Select
-            label="vCPU overcommit"
+            label={t("device.limits.overcommit")}
             value={overcommit}
             onValueChange={(v) =>
               v && setDraft((c) => ({ ...c, overcommit: v }))
@@ -369,21 +418,30 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
           >
             {OVERCOMMIT_PERCENTAGES.map((p) => (
               <SelectOption key={p} value={String(p)}>
-                {p === 100 ? "None (100%)" : `${p}% (${p / 100}×)`}
+                {p === 100
+                  ? t("device.limits.overcommitNone", {
+                      percent: formatPercent(p, lang),
+                    })
+                  : t("device.limits.overcommitValue", {
+                      percent: formatPercent(p, lang),
+                      ratio: formatPlainNumber(p / 100, lang),
+                    })}
               </SelectOption>
             ))}
           </Select>
           <p
             className="callout"
             role="status"
-            aria-label="Effective vCPU limit"
+            aria-label={t("device.limits.effective")}
           >
-            Effective vCPU limit: <strong>{effective}</strong>
+            {rich("device.limits.effectiveValue", {
+              value: <strong>{formatPlainNumber(effective, lang)}</strong>,
+            })}
           </p>
           {admin ? (
             <div className="actions">
               <Button type="submit" disabled={pending}>
-                Save limits
+                {t("device.limits.save")}
               </Button>
             </div>
           ) : null}
@@ -391,25 +449,26 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
       </section>
       {admin ? (
         <section className="section danger-zone" aria-labelledby="remove-title">
-          <h2 id="remove-title">Remove device</h2>
-          <p className="muted">
-            Revokes the device credentials and ends its sandboxes. The agent
-            deletes its local data when it reconnects.
-          </p>
+          <h2 id="remove-title">{t("device.remove.title")}</h2>
+          <p className="muted">{t("device.remove.description")}</p>
           <Button
             variant={ButtonVariant.Danger}
             onClick={() => setConfirmRemove(true)}
           >
-            Remove device
+            {t("device.remove.button")}
           </Button>
         </section>
       ) : null}
       <ConfirmDialog
         open={confirmRemove}
         onOpenChange={setConfirmRemove}
-        title={`Remove ${d.name || "this device"}?`}
-        description="Its sandboxes end and it can no longer connect. To use the machine again, enroll it as a new device."
-        confirmLabel="Remove device"
+        title={
+          d.name
+            ? t("device.remove.dialogTitle", { name: d.name })
+            : t("device.remove.dialogTitleUnnamed")
+        }
+        description={t("device.remove.dialogDescription")}
+        confirmLabel={t("device.remove.button")}
         onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId, deviceId });
           // The redirect belongs to the opening that asked for the removal.

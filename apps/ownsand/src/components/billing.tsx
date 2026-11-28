@@ -7,30 +7,32 @@ import {
 } from "@delino/ownsand-protos/v1/billing_pb";
 import { BillingReason, Role } from "@delino/ownsand-protos/v1/common_pb";
 import { ACCOUNTS_URL } from "../config.ts";
-import { formatTime } from "../format.ts";
+import { formatTime, formatUsdMicros } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
+import type { Text } from "../text.ts";
 import { showsFullError } from "./ui.tsx";
 
+/** The host name of the billing site, which link texts show. */
+export const ACCOUNTS_HOST = new URL(ACCOUNTS_URL).host;
+
 /** Why the organization is blocked, in plain words. */
-function reasonText(billing: OrganizationBilling): string {
-  const unpaid =
-    "the linked billing account has no active subscription, or its balance is $0.00 or less";
+function reasonText(billing: OrganizationBilling, text: Text): string {
+  // The threshold balance of an unpaid billing account.
+  const amount = formatUsdMicros(0n, text.lang);
   switch (billing.reason) {
     case BillingReason.ACCOUNT_REQUIRED:
-      return "No billing account is linked to this organization.";
+      return text.t("billingBanner.reason.accountRequired");
     case BillingReason.BLOCKED:
-      return `Payment is missing: ${unpaid}.`;
+      return text.t("billingBanner.reason.blocked", { amount });
     case BillingReason.SUSPENDED:
       return billing.linked
-        ? `Payment has been missing for 3 days: ${unpaid}.`
-        : "No billing account has been linked for 3 days.";
+        ? text.t("billingBanner.reason.suspendedUnpaid", { amount })
+        : text.t("billingBanner.reason.suspendedUnlinked");
     default:
-      return "Billing does not allow new resources.";
+      return text.t("billingBanner.reason.other");
   }
 }
-
-const BLOCKED_ACTIONS =
-  "creating sandboxes, snapshots, templates and enrollment tokens, resuming sandboxes, exporting snapshots, and enrolling a device even with an existing enrollment token";
 
 /**
  * The billing banner of every organization page. Every member sees it while
@@ -45,6 +47,8 @@ export function BillingBanner({
   organizationId: string;
   role: Role;
 }) {
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const status = useQuery(BillingService.method.getBillingStatus, {
     organizationId,
   });
@@ -66,38 +70,39 @@ export function BillingBanner({
     >
       <h2 id="billing-banner-title">
         {suspended
-          ? "This organization is suspended"
-          : "This organization is blocked"}
+          ? t("billingBanner.suspendedTitle")
+          : t("billingBanner.blockedTitle")}
       </h2>
-      <p>{reasonText(billing)}</p>
+      <p>{reasonText(billing, i18n)}</p>
       {suspended ? (
         <p>
-          Running sandboxes are paused. OwnSand rejects {BLOCKED_ACTIONS}, and
-          also exec, file transfers, sessions and relay connections. Reads and
-          deletions still work.
+          {t("billingBanner.suspendedEffects")}
           {billing.suspendTime
-            ? ` Suspended since ${formatTime(billing.suspendTime)}.`
+            ? ` ${t("billingBanner.suspendedSince", {
+                time: formatTime(billing.suspendTime, lang),
+              })}`
             : null}
         </p>
       ) : (
         <p>
-          OwnSand rejects {BLOCKED_ACTIONS}. Running sandboxes, exec, reads and
-          deletions still work.
+          {t("billingBanner.blockedEffects")}
           {billing.suspendTime
-            ? ` Unless billing is fixed, the organization is suspended on ${formatTime(billing.suspendTime)} and its running sandboxes are paused.`
+            ? ` ${t("billingBanner.suspendOn", {
+                time: formatTime(billing.suspendTime, lang),
+              })}`
             : null}
         </p>
       )}
       <p className="billing-banner-actions">
         {billing.linked ? null : role === Role.OWNER ? (
           <Link to={routePath({ id: RouteId.Settings, organizationId })}>
-            Link a billing account
+            {t("billingBanner.linkAccount")}
           </Link>
         ) : (
-          <span>The organization owner must link a billing account.</span>
+          <span>{t("billingBanner.ownerMustLink")}</span>
         )}
         <a href={ACCOUNTS_URL} target="_blank" rel="noreferrer">
-          Manage billing at accounts.delino.io
+          {t("billingBanner.manageBilling", { site: ACCOUNTS_HOST })}
         </a>
       </p>
     </section>

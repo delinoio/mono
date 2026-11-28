@@ -40,6 +40,7 @@ import {
   Empty,
   ErrorNotice,
   FormDialog,
+  ListNoun,
   Loading,
   MorePagesNotice,
   PageHeader,
@@ -51,11 +52,19 @@ import {
   shortIdText,
 } from "../components/ui.tsx";
 import { useDevices } from "../devices.ts";
-import { deviceOptionLabel, formatMib, formatTime, labels } from "../format.ts";
+import {
+  deviceOptionLabel,
+  formatMib,
+  formatPlainNumber,
+  formatTime,
+  labels,
+} from "../format.ts";
 import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
+import { useI18n } from "../i18n.ts";
 import { lastRequestFailedOnLaterPage } from "../pagination.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 import { useSnapshots, useTemplates } from "../snapshot-lists.ts";
+import { enumText, type Text } from "../text.ts";
 import { uuidV7 } from "../uuid.ts";
 
 const ALL = "all";
@@ -87,6 +96,8 @@ function isCreateRejection(error: unknown): boolean {
 /** Route `sandboxes`: the sandbox list with filters and creation. */
 export function SandboxesPage() {
   const { organizationId } = useOrg();
+  const i18n = useI18n();
+  const { t } = i18n;
   const [state, setState] = useState<string>(ALL);
   const [deviceId, setDeviceId] = useState<string>(ALL);
   const [includeEnded, setIncludeEnded] = useState(false);
@@ -167,33 +178,39 @@ export function SandboxesPage() {
   return (
     <>
       <PageHeader
-        title="Sandboxes"
-        description="Sandboxes run on your organization's devices. The console does not show command output or file contents."
+        title={t("sandboxes.title")}
+        description={t("sandboxes.description")}
         action={
-          <Button onClick={() => setCreating(true)}>Create sandbox</Button>
+          <Button onClick={() => setCreating(true)}>
+            {t("sandboxes.create")}
+          </Button>
         }
       />
       <div className="filters">
         <Select
-          label="State"
+          label={t("sandboxes.filters.state")}
           value={state}
           onValueChange={(v) => setState(v ?? ALL)}
         >
-          <SelectOption value={ALL}>All states</SelectOption>
+          <SelectOption value={ALL}>
+            {t("sandboxes.filters.allStates")}
+          </SelectOption>
           {Object.values(SandboxState)
             .filter((v): v is SandboxState => typeof v === "number" && v !== 0)
             .map((v) => (
               <SelectOption key={v} value={String(v)}>
-                {labels.sandboxState[v]}
+                {enumText(i18n, labels.sandboxState, v)}
               </SelectOption>
             ))}
         </Select>
         <Select
-          label="Device"
+          label={t("sandboxes.filters.device")}
           value={deviceId}
           onValueChange={(v) => setDeviceId(v ?? ALL)}
         >
-          <SelectOption value={ALL}>All devices</SelectOption>
+          <SelectOption value={ALL}>
+            {t("sandboxes.filters.allDevices")}
+          </SelectOption>
           {devices.map((d) => (
             <SelectOption key={d.deviceId} value={d.deviceId}>
               {d.name}
@@ -201,31 +218,31 @@ export function SandboxesPage() {
           ))}
         </Select>
         <Checkbox
-          label="Show ended sandboxes"
+          label={t("sandboxes.filters.showEnded")}
           checked={includeEnded}
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
       {creating ? null : <DeviceListNotice list={deviceList} />}
-      <QueryBoundary query={boundaryQuery} loading="Loading sandboxes">
+      <QueryBoundary query={boundaryQuery} loading={t("sandboxes.loading")}>
         {() => (
           <>
             {sandboxes.length === 0 ? (
-              <Empty title="No sandboxes match">
-                Create a sandbox, or change the filters.
+              <Empty title={t("sandboxes.empty.title")}>
+                {t("sandboxes.empty.description")}
               </Empty>
             ) : (
-              <TableRegion label="Sandbox list">
+              <TableRegion label={t("sandboxes.table.label")}>
                 <table className="table">
                   <thead>
                     <tr>
-                      <th scope="col">Sandbox</th>
-                      <th scope="col">State</th>
-                      <th scope="col">Device</th>
-                      <th scope="col">Resources</th>
-                      <th scope="col">Idle deadline</th>
-                      <th scope="col">Max deadline</th>
-                      <th scope="col">Labels</th>
+                      <th scope="col">{t("sandboxes.table.sandbox")}</th>
+                      <th scope="col">{t("sandboxes.table.state")}</th>
+                      <th scope="col">{t("sandboxes.table.device")}</th>
+                      <th scope="col">{t("sandboxes.table.resources")}</th>
+                      <th scope="col">{t("sandboxes.table.idleDeadline")}</th>
+                      <th scope="col">{t("sandboxes.table.maxDeadline")}</th>
+                      <th scope="col">{t("sandboxes.table.labels")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -250,7 +267,7 @@ export function SandboxesPage() {
                 disabled={list.isFetchingNextPage}
                 onClick={requestNextPage}
               >
-                Show more
+                {t("common.showMore")}
               </Button>
             ) : null}
           </>
@@ -266,11 +283,32 @@ export function SandboxesPage() {
 }
 
 function DeviceListNotice({ list }: { list: ReturnType<typeof useDevices> }) {
+  const { t } = useI18n();
   return (
-    <QueryBoundary query={list.boundary} loading="Loading devices">
-      {() => <MorePagesNotice noun="devices" pages={list.pages} />}
+    <QueryBoundary query={list.boundary} loading={t("devices.loading")}>
+      {() => <MorePagesNotice noun={ListNoun.Devices} pages={list.pages} />}
     </QueryBoundary>
   );
+}
+
+/**
+ * The resources of a sandbox in one line, for example
+ * `2 vCPU · 4 GiB · 20 GiB disk`. `key` selects the wording; its
+ * placeholders are `vcpu`, `memory` and `disk`.
+ */
+export function resourcesText(
+  resources: Sandbox["resources"],
+  text: Text,
+  key:
+    | "sandboxes.resourcesValue"
+    | "sandbox.resourcesValue" = "sandboxes.resourcesValue",
+): string {
+  if (resources === undefined) return "—";
+  return text.t(key, {
+    vcpu: formatPlainNumber(resources.vcpuCount, text.lang),
+    memory: formatMib(resources.memoryMib, text.lang),
+    disk: formatPlainNumber(resources.diskGib, text.lang),
+  });
 }
 
 function SandboxRow({
@@ -282,6 +320,7 @@ function SandboxRow({
   organizationId: string;
   deviceName: string | undefined;
 }) {
+  const i18n = useI18n();
   const ended =
     s.state === SandboxState.DELETED || s.state === SandboxState.FAILED;
   return (
@@ -301,13 +340,9 @@ function SandboxRow({
         <SandboxStateBadge state={s.state} lastKnownState={s.lastKnownState} />
       </td>
       <td>{deviceName ?? <ShortId id={s.deviceId} />}</td>
-      <td>
-        {s.resources
-          ? `${s.resources.vcpuCount} vCPU · ${formatMib(s.resources.memoryMib)} · ${s.resources.diskGib} GiB disk`
-          : "—"}
-      </td>
-      <td>{ended ? "—" : formatTime(s.idleDeadline)}</td>
-      <td>{ended ? "—" : formatTime(s.maxDeadline)}</td>
+      <td>{resourcesText(s.resources, i18n)}</td>
+      <td>{ended ? "—" : formatTime(s.idleDeadline, i18n.lang)}</td>
+      <td>{ended ? "—" : formatTime(s.maxDeadline, i18n.lang)}</td>
       <td className="wrap">
         <LabelList labels={s.labels} />
       </td>
@@ -320,10 +355,12 @@ export function LabelList({
 }: {
   labels: Record<string, string>;
 }) {
+  const { t } = useI18n();
   const entries = Object.entries(values);
-  if (entries.length === 0) return <span className="muted">None</span>;
+  if (entries.length === 0)
+    return <span className="muted">{t("sandboxes.labels.none")}</span>;
   return (
-    <ul className="labels" aria-label="Labels">
+    <ul className="labels" aria-label={t("sandboxes.labels.list")}>
       {entries.map(([k, v]) => (
         <li key={k}>
           <Badge>
@@ -357,6 +394,8 @@ function CreateSandboxDialog({
   deviceList: ReturnType<typeof useDevices>;
 }) {
   const { organizationId } = useOrg();
+  const i18n = useI18n();
+  const { t } = i18n;
   const { devices } = deviceList;
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
@@ -386,15 +425,20 @@ function CreateSandboxDialog({
   const sourceOptions = [
     ...[BaseImage.LINUX, BaseImage.MACOS, BaseImage.WINDOWS].map((image) => ({
       value: `base:${image}`,
-      label: `${labels.baseImage[image]} base image`,
+      label: t("sandboxes.source.baseImage", {
+        image: enumText(i18n, labels.baseImage, image),
+      }),
     })),
     ...templates.rows.map((template) => ({
       value: `template:${template.templateId}`,
-      label: `Template: ${template.name}`,
+      label: t("sandboxes.source.template", { name: template.name }),
     })),
     ...readySnapshots.map((snapshot) => ({
       value: `snapshot:${snapshot.snapshotId}`,
-      label: `Snapshot ${shortIdText(snapshot.snapshotId)} · ${formatTime(snapshot.createTime)}`,
+      label: t("sandboxes.source.snapshot", {
+        id: shortIdText(snapshot.snapshotId),
+        time: formatTime(snapshot.createTime, i18n.lang),
+      }),
     })),
   ];
   const selectedSource = sourceOptions.find(
@@ -434,10 +478,12 @@ function CreateSandboxDialog({
   return (
     <FormDialog
       open={open}
-      title="Create a sandbox"
+      title={t("sandboxes.createDialog.title")}
       wide
-      description="Choose the source, resources and time limits. There is no default TTL."
-      submitLabel={recovering ? "Retry original request" : "Create"}
+      description={t("sandboxes.createDialog.description")}
+      submitLabel={
+        recovering ? t("sandboxes.createDialog.retry") : t("common.create")
+      }
       submitDisabled={
         attempt?.status === "pending" ||
         expired ||
@@ -459,18 +505,23 @@ function CreateSandboxDialog({
         } else {
           if (!selectedSource || deviceUnavailable) return;
           const next: Record<string, string> = {};
-          const ttl = ttlErrors({ idleMinutes, maxHours });
+          const ttl = ttlErrors({ idleMinutes, maxHours }, i18n);
           if (ttl.idle) next.idle = ttl.idle;
           if (ttl.max) next.max = ttl.max;
           Object.assign(
             next,
-            resourceErrors({
-              vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
-              memory: memoryDraft.current?.hasFraction() ? Number.NaN : memory,
-              disk: diskDraft.current?.hasFraction() ? Number.NaN : disk,
-            }),
+            resourceErrors(
+              {
+                vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
+                memory: memoryDraft.current?.hasFraction()
+                  ? Number.NaN
+                  : memory,
+                disk: diskDraft.current?.hasFraction() ? Number.NaN : disk,
+              },
+              i18n,
+            ),
           );
-          const parsed = parseLabels(labelText);
+          const parsed = parseLabels(labelText, i18n);
           if ("error" in parsed) next.labels = parsed.error;
           setErrors(next);
           if (Object.keys(next).length > 0 || "error" in parsed) return;
@@ -482,7 +533,11 @@ function CreateSandboxDialog({
             expiresAt: Date.now() + CREATE_RESERVATION_MS,
             sourceLabel: selectedSource.label,
             deviceLabel: selectedDevice
-              ? deviceOptionLabel(selectedDevice.name, selectedDevice.state)
+              ? deviceOptionLabel(
+                  selectedDevice.name,
+                  selectedDevice.state,
+                  i18n,
+                )
               : undefined,
             request: {
               organizationId,
@@ -553,12 +608,12 @@ function CreateSandboxDialog({
       (templates.boundary.isPending || snapshots.boundary.isPending) ? (
         // Render the source picker once its options are known, so the
         // trigger shows the selected option's name from the start.
-        <Loading label="Loading sources" />
+        <Loading label={t("sandboxes.createDialog.loadingSources")} />
       ) : (
         <Select
-          label="Source"
+          label={t("sandboxes.createDialog.source")}
           value={selectedSource || fieldsLocked ? source : null}
-          placeholder="Choose a source"
+          placeholder={t("sandboxes.createDialog.chooseSource")}
           disabled={fieldsLocked}
           onValueChange={(v) => v && setSource(v)}
         >
@@ -573,18 +628,36 @@ function CreateSandboxDialog({
         </Select>
       )}
       {templates.boundary.isPending ? null : (
-        <QueryBoundary query={templates.boundary} loading="Loading templates">
-          {() => <MorePagesNotice noun="templates" pages={templates.pages} />}
+        <QueryBoundary
+          query={templates.boundary}
+          loading={t("templates.loading")}
+        >
+          {() => (
+            <MorePagesNotice
+              noun={ListNoun.Templates}
+              pages={templates.pages}
+            />
+          )}
         </QueryBoundary>
       )}
       {snapshots.boundary.isPending ? null : (
-        <QueryBoundary query={snapshots.boundary} loading="Loading snapshots">
-          {() => <MorePagesNotice noun="snapshots" pages={snapshots.pages} />}
+        <QueryBoundary
+          query={snapshots.boundary}
+          loading={t("snapshots.loading")}
+        >
+          {() => (
+            <MorePagesNotice
+              noun={ListNoun.Snapshots}
+              pages={snapshots.pages}
+            />
+          )}
         </QueryBoundary>
       )}
       <div className="field-row">
         <NumberInput
-          label="vCPUs"
+          label={t("sandboxes.createDialog.vcpus")}
+          decrementLabel={t("common.decrease")}
+          incrementLabel={t("common.increase")}
           value={vcpu}
           disabled={fieldsLocked}
           onValueChange={setVcpu}
@@ -593,7 +666,9 @@ function CreateSandboxDialog({
           error={errors.vcpu}
         />
         <NumberInput
-          label="Memory (MiB)"
+          label={t("sandboxes.createDialog.memory")}
+          decrementLabel={t("common.decrease")}
+          incrementLabel={t("common.increase")}
           value={memory}
           disabled={fieldsLocked}
           onValueChange={setMemory}
@@ -607,7 +682,9 @@ function CreateSandboxDialog({
           error={errors.memory}
         />
         <NumberInput
-          label="Disk (GiB)"
+          label={t("sandboxes.createDialog.disk")}
+          decrementLabel={t("common.decrease")}
+          incrementLabel={t("common.increase")}
           value={disk}
           disabled={fieldsLocked}
           onValueChange={setDisk}
@@ -618,8 +695,10 @@ function CreateSandboxDialog({
       </div>
       <div className="field-row">
         <NumberInput
-          label="Idle TTL (minutes)"
-          description="Ends the sandbox after this long without activity."
+          label={t("sandboxes.createDialog.idleTtl")}
+          description={t("sandboxes.createDialog.idleTtlDescription")}
+          decrementLabel={t("common.decrease")}
+          incrementLabel={t("common.increase")}
           value={idleMinutes}
           disabled={fieldsLocked}
           onValueChange={setIdleMinutes}
@@ -627,8 +706,10 @@ function CreateSandboxDialog({
           error={errors.idle}
         />
         <NumberInput
-          label="Maximum TTL (hours)"
-          description="At most 168 hours (7 days)."
+          label={t("sandboxes.createDialog.maxTtl")}
+          description={t("sandboxes.createDialog.maxTtlDescription")}
+          decrementLabel={t("common.decrease")}
+          incrementLabel={t("common.increase")}
           value={maxHours}
           disabled={fieldsLocked}
           onValueChange={setMaxHours}
@@ -639,34 +720,38 @@ function CreateSandboxDialog({
       </div>
       <div className="field-row">
         <Select
-          label="Network"
+          label={t("sandboxes.createDialog.network")}
           value={network}
           disabled={fieldsLocked}
           onValueChange={(v) => v && setNetwork(v)}
         >
           <SelectOption value={String(NetworkMode.OUTBOUND)}>
-            Outbound access
+            {t("sandboxes.createDialog.networkOutbound")}
           </SelectOption>
           <SelectOption value={String(NetworkMode.NONE)}>
-            No network
+            {t("sandboxes.createDialog.networkNone")}
           </SelectOption>
         </Select>
         <Select
-          label="Device"
+          label={t("sandboxes.createDialog.device")}
           value={deviceUnavailable && !fieldsLocked ? null : device}
-          placeholder="Choose a device"
+          placeholder={t("sandboxes.createDialog.chooseDevice")}
           error={
             deviceUnavailable && !fieldsLocked
-              ? "The selected device is unavailable. Choose a device or select Any device that fits."
+              ? t("sandboxes.createDialog.deviceUnavailable", {
+                  anyDevice: t("sandboxes.createDialog.anyDevice"),
+                })
               : undefined
           }
           disabled={fieldsLocked}
           onValueChange={(v) => v && setDevice(v)}
         >
-          <SelectOption value={ALL}>Any device that fits</SelectOption>
+          <SelectOption value={ALL}>
+            {t("sandboxes.createDialog.anyDevice")}
+          </SelectOption>
           {devices.map((d) => (
             <SelectOption key={d.deviceId} value={d.deviceId}>
-              {deviceOptionLabel(d.name, d.state)}
+              {deviceOptionLabel(d.name, d.state, i18n)}
             </SelectOption>
           ))}
           {!selectedDevice && attempt?.deviceLabel ? (
@@ -676,8 +761,8 @@ function CreateSandboxDialog({
       </div>
       {open ? <DeviceListNotice list={deviceList} /> : null}
       <Textarea
-        label="Labels"
-        description="One key=value per line. Every member and API key can read labels, so never put secrets in them."
+        label={t("sandboxes.createDialog.labels")}
+        description={t("sandboxes.createDialog.labelsDescription")}
         value={labelText}
         disabled={fieldsLocked}
         onValueChange={setLabelText}
@@ -687,10 +772,9 @@ function CreateSandboxDialog({
       {recovering ? (
         <div className="notice notice-error" role="alert">
           <p>
-            The sandbox may have been created.{" "}
             {expired
-              ? "The retry window has ended. Check the sandbox list before creating another sandbox."
-              : "Retry the original request to recover the sandbox."}
+              ? t("sandboxes.createDialog.unconfirmedExpired")
+              : t("sandboxes.createDialog.unconfirmedRetry")}
           </p>
         </div>
       ) : null}

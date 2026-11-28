@@ -23,6 +23,7 @@ import {
   RefreshFailedNotice,
   showsFullError,
 } from "../components/ui.tsx";
+import { ACCOUNTS_HOST } from "../components/billing.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
 import {
   formatByteCount,
@@ -32,37 +33,43 @@ import {
   formatUsdMicros,
   labels,
 } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { can, Permission } from "../roles.ts";
+import { enumText, type Text } from "../text.ts";
 
 /** The usage quantity of a meter in its display unit. */
-function meterQuantity(usage: BillingMeterUsage): string {
+function meterQuantity(usage: BillingMeterUsage, text: Text): string {
   switch (usage.meter) {
     case BillingMeter.RELAY_EGRESS:
-      return formatByteCount(usage.quantity);
+      return formatByteCount(usage.quantity, text.lang);
     case BillingMeter.R2_STORAGE:
-      return formatGibMonths(usage.quantity);
+      return formatGibMonths(usage.quantity, text);
     case BillingMeter.CLASS_A_RPC:
     case BillingMeter.CLASS_B_RPC:
-      return `${formatCount(usage.quantity)} calls`;
+      // The plural form follows the count; the shown digits stay exact for
+      // an int64 count above 2^53.
+      return text.plural("billing.calls", Number(usage.quantity), {
+        count: formatCount(usage.quantity, text.lang),
+      });
     default:
-      return formatCount(usage.quantity);
+      return formatCount(usage.quantity, text.lang);
   }
 }
 
-/** The UTC calendar month of a timestamp, for example "November 2026". */
-function utcMonth(ts: Timestamp | undefined): string {
-  if (ts === undefined) return "This month";
-  return new Date(Number(ts.seconds) * 1000).toLocaleDateString("en-US", {
-    month: "long",
-    year: "numeric",
-    timeZone: "UTC",
-  });
+/** The label of the cost of the UTC calendar month of a timestamp. */
+function monthCostLabel(ts: Timestamp | undefined, text: Text): string {
+  if (ts === undefined) return text.t("billing.costThisMonth");
+  const month = new Date(Number(ts.seconds) * 1000).toLocaleDateString(
+    text.lang,
+    { month: "long", year: "numeric", timeZone: "UTC" },
+  );
+  return text.t("billing.costInMonth", { month });
 }
 
 function AccountsLink() {
   return (
     <a href={ACCOUNTS_URL} target="_blank" rel="noreferrer">
-      accounts.delino.io
+      {ACCOUNTS_HOST}
     </a>
   );
 }
@@ -75,6 +82,8 @@ function AccountsLink() {
  */
 export function BillingSection() {
   const { organizationId, role } = useOrg();
+  const i18n = useI18n();
+  const { t, lang, rich } = i18n;
   const queryClient = useQueryClient();
   const status = useQuery(BillingService.method.getBillingStatus, {
     organizationId,
@@ -96,13 +105,14 @@ export function BillingSection() {
   const [linking, setLinking] = useState(false);
   const [unlinkTarget, setUnlinkTarget] = useState<{
     id: string;
-    name: string;
+    /** The account name, when the loaded usage names the linked account. */
+    name: string | undefined;
   }>();
   const owner = can(role, Permission.ManageBillingLink);
 
   let body;
   if (status.isPending) {
-    body = <Loading label="Loading the billing status" />;
+    body = <Loading label={t("billing.loadingStatus")} />;
   } else if (status.data === undefined || showsFullError(status)) {
     body = (
       <ErrorNotice error={status.error} onRetry={() => void status.refetch()} />
@@ -110,27 +120,22 @@ export function BillingSection() {
   } else if (!linked) {
     body = owner ? (
       <div className="form">
-        <p className="callout">
-          No billing account is linked. OwnSand rejects new sandboxes,
-          snapshots, templates and enrollment tokens until you link one.
-        </p>
+        <p className="callout">{t("billing.unlinkedOwner")}</p>
         <div className="actions">
           <Button onClick={() => setLinking(true)}>
-            Link a billing account
+            {t("billingBanner.linkAccount")}
           </Button>
         </div>
       </div>
     ) : (
-      <p className="callout">
-        No billing account is linked. The organization owner must link one.
-      </p>
+      <p className="callout">{t("billing.unlinkedAdmin")}</p>
     );
   } else {
     // Linked: the usage portion depends on `GetBillingUsage`, but the owner's
     // unlink action must not, so a loading or failed usage request keeps it.
     let usageBody;
     if (usage.isPending) {
-      usageBody = <Loading label="Loading the billing usage" />;
+      usageBody = <Loading label={t("billing.loadingUsage")} />;
     } else if (usage.data === undefined || showsFullError(usage)) {
       usageBody = (
         <ErrorNotice error={usage.error} onRetry={() => void usage.refetch()} />
@@ -144,39 +149,41 @@ export function BillingSection() {
       usageBody = (
         <>
           <dl className="details details-flat">
-            <Detail term="Billing account">{data.billingAccountName}</Detail>
-            <Detail term="Balance">
-              {formatUsdMicros(data.balanceUsdMicros)}
-              {data.balanceUsdMicros < 0n ? " (debt)" : null}
+            <Detail term={t("billing.account")}>
+              {data.billingAccountName}
             </Detail>
-            <Detail term={`Cost in ${utcMonth(data.monthStart)} (UTC)`}>
-              {formatUsdMicros(total)}
+            <Detail term={t("billing.balance")}>
+              {data.balanceUsdMicros < 0n
+                ? t("billing.balanceDebt", {
+                    amount: formatUsdMicros(data.balanceUsdMicros, lang),
+                  })
+                : formatUsdMicros(data.balanceUsdMicros, lang)}
+            </Detail>
+            <Detail term={monthCostLabel(data.monthStart, i18n)}>
+              {formatUsdMicros(total, lang)}
             </Detail>
           </dl>
           <div className="table-wrap">
-            <table className="table" aria-label="Usage this month">
+            <table className="table" aria-label={t("billing.usageTable")}>
               <thead>
                 <tr>
-                  <th scope="col">Meter</th>
-                  <th scope="col">Usage</th>
-                  <th scope="col">Cost</th>
+                  <th scope="col">{t("billing.meter")}</th>
+                  <th scope="col">{t("billing.usage")}</th>
+                  <th scope="col">{t("billing.cost")}</th>
                 </tr>
               </thead>
               <tbody>
                 {data.meterUsages.map((u) => (
                   <tr key={u.meter}>
-                    <td>{labels.billingMeter[u.meter]}</td>
-                    <td>{meterQuantity(u)}</td>
-                    <td>{formatUsageCostUsdMicros(u.amountUsdMicros)}</td>
+                    <td>{enumText(i18n, labels.billingMeter, u.meter)}</td>
+                    <td>{meterQuantity(u, i18n)}</td>
+                    <td>{formatUsageCostUsdMicros(u.amountUsdMicros, lang)}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-          <p className="muted">
-            Usage of about the last 10 minutes is not included yet. R2 storage
-            shows in GiB-months of 730 hours.
-          </p>
+          <p className="muted">{t("billing.usageNote")}</p>
         </>
       );
     }
@@ -194,11 +201,11 @@ export function BillingSection() {
                   !usage.isError &&
                   usage.data?.billingAccountId === billingAccountId
                     ? usage.data.billingAccountName
-                    : "the billing account";
+                    : undefined;
                 setUnlinkTarget({ id: billingAccountId, name });
               }}
             >
-              Unlink billing account
+              {t("billing.unlink")}
             </Button>
           </div>
         ) : null}
@@ -208,10 +215,9 @@ export function BillingSection() {
 
   return (
     <section className="section" aria-labelledby="billing-title">
-      <h2 id="billing-title">Billing</h2>
+      <h2 id="billing-title">{t("billing.title")}</h2>
       <p className="muted">
-        OwnSand charges the usage of this organization to a Delino billing
-        account. Pay, top up and manage billing accounts at <AccountsLink />.
+        {rich("billing.description", { site: <AccountsLink /> })}
       </p>
       {[status, usage].map((query, i) =>
         query.error && !showsFullError(query) ? (
@@ -227,9 +233,13 @@ export function BillingSection() {
             onOpenChange={(open) => {
               if (!open) setUnlinkTarget(undefined);
             }}
-            title={`Unlink ${unlinkTarget?.name ?? "the billing account"}?`}
-            description="The organization becomes blocked at once: OwnSand rejects new sandboxes, snapshots, templates and enrollment tokens until you link a billing account again. Usage so far stays on this billing account."
-            confirmLabel="Unlink billing account"
+            title={
+              unlinkTarget?.name === undefined
+                ? t("billing.unlinkDialog.titleUnnamed")
+                : t("billing.unlinkDialog.title", { name: unlinkTarget.name })
+            }
+            description={t("billing.unlinkDialog.description")}
+            confirmLabel={t("billing.unlink")}
             onConfirm={async (opening) => {
               if (unlinkTarget === undefined) return;
               try {
@@ -242,9 +252,7 @@ export function BillingSection() {
                   throw error;
                 }
                 if (opening.isCurrent()) {
-                  toast.error(
-                    "The linked billing account changed. Review the current account and confirm again.",
-                  );
+                  toast.error(t("billing.unlinkDialog.accountChanged"));
                 }
               }
             }}
@@ -267,6 +275,8 @@ function LinkBillingDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const { organizationId, name } = useOrg();
+  const i18n = useI18n();
+  const { t, rich } = i18n;
   const queryClient = useQueryClient();
   const accounts = useQuery(
     BillingService.method.listLinkableBillingAccounts,
@@ -313,7 +323,7 @@ function LinkBillingDialog({
 
   let content;
   if (accounts.isPending) {
-    content = <Loading label="Loading your billing accounts" />;
+    content = <Loading label={t("billing.linkDialog.loading")} />;
   } else if (accounts.data === undefined || fullError) {
     content = (
       <ErrorNotice
@@ -324,15 +334,14 @@ function LinkBillingDialog({
   } else if (list === undefined || list.length === 0) {
     content = (
       <p className="callout">
-        You are not an owner or admin of any billing account. Create a billing
-        account at <AccountsLink />, then link it here.
+        {rich("billing.linkDialog.none", { site: <AccountsLink /> })}
       </p>
     );
   } else {
     content = (
       <div ref={listRef}>
         <RadioGroup
-          label="Billing account"
+          label={t("billing.account")}
           value={selectedId ?? null}
           onValueChange={(v: unknown) => {
             if (typeof v === "string") {
@@ -348,7 +357,10 @@ function LinkBillingDialog({
               value={a.billingAccountId}
               data-autofocus={i === 0 ? "" : undefined}
             >
-              {a.name} · {labels.billingAccountRole[a.role]}
+              {t("billing.linkDialog.accountOption", {
+                name: a.name,
+                role: enumText(i18n, labels.billingAccountRole, a.role),
+              })}
             </RadioGroupItem>
           ))}
         </RadioGroup>
@@ -360,13 +372,13 @@ function LinkBillingDialog({
     <FormDialog
       open={open}
       onOpenChange={close}
-      title="Link a billing account"
-      description={`OwnSand charges the usage of ${name} to the billing account you choose. You can choose a billing account in which you are an owner or admin.`}
-      submitLabel="Link"
+      title={t("billingBanner.linkAccount")}
+      description={t("billing.linkDialog.description", { name })}
+      submitLabel={t("billing.linkDialog.submit")}
       submitDisabled={list === undefined || list.length === 0}
       onSubmit={async (opening) => {
         if (selectedId === undefined) {
-          setSelectionError("Choose a billing account.");
+          setSelectionError(t("billing.linkDialog.chooseAccount"));
           return;
         }
         const res = await link.mutateAsync({
@@ -376,7 +388,9 @@ function LinkBillingDialog({
         // The success is real for a dismissed opening too, so its toast
         // stays; only the close of a later opening is guarded.
         if (opening.isCurrent()) close(false);
-        toast.success(`${res.billingAccountName} is linked.`);
+        toast.success(
+          t("billing.linkDialog.linked", { name: res.billingAccountName }),
+        );
       }}
     >
       {accounts.error && !fullError ? (
