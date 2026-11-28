@@ -288,6 +288,16 @@ function fakeGoBuildingCountingServer(t) {
 const countEvents = (output, event) =>
   output.split("\n").filter((line) => line.includes(`"${event}"`)).length;
 
+function serverExitError(stdout) {
+  const record = stdout
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line))
+    .find((record) => record.msg === "server_exited");
+  assert.ok(record, `missing server_exited record in stdout: ${stdout}`);
+  return record.error;
+}
+
 test(
   "skips without DATABASE_URL and starts no build",
   { skip, timeout: Timeout },
@@ -572,7 +582,12 @@ test(
     const { code } = await run.exited;
 
     assert.equal(code, 1, run.stderr);
-    assert.match(run.stdout, /"server_exited"/);
+    assert.match(
+      serverExitError(run.stdout),
+      new RegExp(
+        `^listen tcp 127\\.0\\.0\\.1:${port}: .*address already in use$`,
+      ),
+    );
     assert.doesNotMatch(run.stdout, /"server_started"/);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
   },
@@ -587,7 +602,10 @@ test(
     const { code } = await run.exited;
 
     assert.equal(code, 1, run.stderr);
-    assert.match(run.stdout, /"server_exited"/);
+    assert.equal(
+      serverExitError(run.stdout),
+      'LOG_LEVEL must be one of debug, info, warn, error; got "bogus"',
+    );
     assert.doesNotMatch(run.stdout, /"server_started"/);
     await assertNoListener(port);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
