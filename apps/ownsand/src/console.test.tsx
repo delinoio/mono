@@ -3564,13 +3564,17 @@ describe("billing settings", () => {
       billing: { [MOCK_IDS.acme]: MockBillingState.BlockedUnlinked },
     };
     const mock = createMockTransport(options);
-    const withoutAcme = createMockTransport({
-      ...options,
-      linkableBillingAccounts: MOCK_BILLING_ACCOUNTS.slice(1),
-    });
     const listMethod = BillingService.method.listLinkableBillingAccounts.name;
     const links: string[] = [];
-    let hideAcme = false;
+    let listTransport = mock;
+    const setAccounts = (
+      linkableBillingAccounts: typeof MOCK_BILLING_ACCOUNTS,
+    ) => {
+      listTransport = createMockTransport({
+        ...options,
+        linkableBillingAccounts,
+      });
+    };
     const { transport, calls } = holdMockTransport([listMethod], undefined, {
       ...mock,
       unary(method, ...rest) {
@@ -3579,8 +3583,7 @@ describe("billing settings", () => {
             (rest[3] as unknown as LinkBillingAccountRequest).billingAccountId,
           );
         }
-        const source =
-          method.name === listMethod && hideAcme ? withoutAcme : mock;
+        const source = method.name === listMethod ? listTransport : mock;
         return source.unary(method, ...rest);
       },
     });
@@ -3590,9 +3593,8 @@ describe("billing settings", () => {
     });
     return {
       links,
-      removeAcme: () => {
-        hideAcme = true;
-      },
+      setAccounts,
+      removeAcme: () => setAccounts(MOCK_BILLING_ACCOUNTS.slice(1)),
       refetch: () => {
         void queryClient.refetchQueries({
           type: "active",
@@ -3618,6 +3620,112 @@ describe("billing settings", () => {
       fireEvent.submit(button.form!);
     });
   }
+
+  test("focuses the first billing account after loading and on cached reopen", async () => {
+    const fixture = renderBillingLink();
+    const dialog = await openLinkDialog();
+    const body = within(dialog);
+    expect(body.queryAllByRole("radio")).toHaveLength(0);
+
+    await fixture.finishListRequest(0);
+    const first = await body.findByRole("radio", {
+      name: /Acme Robotics billing/,
+    });
+    await waitFor(() => expect(document.activeElement).toBe(first));
+    await act(async () =>
+      fireEvent.click(
+        body.getByRole("radio", { name: /Research lab credits/ }),
+      ),
+    );
+    await act(async () =>
+      fireEvent.click(body.getByRole("button", { name: "Cancel" })),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const reopened = within(await openLinkDialog());
+    expect(document.activeElement).toBe(
+      reopened.getByRole("radio", {
+        name: /Acme Robotics billing/,
+        checked: false,
+      }),
+    );
+  });
+
+  test.each(["Cancel", "Link", "Research lab credits"])(
+    "preserves focus on %s when the billing account name changes",
+    async (name) => {
+      const fixture = renderBillingLink();
+      const body = within(await openLinkDialog());
+      await fixture.finishListRequest(0);
+      const acme = await body.findByRole("radio", {
+        name: /Acme Robotics billing/,
+      });
+      await act(async () => fireEvent.click(acme));
+      const target =
+        name === "Research lab credits"
+          ? body.getByRole("radio", { name: /Research lab credits/ })
+          : body.getByRole("button", { name });
+      await act(async () => target.focus());
+      expect(document.activeElement).toBe(target);
+
+      fixture.setAccounts(
+        MOCK_BILLING_ACCOUNTS.map((account) =>
+          account.billingAccountId === MOCK_IDS.acmeBillingAccount
+            ? { ...account, name: "Renamed billing account" }
+            : account,
+        ),
+      );
+      fixture.refetch();
+      await fixture.finishListRequest(1);
+
+      await body.findByRole("radio", {
+        name: /Renamed billing account/,
+        checked: true,
+      });
+      expect(document.activeElement).toBe(target);
+    },
+  );
+
+  test.each([true, false])(
+    "moves focus when the focused billing account disappears (selection retained: %s)",
+    async (keepSelection) => {
+      const fixture = renderBillingLink();
+      const body = within(await openLinkDialog());
+      await fixture.finishListRequest(0);
+      const acme = await body.findByRole("radio", {
+        name: /Acme Robotics billing/,
+      });
+      const lab = body.getByRole("radio", { name: /Research lab credits/ });
+      await act(async () => {
+        fireEvent.click(keepSelection ? lab : acme);
+        acme.focus();
+      });
+      expect(document.activeElement).toBe(acme);
+
+      fixture.setAccounts([
+        {
+          ...MOCK_BILLING_ACCOUNTS[0]!,
+          billingAccountId: "0193a000-0000-7000-8000-0000000000e0",
+          name: "Replacement account",
+        },
+        MOCK_BILLING_ACCOUNTS[1]!,
+      ]);
+      fixture.refetch();
+      await fixture.finishListRequest(1);
+
+      const first = await body.findByRole("radio", {
+        name: /Replacement account/,
+        checked: false,
+      });
+      expect(
+        body.queryByRole("radio", { name: /Acme Robotics billing/ }),
+      ).toBeNull();
+      expect(lab.getAttribute("aria-checked")).toBe(String(keepSelection));
+      await waitFor(() =>
+        expect(document.activeElement).toBe(keepSelection ? lab : first),
+      );
+    },
+  );
 
   test.each([
     [
