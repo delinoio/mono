@@ -101,13 +101,14 @@ The device agent has its own commands; the [agent contract](cmds-ownsand-agent-f
 ## Build and Test
 
 - From the repository root: `gofmt` check, `go vet ./...` and `go test ./...`, according to `cmds/AGENTS.md`, plus `GOOS=darwin go vet ./cmds/ownsand/...` and `GOOS=windows go vet ./cmds/ownsand/...`. The tests run the commands in process against a fake control plane built on the generated `ownsandv1connect` handlers (relay transport) and a fake Logto tenant; the [SDK tests](packages-ownsand-sdk-foundation.md#build-and-test) cover the peer-to-peer path.
+- On Linux and macOS, the executable help tests build and launch the CLI with writable and closed stdout pipes. They also check the usage exit status and stderr output when no arguments are given.
 - Required billing tests: `billing status` for an `owner`, an `admin`, a `member` and an API key, linked and not linked, with text and JSON output, and a command rejected with each billing reason (message, link, exit status and no retry).
 - Required tests: argument validation (missing TTL and resources), exit code propagation, the data path error exit status, secret printing to standard output only, `OWNSAND_API_KEY` precedence, credential file permissions, the store lock between processes, and a token refresh that finishes after a logout or a newer login (separate app instances over one store and a mock issuer that holds the refresh response), `login` and `logout` with an operand (usage error, credential file unchanged, no Logto request), and token sources of two processes over one store with a mock issuer that rotates refresh tokens (a refresh of one process is adopted by the other without a request, a refresh uses the stored refresh token, a stale result does not overwrite a newer rotation, an `invalid_grant` for a token that another process rotated is retried with the stored one, an `invalid_grant` for a rotation that the other process publishes only after the rejection is adopted during the bounded wait, a revoked token is reported after the bound, a cancelled request ends the wait at once, and a logout or newer login during the wait keeps its own error).
 
 ## Dependencies and Integrations
 
 - Upstream: the [Go SDK](packages-ownsand-sdk-foundation.md), the [control plane](servers-ownsand-api-foundation.md) (API, relay and STUN) and the Logto shared tenant.
-- Dependencies: only the Go standard library, the Go SDK and its dependencies, and `golang.org/x/sys` (already in the module graph through pion) for the Windows ACL. The CLI uses the standard `flag` package and no command framework.
+- Dependencies: only the Go standard library, the Go SDK and its dependencies, and `golang.org/x/sys` for platform-specific file operations. The CLI uses the standard `flag` package and no command framework.
 
 ## Change Triggers
 
