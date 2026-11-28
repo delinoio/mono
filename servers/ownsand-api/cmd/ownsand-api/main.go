@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -174,26 +175,69 @@ func run() (runErr error) {
 		return err
 	}
 
+	return withStartupSockets(ctx, cfg, net.Listen, net.ListenPacket,
+		func(listener net.Listener, udp net.PacketConn, metricsListener net.Listener) error {
+			return serveBoundSockets(ctx, stop, cfg, tel, a, listener, udp, metricsListener)
+		})
+}
+
+// withStartupSockets owns each socket until it calls activate. From that
+// point, the serving code owns the sockets and runs the normal shutdown.
+func withStartupSockets(ctx context.Context, cfg config.Config,
+	listen func(string, string) (net.Listener, error), listenPacket func(string, string) (net.PacketConn, error),
+	activate func(net.Listener, net.PacketConn, net.Listener) error) (runErr error) {
+	activated := false
+	closeSocket := func(socket io.Closer, name string) {
+		if !activated {
+			if err := socket.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close startup %s socket: %w", name, err))
+			}
+		}
+	}
+
+	if ctx.Err() != nil {
+		return nil
+	}
 	// Only the HTTP and STUN bind errors carry a startup failure reason: they
 	// are the addresses another process can take between the choice of a
 	// free port and the bind, which a supervisor retries on new ports.
-	listener, err := net.Listen("tcp", cfg.Addr)
+	listener, err := listen("tcp", cfg.Addr)
 	if err != nil {
 		return classifyBindError(err)
 	}
-	udp, err := net.ListenPacket("udp", cfg.STUNAddr)
+	defer closeSocket(listener, "public HTTP")
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	udp, err := listenPacket("udp", cfg.STUNAddr)
 	if err != nil {
-		_ = listener.Close()
 		return classifyBindError(err)
 	}
+	defer closeSocket(udp, "STUN")
+
 	var metricsListener net.Listener
 	if cfg.MetricsAddr != "" {
-		if metricsListener, err = net.Listen("tcp", cfg.MetricsAddr); err != nil {
-			_ = listener.Close()
-			_ = udp.Close()
+		if ctx.Err() != nil {
+			return nil
+		}
+		metricsListener, err = listen("tcp", cfg.MetricsAddr)
+		if err != nil {
 			return err
 		}
+		defer closeSocket(metricsListener, "metrics")
 	}
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	activated = true
+	return activate(listener, udp, metricsListener)
+}
+
+func serveBoundSockets(ctx context.Context, stop func(), cfg config.Config, tel *telemetry.Telemetry, a *app.App,
+	listener net.Listener, udp net.PacketConn, metricsListener net.Listener) error {
+	logger := tel.Logger
 	stunServer := stun.New(logger, cfg.STUNRateBytesPerSecond, cfg.STUNRateBurstBytes)
 	srv := newServer(a.Handler(), logger)
 
