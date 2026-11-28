@@ -9,12 +9,14 @@ tags: rendering, script, defer, async, performance
 
 **Impact: HIGH (eliminates render-blocking)**
 
-Script tags without `defer` or `async` block HTML parsing while the script downloads and executes. This delays First Contentful Paint and Time to Interactive.
+A parser-inserted external classic script blocks HTML parsing while the browser fetches and evaluates it if neither `async` nor `defer` is present. This can delay First Contentful Paint and Time to Interactive.
 
-- **`defer`**: Downloads in parallel, executes after HTML parsing completes, maintains execution order
-- **`async`**: Downloads in parallel, executes immediately when ready, no guaranteed order
+- With `defer` and no `async`, the browser fetches the script in parallel with parsing and evaluates it in document order after parsing finishes.
+- With `async`, the browser fetches the script in parallel with parsing and evaluates it as soon as it is ready. Evaluation order can differ from document order.
 
-Use `defer` for scripts that depend on DOM or other scripts. Use `async` for independent scripts like analytics.
+Use `defer` when an external classic script needs the parsed DOM or depends on an earlier deferred script. Use `async` for independent classic scripts such as analytics.
+
+The browser evaluates a parser-inserted module script (`type="module"`) after parsing if the `async` attribute is absent. The `defer` attribute applies only to external classic scripts. With `async`, the browser evaluates a module as soon as its module graph is ready, which can be before parsing finishes.
 
 **Incorrect (blocks rendering):**
 
