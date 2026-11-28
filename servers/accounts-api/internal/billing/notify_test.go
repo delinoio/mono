@@ -83,6 +83,23 @@ func (f *fixture) noticeState(id string) noticeState {
 	return st
 }
 
+// manualDeadlineContext expires when the test closes done.
+type manualDeadlineContext struct {
+	context.Context
+	done chan struct{}
+}
+
+func (c *manualDeadlineContext) Done() <-chan struct{} { return c.done }
+
+func (c *manualDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
 // An expired pass deadline keeps the recipient that already received the
 // email, defers the notification without counting an attempt, lets a newer
 // due notification run first and resumes with the unfinished recipient only.
@@ -92,20 +109,26 @@ func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 	acct := f.account()
 	interrupted, key := f.queueNotice(acct)
 
-	passCtx, cancel := context.WithTimeout(ctx(), 300*time.Millisecond)
-	defer cancel()
+	passCtx := &manualDeadlineContext{Context: ctx(), done: make(chan struct{})}
 	sends := 0
 	f.s.email = &hookSender{next: f.email, before: func(ctx context.Context, _ email.Message) error {
 		sends++
 		if sends == 2 {
-			// The second send hangs until the pass deadline expires.
-			<-ctx.Done()
+			first := f.email.Messages()
+			st := f.noticeState(interrupted)
+			if len(first) != 1 || len(st.Recipients) != 1 || first[0].To != st.Recipients[0]+"@example.com" {
+				t.Fatalf("expected the first email and its receipt before the second send, got %d emails and receipts %v", len(first), st.Recipients)
+			}
+			close(passCtx.done)
 			return ctx.Err()
 		}
 		return nil
 	}}
-	if err := f.s.DeliverNotifications(passCtx); err == nil {
-		t.Fatal("an expired pass reported no error")
+	if err := f.s.DeliverNotifications(passCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("delivery error: %v, want %v", err, context.DeadlineExceeded)
+	}
+	if sends != 2 {
+		t.Fatalf("send hook calls: %d, want 2", sends)
 	}
 	first := f.email.Messages()
 	if len(first) != 1 {
