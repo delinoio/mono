@@ -231,9 +231,12 @@ type Bridge struct {
 	fatal    chan struct{}
 	failOnce sync.Once
 
-	mu             sync.Mutex
-	activity       sandcrewv1.AgentActivity
-	turnActive     bool
+	mu         sync.Mutex
+	activity   sandcrewv1.AgentActivity
+	turnActive bool
+	// promptSent is closed when the session/prompt of the active turn is
+	// written, so cancel_turn sends session/cancel after it.
+	promptSent     chan struct{}
 	queue          []string
 	pending        map[string]*pendingPermission
 	permissionMode sandcrewv1.PermissionMode
@@ -694,9 +697,11 @@ func (b *Bridge) startTurnLocked(text string) {
 		Content: &sandcrewv1.ContentBlock{Block: &sandcrewv1.ContentBlock_Text{Text: text}},
 	}}})
 	b.turnActive = true
+	sent := make(chan struct{})
+	b.promptSent = sent
 	b.setActivityLocked(sandcrewv1.AgentActivity_AGENT_ACTIVITY_WORKING)
 	go func() {
-		stopReason, err := b.agent.Prompt(b.ctx, text)
+		stopReason, err := b.agent.Prompt(b.ctx, text, func() { close(sent) })
 		b.turnDone <- turnResult{stopReason: stopReason, err: err}
 	}()
 }
@@ -754,9 +759,18 @@ func (b *Bridge) cancelTurn(id string) {
 	}
 	b.queue = nil
 	b.cancelPendingLocked()
+	sent := b.promptSent
 	b.mu.Unlock()
 	ctx, cancel := context.WithTimeout(b.ctx, callTimeout)
 	defer cancel()
+	// The prompt of this turn may still wait for its goroutine; the agent
+	// must see session/cancel after session/prompt.
+	select {
+	case <-sent:
+	case <-ctx.Done():
+		b.logger.Warn("session/prompt was not sent before the cancel", "error", ctx.Err())
+		return
+	}
 	if err := b.agent.Cancel(ctx); err != nil {
 		b.logger.Warn("session/cancel failed", "error", err)
 	}

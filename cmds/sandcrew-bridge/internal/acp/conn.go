@@ -131,6 +131,22 @@ func (c *Conn) Err() error {
 // also while the request waits to be written, Call returns the context
 // error and drops the late response.
 func (c *Conn) Call(ctx context.Context, method string, params any, result any) error {
+	return c.CallSent(ctx, method, params, result, nil)
+}
+
+// CallSent is Call that calls sent once the request is written or cannot
+// be written any more, before it waits for the response. A message that
+// the caller sends after sent is therefore written after the request.
+func (c *Conn) CallSent(ctx context.Context, method string, params any, result any, sent func()) error {
+	var once sync.Once
+	markSent := func() {
+		if sent != nil {
+			once.Do(sent)
+		}
+	}
+	// An early return (a closed connection or a failed write) also counts
+	// as sent: nothing will be written for this request.
+	defer markSent()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -151,6 +167,7 @@ func (c *Conn) Call(ctx context.Context, method string, params any, result any) 
 		c.forget(id)
 		return err
 	}
+	markSent()
 	select {
 	case <-ctx.Done():
 		c.forget(id)

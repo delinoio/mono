@@ -64,8 +64,10 @@ type Agent interface {
 	// Start initializes the agent and creates its session with cwd as the
 	// working directory and no MCP servers.
 	Start(ctx context.Context, cwd string) (Info, error)
-	// Prompt runs one turn and returns the ACP stop reason.
-	Prompt(ctx context.Context, text string) (string, error)
+	// Prompt runs one turn and returns the ACP stop reason. It calls sent
+	// once the session/prompt request is written (or cannot be), so a
+	// later Cancel reaches the agent after the prompt.
+	Prompt(ctx context.Context, text string, sent func()) (string, error)
 	// Cancel asks the agent to end the current turn. It returns the
 	// context error when ctx ends before the request is sent.
 	Cancel(ctx context.Context) error
@@ -376,12 +378,13 @@ func (a *ACPAgent) Start(ctx context.Context, cwd string) (Info, error) {
 }
 
 // Prompt implements Agent.
-func (a *ACPAgent) Prompt(ctx context.Context, text string) (string, error) {
+func (a *ACPAgent) Prompt(ctx context.Context, text string, sent func()) (string, error) {
 	var resp acp.PromptResponse
-	if err := a.call(ctx, acp.MethodSessionPrompt, acp.PromptRequest{
+	err := a.conn.CallSent(ctx, acp.MethodSessionPrompt, acp.PromptRequest{
 		SessionID: a.session(),
 		Prompt:    []acp.ContentBlock{{Type: "text", Text: text}},
-	}, &resp); err != nil {
+	}, &resp, sent)
+	if err = a.wrapClosed(err); err != nil {
 		return "", err
 	}
 	return resp.StopReason, nil
@@ -432,7 +435,11 @@ func (a *ACPAgent) session() string {
 }
 
 func (a *ACPAgent) call(ctx context.Context, method string, params, result any) error {
-	err := a.conn.Call(ctx, method, params, result)
+	return a.wrapClosed(a.conn.Call(ctx, method, params, result))
+}
+
+// wrapClosed names the ended agent process in a closed-connection error.
+func (a *ACPAgent) wrapClosed(err error) error {
 	if errors.Is(err, acp.ErrClosed) {
 		select {
 		case <-a.done:

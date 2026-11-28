@@ -629,6 +629,42 @@ func TestCancelTurn(t *testing.T) {
 	h.checkLog()
 }
 
+// slowPrompt delays the start of each prompt, like a goroutine that the
+// scheduler runs late.
+type slowPrompt struct{ agent.Agent }
+
+func (s slowPrompt) Prompt(ctx context.Context, text string, sent func()) (string, error) {
+	time.Sleep(50 * time.Millisecond)
+	return s.Agent.Prompt(ctx, text, sent)
+}
+
+func TestCancelInTheSameScanFollowsThePrompt(t *testing.T) {
+	h := newHarness(t)
+	start := h.cfg.StartAgent
+	h.cfg.StartAgent = func(ctx context.Context, launch Launch) (agent.Agent, error) {
+		a, err := start(ctx, launch)
+		if err != nil {
+			return nil, err
+		}
+		return slowPrompt{a}, nil
+	}
+	// Both files wait in the inbox, so one scan handles them.
+	h.write(prompt("block"))
+	h.write(&sandcrewv1.BridgeInput{Input: &sandcrewv1.BridgeInput_CancelTurn{CancelTurn: &sandcrewv1.CancelTurnInput{}}})
+	h.run()
+	end := h.waitKind(0, "turn_ended")
+	if reason := h.events()[end].GetTurnEnded().GetStopReason(); reason != sandcrewv1.StopReason_STOP_REASON_CANCELLED {
+		t.Fatalf("stop reason %s", reason)
+	}
+	methods, _, _, _, _ := h.agent.snapshot()
+	promptAt, cancelAt := slices.Index(methods, "session/prompt"), slices.Index(methods, "session/cancel")
+	if promptAt < 0 || cancelAt < promptAt {
+		t.Fatalf("agent methods %v: session/cancel must follow session/prompt", methods)
+	}
+	h.waitState(end, sandcrewv1.AgentActivity_AGENT_ACTIVITY_IDLE)
+	h.checkLog()
+}
+
 func TestModeAndConfigOptionChanges(t *testing.T) {
 	h := newHarness(t)
 	h.run()
