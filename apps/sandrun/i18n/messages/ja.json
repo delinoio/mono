@@ -415,6 +415,7 @@
   "profiles.form.guestOsNotVerified": "SandRunがOpenAI Codexの動作を確認済みのゲストOSを選択してください。",
   "profiles.form.guestOsUnsupported": "この連携のベンダーは、このゲストOSに対応していません。",
   "profiles.form.templateRequired": "このゲストOSに対応するOwnSandテンプレートのIDを入力してください。",
+  "profiles.form.templateInvalid": "テンプレート ID に有効な UUID v7 を入力してください。",
   "profiles.form.vcpuRequired": "vCPUの数を1以上で入力してください。",
   "profiles.form.vcpuRange": "vCPUの数を1〜{max}の整数で入力してください。",
   "profiles.form.memoryRequired": "メモリ容量をMiB単位で入力してください。",

@@ -23,6 +23,7 @@ import {
   type RunnerProfile,
   RunnerProfileSchema,
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
+import { isUuidV7 } from "sandrun-sdk";
 import { durationMs } from "./format.ts";
 import type { MessageKey, Translate } from "./i18n.ts";
 import { getVerifiedCodexGuestOses } from "./verified-codex-guest-oses.ts";
@@ -228,11 +229,13 @@ export function profileErrors(
       ? t("profiles.form.guestOsNotVerified")
       : t("profiles.form.guestOsUnsupported");
   }
-  if (
-    values.sourceKind === SourceKind.Template &&
-    values.templateId.trim() === ""
-  ) {
-    errors.templateId = t("profiles.form.templateRequired");
+  if (values.sourceKind === SourceKind.Template) {
+    const templateId = values.templateId.trim();
+    if (templateId === "") {
+      errors.templateId = t("profiles.form.templateRequired");
+    } else if (!isUuidV7(templateId.toLowerCase())) {
+      errors.templateId = t("profiles.form.templateInvalid");
+    }
   }
   if (values.vcpuCount === null || values.vcpuCount <= 0) {
     errors.vcpuCount = t("profiles.form.vcpuRequired");

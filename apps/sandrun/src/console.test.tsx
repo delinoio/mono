@@ -3785,6 +3785,147 @@ describe("runner profiles", () => {
     expect(label.textContent).toBe("sandrun-linux-build");
   });
 
+  test.each(["create", "edit"] as const)(
+    "validates the Template ID before %s sends a mutation",
+    async (mode) => {
+      const mock = createMockTransport();
+      const saves: (CreateRunnerProfileRequest | UpdateRunnerProfileRequest)[] =
+        [];
+      renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+        transport: {
+          ...mock,
+          unary(method, ...args) {
+            if (
+              method.name ===
+                RunnerProfileService.method.createRunnerProfile.name ||
+              method.name ===
+                RunnerProfileService.method.updateRunnerProfile.name
+            ) {
+              saves.push(args[3] as (typeof saves)[number]);
+            }
+            return mock.unary(method, ...args);
+          },
+        },
+      });
+
+      const creating = mode === "create";
+      if (creating) {
+        await click(
+          await screen.findByRole("button", { name: "Create runner profile" }),
+        );
+      } else {
+        const row = (await screen.findByText(/^windows-dev ·/)).closest("li")!;
+        await click(within(row).getByRole("button", { name: "Edit" }));
+      }
+      const dialog = await screen.findByRole("dialog", {
+        name: creating ? "Create a runner profile" : "Edit windows-dev",
+      });
+      const form = within(dialog);
+      if (creating) {
+        await type(
+          form.getByRole("textbox", { name: "Name" }),
+          "template-check",
+        );
+        await selectProfileOption(dialog, "Source", "OwnSand template");
+      }
+      const template = form.getByRole("textbox", { name: "Template ID" });
+      const submit = form.getByRole("button", {
+        name: creating ? "Create profile" : "Save changes",
+      });
+      const invalid = "Enter a valid UUID v7 for the template ID.";
+      for (const [value, message] of [
+        ["   ", "Enter the ID of an OwnSand template of this guest OS."],
+        ["not-a-uuid", invalid],
+        ["0193a000-0000-4000-8000-0000000000c9", invalid],
+        ["0193a000-0000-7000-4000-0000000000c9", invalid],
+      ] as const) {
+        await type(template, value);
+        await click(submit);
+        expect(form.getByText(message)).toBeTruthy();
+        expect(template.getAttribute("aria-invalid")).toBe("true");
+        expect(screen.getByRole("dialog")).toBe(dialog);
+        expect(saves).toHaveLength(0);
+      }
+
+      const valid = "0193A000-0000-7000-8000-0000000000C9";
+      await type(template, ` ${valid} `);
+      await click(submit);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(saves).toHaveLength(1);
+      expect(saves[0]?.profile?.source).toEqual({
+        case: "ownsandTemplateId",
+        value: valid,
+      });
+    },
+  );
+
+  test("rejects malformed template sources and stores valid IDs in lowercase", async () => {
+    const transport = createMockTransport();
+    const profiles = createClient(RunnerProfileService, transport);
+    const audit = createClient(AuditService, transport);
+    const organization = { organizationId: MOCK_IDS.acme };
+    const target = { ...organization, runnerProfileId: MOCK_IDS.linuxProfile };
+    const { profile } = await profiles.getRunnerProfile(target);
+    const createProfile = (value: string) =>
+      profiles.createRunnerProfile({
+        ...organization,
+        profile: {
+          ...profile!,
+          name: "template-check",
+          source: { case: "ownsandTemplateId", value },
+        },
+      });
+    const updateProfile = (value: string) =>
+      profiles.updateRunnerProfile({
+        ...target,
+        profile: { source: { case: "ownsandTemplateId", value } },
+        updateMask: { paths: ["source"] },
+      });
+    const list = () => profiles.listRunnerProfiles(organization);
+    const history = () => audit.listAuditEvents(organization);
+    const before = structuredClone(await list());
+    const auditBefore = structuredClone(await history());
+    const valid = "0193A000-0000-7000-8000-0000000000C9";
+
+    for (const save of [createProfile, updateProfile]) {
+      for (const invalid of [
+        "",
+        "not-a-uuid",
+        "0193a000-0000-4000-8000-0000000000c9",
+        "0193a000-0000-7000-4000-0000000000c9",
+        ` ${valid} `,
+      ]) {
+        await expect(save(invalid)).rejects.toMatchObject({
+          code: Code.InvalidArgument,
+          rawMessage: "invalid ownsand_template_id: must be a UUID v7",
+        });
+        expect(await list()).toEqual(before);
+        expect(await history()).toEqual(auditBefore);
+      }
+    }
+
+    const { profile: created } = await createProfile(valid);
+    const { profile: updated } = await updateProfile(valid);
+    const source = { case: "ownsandTemplateId", value: valid.toLowerCase() };
+    expect(created?.source).toEqual(source);
+    expect(updated?.source).toEqual(source);
+    expect((await list()).profiles).toEqual(
+      expect.arrayContaining([created, updated]),
+    );
+    expect((await history()).events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: AuditAction.RUNNER_PROFILE_CREATED,
+          targetId: created?.runnerProfileId,
+        }),
+        expect.objectContaining({
+          action: AuditAction.RUNNER_PROFILE_UPDATED,
+          targetId: target.runnerProfileId,
+        }),
+      ]),
+    );
+  });
+
   test("preserves a newer memory and disk save when a stale dialog edits vCPUs", async () => {
     const mock = createMockTransport();
     const profiles = createClient(RunnerProfileService, mock);

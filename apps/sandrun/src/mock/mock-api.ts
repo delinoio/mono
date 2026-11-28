@@ -102,6 +102,7 @@ import {
   type WatchQueueResponseSchema,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
+import { isUuidV7 } from "sandrun-sdk";
 import {
   compareTimestamps,
   TERMINAL_REQUEST_STATES,
@@ -1781,7 +1782,7 @@ export function createMockTransport(
         const input = req.profile;
         if (input === undefined)
           throw new ConnectError("profile is required", Code.InvalidArgument);
-        validateProfile(input);
+        const source = validateProfile(input);
         if (org.profiles.some((p) => p.name === input.name))
           throw new ConnectError(
             "a runner profile with this name exists",
@@ -1791,6 +1792,7 @@ export function createMockTransport(
           findIntegration(org, input.agentIntegrationId);
         const p = profile(req.organizationId, {
           ...input,
+          source,
           runnerProfileId: uuidV7(),
           priority:
             input.priority === Priority.UNSPECIFIED
@@ -1915,7 +1917,7 @@ export function createMockTransport(
               );
           }
         }
-        validateProfile(next);
+        next.source = validateProfile(next);
         if (
           org.profiles.some(
             (other) =>
@@ -2387,7 +2389,7 @@ const VENDOR_CREDENTIAL_CASE: Record<AgentVendor, string | undefined> = {
 };
 
 /** The runner profile rules of the control plane contract. */
-function validateProfile(p: RunnerProfile): void {
+function validateProfile(p: RunnerProfile): RunnerProfile["source"] {
   function fail(message: string): never {
     throw new ConnectError(message, Code.InvalidArgument);
   }
@@ -2425,9 +2427,16 @@ function validateProfile(p: RunnerProfile): void {
   if (p.workloadKind !== WorkloadKind.DEV_SESSION && p.workspacePath !== "")
     fail("workspace_path is only for DEV_SESSION");
   if (p.guestOs === GuestOs.UNSPECIFIED) fail("guest_os is required");
-  if (p.source.case === "baseImage" && p.source.value !== p.guestOs)
+  let source = p.source;
+  if (source.case === "baseImage" && source.value !== p.guestOs)
     fail("the base image must be of guest_os");
-  if (p.source.case === undefined) fail("source is required");
+  if (source.case === undefined) fail("source is required");
+  if (source.case === "ownsandTemplateId") {
+    const value = source.value.toLowerCase();
+    if (!isUuidV7(value))
+      fail("invalid ownsand_template_id: must be a UUID v7");
+    source = { case: "ownsandTemplateId", value };
+  }
   if (p.networkMode !== NetworkMode.OUTBOUND)
     fail("network_mode must be OUTBOUND");
   const r = p.resources;
@@ -2455,4 +2464,5 @@ function validateProfile(p: RunnerProfile): void {
   if (maxQueueWait > BigInt(MAX_QUEUE_WAIT_MS))
     fail("max_queue_wait must be at most 24 hours");
   if (p.warmCount < 0 || p.warmCount > 10) fail("warm_count must be 0 to 10");
+  return source;
 }

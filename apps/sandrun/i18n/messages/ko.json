@@ -415,6 +415,7 @@
   "profiles.form.guestOsNotVerified": "SandRun에서 OpenAI Codex용으로 검증한 게스트 OS를 선택하세요.",
   "profiles.form.guestOsUnsupported": "이 연동의 공급업체는 이 게스트 OS에서 실행을 지원하지 않습니다.",
   "profiles.form.templateRequired": "이 게스트 OS용 OwnSand 템플릿의 ID를 입력하세요.",
+  "profiles.form.templateInvalid": "템플릿 ID에 유효한 UUID v7을 입력하세요.",
   "profiles.form.vcpuRequired": "vCPU를 1개 이상 입력하세요.",
   "profiles.form.vcpuRange": "vCPU 개수를 1~{max} 사이의 정수로 입력하세요.",
   "profiles.form.memoryRequired": "메모리 용량을 MiB 단위로 입력하세요.",

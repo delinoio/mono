@@ -415,6 +415,7 @@
   "profiles.form.guestOsNotVerified": "Select a guest OS that SandRun has verified for OpenAI Codex.",
   "profiles.form.guestOsUnsupported": "The vendor of this integration does not run on this guest OS.",
   "profiles.form.templateRequired": "Enter the ID of an OwnSand template of this guest OS.",
+  "profiles.form.templateInvalid": "Enter a valid UUID v7 for the template ID.",
   "profiles.form.vcpuRequired": "Enter at least 1 vCPU.",
   "profiles.form.vcpuRange": "Enter a whole number of vCPUs from 1 to {max}.",
   "profiles.form.memoryRequired": "Enter the memory in MiB.",
