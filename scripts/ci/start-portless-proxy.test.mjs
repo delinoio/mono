@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -15,12 +15,16 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { createPsFixture } from "./fixture-portless-ps.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const preflight = join(root, "scripts", "dev", "start-portless-proxy.mjs");
 
 // The portless version that the fixture apps pin.
 const pinnedVersion = "0.18.1";
+const outdatedVersion = "0.15.8";
+const proxyPid = 12345;
+const commandArgs = ["-o", "command=", "-p", String(proxyPid)];
 
 // A fake portless CLI that records its arguments and working directory and
 // exits with FAKE_PORTLESS_STOP_STATUS for `proxy stop` and with
@@ -37,9 +41,6 @@ const status =
     : process.env.FAKE_PORTLESS_STATUS;
 process.exit(Number(status ?? "0"));
 `;
-
-// A fake proxy process that runs until the test kills it.
-const fakeProxyCli = `setInterval(() => {}, 1000);`;
 
 // Creates a repository fixture with a copy of the preflight script and the
 // given apps. Each app is { name, dev, installed }.
@@ -87,9 +88,13 @@ function proxyCliPath(dir) {
   return join(dir, "global", "portless", "dist", "cli.js");
 }
 
-// Starts a fake proxy from a portless package of the given version and
-// records its PID in the fixture's portless state directory.
-function startProxy(t, dir, version) {
+function recordProxyPid(dir) {
+  mkdirSync(join(dir, "state"));
+  writeFileSync(join(dir, "state", "proxy.pid"), String(proxyPid));
+}
+
+// Install the package that the command from ps points to.
+function recordProxy(dir, version) {
   const cli = proxyCliPath(dir);
   const dist = dirname(cli);
   mkdirSync(dist, { recursive: true });
@@ -97,20 +102,14 @@ function startProxy(t, dir, version) {
     join(dist, "..", "package.json"),
     JSON.stringify({ name: "portless", version }),
   );
-  writeFileSync(cli, fakeProxyCli);
-  const proxy = spawn(
-    process.execPath,
-    [cli, "proxy", "start", "--foreground"],
-    { stdio: "ignore" },
-  );
-  t.after(() => proxy.kill());
-  mkdirSync(join(dir, "state"), { recursive: true });
-  writeFileSync(join(dir, "state", "proxy.pid"), String(proxy.pid));
-  return proxy.pid;
+  writeFileSync(cli, "");
+  recordProxyPid(dir);
+  return { pid: proxyPid, command: `node ${cli} proxy start --foreground` };
 }
 
-function run(dir, env = {}) {
+function run(dir, env = {}, psOptions) {
   const record = join(dir, "record.jsonl");
+  const ps = createPsFixture(dir, psOptions);
   // A PORTLESS value from the developer's shell must not select a branch.
   const { PORTLESS: _shellPortless, ...shellEnv } = process.env;
   // The proxy of the developer's machine must not select a branch either.
@@ -119,6 +118,7 @@ function run(dir, env = {}) {
     PORTLESS_STATE_DIR: join(dir, "state"),
     FAKE_PORTLESS_RECORD: record,
     ...env,
+    ...ps.env,
   };
   const result = spawnSync(
     process.execPath,
@@ -131,7 +131,7 @@ function run(dir, env = {}) {
         .split("\n")
         .map((line) => JSON.parse(line))
     : [];
-  return { ...result, calls };
+  return { ...result, calls, psCalls: ps.readCalls() };
 }
 
 test("root dev script uses the shared development launcher", () => {
@@ -227,7 +227,7 @@ test("exits with the status of a failed proxy start", (t) => {
 });
 
 // The version check reads the proxy command with `ps`, which Windows lacks.
-const psSkip = process.platform === "win32" ? "needs ps" : false;
+const psSkip = process.platform === "win32" ? "needs POSIX ps lookup" : false;
 
 function versionedProxyFixture(t) {
   const dir = fixture(t, [
@@ -243,8 +243,8 @@ function versionedProxyFixture(t) {
 test("stops a proxy that an older portless runs", { skip: psSkip }, (t) => {
   const dir = versionedProxyFixture(t);
   if (dir === null) return;
-  const pid = startProxy(t, dir, "0.15.8");
-  const result = run(dir);
+  const ps = recordProxy(dir, outdatedVersion);
+  const result = run(dir, {}, ps);
   assert.equal(result.status, 0, result.stderr);
   const cwd = join(dir, "apps", "web");
   assert.deepEqual(result.calls, [
@@ -258,8 +258,8 @@ test("stops a proxy that an older portless runs", { skip: psSkip }, (t) => {
   assert.deepEqual(outdated, [
     {
       event: "portless_proxy_outdated",
-      pid,
-      runningVersion: "0.15.8",
+      pid: proxyPid,
+      runningVersion: outdatedVersion,
       pinnedVersion,
     },
   ]);
@@ -269,12 +269,13 @@ for (const version of [pinnedVersion, "0.19.0"]) {
   test(`keeps a proxy that portless ${version} runs`, { skip: psSkip }, (t) => {
     const dir = versionedProxyFixture(t);
     if (dir === null) return;
-    startProxy(t, dir, version);
-    const result = run(dir);
+    const ps = recordProxy(dir, version);
+    const result = run(dir, {}, ps);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.calls, [
       { args: ["proxy", "start"], cwd: join(dir, "apps", "web") },
     ]);
+    assert.deepEqual(result.psCalls, [{ args: commandArgs, status: 0 }]);
     assert.doesNotMatch(result.stderr, /portless_proxy_outdated/);
   });
 }
@@ -288,12 +289,13 @@ test(
       [{ name: "web", dev: "portless run --prefix=", installed: true }],
       "portless preflight-",
     );
-    startProxy(t, dir, "0.15.8");
-    const result = run(dir);
+    const ps = recordProxy(dir, outdatedVersion);
+    const result = run(dir, {}, ps);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.calls, [
       { args: ["proxy", "start"], cwd: join(dir, "apps", "web") },
     ]);
+    assert.deepEqual(result.psCalls, [{ args: commandArgs, status: 0 }]);
     assert.doesNotMatch(result.stderr, /portless_proxy_outdated/);
   },
 );
@@ -302,13 +304,16 @@ test("ignores a recorded PID of a process that is not portless", (t) => {
   const dir = fixture(t, [
     { name: "web", dev: "portless run --prefix=", installed: true },
   ]);
-  mkdirSync(join(dir, "state"), { recursive: true });
-  writeFileSync(join(dir, "state", "proxy.pid"), String(process.pid));
-  const result = run(dir);
+  recordProxyPid(dir);
+  const result = run(dir, {}, { pid: proxyPid, command: "node unrelated.mjs" });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, [
     { args: ["proxy", "start"], cwd: join(dir, "apps", "web") },
   ]);
+  assert.deepEqual(
+    result.psCalls,
+    psSkip ? [] : [{ args: commandArgs, status: 0 }],
+  );
 });
 
 test(
@@ -319,8 +324,8 @@ test(
   (t) => {
     const dir = versionedProxyFixture(t);
     if (dir === null) return;
-    startProxy(t, dir, "0.15.8");
-    const result = run(dir, { FAKE_PORTLESS_STOP_STATUS: "4" });
+    const ps = recordProxy(dir, outdatedVersion);
+    const result = run(dir, { FAKE_PORTLESS_STOP_STATUS: "4" }, ps);
     assert.equal(result.status, 4);
     assert.deepEqual(result.calls, [
       { args: ["proxy", "stop"], cwd: join(dir, "apps", "web") },
@@ -328,3 +333,32 @@ test(
     assert.match(result.stderr, /portless_proxy_stop_failed/);
   },
 );
+
+for (const mode of ["missing", "failing"]) {
+  test(`starts the proxy when ps is ${mode}`, { skip: psSkip }, async (t) => {
+    for (const status of [0, 3]) {
+      await t.test(`start returns ${status}`, (t) => {
+        const dir = versionedProxyFixture(t);
+        if (dir === null) return;
+        const ps = recordProxy(dir, outdatedVersion);
+        const result = run(
+          dir,
+          { FAKE_PORTLESS_STATUS: String(status) },
+          { ...ps, mode },
+        );
+        assert.equal(result.status, status, result.stderr);
+        assert.deepEqual(result.calls, [
+          { args: ["proxy", "start"], cwd: join(dir, "apps", "web") },
+        ]);
+        assert.deepEqual(
+          result.psCalls,
+          mode === "missing" ? [] : [{ args: commandArgs, status: 1 }],
+        );
+        assert.doesNotMatch(
+          result.stderr,
+          /portless_proxy_(outdated|stop_failed)/,
+        );
+      });
+    }
+  });
+}
