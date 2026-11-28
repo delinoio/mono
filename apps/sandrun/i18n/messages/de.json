@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "Nicht verfügbar",
   "profiles.dialog.guestOsPlaceholder": "Gastbetriebssystem auswählen",
   "profiles.dialog.agentIntegration": "Agenten-Integration",
+  "profiles.dialog.savedIntegrationMissing": "Du kannst dieses Profil nicht speichern, weil seine Agenten-Integration fehlt.",
   "profiles.dialog.workspacePath": "Pfad zum Arbeitsbereich",
   "profiles.dialog.workspacePathDescription": "Für Entwicklungssitzungen erforderlich: ein absoluter Pfad im Gastsystem. Die Synchronisierung schreibt in dieses Verzeichnis, und Befehle werden dort gestartet.",
   "profiles.dialog.source": "Quelle",

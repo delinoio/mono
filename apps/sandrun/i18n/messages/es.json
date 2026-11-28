@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "No disponible",
   "profiles.dialog.guestOsPlaceholder": "Selecciona un sistema operativo invitado",
   "profiles.dialog.agentIntegration": "Integración del agente",
+  "profiles.dialog.savedIntegrationMissing": "No puedes guardar este perfil porque falta su integración del agente.",
   "profiles.dialog.workspacePath": "Ruta del espacio de trabajo",
   "profiles.dialog.workspacePathDescription": "Para las sesiones de desarrollo, se requiere una ruta absoluta en el sistema invitado. La sincronización escribe en esa ruta y los comandos se inician allí.",
   "profiles.dialog.source": "Origen",

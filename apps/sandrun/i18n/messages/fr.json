@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "Indisponible",
   "profiles.dialog.guestOsPlaceholder": "Sélectionner un système d’exploitation invité",
   "profiles.dialog.agentIntegration": "Intégration de l’agent",
+  "profiles.dialog.savedIntegrationMissing": "Vous ne pouvez pas enregistrer ce profil, car son intégration de l’agent est introuvable.",
   "profiles.dialog.workspacePath": "Chemin de l’espace de travail",
   "profiles.dialog.workspacePathDescription": "Requis pour les sessions de développement : un chemin absolu dans le système invité. La synchronisation y écrit les fichiers et les commandes y sont lancées.",
   "profiles.dialog.source": "Source",

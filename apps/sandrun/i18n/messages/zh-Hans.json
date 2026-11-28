@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "不可用",
   "profiles.dialog.guestOsPlaceholder": "选择客户机操作系统",
   "profiles.dialog.agentIntegration": "智能体集成",
+  "profiles.dialog.savedIntegrationMissing": "找不到此配置的智能体集成，因此无法保存此配置。",
   "profiles.dialog.workspacePath": "工作区路径",
   "profiles.dialog.workspacePathDescription": "开发会话必填：指定客户机中的绝对路径。同步内容将写入此路径，命令也会从此路径启动。",
   "profiles.dialog.source": "来源",

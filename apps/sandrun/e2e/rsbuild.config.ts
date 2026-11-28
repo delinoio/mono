@@ -3,12 +3,18 @@ import { fileURLToPath } from "node:url";
 import { mergeRsbuildConfig } from "@rsbuild/core";
 import consoleConfig from "../rsbuild.config.ts";
 
+const fixtureGuestOses = fileURLToPath(
+  new URL("./profile-integration-guest-oses.ts", import.meta.url),
+);
+
 export default mergeRsbuildConfig(consoleConfig, {
   resolve: {
     alias: {
       "./mock/mock-api.ts$": fileURLToPath(
-        new URL("./settings-mock.ts", import.meta.url),
+        new URL("./profile-integration-mock.ts", import.meta.url),
       ),
+      "./verified-codex-guest-oses.ts$": fixtureGuestOses,
+      "../verified-codex-guest-oses.ts$": fixtureGuestOses,
     },
   },
   source: {

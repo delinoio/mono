@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "利用不可",
   "profiles.dialog.guestOsPlaceholder": "ゲスト OS を選択",
   "profiles.dialog.agentIntegration": "エージェント連携",
+  "profiles.dialog.savedIntegrationMissing": "このプロファイルのエージェント連携が見つからないため、保存できません。",
   "profiles.dialog.workspacePath": "ワークスペースのパス",
   "profiles.dialog.workspacePathDescription": "開発セッションでは、ゲスト OS 内の絶対パスが必要です。同期データはこのパスに書き込まれ、コマンドはここを作業ディレクトリとして実行されます。",
   "profiles.dialog.source": "ソース",
