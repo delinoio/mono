@@ -415,8 +415,13 @@ function Composer({
   const cancel = useMutation(SessionService.method.cancelTurn, {
     onSuccess: onSessionChange,
   });
+  // A turn that waits for a permission answer is still running: the
+  // session is WAITING_FOR_INPUT, and Stop cancels the suspended turn.
+  // Paused and ended sessions have no agent to cancel.
   const running =
-    isTurnRunning(transcript) && session.state === SessionState.RUNNING;
+    isTurnRunning(transcript) &&
+    (session.state === SessionState.RUNNING ||
+      session.state === SessionState.WAITING_FOR_INPUT);
 
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();

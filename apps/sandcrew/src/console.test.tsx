@@ -499,6 +499,19 @@ describe("chat view", () => {
     expect(await screen.findByText("Turn stopped")).toBeTruthy();
   });
 
+  test("stops a turn that waits for a permission answer", async () => {
+    const { transport, calls } = recording(
+      createMockTransport({ agentStepMs: 5 }),
+    );
+    renderConsole(chatPath, { transport });
+    await screen.findByRole("article", {
+      name: "Permission request for go test ./...",
+    });
+    await click(await screen.findByRole("button", { name: "Stop" }));
+    expect(calls.some((c) => c.method === "CancelTurn")).toBe(true);
+    expect(await screen.findByText("Turn stopped")).toBeTruthy();
+  });
+
   test("switches between auto-approve and ask in the mode menu, and Esc closes it", async () => {
     const { transport, calls } = recording(
       createMockTransport({ agentStepMs: 5 }),
