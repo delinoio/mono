@@ -823,10 +823,10 @@ record_state() {
   fi
   if [[ -n "$current" && "$current" != "$image" ]]; then
     cp -f "$state.current" "$state.previous.new" || return 1
-    mv -f "$state.previous.new" "$state.previous" || return 1
+    mv -fT -- "$state.previous.new" "$state.previous" || return 1
   fi
   echo "$image" > "$state.current.new" || return 1
-  mv -f "$state.current.new" "$state.current" || return 1
+  mv -fT -- "$state.current.new" "$state.current" || return 1
 }
 
 # Prints the unique network alias of a replacement container. The alias is a
