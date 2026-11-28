@@ -30,7 +30,8 @@ import {
   PageHeader,
   QueryBoundary,
 } from "../components/ui.tsx";
-import { formatTime, labels, sessionTitle } from "../format.ts";
+import { formatTime, sessionTitle, vendorName } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { Link, orgPath, RouteId, sessionPath, useRouter } from "../router.tsx";
 import {
   readSessionFilter,
@@ -138,6 +139,7 @@ function useWatchSessions(
 export function SessionListPage() {
   const { organizationId, userId, leaveOnNotFound } = useOrg();
   const { navigate } = useRouter();
+  const { t } = useI18n();
   const [filter, setFilter] = useState(readSessionFilter);
   const list = useInfiniteQuery(
     SessionService.method.listSessions,
@@ -163,21 +165,21 @@ export function SessionListPage() {
   return (
     <>
       <PageHeader
-        title="Sessions"
-        description="Agent sessions of the organization. You read the chat of your own sessions; other members' sessions show only their state."
+        title={t("nav.sessions")}
+        description={t("sessions.description")}
         action={
           <Button
             onClick={() =>
               navigate(orgPath(RouteId.SessionNew, organizationId))
             }
           >
-            New session
+            {t("nav.newSession")}
           </Button>
         }
       />
       <div className="toolbar">
         <SegmentedControl
-          aria-label="Sessions to show"
+          aria-label={t("sessions.filter")}
           value={filter}
           onValueChange={(value) => {
             const next =
@@ -189,35 +191,35 @@ export function SessionListPage() {
           }}
         >
           <SegmentedControlItem value={SessionFilter.Mine}>
-            My sessions
+            {t("sessions.mine")}
           </SegmentedControlItem>
           <SegmentedControlItem value={SessionFilter.All}>
-            All sessions
+            {t("sessions.all")}
           </SegmentedControlItem>
         </SegmentedControl>
         {watch.status === StreamStatus.Reconnecting ? (
           <span className="muted" role="status">
-            Reconnecting to live updates…
+            {t("sessions.reconnecting")}
           </span>
         ) : null}
       </div>
-      <QueryBoundary query={list} loading="Loading sessions">
+      <QueryBoundary query={list} loading={t("sessions.loading")}>
         {(data) => {
           const sessions = data.pages.flatMap((p) => p.sessions);
           if (sessions.length === 0) {
             return filter === SessionFilter.Mine ? (
-              <Empty title="You have no sessions yet">
-                Start a session to give a coding agent a task in a sandbox.{" "}
+              <Empty title={t("sessions.empty.mine")}>
+                {t("sessions.empty.body")}{" "}
                 <Link to={orgPath(RouteId.SessionNew, organizationId)}>
-                  Start a session
+                  {t("sessions.empty.start")}
                 </Link>
               </Empty>
             ) : (
-              <Empty title="The organization has no sessions yet" />
+              <Empty title={t("sessions.empty.all")} />
             );
           }
           return (
-            <ul className="list" aria-label="Sessions">
+            <ul className="list" aria-label={t("nav.sessions")}>
               {sessions.map((s) => (
                 <SessionRow
                   key={s.sessionId}
@@ -235,7 +237,9 @@ export function SessionListPage() {
 }
 
 function SessionRow({ session, own }: { session: Session; own: boolean }) {
-  const deletion = scheduledDeletionText(session);
+  const i18n = useI18n();
+  const { t, lang } = i18n;
+  const deletion = scheduledDeletionText(session, i18n);
   return (
     <li className="list-row">
       <div className="list-main">
@@ -243,14 +247,20 @@ function SessionRow({ session, own }: { session: Session; own: boolean }) {
           to={sessionPath(session.organizationId, session.sessionId)}
           className="list-title"
         >
-          {sessionTitle(session)}
+          {sessionTitle(session, t)}
         </Link>
         <span className="muted">
-          {labels.vendor[session.vendor]} · {own ? "You" : "Another member"} ·
-          created {formatTime(session.createdAt)}
-          {session.endedAt !== undefined
-            ? ` · ended ${formatTime(session.endedAt)}`
-            : ""}
+          {t(
+            session.endedAt !== undefined
+              ? "sessions.rowEnded"
+              : "sessions.row",
+            {
+              vendor: vendorName(session.vendor, t),
+              owner: own ? t("sessions.ownerYou") : t("sessions.ownerOther"),
+              created: formatTime(session.createdAt, lang),
+              ended: formatTime(session.endedAt, lang),
+            },
+          )}
         </span>
         {deletion !== undefined ? (
           <span className="muted">{deletion}</span>

@@ -31,11 +31,13 @@ import {
   QueryBoundary,
 } from "../components/ui.tsx";
 import { formatTime } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { usePushSubscriptions, useSessionSecrets } from "../queries.ts";
 import {
   browserLabel,
   type PushEnvironment,
   PushOptInError,
+  PushOptInFailure,
   PushSupport,
   browserPushEnvironment,
   pushSupport,
@@ -48,16 +50,25 @@ export const SECRET_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 /** The largest session secret value, in bytes. */
 export const MAX_SECRET_VALUE_BYTES = 32 * 1024;
 
-/** Checks a session secret name. Returns an error message or undefined. */
-export function secretNameError(name: string): string | undefined {
+/**
+ * Checks a session secret name. Returns the catalog key of an error message,
+ * or undefined.
+ */
+export function secretNameError(name: string): MessageKey | undefined {
   if (!SECRET_NAME_PATTERN.test(name)) {
-    return "Use 1 to 128 letters, digits and underscores, starting with a letter or an underscore.";
+    return "secrets.error.namePattern";
   }
   if (name.toUpperCase().startsWith("SANDCREW_")) {
-    return "Names that start with SANDCREW_ are reserved.";
+    return "secrets.error.nameReserved";
   }
   return undefined;
 }
+
+/** Catalog keys of the opt-in failures that the user can act on. */
+const PUSH_OPT_IN_MESSAGES: Record<PushOptInFailure, MessageKey> = {
+  [PushOptInFailure.Unsupported]: "notifications.unsupported",
+  [PushOptInFailure.PermissionNotGranted]: "notifications.notGranted",
+};
 
 /** Route `SETTINGS_USER`. */
 export function UserSettingsPage({
@@ -66,19 +77,16 @@ export function UserSettingsPage({
   /** Tests pass fake browser APIs. */
   pushEnvironment?: PushEnvironment;
 }) {
+  const { t } = useI18n();
   return (
     <>
       <PageHeader
-        title="Settings"
-        description="Your vendor credentials, session secrets and notifications in this organization. SandCrew never shows a saved value again."
+        title={t("nav.settings")}
+        description={t("userSettings.description")}
       />
       <section className="section" aria-labelledby="credentials-heading">
-        <h2 id="credentials-heading">Your vendor credentials</h2>
-        <p className="muted">
-          Your credential replaces the organization credential of the same
-          vendor for your sessions. Code in a session sandbox can read the
-          credential of its session.
-        </p>
+        <h2 id="credentials-heading">{t("credentials.userList")}</h2>
+        <p className="muted">{t("userSettings.credentialsHelp")}</p>
         <VendorCredentialSection scope={CredentialScope.USER} />
       </section>
       <SessionSecretsSection />
@@ -89,6 +97,7 @@ export function UserSettingsPage({
 
 function SessionSecretsSection() {
   const { organizationId } = useOrg();
+  const { t, lang } = useI18n();
   const queryClient = useQueryClient();
   const secrets = useSessionSecrets(organizationId);
   const refresh = () => invalidateServices(queryClient, CredentialService);
@@ -102,7 +111,10 @@ function SessionSecretsSection() {
   const [editing, setEditing] = useState<SessionSecret | null>();
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
-  const [errors, setErrors] = useState<{ name?: string; value?: string }>({});
+  const [errors, setErrors] = useState<{
+    name?: MessageKey;
+    value?: MessageKey;
+  }>({});
   const [deleting, setDeleting] = useState<SessionSecret>();
 
   const close = () => {
@@ -116,31 +128,30 @@ function SessionSecretsSection() {
     <section className="section" aria-labelledby="secrets-heading">
       <div className="section-header">
         <div>
-          <h2 id="secrets-heading">Session secrets</h2>
-          <p className="muted">
-            Environment variables that you can give to your sessions, for
-            example a GitHub token. The new-session form selects them.
-          </p>
+          <h2 id="secrets-heading">{t("secrets.title")}</h2>
+          <p className="muted">{t("secrets.description")}</p>
         </div>
         <Button
           variant={ButtonVariant.Secondary}
           onClick={() => setEditing(null)}
         >
-          Add secret
+          {t("secrets.add")}
         </Button>
       </div>
-      <QueryBoundary query={secrets} loading="Loading session secrets">
+      <QueryBoundary query={secrets} loading={t("secrets.loading")}>
         {(list) =>
           list.length === 0 ? (
-            <Empty title="No session secrets" />
+            <Empty title={t("secrets.empty")} />
           ) : (
-            <ul className="list" aria-label="Session secrets">
+            <ul className="list" aria-label={t("secrets.title")}>
               {list.map((s) => (
                 <li key={s.sessionSecretId} className="list-row">
                   <div className="list-main">
                     <code className="list-title">{s.name}</code>
                     <span className="muted">
-                      Value set {formatTime(s.valueSetAt)}
+                      {t("secrets.valueSet", {
+                        time: formatTime(s.valueSetAt, lang),
+                      })}
                     </span>
                   </div>
                   <div className="row-actions">
@@ -151,17 +162,17 @@ function SessionSecretsSection() {
                         setEditing(s);
                         setName(s.name);
                       }}
-                      aria-label={`Replace the value of ${s.name}`}
+                      aria-label={t("secrets.replaceLabel", { name: s.name })}
                     >
-                      Replace
+                      {t("credentials.replaceButton")}
                     </Button>
                     <Button
                       size={ButtonSize.Small}
                       variant={ButtonVariant.Danger}
                       onClick={() => setDeleting(s)}
-                      aria-label={`Delete ${s.name}`}
+                      aria-label={t("secrets.deleteLabel", { name: s.name })}
                     >
-                      Delete
+                      {t("credentials.deleteButton")}
                     </Button>
                   </div>
                 </li>
@@ -173,19 +184,23 @@ function SessionSecretsSection() {
       <FormDialog
         open={editing !== undefined}
         onOpenChange={(open) => !open && close()}
-        title={editing ? `Replace ${editing.name}` : "Add a session secret"}
-        description="SandCrew stores the value encrypted and never shows it again."
-        submitLabel="Save secret"
+        title={
+          editing
+            ? t("secrets.replaceTitle", { name: editing.name })
+            : t("secrets.addTitle")
+        }
+        description={t("secrets.dialogDescription")}
+        submitLabel={t("secrets.save")}
         onSubmit={async (opening) => {
           const trimmedName = name.trim();
           const nextErrors = {
             name: secretNameError(trimmedName),
             value:
               value === ""
-                ? "Enter the value."
+                ? ("credentials.error.enterValue" as const)
                 : new TextEncoder().encode(value).byteLength >
                     MAX_SECRET_VALUE_BYTES
-                  ? "The value is larger than 32 KiB."
+                  ? ("secrets.error.valueTooLarge" as const)
                   : undefined,
           };
           setErrors(nextErrors);
@@ -198,27 +213,27 @@ function SessionSecretsSection() {
       >
         {editing ? null : (
           <TextField
-            label="Name"
-            description="The environment variable name, for example GITHUB_TOKEN."
+            label={t("secrets.name")}
+            description={t("secrets.nameHelp")}
             value={name}
             onValueChange={(v: string) => {
               setName(v);
               setErrors((e) => ({ ...e, name: undefined }));
             }}
-            error={errors.name}
+            error={errors.name === undefined ? undefined : t(errors.name)}
             autoComplete="off"
             autoFocus
           />
         )}
         <PasswordInput
-          label="Value"
-          toggleLabel="Show value"
+          label={t("credentials.value")}
+          toggleLabel={t("credentials.showValue")}
           value={value}
           onValueChange={(v: string) => {
             setValue(v);
             setErrors((e) => ({ ...e, value: undefined }));
           }}
-          error={errors.value}
+          error={errors.value === undefined ? undefined : t(errors.value)}
           autoComplete="off"
           autoFocus={editing !== null}
         />
@@ -226,9 +241,11 @@ function SessionSecretsSection() {
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
-        title={`Delete ${deleting?.name ?? "this secret"}?`}
-        description="New sessions cannot select it. Running sessions keep it until their agent starts again."
-        confirmLabel="Delete secret"
+        title={t("secrets.deleteTitle", {
+          name: deleting?.name ?? t("secrets.thisSecret"),
+        })}
+        description={t("secrets.deleteDescription")}
+        confirmLabel={t("secrets.deleteConfirm")}
         onConfirm={() =>
           remove.mutateAsync({
             organizationId,
@@ -246,6 +263,7 @@ function NotificationsSection({
   pushEnvironment?: PushEnvironment;
 }) {
   const transport = useTransport();
+  const { t, lang } = useI18n();
   const queryClient = useQueryClient();
   const [env] = useState(() => pushEnvironment ?? browserPushEnvironment());
   const support = pushSupport(env);
@@ -262,7 +280,7 @@ function NotificationsSection({
     },
   );
   const [error, setError] = useState<unknown>();
-  const [optInMessage, setOptInMessage] = useState<string>();
+  const [optInMessage, setOptInMessage] = useState<MessageKey>();
   const [pending, setPending] = useState(false);
   const [deleting, setDeleting] = useState<PushSubscription>();
 
@@ -282,10 +300,10 @@ function NotificationsSection({
         ...keys,
         label: browserLabel(navigator.userAgent).slice(0, 100),
       });
-      toast.success("Notifications are on for this browser");
+      toast.success(t("notifications.turnedOn"));
     } catch (e) {
       if (e instanceof PushOptInError) {
-        setOptInMessage(e.message);
+        setOptInMessage(PUSH_OPT_IN_MESSAGES[e.failure]);
       } else {
         setError(e);
       }
@@ -296,48 +314,44 @@ function NotificationsSection({
 
   return (
     <section className="section" aria-labelledby="notifications-heading">
-      <h2 id="notifications-heading">Notifications</h2>
-      <p className="muted">
-        SandCrew notifies you when an agent waits for your input, asks for
-        permission, or when a session ends unexpectedly. It does not notify you
-        about a session that you have open.
-      </p>
+      <h2 id="notifications-heading">{t("notifications.title")}</h2>
+      <p className="muted">{t("notifications.description")}</p>
       {support === PushSupport.Unsupported ? (
         <p className="notice" role="status">
-          This browser does not support notifications.
+          {t("notifications.unsupported")}
         </p>
       ) : support === PushSupport.Denied ? (
         <p className="notice" role="status">
-          Notifications are blocked for this site. Allow them in the browser
-          settings to turn them on.
+          {t("notifications.blocked")}
         </p>
       ) : (
         <Button onClick={turnOn} disabled={pending}>
-          Turn on notifications on this browser
+          {t("notifications.turnOn")}
         </Button>
       )}
       {optInMessage !== undefined ? (
         <p className="notice notice-warning" role="alert">
-          {optInMessage}
+          {t(optInMessage)}
         </p>
       ) : null}
       {error !== undefined ? <ErrorNotice error={error} /> : null}
-      <h3>Browsers with notifications</h3>
-      <QueryBoundary
-        query={subscriptions}
-        loading="Loading notification subscriptions"
-      >
+      <h3>{t("notifications.browsers")}</h3>
+      <QueryBoundary query={subscriptions} loading={t("notifications.loading")}>
         {(list) =>
           list.length === 0 ? (
-            <Empty title="No browser gets notifications" />
+            <Empty title={t("notifications.empty")} />
           ) : (
-            <ul className="list" aria-label="Notification subscriptions">
+            <ul className="list" aria-label={t("notifications.list")}>
               {list.map((s) => (
                 <li key={s.pushSubscriptionId} className="list-row">
                   <div className="list-main">
-                    <span className="list-title">{s.label || "Browser"}</span>
+                    <span className="list-title">
+                      {s.label || t("notifications.browser")}
+                    </span>
                     <span className="muted">
-                      Added {formatTime(s.createdAt)}
+                      {t("notifications.added", {
+                        time: formatTime(s.createdAt, lang),
+                      })}
                       {s.endpointOrigin ? ` · ${s.endpointOrigin}` : ""}
                     </span>
                   </div>
@@ -345,9 +359,11 @@ function NotificationsSection({
                     size={ButtonSize.Small}
                     variant={ButtonVariant.Danger}
                     onClick={() => setDeleting(s)}
-                    aria-label={`Turn off notifications for ${s.label || "this browser"}`}
+                    aria-label={t("notifications.turnOffLabel", {
+                      browser: s.label || t("notifications.thisBrowser"),
+                    })}
                   >
-                    Turn off
+                    {t("notifications.turnOff")}
                   </Button>
                 </li>
               ))}
@@ -358,9 +374,11 @@ function NotificationsSection({
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
-        title={`Turn off notifications for ${deleting?.label || "this browser"}?`}
-        description="SandCrew stops sending notifications to that browser."
-        confirmLabel="Turn off"
+        title={t("notifications.turnOffTitle", {
+          browser: deleting?.label || t("notifications.thisBrowser"),
+        })}
+        description={t("notifications.turnOffDescription")}
+        confirmLabel={t("notifications.turnOff")}
         onConfirm={() =>
           remove.mutateAsync({
             pushSubscriptionId: deleting!.pushSubscriptionId,

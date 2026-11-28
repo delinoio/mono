@@ -3,6 +3,7 @@ import { SessionState } from "@delino/sandcrew-protos/v1/common_pb";
 import type { Session } from "@delino/sandcrew-protos/v1/session_pb";
 import { BadgeVariant } from "delino-ui/badge";
 import { formatTime, labels } from "../format.ts";
+import { type Localizer, type Translate, useI18n } from "../i18n.ts";
 import { StateBadge } from "./ui.tsx";
 
 const ACTIVE: ReadonlySet<SessionState> = new Set([
@@ -20,17 +21,20 @@ export function sessionStateTone(state: SessionState): BadgeVariant {
 }
 
 /** The state of a session, with the end reason of an ended session. */
-export function sessionStateText(session: Session): string {
+export function sessionStateText(session: Session, t: Translate): string {
   if (session.state === SessionState.ENDED) {
-    return `Ended: ${labels.endReason[session.endReason]}`;
+    return t("session.endedWithReason", {
+      reason: t(labels.endReason[session.endReason] ?? "enum.unknown"),
+    });
   }
-  return labels.sessionState[session.state] ?? "Unknown";
+  return t(labels.sessionState[session.state] ?? "enum.unknown");
 }
 
 export function SessionStateBadge({ session }: { session: Session }) {
+  const { t } = useI18n();
   return (
     <StateBadge
-      text={sessionStateText(session)}
+      text={sessionStateText(session, t)}
       tone={sessionStateTone(session.state)}
     />
   );
@@ -40,12 +44,17 @@ export function SessionStateBadge({ session }: { session: Session }) {
  * The scheduled deletion time of a paused session, when the
  * paused-session retention is limited.
  */
-export function scheduledDeletionText(session: Session): string | undefined {
+export function scheduledDeletionText(
+  session: Session,
+  { lang, t }: Localizer,
+): string | undefined {
   if (
     session.state !== SessionState.PAUSED ||
     session.scheduledDeletionTime === undefined
   ) {
     return undefined;
   }
-  return `Deleted on ${formatTime(session.scheduledDeletionTime)} unless it resumes`;
+  return t("session.scheduledDeletion", {
+    time: formatTime(session.scheduledDeletionTime, lang),
+  });
 }

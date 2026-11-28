@@ -8,6 +8,7 @@ import {
 import { Empty, PageHeader, QueryBoundary } from "../components/ui.tsx";
 import { SANDRUN_CONSOLE_URL } from "../config.ts";
 import { labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { Link, orgPath, RouteId } from "../router.tsx";
 import { readSelectedOrganization } from "../storage.ts";
 
@@ -30,6 +31,7 @@ function takeLeftNotice(): boolean {
 /** Route `ORGANIZATION_PICK`: the caller's SandRun organizations. */
 export function OrganizationsPage() {
   const orgs = useOrganizations();
+  const { t, rich } = useI18n();
   const [left, setLeft] = useState(false);
   const [lastUsed] = useState(readSelectedOrganization);
   useLayoutEffect(() => {
@@ -41,43 +43,36 @@ export function OrganizationsPage() {
       <TopBar />
       <main className="content content-narrow">
         <PageHeader
-          title="Organizations"
-          description={
-            <>
-              SandCrew works in your SandRun organizations. Create organizations
-              and manage members in the{" "}
+          title={t("organizations.title")}
+          description={rich("organizations.description", {
+            link: (
               <a
                 href={SANDRUN_CONSOLE_URL}
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                SandRun console
+                {t("shell.sandrunConsole")}
               </a>
-              .
-            </>
-          }
+            ),
+          })}
         />
         {left ? (
           <div className="notice" role="status">
-            <p>
-              You no longer have access to that organization. Select another
-              one.
-            </p>
+            <p>{t("organizations.leftNotice")}</p>
           </div>
         ) : null}
-        <QueryBoundary query={orgs} loading="Loading organizations">
+        <QueryBoundary query={orgs} loading={t("organizations.loading")}>
           {(data) => {
             if (data.length === 0) {
               return (
-                <Empty title="You are not in an organization yet">
-                  Create an organization in the SandRun console, or ask an
-                  administrator to invite you.{" "}
+                <Empty title={t("organizations.empty.title")}>
+                  {t("organizations.empty.body")}{" "}
                   <a
                     href={SANDRUN_CONSOLE_URL}
                     target="_blank"
                     rel="noopener noreferrer"
                   >
-                    Open the SandRun console
+                    {t("organizations.empty.open")}
                   </a>
                 </Empty>
               );
@@ -89,7 +84,7 @@ export function OrganizationsPage() {
                 Number(a.organizationId === lastUsed),
             );
             return (
-              <ul className="list" aria-label="Organizations">
+              <ul className="list" aria-label={t("organizations.title")}>
                 {sorted.map((org) => (
                   <li key={org.organizationId} className="list-row">
                     <Link
@@ -98,8 +93,10 @@ export function OrganizationsPage() {
                     >
                       <span className="list-title">{org.name}</span>{" "}
                       <span className="muted">
-                        {labels.role[org.callerRole]}
-                        {org.organizationId === lastUsed ? " · Last used" : ""}
+                        {t(labels.role[org.callerRole])}
+                        {org.organizationId === lastUsed
+                          ? ` · ${t("organizations.lastUsed")}`
+                          : ""}
                       </span>
                     </Link>
                   </li>

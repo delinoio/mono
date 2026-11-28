@@ -20,6 +20,7 @@ import {
 import type { ReactNode } from "react";
 import { diffLines, DiffLineKind } from "../diff.ts";
 import { labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { Markdown, safeHref } from "../markdown.tsx";
 import {
   type ChatItem,
@@ -73,6 +74,7 @@ function Disclosure({
 }
 
 export function ContentBlockView({ block }: { block: ContentBlock }) {
+  const { t } = useI18n();
   switch (block.block.case) {
     case "text":
       return <Markdown text={block.block.value} />;
@@ -94,8 +96,11 @@ export function ContentBlockView({ block }: { block: ContentBlock }) {
     }
     case "unsupported":
       return (
-        <Disclosure label="Content that the console cannot show">
-          <RawJson label="Original content" json={block.block.value.rawJson} />
+        <Disclosure label={t("chat.unsupportedContent")}>
+          <RawJson
+            label={t("chat.originalContent")}
+            json={block.block.value.rawJson}
+          />
         </Disclosure>
       );
     case undefined:
@@ -104,16 +109,17 @@ export function ContentBlockView({ block }: { block: ContentBlock }) {
 }
 
 function DiffView({ diff }: { diff: Diff }) {
+  const { t } = useI18n();
   const lines = diffLines(diff.oldText, diff.newText);
   return (
     <figure className="diff">
       <figcaption>
         <code>{diff.path}</code>
-        {diff.oldText === undefined ? " (new file)" : null}
+        {diff.oldText === undefined ? ` ${t("chat.diff.newFile")}` : null}
       </figcaption>
       <pre
         className="code-block diff-lines"
-        aria-label={`Changes in ${diff.path}`}
+        aria-label={t("chat.diff.changesIn", { path: diff.path })}
       >
         {lines.map((line, index) => (
           <span key={index} className={`diff-line diff-${line.kind}`}>
@@ -132,6 +138,7 @@ function DiffView({ diff }: { diff: Diff }) {
 }
 
 function ToolCallContentView({ content }: { content: ToolCallContent }) {
+  const { rich } = useI18n();
   switch (content.content.case) {
     case "block":
       return <ContentBlockView block={content.content.value} />;
@@ -140,7 +147,9 @@ function ToolCallContentView({ content }: { content: ToolCallContent }) {
     case "terminal":
       return (
         <p className="muted">
-          Terminal <code>{content.content.value.terminalId}</code>
+          {rich("chat.terminal", {
+            id: <code>{content.content.value.terminalId}</code>,
+          })}
         </p>
       );
     case undefined:
@@ -155,6 +164,7 @@ function toolStatusTone(status: ToolCallStatus): BadgeVariant {
 }
 
 function ToolCallView({ item }: { item: ToolCallItem }) {
+  const { t } = useI18n();
   const diffs = item.content.filter((c) => c.content.case === "diff");
   const others = item.content.filter((c) => c.content.case !== "diff");
   const hasDetails =
@@ -165,13 +175,19 @@ function ToolCallView({ item }: { item: ToolCallItem }) {
   return (
     <article
       className="chat-tool"
-      aria-label={`Tool call: ${item.title || "Untitled"}`}
+      aria-label={t("chat.tool.label", {
+        title: item.title || t("chat.tool.untitled"),
+      })}
     >
       <header className="chat-tool-header">
-        <span className="chat-tool-title">{item.title || "Tool call"}</span>
-        <span className="muted">{labels.toolKind[item.toolKind]}</span>
+        <span className="chat-tool-title">
+          {item.title || t("chat.tool.title")}
+        </span>
+        <span className="muted">
+          {t(labels.toolKind[item.toolKind] ?? "enum.unknown")}
+        </span>
         <StateBadge
-          text={labels.toolCallStatus[item.status] ?? "Unknown"}
+          text={t(labels.toolCallStatus[item.status] ?? "enum.unknown")}
           tone={toolStatusTone(item.status)}
         />
       </header>
@@ -179,7 +195,7 @@ function ToolCallView({ item }: { item: ToolCallItem }) {
         <ToolCallContentView key={index} content={c} />
       ))}
       {hasDetails ? (
-        <Disclosure label="Input and output">
+        <Disclosure label={t("chat.tool.details")}>
           {item.locations.length > 0 ? (
             <ul className="chat-tool-locations">
               {item.locations.map((l, index) => (
@@ -195,8 +211,8 @@ function ToolCallView({ item }: { item: ToolCallItem }) {
           {others.map((c, index) => (
             <ToolCallContentView key={index} content={c} />
           ))}
-          <RawJson label="Input" json={item.rawInput} />
-          <RawJson label="Output" json={item.rawOutput} />
+          <RawJson label={t("chat.tool.input")} json={item.rawInput} />
+          <RawJson label={t("chat.tool.output")} json={item.rawOutput} />
         </Disclosure>
       ) : null}
     </article>
@@ -217,20 +233,26 @@ function PermissionView({
   item: PermissionItem;
   actions: PermissionActions;
 }) {
-  const subject = item.toolTitle || "a tool call";
+  const { t } = useI18n();
+  const subject = item.toolTitle || t("chat.permission.aToolCall");
   const response = item.response;
   let outcome: ReactNode = null;
   if (response !== undefined) {
     const option = item.options.find((o) => o.optionId === response.optionId);
     outcome =
       response.outcome === PermissionOutcome.CANCELLED ? (
-        <p className="muted">The request was cancelled.</p>
+        <p className="muted">{t("chat.permission.cancelled")}</p>
       ) : (
         <p>
           {response.autoApproved ? (
-            <StateBadge text="Auto-approved" tone={BadgeVariant.Accent} />
+            <StateBadge
+              text={t("chat.permission.autoApprovedBadge")}
+              tone={BadgeVariant.Accent}
+            />
           ) : null}{" "}
-          Answer: {option?.name ?? response.optionId}
+          {t("chat.permission.answer", {
+            option: option?.name ?? response.optionId,
+          })}
         </p>
       );
   }
@@ -241,16 +263,16 @@ function PermissionView({
           ? "chat-permission chat-permission-pending"
           : "chat-permission"
       }
-      aria-label={`Permission request for ${subject}`}
+      aria-label={t("chat.permission.label", { subject })}
     >
       <p className="chat-permission-title">
         {response?.autoApproved
-          ? `Auto-approved permission for ${subject}`
-          : `The agent asks for permission for ${subject}`}
+          ? t("chat.permission.autoApproved", { subject })
+          : t("chat.permission.asks", { subject })}
       </p>
       {response === undefined ? (
         actions.answer === undefined ? (
-          <p className="muted">Waiting for an answer.</p>
+          <p className="muted">{t("chat.permission.waiting")}</p>
         ) : (
           <div className="chat-permission-options">
             {item.options.map((option) => (
@@ -282,10 +304,14 @@ export function ChatItemView({
   item: ChatItem;
   actions: PermissionActions;
 }) {
+  const { t } = useI18n();
   switch (item.kind) {
     case ChatItemKind.UserMessage:
       return (
-        <article className="chat-message chat-user" aria-label="Your message">
+        <article
+          className="chat-message chat-user"
+          aria-label={t("chat.userMessage")}
+        >
           {item.blocks.map((b, i) => (
             <ContentBlockView key={i} block={b} />
           ))}
@@ -293,7 +319,10 @@ export function ChatItemView({
       );
     case ChatItemKind.AgentMessage:
       return (
-        <article className="chat-message chat-agent" aria-label="Agent message">
+        <article
+          className="chat-message chat-agent"
+          aria-label={t("chat.agentMessage")}
+        >
           {item.blocks.map((b, i) => (
             <ContentBlockView key={i} block={b} />
           ))}
@@ -302,7 +331,7 @@ export function ChatItemView({
     case ChatItemKind.AgentThought:
       return (
         <div className="chat-thought">
-          <Disclosure label="Thought">
+          <Disclosure label={t("chat.thought")}>
             {item.blocks.map((b, i) => (
               <ContentBlockView key={i} block={b} />
             ))}
@@ -313,15 +342,21 @@ export function ChatItemView({
       return <ToolCallView item={item} />;
     case ChatItemKind.Plan:
       return (
-        <article className="chat-plan" aria-label="Plan">
-          <p className="chat-plan-title">Plan</p>
+        <article className="chat-plan" aria-label={t("chat.plan")}>
+          <p className="chat-plan-title">{t("chat.plan")}</p>
           <ol>
             {item.entries.map((entry, index) => (
               <li key={index}>
                 {entry.content}{" "}
                 <span className="muted">
-                  · {labels.planStatus[entry.status]} ·{" "}
-                  {labels.planPriority[entry.priority]} priority
+                  {t("chat.planEntry", {
+                    status: t(
+                      labels.planStatus[entry.status] ?? "enum.unknown",
+                    ),
+                    priority: t(
+                      labels.planPriority[entry.priority] ?? "enum.unknown",
+                    ),
+                  })}
                 </span>
               </li>
             ))}
@@ -333,21 +368,27 @@ export function ChatItemView({
     case ChatItemKind.TurnEnded:
       return (
         <p className="chat-divider" role="note">
-          {labels.stopReason[item.stopReason] ?? "Turn ended"}
+          {t(labels.stopReason[item.stopReason] ?? "enum.stopReason.endTurn")}
         </p>
       );
     case ChatItemKind.ModeChanged:
       return (
         <p className="chat-divider" role="note">
-          Mode: {item.modeName || "Agent default"} ·{" "}
-          {labels.permissionMode[item.permissionMode]}
+          {t("chat.modeChanged", {
+            mode: item.modeName || t("chat.agentDefaultMode"),
+            permissions: t(
+              labels.permissionMode[item.permissionMode] ?? "enum.unknown",
+            ),
+          })}
         </p>
       );
     case ChatItemKind.BridgeError:
       return (
         <div className="notice notice-error chat-error" role="note">
           <p>
-            <strong>{labels.bridgeError[item.errorKind]}</strong>
+            <strong>
+              {t(labels.bridgeError[item.errorKind] ?? "enum.unknown")}
+            </strong>
             {item.message === "" ? null : `: ${item.message}`}
           </p>
         </div>
@@ -355,25 +396,31 @@ export function ChatItemView({
     case ChatItemKind.InputRejected:
       return (
         <p className="chat-divider" role="note">
-          The agent did not accept an input:{" "}
-          {labels.inputRejection[item.reason]?.toLowerCase()}
+          {t("chat.inputRejected", {
+            reason: t(
+              labels.inputRejection[item.reason] ??
+                "enum.inputRejection.unspecified",
+            ),
+          })}
         </p>
       );
     case ChatItemKind.AgentExited:
       return (
         <p className="chat-divider" role="note">
           {item.signal !== undefined
-            ? `The agent exited with the signal ${item.signal}.`
-            : `The agent exited with the code ${item.exitCode ?? 0}.`}
+            ? t("chat.agentExitedSignal", { signal: item.signal })
+            : t("chat.agentExitedCode", { code: item.exitCode ?? 0 })}
         </p>
       );
     case ChatItemKind.Unknown:
       return (
         <div className="chat-unknown">
           <Disclosure
-            label={`Agent update: ${item.sessionUpdate || "unknown"}`}
+            label={t("chat.unknownUpdate", {
+              update: item.sessionUpdate || t("chat.unknownUpdateName"),
+            })}
           >
-            <RawJson label="Original update" json={item.rawJson} />
+            <RawJson label={t("chat.originalUpdate")} json={item.rawJson} />
           </Disclosure>
         </div>
       );

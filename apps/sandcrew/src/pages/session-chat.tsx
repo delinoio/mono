@@ -46,7 +46,14 @@ import {
   QueryBoundary,
   toastError,
 } from "../components/ui.tsx";
-import { formatTime, labels, sessionTitle } from "../format.ts";
+import {
+  formatTime,
+  guestOsName,
+  labels,
+  sessionTitle,
+  vendorName,
+} from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { Link, orgPath, RouteId, sessionPath, useRouter } from "../router.tsx";
 import { useSessionTranscript } from "../session-transcript.ts";
 import { StreamStatus } from "../streams.ts";
@@ -59,6 +66,7 @@ import {
 /** Route `SESSION_CHAT`: the chat view of the owner, or the metadata view. */
 export function SessionChatPage({ sessionId }: { sessionId: string }) {
   const { organizationId, userId } = useOrg();
+  const { t } = useI18n();
   const query = useQuery(SessionService.method.getSession, {
     organizationId,
     sessionId,
@@ -68,7 +76,7 @@ export function SessionChatPage({ sessionId }: { sessionId: string }) {
   // not-found notice. The organization shell returns to the picker when the
   // organization itself is gone from the caller's list.
   return (
-    <QueryBoundary query={query} loading="Loading the session">
+    <QueryBoundary query={query} loading={t("chat.loadingSession")}>
       {() =>
         session === undefined ? (
           <ErrorNotice error={new Error("missing session")} />
@@ -83,20 +91,33 @@ export function SessionChatPage({ sessionId }: { sessionId: string }) {
 }
 
 function SessionDetails({ session }: { session: Session }) {
+  const { t, lang } = useI18n();
   return (
     <dl className="details">
-      <Detail term="Agent">{labels.vendor[session.vendor]}</Detail>
-      <Detail term="Guest OS">{labels.guestOs[session.guestOs]}</Detail>
-      <Detail term="Created">{formatTime(session.createdAt)}</Detail>
+      <Detail term={t("newSession.agent")}>
+        {vendorName(session.vendor, t)}
+      </Detail>
+      <Detail term={t("chat.details.guestOs")}>
+        {guestOsName(session.guestOs, t)}
+      </Detail>
+      <Detail term={t("chat.details.created")}>
+        {formatTime(session.createdAt, lang)}
+      </Detail>
       {session.startedAt !== undefined ? (
-        <Detail term="Started">{formatTime(session.startedAt)}</Detail>
+        <Detail term={t("chat.details.started")}>
+          {formatTime(session.startedAt, lang)}
+        </Detail>
       ) : null}
       {session.pausedAt !== undefined &&
       session.state === SessionState.PAUSED ? (
-        <Detail term="Paused">{formatTime(session.pausedAt)}</Detail>
+        <Detail term={t("chat.details.paused")}>
+          {formatTime(session.pausedAt, lang)}
+        </Detail>
       ) : null}
       {session.endedAt !== undefined ? (
-        <Detail term="Ended">{formatTime(session.endedAt)}</Detail>
+        <Detail term={t("chat.details.ended")}>
+          {formatTime(session.endedAt, lang)}
+        </Detail>
       ) : null}
     </dl>
   );
@@ -104,19 +125,21 @@ function SessionDetails({ session }: { session: Session }) {
 
 /** Other members see the session metadata only, never the transcript. */
 function MetadataView({ session }: { session: Session }) {
-  const deletion = scheduledDeletionText(session);
+  const i18n = useI18n();
+  const { t } = i18n;
+  const deletion = scheduledDeletionText(session, i18n);
   return (
     <>
       <PageHeader
-        title={sessionTitle(session)}
-        description="This session belongs to another member. Only its owner reads the chat."
+        title={sessionTitle(session, t)}
+        description={t("chat.metadataDescription")}
         action={<SessionStateBadge session={session} />}
       />
       {deletion !== undefined ? <p className="muted">{deletion}</p> : null}
       <SessionDetails session={session} />
       <p>
         <Link to={orgPath(RouteId.SessionList, session.organizationId)}>
-          Back to the sessions
+          {t("chat.backToSessions")}
         </Link>
       </p>
     </>
@@ -126,6 +149,7 @@ function MetadataView({ session }: { session: Session }) {
 function OwnerChat({ session }: { session: Session }) {
   const { organizationId } = useOrg();
   const { navigate } = useRouter();
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const { sessionId } = session;
   const transcriptState = useSessionTranscript(organizationId, sessionId, true);
@@ -153,8 +177,13 @@ function OwnerChat({ session }: { session: Session }) {
   return (
     <div className="chat-page">
       <PageHeader
-        title={sessionTitle(session)}
-        description={`${labels.vendor[session.vendor]} · ${labels.permissionMode[session.permissionMode] ?? ""}`}
+        title={sessionTitle(session, t)}
+        description={t("chat.headerDescription", {
+          vendor: vendorName(session.vendor, t),
+          permissions: t(
+            labels.permissionMode[session.permissionMode] ?? "enum.unknown",
+          ),
+        })}
         action={
           <div className="header-actions">
             <SessionStateBadge session={session} />
@@ -163,14 +192,14 @@ function OwnerChat({ session }: { session: Session }) {
                 variant={ButtonVariant.Secondary}
                 onClick={() => setOptionsOpen(true)}
               >
-                Mode and model
+                {t("chat.options.title")}
               </Button>
             ) : null}
             <Button
               variant={ButtonVariant.Danger}
               onClick={() => setDeleting(true)}
             >
-              Delete session
+              {t("chat.delete")}
             </Button>
           </div>
         }
@@ -178,17 +207,19 @@ function OwnerChat({ session }: { session: Session }) {
       <StateBanner
         session={session}
         onResume={() =>
-          resume.mutateAsync({ organizationId, sessionId }).catch(toastError)
+          resume
+            .mutateAsync({ organizationId, sessionId })
+            .catch((e: unknown) => toastError(e, t))
         }
       />
       {transcriptState.stream.status === StreamStatus.Reconnecting ? (
         <p className="muted" role="status">
-          Reconnecting to the session…
+          {t("chat.reconnecting")}
         </p>
       ) : null}
       {transcriptState.stream.status === StreamStatus.Failed ? (
         <ErrorNotice
-          title="Live updates stopped."
+          title={t("chat.liveUpdatesStopped")}
           error={transcriptState.stream.error}
           onRetry={transcriptState.stream.retry}
         />
@@ -209,7 +240,7 @@ function OwnerChat({ session }: { session: Session }) {
                     permissionRequestId,
                     optionId,
                   })
-                  .catch(toastError)
+                  .catch((e: unknown) => toastError(e, t))
         }
       />
       {ended ? (
@@ -233,9 +264,9 @@ function OwnerChat({ session }: { session: Session }) {
       <ConfirmDialog
         open={deleting}
         onOpenChange={setDeleting}
-        title={`Delete ${sessionTitle(session)}?`}
-        description="SandCrew deletes the sandbox of the session and its transcript permanently. This cannot be undone."
-        confirmLabel="Delete session"
+        title={t("chat.deleteTitle", { session: sessionTitle(session, t) })}
+        description={t("chat.deleteDescription")}
+        confirmLabel={t("chat.delete")}
         onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId, sessionId });
           if (opening.isCurrent()) {
@@ -257,32 +288,30 @@ export function StateBanner({
   session: Session;
   onResume: () => unknown;
 }) {
+  const i18n = useI18n();
+  const { t } = i18n;
   switch (session.state) {
     case SessionState.PAUSED: {
-      const deletion = scheduledDeletionText(session);
+      const deletion = scheduledDeletionText(session, i18n);
       return (
         <section
           className="state-banner"
           role="status"
-          aria-label="Session state"
+          aria-label={t("chat.state.label")}
         >
           {session.resumeWaitExpired ? (
             <>
-              <p>
-                The session is paused. Its resume waited longer than the runner
-                profile allows, because the device had no free capacity.
-              </p>
+              <p>{t("chat.state.resumeWaitExpired")}</p>
               <Button variant={ButtonVariant.Secondary} onClick={onResume}>
-                Resume again
+                {t("chat.state.resumeAgain")}
               </Button>
             </>
           ) : (
-            <p>
-              The session is paused and holds no vCPU or memory. Send a message
-              or answer a permission request to resume it.
-            </p>
+            <p>{t("chat.state.paused")}</p>
           )}
-          {deletion !== undefined ? <p className="muted">{deletion}.</p> : null}
+          {deletion !== undefined ? (
+            <p className="muted">{t("chat.state.deletion", { deletion })}</p>
+          ) : null}
         </section>
       );
     }
@@ -291,11 +320,9 @@ export function StateBanner({
         <section
           className="state-banner"
           role="status"
-          aria-label="Session state"
+          aria-label={t("chat.state.label")}
         >
-          <p>
-            The session is pausing. A new message resumes it after the pause.
-          </p>
+          <p>{t("chat.state.pausing")}</p>
         </section>
       );
     case SessionState.RESUME_QUEUED:
@@ -303,12 +330,9 @@ export function StateBanner({
         <section
           className="state-banner"
           role="status"
-          aria-label="Session state"
+          aria-label={t("chat.state.label")}
         >
-          <p>
-            The resume waits in the SandRun queue for capacity on the device of
-            the session.
-          </p>
+          <p>{t("chat.state.resumeQueued")}</p>
         </section>
       );
     case SessionState.RESUMING:
@@ -316,9 +340,9 @@ export function StateBanner({
         <section
           className="state-banner"
           role="status"
-          aria-label="Session state"
+          aria-label={t("chat.state.label")}
         >
-          <p>The session is resuming.</p>
+          <p>{t("chat.state.resuming")}</p>
         </section>
       );
     case SessionState.DISCONNECTED:
@@ -326,12 +350,9 @@ export function StateBanner({
         <section
           className="state-banner state-banner-warning"
           role="status"
-          aria-label="Session state"
+          aria-label={t("chat.state.label")}
         >
-          <p>
-            The device of the session is offline. The session continues when the
-            device is back.
-          </p>
+          <p>{t("chat.state.disconnected")}</p>
         </section>
       );
     case SessionState.QUEUED:
@@ -340,13 +361,12 @@ export function StateBanner({
         <section
           className="state-banner"
           role="status"
-          aria-label="Session state"
+          aria-label={t("chat.state.label")}
         >
           <p>
             {session.state === SessionState.QUEUED
-              ? "The session waits in the SandRun queue for a sandbox."
-              : "The sandbox is starting the agent."}{" "}
-            The agent reads your first message when it is ready.
+              ? t("chat.state.queued")
+              : t("chat.state.starting")}
           </p>
         </section>
       );
@@ -376,6 +396,7 @@ export function TranscriptView({
   onRetry: () => void;
   answer?: (permissionRequestId: string, optionId: string) => Promise<unknown>;
 }) {
+  const { t } = useI18n();
   const end = useRef<HTMLDivElement>(null);
   const count = transcript.items.length;
   // True while the end of the transcript is in view. Content that is added
@@ -399,17 +420,17 @@ export function TranscriptView({
   if (loadError !== undefined && !loaded) {
     return (
       <ErrorNotice
-        title="The transcript did not load."
+        title={t("chat.transcript.loadFailed")}
         error={loadError}
         onRetry={onRetry}
       />
     );
   }
-  if (!loaded) return <Loading label="Loading the transcript" />;
+  if (!loaded) return <Loading label={t("chat.transcript.loading")} />;
   return (
-    <section className="chat" aria-label="Transcript">
+    <section className="chat" aria-label={t("chat.transcript.label")}>
       {count === 0 ? (
-        <p className="muted">The transcript is empty so far.</p>
+        <p className="muted">{t("chat.transcript.empty")}</p>
       ) : (
         transcript.items.map((item) => (
           <ChatItemView key={item.key} item={item} actions={{ answer }} />
@@ -430,8 +451,9 @@ function Composer({
   onSessionChange: (res: { session?: Session }) => void;
 }) {
   const { organizationId } = useOrg();
+  const { t } = useI18n();
   const [text, setText] = useState("");
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<MessageKey>();
   // The ID of the last send that did not succeed. A retry of the same text
   // reuses it, so the API deduplicates a message whose response was lost.
   const unconfirmed = useRef<{ text: string; clientMessageId: string }>(
@@ -456,7 +478,7 @@ function Composer({
     if (send.isPending) return;
     const message = text.trim();
     if (message === "") {
-      setError("Enter a message.");
+      setError("chat.composer.error");
       return;
     }
     const clientMessageId =
@@ -491,15 +513,15 @@ function Composer({
   return (
     <form className="composer" onSubmit={submit} noValidate>
       <Textarea
-        label="Message"
-        description="Ctrl+Enter or ⌘+Enter sends the message."
+        label={t("chat.composer.label")}
+        description={t("chat.composer.help")}
         value={text}
         onValueChange={(v: string) => {
           setText(v);
           setError(undefined);
         }}
         onKeyDown={onKeyDown}
-        error={error}
+        error={error === undefined ? undefined : t(error)}
         autoFocus
         autoResize
         rows={2}
@@ -518,14 +540,16 @@ function Composer({
                   sessionId: session.sessionId,
                   clientMessageId: uuidV7(),
                 })
-                .catch(toastError)
+                .catch((e: unknown) => toastError(e, t))
             }
           >
-            Stop
+            {t("chat.composer.stop")}
           </Button>
         ) : null}
         <Button type="submit" disabled={send.isPending}>
-          {session.state === SessionState.PAUSED ? "Send and resume" : "Send"}
+          {session.state === SessionState.PAUSED
+            ? t("chat.composer.sendAndResume")
+            : t("chat.composer.send")}
         </Button>
       </div>
     </form>
@@ -541,9 +565,10 @@ function EndedPanel({
 }) {
   const { organizationId } = useOrg();
   const { navigate } = useRouter();
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const [text, setText] = useState("");
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<MessageKey>();
   const restart = useMutation(
     SessionService.method.restartSessionFromTranscript,
     {
@@ -559,7 +584,7 @@ function EndedPanel({
     if (restart.isPending) return;
     const message = text.trim();
     if (message === "") {
-      setError("Enter the first message of the new session.");
+      setError("chat.ended.error");
       return;
     }
     try {
@@ -575,31 +600,30 @@ function EndedPanel({
   };
 
   return (
-    <section className="ended" aria-label="Session ended">
-      <h2>The session ended</h2>
-      <p>{labels.endReason[session.endReason]}.</p>
-      {installFailed ? (
-        <p>
-          The session could not install the agent in the sandbox. Check that the
-          device can download the agent, then start a new session.
-        </p>
-      ) : null}
+    <section className="ended" aria-label={t("chat.ended.label")}>
+      <h2>{t("chat.ended.title")}</h2>
+      <p>
+        {t("chat.ended.reason", {
+          reason: t(labels.endReason[session.endReason] ?? "enum.unknown"),
+        })}
+      </p>
+      {installFailed ? <p>{t("chat.ended.installFailed")}</p> : null}
       <form className="form" onSubmit={submit} noValidate>
         <Textarea
-          label="First message of the new session"
-          description="The new session gets this transcript as the file .sandcrew/previous-session.md in an empty workspace."
+          label={t("chat.ended.firstMessage")}
+          description={t("chat.ended.firstMessageHelp")}
           value={text}
           onValueChange={(v: string) => {
             setText(v);
             setError(undefined);
           }}
-          error={error}
+          error={error === undefined ? undefined : t(error)}
           rows={3}
         />
         {restart.error ? <ErrorNotice error={restart.error} /> : null}
         <div className="form-actions">
           <Button type="submit" disabled={restart.isPending}>
-            Start new session from transcript
+            {t("chat.ended.restart")}
           </Button>
         </div>
       </form>
@@ -624,6 +648,7 @@ function SessionOptionsDialog({
   onSessionChange: (res: { session?: Session }) => void;
 }) {
   const { organizationId } = useOrg();
+  const { t } = useI18n();
   const setMode = useMutation(SessionService.method.setSessionMode, {
     onSuccess: onSessionChange,
   });
@@ -652,15 +677,16 @@ function SessionOptionsDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
-        <DialogTitle>Mode and model</DialogTitle>
+        <DialogTitle>{t("chat.options.title")}</DialogTitle>
         <DialogDescription>
-          Changes apply to the running agent from its next step.
-          {paused ? " Resume the session to change them." : ""}
+          {paused
+            ? t("chat.options.descriptionPaused")
+            : t("chat.options.description")}
         </DialogDescription>
         <div className="form">
           <Select
-            label="Permissions"
-            description="Ask shows each permission request in the chat. Permission prompts are advisory: the sandbox is the security boundary."
+            label={t("chat.options.permissions")}
+            description={t("chat.options.permissionsHelp")}
             value={String(permissionMode)}
             disabled={paused || pending}
             onValueChange={(v) => {
@@ -677,15 +703,15 @@ function SessionOptionsDialog({
             }}
           >
             <SelectOption value={String(PermissionMode.AUTO_APPROVE)}>
-              {labels.permissionMode[PermissionMode.AUTO_APPROVE]}
+              {t(labels.permissionMode[PermissionMode.AUTO_APPROVE])}
             </SelectOption>
             <SelectOption value={String(PermissionMode.ASK)}>
-              {labels.permissionMode[PermissionMode.ASK]}
+              {t(labels.permissionMode[PermissionMode.ASK])}
             </SelectOption>
           </Select>
           {modes.length > 0 ? (
             <Select
-              label="Mode"
+              label={t("newSession.mode")}
               value={currentModeId}
               disabled={paused || pending}
               onValueChange={(v) => {
@@ -730,14 +756,12 @@ function SessionOptionsDialog({
             </Select>
           ))}
           {modes.length === 0 && configOptions.length === 0 ? (
-            <p className="muted">
-              The agent has not advertised modes or models yet.
-            </p>
+            <p className="muted">{t("chat.options.none")}</p>
           ) : null}
           {error ? <ErrorNotice error={error} /> : null}
         </div>
         <DialogActions>
-          <DialogClose>Done</DialogClose>
+          <DialogClose>{t("common.done")}</DialogClose>
         </DialogActions>
       </DialogContent>
     </Dialog>

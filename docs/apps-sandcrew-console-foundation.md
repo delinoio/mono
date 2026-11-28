@@ -70,12 +70,18 @@ Members of SandRun organizations who sign in with Logto. `owner` and `admin` mem
 ### States and accessibility
 
 - Every view has empty, loading, error and permission states. A `not_found` for an organization that the user no longer belongs to returns to the organization picker, which explains that the user no longer has access. An organization route whose organization is not in the caller's list does the same.
-- English only. The layout works down to 320 px wide.
+- The layout works down to 320 px wide.
 - Follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it.
+
+## Localization
+
+- The console follows the [localization contract](repository-localization-contract.md#react-apps) with the [`delino-i18n`](packages-delino-i18n-foundation.md) runtime. The source catalog is `apps/sandcrew/i18n/messages/en.json`, the registry is `apps/sandcrew/i18n/locales.json`, and `src/i18n.ts` creates the provider. `src/index.tsx` loads the selected catalog before the first render and wraps the whole console, so the sign-in and callback pages are translated too.
+- The language menu is in the top bar: at the start of the account links on signed-in pages, and alone in the top bar of the signed-out sign-in page.
+- Product, vendor and guest OS names, identifiers, commands, file names, user messages, agent output and server error text stay unchanged. Dates, numbers and lists use `Intl` with the selected language.
 
 ## Storage
 
-- Logto session storage by the Logto browser SDK. The selected organization and the "My sessions" filter in `localStorage`, wrapped in error handling; the console works without them.
+- Logto session storage by the Logto browser SDK. The selected organization and the "My sessions" filter in `localStorage`, wrapped in error handling; the console works without them. The selected language is stored under the `localStorage` key `delino.language`.
 - No transcript, credential or secret is stored in the browser beyond the React Query memory cache.
 
 ## Security
@@ -93,12 +99,13 @@ The console sends no logs. Errors appear in the user interface with the Connect 
 ## Build and Test
 
 - `pnpm exec turbo run build lint typecheck test --filter=sandcrew-console` and `pnpm test` from the repository root, with unit tests for the session list, the new-session form, the chat view (every event kind, permission buttons, cancel, mode switch), the settings and the Web Push opt-in.
-- Package scripts: `dev` (portless, started as `node node_modules/portless/dist/cli.js run --prefix=` through `scripts/dev/with-infisical.mjs` with the Infisical folder `/apps/sandcrew`), `dev:app` (`rsbuild dev`), `build`, `preview`, `lint` and `typecheck` (`tsc --noEmit`), `test` (`rstest run` with `happy-dom`) and `test:e2e` (`e2e run`).
-- Browser end-to-end tests in `apps/sandcrew/e2e/` according to the [e2e contract](repository-e2e-contract.md), against the development server with the mock API: the session list, the new-session form, the chat view, the settings, the Web Push opt-in, and the empty, loading, error and permission states. For the loading states, a test stores a response delay for the mock in `sessionStorage` (`sandcrew.mock-response-delay-ms`), which only mock builds read. The app command uses Node to run the Rsbuild CLI with `dev --no-env --mode development`, `NODE_ENV=production` and a padded `PUBLIC_SANDCREW_MOCK_API=true` value. Headless Chromium blocks notifications and has no push service, so the opt-in test replaces only the permission prompt and `PushManager.subscribe` in the page; the service worker registration is real. The suite does not test a deployed control plane, Logto or a push service.
+- Package scripts: `dev` (portless, started as `node node_modules/portless/dist/cli.js run --prefix=` through `scripts/dev/with-infisical.mjs` with the Infisical folder `/apps/sandcrew`), `dev:app` (`rsbuild dev`), `build`, `preview`, `lint` and `typecheck` (`tsc --noEmit`), `test` (`delino-i18n check`, then `rstest run` with `happy-dom`), `test:e2e` (`e2e run`), `i18n:check` and `i18n:translate`.
+- A language menu test selects another language with a fake catalog and checks that the text changes without a reload and that the selection is kept; another test checks the menu on the signed-out page, and a catalog test checks that every enum label has source text.
+- Browser end-to-end tests in `apps/sandcrew/e2e/` according to the [e2e contract](repository-e2e-contract.md), against the development server with the mock API and the browser locale `en-US`: the session list, the new-session form, the chat view, the settings, the Web Push opt-in, and the empty, loading, error and permission states. For the loading states, a test stores a response delay for the mock in `sessionStorage` (`sandcrew.mock-response-delay-ms`), which only mock builds read. The app command uses Node to run the Rsbuild CLI with `dev --no-env --mode development`, `NODE_ENV=production` and a padded `PUBLIC_SANDCREW_MOCK_API=true` value. Headless Chromium blocks notifications and has no push service, so the opt-in test replaces only the permission prompt and `PushManager.subscribe` in the page; the service worker registration is real. The suite does not test a deployed control plane, Logto or a push service.
 
 ## Dependencies and Integrations
 
-- Upstream: [`sandcrew-api`](servers-sandcrew-api-foundation.md), Logto, the browser Push API.
+- Upstream: [`sandcrew-api`](servers-sandcrew-api-foundation.md), Logto, the browser Push API, `delino-ui` and `delino-i18n`.
 - Links: the SandRun console for organizations and members, `https://accounts.delino.io` for account management.
 - Dependencies: the pins of the [SandRun console](apps-sandrun-console-foundation.md#dependencies-and-integrations), and `react-markdown` `10.1.0` and `remark-gfm` `4.0.1` for the Markdown rendering (owner-approved).
 - New dependencies need owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds them.

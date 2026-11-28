@@ -20,6 +20,7 @@ import { invalidateServices, useAllPages } from "../api.ts";
 import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL, SANDRUN_CONSOLE_URL } from "../config.ts";
 import { labels } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import {
   Link,
   type OrgRouteId,
@@ -28,6 +29,7 @@ import {
   useRouter,
 } from "../router.tsx";
 import { writeSelectedOrganization } from "../storage.ts";
+import { LanguageSelect } from "./language-select.tsx";
 import {
   ErrorNotice,
   Loading,
@@ -89,32 +91,32 @@ export function OrgContextProvider({
 
 const SECTIONS: {
   id: OrgRouteId;
-  title: string;
+  title: MessageKey;
   /** Also current for these routes. */
   covers: RouteId[];
   managersOnly: boolean;
 }[] = [
   {
     id: RouteId.SessionList,
-    title: "Sessions",
+    title: "nav.sessions",
     covers: [RouteId.SessionChat],
     managersOnly: false,
   },
   {
     id: RouteId.SessionNew,
-    title: "New session",
+    title: "nav.newSession",
     covers: [],
     managersOnly: false,
   },
   {
     id: RouteId.SettingsUser,
-    title: "Settings",
+    title: "nav.settings",
     covers: [],
     managersOnly: false,
   },
   {
     id: RouteId.SettingsOrg,
-    title: "Organization settings",
+    title: "nav.organizationSettings",
     covers: [],
     managersOnly: true,
   },
@@ -128,6 +130,7 @@ export function visibleSections(role: Role | undefined) {
 /** The top bar: product name, organization switcher and account links. */
 export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
+  const { t } = useI18n();
   const { route, navigate } = useRouter();
   const orgs = useOrganizations({ enabled: organizationId !== undefined });
   const section: OrgRouteId =
@@ -148,7 +151,7 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
         <>
           {orgs.error ? <RefreshFailedNotice query={orgs} /> : null}
           <Select
-            label="Organization"
+            label={t("shell.organization")}
             value={organizationId}
             onValueChange={(value) => {
               if (value === null || value === organizationId) return;
@@ -180,16 +183,17 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
         SandCrew
       </Link>
       {switcher ? <div className="org-switcher">{switcher}</div> : null}
-      <nav className="topbar-links" aria-label="Account">
+      <nav className="topbar-links" aria-label={t("shell.account")}>
+        <LanguageSelect />
         <a href={ACCOUNTS_URL} target="_blank" rel="noopener noreferrer">
-          Account settings
+          {t("shell.accountSettings")}
         </a>
         <Button
           variant={ButtonVariant.Secondary}
           size={ButtonSize.Small}
           onClick={() => auth.signOut()}
         >
-          Sign out
+          {t("shell.signOut")}
         </Button>
       </nav>
     </header>
@@ -206,6 +210,7 @@ export function OrgShell({
 }) {
   const { route, navigate } = useRouter();
   const auth = useAuth();
+  const { t, rich } = useI18n();
   const queryClient = useQueryClient();
   const orgs = useOrganizations();
   const organization = orgs.data?.find(
@@ -258,17 +263,17 @@ export function OrgShell({
       </main>
     );
   } else if (value === undefined) {
-    body = <Loading label="Loading the organization" />;
+    body = <Loading label={t("shell.loadingOrganization")} />;
   } else {
     const allowed =
       route.id !== RouteId.SettingsOrg || canManageOrganization(value.role);
     body = (
       <OrgContext.Provider value={value}>
         <div className="org-layout">
-          <nav className="sidenav" aria-label="Organization">
+          <nav className="sidenav" aria-label={t("shell.organization")}>
             <p className="sidenav-org">
               {value.organization.name}
-              <span className="muted"> · {labels.role[value.role]}</span>
+              <span className="muted"> · {t(labels.role[value.role])}</span>
             </p>
             <ul>
               {visibleSections(value.role).map((s) => {
@@ -280,22 +285,24 @@ export function OrgShell({
                       to={orgPath(s.id, organizationId)}
                       aria-current={current ? "page" : undefined}
                     >
-                      {s.title}
+                      {t(s.title)}
                     </Link>
                   </li>
                 );
               })}
             </ul>
             <p className="sidenav-footer muted">
-              Members and runner profiles are managed in the{" "}
-              <a
-                href={SANDRUN_CONSOLE_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                SandRun console
-              </a>
-              .
+              {rich("shell.managedInSandRun", {
+                link: (
+                  <a
+                    href={SANDRUN_CONSOLE_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {t("shell.sandrunConsole")}
+                  </a>
+                ),
+              })}
             </p>
           </nav>
           <main className="content">
@@ -304,12 +311,9 @@ export function OrgShell({
               children
             ) : (
               <div className="notice notice-error" role="alert">
-                <p>
-                  Only owners and admins of the organization change its SandCrew
-                  settings.
-                </p>
+                <p>{t("shell.managersOnly")}</p>
                 <Link to={orgPath(RouteId.SessionList, organizationId)}>
-                  Go to the sessions
+                  {t("shell.goToSessions")}
                 </Link>
               </div>
             )}

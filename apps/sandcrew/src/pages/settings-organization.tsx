@@ -21,7 +21,8 @@ import { VendorCredentialSection } from "../components/credentials.tsx";
 import { useOrg } from "../components/shell.tsx";
 import { ErrorNotice, PageHeader, QueryBoundary } from "../components/ui.tsx";
 import { sandrunProfilesUrl } from "../config.ts";
-import { durationMs, labels } from "../format.ts";
+import { durationMs, labels, profileSummary } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { useRunnerProfiles } from "../queries.ts";
 
 const MINUTE_MS = 60_000;
@@ -69,12 +70,23 @@ export function draftFromSettings(
   };
 }
 
-/** Validates a draft. Returns field errors; an empty object means valid. */
+/** The values of the validation messages. */
+const LIMITS = {
+  minMinutes: PAUSE_DELAY_MIN_MINUTES,
+  maxMinutes: PAUSE_DELAY_MAX_MINUTES,
+  minDays: RETENTION_MIN_DAYS,
+  maxDays: RETENTION_MAX_DAYS,
+};
+
+/**
+ * Validates a draft. Returns the catalog keys of field errors; an empty
+ * object means valid.
+ */
 export function validateDraft(draft: SettingsDraft): {
-  pauseDelay?: string;
-  retentionDays?: string;
+  pauseDelay?: MessageKey;
+  retentionDays?: MessageKey;
 } {
-  const errors: { pauseDelay?: string; retentionDays?: string } = {};
+  const errors: { pauseDelay?: MessageKey; retentionDays?: MessageKey } = {};
   const delay = draft.pauseDelayMinutes;
   if (
     delay === null ||
@@ -82,7 +94,7 @@ export function validateDraft(draft: SettingsDraft): {
     delay < PAUSE_DELAY_MIN_MINUTES ||
     delay > PAUSE_DELAY_MAX_MINUTES
   ) {
-    errors.pauseDelay = `Enter a whole number of minutes from ${PAUSE_DELAY_MIN_MINUTES} to ${PAUSE_DELAY_MAX_MINUTES}.`;
+    errors.pauseDelay = "orgSettings.error.pauseDelay";
   }
   const days = draft.retentionDays;
   if (
@@ -92,7 +104,7 @@ export function validateDraft(draft: SettingsDraft): {
       days < RETENTION_MIN_DAYS ||
       days > RETENTION_MAX_DAYS)
   ) {
-    errors.retentionDays = `Enter a whole number of days from ${RETENTION_MIN_DAYS} to ${RETENTION_MAX_DAYS}.`;
+    errors.retentionDays = "orgSettings.error.retentionDays";
   }
   return errors;
 }
@@ -148,6 +160,7 @@ export function settingsUpdate(
 /** Route `SETTINGS_ORG`: owners and admins only. */
 export function OrganizationSettingsPage() {
   const { organizationId } = useOrg();
+  const { t } = useI18n();
   const settings = useQuery(
     OrganizationService.method.getOrganizationSettings,
     {
@@ -157,21 +170,17 @@ export function OrganizationSettingsPage() {
   return (
     <>
       <PageHeader
-        title="Organization settings"
-        description="SandCrew settings of the organization. Members, roles and runner profiles are managed in the SandRun console."
+        title={t("nav.organizationSettings")}
+        description={t("orgSettings.description")}
       />
       <section className="section" aria-labelledby="org-credentials-heading">
-        <h2 id="org-credentials-heading">Organization vendor credentials</h2>
-        <p className="muted">
-          Sessions of members without their own credential use these. Code in a
-          session sandbox can read the credential of its session.
-        </p>
+        <h2 id="org-credentials-heading">
+          {t("credentials.organizationList")}
+        </h2>
+        <p className="muted">{t("orgSettings.credentialsHelp")}</p>
         <VendorCredentialSection scope={CredentialScope.ORGANIZATION} />
       </section>
-      <QueryBoundary
-        query={settings}
-        loading="Loading the organization settings"
-      >
+      <QueryBoundary query={settings} loading={t("orgSettings.loading")}>
         {(data) => (
           <SettingsForm
             // Two saves can happen in the same second, so the key uses the
@@ -187,6 +196,7 @@ export function OrganizationSettingsPage() {
 
 function SettingsForm({ settings }: { settings: OrganizationSettings }) {
   const { organizationId } = useOrg();
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const profiles = useRunnerProfiles(organizationId);
   const [saved] = useState(() => draftFromSettings(settings));
@@ -212,7 +222,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
         settings: { organizationId, ...change.settings },
         updateMask: create(FieldMaskSchema, { paths: change.paths }),
       });
-      toast.success("Settings saved");
+      toast.success(t("orgSettings.saved"));
     } catch {
       // The form shows the mutation error and keeps the edits.
     }
@@ -229,20 +239,18 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
   return (
     <form className="form" onSubmit={submit} noValidate>
       <section className="section" aria-labelledby="profiles-heading">
-        <h2 id="profiles-heading">Allowed runner profiles</h2>
+        <h2 id="profiles-heading">{t("orgSettings.profiles")}</h2>
         <p className="muted">
-          Members choose one of these SandRun dev session profiles for a new
-          session. SandCrew needs a profile without a maximum lifetime and with
-          outbound-only network.{" "}
+          {t("orgSettings.profilesHelp")}{" "}
           <a
             href={sandrunProfilesUrl(organizationId)}
             target="_blank"
             rel="noopener noreferrer"
           >
-            Manage runner profiles in SandRun
+            {t("orgSettings.manageProfiles")}
           </a>
         </p>
-        <QueryBoundary query={profiles} loading="Loading runner profiles">
+        <QueryBoundary query={profiles} loading={t("profiles.loading")}>
           {(list) => (
             <ProfileChoices
               profiles={list}
@@ -253,10 +261,10 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
         </QueryBoundary>
       </section>
       <section className="section" aria-labelledby="pause-heading">
-        <h2 id="pause-heading">Pause and retention</h2>
+        <h2 id="pause-heading">{t("orgSettings.pause")}</h2>
         <NumberInput
-          label="Pause delay in minutes"
-          description="A session that waits for input this long is paused. A paused session holds no vCPU or memory."
+          label={t("orgSettings.pauseDelay")}
+          description={t("orgSettings.pauseDelayHelp")}
           value={draft.pauseDelayMinutes}
           onValueChange={(v: number | null) => {
             setDraft((d) => ({ ...d, pauseDelayMinutes: v }));
@@ -264,11 +272,15 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
           }}
           min={PAUSE_DELAY_MIN_MINUTES}
           max={PAUSE_DELAY_MAX_MINUTES}
-          error={errors.pauseDelay}
+          error={
+            errors.pauseDelay === undefined
+              ? undefined
+              : t(errors.pauseDelay, LIMITS)
+          }
         />
         <Select
-          label="Paused-session retention"
-          description="When it ends, SandCrew deletes the sandbox of the paused session. The transcript stays readable."
+          label={t("orgSettings.retention")}
+          description={t("orgSettings.retentionHelp")}
           value={draft.retention}
           onValueChange={(v) => {
             if (v === null) return;
@@ -283,13 +295,15 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
           }}
         >
           <SelectOption value={RetentionKind.Days}>
-            A number of days
+            {t("orgSettings.retentionDaysOption")}
           </SelectOption>
-          <SelectOption value={RetentionKind.Unlimited}>Unlimited</SelectOption>
+          <SelectOption value={RetentionKind.Unlimited}>
+            {t("orgSettings.retentionUnlimited")}
+          </SelectOption>
         </Select>
         {draft.retention === RetentionKind.Days ? (
           <NumberInput
-            label="Retention in days"
+            label={t("orgSettings.retentionDays")}
             value={draft.retentionDays}
             onValueChange={(v: number | null) => {
               setDraft((d) => ({ ...d, retentionDays: v }));
@@ -297,7 +311,11 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
             }}
             min={RETENTION_MIN_DAYS}
             max={RETENTION_MAX_DAYS}
-            error={errors.retentionDays}
+            error={
+              errors.retentionDays === undefined
+                ? undefined
+                : t(errors.retentionDays, LIMITS)
+            }
           />
         ) : null}
       </section>
@@ -307,7 +325,7 @@ function SettingsForm({ settings }: { settings: OrganizationSettings }) {
           type="submit"
           disabled={change === undefined || update.isPending}
         >
-          Save settings
+          {t("orgSettings.save")}
         </Button>
       </div>
     </form>
@@ -323,22 +341,21 @@ function ProfileChoices({
   allowed: readonly string[];
   onToggle: (id: string, on: boolean) => void;
 }) {
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const known = new Set(profiles.map((p) => p.runnerProfileId));
   const missing = allowed.filter((id) => !known.has(id));
   if (profiles.length === 0 && missing.length === 0) {
-    return (
-      <p className="muted">
-        The organization has no dev session runner profiles. Create one in the
-        SandRun console.
-      </p>
-    );
+    return <p className="muted">{t("orgSettings.noProfiles")}</p>;
   }
   return (
     <div className="checkbox-list">
       {profiles.map((p) => {
-        const reasons = p.ineligibility
-          .map((r) => labels.ineligibility[r])
-          .join(". ");
+        const reasons = new Intl.ListFormat(lang, { type: "unit" }).format(
+          p.ineligibility.map((r) =>
+            t(labels.ineligibility[r] ?? "enum.unknown"),
+          ),
+        );
         const checked = allowed.includes(p.runnerProfileId);
         return (
           <Checkbox
@@ -346,8 +363,10 @@ function ProfileChoices({
             label={p.name}
             description={
               p.selectable
-                ? `${labels.guestOs[p.guestOs]} · ${p.vcpuCount} vCPU · ${p.memoryMib} MiB memory · ${p.diskGib} GiB disk`
-                : `Not selectable: ${reasons || "SandCrew cannot use this profile"}.`
+                ? profileSummary(p, i18n)
+                : t("orgSettings.notSelectable", {
+                    reasons: reasons || t("orgSettings.cannotUse"),
+                  })
             }
             checked={checked}
             // A profile that is not selectable can still be removed.
@@ -359,8 +378,8 @@ function ProfileChoices({
       {missing.map((id) => (
         <Checkbox
           key={id}
-          label={`Missing profile ${id}`}
-          description="The profile was deleted in SandRun. Clear it to remove it from the list."
+          label={t("orgSettings.missingProfile", { id })}
+          description={t("orgSettings.missingProfileHelp")}
           checked
           onCheckedChange={(on) => onToggle(id, on === true)}
         />

@@ -521,10 +521,10 @@ describe("credentials and secrets", () => {
   test("accepts only a JSON object of at most 64 KiB as auth.json", () => {
     const encode = (s: string) => new TextEncoder().encode(s);
     expect(authJsonError(encode('{"tokens":{}}'))).toBeUndefined();
-    expect(authJsonError(encode("[]"))).toBe("The file is not a JSON object.");
-    expect(authJsonError(encode("{"))).toBe("The file is not valid JSON.");
+    expect(authJsonError(encode("[]"))).toBe("credentials.error.notObject");
+    expect(authJsonError(encode("{"))).toBe("credentials.error.notJson");
     expect(authJsonError(new Uint8Array(MAX_AUTH_JSON_BYTES + 1))).toBe(
-      "The file is larger than 64 KiB.",
+      "credentials.error.fileTooLarge",
     );
   });
 
@@ -534,7 +534,7 @@ describe("credentials and secrets", () => {
     expect(secretNameError("1X")).toBeDefined();
     expect(secretNameError("A-B")).toBeDefined();
     expect(secretNameError("SANDCREW_TOKEN")).toBe(
-      "Names that start with SANDCREW_ are reserved.",
+      "secrets.error.nameReserved",
     );
     expect(secretNameError("A".repeat(129))).toBeDefined();
   });

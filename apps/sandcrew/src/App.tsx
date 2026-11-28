@@ -10,12 +10,13 @@ import {
   AuthContextProvider,
   LogtoAuthProvider,
   MockAuthProvider,
-  SIGN_IN_NOT_CONFIGURED,
   useAuth,
 } from "./auth.tsx";
+import { LanguageSelect } from "./components/language-select.tsx";
 import { OrgShell, TopBar } from "./components/shell.tsx";
 import { PageHeader, SignInAction } from "./components/ui.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
+import { useI18n } from "./i18n.ts";
 import { LogtoCallbackPage, MockCallbackPage } from "./pages/callback.tsx";
 import { OrganizationsPage } from "./pages/organizations.tsx";
 import { SessionChatPage } from "./pages/session-chat.tsx";
@@ -119,6 +120,7 @@ function ApiProviders({
 
 function Routes({ config }: { config: ConsoleConfig }) {
   const auth = useAuth();
+  const { t } = useI18n();
   const { route } = useRouter();
   const configured =
     config.authMode === AuthMode.Mock || config.logto !== undefined;
@@ -143,8 +145,8 @@ function Routes({ config }: { config: ConsoleConfig }) {
         <>
           <TopBar />
           <main className="content content-narrow">
-            <PageHeader title="Page not found" />
-            <Link to="/">Go to your organizations</Link>
+            <PageHeader title={t("notFound.title")} />
+            <Link to="/">{t("notFound.goToOrganizations")}</Link>
           </main>
         </>
       );
@@ -182,18 +184,21 @@ function OrgPage({
 }
 
 function SignIn({ configured }: { configured: boolean }) {
+  const { t } = useI18n();
   return (
-    <main className="sign-in">
-      <h1>SandCrew</h1>
-      <p className="muted">
-        Start coding-agent sessions in your SandRun sandboxes and talk to the
-        agent in a chat.
-      </p>
-      {configured ? (
-        <SignInAction />
-      ) : (
-        <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
-      )}
-    </main>
+    <>
+      <header className="topbar topbar-signed-out">
+        <LanguageSelect />
+      </header>
+      <main className="sign-in">
+        <h1>SandCrew</h1>
+        <p className="muted">{t("auth.intro")}</p>
+        {configured ? (
+          <SignInAction />
+        ) : (
+          <p role="alert">{t("auth.notConfigured")}</p>
+        )}
+      </main>
+    </>
   );
 }

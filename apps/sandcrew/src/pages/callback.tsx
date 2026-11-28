@@ -3,6 +3,7 @@ import { useHandleSignInCallback } from "@logto/react";
 import { useEffect, useRef, useState } from "react";
 import { logtoSignInSessionState, SignInSessionState } from "../auth.tsx";
 import { ErrorNotice, Loading } from "../components/ui.tsx";
+import { useI18n } from "../i18n.ts";
 import { RouteId, routePath, useRouter } from "../router.tsx";
 
 const UNREADABLE_SESSION = new Error(
@@ -37,18 +38,20 @@ function LeaveCallback() {
 
 function CompleteSignIn() {
   const { navigate } = useRouter();
+  const { t } = useI18n();
   const { isLoading, error } = useHandleSignInCallback(() => {
     navigate(routePath({ id: RouteId.OrganizationPick }), { replace: true });
   });
   if (error) return <ErrorNotice error={error} />;
-  return isLoading ? <Loading label="Signing in" /> : null;
+  return isLoading ? <Loading label={t("auth.signingIn")} /> : null;
 }
 
 /** Route `callback` with the mock API. */
 export function MockCallbackPage() {
   const { navigate } = useRouter();
+  const { t } = useI18n();
   useEffect(() => {
     navigate(routePath({ id: RouteId.OrganizationPick }), { replace: true });
   }, [navigate]);
-  return <Loading label="Signing in" />;
+  return <Loading label={t("auth.signingIn")} />;
 }

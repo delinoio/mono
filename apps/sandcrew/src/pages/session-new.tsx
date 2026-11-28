@@ -26,7 +26,8 @@ import {
   PageHeader,
   QueryBoundary,
 } from "../components/ui.tsx";
-import { labels, VENDORS } from "../format.ts";
+import { profileSummary, VENDORS, vendorName } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { Link, orgPath, RouteId, sessionPath, useRouter } from "../router.tsx";
 
 /** The longest session label. */
@@ -39,6 +40,8 @@ const AGENT_DEFAULT = "";
 export function SessionNewPage() {
   const { organizationId, role, userId } = useOrg();
   const { navigate } = useRouter();
+  const i18n = useI18n();
+  const { t } = i18n;
   const queryClient = useQueryClient();
   const profiles = useRunnerProfiles(organizationId);
   const credentials = useVendorCredentials(organizationId);
@@ -51,9 +54,10 @@ export function SessionNewPage() {
   const [secretIds, setSecretIds] = useState<ReadonlySet<string>>(new Set());
   const [modeId, setModeId] = useState(AGENT_DEFAULT);
   const [optionValues, setOptionValues] = useState<Record<string, string>>({});
-  const [errors, setErrors] = useState<{ message?: string; label?: string }>(
-    {},
-  );
+  const [errors, setErrors] = useState<{
+    message?: MessageKey;
+    label?: MessageKey;
+  }>({});
   const options = useQuery(SessionService.method.getAgentOptions, {
     organizationId,
     vendor,
@@ -84,9 +88,9 @@ export function SessionNewPage() {
     const text = message.trim();
     const trimmedLabel = label.trim();
     const nextErrors: typeof errors = {};
-    if (text === "") nextErrors.message = "Enter the first message.";
+    if (text === "") nextErrors.message = "newSession.error.message";
     if ([...trimmedLabel].length > LABEL_LIMIT) {
-      nextErrors.label = `Enter at most ${LABEL_LIMIT} characters.`;
+      nextErrors.label = "newSession.error.label";
     }
     setErrors(nextErrors);
     if (nextErrors.message || nextErrors.label) return;
@@ -112,10 +116,10 @@ export function SessionNewPage() {
   return (
     <>
       <PageHeader
-        title="New session"
-        description="The agent starts in an empty workspace in a SandRun sandbox. Tell it what to do, for example which repository to clone."
+        title={t("nav.newSession")}
+        description={t("newSession.description")}
       />
-      <QueryBoundary query={profiles} loading="Loading runner profiles">
+      <QueryBoundary query={profiles} loading={t("profiles.loading")}>
         {() =>
           selectable.length === 0 ? (
             <NoProfileNotice
@@ -125,20 +129,22 @@ export function SessionNewPage() {
           ) : (
             <form className="form form-page" onSubmit={submit} noValidate>
               <Textarea
-                label="First message"
-                description="The first prompt of the session."
+                label={t("newSession.firstMessage")}
+                description={t("newSession.firstMessageHelp")}
                 value={message}
                 onValueChange={(v: string) => {
                   setMessage(v);
                   setErrors((e) => ({ ...e, message: undefined }));
                 }}
-                error={errors.message}
+                error={
+                  errors.message === undefined ? undefined : t(errors.message)
+                }
                 autoFocus
                 autoResize
                 rows={4}
               />
               <Select
-                label="Agent"
+                label={t("newSession.agent")}
                 value={String(vendor)}
                 onValueChange={(v) => {
                   if (v === null) return;
@@ -149,28 +155,28 @@ export function SessionNewPage() {
               >
                 {VENDORS.map((v) => (
                   <SelectOption key={v} value={String(v)}>
-                    {labels.vendor[v]}
+                    {vendorName(v, t)}
                   </SelectOption>
                 ))}
               </Select>
               {credentials.data !== undefined && !hasCredential ? (
                 <div className="notice notice-warning" role="alert">
                   <p>
-                    You have no {labels.vendor[vendor]} credential, and the
-                    organization has none either. Add an API key or a token
-                    before you start a session.
+                    {t("newSession.noCredential", {
+                      vendor: vendorName(vendor, t),
+                    })}
                   </p>
                   <Link to={orgPath(RouteId.SettingsUser, organizationId)}>
-                    Add a credential in your settings
+                    {t("newSession.addCredential")}
                   </Link>
                 </div>
               ) : null}
               <Select
-                label="Runner profile"
+                label={t("newSession.runnerProfile")}
                 description={
                   selectedProfile === undefined
                     ? undefined
-                    : `${labels.guestOs[selectedProfile.guestOs]} · ${selectedProfile.vcpuCount} vCPU · ${selectedProfile.memoryMib} MiB memory · ${selectedProfile.diskGib} GiB disk`
+                    : profileSummary(selectedProfile, i18n)
                 }
                 value={selectedProfile?.runnerProfileId ?? null}
                 onValueChange={(v) => v !== null && setProfileId(v)}
@@ -185,16 +191,16 @@ export function SessionNewPage() {
                 ))}
               </Select>
               {options.isPending ? (
-                <Loading label="Loading agent options" />
+                <Loading label={t("newSession.loadingOptions")} />
               ) : null}
               {modes.length > 0 ? (
                 <Select
-                  label="Mode"
+                  label={t("newSession.mode")}
                   value={modeId}
                   onValueChange={(v) => setModeId(v ?? AGENT_DEFAULT)}
                 >
                   <SelectOption value={AGENT_DEFAULT}>
-                    Agent default
+                    {t("chat.agentDefaultMode")}
                   </SelectOption>
                   {modes.map((m) => (
                     <SelectOption key={m.modeId} value={m.modeId}>
@@ -216,7 +222,7 @@ export function SessionNewPage() {
                   }
                 >
                   <SelectOption value={AGENT_DEFAULT}>
-                    Agent default
+                    {t("chat.agentDefaultMode")}
                   </SelectOption>
                   {o.values.map((value) => (
                     <SelectOption key={value.valueId} value={value.valueId}>
@@ -226,34 +232,32 @@ export function SessionNewPage() {
                 </Select>
               ))}
               <TextField
-                label="Label (optional)"
-                description="Helps you find the session in the list."
+                label={t("newSession.label")}
+                description={t("newSession.labelHelp")}
                 value={label}
                 onValueChange={(v: string) => {
                   setLabel(v);
                   setErrors((e) => ({ ...e, label: undefined }));
                 }}
-                error={errors.label}
+                error={
+                  errors.label === undefined
+                    ? undefined
+                    : t(errors.label, { limit: LABEL_LIMIT })
+                }
                 autoComplete="off"
               />
               <fieldset className="fieldset">
-                <legend>Session secrets</legend>
-                <p className="muted">
-                  The agent gets the selected secrets as environment variables.
-                  Code in the sandbox can read them.
-                </p>
-                <QueryBoundary
-                  query={secrets}
-                  loading="Loading session secrets"
-                >
+                <legend>{t("secrets.title")}</legend>
+                <p className="muted">{t("newSession.secretsHelp")}</p>
+                <QueryBoundary query={secrets} loading={t("secrets.loading")}>
                   {(list) =>
                     list.length === 0 ? (
                       <p className="muted">
-                        You have no session secrets.{" "}
+                        {t("newSession.noSecrets")}{" "}
                         <Link
                           to={orgPath(RouteId.SettingsUser, organizationId)}
                         >
-                          Add one in your settings
+                          {t("newSession.addSecret")}
                         </Link>
                       </p>
                     ) : (
@@ -287,7 +291,7 @@ export function SessionNewPage() {
                   type="submit"
                   disabled={create.isPending || !hasCredential}
                 >
-                  Start session
+                  {t("newSession.start")}
                 </Button>
               </div>
             </form>
@@ -305,22 +309,19 @@ function NoProfileNotice({
   canManage: boolean;
   organizationId: string;
 }) {
+  const { t } = useI18n();
   return (
     <div className="empty">
-      <p className="empty-title">No runner profile is available</p>
+      <p className="empty-title">{t("newSession.noProfile.title")}</p>
       {canManage ? (
         <p className="muted">
-          Allow a runner profile for SandCrew sessions in the organization
-          settings.{" "}
+          {t("newSession.noProfile.manager")}{" "}
           <Link to={orgPath(RouteId.SettingsOrg, organizationId)}>
-            Go to the organization settings
+            {t("newSession.noProfile.goToSettings")}
           </Link>
         </p>
       ) : (
-        <p className="muted">
-          Ask an owner or admin of the organization to allow a runner profile
-          for SandCrew sessions.
-        </p>
+        <p className="muted">{t("newSession.noProfile.member")}</p>
       )}
     </div>
   );

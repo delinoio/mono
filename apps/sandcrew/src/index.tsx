@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
 import { CONSOLE_CONFIG } from "./build-config.ts";
 import { AuthMode } from "./config.ts";
+import { I18nProvider, loadInitialLanguage } from "./i18n.ts";
 
 const root = document.getElementById("root");
 if (!root) {
@@ -39,9 +40,14 @@ async function start() {
           responseDelayMs: mockResponseDelayMs(),
         })
       : undefined;
+  // Load the selected catalog before the first render, so the first render
+  // (including the sign-in and callback pages) shows the selected language.
+  const initial = await loadInitialLanguage();
   createRoot(root!).render(
     <StrictMode>
-      <App config={CONSOLE_CONFIG} mockTransport={mockTransport} />
+      <I18nProvider initial={initial}>
+        <App config={CONSOLE_CONFIG} mockTransport={mockTransport} />
+      </I18nProvider>
     </StrictMode>,
   );
 }

@@ -21,7 +21,9 @@ import {
   labels,
   VENDOR_CREDENTIAL_KINDS,
   VENDORS,
+  vendorName,
 } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { useVendorCredentials } from "../queries.ts";
 import { useOrg } from "./shell.tsx";
 import { ConfirmDialog, FormDialog, QueryBoundary } from "./ui.tsx";
@@ -29,31 +31,29 @@ import { ConfirmDialog, FormDialog, QueryBoundary } from "./ui.tsx";
 /** The largest Codex auth.json that the control plane accepts. */
 export const MAX_AUTH_JSON_BYTES = 64 * 1024;
 
-/** Help text for each credential kind. */
-const KIND_HELP: Record<VendorCredentialKind, string> = {
-  [VendorCredentialKind.UNSPECIFIED]: "",
-  [VendorCredentialKind.API_KEY]: "An API key of the vendor.",
+/** Catalog keys of the help text of each credential kind. */
+const KIND_HELP: Partial<Record<VendorCredentialKind, MessageKey>> = {
+  [VendorCredentialKind.API_KEY]: "credentials.help.apiKey",
   [VendorCredentialKind.CLAUDE_OAUTH_TOKEN]:
-    "The token that `claude setup-token` prints. It is valid for one year.",
-  [VendorCredentialKind.CODEX_AUTH_JSON]:
-    "The auth.json file of a ChatGPT sign-in, usually ~/.codex/auth.json. Codex refreshes it during sessions.",
+    "credentials.help.claudeOauthToken",
+  [VendorCredentialKind.CODEX_AUTH_JSON]: "credentials.help.codexAuthJson",
 };
 
 /**
- * Checks a Codex auth.json file: a JSON object of at most 64 KiB. Returns an
- * error message, or undefined when the file is valid.
+ * Checks a Codex auth.json file: a JSON object of at most 64 KiB. Returns
+ * the catalog key of an error message, or undefined when the file is valid.
  */
-export function authJsonError(bytes: Uint8Array): string | undefined {
+export function authJsonError(bytes: Uint8Array): MessageKey | undefined {
   if (bytes.byteLength > MAX_AUTH_JSON_BYTES) {
-    return "The file is larger than 64 KiB.";
+    return "credentials.error.fileTooLarge";
   }
   try {
     const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      return "The file is not a JSON object.";
+      return "credentials.error.notObject";
     }
   } catch {
-    return "The file is not valid JSON.";
+    return "credentials.error.notJson";
   }
   return undefined;
 }
@@ -80,6 +80,7 @@ export function credentialFor(
  */
 export function VendorCredentialSection({ scope }: { scope: CredentialScope }) {
   const { organizationId, userId } = useOrg();
+  const { t, lang } = useI18n();
   const queryClient = useQueryClient();
   const credentials = useVendorCredentials(organizationId);
   const refresh = () => invalidateServices(queryClient, CredentialService);
@@ -92,14 +93,14 @@ export function VendorCredentialSection({ scope }: { scope: CredentialScope }) {
 
   return (
     <>
-      <QueryBoundary query={credentials} loading="Loading vendor credentials">
+      <QueryBoundary query={credentials} loading={t("credentials.loading")}>
         {(list) => (
           <ul
             className="list"
             aria-label={
               organizationScope
-                ? "Organization vendor credentials"
-                : "Your vendor credentials"
+                ? t("credentials.organizationList")
+                : t("credentials.userList")
             }
           >
             {VENDORS.map((vendor) => {
@@ -115,20 +116,24 @@ export function VendorCredentialSection({ scope }: { scope: CredentialScope }) {
               return (
                 <li key={vendor} className="list-row">
                   <div className="list-main">
-                    <span className="list-title">{labels.vendor[vendor]}</span>
+                    <span className="list-title">{vendorName(vendor, t)}</span>
                     <span className="muted">
                       {own === undefined
                         ? organizationScope
-                          ? "Not set. Members need their own credential."
+                          ? t("credentials.notSet.organization")
                           : organization === undefined
-                            ? "Not set. The organization has no credential either."
-                            : "Not set. Your sessions use the organization credential."
-                        : `${labels.credentialKind[own.kind]} · set ${formatTime(own.valueSetAt)}${
+                            ? t("credentials.notSet.none")
+                            : t("credentials.notSet.usesOrganization")
+                        : t(
                             own.updatedBy ===
-                            CredentialUpdateSource.AGENT_REFRESH
-                              ? " by an agent refresh"
-                              : ""
-                          }`}
+                              CredentialUpdateSource.AGENT_REFRESH
+                              ? "credentials.setByAgentRefresh"
+                              : "credentials.set",
+                            {
+                              kind: t(labels.credentialKind[own.kind]),
+                              time: formatTime(own.valueSetAt, lang),
+                            },
+                          )}
                     </span>
                   </div>
                   <div className="row-actions">
@@ -136,18 +141,27 @@ export function VendorCredentialSection({ scope }: { scope: CredentialScope }) {
                       size={ButtonSize.Small}
                       variant={ButtonVariant.Secondary}
                       onClick={() => setEditing(vendor)}
-                      aria-label={`${own === undefined ? "Set" : "Replace"} the ${labels.vendor[vendor]} credential`}
+                      aria-label={t(
+                        own === undefined
+                          ? "credentials.setLabel"
+                          : "credentials.replaceLabel",
+                        { vendor: vendorName(vendor, t) },
+                      )}
                     >
-                      {own === undefined ? "Set" : "Replace"}
+                      {own === undefined
+                        ? t("credentials.setButton")
+                        : t("credentials.replaceButton")}
                     </Button>
                     {own !== undefined ? (
                       <Button
                         size={ButtonSize.Small}
                         variant={ButtonVariant.Danger}
                         onClick={() => setDeleting(own)}
-                        aria-label={`Delete the ${labels.vendor[vendor]} credential`}
+                        aria-label={t("credentials.deleteLabel", {
+                          vendor: vendorName(vendor, t),
+                        })}
                       >
-                        Delete
+                        {t("credentials.deleteButton")}
                       </Button>
                     ) : null}
                   </div>
@@ -166,13 +180,15 @@ export function VendorCredentialSection({ scope }: { scope: CredentialScope }) {
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
-        title={`Delete the ${deleting === undefined ? "" : labels.vendor[deleting.vendor]} credential?`}
+        title={t("credentials.deleteTitle", {
+          vendor: deleting === undefined ? "" : vendorName(deleting.vendor, t),
+        })}
         description={
           organizationScope
-            ? "New sessions of members without their own credential cannot start until an owner or admin sets a new one. Running sessions keep the value they started with."
-            : "New sessions use the organization credential, if it has one. Running sessions keep the value they started with."
+            ? t("credentials.deleteOrganizationDescription")
+            : t("credentials.deleteUserDescription")
         }
-        confirmLabel="Delete credential"
+        confirmLabel={t("credentials.deleteConfirm")}
         onConfirm={() =>
           remove.mutateAsync({
             organizationId,
@@ -196,6 +212,7 @@ function CredentialDialog({
   onSaved: () => unknown;
 }) {
   const { organizationId } = useOrg();
+  const { t } = useI18n();
   const set = useMutation(CredentialService.method.setVendorCredential, {
     onSuccess: onSaved,
   });
@@ -203,7 +220,7 @@ function CredentialDialog({
   const [kind, setKind] = useState<VendorCredentialKind>();
   const [value, setValue] = useState("");
   const [file, setFile] = useState<{ name: string; bytes: Uint8Array }>();
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<MessageKey>();
   const selected = kind !== undefined && kinds.includes(kind) ? kind : kinds[0];
   const isFile = selected === VendorCredentialKind.CODEX_AUTH_JSON;
 
@@ -223,15 +240,17 @@ function CredentialDialog({
           onClose();
         }
       }}
-      title={`${vendor === undefined ? "" : labels.vendor[vendor]} credential`}
-      description="SandCrew stores the value encrypted and never shows it again. Code in a session sandbox can read the credential of its session."
-      submitLabel="Save credential"
+      title={t("credentials.dialogTitle", {
+        vendor: vendor === undefined ? "" : vendorName(vendor, t),
+      })}
+      description={t("credentials.dialogDescription")}
+      submitLabel={t("credentials.save")}
       onSubmit={async (opening) => {
         if (vendor === undefined || selected === undefined) return;
         let bytes: Uint8Array;
         if (isFile) {
           if (file === undefined) {
-            setError("Choose the auth.json file.");
+            setError("credentials.error.chooseFile");
             return;
           }
           const fileError = authJsonError(file.bytes);
@@ -243,7 +262,7 @@ function CredentialDialog({
         } else {
           const trimmed = value.trim();
           if (trimmed === "") {
-            setError("Enter the value.");
+            setError("credentials.error.enterValue");
             return;
           }
           bytes = new TextEncoder().encode(trimmed);
@@ -265,8 +284,12 @@ function CredentialDialog({
     >
       {kinds.length > 1 ? (
         <Select
-          label="Kind"
-          description={selected === undefined ? undefined : KIND_HELP[selected]}
+          label={t("credentials.kind")}
+          description={
+            selected === undefined || KIND_HELP[selected] === undefined
+              ? undefined
+              : t(KIND_HELP[selected])
+          }
           value={selected === undefined ? null : String(selected)}
           onValueChange={(v) => {
             if (v === null) return;
@@ -278,14 +301,16 @@ function CredentialDialog({
         >
           {kinds.map((k) => (
             <SelectOption key={k} value={String(k)}>
-              {labels.credentialKind[k]}
+              {t(labels.credentialKind[k])}
             </SelectOption>
           ))}
         </Select>
       ) : null}
       {isFile ? (
         <div className="file-field">
-          <label htmlFor="codex-auth-json">auth.json file</label>
+          <label htmlFor="codex-auth-json">
+            {t("credentials.authJsonFile")}
+          </label>
           <input
             id="codex-auth-json"
             type="file"
@@ -305,26 +330,30 @@ function CredentialDialog({
             }}
           />
           {file !== undefined ? (
-            <p className="muted">Selected: {file.name}</p>
+            <p className="muted">
+              {t("credentials.selectedFile", { name: file.name })}
+            </p>
           ) : null}
           {error !== undefined ? (
             <p className="field-error" role="alert">
-              {error}
+              {t(error)}
             </p>
           ) : null}
         </div>
       ) : (
         <PasswordInput
           label={
-            selected === undefined ? "Value" : labels.credentialKind[selected]
+            selected === undefined
+              ? t("credentials.value")
+              : t(labels.credentialKind[selected])
           }
-          toggleLabel="Show value"
+          toggleLabel={t("credentials.showValue")}
           value={value}
           onValueChange={(v: string) => {
             setValue(v);
             setError(undefined);
           }}
-          error={error}
+          error={error === undefined ? undefined : t(error)}
           autoComplete="off"
           autoFocus
         />

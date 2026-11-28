@@ -1,0 +1,38 @@
+{
+  "sourceLang": "en",
+  "context": "User interface text of the SandCrew web console. SandCrew runs coding agents (Claude Code, OpenAI Codex) in SandRun dev session sandboxes on the devices of an organization, and the user talks to the agent in a chat: messages, tool calls, permission requests, plans and diffs. Keep product and vendor names (SandCrew, SandRun, OwnSand, Delino, Claude Code, OpenAI Codex, Codex, GitHub, Logto) unchanged.",
+  "locales": [
+    {
+      "lang": "en",
+      "label": "English"
+    },
+    {
+      "lang": "ko",
+      "label": "한국어"
+    },
+    {
+      "lang": "ja",
+      "label": "日本語"
+    },
+    {
+      "lang": "zh-Hans",
+      "label": "简体中文"
+    },
+    {
+      "lang": "es",
+      "label": "Español"
+    },
+    {
+      "lang": "fr",
+      "label": "Français"
+    },
+    {
+      "lang": "de",
+      "label": "Deutsch"
+    },
+    {
+      "lang": "pt-BR",
+      "label": "Português (Brasil)"
+    }
+  ]
+}
