@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
 import {
   callUnaryMethod,
   createQueryOptions,
@@ -296,6 +297,17 @@ function Invitations({
                         toast.success(t("members.invitations.revoked"));
                       } catch (error) {
                         reportActionError(error);
+                        if (
+                          error instanceof ConnectError &&
+                          error.code === Code.FailedPrecondition
+                        ) {
+                          const filter = {
+                            queryKey: query.queryKey,
+                            exact: true,
+                          };
+                          await queryClient.cancelQueries(filter);
+                          await queryClient.invalidateQueries(filter);
+                        }
                       }
                     }}
                   >

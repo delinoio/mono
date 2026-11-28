@@ -6720,7 +6720,15 @@ describe("confirmation dialog requests", () => {
 });
 
 describe("invitations", () => {
-  function invitationFixture({ failContinuation = false } = {}) {
+  function invitationFixture({
+    failContinuation = false,
+    beforeList,
+    revokeError,
+  }: {
+    failContinuation?: boolean;
+    beforeList?: (signal: AbortSignal) => Promise<void> | undefined;
+    revokeError?: ConnectError;
+  } = {}) {
     const mock = createMockTransport();
     const client = createClient(MemberService, mock);
     const listRequests: ListInvitationsRequest[] = [];
@@ -6729,6 +6737,7 @@ describe("invitations", () => {
       router.service(MemberService, {
         async listInvitations(req, { signal }) {
           listRequests.push(req);
+          await beforeList?.(signal);
           if (failContinuation && req.pageToken !== "") {
             failContinuation = false;
             throw new ConnectError("Continuation failed", Code.Internal);
@@ -6742,6 +6751,7 @@ describe("invitations", () => {
         },
         revokeInvitation(req, { signal }) {
           revokeRequests.push(req);
+          if (revokeError) throw revokeError;
           return client.revokeInvitation(req, { signal });
         },
       });
@@ -6847,6 +6857,110 @@ describe("invitations", () => {
       "",
       "200",
     ]);
+  });
+
+  test("cancels the pending invitation read and refreshes only the exact list after a stale revoke", async () => {
+    let holdNextList = false;
+    let pendingRead: AbortSignal | undefined;
+    const { client, listRequests, revokeRequests, transport } =
+      invitationFixture({
+        beforeList(signal) {
+          if (!holdNextList) return;
+          holdNextList = false;
+          pendingRead = signal;
+          return new Promise<void>((_, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), {
+              once: true,
+            });
+          });
+        },
+      });
+    const organizationId = MOCK_IDS.globex;
+    const { invitation: stale } = await client.createInvitation({
+      organizationId,
+      role: Role.MEMBER,
+    });
+    await client.createInvitation({
+      organizationId,
+      role: Role.ADMIN,
+    });
+    const queryClient = renderConsole(`/orgs/${organizationId}/members`, {
+      transport,
+    });
+    const method = MemberService.method.listInvitations;
+    const input = { organizationId, pageSize: MAX_PAGE_SIZE };
+    const { queryKey } = createQueryOptions(method, input, { transport });
+    const unrelatedKeys = [
+      createQueryOptions(
+        method,
+        { ...input, organizationId: MOCK_IDS.acme },
+        { transport },
+      ).queryKey,
+      createQueryOptions(method, input, { transport: createMockTransport() })
+        .queryKey,
+      createQueryOptions(MemberService.method.listMembers, input, { transport })
+        .queryKey,
+    ];
+    for (const key of unrelatedKeys) queryClient.setQueryData(key, {});
+
+    const list = await screen.findByRole("list", {
+      name: "Pending invitations",
+    });
+    const staleRow = within(list)
+      .getByText(/^Member invitation/)
+      .closest("li")!;
+    await client.revokeInvitation({
+      organizationId,
+      invitationId: stale!.invitationId,
+    });
+    holdNextList = true;
+    void queryClient.refetchQueries({ queryKey, exact: true });
+    await waitFor(() => expect(pendingRead).toBeDefined());
+
+    await click(within(staleRow).getByRole("button", { name: "Revoke" }));
+
+    await waitFor(() => expect(list.contains(staleRow)).toBe(false));
+    expect(pendingRead?.aborted).toBe(true);
+    expect(within(list).getByText(/^Admin invitation/)).toBeTruthy();
+    expect(revokeRequests).toEqual([
+      expect.objectContaining({
+        organizationId,
+        invitationId: stale!.invitationId,
+      }),
+    ]);
+    expect(listRequests).toEqual(
+      Array.from({ length: 3 }, () =>
+        expect.objectContaining({ organizationId, pageToken: "" }),
+      ),
+    );
+    for (const key of unrelatedKeys) {
+      expect(queryClient.getQueryState(key)?.isInvalidated).toBe(false);
+    }
+  });
+
+  test("reports an unavailable revoke without refreshing pending invitations", async () => {
+    const { client, listRequests, revokeRequests, transport } =
+      invitationFixture({
+        revokeError: new ConnectError("Unavailable", Code.Unavailable),
+      });
+    const organizationId = MOCK_IDS.globex;
+    await client.createInvitation({ organizationId, role: Role.MEMBER });
+    renderConsole(`/orgs/${organizationId}/members`, { transport });
+    const list = await screen.findByRole("list", {
+      name: "Pending invitations",
+    });
+    const notify = rs.spyOn(toast, "error").mockReturnValue("fixture-toast");
+    try {
+      await click(within(list).getByRole("button", { name: "Revoke" }));
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        "SandRun is not available right now. Try again in a moment.",
+      );
+      expect(revokeRequests).toHaveLength(1);
+      expect(listRequests).toHaveLength(1);
+      expect(within(list).getByRole("button", { name: "Revoke" })).toBeTruthy();
+    } finally {
+      notify.mockRestore();
+    }
   });
 
   function holdInvitationAccept(organizationId?: string | null) {
