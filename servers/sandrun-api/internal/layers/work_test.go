@@ -970,6 +970,89 @@ func TestConcurrentCancelRequest(t *testing.T) {
 	}
 }
 
+func TestCreateRetryAfterSandboxIDStoreFailure(t *testing.T) {
+	t.Parallel()
+	const poll = 300 * time.Millisecond
+	timing := testenv.FastWorkTiming()
+	timing.SandboxPoll = poll
+	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
+	ctx := t.Context()
+	pool := w.env.DB.Pool
+	if _, err := pool.Exec(ctx, `
+		CREATE FUNCTION reject_sandbox_id() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected sandbox ID write failure';
+		END;
+		$$;
+		CREATE TRIGGER reject_sandbox_id BEFORE UPDATE OF ownsand_sandbox_id ON runners
+		FOR EACH ROW WHEN (OLD.ownsand_sandbox_id IS NULL AND NEW.ownsand_sandbox_id IS NOT NULL)
+		EXECUTE FUNCTION reject_sandbox_id();`); err != nil {
+		t.Fatal(err)
+	}
+
+	type createCall struct {
+		at  time.Time
+		req *ownsandv1.CreateSandboxRequest
+	}
+	calls := make(chan createCall, 8)
+	w.fake.SetCreateRequestHook(func(_ context.Context, req *ownsandv1.CreateSandboxRequest) error {
+		select {
+		case calls <- createCall{time.Now(), proto.CloneOf(req)}:
+		default:
+		}
+		return nil
+	})
+	nextCall := func() createCall {
+		t.Helper()
+		select {
+		case call := <-calls:
+			return call
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for CreateSandbox")
+			return createCall{}
+		}
+	}
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	s := w.createSession(t, w.env.User(w.org.Member), profileID)
+	first := nextCall()    // Dispatcher attempt.
+	previous := nextCall() // First driver attempt after handoff.
+	for i := 0; i < 2; i++ {
+		if !proto.Equal(previous.req, first.req) {
+			t.Fatal("driver did not replay the saved request")
+		}
+		next := nextCall()
+		if elapsed := next.at.Sub(previous.at); elapsed < poll {
+			t.Fatalf("driver retry after %s, want at least %s", elapsed, poll)
+		}
+		previous = next
+	}
+	if !proto.Equal(previous.req, first.req) {
+		t.Fatal("driver did not replay the saved request")
+	}
+	eventually(t, "the last sandbox ID write to fail", func() bool {
+		return strings.Count(w.env.Logs.String(), `"msg":"runner_sandbox_store_failed"`) >= 4
+	})
+	runnerID := first.req.GetLabels()[ownsandclient.LabelRunnerID]
+	if r := w.runner(t, runnerID); r.GetState() != sandrunv1.RunnerState_RUNNER_STATE_CREATING || r.GetOwnsandSandboxId() != "" {
+		t.Fatalf("runner after failed writes = %v, want CREATING with no sandbox ID", r)
+	}
+	if r := workRequest(t, w, s.GetDevSessionId()); r.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED || r.GetStartAttempts() != 0 {
+		t.Fatalf("request after failed writes = %v, want QUEUED with no start attempts", r)
+	}
+	sandboxes := w.fake.Sandboxes(w.osOrg)
+	if len(sandboxes) != 1 {
+		t.Fatalf("OwnSand created %d sandboxes, want 1", len(sandboxes))
+	}
+
+	if _, err := pool.Exec(ctx, `DROP TRIGGER reject_sandbox_id ON runners`); err != nil {
+		t.Fatal(err)
+	}
+	s = w.waitState(t, s.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
+	if r := w.runner(t, s.GetRunnerId()); r.GetRunnerId() != runnerID || r.GetOwnsandSandboxId() != sandboxes[0].GetSandboxId() {
+		t.Fatalf("request recovered a different runner or sandbox: %v", r)
+	}
+}
+
 // TestCreateRetryAfterProfileChange: when the CreateSandbox response is
 // lost and an admin then changes the profile, the retry sends the original
 // parameters with the key and recovers the created sandbox.
