@@ -94,6 +94,10 @@ import { QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { StrictMode } from "react";
 import {
+  DEV_SESSION_REFRESH_CASES,
+  devSessionRefreshFixture,
+} from "../e2e/dev-session-refresh-fixture.ts";
+import {
   integrationOpenings,
   integrationPermissionFixture,
 } from "../e2e/integration-permission-fixture.ts";
@@ -5322,6 +5326,122 @@ describe("work", () => {
         "100",
       ]);
     });
+  });
+
+  describe("dev session refresh from work", () => {
+    const endedFilter = () =>
+      screen.getByRole("checkbox", { name: "Show ended dev sessions" });
+    const sessionRow = (label: string) =>
+      screen.queryByRole("row", { name: new RegExp(label) });
+    const navigate = (name: string) =>
+      click(screen.getByRole("link", { name }));
+
+    test.each(DEV_SESSION_REFRESH_CASES)(
+      "refreshes both cached session lists after a successful $page action",
+      async (scenario) => {
+        const { transport, reads } = devSessionRefreshFixture(
+          createMockTransport(),
+          "success",
+        );
+        // An indefinitely fresh cache can only refetch on return if invalidated.
+        renderConsole(`/orgs/${MOCK_IDS.acme}/dev-sessions`, {
+          transport,
+          staleTime: Infinity,
+        });
+        const rowName = new RegExp(scenario.session);
+        const initial = await screen.findByRole("row", { name: rowName });
+        expect(
+          within(initial).getByRole("button", { name: "Delete" }),
+        ).toBeTruthy();
+        await click(endedFilter());
+        await screen.findByRole("row", { name: /compiler check/ });
+        expect(reads).toEqual([false, true]);
+
+        await navigate(scenario.page);
+        const workRow = new RegExp(scenario.workRow);
+        const active = await screen.findByRole("row", { name: workRow });
+        await click(
+          within(active).getByRole("button", { name: scenario.action }),
+        );
+        const dialog = await screen.findByRole("alertdialog", {
+          name: scenario.dialog,
+        });
+        await click(
+          within(dialog).getByRole("button", { name: scenario.confirm }),
+        );
+        await waitFor(() =>
+          expect(screen.queryByRole("row", { name: workRow })).toBeNull(),
+        );
+
+        await navigate("Dev sessions");
+        expect(endedFilter().getAttribute("aria-checked")).toBe("false");
+        await waitFor(() => expect(sessionRow(scenario.session)).toBeNull());
+        expect(reads).toEqual([false, true, false]);
+
+        await click(endedFilter());
+        await waitFor(() => {
+          const ended = within(screen.getByRole("row", { name: rowName }));
+          expect(
+            ended.getByRole("cell", { name: scenario.endedState }),
+          ).toBeTruthy();
+          expect(
+            ended.getByRole("cell", { name: scenario.reason }),
+          ).toBeTruthy();
+          expect(ended.queryByRole("button", { name: "Delete" })).toBeNull();
+        });
+        expect(reads).toEqual([false, true, false, true]);
+      },
+    );
+
+    test.each(DEV_SESSION_REFRESH_CASES)(
+      "keeps the error and active session after a rejected $page action",
+      async (scenario) => {
+        const { transport, reads } = devSessionRefreshFixture(
+          createMockTransport(),
+          scenario.failureMode,
+        );
+        const queryClient = renderConsole(
+          `/orgs/${MOCK_IDS.acme}/dev-sessions`,
+          {
+            transport,
+            staleTime: Infinity,
+          },
+        );
+        const invalidation = rs.spyOn(queryClient, "invalidateQueries");
+        const rowName = new RegExp(scenario.session);
+        await screen.findByRole("row", { name: rowName });
+
+        await navigate(scenario.page);
+        const active = await screen.findByRole("row", {
+          name: new RegExp(scenario.workRow),
+        });
+        await click(
+          within(active).getByRole("button", { name: scenario.action }),
+        );
+        const dialog = within(
+          await screen.findByRole("alertdialog", { name: scenario.dialog }),
+        );
+        await click(dialog.getByRole("button", { name: scenario.confirm }));
+        expect(await dialog.findByText(scenario.error)).toBeTruthy();
+        expect(
+          dialog
+            .getByRole("button", { name: scenario.confirm })
+            .hasAttribute("disabled"),
+        ).toBe(false);
+        expect(invalidation).not.toHaveBeenCalled();
+
+        await click(dialog.getByRole("button", { name: "Cancel" }));
+        await navigate("Dev sessions");
+        expect(reads).toEqual([false]);
+        await refetch(queryClient);
+        expect(reads).toEqual([false, false]);
+        const session = within(screen.getByRole("row", { name: rowName }));
+        expect(
+          session.getByRole("cell", { name: scenario.activeState }),
+        ).toBeTruthy();
+        expect(session.getByRole("button", { name: "Delete" })).toBeTruthy();
+      },
+    );
   });
 
   test("dev sessions show only metadata and delete actions by role", async () => {

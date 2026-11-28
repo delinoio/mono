@@ -10,6 +10,7 @@ import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Checkbox } from "delino-ui/checkbox";
 import { Select, SelectOption } from "delino-ui/select";
 import { RunnerState } from "@delino/sandrun-protos/v1/common_pb";
+import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { type Runner, WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { useMemo, useState } from "react";
 import { invalidateServices, PAGE_SIZE } from "../api.ts";
@@ -94,7 +95,8 @@ export function RunnersPage() {
     },
   );
   const remove = useMutation(WorkService.method.deleteRunner, {
-    onSuccess: () => invalidateServices(queryClient, WorkService),
+    onSuccess: () =>
+      invalidateServices(queryClient, WorkService, DevSessionService),
   });
   const admin = can(role, Permission.DeleteRunners);
 

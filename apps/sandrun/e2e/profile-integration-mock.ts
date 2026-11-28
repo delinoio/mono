@@ -3,6 +3,10 @@ import type { Transport } from "@connectrpc/connect";
 import { GitHubInstallationState } from "@delino/sandrun-protos/v1/common_pb";
 import type { MockTransportOptions } from "../src/mock/mock-api.ts";
 import {
+  DEV_SESSION_REFRESH_FIXTURE,
+  devSessionRefreshFixture,
+} from "./dev-session-refresh-fixture.ts";
+import {
   INTEGRATION_PERMISSION_FIXTURE,
   integrationPermissionFixture,
 } from "./integration-permission-fixture.ts";
@@ -23,6 +27,7 @@ import {
 
 declare global {
   interface Window {
+    sandrunDevSessionReads?: boolean[];
     sandrunOrganizationCreationFixture?: Omit<
       ReturnType<typeof organizationCreationFixture>,
       "transport"
@@ -39,6 +44,20 @@ declare global {
 }
 
 export function createMockTransport(options?: MockTransportOptions): Transport {
+  const refreshMode = sessionStorage.getItem(DEV_SESSION_REFRESH_FIXTURE);
+  if (
+    refreshMode === "success" ||
+    refreshMode === "fail-cancel" ||
+    refreshMode === "fail-delete"
+  ) {
+    const { transport, reads } = devSessionRefreshFixture(
+      createSettingsMock(options),
+      refreshMode,
+    );
+    window.sandrunDevSessionReads = reads;
+    return transport;
+  }
+
   const createMode = sessionStorage.getItem(ORGANIZATION_CREATION_FIXTURE);
   if (
     createMode === "hold-list" ||
