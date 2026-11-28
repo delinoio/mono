@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { patchCefLinuxDependencies } from "./tauri-debian-cli.mjs";
 
 function fixture(t, platform = process.platform) {
   const workspace = mkdtempSync(join(tmpdir(), "delidev-tauri-test-"));
@@ -135,14 +136,38 @@ const linuxOnly = { skip: process.platform !== "linux" };
 const unixOnly = { skip: !["darwin", "linux"].includes(process.platform) };
 const embedCef = '{"bundle":{"cef":{"embed":true}}}';
 
+test("changes only the CEF arm of the pinned Linux dependency mapping", () => {
+  const pinned = `    match self {
+      Self::Wry => &[WEBKIT2GTK, GTK],
+      // CEF is shipped with the app
+      Self::Cef | Self::Other => &[GTK],
+    }`;
+  assert.equal(
+    patchCefLinuxDependencies(pinned),
+    `    match self {
+      Self::Wry => &[WEBKIT2GTK, GTK],
+      Self::Cef => &[LinuxDependency {
+        deb_package: "libgtk-4-1",
+        library: "libgtk-4.so.1",
+      }],
+      Self::Other => &[GTK],
+    }`,
+  );
+  for (const source of ["", pinned + pinned]) {
+    assert.throws(
+      () => patchCefLinuxDependencies(source),
+      /Could not locate the pinned CEF Linux dependency mapping/,
+    );
+  }
+});
+
 test(
-  "uses the stock CLI for shared CEF and requests outside the Linux backport",
+  "uses the stock CLI for requests outside the Linux backport",
   linuxOnly,
   (t) => {
     const { run } = fixture(t);
     for (const args of [
-      ["bundle", "--bundles", "deb"],
-      ["bundle", "--bundles", "rpm,appimage"],
+      ["bundle", "--bundles", "appimage"],
       ["bundle", "--config", embedCef, "--bundles", "dmg"],
       ["bundle", "--config", embedCef, "--bundles"],
       ["build", "--config", embedCef, "--no-bundle"],
@@ -152,6 +177,32 @@ test(
       ["bundle", "--target", "x86_64-pc-windows-msvc", "--bundles", "appimage"],
     ]) {
       assert.deepEqual(run(...args), { cli: "stock", args });
+    }
+  },
+);
+
+test(
+  "uses the backport without staging notices for shared CEF Debian and RPM",
+  linuxOnly,
+  (t) => {
+    const { run, staging } = fixture(t);
+    for (const command of ["build", "bundle"]) {
+      for (const selection of [
+        [], // Selects Debian from the Linux config.
+        ["--bundles", "deb"],
+        ["--bundles", "rpm,appimage"],
+        ["--config", '{"bundle":{"targets":["rpm"]}}'],
+        [
+          "--config",
+          embedCef,
+          "--config",
+          '{"bundle":{"cef":{"embed":false}}}',
+        ],
+      ]) {
+        const args = [command, ...selection];
+        assert.deepEqual(run(...args), { cli: "patched", args });
+        assert.deepEqual(readdirSync(staging), []);
+      }
     }
   },
 );
