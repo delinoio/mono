@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	ownsand "github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -31,6 +32,23 @@ func (s *stack) databaseURL() string {
 	}
 	s.t.Fatal("the control plane has no DATABASE_URL")
 	return ""
+}
+
+func directTestDatabaseConfig(databaseURL string) (*pgx.ConnConfig, error) {
+	// Parse pool options here so they do not reach Postgres as session parameters.
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, errors.New("invalid test database configuration")
+	}
+	return config.ConnConfig, nil
+}
+
+func connectTestDatabase(ctx context.Context, databaseURL string) (*pgx.Conn, error) {
+	config, err := directTestDatabaseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.ConnectConfig(ctx, config)
 }
 
 // exportOneSnapshot snapshots the sandbox sb with the real agent, exports it
@@ -123,7 +141,7 @@ func TestSnapshotExportVerification(t *testing.T) {
 	if info, err := sb.WaitStable(ctx); err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("WaitStable = (%v, %v)", info.GetState(), err)
 	}
-	conn, err := pgx.Connect(ctx, s.databaseURL())
+	conn, err := connectTestDatabase(ctx, s.databaseURL())
 	if err != nil {
 		t.Fatalf("connect to the database: %v", err)
 	}
@@ -204,11 +222,60 @@ func TestSnapshotExportVerification(t *testing.T) {
 	}
 }
 
+func TestDirectTestDatabaseConfig(t *testing.T) {
+	t.Parallel()
+
+	const adminURL = "postgresql://fixture@127.0.0.1:5432/postgres?sslmode=disable&application_name=ownsand-e2e"
+	const poolOptions = "&pool_max_conns=4&pool_min_conns=1"
+	const generatedDatabase = "ownsand_test_fixture"
+
+	for _, test := range []struct {
+		name     string
+		url      string
+		database string
+	}{
+		{"admin plain", adminURL, "postgres"},
+		{"admin with pool options", adminURL + poolOptions, "postgres"},
+		{"generated plain", adminURL + "&dbname=" + generatedDatabase, generatedDatabase},
+		{"generated with pool options", adminURL + poolOptions + "&dbname=" + generatedDatabase, generatedDatabase},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			config, err := directTestDatabaseConfig(test.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.Database != test.database {
+				t.Errorf("database = %q, want %q", config.Database, test.database)
+			}
+			if name := config.RuntimeParams["application_name"]; name != "ownsand-e2e" {
+				t.Errorf("application_name = %q, want ownsand-e2e", name)
+			}
+			for _, key := range []string{"pool_max_conns", "pool_min_conns"} {
+				if _, ok := config.RuntimeParams[key]; ok {
+					t.Errorf("pool option %s reached the session parameters", key)
+				}
+			}
+		})
+	}
+
+	t.Run("invalid pool option", func(t *testing.T) {
+		t.Parallel()
+
+		const invalidURL = "postgresql://fixture:synthetic-password@127.0.0.1:5432/postgres?sslmode=disable&pool_max_conns=invalid"
+		config, err := directTestDatabaseConfig(invalidURL)
+		if config != nil || err == nil || err.Error() != "invalid test database configuration" {
+			t.Fatal("expected only the generic configuration error and no connection config")
+		}
+	})
+}
+
 func TestWaitForExportVerificationCancelsPostgresQuery(t *testing.T) {
 	t.Parallel()
 	parent, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(parent, dbtest.URL(t))
+	conn, err := connectTestDatabase(parent, dbtest.URL(t))
 	if err != nil {
 		t.Fatalf("connect to the test database: %v", err)
 	}
