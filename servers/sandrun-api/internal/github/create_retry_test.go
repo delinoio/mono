@@ -42,61 +42,80 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 				w.send(t, "workflow_job", job("queued", installation, sponsor, sandRunLinux, ""))
 			}
 
-			var calls atomic.Int32
-			requests := make(chan *ownsandv1.CreateSandboxRequest, 2)
+			type createArrival struct {
+				request *ownsandv1.CreateSandboxRequest
+				at      time.Time
+			}
+			var initialCalls atomic.Int32
+			initialArrivals := make(chan createArrival, 1)
 			firstPassCtx, cancelFirstPass := context.WithCancel(ctx)
 			defer cancelFirstPass()
 			firstResponse := make(chan struct{})
 			releaseFirstResponse := sync.OnceFunc(func() { close(firstResponse) })
-			watchdogExpired := make(chan struct{})
-			factory := newCreateSandboxPeer(t, func(_ context.Context, req *ownsandv1.CreateSandboxRequest) error {
-				call := calls.Add(1)
-				if call <= 2 {
-					requests <- req
+			initialFactory := newCreateSandboxPeer(t, func(_ context.Context, req *ownsandv1.CreateSandboxRequest) error {
+				arrival := createArrival{request: req, at: time.Now()}
+				if initialCalls.Add(1) == 1 {
+					initialArrivals <- arrival
 				}
-				if call == 1 {
-					// Bound the fixture's hold even if the client loses its RPC deadline.
-					watchdog := time.NewTimer(5 * time.Second)
-					defer watchdog.Stop()
-					select {
-					case <-firstResponse:
-					case <-watchdog.C:
-						close(watchdogExpired)
-						cancelFirstPass()
-					}
-					return context.DeadlineExceeded
+				select {
+				case <-firstResponse:
+				case <-firstPassCtx.Done():
 				}
-				if scenario == "capacity" {
-					return connect.NewError(connect.CodeUnavailable, errors.New("no free capacity"))
-				}
-				return connect.NewError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+				return context.DeadlineExceeded
 			})
 			// Cleanup runs in reverse order. Release the handler before closing the peer.
 			t.Cleanup(releaseFirstResponse)
-			client, err := factory.New(w.osOrg, "osk_"+strings.Repeat("a", 43))
+			client, err := initialFactory.New(w.osOrg, "osk_"+strings.Repeat("a", 43))
 			if err != nil {
 				t.Fatal(err)
 			}
-			initialError := make(chan error, 1)
+			type createResult struct {
+				deadline time.Time
+				err      error
+			}
+			initialResults := make(chan createResult, 1)
 			w.os.SetCreateRequestHook(func(ctx context.Context, req *ownsandv1.CreateSandboxRequest) error {
+				deadline, _ := ctx.Deadline()
 				_, err := client.CreateSandbox(ctx, req)
-				initialError <- err
+				select {
+				case initialResults <- createResult{deadline: deadline, err: err}:
+				default:
+				}
 				return err
 			})
+			// Bound the pass even if the RPC deadline is missing and the peer never sees a request.
+			const watchdogTimeout = 5 * time.Second
+			watchdog := time.AfterFunc(watchdogTimeout, cancelFirstPass)
+			defer watchdog.Stop()
 			w.l.Engine.Pass(firstPassCtx, w.org.ID)
 			releaseFirstResponse()
-			select {
-			case <-watchdogExpired:
-				t.Fatal("first create exceeded the 5-second watchdog while waiting for the RPC deadline")
-			default:
+			if firstPassCtx.Err() != nil {
+				t.Fatalf("first create exceeded the %s watchdog while waiting for the RPC deadline", watchdogTimeout)
 			}
+			var initialResult createResult
 			select {
-			case err := <-initialError:
-				if connect.IsWireError(err) || connect.CodeOf(err) != connect.CodeDeadlineExceeded {
-					t.Fatalf("first create error = %v, want a non-wire deadline error", err)
-				}
+			case initialResult = <-initialResults:
 			default:
 				t.Fatal("dispatcher did not attempt a create")
+			}
+			if initialResult.deadline.IsZero() {
+				t.Fatal("fixture: dispatcher create context had no deadline")
+			}
+			if err := initialResult.err; connect.IsWireError(err) || connect.CodeOf(err) != connect.CodeDeadlineExceeded {
+				t.Fatalf("first create error = %v, want a non-wire deadline error", err)
+			}
+			var firstArrival createArrival
+			select {
+			case firstArrival = <-initialArrivals:
+			case <-firstPassCtx.Done():
+				t.Fatal("fixture: initial OwnSand endpoint did not record the dispatcher create")
+			}
+			watchdog.Stop()
+			if !firstArrival.at.Before(initialResult.deadline) {
+				t.Fatalf("fixture: initial OwnSand endpoint recorded the dispatcher create %s after its deadline", firstArrival.at.Sub(initialResult.deadline))
+			}
+			if got := initialCalls.Load(); got != 1 {
+				t.Fatalf("fixture: initial OwnSand endpoint received %d creates, want 1", got)
 			}
 			runners := w.runnersIn(t, sandrunv1.RunnerState_RUNNER_STATE_CREATING)
 			if len(runners) != 1 || runners[0].GetRequestId() != "" || runners[0].GetOwnsandSandboxId() != "" {
@@ -155,8 +174,19 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 			}
 			w.l.GitHub.Wait()
 			w.env.Stop()
+			var recoveryCalls atomic.Int32
+			recoveryRequests := make(chan *ownsandv1.CreateSandboxRequest, 1)
+			recoveryFactory := newCreateSandboxPeer(t, func(_ context.Context, req *ownsandv1.CreateSandboxRequest) error {
+				if recoveryCalls.Add(1) == 1 {
+					recoveryRequests <- req
+				}
+				if scenario == "capacity" {
+					return connect.NewError(connect.CodeUnavailable, errors.New("no free capacity"))
+				}
+				return connect.NewError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+			})
 			var recovered layers.Layers
-			w.env = w.env.NewReplica(t, testenv.WithLayerOptions(layers.Options{OwnSand: factory, GitHub: w.githubOptions(w.env.Clock.Now)}, &recovered))
+			w.env = w.env.NewReplica(t, testenv.WithLayerOptions(layers.Options{OwnSand: recoveryFactory, GitHub: w.githubOptions(w.env.Clock.Now)}, &recovered))
 			// Run only reconciliation on the new instance. An ordinary
 			// dispatch pass could obscure which create ended the job.
 			reconcileCtx, stop := context.WithCancel(ctx)
@@ -197,10 +227,10 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 			if got := w.requestOfJob(t, other); !proto.Equal(got, otherBefore) {
 				t.Fatalf("retry changed the other queued job: %v", got)
 			}
-			if got := calls.Load(); got != 2 || len(requests) != 2 {
-				t.Fatalf("expected the initial create and one retry, got %d calls", got)
+			if got := recoveryCalls.Load(); got != 1 || len(recoveryRequests) != 1 {
+				t.Fatalf("fixture: recovery OwnSand endpoint received %d creates, want 1", got)
 			}
-			first, second := <-requests, <-requests
+			first, second := firstArrival.request, <-recoveryRequests
 			if first.GetIdempotencyKey() == "" || !proto.Equal(first, second) {
 				t.Fatal("the retry changed the OwnSand create parameters or idempotency key")
 			}
