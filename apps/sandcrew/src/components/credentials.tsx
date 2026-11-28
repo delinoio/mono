@@ -324,10 +324,10 @@ function CredentialDialog({
               const chosen = event.target.files?.[0];
               const read = ++fileReads.current;
               setError(undefined);
-              if (chosen === undefined) {
-                setFile(undefined);
-                return;
-              }
+              // Drop the earlier file at once, so a save during the read
+              // cannot send it in place of the new selection.
+              setFile(undefined);
+              if (chosen === undefined) return;
               void chosen.arrayBuffer().then((buffer) => {
                 if (fileReads.current !== read) return;
                 setFile({ name: chosen.name, bytes: new Uint8Array(buffer) });

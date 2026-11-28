@@ -995,6 +995,44 @@ describe("settings", () => {
     expect(within(dialog).queryByText("Selected: auth.json")).toBeNull();
   });
 
+  test("does not save an earlier file while its replacement loads", async () => {
+    const { transport, calls } = recording(
+      createMockTransport({ agentStepMs: 5 }),
+    );
+    renderConsole(`/orgs/${ACME}/settings`, { transport });
+    await click(
+      await screen.findByRole("button", {
+        name: "Set the OpenAI Codex credential",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    await choose(
+      within(dialog).getByRole("combobox", { name: "Kind" }),
+      "Codex auth.json",
+    );
+    const input = within(dialog).getByLabelText("auth.json file");
+    const first = new File(['{"account":"a"}'], "a.json", {
+      type: "application/json",
+    });
+    await act(async () => {
+      fireEvent.change(input, { target: { files: [first] } });
+    });
+    await settle();
+    expect(within(dialog).getByText("Selected: a.json")).toBeTruthy();
+    const second = new File(['{"account":"b"}'], "b.json", {
+      type: "application/json",
+    });
+    second.arrayBuffer = () => new Promise(() => {});
+    await act(async () => {
+      fireEvent.change(input, { target: { files: [second] } });
+    });
+    await click(
+      within(dialog).getByRole("button", { name: "Save credential" }),
+    );
+    expect(within(dialog).queryByText("Selected: a.json")).toBeNull();
+    expect(calls.some((c) => c.method === "SetVendorCredential")).toBe(false);
+  });
+
   test("adds a session secret and shows only its name", async () => {
     renderConsole(`/orgs/${ACME}/settings`);
     await click(await screen.findByRole("button", { name: "Add secret" }));
