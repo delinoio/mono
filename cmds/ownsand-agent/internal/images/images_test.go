@@ -540,6 +540,20 @@ func TestRecoverWaitsForARunningInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseAttempted := false
+	release := func() error {
+		if releaseAttempted {
+			return nil
+		}
+		// Release closes the file even if unlocking fails.
+		releaseAttempted = true
+		return lock.Release()
+	}
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Errorf("release the build lock: %v", err)
+		}
+	})
 	res, err := images.Recover(dir)
 	if err != nil || res != images.RecoverDeferred {
 		t.Fatalf("Recover under the lock = %v %v", res, err)
@@ -547,8 +561,8 @@ func TestRecoverWaitsForARunningInstall(t *testing.T) {
 	if exists(dir) {
 		t.Fatal("Recover exchanged directories while another handle held the lock")
 	}
-	if err := lock.Release(); err != nil {
-		t.Fatal(err)
+	if err := release(); err != nil {
+		t.Fatalf("release the build lock: %v", err)
 	}
 	if res, err := images.Recover(dir); err != nil || res != images.RecoverRestored {
 		t.Fatalf("Recover after the release = %v %v", res, err)
