@@ -83,20 +83,29 @@ func ValidateTopUpAmount(amount int64) error {
 	return nil
 }
 
+// queuedAutoTopUp contains the queue-time fields of the inserted top-up.
+type queuedAutoTopUp struct {
+	accountID   string
+	id          string
+	amount      int64
+	balance     int64
+	monthToDate int64
+}
+
 // queueAutoTopUp queues an automatic top-up after a usage deduction left the
 // balance below the threshold, unless one is in flight, the subscription
 // cannot be charged or the monthly cap does not allow it.
-func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, st Settings, now time.Time) (bool, error) {
-	skip := func(reason string) (bool, error) {
+func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountState, st Settings, now time.Time) (*queuedAutoTopUp, error) {
+	skip := func(reason string) (*queuedAutoTopUp, error) {
 		s.logger.InfoContext(ctx, "billing_auto_top_up_skipped",
 			slog.String("billing_account_id", acct.ID),
 			slog.String("reason", reason),
 			slog.Int64("balance_usd_micros", acct.Balance))
-		return false, nil
+		return nil, nil
 	}
 	sub, err := LoadSubscription(ctx, tx, acct.ID, false)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if sub.PaddleSubscriptionID == "" || !sub.Manageable() {
 		return skip("no_subscription")
@@ -104,35 +113,31 @@ func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountSt
 	var inFlight bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM top_ups WHERE billing_account_id = $1 AND kind = 'auto'
 		AND status IN ('pending', 'charging', 'charged', 'unknown'))`, acct.ID).Scan(&inFlight); err != nil {
-		return false, err
+		return nil, err
 	}
 	if inFlight {
 		return skip("in_flight")
 	}
 	mtd, err := MonthToDate(ctx, tx, acct.ID, now)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if !capAllows(mtd, st.AutoAmount, st.AutoCap) {
 		return skip("monthly_cap")
 	}
 	id, err := newID()
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	// cap_time starts at the queue time; the claim moves it to the claim time.
 	if _, err := tx.Exec(ctx, `INSERT INTO top_ups (top_up_id, billing_account_id, kind, amount_usd_micros, status,
 			paddle_subscription_id, create_time, update_time, cap_time)
 		VALUES ($1, $2, 'auto', $3, 'pending', $4, $5, $5, $5)`, id, acct.ID, st.AutoAmount, sub.PaddleSubscriptionID, now); err != nil {
-		return false, err
+		return nil, err
 	}
-	s.logger.InfoContext(ctx, "billing_auto_top_up_queued",
-		slog.String("billing_account_id", acct.ID),
-		slog.String("top_up_id", id),
-		slog.Int64("amount_usd_micros", st.AutoAmount),
-		slog.Int64("balance_usd_micros", acct.Balance),
-		slog.Int64("month_to_date_usd_micros", mtd))
-	return true, nil
+	return &queuedAutoTopUp{
+		accountID: acct.ID, id: id, amount: st.AutoAmount, balance: acct.Balance, monthToDate: mtd,
+	}, nil
 }
 
 // CreateTopUp runs a manual top-up. authorize runs first in the transaction
