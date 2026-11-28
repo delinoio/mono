@@ -1180,7 +1180,11 @@ In traditional serverless, each cold start re-executes module-level code, but su
 
 **Impact: HIGH (reduces data transfer size)**
 
-The React Server/Client boundary serializes all object properties into strings and embeds them in the HTML response and subsequent RSC requests. This serialized data directly impacts page weight and load time, so **size matters a lot**. Only pass fields that the client actually uses.
+Props passed from a Server Component to a Client Component must use values that React can serialize. React encodes those props in the React Server Component (RSC) payload. When React reads the payload, numbers and booleans retain their types, as do supported values such as arrays and plain objects with serializable contents. See [React's supported serializable types](https://react.dev/reference/rsc/use-client#serializable-types).
+
+On the first App Router load, the browser displays the server-rendered HTML as a preview. React uses the RSC payload to reconcile the Server and Client Component trees. On later client-side navigations, Next.js uses the RSC payload, which it can prefetch and cache, and renders Client Components in the browser. See [Next.js first-load behavior](https://nextjs.org/docs/app/getting-started/server-and-client-components#on-the-client-first-load) and [subsequent navigations](https://nextjs.org/docs/app/getting-started/server-and-client-components#subsequent-navigations).
+
+To keep the RSC payload small, pass only the fields that the Client Component needs.
 
 **Incorrect: serializes all 50 fields**
 
