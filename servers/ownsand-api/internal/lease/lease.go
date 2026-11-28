@@ -151,6 +151,8 @@ type Period struct {
 	lease  *Lease
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	expiryRequested bool // guarded by lease.mu
 }
 
 func (p *Period) remaining() time.Duration {
@@ -220,12 +222,9 @@ func (p *Period) LockRow(ctx context.Context, tx pgx.Tx) (time.Time, error) {
 	return expiry, nil
 }
 
-// Wait blocks until the instance holds the lease or ctx ends. It returns nil
-// only while the ownership period is current: the acquisition channel stays
-// closed after the confirmed expiry until the watcher runs the loss
-// transition, so Wait checks the deadline itself and, in that interval, runs
-// the transition (which installs a fresh channel) instead of returning for an
-// expired acquisition or spinning on the closed channel.
+// Wait blocks until it observes current ownership or ctx ends. A waiter
+// that observes expiry requests the loss transition asynchronously and
+// waits for that period to end or for ctx to end.
 func (l *Lease) Wait(ctx context.Context) error {
 	l.init()
 	for {
@@ -234,22 +233,20 @@ func (l *Lease) Wait(ctx context.Context) error {
 			l.mu.Unlock()
 			return nil
 		}
-		if l.held {
-			// Expired, but the loss is not recorded yet. expireIfDue is
-			// idempotent and serialized with the other transitions.
-			l.mu.Unlock()
-			l.expireIfDue()
-			if err := ctx.Err(); err != nil {
-				return err
+		var ch <-chan struct{} = l.acquired
+		if period := l.period; period != nil {
+			// The acquisition channel is still closed for this expired
+			// period. Concurrent waiters share its expiry request.
+			ch = period.ctx.Done()
+			if !period.expiryRequested {
+				period.expiryRequested = true
+				go l.expireIfDue(period)
 			}
-			continue
 		}
-		ch := l.acquired
 		l.mu.Unlock()
 		select {
 		case <-ch:
-			// An acquisition closed the channel; loop to confirm that the
-			// period is still current.
+			// Acquisition or loss changed ownership. Check it again.
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -313,12 +310,13 @@ func (l *Lease) lose(reason string) bool {
 }
 
 // expireIfDue ends the ownership period when the confirmed expiry has passed.
-func (l *Lease) expireIfDue() {
+// When period is set, the request only applies to that period.
+func (l *Lease) expireIfDue(period *Period) {
 	l.init()
 	l.transitionMu.Lock()
 	defer l.transitionMu.Unlock()
 	l.mu.Lock()
-	if !l.held || l.deadlineNow().Before(l.expireAt) {
+	if !l.held || (period != nil && l.period != period) || l.deadlineNow().Before(l.expireAt) {
 		l.mu.Unlock()
 		return
 	}
@@ -401,7 +399,7 @@ func (l *Lease) watch(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		l.expireIfDue()
+		l.expireIfDue(nil)
 		wait := poll
 		if _, expireAt, held := l.snapshot(); held {
 			if remaining := expireAt.Sub(l.deadlineNow()); remaining < wait {
@@ -418,7 +416,7 @@ func (l *Lease) watch(ctx context.Context) {
 func (l *Lease) renewOnce(ctx context.Context) {
 	epoch, expireAt, held := l.snapshot()
 	if held && !l.deadlineNow().Before(expireAt) {
-		l.expireIfDue()
+		l.expireIfDue(nil)
 		epoch, expireAt, held = l.snapshot()
 	}
 	// The expiry of a successful call is TTL after the moment before the

@@ -129,6 +129,17 @@ func TestWhileHeldCapturesPeriodAcrossRenewalAndLoss(t *testing.T) {
 	eventually(t, "the earlier period's context to be canceled", func() bool { return ctx.Err() != nil })
 }
 
+func goroutineStacks() []string {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Split(string(buf[:n]), "\n\n")
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
 // waitLossBlockedOnOwnership waits until a goroutine that runs
 // (*Lease).lose is blocked on a mutex. The caller holds the ownership lock
 // and no other goroutine holds the transition lock, so that mutex is the
@@ -139,16 +150,7 @@ func waitLossBlockedOnOwnership(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		buf := make([]byte, 1<<16)
-		for {
-			n := runtime.Stack(buf, true)
-			if n < len(buf) {
-				buf = buf[:n]
-				break
-			}
-			buf = make([]byte, 2*len(buf))
-		}
-		for _, g := range strings.Split(string(buf), "\n\n") {
+		for _, g := range goroutineStacks() {
 			header, _, _ := strings.Cut(g, "\n")
 			blocked := strings.Contains(header, "[sync.Mutex.Lock") || strings.Contains(header, "[semacquire")
 			if blocked && strings.Contains(g, "(*Lease).lose(") {
@@ -289,7 +291,7 @@ func TestHeldEndsAtConfirmedExpiry(t *testing.T) {
 	// The result of the ended period cannot restore it, and a second
 	// expiry check does not run OnLose again.
 	l.applyRenewal(context.Background(), epoch, true, "", clock.Now().Add(TTL))
-	l.expireIfDue()
+	l.expireIfDue(nil)
 	if l.Held() || lost.Load() != 1 {
 		t.Fatalf("held %v, OnLose ran %d times", l.Held(), lost.Load())
 	}
@@ -401,7 +403,7 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 
 // TestWaitIgnoresExpiredAcquisition checks that Wait does not report a lease
 // whose confirmed expiry has passed before the watcher recorded the loss: the
-// acquisition channel is still closed then. Wait must record the loss itself,
+// acquisition channel is still closed then. Wait must request the loss,
 // block until a current acquisition or the end of its context, and not spin.
 func TestWaitIgnoresExpiredAcquisition(t *testing.T) {
 	clock := newTestClock()
@@ -420,13 +422,22 @@ func TestWaitIgnoresExpiredAcquisition(t *testing.T) {
 		t.Fatal("the instance holds the lease at the confirmed expiry")
 	}
 
-	// Wait ends only with its own context. Count the loops through the loss
-	// callback: a spin on the closed channel would never record the loss, and
-	// a Wait that returned nil would fail the check below.
+	// Wait ends only with its own context. Check that it requests expiry
+	// and does not report the expired acquisition as current.
+	lossDone := make(chan struct{})
+	l.OnLose = func() {
+		lost.Add(1)
+		close(lossDone)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	if err := l.Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait for an expired lease returned %v, want the context error", err)
+	}
+	select {
+	case <-lossDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not request expiry")
 	}
 	if got := lost.Load(); got != 1 {
 		t.Fatalf("OnLose ran %d times, want 1 (Wait records the expiry once)", got)
@@ -450,6 +461,205 @@ func TestWaitIgnoresExpiredAcquisition(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Wait did not return after the new acquisition")
+	}
+}
+
+func TestWaitReturnsWhileLossCallbackIsBlocked(t *testing.T) {
+	for _, want := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(want.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				l, _ := newTestLease()
+				lossStarted := make(chan struct{})
+				releaseLoss := make(chan struct{})
+				l.OnLose = func() {
+					close(lossStarted)
+					<-releaseLoss
+				}
+				defer close(releaseLoss)
+				acquireFor(t, l, time.Now().Add(time.Second))
+				time.Sleep(time.Second)
+
+				var ctx context.Context
+				var cancel context.CancelFunc
+				if want == context.DeadlineExceeded {
+					ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+				} else {
+					ctx, cancel = context.WithCancel(context.Background())
+				}
+				defer cancel()
+				result := make(chan error, 1)
+				go func() { result <- l.Wait(ctx) }()
+				select {
+				case <-lossStarted:
+				case <-time.After(time.Second):
+					t.Fatal("Wait did not start the loss callback")
+				}
+				if want == context.Canceled {
+					cancel()
+				}
+				select {
+				case err := <-result:
+					if !errors.Is(err, want) {
+						t.Fatalf("Wait returned %v, want %v", err, want)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("Wait did not return while OnLose was blocked")
+				}
+			})
+		})
+	}
+}
+
+func TestWaitDuringLeaseTransitions(t *testing.T) {
+	database := dbtest.New(t)
+	clock := newTestClock()
+	l, lost := newTestLease()
+	l.DB = database
+	l.DeadlineNow = clock.Now
+	// Keep expiry in the wait path while the actual lease loop uses Postgres.
+	l.poll = time.Hour
+	ticks := make(chan time.Time, 1)
+	l.RenewTicks = ticks
+	firstAcquire := make(chan struct{})
+	releaseAcquire := make(chan struct{})
+	lossStarted := make(chan struct{})
+	releaseLoss := make(chan struct{})
+	secondAcquire := make(chan struct{})
+	var acquired, renewals atomic.Int32
+	secondRenewal := make(chan struct{})
+	l.Renew = func(ctx context.Context, tryAcquire RenewFunc) (bool, error) {
+		ok, err := tryAcquire(ctx)
+		if renewals.Add(1) == 2 && ok {
+			close(secondRenewal)
+		}
+		return ok, err
+	}
+	l.OnAcquire = func(context.Context) {
+		switch acquired.Add(1) {
+		case 1:
+			close(firstAcquire)
+			<-releaseAcquire
+		case 2:
+			close(secondAcquire)
+		}
+	}
+	l.OnLose = func() {
+		if lost.Add(1) == 1 {
+			close(lossStarted)
+			<-releaseLoss
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	var releaseAcquireOnce, releaseLossOnce sync.Once
+	unblockAcquire := func() { releaseAcquireOnce.Do(func() { close(releaseAcquire) }) }
+	unblockLoss := func() { releaseLossOnce.Do(func() { close(releaseLoss) }) }
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		unblockAcquire()
+		unblockLoss()
+		workers.Wait()
+	}()
+	await := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	workers.Go(func() { l.Run(ctx) })
+	await(firstAcquire, "first acquisition callback")
+	if err := l.Wait(ctx); err != nil {
+		t.Fatalf("Wait during current acquisition: %v", err)
+	}
+	clock.Advance(TTL)
+
+	const waiterCount = 4
+	liveWait := make(chan error, 1)
+	expiredWait := make(chan error, waiterCount)
+	waitCtx, cancelWait := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancelWait()
+	workers.Go(func() { liveWait <- l.Wait(ctx) })
+	for range waiterCount {
+		workers.Go(func() { expiredWait <- l.Wait(waitCtx) })
+	}
+	for range waiterCount {
+		select {
+		case err := <-expiredWait:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Wait returned %v, want context.DeadlineExceeded", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("Wait did not return while OnAcquire was blocked")
+		}
+	}
+	// Every timed waiter observed expiry and returned while the transition
+	// lock was held. Any goroutine they started for expiry is still pending.
+	requests := 0
+	for _, stack := range goroutineStacks() {
+		_, creator, _ := strings.Cut(stack, "\ncreated by ")
+		if strings.Contains(creator, ".(*Lease).Wait in goroutine ") {
+			requests++
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("Wait started %d pending expiry requests, want 1", requests)
+	}
+	select {
+	case <-lossStarted:
+		t.Fatal("OnLose started before the first OnAcquire returned")
+	default:
+	}
+
+	unblockAcquire()
+	await(lossStarted, "loss callback requested by Wait")
+	ticks <- clock.Now()
+	await(secondRenewal, "second Postgres acquisition")
+	select {
+	case <-secondAcquire:
+		t.Fatal("the next OnAcquire ran before OnLose returned")
+	case err := <-liveWait:
+		t.Fatalf("Wait returned %v before local reacquisition", err)
+	default:
+	}
+	unblockLoss()
+	await(secondAcquire, "fresh acquisition callback")
+	select {
+	case err := <-liveWait:
+		if err != nil {
+			t.Fatalf("Wait after fresh acquisition: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Wait did not return after fresh acquisition")
+	}
+	if got := lost.Load(); got != 1 {
+		t.Fatalf("OnLose ran %d times, want one loss before shutdown", got)
+	}
+}
+
+func TestWaitExpiryRequestIgnoresReplacementPeriod(t *testing.T) {
+	clock := newTestClock()
+	l, lost := newTestLease()
+	l.DeadlineNow = clock.Now
+	acquireFor(t, l, clock.Now().Add(TTL))
+	first := l.period
+	clock.Advance(TTL)
+
+	// The watcher handles the expired period before Wait's request runs.
+	l.expireIfDue(nil)
+	acquireFor(t, l, clock.Now().Add(TTL))
+	second := l.period
+	clock.Advance(TTL)
+
+	l.expireIfDue(first)
+	if l.period != second || lost.Load() != 1 {
+		t.Fatalf("the first expiry request ended the replacement period: OnLose ran %d times", lost.Load())
+	}
+	l.expireIfDue(second)
+	if l.period != nil || lost.Load() != 2 {
+		t.Fatalf("the replacement period did not end on its own expiry: OnLose ran %d times", lost.Load())
 	}
 }
 
@@ -510,7 +720,7 @@ func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
 		// The watcher's expiry check waits for the callback, which ends at the
 		// expiry; OnLose runs right after, well before the 10 second I/O bound.
 		time.Sleep(expireAt.Sub(time.Now()) + 10*time.Millisecond)
-		l.expireIfDue()
+		l.expireIfDue(nil)
 		<-applied
 		if end := <-returned; !end.Equal(expireAt) {
 			t.Fatalf("the callback returned at %v, want the expiry %v", end, expireAt)
@@ -811,8 +1021,8 @@ func TestRenewalErrorKeepsLeaseUntilConfirmedExpiry(t *testing.T) {
 	fail = true
 	l.renewOnce(context.Background())
 	clock.Advance(time.Second)
-	l.expireIfDue()
-	l.expireIfDue()
+	l.expireIfDue(nil)
+	l.expireIfDue(nil)
 	if l.Held() || lost.Load() != 1 {
 		t.Fatalf("held %v, OnLose ran %d times, want released once", l.Held(), lost.Load())
 	}
