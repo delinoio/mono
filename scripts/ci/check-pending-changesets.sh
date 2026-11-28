@@ -93,10 +93,13 @@ fi
 api_stderr_file="$(mktemp -t deploy-guard-gh.XXXXXXXX)"
 trap 'rm -f -- "$api_stderr_file"' EXIT
 
-# Collect the started runs on `main` that are newer than this run. The API
-# lists runs newest first, so read pages until a page reaches this run or
-# runs out; a page of queue-cancelled runs must not hide a newer started run.
+# Collect newer runs on `main` that may have started. The API lists runs
+# newest first and caps branch-filtered results at 1,000. If the scan
+# reaches the cap, only a result at or below this run proves coverage.
 newer_runs=""
+run_history_limit=1000
+run_count=0
+reached=false
 # Each newer run gets a kind (no empty TSV fields, because a tab is an IFS
 # whitespace character and empty fields would collapse):
 # - started: in progress, or completed without being cancelled;
@@ -116,15 +119,15 @@ for (( page = 1; ; page++ )); do
     exit 1
   fi
   [[ -n "$api_output" ]] || break
-  reached=false
   while IFS=$'\t' read -r run_id run_number kind; do
+    (( run_count += 1 ))
     if (( run_number <= GITHUB_RUN_NUMBER )); then
       reached=true
     elif [[ "$kind" != "queued" ]]; then
       newer_runs+="$run_id"$'\t'"$run_number"$'\t'"$kind"$'\n'
     fi
   done <<< "$api_output"
-  if [[ "$reached" == true ]]; then
+  if [[ "$reached" == true ]] || (( run_count >= run_history_limit )); then
     break
   fi
 done
@@ -157,6 +160,11 @@ while IFS=$'\t' read -r run_id run_number kind; do
   fi
   stale "run #$run_number of $WORKFLOW started after this run #$GITHUB_RUN_NUMBER."
 done <<< "$newer_runs"
+
+if (( run_count >= run_history_limit )) && [[ "$reached" == false ]]; then
+  echo "::error::Could not verify the plan: GitHub's workflow run history limit of 1,000 results was reached before finding run #$GITHUB_RUN_NUMBER of $WORKFLOW or an older run. Start a new deployment instead of rerunning this one."
+  exit 1
+fi
 
 if [[ "${RUNS_ONLY:-}" == true ]]; then
   echo "No newer run of $WORKFLOW started after this run #$GITHUB_RUN_NUMBER."

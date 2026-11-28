@@ -126,7 +126,7 @@ const plannedSha = "c".repeat(40);
 const blobA = "a".repeat(40);
 const blobNew = "b".repeat(40);
 
-function runGuard(t, responses, blobs, runNumber = "7") {
+function runGuard(t, responses, blobs, { runsOnly = false } = {}) {
   const dir = scratch(t);
   const bin = stubGh(dir, {
     [`repos/owner/repo/compare/${plannedSha}...main`]: [
@@ -142,7 +142,8 @@ function runGuard(t, responses, blobs, runNumber = "7") {
       CHANGESET_BLOBS: JSON.stringify(blobs),
       REPOSITORY: "owner/repo",
       WORKFLOW: "deploy.yml",
-      GITHUB_RUN_NUMBER: runNumber,
+      GITHUB_RUN_NUMBER: "7",
+      RUNS_ONLY: String(runsOnly),
       SHA: plannedSha,
       GH_TOKEN: "token",
       CHECK_RETRY_DELAY: "0",
@@ -196,6 +197,21 @@ const jobPages = (runNumber, ...pages) => ({
   ],
 });
 const jobs = (runNumber, ...startedAt) => jobPages(runNumber, startedAt);
+function runHistoryAtLimit(lastRun = [8, "queued", null, 2]) {
+  const pages = Array.from({ length: 10 }, (_, page) =>
+    Array.from({ length: 100 }, (_, row) => [
+      1007 - page * 100 - row,
+      "pending",
+    ]),
+  );
+  pages[9][98] = [9, "completed", "cancelled"];
+  pages[9][99] = lastRun;
+  return { ...runPages(...pages), ...jobs(9), ...jobs(8) };
+}
+
+const runHistoryLimitError =
+  /Could not verify the plan: GitHub's workflow run history limit of 1,000 results .* Start a new deployment/;
+
 const changeset = (id, ...list) => ({
   // The guard lists the `.changeset` directory once; a {body: {sha}}
   // response becomes a listing that contains `<id>.md` with that blob.
@@ -392,6 +408,84 @@ test("guard reads further pages until it reaches this run", { skip }, (t) => {
     ["1", "2"],
   );
 });
+
+test(
+  "guard rejects incomplete workflow run history in both modes",
+  { skip },
+  (t) => {
+    for (const runsOnly of [false, true]) {
+      const result = runGuard(
+        t,
+        {
+          ...runHistoryAtLimit(),
+          ...changeset("a", { body: { sha: blobA } }),
+        },
+        { a: blobA },
+        { runsOnly },
+      );
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stdout, runHistoryLimitError);
+      assert.match(result.stdout, /Ignoring run #9/);
+      assert.match(result.stdout, /Ignoring run #8/);
+      assert.doesNotMatch(result.args, /\/compare\/|\/contents\/\.changeset/);
+    }
+  },
+);
+
+test(
+  "guard accepts a boundary at the workflow run history limit",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runHistoryAtLimit([6, "completed", "success"]),
+        ...changeset("a", { body: { sha: blobA } }),
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /The plan is current/);
+  },
+);
+
+test(
+  "guard accepts shorter workflow run history without a boundary",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runs([8, "pending"]),
+        ...changeset("a", { body: { sha: blobA } }),
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /The plan is current/);
+  },
+);
+
+test(
+  "guard reports a stale plan when jobs confirm a newer run at the history limit",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runHistoryAtLimit(),
+        ...jobs(8, "2026-11-18T00:00:00Z"),
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stdout,
+      /plan is stale: run #8 .* started after this run #7/,
+    );
+    assert.doesNotMatch(result.stdout, runHistoryLimitError);
+  },
+);
 
 test("guard lists only runs on main", { skip }, (t) => {
   const result = runGuard(
@@ -1550,6 +1644,14 @@ test("recovery rejects a superseding deployment", { skip }, (t) => {
   assert.equal(result.recovered, "recovered=false");
   assert.match(result.stdout, /run #8 of deploy\.yml started after this run/);
   assert.match(result.stdout, /newer deployment run exists/);
+  assert.ok(result.refsUnchanged);
+});
+
+test("recovery rejects incomplete workflow run history", { skip }, (t) => {
+  const state = landedRelease(t);
+  const result = runRecovery(t, state, { responses: runHistoryAtLimit() });
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, runHistoryLimitError);
   assert.ok(result.refsUnchanged);
 });
 
