@@ -94,6 +94,11 @@ func TestCanceledStartup(t *testing.T) {
 // (prior knowledge), which gRPC clients of the server streams need behind Caddy, and
 // that a cancelled context drains it.
 func TestServeH2CAndShutdown(t *testing.T) {
+	const (
+		requestTimeout = 5 * time.Second
+		drainTimeout   = time.Second
+		joinTimeout    = 5 * time.Second
+	)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -105,28 +110,53 @@ func TestServeH2CAndShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	drained := false
 	done := make(chan error, 1)
-	go func() {
-		done <- serve(ctx, func() {}, srv, listener, logger, time.Second, func() { drained = true })
-	}()
+	stopAndJoin := sync.OnceFunc(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve: %v", err)
+			}
+		case <-time.After(joinTimeout):
+			_ = srv.Close()
+			_ = listener.Close()
+			select {
+			case err := <-done:
+				t.Errorf("serve exceeded the shutdown deadline and exited after force close (result: %v)", err)
+			case <-time.After(drainTimeout):
+				t.Error("serve exceeded the shutdown deadline and did not exit after force close")
+				return
+			}
+		}
+		if !drained {
+			t.Error("beforeDrain did not run")
+		}
+	})
+	t.Cleanup(stopAndJoin)
 
 	var protocols http.Protocols
 	protocols.SetUnencryptedHTTP2(true)
-	client := &http.Client{Transport: &http.Transport{Protocols: &protocols}}
+	client := &http.Client{
+		Transport: &http.Transport{Protocols: &protocols},
+		Timeout:   requestTimeout,
+	}
+	t.Cleanup(client.CloseIdleConnections)
+	go func() {
+		done <- serve(ctx, func() {}, srv, listener, logger, drainTimeout, func() { drained = true })
+	}()
+
 	resp, err := client.Get("http://" + listener.Addr().String() + "/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	stopAndJoin()
 	if string(body) != "HTTP/2.0" {
 		t.Fatalf("protocol = %q", body)
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("serve: %v", err)
-	}
-	if !drained {
-		t.Fatal("beforeDrain did not run")
 	}
 }
 
