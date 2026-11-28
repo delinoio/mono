@@ -220,16 +220,74 @@ func TestInstrumentedTemplateGuestOSCountsRPCResults(t *testing.T) {
 }
 
 func TestSDKDeleteSandboxDeadline(t *testing.T) {
-	requests := make(chan string, 1)
+	client := newDeleteSandboxFixture(t, http.NotFoundHandler())
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	if _, err := client.DeleteSandbox(ctx, "sandbox-1"); connect.CodeOf(err) != connect.CodeDeadlineExceeded {
+		t.Fatalf("DeleteSandbox error = %v, want deadline_exceeded", err)
+	}
+}
+
+func TestSDKDeleteSandboxCancellation(t *testing.T) {
+	const wait = 5 * time.Second
+	testCtx := t.Context()
+	arrived := make(chan string)
 	canceled := make(chan struct{})
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- r.URL.Path
+	client := newDeleteSandboxFixture(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case arrived <- r.URL.Path:
+		case <-r.Context().Done():
+			return
+		case <-testCtx.Done():
+			return
+		}
 		select {
 		case <-r.Context().Done():
 			close(canceled)
-		case <-t.Context().Done():
+		case <-testCtx.Done():
 		}
 	}))
+
+	ctx, cancel := context.WithCancel(testCtx)
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.DeleteSandbox(ctx, "sandbox-1")
+		result <- err
+	}()
+
+	select {
+	case path := <-arrived:
+		if want := ownsandv1connect.SandboxServiceDeleteSandboxProcedure; path != want {
+			t.Fatalf("request path = %q, want %q", path, want)
+		}
+	case err := <-result:
+		t.Fatalf("DeleteSandbox returned before reaching the h2c fixture: %v", err)
+	case <-time.After(wait):
+		t.Fatal("timed out waiting for DeleteSandbox to reach the h2c fixture")
+	}
+
+	cancel()
+	select {
+	case err := <-result:
+		if connect.CodeOf(err) != connect.CodeCanceled {
+			t.Fatalf("DeleteSandbox error = %v, want canceled", err)
+		}
+	case <-time.After(wait):
+		t.Fatal("timed out waiting for DeleteSandbox to return after cancellation")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(wait):
+		t.Fatal("the server did not observe request cancellation")
+	}
+}
+
+func newDeleteSandboxFixture(t *testing.T, handler http.Handler) ownsandclient.Client {
+	t.Helper()
+	server := httptest.NewUnstartedServer(handler)
 	server.Config.Protocols = new(http.Protocols)
 	server.Config.Protocols.SetUnencryptedHTTP2(true)
 	server.Start()
@@ -240,23 +298,5 @@ func TestSDKDeleteSandboxDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
-	defer cancel()
-
-	if _, err := client.DeleteSandbox(ctx, "sandbox-1"); connect.CodeOf(err) != connect.CodeDeadlineExceeded {
-		t.Fatalf("DeleteSandbox error = %v, want deadline_exceeded", err)
-	}
-	select {
-	case path := <-requests:
-		if path != ownsandv1connect.SandboxServiceDeleteSandboxProcedure {
-			t.Fatalf("request path = %q, want DeleteSandbox", path)
-		}
-	default:
-		t.Fatal("the server never received the DeleteSandbox attempt")
-	}
-	select {
-	case <-canceled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the server did not observe request cancellation")
-	}
+	return client
 }
