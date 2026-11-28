@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, fromBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, rs, test } from "@rstest/core";
 import { ExecFailureReason } from "@delino/sandrun-protos/v1/common_pb";
 import {
   type AttachDevSessionExecRequest,
+  type AttachDevSessionExecResponse,
   AttachDevSessionExecResponseSchema,
   type DevSessionExecEvent,
   type DevSessionExecEventSchema,
   DevSessionService,
   type ExecDevSessionRequest,
+  type ExecDevSessionResponse,
   ExecDevSessionResponseSchema,
 } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { SandRunClient } from "./client.ts";
@@ -57,6 +59,9 @@ const exited = (code: number): EventInit => ({
   value: { status: { case: "exitCode", value: BigInt(code) } },
 });
 
+// Response field 1 wraps an exec event with unknown inner field 9.
+const futureEvent = Uint8Array.of(0x0a, 0x02, 0x4a, 0x00);
+
 const execInput = {
   organizationId: ORG,
   devSessionId: SESSION,
@@ -65,6 +70,31 @@ const execInput = {
 
 function response(event: EventInit) {
   return create(ExecDevSessionResponseSchema, { event: { event } });
+}
+
+function scriptedExecCaller(
+  exec: (ExecDevSessionResponse | ConnectError)[],
+  attaches: (AttachDevSessionExecResponse | ConnectError)[][],
+) {
+  async function* play<T>(script: (T | ConnectError)[]) {
+    for (const step of script) {
+      if (step instanceof ConnectError) {
+        throw step;
+      }
+      yield step;
+    }
+  }
+
+  let attachIndex = 0;
+  return {
+    execDevSession: rs.fn(
+      (_request: Parameters<ExecCaller["execDevSession"]>[0]) => play(exec),
+    ),
+    attachDevSessionExec: rs.fn(
+      (_request: Parameters<ExecCaller["attachDevSessionExec"]>[0]) =>
+        play(attaches[attachIndex++]!),
+    ),
+  } satisfies ExecCaller;
 }
 
 function execCaller(execDevSession: ExecCaller["execDevSession"]): ExecCaller {
@@ -635,6 +665,113 @@ describe("exec helper", () => {
       });
     },
   );
+
+  test.each(["exec", "attach", "attach after Started"] as const)(
+    "reports the expected error after an unknown event on %s",
+    async (placement) => {
+      const startupError = new ConnectError(
+        "startup failure",
+        Code.Unavailable,
+      );
+      const attachError = new ConnectError("attach missing", Code.NotFound);
+      const unknownExec = fromBinary(ExecDevSessionResponseSchema, futureEvent);
+      const unknownAttach = fromBinary(
+        AttachDevSessionExecResponseSchema,
+        futureEvent,
+      );
+      const startedBeforeAttach = placement === "attach after Started";
+      const execEvents = {
+        exec: [unknownExec],
+        attach: [],
+        "attach after Started": [response(started)],
+      }[placement];
+      const attachEvents = placement === "exec" ? [] : [unknownAttach];
+      const makeCaller = () =>
+        scriptedExecCaller(
+          [...execEvents, startupError],
+          [[...attachEvents, attachError]],
+        );
+      const caller = makeCaller();
+      const clock = new RecordingClock();
+      const stream = execDevSession(caller, execInput, { clock });
+      if (startedBeforeAttach) {
+        expect((await stream.next()).value).toMatchObject({
+          kind: ExecEventKind.Started,
+        });
+      }
+      expect(await stream.next()).toEqual({
+        done: false,
+        value: {
+          kind: ExecEventKind.Reattached,
+          stdoutOffset: 0n,
+          stderrOffset: 0n,
+          cause: startupError,
+        },
+      });
+      await expect(stream.next()).rejects.toBe(
+        startedBeforeAttach ? attachError : startupError,
+      );
+      expect(caller.execDevSession).toHaveBeenCalledTimes(1);
+      expect(caller.attachDevSessionExec).toHaveBeenCalledTimes(1);
+      expect(caller.attachDevSessionExec.mock.calls[0]![0]).toMatchObject({
+        execId: caller.execDevSession.mock.calls[0]![0].execId,
+        stdoutOffset: 0n,
+        stderrOffset: 0n,
+      });
+      expect(clock.sleeps).toEqual([1_000]);
+
+      if (placement === "attach") {
+        await expect(
+          runDevSessionExec(makeCaller(), execInput, {
+            clock: new RecordingClock(),
+          }),
+        ).rejects.toBe(startupError);
+      }
+    },
+  );
+
+  test("backs off to the cap after unknown events and resets after the first Started", async () => {
+    const unavailable = new ConnectError("relay restarting", Code.Unavailable);
+    const unknownAttach = fromBinary(
+      AttachDevSessionExecResponseSchema,
+      futureEvent,
+    );
+    const attachResponse = (event: EventInit) =>
+      create(AttachDevSessionExecResponseSchema, { event: { event } });
+    const caller = scriptedExecCaller(
+      [unavailable],
+      [
+        ...Array.from({ length: 6 }, () => [unknownAttach, unavailable]),
+        [attachResponse(started), unavailable],
+        [attachResponse(exited(0))],
+      ],
+    );
+    const clock = new RecordingClock();
+    const events: string[] = [];
+    for await (const event of execDevSession(caller, execInput, { clock })) {
+      events.push(describeEvent(event));
+    }
+
+    expect(clock.sleeps).toEqual([
+      1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 1_000,
+    ]);
+    expect(events).toEqual([
+      ...Array.from({ length: 7 }, () => "reattach 0 0"),
+      "started",
+      "reattach 0 0",
+      "exited 0",
+    ]);
+    expect(caller.execDevSession).toHaveBeenCalledTimes(1);
+    expect(caller.attachDevSessionExec).toHaveBeenCalledTimes(8);
+    const execId = caller.execDevSession.mock.calls[0]![0].execId;
+    for (const [request] of caller.attachDevSessionExec.mock.calls) {
+      expect(request).toMatchObject({
+        execId,
+        stdoutOffset: 0n,
+        stderrOffset: 0n,
+      });
+    }
+  });
 
   test("surfaces attach NotFound after a command starts", async () => {
     const { server, execs, attachRequests } = execServer(
