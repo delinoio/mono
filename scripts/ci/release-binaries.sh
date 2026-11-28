@@ -581,6 +581,9 @@ check_release_assets() {
   local name version dir binary tag key current asset digest staged remote work
   local -A signed
   work="$(mktemp -d)"
+  # Quote the path now so the trap can run even after the local variable goes
+  # out of scope. Keep the original exit status if cleanup fails.
+  trap "rm -rf -- $(printf '%q' "$work") || :" EXIT
   while IFS=$'\t' read -r -u 3 name version dir binary; do
     tag="$name@$version"
     check_tag "$tag"
@@ -631,7 +634,8 @@ check_release_assets() {
       fi
     done
   done 3< <(binary_rows)
-  rm -rf "$work"
+  rm -rf -- "$work"
+  trap - EXIT
 }
 
 # Publishes the GitHub Release of every planned binary. All checks run first:
