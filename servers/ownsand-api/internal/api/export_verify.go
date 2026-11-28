@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 )
 
@@ -31,6 +33,8 @@ const exportVerifyBatch = 50
 
 // exportVerifyListTimeout bounds one R2 listing of the verifier.
 const exportVerifyListTimeout = 60 * time.Second
+
+var errExportVerifyLeaseEnded = errors.New("export verification lease period ended")
 
 // ExportVerifyReason names why a verification failed.
 type ExportVerifyReason string
@@ -91,51 +95,70 @@ func (c *Control) runExportVerifier(ctx context.Context) {
 				return
 			}
 		}
-		if c.held() {
-			c.RunExportVerifyOnce(ctx)
-		}
+		c.RunExportVerifyOnce(ctx)
 	}
 }
 
-// RunExportVerifyOnce makes one verifier pass over the EXPORTED snapshots that
-// are not verified yet. A row without export_verify_after (exported before
-// the migration or by a release that does not set it) gets it set to now plus
-// the upload URL lifetime and is not listed in this pass. A listing or apply
-// error leaves the export unverified so the worker can retry it on a later
-// pass.
-func (c *Control) RunExportVerifyOnce(ctx context.Context) {
+// RunExportVerifyOnce makes one verifier pass during the current lease period
+// over EXPORTED snapshots that are not verified yet. The pass schedules rows
+// without export_verify_after for the end of the upload URL lifetime and skips
+// listing them. A listing or apply error leaves the export unverified so a
+// later pass can retry it.
+func (c *Control) RunExportVerifyOnce(parent context.Context) {
 	s := c.S
+	if s.Lease == nil {
+		return
+	}
+	var period *lease.Period
+	s.Lease.WhileHeld(func(held *lease.Period) { period = held })
+	if period == nil {
+		return
+	}
+	ctx, cancel := period.ContextUntilLoss(parent)
+	defer cancel()
 	if s.Objects == nil {
 		c.noExportVerifyStore.Do(func() {
 			s.Logger.Warn("export_verification_retry", slog.String("reason", "r2_not_configured"))
 		})
 		return
 	}
-	jobs, err := s.claimExportVerifyJobs(ctx)
+	jobs, err := s.claimExportVerifyJobs(ctx, period)
 	if err != nil {
-		if ctx.Err() == nil {
+		if ctx.Err() == nil && !errors.Is(err, errExportVerifyLeaseEnded) {
 			s.Logger.Warn("export_verification_scan_failed", slog.Any("error", err))
 		}
 		return
 	}
+	// Check the captured period directly. Its context may still be waiting
+	// for cancellation to propagate, or this instance may have reacquired.
+	stillHeld := func() bool {
+		var current bool
+		s.Lease.WhileHeld(func(held *lease.Period) { current = held == period })
+		return current
+	}
 	for _, job := range jobs {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !stillHeld() {
 			return
 		}
 		prefix := attemptPrefix(job.orgID, job.snapshotID, job.commandID)
-		listCtx, cancel := context.WithTimeout(ctx, exportVerifyListTimeout)
+		listCtx, cancelList := context.WithTimeout(ctx, exportVerifyListTimeout)
 		objects, err := s.Objects.ListPrefix(listCtx, prefix)
-		cancel()
+		cancelList()
+		if ctx.Err() != nil || !stillHeld() {
+			return
+		}
 		if err != nil {
 			s.Logger.Warn("export_verification_retry", slog.String("snapshot_id", job.snapshotID), slog.String("command_id", job.commandID),
 				slog.String("reason", "r2_list_failed"), slog.Any("error", err))
 			continue
 		}
-		if err := s.applyExportVerification(ctx, job, objects); err != nil {
-			if ctx.Err() == nil {
-				s.Logger.Warn("export_verification_retry", slog.String("snapshot_id", job.snapshotID), slog.String("command_id", job.commandID),
-					slog.String("reason", "database_error"), slog.Any("error", err))
-			}
+		err = s.applyExportVerification(ctx, period, job, objects)
+		if errors.Is(err, errExportVerifyLeaseEnded) {
+			return
+		}
+		if err != nil && ctx.Err() == nil {
+			s.Logger.Warn("export_verification_retry", slog.String("snapshot_id", job.snapshotID), slog.String("command_id", job.commandID),
+				slog.String("reason", "database_error"), slog.Any("error", err))
 		}
 	}
 }
@@ -145,7 +168,7 @@ func (c *Control) RunExportVerifyOnce(ctx context.Context) {
 // before releasing the row locks so errors cannot keep other due jobs waiting.
 // The R2 listing runs outside the transaction. When applying a result, the
 // verifier locks the row again and checks that it still names the same attempt.
-func (s *Service) claimExportVerifyJobs(ctx context.Context) ([]exportVerifyJob, error) {
+func (s *Service) claimExportVerifyJobs(ctx context.Context, period *lease.Period) ([]exportVerifyJob, error) {
 	type scheduledVerification struct {
 		snapshotID string
 		after      time.Time
@@ -175,23 +198,36 @@ func (s *Service) claimExportVerifyJobs(ctx context.Context) ([]exportVerifyJob,
 			due = append(due, r)
 		}
 		rows.Close()
-		if err := rows.Err(); err != nil {
+		if err := rows.Err(); err != nil || len(due) == 0 {
 			return err
+		}
+		// Lock snapshots first so a wait on them cannot stall takeover.
+		// The shared lease lock serializes the claim commit with takeover.
+		expiry, err := period.LockRow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if expiry.IsZero() {
+			return errExportVerifyLeaseEnded
 		}
 		retryAfter := now.Add(s.exportVerifyPoll())
 		for _, r := range due {
+			after := retryAfter
 			if r.after == nil {
 				// Upload URLs can still be valid for a full lifetime.
-				var after time.Time
-				if err := tx.QueryRow(ctx, "UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1 RETURNING export_verify_after",
-					r.snapshotID, now.Add(s.exportVerifyDelay())).Scan(&after); err != nil {
-					return err
-				}
+				after = now.Add(s.exportVerifyDelay())
+			}
+			err := tx.QueryRow(ctx, `UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1
+				AND clock_timestamp() < $3::timestamptz RETURNING export_verify_after`, r.snapshotID, after, expiry).Scan(&after)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errExportVerifyLeaseEnded
+			}
+			if err != nil {
+				return err
+			}
+			if r.after == nil {
 				scheduled = append(scheduled, scheduledVerification{snapshotID: r.snapshotID, after: after})
 				continue
-			}
-			if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_verify_after = $2 WHERE snapshot_id = $1", r.snapshotID, retryAfter); err != nil {
-				return err
 			}
 			parts, err := loadManifest(ctx, tx, r.snapshotID)
 			if err != nil {
@@ -273,7 +309,7 @@ func compareExport(job exportVerifyJob, objects []objectstore.Object) (ExportVer
 // the snapshot becomes EXPORT_FAILED, its manifest is removed so that billing
 // stops counting the reported sizes, and a clean-up job deletes the attempt
 // prefix.
-func (s *Service) applyExportVerification(ctx context.Context, job exportVerifyJob, objects []objectstore.Object) error {
+func (s *Service) applyExportVerification(ctx context.Context, period *lease.Period, job exportVerifyJob, objects []objectstore.Object) error {
 	reason, key := compareExport(job, objects)
 	var applied bool
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -291,22 +327,37 @@ func (s *Service) applyExportVerification(ctx context.Context, job exportVerifyJ
 		if ownsandv1.SnapshotExportState(export) != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED || owner != job.commandID || verified {
 			return nil
 		}
+		// The snapshot row is already locked. Check the lease at the
+		// write and hold its shared lock through the result's commit.
+		expiry, err := period.LockRow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if expiry.IsZero() {
+			return errExportVerifyLeaseEnded
+		}
+		var updated pgconn.CommandTag
 		if reason == "" {
-			if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_verified = true WHERE snapshot_id = $1", job.snapshotID); err != nil {
+			updated, err = tx.Exec(ctx, `UPDATE snapshots SET export_verified = true WHERE snapshot_id = $1
+				AND clock_timestamp() < $2::timestamptz`, job.snapshotID, expiry)
+		} else {
+			updated, err = tx.Exec(ctx, `UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1
+				AND clock_timestamp() < $3::timestamptz`, job.snapshotID,
+				int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED), expiry)
+		}
+		if err != nil {
+			return err
+		}
+		if updated.RowsAffected() == 0 {
+			return errExportVerifyLeaseEnded
+		}
+		if reason != "" {
+			if _, err := tx.Exec(ctx, "DELETE FROM snapshot_parts WHERE snapshot_id = $1", job.snapshotID); err != nil {
 				return err
 			}
-			applied = true
-			return nil
-		}
-		if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", job.snapshotID,
-			int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "DELETE FROM snapshot_parts WHERE snapshot_id = $1", job.snapshotID); err != nil {
-			return err
-		}
-		if err := s.startCleanupJobTx(ctx, tx, job.orgID, attemptPrefix(job.orgID, job.snapshotID, job.commandID)); err != nil {
-			return err
+			if err := s.startCleanupJobTx(ctx, tx, job.orgID, attemptPrefix(job.orgID, job.snapshotID, job.commandID)); err != nil {
+				return err
+			}
 		}
 		applied = true
 		return nil

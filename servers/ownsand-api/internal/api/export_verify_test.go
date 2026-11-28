@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -37,13 +39,13 @@ type exportVerifyFixture struct {
 	exportedAt time.Time
 }
 
-func newExportVerifyFixture(t *testing.T) *exportVerifyFixture {
+func newExportVerifyFixture(t *testing.T, options ...testenv.Option) *exportVerifyFixture {
 	t.Helper()
 	ticks := make(chan time.Time)
-	env := testenv.New(t, func(opts *app.Options) {
+	env := testenv.New(t, append(options, func(opts *app.Options) {
 		opts.ExportVerifyTicks = ticks
 		opts.Timing.ExportVerifyPoll = verifyPoll
-	})
+	})...)
 	org := env.NewOrg("alice")
 	setupAgent(t, env, org, nil)
 	exportedAt := env.Clock.Now()
@@ -708,4 +710,331 @@ func TestExportVerificationIgnoresStaleWork(t *testing.T) {
 			f.wantLogCount(t, "export_verification_failed", 0)
 		})
 	}
+}
+
+func startExportVerifyPass(t *testing.T, f *exportVerifyFixture) <-chan struct{} {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.env.App.Control.RunExportVerifyOnce(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		waitExportVerifySignal(t, done, "verifier pass to exit during cleanup")
+	})
+	return done
+}
+
+func waitExportVerifySignal(t *testing.T, signal <-chan struct{}, event string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", event)
+	}
+}
+
+func waitExportVerifyLock(t *testing.T, f *exportVerifyFixture, query string) int {
+	t.Helper()
+	var pid int
+	testenv.Eventually(t, "verification query to wait on a lock", func() bool {
+		err := f.env.DB.Pool.QueryRow(t.Context(), `SELECT pid FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1`, query).Scan(&pid)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return true
+	})
+	return pid
+}
+
+func TestExportVerificationHandoverCancelsListing(t *testing.T) {
+	t.Parallel()
+	f := newExportVerifyFixture(t, func(o *app.Options) {
+		o.LeaseRenewTicks = make(chan time.Time)
+	})
+	peer := f.env.StartPeer()
+	older := f.seedOlderExportVerifications(t, 1)[0]
+	before := manifestHashes(t, f.env, older.snapID)
+	started, canceled, resume := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	releaseListing := sync.OnceFunc(func() { close(resume) })
+	defer releaseListing()
+	var listed []string
+	f.env.App.Service.Objects = exportVerifyStore{Store: f.env.Objects, list: func(ctx context.Context, prefix string) ([]objectstore.Object, error) {
+		listed = append(listed, prefix)
+		if len(listed) == 1 {
+			context.AfterFunc(ctx, func() { close(canceled) })
+			close(started)
+			<-resume
+		}
+		// Simulate a successful response that arrives despite cancellation.
+		return nil, nil
+	}}
+	f.env.Clock.Advance(verifyDelay)
+	done := startExportVerifyPass(t, f)
+	waitExportVerifySignal(t, started, "the first holder to list")
+	f.env.App.Lease.Release()
+	runHandoverLease(t, peer)
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Error("takeover did not cancel the listing while the old service was running")
+	}
+	if err := t.Context().Err(); err != nil {
+		t.Fatalf("test context ended during lease handover: %v", err)
+	}
+	releaseListing()
+	waitExportVerifySignal(t, done, "the old pass to exit")
+	if len(listed) != 1 || listed[0] == f.prefix {
+		t.Errorf("old holder listings = %v, want only the older export", listed)
+	}
+	older.wantExported(t, false)
+	f.wantExported(t, false)
+	if got := manifestHashes(t, f.env, older.snapID); !slices.EqualFunc(got, before, bytes.Equal) {
+		t.Fatal("late result changed the older export's manifest")
+	}
+	if got := len(f.manifest(t)); got != 2 {
+		t.Fatalf("later export manifest has %d parts, want 2", got)
+	}
+	if got := cleanupJobs(t, f.env); len(got) != 0 {
+		t.Fatalf("old pass queued cleanup: %v", got)
+	}
+	t.Log("takeover canceled the pending listing, discarded the late mismatch and stopped before the second listing")
+
+	f.env.Clock.Advance(verifyPoll - time.Second)
+	peer.App.Control.RunExportVerifyOnce(t.Context())
+	if got := f.env.Objects.ListCalls(); got != 0 {
+		t.Fatalf("successor listed %d prefixes before their retry deadlines", got)
+	}
+	f.env.Clock.Advance(time.Second)
+	peer.App.Control.RunExportVerifyOnce(t.Context())
+	older.wantExported(t, true)
+	f.wantExported(t, true)
+	if got := f.env.Objects.ListCalls(); got != 2 {
+		t.Fatalf("successor listed %d prefixes, want 2", got)
+	}
+	t.Log("the successor verified both exports at the existing retry deadline")
+}
+
+func TestExportVerificationLeaseReacquisitionFencesApply(t *testing.T) {
+	t.Parallel()
+	ticks := make(chan time.Time, 1)
+	f := newExportVerifyFixture(t, func(o *app.Options) { o.LeaseRenewTicks = ticks })
+	oldEpoch, _ := f.env.App.Lease.Ownership()
+	before := manifestHashes(t, f.env, f.snapID)
+	// Acquire the snapshot lock during the listing, after the claim has
+	// released its locks, and keep it until after same-instance reacquisition.
+	listed := make(chan error, 1)
+	tx, err := f.env.DB.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	f.env.App.Service.Objects = exportVerifyStore{Store: f.env.Objects, list: func(ctx context.Context, _ string) ([]objectstore.Object, error) {
+		_, err := tx.Exec(ctx, "SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR UPDATE", f.snapID)
+		listed <- err
+		return nil, err
+	}}
+	f.env.Clock.Advance(verifyDelay)
+	done := startExportVerifyPass(t, f)
+	select {
+	case err := <-listed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the verifier did not list the export")
+	}
+	pid := waitExportVerifyLock(t, f, "%SELECT export_state,%FROM snapshots%FOR UPDATE%")
+	f.env.App.Lease.Release()
+	ticks <- time.Now()
+	f.env.WaitForLease()
+	if epoch, held := f.env.App.Lease.Ownership(); !held || epoch == oldEpoch {
+		t.Fatal("original holder did not acquire a new lease period")
+	}
+	if err := tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	waitExportVerifySignal(t, done, "the old apply to exit")
+	f.wantExported(t, false)
+	if got := manifestHashes(t, f.env, f.snapID); !slices.EqualFunc(got, before, bytes.Equal) {
+		t.Fatal("outdated apply changed the manifest")
+	}
+	if jobs := cleanupJobs(t, f.env); len(jobs) != 0 {
+		t.Fatalf("outdated apply queued cleanup: %v", jobs)
+	}
+	// The canceled connection can still hold the row until PostgreSQL
+	// finishes the transaction. A claim skips locked snapshots.
+	testenv.Eventually(t, "canceled apply transaction to end", func() bool {
+		var ended bool
+		err := f.env.DB.Pool.QueryRow(t.Context(), `SELECT NOT EXISTS (
+			SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND xact_start IS NOT NULL)`, pid).Scan(&ended)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ended
+	})
+	f.env.App.Service.Objects = f.env.Objects
+	f.run(verifyPoll)
+	f.wantExported(t, true)
+	t.Log("same-instance reacquisition fenced the blocked apply and allowed a matching retry")
+}
+
+func TestExportVerificationLeaseTakeoverFencesClaim(t *testing.T) {
+	t.Parallel()
+	f := newExportVerifyFixture(t, func(o *app.Options) {
+		o.LeaseRenewTicks = make(chan time.Time)
+	})
+	peer := f.env.StartPeer()
+	_, _, original := f.verification(t)
+	tx, err := f.env.DB.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	// Claims skip locked rows, so use a table lock to pause the statement
+	// after the pass has captured its period and before it can lock rows.
+	if _, err := tx.Exec(t.Context(), "LOCK TABLE snapshots IN EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	f.env.Clock.Advance(verifyDelay)
+	done := startExportVerifyPass(t, f)
+	waitExportVerifyLock(t, f, "%FROM snapshots WHERE export_state%FOR UPDATE SKIP LOCKED%")
+	f.env.App.Lease.Release()
+	runHandoverLease(t, peer)
+	if err := tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	waitExportVerifySignal(t, done, "the old claim to exit")
+	f.wantExported(t, false)
+	if _, _, after := f.verification(t); after == nil || !after.Equal(*original) {
+		t.Fatalf("old claim deadline = %v, want %v", after, original)
+	}
+	if got := f.env.Objects.ListCalls(); got != 0 {
+		t.Fatalf("old claim made %d listings", got)
+	}
+
+	peer.App.Service.Objects = exportVerifyStore{Store: peer.Objects, list: func(context.Context, string) ([]objectstore.Object, error) {
+		return []objectstore.Object{{Key: f.part1, Size: 1 << 20}}, nil
+	}}
+	peer.App.Control.RunExportVerifyOnce(t.Context())
+	f.wantFailed(t, "missing_part", f.part2)
+	t.Log("the old pass left the deadline intact and the successor applied a missing-part result")
+}
+
+func TestExportVerificationLeaseDatabaseExpiryFencesWrites(t *testing.T) {
+	t.Parallel()
+	for _, phase := range []string{"claim", "apply"} {
+		t.Run(phase, func(t *testing.T) {
+			f := newExportVerifyFixture(t, func(o *app.Options) {
+				o.LeaseRenewTicks = make(chan time.Time)
+			})
+			_, _, original := f.verification(t)
+			tx, err := f.env.DB.Pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(t.Context()) }()
+			lock := func(ctx context.Context) error {
+				_, err := tx.Exec(ctx, "SELECT 1 FROM instance_leases WHERE lease_name = $1 FOR UPDATE", lease.Name)
+				return err
+			}
+			if phase == "claim" {
+				if err := lock(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				f.env.App.Service.Objects = exportVerifyStore{Store: f.env.Objects, list: func(ctx context.Context, _ string) ([]objectstore.Object, error) {
+					return nil, lock(ctx)
+				}}
+			}
+			f.env.Clock.Advance(verifyDelay)
+			done := startExportVerifyPass(t, f)
+			waitExportVerifyLock(t, f, "%FROM instance_leases%FOR SHARE%")
+			// Expire the shared row while the local period still reports held.
+			if _, err := tx.Exec(t.Context(), "UPDATE instance_leases SET expire_time = clock_timestamp() WHERE lease_name = $1", lease.Name); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			waitExportVerifySignal(t, done, "the attempt with an expired database lease to exit")
+			if !f.env.App.Lease.Held() {
+				t.Fatal("local lease ended before the write guard could be observed")
+			}
+			f.wantExported(t, false)
+			if phase == "claim" {
+				if _, _, after := f.verification(t); after == nil || !after.Equal(*original) {
+					t.Fatalf("expired claim deadline = %v, want %v", after, original)
+				}
+				if got := f.env.Objects.ListCalls(); got != 0 {
+					t.Fatalf("expired claim made %d listings", got)
+				}
+			}
+			if got := len(f.manifest(t)); got != 2 {
+				t.Fatalf("manifest has %d parts after lease expiry, want 2", got)
+			}
+			if jobs := cleanupJobs(t, f.env); len(jobs) != 0 {
+				t.Fatalf("expired write queued cleanup: %v", jobs)
+			}
+			t.Log("the database clock rejected the write while the local lease still appeared current")
+		})
+	}
+}
+
+func TestExportVerificationLeaseRenewalKeepsListing(t *testing.T) {
+	t.Parallel()
+	clock := testenv.NewClock()
+	ticks := make(chan time.Time, 1)
+	f := newExportVerifyFixture(t, func(o *app.Options) {
+		o.LeaseDeadlineNow = clock.Now
+		o.LeaseRenewTicks = ticks
+	})
+	// Start the listing with only 10 seconds left in the initial period.
+	clock.Advance(20 * time.Second)
+	started := make(chan context.Context, 1)
+	resume := make(chan struct{})
+	releaseListing := sync.OnceFunc(func() { close(resume) })
+	defer releaseListing()
+	f.env.App.Service.Objects = exportVerifyStore{Store: f.env.Objects, list: func(ctx context.Context, prefix string) ([]objectstore.Object, error) {
+		started <- ctx
+		<-resume
+		return f.env.Objects.ListPrefix(ctx, prefix)
+	}}
+	f.env.Clock.Advance(verifyDelay)
+	done := startExportVerifyPass(t, f)
+	var listCtx context.Context
+	select {
+	case listCtx = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the verifier did not start a listing")
+	}
+	if deadline, ok := listCtx.Deadline(); !ok || time.Until(deadline) < 45*time.Second {
+		t.Fatalf("listing deadline = %v, want the listing timeout independent of the first lease expiry", deadline)
+	}
+	owner := f.env.App.Lease
+	var period *lease.Period
+	if !owner.WhileHeld(func(p *lease.Period) { period = p }) {
+		t.Fatal("lease ended before renewal")
+	}
+	ticks <- time.Now()
+	testenv.Eventually(t, "the initial lease period to renew", func() bool {
+		ctx, cancel := period.Context(t.Context())
+		defer cancel()
+		deadline, _ := ctx.Deadline()
+		return time.Until(deadline) > 20*time.Second
+	})
+	clock.Advance(11 * time.Second)
+	if listCtx.Err() != nil || !owner.Held() {
+		t.Fatalf("renewal did not keep the original listing active: %v", listCtx.Err())
+	}
+	releaseListing()
+	waitExportVerifySignal(t, done, "the renewed pass to exit")
+	f.wantExported(t, true)
+	t.Log("the listing stayed active past the initial lease expiry and its matching result committed")
 }
