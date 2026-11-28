@@ -4,7 +4,10 @@
 // dist/<target>/. The owning contract is
 // docs/cmds-sandcrew-bridge-foundation.md#build-and-test. sandcrew-api embeds
 // these binaries, so its build sets the version (its own package version) and
-// the commit; a local build uses 0.0.0-dev and the checkout's HEAD.
+// the commit; a local build uses 0.0.0-dev and the checkout's HEAD. The
+// package script is `build:binaries`, not `build`, so that the `turbo run
+// build` of the CI workspace jobs does not cross-compile release binaries that
+// no pull request check uses.
 //
 // Usage: node scripts/build.mjs [--out <dir>] [--version <v>] [--commit <sha>]
 // SANDCREW_BRIDGE_VERSION and SANDCREW_BRIDGE_COMMIT are the defaults of

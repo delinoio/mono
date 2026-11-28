@@ -799,8 +799,17 @@ test("task single workspace packages declare tasks and select workspace checks",
       readFileSync(join(root, dir, "package.json"), "utf8"),
     );
     assert.equal(manifest.private, true, `${dir} must be private`);
-    assert.ok(manifest.scripts?.build, `${dir} must declare a build script`);
     assert.ok(manifest.scripts?.test, `${dir} must declare a test script`);
+    // The go-vet, go-test and go-platforms jobs check the Go source of the
+    // root module. A `build` or `lint` script would repeat that work in the
+    // workspace jobs, and a release build there has no consumer.
+    for (const name of ["build", "lint"]) {
+      assert.equal(
+        manifest.scripts?.[name],
+        undefined,
+        `${dir} must not declare a ${name} script`,
+      );
+    }
     assert.ok(!releaseOnlyPackageDirs.includes(dir));
   }
   const f = fixture(t);
