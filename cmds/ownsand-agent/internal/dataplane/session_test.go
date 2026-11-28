@@ -161,12 +161,25 @@ func TestSessionServesExec(t *testing.T) {
 		}
 		ev := f.GetExecEvent()
 		out = append(out, ev.GetStdout().GetData()...)
-		if ev.GetExited() != nil {
+		if exited := ev.GetExited(); exited != nil {
+			status, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
+			if !ok {
+				t.Fatalf("exec exit status %T, want exit code", exited.GetStatus())
+			}
+			if status.ExitCode != 0 || exited.GetTimedOut() {
+				t.Fatalf("exec exit code %d, timed_out=%t, want code 0 and timed_out=false", status.ExitCode, exited.GetTimedOut())
+			}
 			break
 		}
 	}
-	if len(out) != 100004 || string(out[len(out)-4:]) != "done" {
-		t.Fatalf("stdout %d bytes", len(out))
+	want := strings.Repeat("a", 100000) + "done"
+	if len(out) != len(want) {
+		t.Fatalf("stdout length %d, want %d", len(out), len(want))
+	}
+	for i, got := range out {
+		if got != want[i] {
+			t.Fatalf("stdout byte at offset %d = %#02x, want %#02x", i, got, want[i])
+		}
 	}
 	// A frame for another sandbox is rejected.
 	c.send(datapath.MustNewFrame(6, newID(t), w.execReq("/bin/true")))

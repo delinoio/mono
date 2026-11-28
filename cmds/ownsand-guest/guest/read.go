@@ -207,7 +207,7 @@ func clearReadRoot(root string, logger *slog.Logger) error {
 			return rmErr
 		}
 		logger.Warn("old read snapshot directory is still in use and stays until the next start",
-			"path", path, "error", rmErr)
+			"error", sanitizedError(rmErr))
 	}
 	return nil
 }

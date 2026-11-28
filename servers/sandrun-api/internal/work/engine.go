@@ -118,6 +118,8 @@ type Engine struct {
 	timing   Timing
 	adapters map[sandrunv1.WorkloadKind]Adapter
 
+	observeReconcileDriverDecision func(runnerID string, registered bool)
+
 	kicks chan string
 
 	mu      sync.Mutex

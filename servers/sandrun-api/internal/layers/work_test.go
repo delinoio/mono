@@ -453,45 +453,124 @@ func TestWarmPreparationFailureBacksOffAndReadyRunnerClearsRetry(t *testing.T) {
 }
 
 func TestWarmInFlightRejectionDoesNotBackOffNewProfileRevision(t *testing.T) {
-	t.Parallel()
-	w := newWorkWorld(t, devsession.Timing{})
-	started, release, duplicate := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	const observationTimeout = 5 * time.Second
+	timing := testenv.FastWorkTiming()
+	timing.CreateTimeout = 15 * time.Second
+	renamed := make(chan struct{})
+	decision := make(chan bool, 1)
+	var runnerID string
+	fake := ownsandfake.New()
+	w := newWorkWorldWithOptions(t, fake, layers.Options{
+		OwnSand:    fake,
+		WorkTiming: &timing,
+		ReconcileDriverObserver: func(id string, registered bool) {
+			select {
+			case <-renamed:
+			default:
+				return
+			}
+			if id == runnerID {
+				select {
+				case decision <- registered:
+				default:
+				}
+			}
+		},
+	})
+
+	started := make(chan *ownsandv1.CreateSandboxRequest, 1)
+	finished := make(chan error, 1)
+	duplicate := make(chan struct{}, 1)
+	release := make(chan struct{})
+	releaseCreate := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseCreate)
+	rejection := connect.NewWireError(connect.CodeNotFound, errors.New("old profile rejected"))
 	var first sync.Once
-	w.fake.SetCreateHook(func(ctx context.Context) error {
+	var firstKey string
+	fake.SetCreateRequestHook(func(ctx context.Context, req *ownsandv1.CreateSandboxRequest) error {
+		key := req.GetIdempotencyKey()
 		initial := false
-		first.Do(func() { initial = true })
-		if !initial {
+		first.Do(func() {
+			initial = true
+			firstKey = key
+		})
+		if !initial && key != firstKey {
+			return nil
+		}
+		if initial {
+			started <- req
+		} else {
 			select {
 			case duplicate <- struct{}{}:
 			default:
 			}
-			return nil
 		}
-		close(started)
+
+		// Hold any replay as well, so it cannot change the row before the
+		// test observes the reconciler's decision.
 		select {
 		case <-release:
-			return connect.NewWireError(connect.CodeNotFound, errors.New("old profile rejected"))
 		case <-ctx.Done():
-			return ctx.Err()
 		}
+		err := ctx.Err()
+		if err == nil {
+			err = rejection
+		}
+		if initial {
+			finished <- err
+		}
+		return err
 	})
 	profileID := w.createProfile(t, devProfileProto("warm", 1, 0))
+	var firstRequest *ownsandv1.CreateSandboxRequest
 	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
+	case firstRequest = <-started:
+	case <-time.After(observationTimeout):
 		t.Fatal("warm create did not start")
 	}
-	renameWarmProfile(t, w, profileID)
-	// Let the reconciler see the open row while the dispatcher still owns it.
-	select {
-	case <-duplicate:
-		t.Fatal("reconciler duplicated the in-flight CreateSandbox call")
-	case <-time.After(3 * testenv.FastWorkTiming().ReconcileInterval):
+	runnerID = firstRequest.GetLabels()[ownsandclient.LabelRunnerID]
+	key := firstRequest.GetIdempotencyKey()
+	if runnerID == "" || key == "" {
+		t.Fatal("first warm create has no runner ID or idempotency key")
 	}
-	close(release)
+	var storedKey string
+	var state sandrunv1.RunnerState
+	if err := w.env.DB.Pool.QueryRow(t.Context(), "SELECT idempotency_key::text, state FROM runners WHERE runner_id = $1", runnerID).Scan(&storedKey, &state); err != nil {
+		t.Fatalf("load the in-flight runner: %v", err)
+	}
+	if storedKey != key || state != sandrunv1.RunnerState_RUNNER_STATE_CREATING {
+		t.Fatalf("in-flight runner has state %v and stored key %q, want CREATING and %q", state, storedKey, key)
+	}
+
+	renameWarmProfile(t, w, profileID)
+	close(renamed)
+	select {
+	case registered := <-decision:
+		if registered {
+			t.Fatal("reconciler registered a driver for the in-flight warm runner")
+		}
+	case err := <-finished:
+		t.Fatalf("first warm create exited before release: %v", err)
+	case <-time.After(observationTimeout):
+		t.Fatal("reconciler did not decide whether to register a driver for the in-flight warm runner")
+	}
+	releaseCreate()
+	select {
+	case err := <-finished:
+		if err != rejection {
+			t.Fatalf("first warm create exited before release: %v", err)
+		}
+	case <-time.After(observationTimeout):
+		t.Fatal("first warm create did not exit after release")
+	}
 	eventually(t, "warm runner under the new profile revision without advancing the clock", func() bool {
 		return profileRunnerCount(t, w, profileID, sandrunv1.RunnerState_RUNNER_STATE_WARM) == 1
 	})
+	select {
+	case <-duplicate:
+		t.Fatal("reconciler replayed the in-flight warm create's idempotency key")
+	default:
+	}
 }
 
 func renameWarmProfile(t *testing.T, w *workWorld, profileID string) {

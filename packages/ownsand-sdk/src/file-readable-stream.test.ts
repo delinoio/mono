@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { runInNewContext } from "node:vm";
+import type { WriteFileRequest } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { describe, expect, test } from "@rstest/core";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SANDBOX, setup } from "./testing/harness.ts";
@@ -15,8 +16,9 @@ const REASON = new Error("caller aborted the write");
  */
 function foreignReadableStream(
   underlyingSource: UnderlyingDefaultSource<Uint8Array>,
+  strategy?: QueuingStrategy<Uint8Array>,
 ): ReadableStream<Uint8Array> {
-  const stream = new ReadableStream<Uint8Array>(underlyingSource);
+  const stream = new ReadableStream<Uint8Array>(underlyingSource, strategy);
   const proto = runInNewContext("({})") as object;
   const source = ReadableStream.prototype;
   Object.defineProperties(proto, {
@@ -95,35 +97,63 @@ describe("file write from a readable stream of another realm", () => {
 
   test("an abort after the first chunk was acknowledged stops at the next source wait, sends no final chunk and releases the lock", async () => {
     const h = setup();
-    h.api.unary(RelayService, "WriteFile", (req) => ({
-      writeId: req.writeId,
-      offset: req.offset,
-      length: BigInt(req.data.length),
-      finished: false,
-      sizeBytes: 0n,
-    }));
-    const controller = new AbortController();
-    let pulls = 0;
-    const stream = foreignReadableStream({
-      pull(c) {
-        pulls += 1;
-        if (pulls <= 3) {
-          c.enqueue(new Uint8Array(1 << 20));
-          return;
-        }
-        controller.abort(REASON);
-        return new Promise(() => {});
-      },
+    const writeEntered = deferred();
+    const releaseAck = deferred();
+    h.api.unary(RelayService, "WriteFile", async (req) => {
+      writeEntered.resolve();
+      await releaseAck.promise;
+      return {
+        writeId: req.writeId,
+        offset: req.offset,
+        length: BigInt(req.data.length),
+        finished: false,
+        sizeBytes: 0n,
+      };
     });
-    await expect(
-      h.client
-        .sandbox(SANDBOX)
-        .writeFile("/f", stream, { signal: controller.signal }),
-    ).rejects.toBe(REASON);
+    const controller = new AbortController();
+    const thirdPull = deferred();
+    let pulls = 0;
+    const stream = foreignReadableStream(
+      {
+        pull(c) {
+          pulls += 1;
+          // The second piece lets the SDK send the first chunk without finish.
+          if (pulls <= 2) {
+            c.enqueue(new Uint8Array(1 << 20));
+            return;
+          }
+          thirdPull.resolve();
+          return new Promise<void>(() => {});
+        },
+      },
+      // Disable prefetch so every pull requires a pending read.
+      { highWaterMark: 0 },
+    );
+    const outcome = h.client
+      .sandbox(SANDBOX)
+      .writeFile("/f", stream, { signal: controller.signal })
+      .then(
+        () => "resolved",
+        (error: unknown) => error,
+      );
+    try {
+      await h.clock.run(writeEntered.promise, 0);
+      await h.clock.settle();
+      expect(pulls).toBe(2);
+      releaseAck.resolve();
+      await h.clock.run(thirdPull.promise, 0);
+    } finally {
+      controller.abort(REASON);
+      releaseAck.resolve();
+    }
+    expect(await h.clock.run(outcome, 0)).toBe(REASON);
     expect(stream.locked).toBe(false);
-    const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
-    expect(writes.length).toBeGreaterThan(0);
-    expect(writes.every((w) => w.finish === undefined)).toBe(true);
+    const writes = h.api.callsOf("WriteFile");
+    expect(writes).toHaveLength(1);
+    const write = writes[0]!.request as WriteFileRequest;
+    expect(write.offset).toBe(0n);
+    expect(write.data).toHaveLength(1 << 20);
+    expect(write.finish).toBeUndefined();
   });
 
   test("uploads the bytes of a completed stream", async () => {

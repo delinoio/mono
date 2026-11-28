@@ -86,20 +86,32 @@ describe("pagination", () => {
       fetch: server.fetch,
       token: "test-token",
     });
+    const received: string[] = [];
     for await (const org of client.iterate.organizations()) {
-      expect(org.organizationId).toBe("o-");
+      received.push(org.organizationId);
       break;
     }
-    expect(seen.length).toBe(1);
+    expect(received).toEqual(["o-"]);
+    expect(seen.map((request) => request.pageToken)).toEqual([""]);
   });
 
   test("ends with an error when the server repeats a page token", async () => {
+    let requestNumber = 0;
     const server = fakeServer((router) => {
       router.service(AuditService, {
-        listAuditEvents: () => ({
-          events: [{ auditEventId: "a" }],
-          nextPageToken: "same",
-        }),
+        listAuditEvents: (req) => {
+          requestNumber += 1;
+          if (requestNumber > 2) {
+            throw new ConnectError(
+              `Repeated-token fixture received unexpected ListAuditEvents request ${requestNumber} with page token ${JSON.stringify(req.pageToken)}`,
+              Code.FailedPrecondition,
+            );
+          }
+          return {
+            events: [{ auditEventId: "a" }],
+            nextPageToken: "same",
+          };
+        },
       });
     });
     const client = new SandRunClient({

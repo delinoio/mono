@@ -237,25 +237,34 @@ export async function runCleanup(
   steps: readonly CleanupStep[],
   options: RunCleanupOptions,
 ): Promise<unknown[]> {
-  const clock = options.clock ?? systemClock;
+  const { clock = systemClock, stepTimeoutMs } = options;
   const errors: unknown[] = [];
   for (const step of steps) {
+    const deadline = clock.now() + stepTimeoutMs;
     const stop = new AbortController();
-    clock.sleep(options.stepTimeoutMs, stop.signal).then(
-      () =>
-        stop.abort(
-          new Error(`cleanup step timed out after ${options.stepTimeoutMs} ms`),
-        ),
-      () => {},
+    const timeoutError = new Error(
+      `cleanup step timed out after ${stepTimeoutMs} ms`,
     );
+    const expire = () => stop.abort(timeoutError);
     const aborted = new Promise<never>((_, reject) => {
       stop.signal.addEventListener("abort", () => reject(stop.signal.reason), {
         once: true,
       });
     });
-    aborted.catch(() => {});
+    clock
+      .sleep(Math.ceil(deadline - clock.now()), stop.signal)
+      .then(expire, () => {});
+    const run = async () => {
+      try {
+        await step(stop.signal);
+      } finally {
+        // A step can settle at or after the deadline before the timer fires.
+        if (clock.now() >= deadline) expire();
+        stop.signal.throwIfAborted();
+      }
+    };
     try {
-      await Promise.race([(async () => step(stop.signal))(), aborted]);
+      await Promise.race([aborted, run()]);
     } catch (error) {
       errors.push(error);
     } finally {

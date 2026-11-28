@@ -5,18 +5,26 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/devsession"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/lease"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
 )
 
 func TestWarmBindingQueueDeadline(t *testing.T) {
@@ -69,6 +77,173 @@ func TestWarmBindingQueueDeadline(t *testing.T) {
 			req := workRequest(t, w, id)
 			if req.GetState() != sandrunv1.RequestState_REQUEST_STATE_RUNNING || req.GetStartAttempts() != 1 || req.GetRunnerId() != warm.GetRunnerId() {
 				t.Fatalf("request after warm binding: %v", req)
+			}
+		})
+	}
+}
+
+type warmBindingGate struct {
+	runnerID    string
+	beforeLock  string
+	entered     chan struct{}
+	resume      chan struct{}
+	runnerLocks int
+}
+
+func (g *warmBindingGate) TraceQueryStart(ctx context.Context, _ *pgx.Conn, q pgx.TraceQueryStartData) context.Context {
+	if ctx.Value(manualDispatchKey{}) == nil {
+		return ctx
+	}
+	const runnerLock = "FROM runners WHERE runner_id = $1 FOR UPDATE"
+	if strings.HasSuffix(q.SQL, runnerLock) && q.Args[0] == g.runnerID {
+		g.runnerLocks++
+	}
+	if g.beforeLock != "" && strings.HasSuffix(q.SQL, g.beforeLock) {
+		g.beforeLock = ""
+		close(g.entered)
+		select {
+		case <-g.resume:
+		case <-ctx.Done():
+		}
+	}
+	return ctx
+}
+
+func (*warmBindingGate) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func TestWarmBindingSamePass(t *testing.T) {
+	t.Parallel()
+	const (
+		queued   = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+		starting = sandrunv1.RequestState_REQUEST_STATE_STARTING
+		canceled = sandrunv1.RequestState_REQUEST_STATE_CANCELED
+		expired  = sandrunv1.RequestState_REQUEST_STATE_EXPIRED
+	)
+	for _, tc := range []struct {
+		name          string
+		first, second sandrunv1.RequestState
+		staleRunner   bool
+		createCalls   int
+	}{
+		{name: "canceled", first: canceled, second: starting, createCalls: 1},
+		{name: "committed_binding", first: starting, second: queued, createCalls: 2},
+		{name: "binding_deadline", first: expired, second: starting, createCalls: 1},
+		{name: "stale_runner", first: queued, second: queued, staleRunner: true, createCalls: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			w := newWorkWorld(t, devsession.Timing{})
+			w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.MaxSandboxes = 1 })
+			profileID := w.createProfile(t, devProfileProto("warm", 1, 0))
+			var runnerID string
+			eventually(t, "one warm runner", func() bool {
+				err := w.env.DB.Pool.QueryRow(ctx, "SELECT runner_id::text FROM runners WHERE runner_profile_id = $1 AND state = $2",
+					profileID, int16(sandrunv1.RunnerState_RUNNER_STATE_WARM)).Scan(&runnerID)
+				if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					t.Fatal(err)
+				}
+				return err == nil
+			})
+
+			// Park the lease before creating demand so only the manual pass
+			// can dispatch it and the reconciler cannot advance the runner.
+			w.env.Stop()
+			parked := lease.Lease{DB: w.env.DB, InstanceID: "parked"}
+			if held, err := parked.TryAcquire(ctx); err != nil || !held {
+				t.Fatalf("park lease: held=%v, err=%v", held, err)
+			}
+			defer parked.Release()
+
+			g := &warmBindingGate{
+				runnerID:   runnerID,
+				beforeLock: "FROM requests WHERE request_id = $1 FOR UPDATE",
+				entered:    make(chan struct{}),
+				resume:     make(chan struct{}),
+			}
+			if tc.staleRunner {
+				g.beforeLock = "FROM runners WHERE runner_id = $1 FOR UPDATE"
+			}
+			var replica layers.Layers
+			w.env = w.env.NewReplica(t, testenv.WithLayers(w.fake, &replica), func(o *app.Options) {
+				cfg := o.DB.Pool.Config()
+				cfg.ConnConfig.Tracer = g
+				pool, err := pgxpool.NewWithConfig(ctx, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(pool.Close)
+				o.DB = &db.DB{Pool: pool}
+			})
+			member := w.env.User(w.org.Member)
+			first := w.createSession(t, member, profileID).GetDevSessionId()
+			w.env.Clock.Advance(time.Millisecond)
+			second := w.createSession(t, member, profileID).GetDevSessionId()
+
+			dispatched := make(chan struct{})
+			go func() {
+				defer close(dispatched)
+				replica.Engine.Pass(context.WithValue(ctx, manualDispatchKey{}, true), w.org.ID)
+			}()
+			select {
+			case <-g.entered:
+			case <-dispatched:
+				t.Fatal("dispatch ended before reaching the warm binding")
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			switch {
+			case tc.first == canceled:
+				if _, err := w.env.User(w.org.Owner).Work.CancelRequest(ctx, connect.NewRequest(&sandrunv1.CancelRequestRequest{
+					OrganizationId: w.org.ID, RequestId: first,
+				})); err != nil {
+					t.Fatal(err)
+				}
+			case tc.first == expired:
+				w.env.Clock.Advance(time.Hour - time.Millisecond)
+			case tc.staleRunner:
+				if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE runners SET state = $2 WHERE runner_id = $1",
+					runnerID, int16(sandrunv1.RunnerState_RUNNER_STATE_PREPARING)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close(g.resume)
+			select {
+			case <-dispatched:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+
+			for _, want := range []struct {
+				id    string
+				state sandrunv1.RequestState
+			}{{first, tc.first}, {second, tc.second}} {
+				req := workRequest(t, w, want.id)
+				var attempts int32
+				var boundRunner string
+				if want.state == starting {
+					attempts, boundRunner = 1, runnerID
+				}
+				if req.GetState() != want.state || req.GetStartAttempts() != attempts || req.GetRunnerId() != boundRunner {
+					t.Fatalf("request %s after dispatch: state=%s, attempts=%d, runner=%q, want %s, %d, %q",
+						want.id, req.GetState(), req.GetStartAttempts(), req.GetRunnerId(), want.state, attempts, boundRunner)
+				}
+				if want.state == expired {
+					assertQueueExpiry(t, req)
+				}
+				if want.state == canceled && req.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER {
+					t.Fatalf("canceled request end reason: %s", req.GetEndReason())
+				}
+			}
+			if got := w.fake.Calls("CreateSandbox"); got != tc.createCalls {
+				t.Fatalf("CreateSandbox calls: %d, want %d", got, tc.createCalls)
+			}
+			wantLocks := 1
+			if tc.second == starting {
+				wantLocks = 2
+			}
+			if g.runnerLocks != wantLocks {
+				t.Fatalf("warm runner locks: %d, want %d", g.runnerLocks, wantLocks)
 			}
 		})
 	}

@@ -157,6 +157,14 @@ function runGuard(t, responses, blobs, runNumber = "7") {
   return { ...result, calls, args };
 }
 
+function requestedPages(args, endpoint) {
+  return args
+    .split("\n")
+    .map((path) => new URL(path, "https://api.github.com/"))
+    .filter((url) => url.pathname === endpoint)
+    .map((url) => url.searchParams.get("page"));
+}
+
 const runPage = (entries) => ({
   body: {
     workflow_runs: entries.map(
@@ -208,7 +216,13 @@ test("deploy.yml keeps pending runs in the concurrency queue", () => {
     .map((line) => line.trim());
   assert.ok(keys.includes("queue: max"));
   assert.ok(keys.includes("cancel-in-progress: false"));
-  assert.ok(keys.some((key) => key.startsWith("group: ")));
+  assert.deepEqual(
+    keys.filter((key) => key.startsWith("group:")),
+    [
+      "group: ${{ github.ref == 'refs/heads/main' && 'deploy' || format('deploy-rejected-{0}', github.run_id) }}",
+    ],
+    "Main dispatches share the deploy group and each non-main dispatch has its own group",
+  );
   // actionlint v1.7.12 rejects `queue`; the exception must name only that
   // diagnostic and only this workflow.
   const lint = readYamlFixture(".github/actionlint.yaml");
@@ -370,6 +384,13 @@ test("guard reads further pages until it reaches this run", { skip }, (t) => {
     result.stdout,
     /plan is stale: run #8 .* started after this run #7/,
   );
+  assert.deepEqual(
+    requestedPages(
+      result.args,
+      "/repos/owner/repo/actions/workflows/deploy.yml/runs",
+    ),
+    ["1", "2"],
+  );
 });
 
 test("guard lists only runs on main", { skip }, (t) => {
@@ -454,6 +475,10 @@ test("guard reads every jobs page of a cancelled newer run", { skip }, (t) => {
   );
   assert.equal(result.status, 1, result.stdout + result.stderr);
   assert.match(result.stdout, /plan is stale: run #8/);
+  assert.deepEqual(
+    requestedPages(result.args, "/repos/owner/repo/actions/runs/1008/jobs"),
+    ["1", "2"],
+  );
 });
 
 test("guard rejects a missing or malformed changeset map", { skip }, (t) => {
@@ -1742,9 +1767,17 @@ test("provider waits for the Pages deploy stage", { skip: skipWait }, (t) => {
     },
   });
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.match(
-    result.calls,
-    /curl .*accounts\/account\/pages\/projects\/site\/deployments\/pages-1/,
+  const calls = result.calls.trimEnd().split("\n");
+  assert.equal(calls.length, 3, result.calls);
+  for (const call of calls) {
+    assert.match(
+      call,
+      /^curl .* https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/account\/pages\/projects\/site\/deployments\/pages-1$/,
+    );
+  }
+  assert.equal(
+    result.stdout.replace(/\n$/, "").split("\n").at(-1),
+    "Pages deployment pages-1 of site: production deploy success",
   );
 });
 
@@ -1895,8 +1928,9 @@ function shellStub(bin, name, body = "") {
 const digest = `sha256:${"d".repeat(64)}`;
 
 // Runs deploy-targets.sh with stubbed `pnpm`, `docker`, `ssh`, guard and
-// provider. The guard fails once `withdrawn` exists, as when a changeset is
-// withdrawn on main. The `ssh` stub saves the remote script from standard
+// provider. The provider stub runs the local Pages ID parser and skips polling.
+// The guard fails once `withdrawn` exists, as when a changeset is withdrawn on
+// main. The `ssh` stub saves the remote script from standard
 // input to `remote-<n>.sh`. The script appends its job summary to `summary.md`
 // in the fixture directory, never to the `GITHUB_STEP_SUMMARY` file that this
 // process may inherit from a CI job; the content is returned as `summary`.
@@ -1909,7 +1943,19 @@ function runTargets(
   const bin = join(dir, "bin");
   mkdirSync(bin);
   writeFileSync(join(dir, "calls.log"), "");
-  shellStub(bin, "pnpm", pnpmBody);
+  shellStub(
+    bin,
+    "pnpm",
+    `if [[ "$1 $2 $3 $4" == "exec wrangler pages deploy" ]]; then
+  (
+    while (( $# > 0 )) && [[ "$1" != "--project-name" ]]; do shift; done
+    jq -nc --arg id "pages-\${2:?missing Pages project}" \\
+      '{type: "pages-deploy", version: 1, deployment_id: $id}' \\
+      > "\${WRANGLER_OUTPUT_FILE_PATH:?missing Wrangler output path}"
+  ) || exit 1
+fi
+${pnpmBody}`,
+  );
   shellStub(
     bin,
     "docker",
@@ -1930,7 +1976,11 @@ function runTargets(
   const providerStub = shellStub(
     bin,
     "provider",
-    'case "$1" in pages-id) echo pages ;; esac',
+    `case "$1" in
+  pages-id) exec "$REAL_DEPLOY_PROVIDER" "$@" ;;
+  wait-pages) exit 0 ;;
+  *) exit 2 ;;
+esac`,
   );
   mkdirSync(join(dir, "servers"));
   // Site outputs, relative to the working directory, as after a build.
@@ -1963,6 +2013,7 @@ function runTargets(
       SHA: "a".repeat(40),
       DEPLOY_GUARD: guardStub,
       DEPLOY_PROVIDER: providerStub,
+      REAL_DEPLOY_PROVIDER: provider,
       DROPLET_REGISTRY: "registry.digitalocean.com/delino",
       DROPLET_SSH_CONFIG: join(dir, "ssh_config"),
       SERVERS: JSON.stringify([
@@ -2013,22 +2064,33 @@ function runTargets(
 test("targets check the plan before each site upload", { skip }, (t) => {
   const result = runTargets(t, "static-sites");
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  // Command, subcommand and, for uploads and waits, the target.
-  const order = result.calls.map((call) => {
-    const words = call.split(" ").filter(Boolean);
-    const keep = words[0] === "pnpm" || words[1] === "wait-pages" ? 3 : 2;
-    return words.slice(0, keep).join(" ");
-  });
+  const docsOutput = join(result.dir, "wrangler-docs.ndjson");
+  const siteOutput = join(result.dir, "wrangler-site.ndjson");
+  const order = result.calls.map((call) =>
+    call.startsWith("pnpm exec wrangler ")
+      ? `pnpm exec wrangler ${call.match(/ --project-name (\S+)/)?.[1]}`
+      : call.trimEnd(),
+  );
   assert.deepEqual(order, [
     "guard",
-    "pnpm exec wrangler",
-    "provider pages-id",
-    "provider wait-pages docs",
+    "pnpm exec wrangler docs",
+    `provider pages-id ${docsOutput}`,
+    "provider wait-pages docs pages-docs",
     "guard",
-    "pnpm exec wrangler",
-    "provider pages-id",
-    "provider wait-pages site",
+    "pnpm exec wrangler site",
+    `provider pages-id ${siteOutput}`,
+    "provider wait-pages site pages-site",
   ]);
+  for (const [output, id] of [
+    [docsOutput, "pages-docs"],
+    [siteOutput, "pages-site"],
+  ]) {
+    assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), {
+      type: "pages-deploy",
+      version: 1,
+      deployment_id: id,
+    });
+  }
 });
 
 test("targets deploy site outputs from SITES_ROOT", { skip }, (t) => {
@@ -2055,8 +2117,8 @@ test("targets write the job summary to a fixture-local file", { skip }, (t) => {
     sites.summary,
     [
       "## Static sites",
-      "- docs@1.0.0: Cloudflare Pages project `docs`, deployment `pages`",
-      "- site@1.0.0: Cloudflare Pages project `site`, deployment `pages`",
+      "- docs@1.0.0: Cloudflare Pages project `docs`, deployment `pages-docs`",
+      "- site@1.0.0: Cloudflare Pages project `site`, deployment `pages-site`",
       "",
     ].join("\n"),
   );
@@ -2872,15 +2934,15 @@ test(
   "droplet deploy keeps the alias of a long service name a valid DNS label",
   { skip: skipDroplet },
   (t) => {
-    // The service name may have 63 characters, and cutting the name can leave a
-    // trailing hyphen.
-    const services = [
-      "a".repeat(63),
-      `${"b".repeat(34)}-${"c".repeat(28)}`,
-      "d".repeat(36),
-      "api",
+    const deploymentId = dropletDeploymentUuid.replaceAll("-", "");
+    const cases = [
+      ["a".repeat(63), "a".repeat(30)],
+      [`${"b".repeat(29)}-${"c".repeat(33)}`, "b".repeat(29)],
+      [`${"b".repeat(28)}--${"c".repeat(33)}`, "b".repeat(28)],
+      ["d".repeat(36), "d".repeat(30)],
+      ["api", "api"],
     ];
-    for (const service of services) {
+    for (const [service, expectedPrefix] of cases) {
       const result = runDroplet(
         t,
         [service, dropletImage, "8080", "api.example.com", "http1", "none"],
@@ -2888,17 +2950,14 @@ test(
       );
       assert.equal(result.status, 0, `${service}: ${result.stderr}`);
       const run = result.calls.find((call) => call.startsWith("docker run"));
-      const alias = run.match(/--network-alias (\S+)/)[1];
+      const alias = run?.match(/--network-alias (\S+)/)?.[1];
+      assert.equal(alias, `${expectedPrefix}-${deploymentId}`, service);
       assert.match(alias, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/, service);
-      assert.ok(
-        alias.endsWith(`-${dropletDeploymentUuid.replaceAll("-", "")}`),
-      );
-      assert.ok(!alias.includes("--"), alias);
-      assert.ok(alias.startsWith(service.slice(0, 30).replace(/-+$/, "")));
-      assert.ok(
-        result
-          .read(`caddy/sites/${service}.caddy`)
-          .includes(`reverse_proxy ${alias}:8080 {`),
+      const route = result.read(`caddy/sites/${service}.caddy`);
+      assert.equal(
+        route?.match(/^[ \t]+reverse_proxy (\S+)/m)?.[1],
+        `${alias}:8080`,
+        service,
       );
     }
   },

@@ -5,6 +5,8 @@ package api
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -200,4 +202,39 @@ func (h APIKeyHandler) RevokeApiKey(ctx context.Context, req *connect.Request[sa
 		return nil, h.Internal(ctx, "revoke api key", err)
 	}
 	return connect.NewResponse(resp), nil
+}
+
+// apiKeyUseCache remembers when this process last wrote the last use time of
+// each key, so most calls skip the database write.
+type apiKeyUseCache struct {
+	mu      sync.Mutex
+	written map[string]time.Time
+}
+
+// RecordAuthorizedAPIKeyUse records personal key use after all applicable
+// access checks. Call it outside the business transaction. The UPDATE
+// condition enforces the one-minute interval across instances. A failed
+// write is logged and does not fail the RPC.
+func (s *Service) RecordAuthorizedAPIKeyUse(ctx context.Context, caller Caller) {
+	if !caller.Principal.IsAPIKey() {
+		return
+	}
+	keyID := caller.Principal.APIKeyID
+	now := s.NowUTC()
+	c := &s.apiKeyUses
+	c.mu.Lock()
+	if last, ok := c.written[keyID]; ok && now.Sub(last) < apiKeyUseWriteInterval {
+		c.mu.Unlock()
+		return
+	}
+	if c.written == nil || len(c.written) > 100_000 {
+		c.written = map[string]time.Time{}
+	}
+	c.written[keyID] = now
+	c.mu.Unlock()
+	_, err := s.DB.Pool.Exec(ctx, `UPDATE api_keys SET last_used_time = $2
+		WHERE api_key_id = $1 AND (last_used_time IS NULL OR last_used_time <= $2::timestamptz - interval '1 minute')`, keyID, now)
+	if err != nil {
+		s.Logger.WarnContext(ctx, "api_key_last_use_write_failed", slog.String("api_key_id", keyID), slog.Any("error", err))
+	}
 }
