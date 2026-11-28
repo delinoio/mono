@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Microsoft/go-winio/vhd"
@@ -30,6 +31,7 @@ const (
 
 	driveLetterMutexName   = `Global\Delino.OwnSand.ImageBuild.DriveLetters`
 	driveLetterMutexWaitMS = 50
+	diskpartShutdownDelay  = 15 * time.Second
 )
 
 // attachedDisk is the new image VHDX attached to the host with two drive
@@ -89,8 +91,8 @@ func (d *attachedDisk) detach() error {
 	return err
 }
 
-// withDriveLetterMutex serializes drive-letter selection and assignment
-// across builder processes, including those in different Windows sessions.
+// withDriveLetterMutex serializes drive-letter selection, assignment and
+// DiskPart shutdown across builder processes and Windows sessions.
 func withDriveLetterMutex(ctx context.Context, name string, partition func() error) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -176,10 +178,16 @@ func diskpartScript(number int, system, win string) string {
 
 // partition partitions the attached disk and mounts its two volumes.
 func (d *attachedDisk) partition(ctx context.Context, scratch string) error {
-	return d.partitionWith(ctx, scratch, driveLetterMutexName, windows.GetLogicalDrives, runTool)
+	return d.partitionWith(ctx, scratch, driveLetterMutexName, windows.GetLogicalDrives, runTool, time.Sleep)
 }
 
-func (d *attachedDisk) partitionWith(ctx context.Context, scratch, mutexName string, readMask func() (uint32, error), run func(context.Context, string, ...string) (string, error)) error {
+func (d *attachedDisk) partitionWith(
+	ctx context.Context,
+	scratch, mutexName string,
+	readMask func() (uint32, error),
+	run func(context.Context, string, ...string) (string, error),
+	waitForShutdown func(time.Duration),
+) error {
 	return withDriveLetterMutex(ctx, mutexName, func() error {
 		mask, err := readMask()
 		if err != nil {
@@ -195,7 +203,11 @@ func (d *attachedDisk) partitionWith(ctx context.Context, scratch, mutexName str
 			return err
 		}
 		defer os.Remove(script)
-		if out, err := run(ctx, "diskpart.exe", "/s", script); err != nil {
+		out, err := run(ctx, "diskpart.exe", "/s", script)
+		// DiskPart requires 15 seconds between scripts for shutdown. Keep the
+		// mutex for the full interval even if the invocation failed or was canceled.
+		waitForShutdown(diskpartShutdownDelay)
+		if err != nil {
 			return fmt.Errorf("imagebuild: partition the image disk: %w: %s", err, out)
 		}
 		return nil
