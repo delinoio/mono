@@ -690,7 +690,7 @@ The server reads these environment variables without a service prefix. It remove
 | --------------------------------- | -------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `ADDR`                            | no       | `127.0.0.1:18400`               | `host:port` of the HTTP/1.1 and h2c listener. The deployment sets it.                                          |
 | `LOG_LEVEL`                       | no       | `info`                          | `debug`, `info`, `warn` or `error`.                                                                            |
-| `DATABASE_URL`                    | yes      |                                 | Postgres connection URL.                                                                                       |
+| `DATABASE_URL`                    | yes      |                                 | Session-preserving PostgreSQL URL. See [Database connection](#database-connection).                            |
 | `RUN_MIGRATIONS`                  | no       | `true`                          | Apply the embedded migrations at startup.                                                                      |
 | `RECLAIM_LEGACY_OWNSAND_REMOVALS` | no       | `false`                         | Recover old link removal marks. Enable after all instances and requests from before link leases have drained.  |
 | `LOGTO_ISSUER`                    | yes      |                                 | Logto issuer, `<tenant endpoint>/oidc`.                                                                        |
@@ -719,6 +719,12 @@ The Logto endpoint URLs and the OwnSand, public and GitHub origins require a hos
 - When none of the six `GITHUB_APP_*` variables is set, the GitHub layer is off, so development setups without a GitHub App still start: the `GitHubService` RPCs fail with `failed_precondition` after authorization, `POST /webhooks/github` answers `503`, and no GitHub job is matched. Some but not all of the six variables stop the server at startup.
 - Later layers add the vendor settings to this table with their implementation. The Cursor, Devin, Claude Code and OpenAI Codex adapters add no variable. The Claude Code orchestrators put their run directories in `TMPDIR` (default `/tmp`); a Unix socket path must stay below 104 bytes, so `TMPDIR` must be short.
 - Member display names: `ListMembers` reads them through an optional display name source. The `delino-accounts` API has no display name RPC yet, as the [OwnSand contract](servers-ownsand-api-foundation.md#dependencies-and-integrations) records, so sandrun-api has no client or configuration for it and returns empty display names until that RPC exists.
+
+### Database connection
+
+Set `DATABASE_URL` to a direct PostgreSQL endpoint or a pooler that keeps the same PostgreSQL session for the lifetime of each client connection. Organization deletion holds a session advisory lock across transactions. This requirement applies even when `RUN_MIGRATIONS=false`.
+
+For PlanetScale, choose the direct primary endpoint on port `5432`. Startup rejects PlanetScale `psdb.cloud` endpoints on port `6432` in both the primary and fallback settings because PlanetScale PgBouncer uses transaction pooling. For a custom endpoint or DNS alias, verify the pooling mode of every host, including fallbacks. [PlanetScale PgBouncer documentation](https://planetscale.com/docs/postgres/connecting/pgbouncer)
 
 ### CORS origin format
 
