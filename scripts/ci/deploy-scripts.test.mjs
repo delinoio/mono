@@ -2472,7 +2472,8 @@ const sandrunArgs = ["sandrun-api", ...httpArgs.slice(1)];
 //   STUB_CREATE_EXIT exit code of `docker create` (default 0), like STUB_RUN_EXIT.
 //   STUB_BLOCK_ON  glob that a `docker` call (its arguments joined by spaces)
 //                 must match to block until `<scratch>/release-docker` exists,
-//                 so that a test can send a signal while the call runs.
+//                 so that a test can send a signal while the call runs. A
+//                 blocked create records its name in `created-replacement`.
 //   STUB_BLOCK_IGNORES_TERM makes the blocked command ignore TERM for four seconds.
 //   STUB_STATUS_DELAY delays the replacement's status inspection.
 //   STUB_ADDRESS overrides the replacement's inspected address.
@@ -2569,6 +2570,10 @@ function setupDroplet(
     trap '' TERM
     sleep 4
   else
+    if [[ "$1" == create && "$2" == --name ]]; then
+      printf '%s\n' "$3" > "$STUB_DIR/created-replacement.tmp"
+      mv "$STUB_DIR/created-replacement.tmp" "$STUB_DIR/created-replacement"
+    fi
     # A blocked stub also ends when the scratch directory is removed.
     while [[ -d "$STUB_DIR" && ! -e "$STUB_DIR/release-docker" ]]; do sleep 0.05; done
   fi
@@ -3888,6 +3893,66 @@ test(
         assert.equal(setup.read(`caddy/sites/${service}.caddy`), route);
         assert.equal(setup.read(`state/${service}.current`), state);
         assert.equal(setup.read(`state/${service}.previous`), previous);
+      });
+    }
+  },
+);
+
+test(
+  "droplet deploy removes only the UDP replacement on a signal during docker create",
+  { skip: skipDroplet },
+  async (t) => {
+    const route = "# old route\n";
+    const state = `${olderImage}\n`;
+    const previous = `${oldestImage}\n`;
+    for (const [signal, status] of [
+      ["SIGTERM", 143],
+      ["SIGINT", 130],
+      ["SIGHUP", 129],
+    ]) {
+      await t.test(signal, async (t) => {
+        const setup = setupDroplet(t, udpArgs, {
+          old: ["old1"],
+          route,
+          state,
+          previous,
+        });
+        const run = startDroplet(t, setup, udpArgs, {
+          STUB_BLOCK_ON: "create *",
+        });
+        const created = join(setup.dir, "created-replacement");
+        await waitFor(
+          () => run.child.pid && existsSync(created),
+          "creation of the UDP replacement",
+        );
+        const replacement = readFileSync(created, "utf8").trim();
+        assert.match(replacement, /^api-/);
+        process.kill(run.child.pid, signal);
+        writeFileSync(join(setup.dir, "release-docker"), "");
+
+        const result = await run.done;
+        assert.equal(result.status, status, result.stderr);
+        assert.match(
+          result.stderr,
+          new RegExp(`received ${signal} before the route`),
+        );
+        assert.deepEqual(
+          setup
+            .calls()
+            .filter((call) => /^docker (exec|start|stop|rm) /.test(call)),
+          [`docker rm --force ${replacement}`],
+        );
+        for (const [file, contents] of [
+          ["caddy/sites/api.caddy", route],
+          ["state/api.current", state],
+          ["state/api.previous", previous],
+        ]) {
+          assert.deepEqual(
+            readFileSync(join(setup.deployRoot, file)),
+            Buffer.from(contents),
+            file,
+          );
+        }
       });
     }
   },

@@ -49,10 +49,11 @@
 #
 # On `SIGTERM`, `SIGINT` or `SIGHUP`, the script cleans up an HTTP-only
 # replacement from launch through the readiness check under the proxy lock.
-# For UDP, the same handler runs from the first stop through that check and also
-# restarts the stopped containers. The handler holds the service lock and
-# exits with 128 plus the signal number. Bash runs the trap after the
-# foreground command returns. A Docker stop, `curl` or `flock` can wait
+# For UDP, cleanup starts at creation. The previous containers keep serving
+# during creation. Once the stop phase begins, the handler also restarts the
+# previous containers. The handler holds the service lock and exits with
+# 128 plus the signal number. Bash runs the trap after the foreground command
+# returns. A Docker stop, `curl` or `flock` can wait
 # up to its configured timeout. `SIGKILL` cannot be caught and can leave
 # the UDP containers stopped. For both HTTP-only and UDP deployments,
 # the script defers these signals during the route switch and image-state
@@ -338,17 +339,15 @@ main() {
     --env-file "$env_file" --env "ADDR=:$port"
     "${publish[@]}"
     "$image")
-  # Running containers that the script stops before the replacement starts
-  # (only for a service with UDP ports), and starts again when the
-  # replacement fails.
+  # The name check passed. The trap expands the restart list when it runs.
+  # Keep the list empty through creation so cleanup touches only the
+  # replacement. For UDP, fill the list when the stop phase begins.
   local -a stopped=()
   local proxy_lock_fd=""
+  trap 'interrupted TERM "$new" "$replacement_stop_timeout" "${stopped[@]}"' TERM
+  trap 'interrupted INT "$new" "$replacement_stop_timeout" "${stopped[@]}"' INT
+  trap 'interrupted HUP "$new" "$replacement_stop_timeout" "${stopped[@]}"' HUP
   if (( ${#publish[@]} == 0 )); then
-    # The name check passed. Clean up the replacement if a signal arrives
-    # before the route switch.
-    trap 'interrupted TERM "$new" "$replacement_stop_timeout"' TERM
-    trap 'interrupted INT "$new" "$replacement_stop_timeout"' INT
-    trap 'interrupted HUP "$new" "$replacement_stop_timeout"' HUP
     echo "Start $new as $upstream"
     # A failed `docker run` can leave a created container that did not start
     # (for example an OCI runtime or entrypoint error). `set -e` would end the
@@ -362,20 +361,13 @@ main() {
       fail "$new did not pass the health check; $previous_serving."
     fi
   else
-    stopped=("${running[@]}")
     echo "Create $new as $upstream with the UDP ports $udp_ports"
     # No container is stopped yet, so the previous containers keep serving.
     if ! docker create "${create[@]}" > /dev/null; then
       discard_replacement "$new" "$replacement_stop_timeout"
       fail "$new was not created; the previous containers keep serving."
     fi
-    # From the first stop until the route switch, a signal restores the
-    # previous containers (see `interrupted`). Bash expands the quoted trap
-    # text when the signal arrives, in the frame of the running command, so
-    # `$new` and `stopped` are the values of this deployment.
-    trap 'interrupted TERM "$new" "$replacement_stop_timeout" "${stopped[@]}"' TERM
-    trap 'interrupted INT "$new" "$replacement_stop_timeout" "${stopped[@]}"' INT
-    trap 'interrupted HUP "$new" "$replacement_stop_timeout" "${stopped[@]}"' HUP
+    stopped=("${running[@]}")
     for running_id in "${stopped[@]}"; do
       echo "Stop the previous container $running_id to free the UDP ports"
       if ! docker stop --time "$stop_timeout" "$running_id" > /dev/null; then
@@ -800,10 +792,10 @@ signal_number() {
 }
 
 # Handles signals before the route switch. The arguments are the signal name,
-# the replacement, its stop timeout and, for UDP, the containers that were
-# running. The handler releases the proxy lock if held. It ignores further
-# signals while it discards the replacement and restarts any previous
-# containers passed by the caller.
+# the replacement, its stop timeout and, after the UDP stop phase begins,
+# the containers that were running. The handler releases the proxy lock if
+# held. It ignores further signals while it discards the replacement and
+# restarts any previous containers passed by the caller.
 # Starting a container that already runs is a no-op, so recovery also works
 # partway through the UDP stop loop. The handler exits with 128 plus the
 # signal number.
