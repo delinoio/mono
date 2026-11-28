@@ -71,11 +71,14 @@ func newGuest(t *testing.T, link netpolicy.Link, mac net.HardwareAddr, conn net.
 			if pkt == nil {
 				return
 			}
-			frame := pkt.ToView().AsSlice()
+			view := pkt.ToView()
 			pkt.DecRef()
+			payload := view.AsSlice()
 			var hdr [4]byte
-			binary.BigEndian.PutUint32(hdr[:], uint32(len(frame)))
-			if _, err := conn.Write(append(hdr[:], frame...)); err != nil {
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+			frame := append(hdr[:], payload...)
+			view.Release()
+			if _, err := conn.Write(frame); err != nil {
 				return
 			}
 		}
