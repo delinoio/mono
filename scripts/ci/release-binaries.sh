@@ -676,7 +676,7 @@ github_releases() {
         gh release upload "$tag" --repo "$REPOSITORY" --clobber "${files[@]}" < /dev/null
       fi
       if [[ "$draft" == true ]]; then
-        gh release edit "$tag" --repo "$REPOSITORY" --draft=false < /dev/null
+        gh release edit "$tag" --repo "$REPOSITORY" --draft=false --latest=false < /dev/null
       fi
     else
       notes="Release of \`$name\` $version from $SHA. See [the changelog](https://github.com/$REPOSITORY/blob/$name%40$version/$dir/CHANGELOG.md). Verify the downloads with \`SHA256SUMS\`."
