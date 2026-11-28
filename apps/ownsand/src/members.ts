@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useInfiniteQuery } from "@connectrpc/connect-query";
+import {
+  createConnectQueryKey,
+  useInfiniteQuery,
+  useTransport,
+} from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
 import type { Member } from "@delino/ownsand-protos/v1/member_pb";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { useMemo } from "react";
-import type { BoundaryQuery } from "./components/ui.tsx";
+import { type BoundaryQuery, isTerminalError } from "./components/ui.tsx";
 import {
   type FollowedPages,
   FOLLOW_ALL_PAGES_OPTIONS,
@@ -21,6 +26,8 @@ export interface MembersResult extends FollowedPages {
   isLoaded: boolean;
   /** Whether a request of the entry is running now. */
   isFetching: boolean;
+  /** Reads a member from the current cache for an action. */
+  getCurrentMember: (userId: string) => Member | undefined;
   /** Reads every page again from the first one. */
   refetch: () => Promise<unknown>;
 }
@@ -38,14 +45,15 @@ export interface MembersResult extends FollowedPages {
  * how transient and terminal errors affect the list.
  */
 export function useMembers(organizationId: string): MembersResult {
-  const query = useInfiniteQuery(
-    MemberService.method.listMembers,
-    { organizationId, pageSize: 200, pageToken: "" },
-    {
-      ...FOLLOW_ALL_PAGES_OPTIONS,
-      getNextPageParam: (last) => last.nextPageToken || undefined,
-    },
-  );
+  const queryClient = useQueryClient();
+  const transport = useTransport();
+  const input = { organizationId, pageSize: 200, pageToken: "" };
+  const schema = MemberService.method.listMembers;
+  const query = useInfiniteQuery(schema, input, {
+    ...FOLLOW_ALL_PAGES_OPTIONS,
+    transport,
+    getNextPageParam: (last) => last.nextPageToken || undefined,
+  });
   const pages = useFollowAllPages(query);
   const { data } = query;
 
@@ -66,6 +74,25 @@ export function useMembers(organizationId: string): MembersResult {
     isLoaded: data !== undefined,
     isFetching: query.isFetching,
     ...pages,
+    getCurrentMember: (userId) => {
+      // An action can run after the cache changes and before React updates the UI.
+      const state = queryClient.getQueryState(
+        createConnectQueryKey({
+          schema,
+          input,
+          transport,
+          cardinality: "infinite",
+          pageParamKey: FOLLOW_ALL_PAGES_OPTIONS.pageParamKey,
+        }),
+      );
+      if (isTerminalError(state?.error)) return undefined;
+      // As in uniqueRows, the last occurrence wins when a member spans pages.
+      for (const page of state?.data?.pages.toReversed() ?? []) {
+        const member = page.members.findLast((row) => row.userId === userId);
+        if (member !== undefined) return member;
+      }
+      return undefined;
+    },
     refetch: () => query.refetch(),
   };
 }

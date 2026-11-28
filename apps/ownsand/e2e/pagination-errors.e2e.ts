@@ -876,3 +876,87 @@ describe("device inventory pagination", () => {
     },
   );
 });
+
+describe("member removal roster refresh", () => {
+  for (const reason of ["missing", "owner"] as const) {
+    refreshTest(
+      `dismisses confirmation when the target is ${reason}`,
+      async ({ app, browser, refresh, screen }) => {
+        await refresh.open("members", "ListMembers", "RemoveMember");
+        const dialog = screen.getByRole("alertdialog");
+        const remove = screen.getByRole("button", "Remove Jun Park", {
+          exact: true,
+        });
+        const jun = screen
+          .getByRole("listitem")
+          .filter({ hasText: "Jun Park" });
+        const requests = () =>
+          browser.evaluate(() =>
+            (
+              JSON.parse(
+                sessionStorage.getItem(
+                  "ownsand-e2e-resource-mutation-inputs",
+                ) ?? "[]",
+              ) as string[]
+            ).map((request) => JSON.parse(request)),
+          );
+        const changeRoster = (
+          change: "missing" | "owner" | "paginate" | "restore",
+        ) =>
+          browser.evaluate(async (mode) => {
+            const userId = "user-admin-jun";
+            if (mode === "paginate")
+              sessionStorage.setItem("ownsand-e2e-deferred-member", userId);
+            if (mode === "missing")
+              sessionStorage.setItem("ownsand-e2e-excluded-member", userId);
+            if (mode === "owner")
+              sessionStorage.setItem("ownsand-e2e-roster-owner", userId);
+            if (mode === "restore") {
+              sessionStorage.removeItem("ownsand-e2e-excluded-member");
+              sessionStorage.removeItem("ownsand-e2e-roster-owner");
+            }
+            const now = Date.now;
+            Date.now = () => now() + 11_000;
+            try {
+              window.dispatchEvent(new Event("visibilitychange"));
+              await Promise.resolve();
+            } finally {
+              Date.now = now;
+            }
+            return true;
+          }, change);
+
+        if (reason === "missing") {
+          await changeRoster("paginate");
+          await expect(
+            screen.getByRole("list", "Members").getByRole("listitem").last(),
+          ).toHaveText(/Jun Park/);
+        }
+        await remove.tap();
+        await expect(dialog).toHaveText(/Remove Jun Park\?/);
+        await app.screenshot(`member-removal-${reason}-before`);
+
+        await changeRoster(reason);
+        await expect(dialog).toBeHidden();
+        if (reason === "owner") {
+          await expect(jun.getByText("Owner")).toBeVisible();
+        } else {
+          await expect(jun).toHaveCount(0);
+        }
+        expect(await requests()).toEqual([]);
+        await app.screenshot(`member-removal-${reason}-dismissed`);
+
+        await changeRoster("restore");
+        await expect(remove).toBeVisible();
+        await expect(dialog).toBeHidden();
+        await remove.tap();
+        await dialog.getByRole("button", "Remove member").tap();
+        await expect(jun).toHaveCount(0);
+        await expect(dialog).toBeHidden();
+        expect(await requests()).toEqual([
+          { organizationId: ACME, userId: "user-admin-jun" },
+        ]);
+      },
+    );
+  }
+});

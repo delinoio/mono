@@ -74,7 +74,7 @@ export function MembersPage() {
   // organization, so a refetch of its member and organization queries would
   // fail with `not_found` and render that error before the navigation.
   const leave = useMutation(MemberService.method.removeMember);
-  const [removing, setRemoving] = useState<Member>();
+  const [removingUserId, setRemovingUserId] = useState<string>();
   const [leaving, setLeaving] = useState(false);
   const canLeave = !!userId && can(role, Permission.LeaveOrganization);
 
@@ -82,8 +82,21 @@ export function MembersPage() {
     setLeaving(false);
   }
 
-  if (isTerminalError(members.error) && removing !== undefined) {
-    setRemoving(undefined);
+  const removing = members.members.find((m) => m.userId === removingUserId);
+  const canRemove =
+    removing !== undefined && canManageMember(role, userId, removing);
+  const terminalMembersError = isTerminalError(members.error);
+  const hasCompleteRoster =
+    members.isLoaded &&
+    !members.isFetching &&
+    !members.isIncomplete &&
+    members.error === null;
+  if (
+    removingUserId !== undefined &&
+    (terminalMembersError ||
+      (removing !== undefined ? !canRemove : hasCompleteRoster))
+  ) {
+    setRemovingUserId(undefined);
   }
 
   return (
@@ -160,7 +173,7 @@ export function MembersPage() {
                           aria-label={t("members.removeNamed", {
                             name: displayName(m),
                           })}
-                          onClick={() => setRemoving(m)}
+                          onClick={() => setRemovingUserId(m.userId)}
                         >
                           {t("members.remove")}
                         </Button>
@@ -180,18 +193,25 @@ export function MembersPage() {
       </QueryBoundary>
       {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
       <ConfirmDialog
-        open={removing !== undefined}
-        onOpenChange={(open) => !open && setRemoving(undefined)}
+        open={canRemove && !terminalMembersError}
+        onOpenChange={(open) => !open && setRemovingUserId(undefined)}
         title={t("members.removeDialog.title", {
           name: removing ? displayName(removing) : "",
         })}
         description={t("members.removeDialog.description")}
         confirmLabel={t("members.removeDialog.confirm")}
         onConfirm={async () => {
-          if (!removing) return;
+          if (removingUserId === undefined) return false;
+          const current = members.getCurrentMember(removingUserId);
+          if (
+            current === undefined ||
+            !canManageMember(role, userId, current)
+          ) {
+            return false;
+          }
           await removeMember.mutateAsync({
             organizationId,
-            userId: removing.userId,
+            userId: current.userId,
           });
         }}
       />
