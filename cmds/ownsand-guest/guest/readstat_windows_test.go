@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // longDrivePath returns a drive path of at least 270 bytes below root, built
@@ -95,16 +97,24 @@ func TestExtendedPathReadSuffixes(t *testing.T) {
 	}
 }
 
-func TestExtendedPathRelative(t *testing.T) {
-	// A short relative path in a short working directory keeps its form.
-	t.Chdir(t.TempDir())
-	if got := extendedPath(`sub\file`); got != `sub\file` {
-		t.Fatalf("short relative path changed to %q", got)
+// Not parallel: t.Chdir changes the process working directory.
+func TestExtendedPathRelative(t *testing.T) { //nolint:paralleltest // Changes the process working directory.
+	systemDir, err := windows.GetSystemWindowsDirectory()
+	if err != nil {
+		t.Fatalf("get system Windows directory: %v", err)
+	}
+	// The drive root keeps the resolved short path below the conversion limit
+	// regardless of the configured temp directory.
+	driveRoot := filepath.VolumeName(systemDir) + `\`
+	t.Chdir(driveRoot)
+	short := `sub\file`
+	if got := extendedPath(short); got != short {
+		t.Fatalf("extendedPath(%q) = %q, want %q", short, got, short)
 	}
 	long := strings.Repeat("r", 250)
-	got := extendedPath(long)
-	if !strings.HasPrefix(got, `\\?\`) || !strings.HasSuffix(got, `\`+long) {
-		t.Fatalf("long relative path became %q", got)
+	want := `\\?\` + driveRoot + long
+	if got := extendedPath(long); got != want {
+		t.Fatalf("extendedPath(%q) = %q, want %q", long, got, want)
 	}
 }
 
