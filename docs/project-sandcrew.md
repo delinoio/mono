@@ -22,7 +22,7 @@ A `planned` path changes to an actual path in the change that creates it, togeth
 
 - `servers/sandcrew-api/` (`planned`): Go control plane on the shared DigitalOcean Droplet, served at `https://sandcrew.api.delino.io`. It owns sessions, transcripts, vendor credentials, session secrets, the organization settings of SandCrew, the event collector and Web Push notifications.
 - `apps/sandcrew/` (`planned`): Rsbuild React web console (workspace package `sandcrew-console`) served at `https://sandcrew.delino.io`.
-- `cmds/sandcrew-bridge/` (`planned`): Go guest program (the bridge) that SandCrew copies into each session sandbox. It starts the vendor agent, speaks ACP with it over local stdio, reads input from an inbox directory and writes normalized events.
+- `cmds/sandcrew-bridge/`: Go guest program (the bridge) that SandCrew copies into each session sandbox. It starts the vendor agent, speaks ACP with it over local stdio, reads input from an inbox directory and writes normalized events.
 - `protos/delino/sandcrew/`: the workspace package `@delino/sandcrew-protos` with the Connect RPC schemas and the bridge event schema in `v1/`, the committed Go bindings and the committed TypeScript bindings. The bridge schema exists; the Connect RPC schemas are added with the control plane.
 
 The project has one hosted server deployable (the control plane), one static site (the console) and one distributed program (the bridge, which SandCrew distributes itself into session sandboxes). The project has no `crates` or `packages` paths.
@@ -155,7 +155,7 @@ Record each decision in the owning domain contract before the implementation tha
 
 - Per-hypervisor verification of the memory-state save and restore after an agent restart and a host reboot (Firecracker, Virtualization.framework and Hyper-V). The [agent contract](cmds-ownsand-agent-foundation.md#memory-state-pause) records the result.
 - Whether a Codex `auth.json` refresh in one session invalidates the token in other sessions that use the same credential. The [bridge contract](cmds-sandcrew-bridge-foundation.md#credential-updates) records the result.
-- The vendor CLI and ACP adapter of each MVP vendor on each guest OS, their auto-approve modes, their `session/load` or `session/resume` support and the exact headless fallback commands. The [bridge contract](cmds-sandcrew-bridge-foundation.md#vendors) records them with the adapter implementation.
+- The exact headless fallback commands of a vendor without ACP. The [bridge contract](cmds-sandcrew-bridge-foundation.md#vendors) records them when such a vendor is added; it already records the ACP adapter of each MVP vendor, its guest OSes, its auto-approve and asking modes and its `session/load` and `session/resume` support.
 - Alert thresholds. The [control plane contract](servers-sandcrew-api-foundation.md#metrics-and-alerts) records them after internal usage data exists.
 - Every new third-party dependency (for example, a Web Push library or an R2 client). Each needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
 
