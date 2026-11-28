@@ -433,6 +433,26 @@ func TestStickyWriterKeepsFirstError(t *testing.T) {
 	}
 }
 
+func TestErrorAndWarningLinesEscapeControlCharacters(t *testing.T) {
+	const value = "café\x1b\x07\n\r\t\x7f\u0085\u202e\U000e0001\xff"
+	const escaped = "café\\x1b\\x07\\n\\r\\t\\x7f\\x85\\u202e\\U000e0001\\xff"
+	for _, color := range []bool{false, true} {
+		var stderr bytes.Buffer
+		a := &app{env: Env{Stderr: &stderr}, color: color}
+		a.errorf("read %s", value)
+		a.warnf("retry %s", value)
+		errorLabel, warningLabel := "error:", "warning:"
+		if color {
+			errorLabel = ansiRed + errorLabel + ansiReset
+			warningLabel = ansiYellow + warningLabel + ansiReset
+		}
+		want := errorLabel + " read " + escaped + "\n" + warningLabel + " retry " + escaped + "\n"
+		if got := stderr.String(); got != want {
+			t.Errorf("color %t: stderr = %q, want %q", color, got, want)
+		}
+	}
+}
+
 func TestSafeText(t *testing.T) {
 	for _, tc := range []struct{ name, in, want string }{
 		{"empty", "", ""},

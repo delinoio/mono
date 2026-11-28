@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -82,6 +83,52 @@ func TestLoginPromptWriteSuccessKeepsPolling(t *testing.T) {
 	lg.mu.Unlock()
 	if polls == 0 {
 		t.Fatal("login did not poll the token endpoint")
+	}
+}
+
+func TestLoginPromptEscapesLogtoValues(t *testing.T) {
+	for _, tc := range []struct {
+		name, completeURI, wantURI string
+		color                      bool
+	}{
+		{"fallback URI", "", "https://login.example/device\\n", false},
+		{"complete URI", "https://login.example/complete\r", "https://login.example/complete\\r", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			delete(r.env, ownsand.EnvAPIKey)
+			body := fmt.Sprintf(
+				"{\"device_code\":\"dev-secret\",\"user_code\":\"ABCD\\tEFGH\",\"verification_uri\":\"https://login.example/device\\n\",\"verification_uri_complete\":%q,\"expires_in\":60,\"interval\":0}",
+				tc.completeURI,
+			)
+			lg := &fakeLogto{deviceAuthorizationBody: body}
+			ls := httptest.NewServer(lg.handler(t))
+			defer ls.Close()
+			r.env[EnvLogtoEndpoint] = ls.URL
+			r.env[EnvLogtoAppID] = "app"
+
+			args := []string{"login"}
+			code := "ABCD\\tEFGH"
+			wantURI := tc.wantURI
+			if tc.color {
+				wantURI = ansiBold + wantURI + ansiReset
+				code = ansiBold + code + ansiReset
+			} else {
+				args = append(args, "--no-color")
+			}
+			want := fmt.Sprintf("Open %s in a browser and enter the code %s to sign in.", wantURI, code)
+			res := r.run(args...)
+			prompt, _, _ := strings.Cut(res.stderr, "\n")
+			if res.code != ExitOK || prompt != want {
+				t.Fatalf("login: exit %d, stderr %q, want prompt %q", res.code, res.stderr, want)
+			}
+			lg.mu.Lock()
+			polls := lg.polls
+			lg.mu.Unlock()
+			if polls != 3 {
+				t.Fatalf("token polls = %d, want 3", polls)
+			}
+		})
 	}
 }
 
