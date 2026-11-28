@@ -32,14 +32,14 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// Environment of the opt-in integration test. It boots real microVMs and
-// needs /dev/kvm access, a firecracker binary, a guest kernel and a root
-// file system from cmds/ownsand-agent/images/linux/. It uses NONE network
-// sandboxes, so it needs no root.
+// The opt-in tests boot real microVMs with NONE network. They need /dev/kvm
+// access, a Firecracker binary, a guest kernel and separate root file systems
+// from cmds/ownsand-agent/images/linux/. They need no root privileges.
 const (
-	envBinary = "OWNSAND_FC_TEST_BINARY"
-	envKernel = "OWNSAND_FC_TEST_KERNEL"
-	envRootfs = "OWNSAND_FC_TEST_ROOTFS"
+	envBinary           = "OWNSAND_FC_TEST_BINARY"
+	envKernel           = "OWNSAND_FC_TEST_KERNEL"
+	envLifecycleRootfs  = "OWNSAND_FC_TEST_ROOTFS"
+	envDiskSizingRootfs = "OWNSAND_FC_TEST_DISK_SIZING_ROOTFS"
 )
 
 const orgID = "0192f4b6-7c3a-7def-8abc-0123456789ab"
@@ -270,17 +270,17 @@ func TestRequireExplicitExecSuccess(t *testing.T) {
 }
 
 func TestFirecrackerIntegration(t *testing.T) {
-	testFirecrackerIntegration(t, false)
+	testFirecrackerIntegration(t, envLifecycleRootfs, false)
 }
 
 func TestFirecrackerLinuxBaseDiskSizing(t *testing.T) {
-	testFirecrackerIntegration(t, true)
+	testFirecrackerIntegration(t, envDiskSizingRootfs, true)
 }
 
-func testFirecrackerIntegration(t *testing.T, diskSizing bool) {
-	binary, kernel, rootfs := os.Getenv(envBinary), os.Getenv(envKernel), os.Getenv(envRootfs)
+func testFirecrackerIntegration(t *testing.T, rootfsEnv string, diskSizing bool) {
+	binary, kernel, rootfs := os.Getenv(envBinary), os.Getenv(envKernel), os.Getenv(rootfsEnv)
 	if binary == "" || kernel == "" || rootfs == "" {
-		t.Skipf("set %s, %s and %s to boot real microVMs", envBinary, envKernel, envRootfs)
+		t.Skipf("set %s, %s and %s to boot real microVMs", envBinary, envKernel, rootfsEnv)
 	}
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	if os.Getenv("OWNSAND_TEST_VERBOSE") != "" {
@@ -422,14 +422,21 @@ func (e *env) checkBaseDiskSizing(rt vmruntime.Runtime, rootfs, vmsDir string) {
 		entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
 		e.t.Fatalf("undersized create: entry %v, error %v", entry, err)
 	}
-	if e.m.Busy() {
-		e.t.Fatal("undersized create left an active sandbox")
-	}
 	if ids, err := rt.Running(ctx); err != nil || len(ids) != 0 {
 		e.t.Fatalf("running VMs after undersized create: %v, error %v", ids, err)
 	}
 	if _, err := os.Stat(filepath.Join(vmsDir, cmd.GetSandboxId())); !errors.Is(err, os.ErrNotExist) {
 		e.t.Fatalf("undersized create left a VM directory: %v", err)
+	}
+	// Tick starts cleanup in the background. Busy reports the pending cleanup
+	// until it finishes.
+	e.m.Tick(ctx, false)
+	cleanupDeadline := time.Now().Add(5 * time.Second)
+	for e.m.Busy() && time.Now().Before(cleanupDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if e.m.Busy() {
+		e.t.Fatal("undersized create left an active sandbox")
 	}
 	for _, diskGiB := range []int64{2, 3} {
 		cmd := createCommand("", 256, diskGiB, false)
