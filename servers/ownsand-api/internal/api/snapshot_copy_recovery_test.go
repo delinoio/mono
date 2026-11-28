@@ -111,18 +111,21 @@ func stateReportLogs(t *testing.T, env *testenv.Env, deviceID string) []int {
 	return out
 }
 
-// reportAndWait sends a state report of agent and waits until the server
-// logged it as applied. It returns the recovered copy count of that report.
-//
-// The control plane marks a channel live before it logs the startup report, so
-// the helper first waits for that startup entry. Without it the baseline could
-// be taken before the startup entry is logged, and the startup entry would then
-// satisfy the wait for the explicit report. The channel handles reports one at
-// a time, so the startup entry always precedes the explicit one.
+// waitForStartupReportLog waits for the device's startup report log and returns
+// the count of reports already logged. The channel becomes live before the
+// startup report is logged, so channel readiness alone cannot establish the
+// baseline for an explicit report.
+func waitForStartupReportLog(t *testing.T, env *testenv.Env, deviceID string) int {
+	t.Helper()
+	testenv.Eventually(t, "startup state report applied", func() bool { return len(stateReportLogs(t, env, deviceID)) > 0 })
+	return len(stateReportLogs(t, env, deviceID))
+}
+
+// reportAndWait sends a state report of agent and returns its recovered copy
+// count once the server logs the report.
 func reportAndWait(t *testing.T, env *testenv.Env, agent *testenv.FakeAgent) int {
 	t.Helper()
-	testenv.Eventually(t, "startup state report applied", func() bool { return len(stateReportLogs(t, env, agent.Device.ID)) > 0 })
-	before := len(stateReportLogs(t, env, agent.Device.ID))
+	before := waitForStartupReportLog(t, env, agent.Device.ID)
 	agent.SendStateReport()
 	testenv.Eventually(t, "explicit state report applied", func() bool { return len(stateReportLogs(t, env, agent.Device.ID)) > before })
 	logs := stateReportLogs(t, env, agent.Device.ID)
@@ -323,13 +326,15 @@ func waitLockWaiters(t *testing.T, env *testenv.Env, want int) {
 // it in both orders.
 func TestStateReportCopyRecoveryCommitOrder(t *testing.T) {
 	t.Parallel()
-	setup := func(t *testing.T) (*testenv.Env, *testenv.Org, *testenv.FakeAgent, string, pgx.Tx) {
+	setup := func(t *testing.T) (*testenv.Env, *testenv.Org, *testenv.FakeAgent, string, pgx.Tx, int) {
+		t.Helper()
 		env := testenv.New(t)
 		org := env.NewOrg("alice")
 		_, _ = setupAgent(t, env, org, nil)
 		snapID := exportedSnapshot(t, org)
 		_, agent2 := setupAgent(t, env, org, nil)
 		agent2.AddSnapshot(readySnapshotEntry(snapID))
+		before := waitForStartupReportLog(t, env, agent2.Device.ID)
 		tx, err := env.DB.Pool.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -338,7 +343,7 @@ func TestStateReportCopyRecoveryCommitOrder(t *testing.T) {
 		if _, err := tx.Exec(context.Background(), "SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR UPDATE", snapID); err != nil {
 			t.Fatal(err)
 		}
-		return env, org, agent2, snapID, tx
+		return env, org, agent2, snapID, tx, before
 	}
 	deleteSnapshot := func(org *testenv.Org, snapID string) chan error {
 		done := make(chan error, 1)
@@ -350,8 +355,7 @@ func TestStateReportCopyRecoveryCommitOrder(t *testing.T) {
 	}
 
 	t.Run("report commits first", func(t *testing.T) {
-		env, org, agent2, snapID, tx := setup(t)
-		before := len(stateReportLogs(t, env, agent2.Device.ID))
+		env, org, agent2, snapID, tx, before := setup(t)
 		agent2.SendStateReport()
 		waitLockWaiters(t, env, 1)
 		done := deleteSnapshot(org, snapID)
@@ -377,8 +381,7 @@ func TestStateReportCopyRecoveryCommitOrder(t *testing.T) {
 	})
 
 	t.Run("deletion commits first", func(t *testing.T) {
-		env, org, agent2, snapID, tx := setup(t)
-		before := len(stateReportLogs(t, env, agent2.Device.ID))
+		env, org, agent2, snapID, tx, before := setup(t)
 		done := deleteSnapshot(org, snapID)
 		waitLockWaiters(t, env, 1)
 		agent2.SendStateReport()
