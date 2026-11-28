@@ -3,6 +3,7 @@
 package sandruntest
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -525,6 +526,61 @@ func normalizeListProfileID(value string) (string, error) {
 	return id.String(), nil
 }
 
+type requestSortGroup uint8
+
+const (
+	requestSortOpen requestSortGroup = iota
+	requestSortUnknown
+	requestSortTerminal
+)
+
+func listRequestGroup(state sandrunv1.RequestState) requestSortGroup {
+	if slices.Contains(openRequestStates, state) {
+		return requestSortOpen
+	}
+	if terminalRequest(state) {
+		return requestSortTerminal
+	}
+	return requestSortUnknown
+}
+
+// compareRequestTimes orders timestamps ascending with missing values last.
+func compareRequestTimes(a, b *timestamppb.Timestamp) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return 1
+	case b == nil:
+		return -1
+	default:
+		return a.AsTime().Compare(b.AsTime())
+	}
+}
+
+// compareListRequests follows the production WorkService query order.
+func compareListRequests(a, b *sandrunv1.Request) int {
+	group := listRequestGroup(a.GetState())
+	if order := cmp.Compare(group, listRequestGroup(b.GetState())); order != 0 {
+		return order
+	}
+	switch group {
+	case requestSortOpen:
+		if order := cmp.Compare(a.GetPriority(), b.GetPriority()); order != 0 {
+			return order
+		}
+		if order := compareRequestTimes(a.GetQueuedAt(), b.GetQueuedAt()); order != 0 {
+			return order
+		}
+	case requestSortTerminal:
+		// Descending end time puts missing values first.
+		if order := compareRequestTimes(b.GetEndedAt(), a.GetEndedAt()); order != 0 {
+			return order
+		}
+	}
+	return cmp.Compare(a.GetRequestId(), b.GetRequestId())
+}
+
 func (w *workService) ListRequests(_ context.Context, req *connect.Request[sandrunv1.ListRequestsRequest]) (*connect.Response[sandrunv1.ListRequestsResponse], error) {
 	m := req.Msg
 	w.s.mu.Lock()
@@ -557,6 +613,7 @@ func (w *workService) ListRequests(_ context.Context, req *connect.Request[sandr
 		}
 		mine = append(mine, r)
 	}
+	slices.SortStableFunc(mine, compareListRequests)
 	items, next, err := page(mine, m.GetPageSize(), m.GetPageToken())
 	if err != nil {
 		return nil, err
