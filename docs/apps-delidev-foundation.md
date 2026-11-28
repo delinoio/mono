@@ -87,6 +87,7 @@ Prerequisites:
 - The [Tauri prerequisites](https://v3.tauri.app/start/prerequisites/) of the host operating system.
 - Linux: `pkg-config` and `libgtk-4-dev`. Tauri and `tauri-runtime-cef` use GTK 4 with CEF; the app does not need `libgtk-3-dev` or `libwebkit2gtk-4.1-dev`. To run the app, the host must allow the Chromium sandbox (see [Security](#security)).
 - macOS and Windows: CMake and Ninja, for the CEF C++ wrapper.
+- macOS: The pinned CEF runtime requires macOS 13.0 on Apple Silicon and Intel. The app bundle and the copy inside the DMG declare the same minimum. Recheck the minimum when the CEF pin changes.
 - About 1 GB of disk space for the CEF distribution, which the first build downloads.
 - Android: Android SDK, NDK and the Rust Android targets. iOS: macOS with Xcode and the Rust iOS targets.
 
