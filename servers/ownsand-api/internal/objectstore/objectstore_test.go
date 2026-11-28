@@ -91,6 +91,76 @@ func TestPresignExpiryMatchesSignedValues(t *testing.T) {
 	}
 }
 
+func TestPresignLifetimeBounds(t *testing.T) {
+	t.Parallel()
+
+	const invalidLifetime = "objectstore: invalid signed URL lifetime"
+	signedAt := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	r := &R2{
+		Endpoint:        "https://acct.r2.cloudflarestorage.com",
+		Bucket:          "snapshots",
+		AccessKeyID:     "k",
+		SecretAccessKey: "s",
+		Now:             func() time.Time { return signedAt.Add(900 * time.Millisecond) },
+	}
+	for _, method := range []struct {
+		name string
+		sign func(key string, ttl time.Duration) (string, time.Time, error)
+	}{
+		{"put", r.PresignPut},
+		{"get", r.PresignGet},
+	} {
+		t.Run(method.name, func(t *testing.T) {
+			for _, ttl := range []time.Duration{
+				-time.Second,
+				-time.Nanosecond,
+				0,
+				time.Nanosecond,
+				500 * time.Millisecond,
+				time.Second - time.Nanosecond,
+				7*24*time.Hour + time.Nanosecond,
+				8 * 24 * time.Hour,
+			} {
+				t.Run(ttl.String(), func(t *testing.T) {
+					signed, expiry, err := method.sign("k", ttl)
+					if err == nil || err.Error() != invalidLifetime || signed != "" || !expiry.IsZero() {
+						t.Fatalf("presign = (%q, %v, %v), want empty URL, zero expiry, and error %q", signed, expiry, err, invalidLifetime)
+					}
+				})
+			}
+			for _, tc := range []struct {
+				ttl         time.Duration
+				wantSeconds int64
+			}{
+				{time.Second, 1},
+				{time.Second + 999*time.Millisecond, 1},
+				{7 * 24 * time.Hour, 604800},
+			} {
+				t.Run(tc.ttl.String(), func(t *testing.T) {
+					signed, expiry, err := method.sign("k", tc.ttl)
+					if err != nil {
+						t.Fatal(err)
+					}
+					u, err := url.Parse(signed)
+					if err != nil {
+						t.Fatal(err)
+					}
+					q := u.Query()
+					if got := q.Get("X-Amz-Date"); got != "20260102T120000Z" {
+						t.Errorf("X-Amz-Date = %q, want 20260102T120000Z", got)
+					}
+					if got, want := q.Get("X-Amz-Expires"), strconv.FormatInt(tc.wantSeconds, 10); got != want {
+						t.Errorf("X-Amz-Expires = %q, want %q", got, want)
+					}
+					if want := signedAt.Add(time.Duration(tc.wantSeconds) * time.Second); !expiry.Equal(want) {
+						t.Errorf("expiry = %v, want %v", expiry, want)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestPathStyleKey(t *testing.T) {
 	r := &R2{Endpoint: "https://acct.r2.cloudflarestorage.com", Bucket: "snapshots", AccessKeyID: "k", SecretAccessKey: "s", Now: func() time.Time { return time.Unix(0, 0) }}
 	signed, _, err := r.PresignPut("organizations/o/snapshots/s/parts/1", 15*time.Minute)

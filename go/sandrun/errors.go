@@ -34,9 +34,9 @@ type PathSize struct {
 }
 
 // LimitError reports a sync or download that breaks a transfer limit. The
-// SDK returns it before the transfer starts, or during a download as soon as
-// an archive entry breaks a limit. It is wrapped in a *connect.Error with
-// the code failed_precondition, so connect.CodeOf works on it.
+// SDK returns it before a transfer starts or when a download exceeds a limit
+// during reading or extraction. The SDK wraps it in a *connect.Error with the
+// code failed_precondition, so connect.CodeOf works on it.
 type LimitError struct {
 	// Operation is "sync" or "download".
 	Operation string

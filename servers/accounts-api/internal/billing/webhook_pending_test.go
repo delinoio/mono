@@ -64,31 +64,38 @@ func TestAdjustmentBeforePurchaseMatchesGrantFirst(t *testing.T) {
 			f := newFixture(t)
 			control, late := f.account(), f.account()
 
-			f.webhook(paddle.EventTransactionCompleted, purchase("txn_control", control, tc.kind, tc.cents))
-			f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_control", "refund", "approved", "txn_control", 400))
+			delivery := 0
+			deliverOK := func(eventType string, data any) {
+				t.Helper()
+				delivery++
+				if code := f.webhook(eventType, data); code != http.StatusOK {
+					t.Fatalf("delivery %d (%s) returned HTTP %d, want HTTP %d", delivery, eventType, code, http.StatusOK)
+				}
+			}
+
+			deliverOK(paddle.EventTransactionCompleted, purchase("txn_control", control, tc.kind, tc.cents))
+			deliverOK(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_control", "refund", "approved", "txn_control", 400))
 
 			// The adjustment arrives first. Its notification is acknowledged,
 			// remembered and has no balance effect yet.
-			if code := f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400)); code != http.StatusOK {
-				t.Fatal(code)
-			}
+			deliverOK(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400))
 			if f.pendingCount() != 1 || f.refundCount() != 1 {
 				t.Fatalf("pending %d, refunds %d", f.pendingCount(), f.refundCount())
 			}
 			f.wantLedger(late)
 			// Paddle repeats the adjustment, and sends it as updated too.
-			f.webhook(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400))
-			f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400))
+			deliverOK(paddle.EventAdjustmentCreated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400))
+			deliverOK(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400))
 			if f.pendingCount() != 1 {
 				t.Fatalf("pending rows = %d, want 1", f.pendingCount())
 			}
 
 			data := purchase("txn_late", late, tc.kind, tc.cents)
 			for range 3 {
-				f.webhook(paddle.EventTransactionCompleted, data)
+				deliverOK(paddle.EventTransactionCompleted, data)
 			}
 			// Adjustments that follow the grant are no-ops.
-			f.webhook(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400))
+			deliverOK(paddle.EventAdjustmentUpdated, paddletest.Adjustment("adj_late", "refund", "approved", "txn_late", 400))
 
 			f.wantLedger(control, tc.want...)
 			f.wantLedger(late, tc.want...)
