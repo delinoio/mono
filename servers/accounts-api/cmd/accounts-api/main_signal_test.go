@@ -381,20 +381,20 @@ func (h *helperProcess) finished() bool {
 
 func (h *helperProcess) waitForListenerClosure() {
 	h.t.Helper()
-	// server_shutdown_started is logged just before the server closes its
-	// listeners. A failed dial proves that the public listener is closed.
+	// Shutdown logs server_shutdown_started before closing its listeners.
 	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err := net.DialTimeout("tcp", h.addr, time.Second)
+	dialer := net.Dialer{Deadline: deadline, Timeout: listenerProbeTimeout}
+	for time.Now().Before(deadline) {
+		refused, err := probeTCPRefusal(h.addr, dialer.Dial)
 		if err != nil {
+			h.t.Fatalf("%v; helper output:\n%s", err, h.out.String())
+		}
+		if refused {
 			return
 		}
-		_ = conn.Close()
-		if time.Now().After(deadline) {
-			h.t.Fatalf("helper listener still accepts connections after shutdown started; output:\n%s", h.out.String())
-		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(min(10*time.Millisecond, time.Until(deadline)))
 	}
+	h.t.Fatalf("helper listener at %s still accepts connections after shutdown started; output:\n%s", h.addr, h.out.String())
 }
 
 // getAsync starts a GET and delivers the status code, or -1 on a client error.

@@ -310,16 +310,6 @@ func (r *backgroundRig) await(t *testing.T) error {
 	}
 }
 
-// publicRefusesConnections reports whether the public listener is closed.
-func (r *backgroundRig) publicRefusesConnections() bool {
-	conn, err := net.DialTimeout("tcp", r.publicAddr, time.Second)
-	if err == nil {
-		_ = conn.Close()
-		return false
-	}
-	return true
-}
-
 // permanentAcceptMetrics serves the metrics handler on a listener whose Accept
 // fails with errMetricsAccept, after the bind has succeeded.
 func permanentAcceptMetrics(t *testing.T) func(context.Context) error {
@@ -340,8 +330,15 @@ func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	if !errors.Is(err, errMetricsAccept) {
 		t.Fatalf("runServers error = %v; want the metrics Accept error", err)
 	}
-	if !rig.publicRefusesConnections() {
-		t.Error("public listener still accepts connections after runServers returned")
+	if !rig.workerStopped.Load() {
+		t.Error("runServers returned before the billing worker finished its in-progress work")
+	}
+	dialer := net.Dialer{Timeout: listenerProbeTimeout}
+	refused, err := probeTCPRefusal(rig.publicAddr, dialer.Dial)
+	if err != nil {
+		t.Errorf("after runServers returned: %v", err)
+	} else if !refused {
+		t.Errorf("public listener at %s still accepts connections after runServers returned", rig.publicAddr)
 	}
 	logs := rig.logs.String()
 	for _, want := range []string{"metrics_listener_failed", "server_shutdown_started", "server_shutdown_completed", errMetricsAccept.Error()} {
