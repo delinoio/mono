@@ -442,16 +442,18 @@ func TestLoadRejectsInvalidBillingValues(t *testing.T) {
 
 func TestLoadRejectsInvalidURLAndOriginHosts(t *testing.T) {
 	for name, tc := range map[string]struct{ env, value string }{
-		"issuer https port only":       {EnvLogtoIssuer, "https://:443/oidc"},
-		"issuer http port only":        {EnvLogtoIssuer, "http://:80"},
-		"management port only":         {EnvLogtoManagementEndpoint, "https://:443"},
-		"cors port only":               {EnvCORSOrigins, "https://:443"},
-		"cors port only in a list":     {EnvCORSOrigins, "https://accounts.delino.io, https://:443"},
-		"web origin port only":         {EnvWebOrigin, "https://:443"},
-		"web origin http port only":    {EnvWebOrigin, "http://:80"},
-		"cors empty bracketed address": {EnvCORSOrigins, "http://[]:80"},
-		"cors percent in host":         {EnvCORSOrigins, "https://exa%25mple.test"},
-		"web origin percent in host":   {EnvWebOrigin, "https://exa%25mple.test"},
+		"issuer https port only":             {EnvLogtoIssuer, "https://:443/oidc"},
+		"issuer http port only":              {EnvLogtoIssuer, "http://:80"},
+		"management port only":               {EnvLogtoManagementEndpoint, "https://:443"},
+		"cors port only":                     {EnvCORSOrigins, "https://:443"},
+		"cors port only in a list":           {EnvCORSOrigins, "https://valid.example, https://:443"},
+		"web origin port only":               {EnvWebOrigin, "https://:443"},
+		"web origin http port only":          {EnvWebOrigin, "http://:80"},
+		"cors empty bracketed address":       {EnvCORSOrigins, "http://[]:80"},
+		"cors percent in host":               {EnvCORSOrigins, "https://exa%25mple.test"},
+		"web origin percent in host":         {EnvWebOrigin, "https://exa%25mple.test"},
+		"web origin whitespace in host":      {EnvWebOrigin, "https://example.test\u00a0"},
+		"cors whitespace after valid origin": {EnvCORSOrigins, "https://valid.example, https://exam\u3000ple.test"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(lookupFrom(map[string]string{tc.env: tc.value}))
@@ -463,6 +465,11 @@ func TestLoadRejectsInvalidURLAndOriginHosts(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), ":443") || strings.Contains(err.Error(), ":80") {
 				t.Errorf("error %q contains the value", err)
+			}
+			for _, value := range strings.Split(tc.value, ", ") {
+				if strings.Contains(err.Error(), value) {
+					t.Errorf("error %q contains the configured URL %q", err, value)
+				}
 			}
 		})
 	}
@@ -486,8 +493,8 @@ func TestLoadKeepsLoopbackAndIPv6Hosts(t *testing.T) {
 
 func TestLoadCanonicalizesOrigins(t *testing.T) {
 	cfg, err := Load(lookupFrom(map[string]string{
-		EnvCORSOrigins: "HTTPS://Accounts.Delino.IO:443, http://Accounts.Delino.Localhost:80, https://accounts.delino.io:8443, http://localhost:443, https://[2001:DB8::1]:443",
-		EnvWebOrigin:   "HTTPS://Accounts.Delino.IO:443",
+		EnvCORSOrigins: "HTTPS://Accounts.Delino.IO:443, http://Accounts.Delino.Localhost:80, https://accounts.delino.io:8443, http://localhost:443, https://[2001:DB8::1]:443, \tHTTPS://XN--BCHER-KVA.EXAMPLE:443 \r",
+		EnvWebOrigin:   " \tHTTPS://XN--BCHER-KVA.EXAMPLE:443 \r",
 	}))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -498,12 +505,13 @@ func TestLoadCanonicalizesOrigins(t *testing.T) {
 		"https://accounts.delino.io:8443",
 		"http://localhost:443",
 		"https://[2001:db8::1]",
+		"https://xn--bcher-kva.example",
 	}
 	if !slices.Equal(cfg.CORSOrigins, want) {
 		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
 	}
-	if cfg.WebOrigin != "https://accounts.delino.io" {
-		t.Errorf("WebOrigin = %q, want %q", cfg.WebOrigin, "https://accounts.delino.io")
+	if want := "https://xn--bcher-kva.example"; cfg.WebOrigin != want {
+		t.Errorf("WebOrigin = %q, want %q", cfg.WebOrigin, want)
 	}
 }
 

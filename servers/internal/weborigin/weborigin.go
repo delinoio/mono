@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Canonical returns the serialized origin of u: the scheme, the host in the
@@ -29,14 +30,18 @@ import (
 // IPv4 spelling such as 127.1, 0x7f.1, 2130706433 or 0177.0.0.1 is stored as
 // 127.0.0.1, as a browser sends it. Such a host that is not an IPv4 address (for
 // example 1.2.3.4.5, 256.1.1.1 or example.1) is rejected, as browsers reject it.
-// A percent sign in the decoded domain is rejected. A non-ASCII host name
-// is only lower-cased: a browser sends it in its punycode form, so an
-// operator must configure that form.
+// A decoded hostname with Unicode whitespace or a domain with a percent sign
+// is rejected. Configure internationalized hostnames in Punycode to match the
+// form that browsers send.
 func Canonical(u *url.URL) (string, bool) {
-	if u == nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+	if u == nil || (u.Scheme != "https" && u.Scheme != "http") {
 		return "", false
 	}
-	host := strings.ToLower(u.Hostname())
+	host := u.Hostname()
+	if host == "" || strings.ContainsFunc(host, unicode.IsSpace) {
+		return "", false
+	}
+	host = strings.ToLower(host)
 	if strings.HasPrefix(u.Host, "[") || strings.Contains(host, ":") {
 		// url.URL.Hostname drops the brackets, so u.Host tells an IPv6 literal from an IPv4 host.
 		addr, ok := serializeIPv6(host)
