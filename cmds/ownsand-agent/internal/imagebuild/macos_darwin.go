@@ -243,10 +243,9 @@ func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logge
 	if err != nil {
 		return "", fmt.Errorf("imagebuild: create the first-boot VM: %w", err)
 	}
-	exit := vzrt.WatchVMExit(machine.StateChangedNotify())
-	start := time.Now()
-	if err := machine.Start(); err != nil {
-		return "", fmt.Errorf("imagebuild: start the first boot: %w", err)
+	exit, start, err := startMacOSFirstBoot(ctx, machine)
+	if err != nil {
+		return "", err
 	}
 	defer func() {
 		if err != nil {
@@ -257,6 +256,23 @@ func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logge
 		return vzrt.DialGuest(ctx, machine, vzrt.GuestPort, exit.Done())
 	}
 	return provisionAndShutdownMacOS(ctx, dial, exit, logger, start, macOSShutdownTimeout)
+}
+
+type macOSFirstBootVM interface {
+	StateChangedNotify() <-chan vz.VirtualMachineState
+	Start() error
+}
+
+func startMacOSFirstBoot(ctx context.Context, machine macOSFirstBootVM) (*vzrt.VMExit, time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, time.Time{}, err
+	}
+	exit := vzrt.WatchVMExit(machine.StateChangedNotify())
+	start := time.Now()
+	if err := machine.Start(); err != nil {
+		return nil, time.Time{}, fmt.Errorf("imagebuild: start the first boot: %w", err)
+	}
+	return exit, start, nil
 }
 
 func provisionAndShutdownMacOS(ctx context.Context, dial guestclient.Dialer, exit *vzrt.VMExit, logger *slog.Logger, start time.Time, shutdownTimeout time.Duration) (string, error) {

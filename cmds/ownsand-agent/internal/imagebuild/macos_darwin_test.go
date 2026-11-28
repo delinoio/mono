@@ -32,6 +32,58 @@ import (
 
 const fixtureHelperVersion = "first-boot-fixture"
 
+type firstBootVMSpy struct {
+	states     chan vz.VirtualMachineState
+	watchCalls int
+	startCalls int
+}
+
+func (m *firstBootVMSpy) StateChangedNotify() <-chan vz.VirtualMachineState {
+	m.watchCalls++
+	return m.states
+}
+
+func (m *firstBootVMSpy) Start() error {
+	m.startCalls++
+	m.states <- vz.VirtualMachineStateStopped
+	return nil
+}
+
+func TestMacOSImageFirstBootStart(t *testing.T) {
+	t.Run("canceled after setup", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		machine := &firstBootVMSpy{states: make(chan vz.VirtualMachineState, 1)}
+		t.Cleanup(func() { close(machine.states) })
+		cancel()
+		exit, _, err := startMacOSFirstBoot(ctx, machine)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("first boot error = %v, want context.Canceled", err)
+		}
+		if exit != nil || machine.watchCalls != 0 || machine.startCalls != 0 {
+			t.Fatalf("exit watcher = %v, watch calls = %d, start calls = %d, want no VM activity", exit, machine.watchCalls, machine.startCalls)
+		}
+	})
+	t.Run("live context", func(t *testing.T) {
+		machine := &firstBootVMSpy{states: make(chan vz.VirtualMachineState, 1)}
+		t.Cleanup(func() { close(machine.states) })
+		exit, start, err := startMacOSFirstBoot(t.Context(), machine)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exit == nil || start.IsZero() || machine.watchCalls != 1 || machine.startCalls != 1 {
+			t.Fatalf("exit watcher = %v, start time = %v, watch calls = %d, start calls = %d", exit, start, machine.watchCalls, machine.startCalls)
+		}
+		select {
+		case <-exit.Done():
+			if state := exit.State(); state != vz.VirtualMachineStateStopped {
+				t.Fatalf("exit state = %s, want Stopped", state)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("exit watcher did not observe Stopped")
+		}
+	})
+}
+
 type firstBootGuest struct {
 	ownsandv1connect.UnimplementedGuestServiceHandler
 	mu       sync.Mutex

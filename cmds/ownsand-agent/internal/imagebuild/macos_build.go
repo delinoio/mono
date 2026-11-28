@@ -25,6 +25,9 @@ func withMacOSBuildDir(ctx context.Context, dir string, logger *slog.Logger, run
 }
 
 func finishMacOSImage(ctx context.Context, dir string, metadata images.Metadata, downloadedIPSW string, firstBoot func() (string, error)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	helper, err := firstBoot()
 	if err != nil {
 		return err
