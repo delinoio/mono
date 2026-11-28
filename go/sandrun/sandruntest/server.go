@@ -108,7 +108,8 @@ type Server struct {
 	linkKeys        map[string]string
 	integrationReqs []*sandrunv1.CreateAgentIntegrationRequest
 	integration     []*sandrunv1.AgentIntegration
-	queueByOrg      map[string]chan *sandrunv1.WatchQueueResponse
+	queueByOrg      map[string]*scopedQueue
+	watchDone       chan struct{}
 	unscopedQueue   chan *sandrunv1.WatchQueueResponse
 
 	guest *guest
@@ -126,7 +127,8 @@ func New() *Server {
 		sessionGets:   map[string]int{},
 		sessionExecs:  map[string]*sessionExecs{},
 		links:         map[string]*sandrunv1.OwnSandLink{},
-		queueByOrg:    map[string]chan *sandrunv1.WatchQueueResponse{},
+		queueByOrg:    map[string]*scopedQueue{},
+		watchDone:     make(chan struct{}),
 		unscopedQueue: make(chan *sandrunv1.WatchQueueResponse, queueBufferSize),
 	}
 	s.guest = newGuest(s)
@@ -154,6 +156,13 @@ func New() *Server {
 
 // Close stops the server and kills the running exec processes.
 func (s *Server) Close() {
+	s.mu.Lock()
+	if s.queueByOrg != nil {
+		s.queueByOrg = nil
+		close(s.watchDone)
+	}
+	s.mu.Unlock()
+
 	s.guest.close()
 	s.srv.CloseClientConnections()
 	s.srv.Close()
