@@ -319,6 +319,9 @@ func (d *devSessionService) ExecDevSession(ctx context.Context, req *connect.Req
 	if len(req.Msg.GetCommand()) == 0 || req.Msg.GetExecId() == "" {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("exec_id and command are required"))
 	}
+	if timeout := req.Msg.GetTimeout(); timeout != nil && (timeout.CheckValid() != nil || timeout.AsDuration() <= 0) {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("invalid timeout: must be greater than zero"))
+	}
 	if d.s.BeforeExec != nil {
 		d.s.BeforeExec(proto.CloneOf(req.Msg))
 	}
