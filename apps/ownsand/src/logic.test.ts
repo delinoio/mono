@@ -242,7 +242,11 @@ describe("console configuration", () => {
         { PUBLIC_API_ORIGIN: "https://secret.example.test\\tenant\\.." },
         { production: false },
       ),
-    ).not.toThrow(/secret/);
+    ).toThrow(
+      new Error(
+        "PUBLIC_API_ORIGIN must be an origin without a path, query or fragment",
+      ),
+    );
   });
 
   test.each([
