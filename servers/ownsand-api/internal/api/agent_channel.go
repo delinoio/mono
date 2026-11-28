@@ -578,7 +578,7 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 }
 
 func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ownsandv1.SandboxStateEntry) error {
-	res, err := s.applySandboxUpdate(ctx, conn.DeviceID, e)
+	res, err := s.applySandboxUpdate(ctx, conn.DeviceID, e, sandboxEntryFromIncrementalUpdate)
 	if err != nil {
 		return err
 	}
@@ -783,7 +783,7 @@ func (s *Service) registerImportedCopy(ctx context.Context, conn *hub.Conn, info
 }
 
 func (s *Service) applyResultEntry(ctx context.Context, conn *hub.Conn, e *ownsandv1.SandboxStateEntry) error {
-	res, err := s.applySandboxUpdate(ctx, conn.DeviceID, e)
+	res, err := s.applySandboxUpdate(ctx, conn.DeviceID, e, sandboxEntryFromCommandResult)
 	if err != nil {
 		return err
 	}
