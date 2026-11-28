@@ -1,0 +1,852 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Layout of the SandCrew console. Components come from delino-ui and its
+   --dui-* tokens; this file adds the page layout in the same visual
+   language (Toss Design Guidelines: plain surfaces, one primary action per
+   view, generous spacing and large touch targets). */
+
+:root {
+  --app-background: #f2f4f6;
+  --app-gap: 24px;
+  color-scheme: light dark;
+  font-family: var(
+    --dui-font-family,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif
+  );
+  color: var(--dui-color-text);
+  background: var(--app-background);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --app-background: #101013;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--app-background);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--dui-color-accent-graphic);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+a:focus-visible {
+  outline: 2px solid var(--dui-color-focus-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.625rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  margin: 0 0 8px;
+  font-size: 1.125rem;
+  font-weight: 700;
+}
+
+.muted {
+  color: var(--dui-color-text-muted);
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px var(--app-gap);
+  background: var(--dui-color-surface);
+  border-bottom: 1px solid var(--dui-color-neutral-hover);
+}
+
+.brand {
+  font-size: 1.125rem;
+  font-weight: 800;
+  color: var(--dui-color-text);
+}
+
+.org-switcher {
+  min-width: 220px;
+}
+
+/* The switcher's visible label is redundant next to the brand; keep it for
+   assistive technology only. */
+.org-switcher .dui-text-field-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.topbar-links {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-inline-start: auto;
+}
+
+/* The language menu keeps its accessible name; the label is visually hidden. */
+.language-select {
+  min-width: 160px;
+}
+
+.language-select .dui-text-field-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The signed-out top bar holds only the language menu, at the end. */
+.topbar-signed-out {
+  justify-content: flex-end;
+}
+
+.org-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: var(--app-gap);
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: var(--app-gap);
+}
+
+.sidenav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.sidenav-org {
+  margin: 0 0 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.sidenav a {
+  display: block;
+  padding: 10px 12px;
+  border-radius: var(--dui-radius-control, 8px);
+  color: var(--dui-color-text);
+  font-weight: 500;
+}
+
+.sidenav a:hover {
+  background: var(--dui-color-neutral);
+  text-decoration: none;
+}
+
+.sidenav a[aria-current="page"] {
+  background: var(--dui-color-surface);
+  color: var(--dui-color-accent-graphic);
+  font-weight: 700;
+}
+
+.content {
+  min-width: 0;
+}
+
+.content-narrow {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: var(--app-gap);
+}
+
+.page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: var(--app-gap);
+}
+
+.page-header p {
+  margin: 6px 0 0;
+  max-width: 60ch;
+}
+
+.section {
+  margin-top: 32px;
+  padding: 24px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+  overflow: hidden;
+}
+
+.list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 64px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--dui-color-neutral);
+}
+
+.list-row:last-child {
+  border-bottom: none;
+}
+
+.list-link {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--dui-color-text);
+}
+
+.list-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.list-title {
+  font-weight: 600;
+}
+
+.list-link > .list-title {
+  overflow-wrap: anywhere;
+}
+
+.list-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.filters > * {
+  min-width: 180px;
+}
+
+.details {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px 24px;
+  margin: 0;
+  padding: 24px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+}
+
+.detail dt {
+  color: var(--dui-color-text-muted);
+  font-size: 0.875rem;
+}
+
+.detail dd {
+  margin: 4px 0 0;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+}
+
+.inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.inline-form > :first-child {
+  flex: 1;
+  min-width: 240px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.callout {
+  margin: 0;
+  padding: 12px 16px;
+  border-radius: var(--dui-radius-control, 8px);
+  background: var(--dui-color-neutral);
+}
+
+.notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+}
+
+.notice p {
+  margin: 0;
+}
+
+.notice-error {
+  color: var(--dui-color-danger-text);
+}
+
+.notice > .sign-in-failure {
+  flex-basis: 100%;
+}
+
+.empty {
+  padding: 48px 24px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+  text-align: center;
+}
+
+.empty-title {
+  margin: 0 0 4px;
+  font-weight: 700;
+}
+
+.empty .muted {
+  margin: 0;
+}
+
+.loading {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dui-dialog-content.dialog-wide {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.dui-dialog-description + .form {
+  margin-top: 16px;
+}
+
+.id {
+  white-space: nowrap;
+}
+
+.sign-in {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 480px;
+  margin: 15vh auto 0;
+  padding: 32px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+}
+
+.sign-in h1 {
+  font-size: 2rem;
+}
+
+.sign-in p {
+  margin: 0 0 8px;
+}
+
+@media (max-width: 760px) {
+  :root {
+    --app-gap: 16px;
+  }
+
+  .org-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidenav ul {
+    display: flex;
+    overflow-x: auto;
+    gap: 4px;
+  }
+
+  .sidenav a {
+    white-space: nowrap;
+  }
+
+  .topbar {
+    flex-wrap: wrap;
+  }
+
+  .org-switcher {
+    order: 3;
+    width: 100%;
+  }
+}
+
+/* The banner of an organization whose OwnSand link is invalid. */
+
+.sidenav-footer {
+  margin: 16px 0 0;
+  padding: 0 12px;
+  font-size: 0.875rem;
+}
+
+.sidenav .sidenav-footer a {
+  display: inline;
+  padding: 0;
+  color: var(--dui-color-accent-graphic);
+  font-weight: 500;
+}
+
+@media (min-width: 761px) {
+  /* Keep the navigation in view on long pages such as the chat view. */
+  .sidenav {
+    position: sticky;
+    top: 92px;
+    align-self: start;
+  }
+}
+
+.form .section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 0;
+}
+
+.form .section h2,
+.form .section > p {
+  margin: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.row-actions,
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.notice-warning {
+  border: 1px solid var(--dui-color-border);
+}
+
+.form-page {
+  padding: 24px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.fieldset legend {
+  padding: 0;
+  font-weight: 600;
+}
+
+.fieldset p {
+  margin: 0;
+}
+
+.checkbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.file-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.file-field label {
+  font-weight: 600;
+}
+
+.file-field input {
+  max-width: 100%;
+}
+
+.field-error {
+  margin: 0;
+  color: var(--dui-color-danger-text);
+}
+
+.section h3 {
+  margin: 24px 0 8px;
+  font-size: 1rem;
+}
+
+/* Chat view. */
+
+.chat-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.chat-page > .page-header {
+  margin-bottom: 0;
+}
+
+.state-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 16px 20px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+  border-left: 4px solid var(--dui-color-accent-graphic);
+}
+
+.state-banner p {
+  margin: 0;
+}
+
+.state-banner-warning {
+  border-left-color: var(--dui-color-danger);
+}
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.chat-message {
+  max-width: min(720px, 100%);
+  padding: 12px 16px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+  overflow-wrap: anywhere;
+}
+
+.chat-user {
+  align-self: flex-end;
+  background: var(--dui-color-neutral);
+}
+
+.chat-agent {
+  align-self: flex-start;
+}
+
+.chat-thought,
+.chat-unknown {
+  align-self: flex-start;
+}
+
+.chat-tool,
+.chat-permission,
+.chat-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 16px;
+  border: 1px solid var(--dui-color-border);
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+}
+
+.chat-tool-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-tool-title,
+.chat-permission-title,
+.chat-plan-title {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.chat-tool-locations {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.chat-permission-pending {
+  border-color: var(--dui-color-accent-graphic);
+}
+
+.chat-permission p {
+  margin: 0;
+}
+
+.chat-permission-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chat-plan ol {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.chat-divider {
+  margin: 0;
+  color: var(--dui-color-text-muted);
+  font-size: 0.875rem;
+  text-align: center;
+}
+
+.chat-error {
+  justify-content: flex-start;
+}
+
+.disclosure {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.disclosure-panel {
+  width: 100%;
+  min-width: 0;
+}
+
+.raw-json-label {
+  margin: 8px 0 4px;
+  font-size: 0.875rem;
+  color: var(--dui-color-text-muted);
+}
+
+.code-block {
+  margin: 0;
+  padding: 12px;
+  border-radius: var(--dui-radius-control, 8px);
+  background: var(--dui-color-neutral);
+  overflow-x: auto;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.diff {
+  margin: 0;
+  min-width: 0;
+}
+
+.diff figcaption {
+  margin-bottom: 4px;
+  font-size: 0.875rem;
+}
+
+.diff-line {
+  display: block;
+}
+
+.diff-added {
+  color: var(--dui-color-accent-graphic);
+}
+
+.diff-removed {
+  color: var(--dui-color-danger-text);
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote,
+.markdown pre {
+  margin: 8px 0;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 20px;
+}
+
+.markdown blockquote {
+  padding-left: 12px;
+  border-left: 3px solid var(--dui-color-border);
+  color: var(--dui-color-text-muted);
+}
+
+.markdown h3,
+.markdown h4 {
+  margin: 12px 0 4px;
+}
+
+/* GitHub Flavored Markdown tables scroll inside the message on a phone. */
+.markdown table {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  padding: 6px 10px;
+  border: 1px solid var(--dui-color-border);
+  text-align: left;
+}
+
+.markdown li:has(> input[type="checkbox"]) {
+  list-style: none;
+}
+
+.resource-link {
+  margin: 4px 0;
+}
+
+.composer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+  box-shadow: 0 -4px 16px rgb(0 0 0 / 6%);
+}
+
+.composer .dui-textarea {
+  max-height: 40vh;
+}
+
+.composer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.ended {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 20px;
+  border-radius: var(--dui-radius-panel, 16px);
+  background: var(--dui-color-surface);
+}
+
+.ended p {
+  margin: 0;
+}
+
+@media (max-width: 480px) {
+  .topbar-links {
+    gap: 8px;
+  }
+
+  /* Keep the sticky composer small on a phone. */
+  .composer .dui-text-field-description {
+    display: none;
+  }
+
+  .list-row {
+    flex-wrap: wrap;
+    padding: 12px 16px;
+  }
+
+  .section {
+    padding: 16px;
+  }
+
+  .form-page {
+    padding: 16px;
+  }
+}

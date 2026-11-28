@@ -237,6 +237,358 @@ func (VendorCredentialKind) EnumDescriptor() ([]byte, []int) {
 	return file_delino_sandcrew_v1_common_proto_rawDescGZIP(), []int{3}
 }
 
+// The caller's SandRun role in an organization.
+type Role int32
+
+const (
+	Role_ROLE_UNSPECIFIED Role = 0
+	Role_ROLE_OWNER       Role = 1
+	Role_ROLE_ADMIN       Role = 2
+	Role_ROLE_MEMBER      Role = 3
+)
+
+// Enum value maps for Role.
+var (
+	Role_name = map[int32]string{
+		0: "ROLE_UNSPECIFIED",
+		1: "ROLE_OWNER",
+		2: "ROLE_ADMIN",
+		3: "ROLE_MEMBER",
+	}
+	Role_value = map[string]int32{
+		"ROLE_UNSPECIFIED": 0,
+		"ROLE_OWNER":       1,
+		"ROLE_ADMIN":       2,
+		"ROLE_MEMBER":      3,
+	}
+)
+
+func (x Role) Enum() *Role {
+	p := new(Role)
+	*p = x
+	return p
+}
+
+func (x Role) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Role) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_common_proto_enumTypes[4].Descriptor()
+}
+
+func (Role) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_common_proto_enumTypes[4]
+}
+
+func (x Role) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Role.Descriptor instead.
+func (Role) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_common_proto_rawDescGZIP(), []int{4}
+}
+
+// The state of a session. Only ENDED is terminal.
+type SessionState int32
+
+const (
+	SessionState_SESSION_STATE_UNSPECIFIED       SessionState = 0
+	SessionState_SESSION_STATE_QUEUED            SessionState = 1
+	SessionState_SESSION_STATE_STARTING          SessionState = 2
+	SessionState_SESSION_STATE_RUNNING           SessionState = 3
+	SessionState_SESSION_STATE_WAITING_FOR_INPUT SessionState = 4
+	SessionState_SESSION_STATE_PAUSING           SessionState = 5
+	SessionState_SESSION_STATE_PAUSED            SessionState = 6
+	SessionState_SESSION_STATE_RESUME_QUEUED     SessionState = 7
+	SessionState_SESSION_STATE_RESUMING          SessionState = 8
+	SessionState_SESSION_STATE_DISCONNECTED      SessionState = 9
+	SessionState_SESSION_STATE_ENDED             SessionState = 10
+)
+
+// Enum value maps for SessionState.
+var (
+	SessionState_name = map[int32]string{
+		0:  "SESSION_STATE_UNSPECIFIED",
+		1:  "SESSION_STATE_QUEUED",
+		2:  "SESSION_STATE_STARTING",
+		3:  "SESSION_STATE_RUNNING",
+		4:  "SESSION_STATE_WAITING_FOR_INPUT",
+		5:  "SESSION_STATE_PAUSING",
+		6:  "SESSION_STATE_PAUSED",
+		7:  "SESSION_STATE_RESUME_QUEUED",
+		8:  "SESSION_STATE_RESUMING",
+		9:  "SESSION_STATE_DISCONNECTED",
+		10: "SESSION_STATE_ENDED",
+	}
+	SessionState_value = map[string]int32{
+		"SESSION_STATE_UNSPECIFIED":       0,
+		"SESSION_STATE_QUEUED":            1,
+		"SESSION_STATE_STARTING":          2,
+		"SESSION_STATE_RUNNING":           3,
+		"SESSION_STATE_WAITING_FOR_INPUT": 4,
+		"SESSION_STATE_PAUSING":           5,
+		"SESSION_STATE_PAUSED":            6,
+		"SESSION_STATE_RESUME_QUEUED":     7,
+		"SESSION_STATE_RESUMING":          8,
+		"SESSION_STATE_DISCONNECTED":      9,
+		"SESSION_STATE_ENDED":             10,
+	}
+)
+
+func (x SessionState) Enum() *SessionState {
+	p := new(SessionState)
+	*p = x
+	return p
+}
+
+func (x SessionState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SessionState) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_common_proto_enumTypes[5].Descriptor()
+}
+
+func (SessionState) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_common_proto_enumTypes[5]
+}
+
+func (x SessionState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SessionState.Descriptor instead.
+func (SessionState) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_common_proto_rawDescGZIP(), []int{5}
+}
+
+// Why a session ended.
+type SessionEndReason int32
+
+const (
+	SessionEndReason_SESSION_END_REASON_UNSPECIFIED              SessionEndReason = 0
+	SessionEndReason_SESSION_END_REASON_START_FAILED             SessionEndReason = 1
+	SessionEndReason_SESSION_END_REASON_QUEUE_EXPIRED            SessionEndReason = 2
+	SessionEndReason_SESSION_END_REASON_AGENT_EXITED             SessionEndReason = 3
+	SessionEndReason_SESSION_END_REASON_DEVICE_LOST              SessionEndReason = 4
+	SessionEndReason_SESSION_END_REASON_RESTORE_FAILED           SessionEndReason = 5
+	SessionEndReason_SESSION_END_REASON_PAUSED_RETENTION_EXPIRED SessionEndReason = 6
+	SessionEndReason_SESSION_END_REASON_BRIDGE_UNSUPPORTED       SessionEndReason = 7
+	SessionEndReason_SESSION_END_REASON_EXECUTOR_ENDED           SessionEndReason = 8
+)
+
+// Enum value maps for SessionEndReason.
+var (
+	SessionEndReason_name = map[int32]string{
+		0: "SESSION_END_REASON_UNSPECIFIED",
+		1: "SESSION_END_REASON_START_FAILED",
+		2: "SESSION_END_REASON_QUEUE_EXPIRED",
+		3: "SESSION_END_REASON_AGENT_EXITED",
+		4: "SESSION_END_REASON_DEVICE_LOST",
+		5: "SESSION_END_REASON_RESTORE_FAILED",
+		6: "SESSION_END_REASON_PAUSED_RETENTION_EXPIRED",
+		7: "SESSION_END_REASON_BRIDGE_UNSUPPORTED",
+		8: "SESSION_END_REASON_EXECUTOR_ENDED",
+	}
+	SessionEndReason_value = map[string]int32{
+		"SESSION_END_REASON_UNSPECIFIED":              0,
+		"SESSION_END_REASON_START_FAILED":             1,
+		"SESSION_END_REASON_QUEUE_EXPIRED":            2,
+		"SESSION_END_REASON_AGENT_EXITED":             3,
+		"SESSION_END_REASON_DEVICE_LOST":              4,
+		"SESSION_END_REASON_RESTORE_FAILED":           5,
+		"SESSION_END_REASON_PAUSED_RETENTION_EXPIRED": 6,
+		"SESSION_END_REASON_BRIDGE_UNSUPPORTED":       7,
+		"SESSION_END_REASON_EXECUTOR_ENDED":           8,
+	}
+)
+
+func (x SessionEndReason) Enum() *SessionEndReason {
+	p := new(SessionEndReason)
+	*p = x
+	return p
+}
+
+func (x SessionEndReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SessionEndReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_common_proto_enumTypes[6].Descriptor()
+}
+
+func (SessionEndReason) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_common_proto_enumTypes[6]
+}
+
+func (x SessionEndReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SessionEndReason.Descriptor instead.
+func (SessionEndReason) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_common_proto_rawDescGZIP(), []int{6}
+}
+
+// The owner of a vendor credential.
+type CredentialScope int32
+
+const (
+	CredentialScope_CREDENTIAL_SCOPE_UNSPECIFIED  CredentialScope = 0
+	CredentialScope_CREDENTIAL_SCOPE_ORGANIZATION CredentialScope = 1
+	CredentialScope_CREDENTIAL_SCOPE_USER         CredentialScope = 2
+)
+
+// Enum value maps for CredentialScope.
+var (
+	CredentialScope_name = map[int32]string{
+		0: "CREDENTIAL_SCOPE_UNSPECIFIED",
+		1: "CREDENTIAL_SCOPE_ORGANIZATION",
+		2: "CREDENTIAL_SCOPE_USER",
+	}
+	CredentialScope_value = map[string]int32{
+		"CREDENTIAL_SCOPE_UNSPECIFIED":  0,
+		"CREDENTIAL_SCOPE_ORGANIZATION": 1,
+		"CREDENTIAL_SCOPE_USER":         2,
+	}
+)
+
+func (x CredentialScope) Enum() *CredentialScope {
+	p := new(CredentialScope)
+	*p = x
+	return p
+}
+
+func (x CredentialScope) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CredentialScope) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_common_proto_enumTypes[7].Descriptor()
+}
+
+func (CredentialScope) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_common_proto_enumTypes[7]
+}
+
+func (x CredentialScope) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CredentialScope.Descriptor instead.
+func (CredentialScope) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_common_proto_rawDescGZIP(), []int{7}
+}
+
+// Who set the stored value of a vendor credential.
+type CredentialUpdateSource int32
+
+const (
+	CredentialUpdateSource_CREDENTIAL_UPDATE_SOURCE_UNSPECIFIED CredentialUpdateSource = 0
+	CredentialUpdateSource_CREDENTIAL_UPDATE_SOURCE_USER        CredentialUpdateSource = 1
+	// The agent refreshed the credential in a session.
+	CredentialUpdateSource_CREDENTIAL_UPDATE_SOURCE_AGENT_REFRESH CredentialUpdateSource = 2
+)
+
+// Enum value maps for CredentialUpdateSource.
+var (
+	CredentialUpdateSource_name = map[int32]string{
+		0: "CREDENTIAL_UPDATE_SOURCE_UNSPECIFIED",
+		1: "CREDENTIAL_UPDATE_SOURCE_USER",
+		2: "CREDENTIAL_UPDATE_SOURCE_AGENT_REFRESH",
+	}
+	CredentialUpdateSource_value = map[string]int32{
+		"CREDENTIAL_UPDATE_SOURCE_UNSPECIFIED":   0,
+		"CREDENTIAL_UPDATE_SOURCE_USER":          1,
+		"CREDENTIAL_UPDATE_SOURCE_AGENT_REFRESH": 2,
+	}
+)
+
+func (x CredentialUpdateSource) Enum() *CredentialUpdateSource {
+	p := new(CredentialUpdateSource)
+	*p = x
+	return p
+}
+
+func (x CredentialUpdateSource) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CredentialUpdateSource) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_common_proto_enumTypes[8].Descriptor()
+}
+
+func (CredentialUpdateSource) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_common_proto_enumTypes[8]
+}
+
+func (x CredentialUpdateSource) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CredentialUpdateSource.Descriptor instead.
+func (CredentialUpdateSource) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_common_proto_rawDescGZIP(), []int{8}
+}
+
+// Why SandCrew cannot use a SandRun DEV_SESSION runner profile.
+type ProfileIneligibility int32
+
+const (
+	ProfileIneligibility_PROFILE_INELIGIBILITY_UNSPECIFIED ProfileIneligibility = 0
+	// The profile has a maximum lifetime (`max_ttl`).
+	ProfileIneligibility_PROFILE_INELIGIBILITY_HAS_MAXIMUM_LIFETIME ProfileIneligibility = 1
+	// The network mode of the profile is not OUTBOUND.
+	ProfileIneligibility_PROFILE_INELIGIBILITY_NETWORK_NOT_OUTBOUND ProfileIneligibility = 2
+	// SandCrew does not support the guest OS of the profile.
+	ProfileIneligibility_PROFILE_INELIGIBILITY_GUEST_OS_UNSUPPORTED ProfileIneligibility = 3
+)
+
+// Enum value maps for ProfileIneligibility.
+var (
+	ProfileIneligibility_name = map[int32]string{
+		0: "PROFILE_INELIGIBILITY_UNSPECIFIED",
+		1: "PROFILE_INELIGIBILITY_HAS_MAXIMUM_LIFETIME",
+		2: "PROFILE_INELIGIBILITY_NETWORK_NOT_OUTBOUND",
+		3: "PROFILE_INELIGIBILITY_GUEST_OS_UNSUPPORTED",
+	}
+	ProfileIneligibility_value = map[string]int32{
+		"PROFILE_INELIGIBILITY_UNSPECIFIED":          0,
+		"PROFILE_INELIGIBILITY_HAS_MAXIMUM_LIFETIME": 1,
+		"PROFILE_INELIGIBILITY_NETWORK_NOT_OUTBOUND": 2,
+		"PROFILE_INELIGIBILITY_GUEST_OS_UNSUPPORTED": 3,
+	}
+)
+
+func (x ProfileIneligibility) Enum() *ProfileIneligibility {
+	p := new(ProfileIneligibility)
+	*p = x
+	return p
+}
+
+func (x ProfileIneligibility) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ProfileIneligibility) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_sandcrew_v1_common_proto_enumTypes[9].Descriptor()
+}
+
+func (ProfileIneligibility) Type() protoreflect.EnumType {
+	return &file_delino_sandcrew_v1_common_proto_enumTypes[9]
+}
+
+func (x ProfileIneligibility) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ProfileIneligibility.Descriptor instead.
+func (ProfileIneligibility) EnumDescriptor() ([]byte, []int) {
+	return file_delino_sandcrew_v1_common_proto_rawDescGZIP(), []int{9}
+}
+
 var File_delino_sandcrew_v1_common_proto protoreflect.FileDescriptor
 
 const file_delino_sandcrew_v1_common_proto_rawDesc = "" +
@@ -259,7 +611,50 @@ const file_delino_sandcrew_v1_common_proto_rawDesc = "" +
 	"\"VENDOR_CREDENTIAL_KIND_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eVENDOR_CREDENTIAL_KIND_API_KEY\x10\x01\x12-\n" +
 	")VENDOR_CREDENTIAL_KIND_CLAUDE_OAUTH_TOKEN\x10\x02\x12*\n" +
-	"&VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON\x10\x03B?Z=github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1b\x06proto3"
+	"&VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON\x10\x03*M\n" +
+	"\x04Role\x12\x14\n" +
+	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x0e\n" +
+	"\n" +
+	"ROLE_OWNER\x10\x01\x12\x0e\n" +
+	"\n" +
+	"ROLE_ADMIN\x10\x02\x12\x0f\n" +
+	"\vROLE_MEMBER\x10\x03*\xce\x02\n" +
+	"\fSessionState\x12\x1d\n" +
+	"\x19SESSION_STATE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14SESSION_STATE_QUEUED\x10\x01\x12\x1a\n" +
+	"\x16SESSION_STATE_STARTING\x10\x02\x12\x19\n" +
+	"\x15SESSION_STATE_RUNNING\x10\x03\x12#\n" +
+	"\x1fSESSION_STATE_WAITING_FOR_INPUT\x10\x04\x12\x19\n" +
+	"\x15SESSION_STATE_PAUSING\x10\x05\x12\x18\n" +
+	"\x14SESSION_STATE_PAUSED\x10\x06\x12\x1f\n" +
+	"\x1bSESSION_STATE_RESUME_QUEUED\x10\a\x12\x1a\n" +
+	"\x16SESSION_STATE_RESUMING\x10\b\x12\x1e\n" +
+	"\x1aSESSION_STATE_DISCONNECTED\x10\t\x12\x17\n" +
+	"\x13SESSION_STATE_ENDED\x10\n" +
+	"*\xf4\x02\n" +
+	"\x10SessionEndReason\x12\"\n" +
+	"\x1eSESSION_END_REASON_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fSESSION_END_REASON_START_FAILED\x10\x01\x12$\n" +
+	" SESSION_END_REASON_QUEUE_EXPIRED\x10\x02\x12#\n" +
+	"\x1fSESSION_END_REASON_AGENT_EXITED\x10\x03\x12\"\n" +
+	"\x1eSESSION_END_REASON_DEVICE_LOST\x10\x04\x12%\n" +
+	"!SESSION_END_REASON_RESTORE_FAILED\x10\x05\x12/\n" +
+	"+SESSION_END_REASON_PAUSED_RETENTION_EXPIRED\x10\x06\x12)\n" +
+	"%SESSION_END_REASON_BRIDGE_UNSUPPORTED\x10\a\x12%\n" +
+	"!SESSION_END_REASON_EXECUTOR_ENDED\x10\b*q\n" +
+	"\x0fCredentialScope\x12 \n" +
+	"\x1cCREDENTIAL_SCOPE_UNSPECIFIED\x10\x00\x12!\n" +
+	"\x1dCREDENTIAL_SCOPE_ORGANIZATION\x10\x01\x12\x19\n" +
+	"\x15CREDENTIAL_SCOPE_USER\x10\x02*\x91\x01\n" +
+	"\x16CredentialUpdateSource\x12(\n" +
+	"$CREDENTIAL_UPDATE_SOURCE_UNSPECIFIED\x10\x00\x12!\n" +
+	"\x1dCREDENTIAL_UPDATE_SOURCE_USER\x10\x01\x12*\n" +
+	"&CREDENTIAL_UPDATE_SOURCE_AGENT_REFRESH\x10\x02*\xcd\x01\n" +
+	"\x14ProfileIneligibility\x12%\n" +
+	"!PROFILE_INELIGIBILITY_UNSPECIFIED\x10\x00\x12.\n" +
+	"*PROFILE_INELIGIBILITY_HAS_MAXIMUM_LIFETIME\x10\x01\x12.\n" +
+	"*PROFILE_INELIGIBILITY_NETWORK_NOT_OUTBOUND\x10\x02\x12.\n" +
+	"*PROFILE_INELIGIBILITY_GUEST_OS_UNSUPPORTED\x10\x03B?Z=github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1b\x06proto3"
 
 var (
 	file_delino_sandcrew_v1_common_proto_rawDescOnce sync.Once
@@ -273,12 +668,18 @@ func file_delino_sandcrew_v1_common_proto_rawDescGZIP() []byte {
 	return file_delino_sandcrew_v1_common_proto_rawDescData
 }
 
-var file_delino_sandcrew_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_delino_sandcrew_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 10)
 var file_delino_sandcrew_v1_common_proto_goTypes = []any{
-	(AgentVendor)(0),          // 0: delino.sandcrew.v1.AgentVendor
-	(GuestOs)(0),              // 1: delino.sandcrew.v1.GuestOs
-	(PermissionMode)(0),       // 2: delino.sandcrew.v1.PermissionMode
-	(VendorCredentialKind)(0), // 3: delino.sandcrew.v1.VendorCredentialKind
+	(AgentVendor)(0),            // 0: delino.sandcrew.v1.AgentVendor
+	(GuestOs)(0),                // 1: delino.sandcrew.v1.GuestOs
+	(PermissionMode)(0),         // 2: delino.sandcrew.v1.PermissionMode
+	(VendorCredentialKind)(0),   // 3: delino.sandcrew.v1.VendorCredentialKind
+	(Role)(0),                   // 4: delino.sandcrew.v1.Role
+	(SessionState)(0),           // 5: delino.sandcrew.v1.SessionState
+	(SessionEndReason)(0),       // 6: delino.sandcrew.v1.SessionEndReason
+	(CredentialScope)(0),        // 7: delino.sandcrew.v1.CredentialScope
+	(CredentialUpdateSource)(0), // 8: delino.sandcrew.v1.CredentialUpdateSource
+	(ProfileIneligibility)(0),   // 9: delino.sandcrew.v1.ProfileIneligibility
 }
 var file_delino_sandcrew_v1_common_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
@@ -298,7 +699,7 @@ func file_delino_sandcrew_v1_common_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_sandcrew_v1_common_proto_rawDesc), len(file_delino_sandcrew_v1_common_proto_rawDesc)),
-			NumEnums:      4,
+			NumEnums:      10,
 			NumMessages:   0,
 			NumExtensions: 0,
 			NumServices:   0,

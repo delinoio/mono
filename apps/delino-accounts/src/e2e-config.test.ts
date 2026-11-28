@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { describe, expect, test } from "@rstest/core";
 import ownsandConfig from "../../ownsand/e2e.config.ts";
+import sandCrewConfig from "../../sandcrew/e2e.config.ts";
 import sandRunConfig from "../../sandrun/e2e.config.ts";
 import accountsConfig from "../e2e.config.ts";
 
@@ -42,6 +43,12 @@ describe("e2e app command", () => {
         "e2e/rsbuild.config.ts",
       ],
       env: { NODE_ENV: "production", PUBLIC_SANDRUN_MOCK_API: " true " },
+    },
+    {
+      directory: "sandcrew",
+      config: sandCrewConfig,
+      configArgs: ["--mode", "development"],
+      env: { NODE_ENV: "production", PUBLIC_SANDCREW_MOCK_API: " true " },
     },
   ]) {
     test(`starts ${directory} through Node on the selected loopback port`, () => {

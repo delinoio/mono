@@ -4,7 +4,7 @@
 
 This contract owns the protocol schemas of [`sandcrew`](project-sandcrew.md) at `protos/delino/sandcrew/v1/`: the Connect RPC API of `sandcrew-api` and the bridge schema that the [bridge](cmds-sandcrew-bridge-foundation.md) and the [control plane](servers-sandcrew-api-foundation.md) exchange. The directory `protos/delino/sandcrew/` is also the TypeScript binding workspace package `@delino/sandcrew-protos` (not published), according to `protos/AGENTS.md`.
 
-Files: `v1/common.proto` holds the enums that the Connect API and the bridge schema share, `v1/bridge.proto` holds the bridge schema and its enums. The Connect API services and their messages are added with the control plane implementation; until then the directory has no `sandcrewv1connect/` bindings.
+Files: `v1/common.proto` holds the enums that the Connect API and the bridge schema share and the Connect API enums that more than one file uses, `v1/bridge.proto` holds the bridge schema and its enums, and `v1/organization.proto`, `v1/credential.proto`, `v1/session.proto` and `v1/notification.proto` hold the Connect API services and their messages. `sandcrewv1connect/` holds the generated Connect Go bindings.
 
 ## Runtime and Language
 
@@ -25,7 +25,7 @@ Files: `v1/common.proto` holds the enums that the Connect API and the bridge sch
 - Identifiers are UUID v7 values in canonical text form in `string` fields named `<entity>_id`. `organization_id` is the SandRun organization ID. `dev_session_id` is the SandRun dev session ID. User ID fields (`user_id`, `owner_user_id`) hold the Logto `sub` unchanged.
 - Times use `google.protobuf.Timestamp`. Durations use `google.protobuf.Duration`. Sizes use `int64` fields with a unit suffix.
 - Every enum has a zero value `<ENUM>_UNSPECIFIED`. The server rejects `UNSPECIFIED` in a required enum field with `invalid_argument`. Enum value names follow the buf `STANDARD` lint rule (for example `SESSION_STATE_PAUSED`); the tables below list the values without the prefix.
-- List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`. An undefined enum number in a list filter fails with `invalid_argument` that names the field.
+- List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`, and return `next_page_token`, which is empty on the last page. `ListSessionEvents` uses sequence numbers instead (see [Session messages](#session-messages)). An undefined enum number in a list filter fails with `invalid_argument` that names the field.
 - Every public RPC is unary or server-streaming. A server-streaming RPC returns a `<Rpc>Response` message that wraps its event.
 - Errors use Connect error codes. Detail messages never contain credentials, secrets, prompts or agent output.
 - Credential and secret values exist only in request messages of set operations. Response messages carry `value_set_at` and never the value.
@@ -73,6 +73,7 @@ The control plane serves every public service at `https://sandcrew.api.delino.io
 - `UpdateOrganizationSettings` takes the settings and a field mask with the paths `allowed_runner_profile_ids`, `pause_delay` and `paused_session_retention`. A masked path without a value restores the default. The [control plane contract](servers-sandcrew-api-foundation.md#organization-settings) owns the ranges.
 - `RunnerProfile` (in `ListRunnerProfilesResponse`): `runner_profile_id`, `name`, `guest_os` (SandRun guest OS as the SandCrew enum `GuestOs`), `vcpu_count`, `memory_mib`, `disk_gib`, `allowed`, `selectable` and `ineligibility` (repeated `ProfileIneligibility`).
 - `Organization` (in `ListOrganizationsResponse`): `organization_id`, `name`, `caller_role` (`Role`).
+- `PausedSessionRetention` is the message of `paused_session_retention`: a `oneof retention` of `duration` (`Duration`) and `unlimited` (`bool`), so that the field mask path `paused_session_retention` replaces the whole value.
 
 ### Credential messages
 
@@ -82,13 +83,22 @@ The control plane serves every public service at `https://sandcrew.api.delino.io
 
 ### Session messages
 
-- `Session`: `session_id`, `organization_id`, `owner_user_id`, `label`, `vendor`, `runner_profile_id`, `guest_os`, `state` (`SessionState`), `end_reason` (`SessionEndReason`, set in `ENDED`), `permission_mode` (`PermissionMode`), `created_at`, `started_at`, `paused_at`, `ended_at`, `scheduled_deletion_time` (set while `PAUSED` with a limited retention), `previous_session_id` (for a session from a transcript) and, for the owner only, `agent` (`AgentInfo` from the bridge `hello` and `agent_ready` events: agent version, current mode, available modes and configuration options).
+- `Session`: `session_id`, `organization_id`, `owner_user_id`, `label`, `vendor`, `runner_profile_id`, `guest_os`, `state` (`SessionState`), `end_reason` (`SessionEndReason`, set in `ENDED`), `permission_mode` (`PermissionMode`), `created_at`, `started_at`, `paused_at`, `ended_at`, `scheduled_deletion_time` (set while `PAUSED` with a limited retention), `previous_session_id` (for a session from a transcript), `resume_wait_expired` (true while `PAUSED` after a resume waited longer than the maximum queue wait of the runner profile) and, for the owner only, `agent` (`AgentInfo` from the bridge `hello` and `agent_ready` events: agent version, current mode, available modes and configuration options).
 - `GetSession`, `ListSessions` and `WatchSessions` return the owner-only fields only to the owner. Other members get the metadata fields only.
 - `CreateSessionRequest`: `organization_id`, `vendor`, `runner_profile_id`, `first_message` (text), optional `label` (at most 100 characters), `session_secret_ids`, optional `mode_id` and optional `config_options` (option ID and value ID pairs). The console offers the model and mode values of `GetAgentOptions`; the bridge applies them after `session/new` and reports a value that the agent rejects as a `bridge_error` with `OPTION_REJECTED`, and the session continues with the agent's default.
 - `SendMessageRequest`: `organization_id`, `session_id`, `client_message_id` (UUID v7, for idempotency) and `text`. `AnswerPermissionRequest`: `organization_id`, `session_id`, `permission_request_id` and `option_id`. `CancelTurnRequest`, `SetSessionModeRequest` (`mode_id` or `permission_mode`) and `SetSessionConfigOptionRequest` (`config_option_id`, `value_id`) also carry a `client_message_id`.
-- `ListSessionEventsRequest`: `organization_id`, `session_id`, `after_sequence` and `page_size` (maximum 500). The response holds `TranscriptEvent` messages and `next_sequence`.
-- `WatchSessionResponse` is a `oneof` of `keepalive`, `event` (`TranscriptEvent`), `session` (the changed `Session`) and `caught_up` (all stored events after the requested sequence were sent).
-- `TranscriptEvent`: `sequence`, `time` and `event` (`BridgeEvent` without the `credential_update` case; see below). The server never returns a `credential_update` event.
+- `ListSessionsRequest`: `organization_id`, `page_size`, `page_token`, an optional owner `oneof` of `owner_user_id` and `owned_by_caller`, and the filters `vendors` and `states`. The response lists the sessions newest first.
+- `ListSessionEventsRequest`: `organization_id`, `session_id`, `after_sequence` (0 reads from the start) and `page_size` (default 200, maximum 500). The response holds `TranscriptEvent` messages and `next_sequence`: the `after_sequence` of the next page, or 0 when the response holds the last stored event.
+- `WatchSessionRequest`: `organization_id`, `session_id` and `after_sequence`. `WatchSessionResponse` is a `oneof event` of `keepalive` (`Keepalive`), `transcript_event` (`TranscriptEvent`), `session` (the changed `Session`) and `caught_up` (`CaughtUp`: all stored events after the requested sequence were sent). The case is named `transcript_event` because a field cannot have the name of its `oneof`.
+- `WatchSessionsRequest`: `organization_id`. `WatchSessionsResponse` is a `oneof event` of `keepalive`, `session` (a created or changed `Session`, with the owner-only fields only for the owner) and `session_deleted` (`SessionDeleted` with the `session_id`).
+- `GetAgentOptionsRequest`: `organization_id` and `vendor`. The response holds `available_modes` and `config_options`, both empty when no session of the vendor advertised them.
+- `TranscriptEvent`: `sequence`, `time` and the `oneof event` of `BridgeEvent` without the `credential_update` case (see below), with the same field numbers. It reserves the number and the name of `credential_update`. The server never returns a `credential_update` event.
+
+### Notification messages
+
+- `RegisterPushSubscriptionRequest`: `endpoint` (the push service URL of the browser), `p256dh_key` and `auth_key` (base64url) and `label` (at most 100 characters, a browser name that the console sets for display).
+- `PushSubscription`: `push_subscription_id`, `label`, `endpoint_origin` (the origin of the push service, for display) and `created_at`. It never carries the endpoint URL or the keys.
+- `GetWebPushConfigResponse`: `vapid_public_key` (base64url without padding).
 
 ### Bridge schema
 
@@ -121,6 +131,7 @@ The bridge writes `BridgeEvent` messages, one per line, to the stdout of its exe
 
 - Mapping to ACP: the content cases map the ACP `session/update` values `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update` and `plan`; `mode_changed` maps `current_mode_update`; `config_options` maps `config_option_update`. ACP updates without a case in this table (for example `available_commands_update`, `usage_update` or a value that a later ACP version adds) become `unknown_update` with the original JSON. A diff is a `ToolCallContent` case, like in ACP.
 - Headless-fallback vendors produce the same cases. Their `hello.wrapped_headless` is true.
+- Message shapes: `ContentBlock` is a `oneof block` of `text`, `resource_link` and `unsupported`. `ToolCallContent` is a `oneof content` of `block` (a `ContentBlock`), `diff` (`Diff` with `path`, optional `old_text`, unset for a new file, and `new_text`) and `terminal`. `ToolCallUpdate` marks each changed field with presence: `title`, `kind`, `status`, `raw_input` and `raw_output` are `optional`, and `content` and `locations` are the list messages `ToolCallContentList` and `ToolCallLocationList`, which replace the whole list when set. `AgentExited` is a `oneof status` of `exit_code` and `signal`.
 
 `BridgeInput`: `input_id` (UUID v7), `create_time` and a `oneof input`:
 

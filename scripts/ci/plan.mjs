@@ -78,6 +78,7 @@ export const e2eWorkspacePackages = [
   "packages/sandrun-sdk/",
   "protos/delino/accounts/",
   "protos/delino/ownsand/",
+  "protos/delino/sandcrew/",
   "protos/delino/sandrun/",
 ];
 

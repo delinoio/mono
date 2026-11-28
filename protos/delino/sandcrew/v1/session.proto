@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandcrew.v1;
+
+import "delino/sandcrew/v1/bridge.proto";
+import "delino/sandcrew/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1";
+
+// SessionService creates agent sessions, sends input to them and streams
+// their transcripts. Only the session owner reads a transcript and sends
+// input; other members read the session metadata.
+service SessionService {
+  // Create a session. Returns at once.
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  // Create a new session from an ENDED session of the caller, with the
+  // previous transcript file and a new first message.
+  rpc RestartSessionFromTranscript(RestartSessionFromTranscriptRequest) returns (RestartSessionFromTranscriptResponse);
+  // Read the metadata of one session.
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  // List sessions of the organization.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Delete a session, its sandbox and its transcript, immediately and
+  // permanently.
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+  // Send a user message. Resumes a paused session.
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  // Start the resume of a PAUSED session without new input.
+  rpc ResumeSession(ResumeSessionRequest) returns (ResumeSessionResponse);
+  // Answer a pending permission request. Resumes a paused session.
+  rpc AnswerPermission(AnswerPermissionRequest) returns (AnswerPermissionResponse);
+  // Cancel the current turn (ACP `session/cancel`).
+  rpc CancelTurn(CancelTurnRequest) returns (CancelTurnResponse);
+  // Switch to a mode that the agent advertises, or between AUTO_APPROVE and
+  // ASK.
+  rpc SetSessionMode(SetSessionModeRequest) returns (SetSessionModeResponse);
+  // Set a session configuration option that the agent advertises.
+  rpc SetSessionConfigOption(SetSessionConfigOptionRequest) returns (SetSessionConfigOptionResponse);
+  // Return the modes and configuration options that the latest session of a
+  // vendor in the organization advertised, for the new-session form.
+  rpc GetAgentOptions(GetAgentOptionsRequest) returns (GetAgentOptionsResponse);
+  // Read transcript events of a session after a sequence number, in pages.
+  rpc ListSessionEvents(ListSessionEventsRequest) returns (ListSessionEventsResponse);
+  // Stream the transcript events and state changes of one session after a
+  // sequence number. Keepalive at least every 30 seconds; the stream ends
+  // with an OK status before 14 minutes and the client continues from the
+  // last sequence it has.
+  rpc WatchSession(WatchSessionRequest) returns (stream WatchSessionResponse);
+  // Stream session metadata changes of the organization. Same keepalive and
+  // rotation rules as WatchSession.
+  rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
+}
+
+// What the agent of a session advertised in its latest events.
+message AgentInfo {
+  string agent_version = 1;
+  string current_mode_id = 2;
+  repeated SessionMode available_modes = 3;
+  repeated ConfigOption config_options = 4;
+}
+
+message Session {
+  string session_id = 1;
+  // The SandRun organization ID.
+  string organization_id = 2;
+  // The Logto user ID of the user who created the session.
+  string owner_user_id = 3;
+  // At most 100 characters, for display.
+  string label = 4;
+  AgentVendor vendor = 5;
+  string runner_profile_id = 6;
+  GuestOs guest_os = 7;
+  SessionState state = 8;
+  // Set in ENDED.
+  SessionEndReason end_reason = 9;
+  PermissionMode permission_mode = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp started_at = 12;
+  google.protobuf.Timestamp paused_at = 13;
+  google.protobuf.Timestamp ended_at = 14;
+  // Set while PAUSED with a limited paused-session retention.
+  google.protobuf.Timestamp scheduled_deletion_time = 15;
+  // Set for a session that started from the transcript of another session.
+  string previous_session_id = 16;
+  // For the owner only.
+  AgentInfo agent = 17;
+  // True while PAUSED after a resume waited longer than the maximum queue
+  // wait of the runner profile. A new input or ResumeSession starts the
+  // resume again.
+  bool resume_wait_expired = 18;
+}
+
+// One stored transcript event: a BridgeEvent without the credential_update
+// case. The field numbers of the cases equal those of BridgeEvent.
+message TranscriptEvent {
+  reserved 27;
+  reserved "credential_update";
+
+  uint64 sequence = 1;
+  google.protobuf.Timestamp time = 2;
+  oneof event {
+    BridgeHello hello = 10;
+    InputAccepted input_accepted = 11;
+    InputRejected input_rejected = 12;
+    ContentChunk user_message_chunk = 13;
+    ContentChunk agent_message_chunk = 14;
+    ContentChunk agent_thought_chunk = 15;
+    ToolCall tool_call = 16;
+    ToolCallUpdate tool_call_update = 17;
+    Plan plan = 18;
+    PermissionRequest permission_request = 19;
+    PermissionResponse permission_response = 20;
+    TurnEnded turn_ended = 21;
+    ModeChanged mode_changed = 22;
+    ConfigOptions config_options = 23;
+    AgentSessionState session_state = 24;
+    BridgeError bridge_error = 25;
+    AgentExited agent_exited = 26;
+    UnknownUpdate unknown_update = 28;
+    AgentReady agent_ready = 29;
+  }
+}
+
+message CreateSessionRequest {
+  string organization_id = 1;
+  AgentVendor vendor = 2;
+  string runner_profile_id = 3;
+  string first_message = 4;
+  // Optional, at most 100 characters.
+  string label = 5;
+  // IDs of the caller's session secrets that the session gets.
+  repeated string session_secret_ids = 6;
+  // Optional mode that GetAgentOptions returned.
+  string mode_id = 7;
+  // Optional configuration option values that GetAgentOptions returned.
+  repeated ConfigOptionSelection config_options = 8;
+}
+
+message CreateSessionResponse {
+  Session session = 1;
+}
+
+message RestartSessionFromTranscriptRequest {
+  string organization_id = 1;
+  // The ENDED session whose transcript the new session gets.
+  string session_id = 2;
+  string first_message = 3;
+}
+
+message RestartSessionFromTranscriptResponse {
+  Session session = 1;
+}
+
+message GetSessionRequest {
+  string organization_id = 1;
+  string session_id = 2;
+}
+
+message GetSessionResponse {
+  Session session = 1;
+}
+
+message ListSessionsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  // Optional owner filter.
+  oneof owner {
+    string owner_user_id = 4;
+    // Only the caller's own sessions.
+    bool owned_by_caller = 5;
+  }
+  repeated AgentVendor vendors = 6;
+  repeated SessionState states = 7;
+}
+
+message ListSessionsResponse {
+  // Newest first.
+  repeated Session sessions = 1;
+  string next_page_token = 2;
+}
+
+message DeleteSessionRequest {
+  string organization_id = 1;
+  string session_id = 2;
+}
+
+message DeleteSessionResponse {}
+
+message SendMessageRequest {
+  string organization_id = 1;
+  string session_id = 2;
+  // UUID v7, for idempotency.
+  string client_message_id = 3;
+  string text = 4;
+}
+
+message SendMessageResponse {
+  Session session = 1;
+}
+
+message ResumeSessionRequest {
+  string organization_id = 1;
+  string session_id = 2;
+}
+
+message ResumeSessionResponse {
+  Session session = 1;
+}
+
+message AnswerPermissionRequest {
+  string organization_id = 1;
+  string session_id = 2;
+  string permission_request_id = 3;
+  string option_id = 4;
+}
+
+message AnswerPermissionResponse {
+  Session session = 1;
+}
+
+message CancelTurnRequest {
+  string organization_id = 1;
+  string session_id = 2;
+  // UUID v7, for idempotency.
+  string client_message_id = 3;
+}
+
+message CancelTurnResponse {
+  Session session = 1;
+}
+
+message SetSessionModeRequest {
+  string organization_id = 1;
+  string session_id = 2;
+  // UUID v7, for idempotency.
+  string client_message_id = 3;
+  oneof mode {
+    // A mode that the agent advertised.
+    string mode_id = 4;
+    PermissionMode permission_mode = 5;
+  }
+}
+
+message SetSessionModeResponse {
+  Session session = 1;
+}
+
+message SetSessionConfigOptionRequest {
+  string organization_id = 1;
+  string session_id = 2;
+  // UUID v7, for idempotency.
+  string client_message_id = 3;
+  string config_option_id = 4;
+  string value_id = 5;
+}
+
+message SetSessionConfigOptionResponse {
+  Session session = 1;
+}
+
+message GetAgentOptionsRequest {
+  string organization_id = 1;
+  AgentVendor vendor = 2;
+}
+
+message GetAgentOptionsResponse {
+  // Empty when no session of the vendor advertised modes.
+  repeated SessionMode available_modes = 1;
+  // Empty when no session of the vendor advertised options.
+  repeated ConfigOption config_options = 2;
+}
+
+message ListSessionEventsRequest {
+  string organization_id = 1;
+  string session_id = 2;
+  // Return events with a greater sequence. 0 reads from the start.
+  uint64 after_sequence = 3;
+  // Default 200, maximum 500.
+  int32 page_size = 4;
+}
+
+message ListSessionEventsResponse {
+  repeated TranscriptEvent events = 1;
+  // The after_sequence of the next page. 0 when the response holds the last
+  // stored event.
+  uint64 next_sequence = 2;
+}
+
+message WatchSessionRequest {
+  string organization_id = 1;
+  string session_id = 2;
+  // Stream events with a greater sequence.
+  uint64 after_sequence = 3;
+}
+
+// Sent at least every 30 seconds while nothing else is sent.
+message Keepalive {}
+
+// Every stored event after the requested sequence was sent.
+message CaughtUp {}
+
+message WatchSessionResponse {
+  oneof event {
+    Keepalive keepalive = 1;
+    TranscriptEvent transcript_event = 2;
+    // The changed session metadata.
+    Session session = 3;
+    CaughtUp caught_up = 4;
+  }
+}
+
+message WatchSessionsRequest {
+  string organization_id = 1;
+}
+
+// A session that its owner deleted.
+message SessionDeleted {
+  string session_id = 1;
+}
+
+message WatchSessionsResponse {
+  oneof event {
+    Keepalive keepalive = 1;
+    // A created or changed session. Owner-only fields only for the owner.
+    Session session = 2;
+    SessionDeleted session_deleted = 3;
+  }
+}

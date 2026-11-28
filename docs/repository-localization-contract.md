@@ -2,13 +2,13 @@
 
 ## Scope
 
-This contract owns the languages and the language selection behavior of every app under `apps/`: `delino-site`, `delino-docs`, `delino-accounts`, `ownsand-console` (`apps/ownsand/`), `sandrun-console` (`apps/sandrun/`) and `delidev` (`apps/delidev/`). The [`delino-i18n` package contract](packages-delino-i18n-foundation.md) owns the catalog format, the translation tool, the ChatGPT integration and the browser runtime.
+This contract owns the languages and the language selection behavior of every app under `apps/`: `delino-site`, `delino-docs`, `delino-accounts`, `ownsand-console` (`apps/ownsand/`), `sandrun-console` (`apps/sandrun/`), `sandcrew-console` (`apps/sandcrew/`) and `delidev` (`apps/delidev/`). The [`delino-i18n` package contract](packages-delino-i18n-foundation.md) owns the catalog format, the translation tool, the ChatGPT integration and the browser runtime.
 
 ## Languages
 
 Every app uses English (`en`) as its source language and registers the same target languages, identified by BCP 47 tags, in this menu order: Korean (`ko`), Japanese (`ja`), Simplified Chinese (`zh-Hans`), Spanish (`es`), French (`fr`), German (`de`) and Brazilian Portuguese (`pt-BR`). Right-to-left languages are not registered until the layouts define mirroring. Each app owns its `i18n/locales.json` registry, its `i18n/messages/<lang>.json` catalogs and its `i18n/state.json`.
 
-Keep every user-visible text in the source catalog, not in components: headings, labels, buttons, descriptions, empty states, errors shown to users, accessible names and document titles. These stay unchanged and untranslated: product and company names (Delino, DeliDev, OwnSand, Sandrun, Logto, Paddle, GitHub, ChatGPT and other third-party names), identifiers, code, commands, URLs, enum values sent to APIs, values from the server and user content. Error text that a server returns is shown as received. Prices stay in USD as the [billing contract](repository-billing-contract.md) requires; numbers, dates and currency amounts are formatted with `Intl` for the selected language.
+Keep every user-visible text in the source catalog, not in components: headings, labels, buttons, descriptions, empty states, errors shown to users, accessible names and document titles. These stay unchanged and untranslated: product and company names (Delino, DeliDev, OwnSand, Sandrun, SandCrew, Logto, Paddle, GitHub, ChatGPT and other third-party names), identifiers, code, commands, URLs, enum values sent to APIs, values from the server and user content. Error text that a server returns is shown as received. Prices stay in USD as the [billing contract](repository-billing-contract.md) requires; numbers, dates and currency amounts are formatted with `Intl` for the selected language.
 
 ## Language selection
 
@@ -20,7 +20,7 @@ The `theme.*` catalog entries originate from the pinned Rspress theme and keep i
 
 ### React apps
 
-`delino-accounts`, `ownsand-console`, `sandrun-console` and `delidev` keep their routes unchanged in every language, because sign-in redirect URIs, invitation links and deep links are path-based. Before the first render, the app selects the language stored under the `localStorage` key `delino.language`, otherwise the best match for the browser languages, otherwise English (see `matchLanguage` in the package contract). The app shell shows a language menu that lists each registered language by its native label, on signed-in and signed-out pages. A selection applies immediately, without a page reload, and is kept in the browser. The source catalog is part of the main bundle; each target catalog is a separate chunk that loads only when selected.
+`delino-accounts`, `ownsand-console`, `sandrun-console`, `sandcrew-console` and `delidev` keep their routes unchanged in every language, because sign-in redirect URIs, invitation links and deep links are path-based. Before the first render, the app selects the language stored under the `localStorage` key `delino.language`, otherwise the best match for the browser languages, otherwise English (see `matchLanguage` in the package contract). The app shell shows a language menu that lists each registered language by its native label, on signed-in and signed-out pages. A selection applies immediately, without a page reload, and is kept in the browser. The source catalog is part of the main bundle; each target catalog is a separate chunk that loads only when selected.
 
 ## Translation workflow
 
@@ -49,5 +49,6 @@ To change text, edit the source catalog or the English page, run `pnpm i18n:tran
 - [delino-accounts web app foundation](apps-delino-accounts-foundation.md)
 - [ownsand-console foundation](apps-ownsand-console-foundation.md)
 - [sandrun-console foundation](apps-sandrun-console-foundation.md)
+- [sandcrew-console foundation](apps-sandcrew-console-foundation.md)
 - [delidev foundation](apps-delidev-foundation.md)
 - [Repository defaults](repository-defaults.md)

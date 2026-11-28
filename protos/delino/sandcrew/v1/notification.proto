@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandcrew.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1";
+
+// NotificationService stores the Web Push subscriptions of the caller's
+// browsers. A subscription is per user, not per organization.
+service NotificationService {
+  // Return the VAPID public key.
+  rpc GetWebPushConfig(GetWebPushConfigRequest) returns (GetWebPushConfigResponse);
+  // Store the Web Push subscription of the caller's browser.
+  rpc RegisterPushSubscription(RegisterPushSubscriptionRequest) returns (RegisterPushSubscriptionResponse);
+  // List the caller's subscriptions, without their keys.
+  rpc ListPushSubscriptions(ListPushSubscriptionsRequest) returns (ListPushSubscriptionsResponse);
+  // Delete one of the caller's subscriptions.
+  rpc DeletePushSubscription(DeletePushSubscriptionRequest) returns (DeletePushSubscriptionResponse);
+}
+
+message PushSubscription {
+  string push_subscription_id = 1;
+  // A name of the browser that the console sets, for display.
+  string label = 2;
+  // The origin of the push service endpoint, for display.
+  string endpoint_origin = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message GetWebPushConfigRequest {}
+
+message GetWebPushConfigResponse {
+  // The VAPID public key, base64url-encoded without padding.
+  string vapid_public_key = 1;
+}
+
+message RegisterPushSubscriptionRequest {
+  // The push service endpoint URL of the browser.
+  string endpoint = 1;
+  // The `p256dh` key of the subscription, base64url-encoded.
+  string p256dh_key = 2;
+  // The `auth` secret of the subscription, base64url-encoded.
+  string auth_key = 3;
+  // At most 100 characters, for display.
+  string label = 4;
+}
+
+message RegisterPushSubscriptionResponse {
+  PushSubscription subscription = 1;
+}
+
+message ListPushSubscriptionsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListPushSubscriptionsResponse {
+  repeated PushSubscription subscriptions = 1;
+  string next_page_token = 2;
+}
+
+message DeletePushSubscriptionRequest {
+  string push_subscription_id = 1;
+}
+
+message DeletePushSubscriptionResponse {}

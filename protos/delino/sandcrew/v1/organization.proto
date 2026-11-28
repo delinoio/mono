@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandcrew.v1;
+
+import "delino/sandcrew/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1";
+
+// OrganizationService reads the caller's SandRun organizations and owns the
+// SandCrew settings of each organization.
+service OrganizationService {
+  // List the SandRun organizations of the caller with the caller's role.
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse);
+  // Read the SandCrew settings of one organization.
+  rpc GetOrganizationSettings(GetOrganizationSettingsRequest) returns (GetOrganizationSettingsResponse);
+  // Change the SandCrew settings with a field mask (owner and admin).
+  rpc UpdateOrganizationSettings(UpdateOrganizationSettingsRequest) returns (UpdateOrganizationSettingsResponse);
+  // List the SandRun DEV_SESSION runner profiles with their eligibility.
+  rpc ListRunnerProfiles(ListRunnerProfilesRequest) returns (ListRunnerProfilesResponse);
+}
+
+message Organization {
+  // The SandRun organization ID.
+  string organization_id = 1;
+  string name = 2;
+  Role caller_role = 3;
+}
+
+// The paused-session retention: a whole number of days or unlimited.
+message PausedSessionRetention {
+  oneof retention {
+    // 1 to 365 days in whole days.
+    google.protobuf.Duration duration = 1;
+    // Paused sessions are kept until their owner deletes them.
+    bool unlimited = 2;
+  }
+}
+
+message OrganizationSettings {
+  string organization_id = 1;
+  // SandRun DEV_SESSION runner profile IDs that members can select.
+  repeated string allowed_runner_profile_ids = 2;
+  // How long a session waits for input before SandCrew pauses it.
+  google.protobuf.Duration pause_delay = 3;
+  PausedSessionRetention paused_session_retention = 4;
+  google.protobuf.Timestamp update_time = 5;
+}
+
+// A SandRun DEV_SESSION runner profile, as SandCrew sees it.
+message RunnerProfile {
+  string runner_profile_id = 1;
+  string name = 2;
+  GuestOs guest_os = 3;
+  int32 vcpu_count = 4;
+  int64 memory_mib = 5;
+  int64 disk_gib = 6;
+  // The profile is in allowed_runner_profile_ids.
+  bool allowed = 7;
+  // SandCrew can use the profile. When false, ineligibility says why.
+  bool selectable = 8;
+  repeated ProfileIneligibility ineligibility = 9;
+}
+
+message ListOrganizationsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListOrganizationsResponse {
+  repeated Organization organizations = 1;
+  string next_page_token = 2;
+}
+
+message GetOrganizationSettingsRequest {
+  string organization_id = 1;
+}
+
+message GetOrganizationSettingsResponse {
+  OrganizationSettings settings = 1;
+}
+
+message UpdateOrganizationSettingsRequest {
+  string organization_id = 1;
+  OrganizationSettings settings = 2;
+  // Paths: allowed_runner_profile_ids, pause_delay and
+  // paused_session_retention. A masked path without a value restores the
+  // default.
+  google.protobuf.FieldMask update_mask = 3;
+}
+
+message UpdateOrganizationSettingsResponse {
+  OrganizationSettings settings = 1;
+}
+
+message ListRunnerProfilesRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListRunnerProfilesResponse {
+  repeated RunnerProfile profiles = 1;
+  string next_page_token = 2;
+}

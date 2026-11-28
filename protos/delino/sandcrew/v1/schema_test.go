@@ -143,3 +143,160 @@ func sample(value protoreflect.Value, field protoreflect.FieldDescriptor) protor
 		panic("unsupported kind " + field.Kind().String())
 	}
 }
+
+// services returns every service of the package.
+func services(t *testing.T) []protoreflect.ServiceDescriptor {
+	t.Helper()
+	var out []protoreflect.ServiceDescriptor
+	protoregistry.GlobalFiles.RangeFilesByPackage(packageName, func(file protoreflect.FileDescriptor) bool {
+		for i := 0; i < file.Services().Len(); i++ {
+			out = append(out, file.Services().Get(i))
+		}
+		return true
+	})
+	if len(out) == 0 {
+		t.Fatal("no services registered for the package")
+	}
+	return out
+}
+
+// Every public RPC is unary or server-streaming, so browser clients can call
+// it. A server-streaming RPC returns a <Rpc>Response message.
+func TestRPCsAreUnaryOrServerStreaming(t *testing.T) {
+	for _, service := range services(t) {
+		for i := 0; i < service.Methods().Len(); i++ {
+			method := service.Methods().Get(i)
+			if method.IsStreamingClient() {
+				t.Errorf("%s is client-streaming", method.FullName())
+			}
+			if want := method.Name() + "Response"; method.Output().Name() != want {
+				t.Errorf("%s returns %s, want %s", method.FullName(), method.Output().Name(), want)
+			}
+		}
+	}
+}
+
+// Every RPC except ListOrganizations and the NotificationService RPCs takes
+// an organization_id.
+func TestRPCsTakeOrganizationID(t *testing.T) {
+	for _, service := range services(t) {
+		for i := 0; i < service.Methods().Len(); i++ {
+			method := service.Methods().Get(i)
+			without := method.FullName() == "delino.sandcrew.v1.OrganizationService.ListOrganizations" ||
+				service.FullName() == "delino.sandcrew.v1.NotificationService"
+			has := method.Input().Fields().ByName("organization_id") != nil
+			if has == without {
+				t.Errorf("%s: organization_id present = %v", method.FullName(), has)
+			}
+		}
+	}
+}
+
+// valueFields are the request fields that carry credential, secret or push
+// subscription key values.
+var valueFields = map[protoreflect.FullName]bool{
+	"delino.sandcrew.v1.SetVendorCredentialRequest.value":           true,
+	"delino.sandcrew.v1.SetSessionSecretRequest.value":              true,
+	"delino.sandcrew.v1.RegisterPushSubscriptionRequest.p256dh_key": true,
+	"delino.sandcrew.v1.RegisterPushSubscriptionRequest.auth_key":   true,
+}
+
+// No response message, or message reachable from one, has a field named like
+// a credential or secret value.
+func TestResponsesCarryNoValues(t *testing.T) {
+	for name := range valueFields {
+		if _, err := protoregistry.GlobalFiles.FindDescriptorByName(name); err != nil {
+			t.Errorf("value field %s is not registered: %v", name, err)
+		}
+	}
+	seen := map[protoreflect.FullName]bool{}
+	var walk func(protoreflect.MessageDescriptor)
+	walk = func(message protoreflect.MessageDescriptor) {
+		if seen[message.FullName()] || message.ParentFile().Package() != packageName {
+			return
+		}
+		seen[message.FullName()] = true
+		for i := 0; i < message.Fields().Len(); i++ {
+			field := message.Fields().Get(i)
+			switch field.Name() {
+			case "value", "p256dh_key", "auth_key", "endpoint":
+				t.Errorf("response field %s carries a value", field.FullName())
+			}
+			if field.Message() != nil {
+				walk(field.Message())
+			}
+		}
+	}
+	for _, service := range services(t) {
+		for i := 0; i < service.Methods().Len(); i++ {
+			walk(service.Methods().Get(i).Output())
+		}
+	}
+}
+
+// TranscriptEvent has every BridgeEvent case except credential_update, with
+// the same field numbers and messages.
+func TestTranscriptEventHasNoCredentialUpdate(t *testing.T) {
+	transcript := (&sandcrewv1.TranscriptEvent{}).ProtoReflect().Descriptor()
+	if transcript.Fields().ByName("credential_update") != nil {
+		t.Fatal("TranscriptEvent has a credential_update case")
+	}
+	if !transcript.ReservedNames().Has("credential_update") {
+		t.Error("TranscriptEvent does not reserve the name credential_update")
+	}
+	bridge := (&sandcrewv1.BridgeEvent{}).ProtoReflect().Descriptor().Oneofs().ByName("event")
+	oneof := transcript.Oneofs().ByName("event")
+	if oneof.Fields().Len() != bridge.Fields().Len()-1 {
+		t.Fatalf("TranscriptEvent has %d cases, want %d", oneof.Fields().Len(), bridge.Fields().Len()-1)
+	}
+	for i := 0; i < bridge.Fields().Len(); i++ {
+		want := bridge.Fields().Get(i)
+		if want.Name() == "credential_update" {
+			continue
+		}
+		got := oneof.Fields().ByName(want.Name())
+		if got == nil {
+			t.Errorf("TranscriptEvent has no case %q", want.Name())
+			continue
+		}
+		if got.Number() != want.Number() || got.Message().FullName() != want.Message().FullName() {
+			t.Errorf("case %q is %d %s, want %d %s", want.Name(), got.Number(), got.Message().FullName(), want.Number(), want.Message().FullName())
+		}
+	}
+}
+
+// Every BridgeEvent case except credential_update has a TranscriptEvent case
+// with the same wire encoding.
+func TestBridgeEventCasesConvertToTranscriptEvents(t *testing.T) {
+	oneof := (&sandcrewv1.BridgeEvent{}).ProtoReflect().Descriptor().Oneofs().ByName("event")
+	fields := oneof.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		if field.Name() == "credential_update" {
+			continue
+		}
+		t.Run(string(field.Name()), func(t *testing.T) {
+			event := &sandcrewv1.BridgeEvent{Sequence: 7, Time: timestamppb.Now()}
+			message := event.ProtoReflect()
+			value := message.NewField(field)
+			populate(value.Message())
+			message.Set(field, value)
+			wire, err := proto.Marshal(event)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var transcript sandcrewv1.TranscriptEvent
+			if err := proto.Unmarshal(wire, &transcript); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			transcriptMessage := transcript.ProtoReflect()
+			got := transcriptMessage.WhichOneof(transcriptMessage.Descriptor().Oneofs().ByName("event"))
+			if got == nil || got.Name() != field.Name() {
+				t.Fatalf("case %s did not convert", field.Name())
+			}
+			if !proto.Equal(message.Get(field).Message().Interface(), transcriptMessage.Get(got).Message().Interface()) {
+				t.Fatalf("case %s changed during conversion", field.Name())
+			}
+		})
+	}
+}

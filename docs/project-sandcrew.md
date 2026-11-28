@@ -21,9 +21,9 @@ Success criterion (feature completion): an organization member creates a Claude 
 A `planned` path changes to an actual path in the change that creates it, together with its workspace membership and its validation scripts.
 
 - `servers/sandcrew-api/` (`planned`): Go control plane on the shared DigitalOcean Droplet, served at `https://sandcrew.api.delino.io`. It owns sessions, transcripts, vendor credentials, session secrets, the organization settings of SandCrew, the event collector and Web Push notifications.
-- `apps/sandcrew/` (`planned`): Rsbuild React web console (workspace package `sandcrew-console`) served at `https://sandcrew.delino.io`.
+- `apps/sandcrew/`: Rsbuild React web console (workspace package `sandcrew-console`) served at `https://sandcrew.delino.io`.
 - `cmds/sandcrew-bridge/`: Go guest program (the bridge) that SandCrew copies into each session sandbox. It starts the vendor agent, speaks ACP with it over local stdio, reads input from an inbox directory and writes normalized events.
-- `protos/delino/sandcrew/`: the workspace package `@delino/sandcrew-protos` with the Connect RPC schemas and the bridge event schema in `v1/`, the committed Go bindings and the committed TypeScript bindings. The bridge schema exists; the Connect RPC schemas are added with the control plane.
+- `protos/delino/sandcrew/`: the workspace package `@delino/sandcrew-protos` with the Connect RPC schemas and the bridge event schema in `v1/`, the committed Go bindings and the committed TypeScript bindings.
 
 The project has one hosted server deployable (the control plane), one static site (the console) and one distributed program (the bridge, which SandCrew distributes itself into session sandboxes). The project has no `crates` or `packages` paths.
 

@@ -47,3 +47,63 @@ enum VendorCredentialKind {
   // The OpenAI Codex ChatGPT sign-in file `auth.json`.
   VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON = 3;
 }
+
+// Enums of the Connect API only. They are here because more than one Connect
+// API file uses them.
+
+// The caller's SandRun role in an organization.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_OWNER = 1;
+  ROLE_ADMIN = 2;
+  ROLE_MEMBER = 3;
+}
+// The state of a session. Only ENDED is terminal.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_QUEUED = 1;
+  SESSION_STATE_STARTING = 2;
+  SESSION_STATE_RUNNING = 3;
+  SESSION_STATE_WAITING_FOR_INPUT = 4;
+  SESSION_STATE_PAUSING = 5;
+  SESSION_STATE_PAUSED = 6;
+  SESSION_STATE_RESUME_QUEUED = 7;
+  SESSION_STATE_RESUMING = 8;
+  SESSION_STATE_DISCONNECTED = 9;
+  SESSION_STATE_ENDED = 10;
+}
+// Why a session ended.
+enum SessionEndReason {
+  SESSION_END_REASON_UNSPECIFIED = 0;
+  SESSION_END_REASON_START_FAILED = 1;
+  SESSION_END_REASON_QUEUE_EXPIRED = 2;
+  SESSION_END_REASON_AGENT_EXITED = 3;
+  SESSION_END_REASON_DEVICE_LOST = 4;
+  SESSION_END_REASON_RESTORE_FAILED = 5;
+  SESSION_END_REASON_PAUSED_RETENTION_EXPIRED = 6;
+  SESSION_END_REASON_BRIDGE_UNSUPPORTED = 7;
+  SESSION_END_REASON_EXECUTOR_ENDED = 8;
+}
+// The owner of a vendor credential.
+enum CredentialScope {
+  CREDENTIAL_SCOPE_UNSPECIFIED = 0;
+  CREDENTIAL_SCOPE_ORGANIZATION = 1;
+  CREDENTIAL_SCOPE_USER = 2;
+}
+// Who set the stored value of a vendor credential.
+enum CredentialUpdateSource {
+  CREDENTIAL_UPDATE_SOURCE_UNSPECIFIED = 0;
+  CREDENTIAL_UPDATE_SOURCE_USER = 1;
+  // The agent refreshed the credential in a session.
+  CREDENTIAL_UPDATE_SOURCE_AGENT_REFRESH = 2;
+}
+// Why SandCrew cannot use a SandRun DEV_SESSION runner profile.
+enum ProfileIneligibility {
+  PROFILE_INELIGIBILITY_UNSPECIFIED = 0;
+  // The profile has a maximum lifetime (`max_ttl`).
+  PROFILE_INELIGIBILITY_HAS_MAXIMUM_LIFETIME = 1;
+  // The network mode of the profile is not OUTBOUND.
+  PROFILE_INELIGIBILITY_NETWORK_NOT_OUTBOUND = 2;
+  // SandCrew does not support the guest OS of the profile.
+  PROFILE_INELIGIBILITY_GUEST_OS_UNSUPPORTED = 3;
+}

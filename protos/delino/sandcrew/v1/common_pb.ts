@@ -11,7 +11,7 @@ import { enumDesc, fileDesc } from "@bufbuild/protobuf/codegenv2";
  * Describes the file delino/sandcrew/v1/common.proto.
  */
 export const file_delino_sandcrew_v1_common: GenFile = /*@__PURE__*/
-  fileDesc("Ch9kZWxpbm8vc2FuZGNyZXcvdjEvY29tbW9uLnByb3RvEhJkZWxpbm8uc2FuZGNyZXcudjEqaAoLQWdlbnRWZW5kb3ISHAoYQUdFTlRfVkVORE9SX1VOU1BFQ0lGSUVEEAASHAoYQUdFTlRfVkVORE9SX0NMQVVERV9DT0RFEAESHQoZQUdFTlRfVkVORE9SX09QRU5BSV9DT0RFWBACKmEKB0d1ZXN0T3MSGAoUR1VFU1RfT1NfVU5TUEVDSUZJRUQQABISCg5HVUVTVF9PU19MSU5VWBABEhIKDkdVRVNUX09TX01BQ09TEAISFAoQR1VFU1RfT1NfV0lORE9XUxADKmwKDlBlcm1pc3Npb25Nb2RlEh8KG1BFUk1JU1NJT05fTU9ERV9VTlNQRUNJRklFRBAAEiAKHFBFUk1JU1NJT05fTU9ERV9BVVRPX0FQUFJPVkUQARIXChNQRVJNSVNTSU9OX01PREVfQVNLEAIqvQEKFFZlbmRvckNyZWRlbnRpYWxLaW5kEiYKIlZFTkRPUl9DUkVERU5USUFMX0tJTkRfVU5TUEVDSUZJRUQQABIiCh5WRU5ET1JfQ1JFREVOVElBTF9LSU5EX0FQSV9LRVkQARItCilWRU5ET1JfQ1JFREVOVElBTF9LSU5EX0NMQVVERV9PQVVUSF9UT0tFThACEioKJlZFTkRPUl9DUkVERU5USUFMX0tJTkRfQ09ERVhfQVVUSF9KU09OEANCP1o9Z2l0aHViLmNvbS9kZWxpbm9pby9tb25vL3Byb3Rvcy9kZWxpbm8vc2FuZGNyZXcvdjE7c2FuZGNyZXd2MWIGcHJvdG8z");
+  fileDesc("Ch9kZWxpbm8vc2FuZGNyZXcvdjEvY29tbW9uLnByb3RvEhJkZWxpbm8uc2FuZGNyZXcudjEqaAoLQWdlbnRWZW5kb3ISHAoYQUdFTlRfVkVORE9SX1VOU1BFQ0lGSUVEEAASHAoYQUdFTlRfVkVORE9SX0NMQVVERV9DT0RFEAESHQoZQUdFTlRfVkVORE9SX09QRU5BSV9DT0RFWBACKmEKB0d1ZXN0T3MSGAoUR1VFU1RfT1NfVU5TUEVDSUZJRUQQABISCg5HVUVTVF9PU19MSU5VWBABEhIKDkdVRVNUX09TX01BQ09TEAISFAoQR1VFU1RfT1NfV0lORE9XUxADKmwKDlBlcm1pc3Npb25Nb2RlEh8KG1BFUk1JU1NJT05fTU9ERV9VTlNQRUNJRklFRBAAEiAKHFBFUk1JU1NJT05fTU9ERV9BVVRPX0FQUFJPVkUQARIXChNQRVJNSVNTSU9OX01PREVfQVNLEAIqvQEKFFZlbmRvckNyZWRlbnRpYWxLaW5kEiYKIlZFTkRPUl9DUkVERU5USUFMX0tJTkRfVU5TUEVDSUZJRUQQABIiCh5WRU5ET1JfQ1JFREVOVElBTF9LSU5EX0FQSV9LRVkQARItCilWRU5ET1JfQ1JFREVOVElBTF9LSU5EX0NMQVVERV9PQVVUSF9UT0tFThACEioKJlZFTkRPUl9DUkVERU5USUFMX0tJTkRfQ09ERVhfQVVUSF9KU09OEAMqTQoEUm9sZRIUChBST0xFX1VOU1BFQ0lGSUVEEAASDgoKUk9MRV9PV05FUhABEg4KClJPTEVfQURNSU4QAhIPCgtST0xFX01FTUJFUhADKs4CCgxTZXNzaW9uU3RhdGUSHQoZU0VTU0lPTl9TVEFURV9VTlNQRUNJRklFRBAAEhgKFFNFU1NJT05fU1RBVEVfUVVFVUVEEAESGgoWU0VTU0lPTl9TVEFURV9TVEFSVElORxACEhkKFVNFU1NJT05fU1RBVEVfUlVOTklORxADEiMKH1NFU1NJT05fU1RBVEVfV0FJVElOR19GT1JfSU5QVVQQBBIZChVTRVNTSU9OX1NUQVRFX1BBVVNJTkcQBRIYChRTRVNTSU9OX1NUQVRFX1BBVVNFRBAGEh8KG1NFU1NJT05fU1RBVEVfUkVTVU1FX1FVRVVFRBAHEhoKFlNFU1NJT05fU1RBVEVfUkVTVU1JTkcQCBIeChpTRVNTSU9OX1NUQVRFX0RJU0NPTk5FQ1RFRBAJEhcKE1NFU1NJT05fU1RBVEVfRU5ERUQQCir0AgoQU2Vzc2lvbkVuZFJlYXNvbhIiCh5TRVNTSU9OX0VORF9SRUFTT05fVU5TUEVDSUZJRUQQABIjCh9TRVNTSU9OX0VORF9SRUFTT05fU1RBUlRfRkFJTEVEEAESJAogU0VTU0lPTl9FTkRfUkVBU09OX1FVRVVFX0VYUElSRUQQAhIjCh9TRVNTSU9OX0VORF9SRUFTT05fQUdFTlRfRVhJVEVEEAMSIgoeU0VTU0lPTl9FTkRfUkVBU09OX0RFVklDRV9MT1NUEAQSJQohU0VTU0lPTl9FTkRfUkVBU09OX1JFU1RPUkVfRkFJTEVEEAUSLworU0VTU0lPTl9FTkRfUkVBU09OX1BBVVNFRF9SRVRFTlRJT05fRVhQSVJFRBAGEikKJVNFU1NJT05fRU5EX1JFQVNPTl9CUklER0VfVU5TVVBQT1JURUQQBxIlCiFTRVNTSU9OX0VORF9SRUFTT05fRVhFQ1VUT1JfRU5ERUQQCCpxCg9DcmVkZW50aWFsU2NvcGUSIAocQ1JFREVOVElBTF9TQ09QRV9VTlNQRUNJRklFRBAAEiEKHUNSRURFTlRJQUxfU0NPUEVfT1JHQU5JWkFUSU9OEAESGQoVQ1JFREVOVElBTF9TQ09QRV9VU0VSEAIqkQEKFkNyZWRlbnRpYWxVcGRhdGVTb3VyY2USKAokQ1JFREVOVElBTF9VUERBVEVfU09VUkNFX1VOU1BFQ0lGSUVEEAASIQodQ1JFREVOVElBTF9VUERBVEVfU09VUkNFX1VTRVIQARIqCiZDUkVERU5USUFMX1VQREFURV9TT1VSQ0VfQUdFTlRfUkVGUkVTSBACKs0BChRQcm9maWxlSW5lbGlnaWJpbGl0eRIlCiFQUk9GSUxFX0lORUxJR0lCSUxJVFlfVU5TUEVDSUZJRUQQABIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfSEFTX01BWElNVU1fTElGRVRJTUUQARIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfTkVUV09SS19OT1RfT1VUQk9VTkQQAhIuCipQUk9GSUxFX0lORUxJR0lCSUxJVFlfR1VFU1RfT1NfVU5TVVBQT1JURUQQA0I/Wj1naXRodWIuY29tL2RlbGlub2lvL21vbm8vcHJvdG9zL2RlbGluby9zYW5kY3Jldy92MTtzYW5kY3Jld3YxYgZwcm90bzM");
 
 /**
  * Vendor of the coding agent of a session.
@@ -149,4 +149,260 @@ export enum VendorCredentialKind {
  */
 export const VendorCredentialKindSchema: GenEnum<VendorCredentialKind> = /*@__PURE__*/
   enumDesc(file_delino_sandcrew_v1_common, 3);
+
+/**
+ * The caller's SandRun role in an organization.
+ *
+ * @generated from enum delino.sandcrew.v1.Role
+ */
+export enum Role {
+  /**
+   * @generated from enum value: ROLE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: ROLE_OWNER = 1;
+   */
+  OWNER = 1,
+
+  /**
+   * @generated from enum value: ROLE_ADMIN = 2;
+   */
+  ADMIN = 2,
+
+  /**
+   * @generated from enum value: ROLE_MEMBER = 3;
+   */
+  MEMBER = 3,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.Role.
+ */
+export const RoleSchema: GenEnum<Role> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 4);
+
+/**
+ * The state of a session. Only ENDED is terminal.
+ *
+ * @generated from enum delino.sandcrew.v1.SessionState
+ */
+export enum SessionState {
+  /**
+   * @generated from enum value: SESSION_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SESSION_STATE_QUEUED = 1;
+   */
+  QUEUED = 1,
+
+  /**
+   * @generated from enum value: SESSION_STATE_STARTING = 2;
+   */
+  STARTING = 2,
+
+  /**
+   * @generated from enum value: SESSION_STATE_RUNNING = 3;
+   */
+  RUNNING = 3,
+
+  /**
+   * @generated from enum value: SESSION_STATE_WAITING_FOR_INPUT = 4;
+   */
+  WAITING_FOR_INPUT = 4,
+
+  /**
+   * @generated from enum value: SESSION_STATE_PAUSING = 5;
+   */
+  PAUSING = 5,
+
+  /**
+   * @generated from enum value: SESSION_STATE_PAUSED = 6;
+   */
+  PAUSED = 6,
+
+  /**
+   * @generated from enum value: SESSION_STATE_RESUME_QUEUED = 7;
+   */
+  RESUME_QUEUED = 7,
+
+  /**
+   * @generated from enum value: SESSION_STATE_RESUMING = 8;
+   */
+  RESUMING = 8,
+
+  /**
+   * @generated from enum value: SESSION_STATE_DISCONNECTED = 9;
+   */
+  DISCONNECTED = 9,
+
+  /**
+   * @generated from enum value: SESSION_STATE_ENDED = 10;
+   */
+  ENDED = 10,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.SessionState.
+ */
+export const SessionStateSchema: GenEnum<SessionState> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 5);
+
+/**
+ * Why a session ended.
+ *
+ * @generated from enum delino.sandcrew.v1.SessionEndReason
+ */
+export enum SessionEndReason {
+  /**
+   * @generated from enum value: SESSION_END_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_START_FAILED = 1;
+   */
+  START_FAILED = 1,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_QUEUE_EXPIRED = 2;
+   */
+  QUEUE_EXPIRED = 2,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_AGENT_EXITED = 3;
+   */
+  AGENT_EXITED = 3,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_DEVICE_LOST = 4;
+   */
+  DEVICE_LOST = 4,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_RESTORE_FAILED = 5;
+   */
+  RESTORE_FAILED = 5,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_PAUSED_RETENTION_EXPIRED = 6;
+   */
+  PAUSED_RETENTION_EXPIRED = 6,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_BRIDGE_UNSUPPORTED = 7;
+   */
+  BRIDGE_UNSUPPORTED = 7,
+
+  /**
+   * @generated from enum value: SESSION_END_REASON_EXECUTOR_ENDED = 8;
+   */
+  EXECUTOR_ENDED = 8,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.SessionEndReason.
+ */
+export const SessionEndReasonSchema: GenEnum<SessionEndReason> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 6);
+
+/**
+ * The owner of a vendor credential.
+ *
+ * @generated from enum delino.sandcrew.v1.CredentialScope
+ */
+export enum CredentialScope {
+  /**
+   * @generated from enum value: CREDENTIAL_SCOPE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: CREDENTIAL_SCOPE_ORGANIZATION = 1;
+   */
+  ORGANIZATION = 1,
+
+  /**
+   * @generated from enum value: CREDENTIAL_SCOPE_USER = 2;
+   */
+  USER = 2,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.CredentialScope.
+ */
+export const CredentialScopeSchema: GenEnum<CredentialScope> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 7);
+
+/**
+ * Who set the stored value of a vendor credential.
+ *
+ * @generated from enum delino.sandcrew.v1.CredentialUpdateSource
+ */
+export enum CredentialUpdateSource {
+  /**
+   * @generated from enum value: CREDENTIAL_UPDATE_SOURCE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: CREDENTIAL_UPDATE_SOURCE_USER = 1;
+   */
+  USER = 1,
+
+  /**
+   * The agent refreshed the credential in a session.
+   *
+   * @generated from enum value: CREDENTIAL_UPDATE_SOURCE_AGENT_REFRESH = 2;
+   */
+  AGENT_REFRESH = 2,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.CredentialUpdateSource.
+ */
+export const CredentialUpdateSourceSchema: GenEnum<CredentialUpdateSource> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 8);
+
+/**
+ * Why SandCrew cannot use a SandRun DEV_SESSION runner profile.
+ *
+ * @generated from enum delino.sandcrew.v1.ProfileIneligibility
+ */
+export enum ProfileIneligibility {
+  /**
+   * @generated from enum value: PROFILE_INELIGIBILITY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * The profile has a maximum lifetime (`max_ttl`).
+   *
+   * @generated from enum value: PROFILE_INELIGIBILITY_HAS_MAXIMUM_LIFETIME = 1;
+   */
+  HAS_MAXIMUM_LIFETIME = 1,
+
+  /**
+   * The network mode of the profile is not OUTBOUND.
+   *
+   * @generated from enum value: PROFILE_INELIGIBILITY_NETWORK_NOT_OUTBOUND = 2;
+   */
+  NETWORK_NOT_OUTBOUND = 2,
+
+  /**
+   * SandCrew does not support the guest OS of the profile.
+   *
+   * @generated from enum value: PROFILE_INELIGIBILITY_GUEST_OS_UNSUPPORTED = 3;
+   */
+  GUEST_OS_UNSUPPORTED = 3,
+}
+
+/**
+ * Describes the enum delino.sandcrew.v1.ProfileIneligibility.
+ */
+export const ProfileIneligibilitySchema: GenEnum<ProfileIneligibility> = /*@__PURE__*/
+  enumDesc(file_delino_sandcrew_v1_common, 9);
 
