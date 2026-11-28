@@ -879,6 +879,74 @@ const linuxProfile = {
   organizationId: MOCK_IDS.acme,
   runnerProfileId: MOCK_IDS.linuxProfile,
 };
+test.each([
+  { label: "an omitted update mask", mask: {} },
+  {
+    label: "an update mask with zero paths",
+    mask: { updateMask: { paths: [] } },
+  },
+])(
+  "rejects $label without changing the profile or its audit history",
+  async ({ mask }) => {
+    const transport = createMockTransport();
+    const profiles = createClient(RunnerProfileService, transport);
+    const audit = createClient(AuditService, transport);
+    const auditRequest = { organizationId: linuxProfile.organizationId };
+    const before = structuredClone(
+      await profiles.getRunnerProfile(linuxProfile),
+    );
+    const auditsBefore = structuredClone(
+      await audit.listAuditEvents(auditRequest),
+    );
+
+    await expect(
+      profiles.updateRunnerProfile({
+        ...linuxProfile,
+        profile: { name: "linux-build-new" },
+        ...mask,
+      }),
+    ).rejects.toMatchObject({
+      code: Code.InvalidArgument,
+      rawMessage: "invalid update_mask: must name at least one path",
+    });
+
+    expect(await profiles.getRunnerProfile(linuxProfile)).toEqual(before);
+    expect(await audit.listAuditEvents(auditRequest)).toEqual(auditsBefore);
+  },
+);
+
+test("updates the runner profile name and label and adds one audit event", async () => {
+  const transport = createMockTransport();
+  const profiles = createClient(RunnerProfileService, transport);
+  const audit = createClient(AuditService, transport);
+  const auditRequest = { organizationId: linuxProfile.organizationId };
+  const auditsBefore = structuredClone(
+    await audit.listAuditEvents(auditRequest),
+  );
+
+  const updated = await profiles.updateRunnerProfile({
+    ...linuxProfile,
+    profile: { name: "linux-build-new" },
+    updateMask: { paths: ["name"] },
+  });
+
+  expect(updated.profile).toMatchObject({
+    name: "linux-build-new",
+    githubLabel: "sandrun-linux-build-new",
+  });
+  expect((await profiles.getRunnerProfile(linuxProfile)).profile).toEqual(
+    updated.profile,
+  );
+  const auditAfter = await audit.listAuditEvents(auditRequest);
+  const [event, ...events] = auditAfter.events;
+  expect(event).toMatchObject({
+    action: AuditAction.RUNNER_PROFILE_UPDATED,
+    targetKind: AuditTargetKind.RUNNER_PROFILE,
+    targetId: linuxProfile.runnerProfileId,
+  });
+  expect({ ...auditAfter, events }).toEqual(auditsBefore);
+});
+
 const seededResources = { vcpuCount: 4, memoryMib: 8192n, diskGib: 64n };
 
 test.each([

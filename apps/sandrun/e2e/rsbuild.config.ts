@@ -23,6 +23,8 @@ export default mergeRsbuildConfig(consoleConfig, {
       "credential-replacement-fixture":
         "./e2e/credential-replacement-fixture.ts",
       "direct-action-fixture": "./e2e/direct-action-fixture.tsx",
+      "runner-profile-update-mask-fixture":
+        "./e2e/runner-profile-update-mask-fixture.ts",
     },
   },
 });
