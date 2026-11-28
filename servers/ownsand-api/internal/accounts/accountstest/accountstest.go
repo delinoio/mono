@@ -504,7 +504,10 @@ func (h handler) ListBillingStatusChanges(_ context.Context, req *connect.Reques
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("negative after_sequence"))
 	}
 	size := int(req.Msg.GetPageSize())
-	if size <= 0 {
+	if size < 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("page_size must not be negative"))
+	}
+	if size == 0 {
 		size = 50
 	}
 	size = min(size, 200)
