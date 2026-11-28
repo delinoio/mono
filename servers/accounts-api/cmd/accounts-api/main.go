@@ -50,10 +50,7 @@ const (
 )
 
 func main() {
-	// Keep startup failures in the same JSON format as the server logs.
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if err := run(runAsync); err != nil {
-		slog.Error("server_exited", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
@@ -62,26 +59,36 @@ func main() {
 // receives the worker's result after it finishes.
 type workerDispatcher func(func() error) <-chan error
 
-func run(dispatchWorker workerDispatcher) error {
+func run(dispatchWorker workerDispatcher) (runErr error) {
+	// Use JSON for startup errors even before telemetry initializes.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+	var tel *telemetry.Telemetry
+	// Register this first so application cleanup runs before the final log
+	// record and the telemetry flush.
+	defer func() {
+		if runErr != nil {
+			logger.Error("server_exited", slog.Any("error", runErr))
+		}
+		if tel == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+		defer cancel()
+		if err := tel.Shutdown(ctx); err != nil {
+			logger.Error("telemetry_shutdown_failed", slog.Any("error", err))
+		}
+	}()
+
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
 		return err
 	}
-
-	tel, err := telemetry.New(context.Background(), telemetry.Options{ServiceName: "accounts-api", Level: cfg.LogLevel.SlogLevel()})
+	tel, err = telemetry.New(context.Background(), telemetry.Options{ServiceName: "accounts-api", Level: cfg.LogLevel.SlogLevel()})
 	if err != nil {
 		return err
 	}
-	// This deferred call runs last, so the OTLP export flushes the records of
-	// the shutdown.
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
-		defer cancel()
-		if err := tel.Shutdown(ctx); err != nil {
-			slog.Error("telemetry_shutdown_failed", slog.Any("error", err))
-		}
-	}()
-	logger := tel.Logger
+	logger = tel.Logger
 	slog.SetDefault(logger)
 
 	ctx, stop := shutdownContext()
