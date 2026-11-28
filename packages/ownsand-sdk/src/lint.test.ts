@@ -99,24 +99,32 @@ describe("ownsand-sdk lint server imports", () => {
     'export { x } from "../../../servers/x";',
     "void import(`../../../servers/x`);",
     'void import("../../../packages/../servers/x", {});',
+    'export type Example = import("../../../servers/x").Example;',
+    'export type Example = typeof import("../../../servers/x");',
   ])("rejects %s", (source) => {
     const result = lint({ "a.ts": `${header}\n${source}\n` });
     expect(result.status).toBe(1);
     expect(result.stderr).toBe("a.ts: the SDK must not import from servers/\n");
   });
 
-  test("checks paths relative to nested source files", () => {
+  test.each([
+    'import "../../../../servers/x";',
+    'export type Example = import("../../../../servers/x").Example;',
+  ])("rejects %s in a nested source file", (source) => {
     const result = lint({
-      "nested/a.ts": `${header}\nimport "../../../../servers/x";\n`,
+      "nested/a.ts": `${header}\n${source}\n`,
     });
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("the SDK must not import from servers/");
+    expect(result.stderr).toBe(
+      `${join("nested", "a.ts")}: the SDK must not import from servers/\n`,
+    );
   });
 
   test.each([
     'import x from "./local";',
     'import "./local";',
     'void import("./local");',
+    'export type Example = import("./local").Example;',
     'import x from "./servers/local";',
     '// import x from "../../../servers/x";',
     '/* import "../../../servers/x"; void import("../../../servers/x"); */',
