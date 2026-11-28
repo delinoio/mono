@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { rejects, throws } from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { describe, test, type WebFixtures } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -94,69 +95,8 @@ describe("languages", () => {
 });
 
 describe("brand colors", () => {
-  // Reads the resolved brand custom properties and the Rspress dark surfaces
-  // in the page, then computes WCAG 2.1 contrast ratios. Adding the `rp-dark`
-  // class to `html` is what the Rspress theme switch does.
-  const readBrandContrast = () =>
-    function () {
-      const probe = document.createElement("span");
-      document.body.append(probe);
-      const resolve = (name: string): [number, number, number] => {
-        // An undefined custom property makes `var()` invalid at computed-value
-        // time, so the probe would silently inherit the body color and could
-        // pass the contrast check. Fail on an undefined variable instead.
-        if (
-          !getComputedStyle(document.documentElement)
-            .getPropertyValue(name)
-            .trim()
-        ) {
-          throw new Error(`${name} is not defined`);
-        }
-        probe.style.color = "";
-        probe.style.color = `var(${name})`;
-        const channels = getComputedStyle(probe).color.match(/[\d.]+/g) ?? [];
-        return [Number(channels[0]), Number(channels[1]), Number(channels[2])];
-      };
-      const luminance = ([r, g, b]: [number, number, number]) => {
-        const [lr, lg, lb] = [r, g, b].map((value) => {
-          const channel = value / 255;
-          return channel <= 0.03928
-            ? channel / 12.92
-            : ((channel + 0.055) / 1.055) ** 2.4;
-        });
-        return 0.2126 * lr! + 0.7152 * lg! + 0.0722 * lb!;
-      };
-      const ratio = (foreground: string, background: string) => {
-        const first = luminance(resolve(foreground));
-        const second = luminance(resolve(background));
-        return (
-          (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05)
-        );
-      };
-      const surfaces = [
-        "--rp-c-bg",
-        "--rp-c-bg-soft",
-        "--rp-c-bg-mute",
-        "--rp-c-bg-alt",
-      ];
-      const lowest = (foreground: string) =>
-        Math.min(...surfaces.map((surface) => ratio(foreground, surface)));
-      const result = {
-        brand: resolve("--rp-c-brand").join(","),
-        brandLight: resolve("--rp-c-brand-light").join(","),
-        brandLighter: resolve("--rp-c-brand-lighter").join(","),
-        brandDark: resolve("--rp-c-brand-dark").join(","),
-        brandDarker: resolve("--rp-c-brand-darker").join(","),
-        brandLowest: lowest("--rp-c-brand"),
-        brandLightLowest: lowest("--rp-c-brand-light"),
-        brandLighterLowest: lowest("--rp-c-brand-lighter"),
-      };
-      probe.remove();
-      return result;
-    };
-
-  // Installs the `ColorKit` in the page. `resolve` fails on an undefined custom
-  // property, for the reason that `readBrandContrast` gives.
+  // An undefined custom property would make the probe inherit the body color.
+  // Fail before resolving the probe so that inherited color cannot pass a check.
   const installColorKit = () =>
     function () {
       const parse = (color: string): Rgba => {
@@ -227,6 +167,78 @@ describe("brand colors", () => {
       (window as unknown as { colorKit: ColorKit }).colorKit = kit;
       return true;
     };
+
+  type BrandContrast = { token: string; surface: string; ratio: number };
+
+  const readBrandContrast = () =>
+    function (checkDarkContrast: boolean) {
+      const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
+      const join = ({ r, g, b }: Rgba) => [r, g, b].join(",");
+      const brand = kit.resolve("--rp-c-brand");
+      const brandLight = kit.resolve("--rp-c-brand-light");
+      const brandLighter = kit.resolve("--rp-c-brand-lighter");
+      const palette = {
+        brand: join(brand),
+        brandLight: join(brandLight),
+        brandLighter: join(brandLighter),
+        brandDark: join(kit.resolve("--rp-c-brand-dark")),
+        brandDarker: join(kit.resolve("--rp-c-brand-darker")),
+      };
+      if (!checkDarkContrast) {
+        return { ...palette, contrasts: [] };
+      }
+
+      const surfaces = [
+        "--rp-c-bg",
+        "--rp-c-bg-soft",
+        "--rp-c-bg-mute",
+        "--rp-c-bg-alt",
+      ].map((surface) => {
+        const background = kit.resolve(surface);
+        if (background.a !== 1) {
+          throw new Error(
+            `${surface} must be opaque, got alpha ${background.a}`,
+          );
+        }
+        return { surface, background };
+      });
+      const tokens = [
+        { token: "--rp-c-brand", foreground: brand },
+        { token: "--rp-c-brand-light", foreground: brandLight },
+        { token: "--rp-c-brand-lighter", foreground: brandLighter },
+      ];
+      const contrasts: BrandContrast[] = tokens.flatMap(
+        ({ token, foreground }) =>
+          surfaces.map(({ surface, background }) => ({
+            token,
+            surface,
+            ratio: kit.ratio(kit.over(foreground, background), background),
+          })),
+      );
+      return { ...palette, contrasts };
+    };
+
+  const expectDarkBrandContrast = ({
+    token,
+    surface,
+    ratio,
+  }: BrandContrast) => {
+    expect(ratio, `${token} over ${surface}`).toBeGreaterThanOrEqual(4.5);
+  };
+
+  const setBrandMode = (browser: WebFixtures["browser"], dark: boolean) =>
+    browser.evaluate((dark) => {
+      document.documentElement.classList.toggle("rp-dark", dark);
+      return true;
+    }, dark);
+
+  const openBrandGuide = async ({
+    app,
+    browser,
+  }: Pick<WebFixtures, "app" | "browser">) => {
+    await app.open("/guide/introduction");
+    await browser.evaluate(installColorKit());
+  };
 
   const readSearchResults = () =>
     function () {
@@ -542,38 +554,91 @@ describe("brand colors", () => {
     app,
     browser,
   }) => {
-    await app.open("/guide/introduction");
-    await browser.evaluate(() => {
-      document.documentElement.classList.add("rp-dark");
-      return true;
-    });
+    await openBrandGuide({ app, browser });
+    await setBrandMode(browser, true);
 
-    const dark = await browser.evaluate(readBrandContrast());
+    const dark = await browser.evaluate(readBrandContrast(), true);
 
     expect(dark.brand).toBe("138,160,255");
     expect(dark.brandLight).toBe("163,180,255");
     expect(dark.brandLighter).toBe("192,204,255");
-    expect(dark.brandLowest).toBeGreaterThanOrEqual(4.5);
-    expect(dark.brandLightLowest).toBeGreaterThanOrEqual(4.5);
-    expect(dark.brandLighterLowest).toBeGreaterThanOrEqual(4.5);
+    expect(dark.contrasts).toHaveLength(12);
+    for (const contrast of dark.contrasts) {
+      expectDarkBrandContrast(contrast);
+    }
   });
 
   test("keeps the light brand and the hero gradient colors unchanged", async ({
     app,
     browser,
   }) => {
-    await app.open("/guide/introduction");
-    const light = await browser.evaluate(readBrandContrast());
-    await browser.evaluate(() => {
-      document.documentElement.classList.add("rp-dark");
-      return true;
-    });
-    const dark = await browser.evaluate(readBrandContrast());
+    await openBrandGuide({ app, browser });
+    await setBrandMode(browser, false);
+    const light = await browser.evaluate(readBrandContrast(), false);
+    await setBrandMode(browser, true);
+    const dark = await browser.evaluate(readBrandContrast(), false);
 
     expect(light.brand).toBe("59,91,253");
     expect(dark.brandDark).toBe(light.brandDark);
     expect(dark.brandDarker).toBe(light.brandDarker);
   });
+
+  const overrideBrandProperty = (
+    browser: WebFixtures["browser"],
+    property: string,
+    value: string,
+  ) =>
+    browser.evaluate(
+      ({ property, value }) => {
+        document.documentElement.style.setProperty(property, value);
+        return true;
+      },
+      { property, value },
+    );
+
+  for (const [token, rgb] of [
+    ["--rp-c-brand", "138,160,255"],
+    ["--rp-c-brand-light", "163,180,255"],
+    ["--rp-c-brand-lighter", "192,204,255"],
+  ] as const) {
+    test(`rejects insufficient contrast for translucent ${token}`, async ({
+      app,
+      browser,
+    }) => {
+      await openBrandGuide({ app, browser });
+      await setBrandMode(browser, true);
+      await overrideBrandProperty(browser, token, `rgba(${rgb}, 0.01)`);
+
+      const dark = await browser.evaluate(readBrandContrast(), true);
+
+      const affected = dark.contrasts.filter(
+        (contrast) => contrast.token === token,
+      );
+      expect(affected).toHaveLength(4);
+      for (const contrast of affected) {
+        throws(
+          () => expectDarkBrandContrast(contrast),
+          new RegExp(`${token} over ${contrast.surface}`),
+        );
+      }
+    });
+  }
+
+  for (const [property, value, diagnostic] of [
+    ["--rp-c-bg-soft", "initial", /--rp-c-bg-soft is not defined/],
+    ["--rp-c-bg-mute", "rgb(52 58 70 / 50%)", /--rp-c-bg-mute must be opaque/],
+  ] as const) {
+    test(`rejects invalid dark surface ${property}`, async ({
+      app,
+      browser,
+    }) => {
+      await openBrandGuide({ app, browser });
+      await setBrandMode(browser, true);
+      await overrideBrandProperty(browser, property, value);
+
+      await rejects(browser.evaluate(readBrandContrast(), true), diagnostic);
+    });
+  }
 
   // Rspress paints the 404 home link hover (text and border) with
   // `--rp-c-brand-dark`, which stays unchanged for the hero gradient. The
