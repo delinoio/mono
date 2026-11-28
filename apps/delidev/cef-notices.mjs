@@ -98,7 +98,7 @@ if (platform) {
     }
   } catch (error) {
     console.error(
-      `Cannot bundle the original CEF notices for ${platform === "macos" ? "macOS" : "Debian"}: ${error.message}`,
+      `Cannot bundle the original CEF notices for ${platform === "macos" ? "macOS" : "Linux"}: ${error.message}`,
     );
     process.exitCode = 1;
   }

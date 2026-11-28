@@ -45,6 +45,34 @@ describe("home", () => {
     );
   });
 
+  test("offers every registered language in the top bar while signed out", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+
+    await expect(browser.locator("html")).toHaveAttribute("lang", "en");
+    const menu = screen.getByRole("combobox", "Language");
+    await expect(menu).toHaveText("English");
+    await menu.click();
+    for (const [lang, label] of [
+      ["en", "English"],
+      ["ko", "한국어"],
+      ["ja", "日本語"],
+      ["zh-Hans", "简体中文"],
+      ["es", "Español"],
+      ["fr", "Français"],
+      ["de", "Deutsch"],
+      ["pt-BR", "Português (Brasil)"],
+    ]) {
+      await expect(screen.getByRole("option", label)).toHaveAttribute(
+        "lang",
+        lang!,
+      );
+    }
+  });
+
   test(
     "marks only the Account section as coming soon",
     { tags: ["agent"] },

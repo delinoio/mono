@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -239,27 +240,66 @@ func TestSnapshotResultRetryKeepsOtherWriters(t *testing.T) {
 	}
 }
 
-// TestSnapshotResultRetryStopsOnReplacedChannel checks that the retry of a
-// result whose channel was replaced stops without closing the replacement
-// channel, and that the replacement's state report applies the agent's
-// report of the snapshot.
+// snapshotResultLogged matches an event for the given command. The retry
+// events omit the channel ID.
+func snapshotResultLogged(logs, event, commandID, channelID string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		var rec struct {
+			Msg       string `json:"msg"`
+			CommandID string `json:"command_id"`
+			ChannelID string `json:"channel_id"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Msg == event &&
+			rec.CommandID == commandID && (channelID == "" || rec.ChannelID == channelID) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSnapshotResultRetryStopsOnReplacedChannel checks that closing the old
+// channel ends its retry and that the replacement's initial state report
+// makes the snapshot ready.
 func TestSnapshotResultRetryStopsOnReplacedChannel(t *testing.T) {
-	env, org, sandboxID, agent, _ := snapshotResultEnv(t, 10*time.Second, 300*time.Millisecond)
+	env, org, sandboxID, agent, conn := snapshotResultEnv(t, 10*time.Second, 300*time.Millisecond)
 	fault := snapshotReadyFault(t, env)
 	fault.on("40001", 1<<30)
 	snapID := startSnapshot(t, org, sandboxID)
-	waitLog(t, env, `"msg":"snapshot_result_apply_retry"`)
+	command := agent.WaitFor("create-snapshot command", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetCreateSnapshot().GetSnapshotId() == snapID
+	}).GetCommand()
+	commandID := command.GetCommandId()
+	testenv.Eventually(t, "the create-snapshot result to retry", func() bool {
+		return snapshotResultLogged(env.Logs.String(), "snapshot_result_apply_retry", commandID, "")
+	})
 
+	// Keep the write fault active until the old result leaves the retry loop.
+	agent.Close()
+	waitConnClosed(t, conn)
+	testenv.Eventually(t, "the old channel's create-snapshot result to stop retrying", func() bool {
+		logs := env.Logs.String()
+		for _, event := range []string{"snapshot_result_apply_recovered", "snapshot_result_apply_abandoned"} {
+			if snapshotResultLogged(logs, event, commandID, "") {
+				t.Fatalf("old channel's create-snapshot result logged %s", event)
+			}
+		}
+		return snapshotResultLogged(logs, "agent_command_result_apply_failed", commandID, conn.ID)
+	})
+	if got := snapshotStateOf(t, org.OwnerClient, org.ID, snapID); got != ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
+		t.Fatalf("snapshot state before replacement = %v, want CREATING", got)
+	}
 	fault.off()
-	reconnect(agent)
-	waitSnapshotState(t, org, snapID, ownsandv1.SnapshotState_SNAPSHOT_STATE_READY)
-	replacement := env.App.Service.Hub.Get(agent.Device.ID)
-	if replacement == nil {
-		t.Fatal("no replacement channel")
+
+	// Connect waits for the acknowledgement of the replacement's initial report.
+	agent.Connect()
+	if got := snapshotStateOf(t, org.OwnerClient, org.ID, snapID); got != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("snapshot state after the acknowledged report = %v, want READY", got)
 	}
-	time.Sleep(time.Second) // a retry loop that outlived its channel would have closed the replacement by now
-	if strings.Contains(env.Logs.String(), `"msg":"snapshot_result_apply_abandoned"`) {
-		t.Fatal("the result was abandoned although its channel closed")
+	replacement := env.App.Service.Hub.Live(agent.Device.ID)
+	if replacement == nil || replacement == conn {
+		t.Fatal("no live replacement channel")
 	}
+	agent.Heartbeat(1)
+	waitHeartbeatAck(agent, 1)
 	connStaysOpen(t, replacement)
 }

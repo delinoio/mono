@@ -705,28 +705,26 @@ func TestClaimDirectRejection(t *testing.T) {
 	})
 }
 
-func TestClaimReadTimeout(t *testing.T) {
+func TestNoteReadTimeout(t *testing.T) {
 	const postRequest = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
 	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name  string
 		setup func(o *connObserver)
 		// deadline is relative to the moment it is set.
-		deadline time.Duration
-		wantOK   bool
+		deadline    time.Duration
+		wantPending bool
 	}{
 		{"connection that sent nothing", func(*connObserver) {}, time.Second, true},
 		{"partial head at a line boundary", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n")) }, time.Second, true},
-		// A partial line is not claimed yet: net/http answers it with a 400 or
-		// closes without a response (see TestPartialLineHeaderTimeoutWaitsForNetHTTP).
-		{"partial head inside a line", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHo")) }, time.Second, false},
+		{"partial head inside a line", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHo")) }, time.Second, true},
 		{"idle wait after a request", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\n")) }, time.Second, false},
 		{"partial head after a request, at a line boundary", func(o *connObserver) {
 			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHost: t\r\n"))
 		}, time.Second, true},
 		{"partial head after a request, inside a line", func(o *connObserver) {
 			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHo"))
-		}, time.Second, false},
+		}, time.Second, true},
 		{"idle wait after a POST", func(o *connObserver) { o.feed([]byte(postRequest)) }, time.Second, false},
 		// net/http waits for four bytes of the next request under IdleTimeout and
 		// reads the head under ReadHeaderTimeout only afterwards. The skipped
@@ -764,18 +762,17 @@ func TestClaimReadTimeout(t *testing.T) {
 			if tc.deadline != 0 {
 				o.setReadDeadline(now.Add(tc.deadline))
 			}
-			if _, ok := o.claimReadTimeout(); ok != tc.wantOK {
-				t.Errorf("claimReadTimeout = %v, want %v", ok, tc.wantOK)
+			o.noteReadTimeout()
+			if o.timeoutPending != tc.wantPending {
+				t.Errorf("timeoutPending = %v, want %v", o.timeoutPending, tc.wantPending)
 			}
 		})
 	}
 }
 
-// TestClaimReadTimeoutFourByteRule checks the number of bytes of the next
-// request after which a stall is a header read timeout rather than the
-// keep-alive wait. A partial line is left pending instead of claimed, so the
-// check looks at timeoutPending.
-func TestClaimReadTimeoutFourByteRule(t *testing.T) {
+// TestNoteReadTimeoutFourByteRule checks when a keep-alive connection starts
+// the header read after a successful request.
+func TestNoteReadTimeoutFourByteRule(t *testing.T) {
 	const get = "GET / HTTP/1.1\r\nHost: t\r\n\r\n"
 	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
@@ -795,9 +792,7 @@ func TestClaimReadTimeoutFourByteRule(t *testing.T) {
 			o.now = func() time.Time { return now }
 			o.feed([]byte(tc.feed))
 			o.setReadDeadline(now.Add(time.Second))
-			if _, ok := o.claimReadTimeout(); ok {
-				t.Fatal("claimed a partial line at once, want it pending")
-			}
+			o.noteReadTimeout()
 			if o.timeoutPending != tc.wantPending {
 				t.Errorf("timeoutPending = %v, want %v", o.timeoutPending, tc.wantPending)
 			}
@@ -822,11 +817,14 @@ func TestRejectionStart(t *testing.T) {
 	o.feed([]byte("GET / HTTP/1.1\r\n"))
 	first := clock
 	clock = clock.Add(time.Second)
-	if _, ok := o.claimReadTimeout(); ok {
-		t.Fatal("claimed a timeout without a deadline")
+	o.noteReadTimeout()
+	if o.timeoutPending {
+		t.Fatal("recorded a timeout without a deadline")
 	}
 	o.setReadDeadline(clock.Add(time.Second))
-	if start, ok := o.claimReadTimeout(); !ok || !start.Equal(first) {
+	clock = clock.Add(2 * time.Second)
+	o.noteReadTimeout()
+	if start, ok := o.claimPendingTimeout(); !ok || !start.Equal(first) {
 		t.Errorf("start = %v, %v; want the first byte %v", start, ok, first)
 	}
 }
@@ -839,8 +837,8 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name string
-		// arrival is what the first read holds; more arrives nine seconds later and
-		// ends at a line boundary, so that the stall is claimed at once.
+		// arrival is what the first read holds. More bytes arrive nine seconds
+		// later and end at a line boundary before the timeout.
 		arrival string
 		more    string
 		// handlers is the number of handler calls that finish before that.
@@ -873,7 +871,8 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 			o.feed([]byte(tc.more))
 			o.setReadDeadline(clock.Add(time.Second))
 			clock = clock.Add(time.Second)
-			start, ok := o.claimReadTimeout()
+			o.noteReadTimeout()
+			start, ok := o.claimPendingTimeout()
 			if !ok || !start.Equal(origin.Add(tc.wantStart)) {
 				t.Errorf("start = %v, %v; want %v after the first byte", start, ok, tc.wantStart)
 			}
@@ -939,43 +938,39 @@ func TestLeadingCRLFDuringTheHandlerKeepsTheRejectionStart(t *testing.T) {
 			run(t, func(o *connObserver, clock *time.Time) (time.Time, bool) {
 				o.setReadDeadline(clock.Add(time.Second))
 				*clock = clock.Add(time.Second)
-				return o.claimReadTimeout()
+				o.noteReadTimeout()
+				return o.claimPendingTimeout()
 			}, "GET / HTTP/1.1\r\n")
 		})
 	}
 }
 
-// TestPartialLineHeaderTimeoutWaitsForNetHTTP checks the header timeout inside
-// a partial line. net/http answers such a line with a 400 or closes the
-// connection without a response, and the observer learns which only from the
-// write or from the close, so the timeout is not claimed when the read fails.
-func TestPartialLineHeaderTimeoutWaitsForNetHTTP(t *testing.T) {
+// TestHeaderTimeoutWaitsForNetHTTP checks that the write or close determines
+// the outcome of a pending timeout at a line boundary.
+func TestHeaderTimeoutWaitsForNetHTTP(t *testing.T) {
 	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
-	// pendingObserver returns an observer whose connection received a partial
-	// line at origin, with a read deadline that expired at origin+1s.
-	pendingObserver := func(t *testing.T) (*connObserver, *time.Time) {
+	// pendingObserver records a timeout for a head that arrived at origin.
+	pendingObserver := func(t *testing.T, head string) *connObserver {
 		t.Helper()
 		clock := origin
 		o, _ := newTestObserver()
 		o.now = func() time.Time { return clock }
 		o.acceptedAt = origin.Add(-time.Hour)
-		o.feed([]byte("GET /hea"))
+		o.feed([]byte(head))
 		o.setReadDeadline(origin.Add(time.Second))
 		clock = origin.Add(2 * time.Second)
-		if _, ok := o.claimReadTimeout(); ok {
-			t.Fatal("claimed a header timeout inside a partial line before net/http answered")
-		}
+		o.noteReadTimeout()
 		if !o.timeoutPending || !o.timeoutPendingStart.Equal(origin) {
 			t.Fatalf("timeoutPending = %v, start = %v; want a pending timeout started at the first byte", o.timeoutPending, o.timeoutPendingStart)
 		}
 		if o.rejected {
 			t.Fatal("marked the connection rejected while the timeout is pending")
 		}
-		return o, &clock
+		return o
 	}
 
 	t.Run("net/http answers with a 400", func(t *testing.T) {
-		o, _ := pendingObserver(t)
+		o := pendingObserver(t, "GET / HTTP/1.1\r\nHost: t\r\nX-Test: bad\x01value\r\n")
 		reason, status, start, ok := o.claimDirectRejection([]byte(directBadRequest))
 		if !ok || reason != RejectionMalformedRequest || status != http.StatusBadRequest || !start.Equal(origin) {
 			t.Fatalf("claimDirectRejection = %q, %d, %v, %v; want a malformed_request 400 started at the first byte", reason, status, start, ok)
@@ -989,7 +984,7 @@ func TestPartialLineHeaderTimeoutWaitsForNetHTTP(t *testing.T) {
 	})
 
 	t.Run("net/http closes without a response", func(t *testing.T) {
-		o, _ := pendingObserver(t)
+		o := pendingObserver(t, "GET / HTTP/1.1\r\nHost: t\r\n")
 		start, ok := o.claimPendingTimeout()
 		if !ok || !start.Equal(origin) {
 			t.Fatalf("claimPendingTimeout = %v, %v; want the first byte %v", start, ok, origin)
@@ -1003,21 +998,27 @@ func TestPartialLineHeaderTimeoutWaitsForNetHTTP(t *testing.T) {
 	})
 
 	t.Run("a hijacked connection logs nothing", func(t *testing.T) {
-		o, _ := pendingObserver(t)
+		o := pendingObserver(t, "GET /hea")
 		o.markHijacked()
 		if _, ok := o.claimPendingTimeout(); ok {
 			t.Error("claimed a pending timeout on a hijacked connection")
 		}
 	})
 
-	t.Run("a later empty read timeout keeps the first start", func(t *testing.T) {
-		o, clock := pendingObserver(t)
-		*clock = origin.Add(3 * time.Second)
-		if _, ok := o.claimReadTimeout(); ok {
-			t.Fatal("claimed a second timeout")
-		}
-		if start, ok := o.claimPendingTimeout(); !ok || !start.Equal(origin) {
-			t.Errorf("claimPendingTimeout = %v, %v; want %v", start, ok, origin)
+	t.Run("a later read timeout keeps the first start", func(t *testing.T) {
+		clock := origin
+		o, _ := newTestObserver()
+		o.now = func() time.Time { return clock }
+		o.acceptedAt = origin
+		o.setReadDeadline(origin.Add(time.Second))
+		clock = origin.Add(2 * time.Second)
+		o.noteReadTimeout()
+		o.feed([]byte("GET / HTTP/1.1\r\n"))
+		o.setReadDeadline(clock.Add(time.Second))
+		clock = origin.Add(4 * time.Second)
+		o.noteReadTimeout()
+		if _, _, start, ok := o.claimDirectRejection([]byte(directBadRequest)); !ok || !start.Equal(origin) {
+			t.Errorf("direct rejection start = %v, %v; want %v", start, ok, origin)
 		}
 	})
 
@@ -1046,8 +1047,9 @@ func TestConnStateLogsAPendingHeaderTimeoutWhenTheConnectionCloses(t *testing.T)
 	observed.obs.feed([]byte("GET /hea"))
 	observed.obs.setReadDeadline(origin.Add(time.Second))
 	clock = origin.Add(2 * time.Second)
-	if _, ok := observed.obs.claimReadTimeout(); ok {
-		t.Fatal("claimed a header timeout inside a partial line")
+	observed.obs.noteReadTimeout()
+	if logs.Len() != 0 {
+		t.Fatal("logged a timeout before the close")
 	}
 
 	ConnState(observed, http.StateClosed)
@@ -1130,7 +1132,8 @@ func TestRejectionStartIgnoresDrainedBodyBytes(t *testing.T) {
 		o.feed([]byte("GET /next HTTP/1.1\r\nHost: t\r\n"))
 		o.setReadDeadline(origin.Add(time.Second))
 		clock = origin.Add(2 * time.Second)
-		start, ok := o.claimReadTimeout()
+		o.noteReadTimeout()
+		start, ok := o.claimPendingTimeout()
 		if !ok || !start.Equal(origin.Add(500*time.Millisecond)) {
 			t.Errorf("start = %v, %v; want the first byte of the partial head at 500ms", start.Sub(origin), ok)
 		}
@@ -1870,8 +1873,7 @@ func TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout(t *testing.T) {
 			if got := strings.Count(string(response), "HTTP/1.1 "); got != 1 {
 				t.Fatalf("responses = %d, want only the one to the POST: %q", got, response)
 			}
-			// The timed-out read is logged before net/http closes the connection;
-			// allow the logger a moment.
+			// The close hook can log after the client sees EOF.
 			deadline := time.Now().Add(2 * time.Second)
 			for countRecords(logs, "http_request_rejected") == 0 && time.Now().Before(deadline) && tc.wantLogged {
 				time.Sleep(10 * time.Millisecond)
@@ -1969,8 +1971,7 @@ func TestStallWithFewerThanFourHeadBytesIsNotAHeaderReadTimeout(t *testing.T) {
 				t.Fatalf("response after the stall = %q, want a %d", rest, tc.wantStatus)
 			}
 			elapsed := time.Since(stalled)
-			// The timed-out read is logged before net/http closes the connection;
-			// allow the logger a moment.
+			// The close hook can log after the client sees EOF.
 			time.Sleep(50 * time.Millisecond)
 			got := countRecords(logs, "http_request_rejected")
 			if tc.wantReason != "" {
@@ -2188,8 +2189,7 @@ func TestDrainedRequestBodyDoesNotMoveRejectionStart(t *testing.T) {
 		time.Sleep(gap)
 		write(t, conn, "hello")
 		time.Sleep(gap)
-		// The tail ends at a line boundary, so net/http closes the connection
-		// without a response when the header timeout expires.
+		// The valid incomplete head closes silently when the timeout expires.
 		write(t, conn, "GET /next HTTP/1.1\r\nHost: t\r\n")
 		readUntilServerClose(t, conn)
 		records := waitForRejection(t, logs)

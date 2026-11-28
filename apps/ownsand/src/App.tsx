@@ -24,9 +24,10 @@ import {
   SIGN_IN_NOT_CONFIGURED,
   useAuth,
 } from "./auth.tsx";
-import { OrgShell, TopBar } from "./components/shell.tsx";
+import { OrgShell, PublicTopBar, TopBar } from "./components/shell.tsx";
 import { PageHeader, SignInFailureNotice } from "./components/ui.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
+import { useI18n } from "./i18n.ts";
 import { pendingInvitation } from "./invitation.ts";
 import { ApiKeysPage } from "./pages/api-keys.tsx";
 import { LogtoCallbackPage, MockCallbackPage } from "./pages/callback.tsx";
@@ -165,6 +166,7 @@ function ApiProviders({
 function Routes({ config }: { config: ConsoleConfig }) {
   const auth = useAuth();
   const { route } = useRouter();
+  const { t } = useI18n();
   const configured =
     config.authMode === AuthMode.Mock || config.logto !== undefined;
   if (route.id === RouteId.Callback) {
@@ -176,7 +178,12 @@ function Routes({ config }: { config: ConsoleConfig }) {
     if (config.logto === undefined) {
       return <SignIn configured={false} />;
     }
-    return <LogtoCallbackPage appId={config.logto.appId} />;
+    return (
+      <>
+        <PublicTopBar />
+        <LogtoCallbackPage appId={config.logto.appId} />
+      </>
+    );
   }
   if (auth.isLoading) {
     return null;
@@ -195,8 +202,8 @@ function Routes({ config }: { config: ConsoleConfig }) {
         <>
           <TopBar />
           <main className="content content-narrow">
-            <PageHeader title="Page not found" />
-            <Link to="/">Go to your organizations</Link>
+            <PageHeader title={t("notFound.title")} />
+            <Link to="/">{t("common.goToOrganizations")}</Link>
           </main>
         </>
       );
@@ -239,20 +246,25 @@ function OrgPage({ route }: { route: Route }) {
 
 function SignIn({ configured }: { configured: boolean }) {
   const auth = useAuth();
+  const { t } = useI18n();
   return (
-    <main className="sign-in">
-      <h1>OwnSand</h1>
-      <p className="muted">
-        Run sandboxes on the devices your team already owns.
-      </p>
-      {configured ? (
-        <>
-          <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
-          <SignInFailureNotice />
-        </>
-      ) : (
-        <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
-      )}
-    </main>
+    <>
+      {/* The heading below already names the product. */}
+      <PublicTopBar brand={false} />
+      <main className="sign-in">
+        <h1>OwnSand</h1>
+        <p className="muted">{t("signIn.tagline")}</p>
+        {configured ? (
+          <>
+            <Button onClick={() => auth.signIn()}>
+              {t("common.signInWithDelino")}
+            </Button>
+            <SignInFailureNotice />
+          </>
+        ) : (
+          <p role="alert">{t(SIGN_IN_NOT_CONFIGURED)}</p>
+        )}
+      </main>
+    </>
   );
 }

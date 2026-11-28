@@ -12,6 +12,7 @@ import {
 } from "react";
 import { API_RESOURCE, type LogtoSettings } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
+import type { MessageKey } from "./text.ts";
 
 /** The signed-in state that the console needs, independent of the provider. */
 export interface Auth {
@@ -56,9 +57,9 @@ export function AuthContextProvider({
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
-/** The notice of a build that has no sign-in configuration. */
+/** The message key of the notice of a build without a sign-in configuration. */
 export const SIGN_IN_NOT_CONFIGURED =
-  "Sign-in is not configured for this build.";
+  "signIn.notConfigured" satisfies MessageKey;
 
 /** Path of the sign-in callback route. */
 export const CALLBACK_PATH = "/callback";

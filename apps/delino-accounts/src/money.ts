@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { englishText, type MessageKey, type Text } from "./text.ts";
 
 /**
  * Money helpers. Every amount is a `bigint` of micro-USD (1 USD =
@@ -78,18 +79,20 @@ export function parseUsdCents(text: string): ParsedAmount {
   return parsed;
 }
 
+/** The catalog keys of the parse errors, for a field error. */
+const AMOUNT_ERROR_KEYS = {
+  [AmountError.Empty]: "validation.amountRequired",
+  [AmountError.Invalid]: "validation.amountInvalid",
+  [AmountError.TooPrecise]: "validation.amountTooPrecise",
+  [AmountError.NotWholeCents]: "validation.amountNotWholeCents",
+} as const satisfies Record<AmountError, MessageKey>;
+
 /** The message of a parse error, for a field error. */
-export function amountErrorMessage(error: AmountError): string {
-  switch (error) {
-    case AmountError.Empty:
-      return "Enter an amount.";
-    case AmountError.Invalid:
-      return "Enter an amount in USD, for example 25.00.";
-    case AmountError.TooPrecise:
-      return "Use at most 6 decimal places.";
-    case AmountError.NotWholeCents:
-      return "Use whole cents (at most 2 decimal places).";
-  }
+export function amountErrorMessage(
+  error: AmountError,
+  text: Text = englishText,
+): string {
+  return text.t(AMOUNT_ERROR_KEYS[error]);
 }
 
 /**
@@ -103,10 +106,6 @@ function divRound(value: bigint, divisor: bigint): bigint {
   return negative ? -rounded : rounded;
 }
 
-function groupThousands(digits: string): string {
-  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
-
 /** Removes trailing zeros from a digit string. */
 function trimTrailingZeros(digits: string): string {
   let end = digits.length;
@@ -117,45 +116,81 @@ function trimTrailingZeros(digits: string): string {
 }
 
 /**
- * Formats micro-USD in USD with `decimals` decimals (0 to 6), rounding half
- * away from zero, for example `$1,234.57` or `-$5.00`.
+ * The exact decimal text of `scaled / 10^decimals`, for example `-1234.57`.
+ * `Intl.NumberFormat` formats this text without converting it to `number`,
+ * so amounts beyond the safe integer range keep every digit.
  */
-function formatDecimals(micros: bigint, decimals: number): string {
-  const scale = 10n ** BigInt(6 - decimals);
-  const scaled = divRound(micros, scale);
+function decimalText(
+  scaled: bigint,
+  decimals: number,
+): Intl.StringNumericLiteral {
   const negative = scaled < 0n;
   const abs = negative ? -scaled : scaled;
   const unit = 10n ** BigInt(decimals);
-  const whole = groupThousands((abs / unit).toString());
   const fraction =
     decimals === 0 ? "" : `.${(abs % unit).toString().padStart(decimals, "0")}`;
-  return `${negative ? "-" : ""}$${whole}${fraction}`;
+  return `${negative ? "-" : ""}${abs / unit}${fraction}` as Intl.StringNumericLiteral;
 }
 
 /**
- * Formats an amount in USD with 2 decimals, for example `$25.00`. Values
- * between cents round half away from zero, for display only.
+ * Formats an exact decimal text as USD for the language, with at least
+ * `minDecimals` and at most `maxDecimals` decimals. The text never has more
+ * than `maxDecimals` decimals, so `Intl.NumberFormat` does not round it; the
+ * rounding happens before, on `bigint` values.
  */
-export function formatUsd(micros: bigint): string {
-  return formatDecimals(micros, 2);
+function formatUsdText(
+  value: Intl.StringNumericLiteral,
+  minDecimals: number,
+  maxDecimals: number,
+  lang: string,
+): string {
+  return new Intl.NumberFormat(lang, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: minDecimals,
+    maximumFractionDigits: maxDecimals,
+  }).format(value);
+}
+
+/**
+ * Formats micro-USD in USD with `decimals` decimals (0 to 6), rounding half
+ * away from zero, for example `$1,234.57` or `-$5.00` in English.
+ */
+function formatDecimals(
+  micros: bigint,
+  decimals: number,
+  lang: string,
+): string {
+  const scaled = divRound(micros, 10n ** BigInt(6 - decimals));
+  return formatUsdText(decimalText(scaled, decimals), decimals, decimals, lang);
+}
+
+/**
+ * Formats an amount in USD with 2 decimals for the language, for example
+ * `$25.00` in English. Values between cents round half away from zero, for
+ * display only.
+ */
+export function formatUsd(micros: bigint, lang = englishText.lang): string {
+  return formatDecimals(micros, 2, lang);
 }
 
 /**
  * Formats a usage cost. A nonzero cost below $0.01 (in absolute value) shows
  * with up to 6 decimals without trailing zeros (at least 2), for example
- * `$0.000123` or `$0.005`; every other cost shows with 2 decimals like
- * `formatUsd`.
+ * `$0.000123` or `$0.005` in English; every other cost shows with 2 decimals
+ * like `formatUsd`.
  */
-export function formatUsageCost(micros: bigint): string {
+export function formatUsageCost(
+  micros: bigint,
+  lang = englishText.lang,
+): string {
   const abs = micros < 0n ? -micros : micros;
   if (abs === 0n || abs >= MICROS_PER_CENT) {
-    return formatUsd(micros);
+    return formatUsd(micros, lang);
   }
-  const digits = trimTrailingZeros(abs.toString().padStart(6, "0")).padEnd(
-    2,
-    "0",
-  );
-  return `${micros < 0n ? "-" : ""}$0.${digits}`;
+  // Exact micro-USD text; the formatter drops trailing zeros down to 2
+  // decimals.
+  return formatUsdText(decimalText(micros, 6), 2, 6, lang);
 }
 
 /**

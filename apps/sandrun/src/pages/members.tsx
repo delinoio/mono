@@ -37,6 +37,7 @@ import {
   useActionSignInNotice,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { invitationLink } from "../invitation.ts";
 import { displayName, useMembers } from "../members.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
@@ -44,6 +45,7 @@ import { useRouter } from "../router.tsx";
 
 /** Route `members`: members, roles, leaving and invitations. */
 export function MembersPage() {
+  const { lang, t } = useI18n();
   const { organizationId, role } = useOrg();
   const { userId } = useAuth();
   const { navigate } = useRouter();
@@ -62,22 +64,22 @@ export function MembersPage() {
   return (
     <>
       <PageHeader
-        title="Members"
-        description="People who can use this SandRun organization. SandRun memberships are separate from OwnSand memberships. Profiles come from your Delino account."
+        title={t("members.title")}
+        description={t("members.description")}
         action={
           can(role, Permission.LeaveOrganization) ? (
             <Button
               variant={ButtonVariant.Secondary}
               onClick={() => setLeaving(true)}
             >
-              Leave organization
+              {t("members.leave")}
             </Button>
           ) : undefined
         }
       />
       {signInError ? <ErrorNotice error={signInError} /> : null}
       <MemberListStatus roster={roster}>
-        <ul className="list" aria-label="Members">
+        <ul className="list" aria-label={t("members.title")}>
           {roster.members.map((m) => {
             const manageable = canManageMember(role, userId, m);
             return (
@@ -86,15 +88,19 @@ export function MembersPage() {
                   <span className="list-title">
                     {displayName(m)}
                     {m.userId === userId ? (
-                      <span className="muted"> (you)</span>
+                      <span className="muted"> {t("common.you")}</span>
                     ) : null}
                   </span>
-                  <span className="muted">Joined {formatTime(m.joinTime)}</span>
+                  <span className="muted">
+                    {t("members.joined", {
+                      time: formatTime(m.joinTime, lang),
+                    })}
+                  </span>
                 </div>
                 {manageable ? (
                   <div className="list-actions">
                     <Select
-                      label={`Role of ${displayName(m)}`}
+                      label={t("members.roleOf", { name: displayName(m) })}
                       value={String(m.role)}
                       onValueChange={async (v) => {
                         if (v === null || Number(v) === m.role) return;
@@ -104,17 +110,17 @@ export function MembersPage() {
                             userId: m.userId,
                             role: Number(v) as Role,
                           });
-                          toast.success("The role is changed.");
+                          toast.success(t("members.roleChanged"));
                         } catch (error) {
                           reportActionError(error);
                         }
                       }}
                     >
                       <SelectOption value={String(Role.ADMIN)}>
-                        Admin
+                        {t(labels.role[Role.ADMIN])}
                       </SelectOption>
                       <SelectOption value={String(Role.MEMBER)}>
-                        Member
+                        {t(labels.role[Role.MEMBER])}
                       </SelectOption>
                     </Select>
                     <Button
@@ -122,11 +128,11 @@ export function MembersPage() {
                       size={ButtonSize.Small}
                       onClick={() => setRemoving(m)}
                     >
-                      Remove
+                      {t("members.remove")}
                     </Button>
                   </div>
                 ) : (
-                  <span className="role">{labels.role[m.role]}</span>
+                  <span className="role">{t(labels.role[m.role])}</span>
                 )}
               </li>
             );
@@ -139,9 +145,11 @@ export function MembersPage() {
       <ConfirmDialog
         open={removing !== undefined}
         onOpenChange={(open) => !open && setRemoving(undefined)}
-        title={`Remove ${removing ? displayName(removing) : ""}?`}
-        description="They lose access to this organization. SandRun revokes their personal API keys and ends their dev sessions."
-        confirmLabel="Remove member"
+        title={t("members.removeDialog.title", {
+          name: removing ? displayName(removing) : "",
+        })}
+        description={t("members.removeDialog.description")}
+        confirmLabel={t("members.removeDialog.confirm")}
         onConfirm={async () => {
           await removeMember.mutateAsync({
             organizationId,
@@ -153,9 +161,9 @@ export function MembersPage() {
       <ConfirmDialog
         open={leaving}
         onOpenChange={setLeaving}
-        title="Leave this organization?"
-        description="You lose access to this organization. SandRun revokes your personal API keys and ends your dev sessions. An admin can invite you again."
-        confirmLabel="Leave organization"
+        title={t("members.leaveDialog.title")}
+        description={t("members.leaveDialog.description")}
+        confirmLabel={t("members.leave")}
         onConfirm={async (opening) => {
           await removeMember.mutateAsync({
             organizationId,
@@ -175,6 +183,7 @@ function Invitations({
 }: {
   reportActionError: (error: unknown) => void;
 }) {
+  const { lang, t, rich } = useI18n();
   const { organizationId } = useOrg();
   const transport = useTransport();
   const queryClient = useQueryClient();
@@ -219,32 +228,39 @@ function Invitations({
   return (
     <section className="section" aria-labelledby="invitations-title">
       <div className="section-header">
-        <h2 id="invitations-title">Invitations</h2>
+        <h2 id="invitations-title">{t("members.invitations.title")}</h2>
         <Button
           variant={ButtonVariant.Secondary}
           onClick={() => setCreating(true)}
         >
-          Invite someone
+          {t("members.invitations.invite")}
         </Button>
       </div>
-      <QueryBoundary query={list} loading="Loading invitations">
+      <QueryBoundary query={list} loading={t("members.invitations.loading")}>
         {(data) => {
           const pending = data.invitations.filter(
             (i) => i.state === InvitationState.PENDING,
           );
           return pending.length === 0 ? (
-            <Empty title="No pending invitations" />
+            <Empty title={t("members.invitations.empty")} />
           ) : (
-            <ul className="list" aria-label="Pending invitations">
+            <ul
+              className="list"
+              aria-label={t("members.invitations.pendingLabel")}
+            >
               {pending.map((i) => (
                 <li key={i.invitationId} className="list-row">
                   <div className="list-main">
                     <span className="list-title">
-                      {labels.role[i.role]} invitation{" "}
-                      <code>{i.secretPrefix}…</code>
+                      {rich("members.invitations.item", {
+                        role: t(labels.role[i.role]),
+                        prefix: <code>{i.secretPrefix}…</code>,
+                      })}
                     </span>
                     <span className="muted">
-                      Expires {formatTime(i.expireTime)}
+                      {t("members.invitations.expires", {
+                        time: formatTime(i.expireTime, lang),
+                      })}
                     </span>
                   </div>
                   <Button
@@ -256,13 +272,13 @@ function Invitations({
                           organizationId,
                           invitationId: i.invitationId,
                         });
-                        toast.success("The invitation is revoked.");
+                        toast.success(t("members.invitations.revoked"));
                       } catch (error) {
                         reportActionError(error);
                       }
                     }}
                   >
-                    Revoke
+                    {t("members.invitations.revoke")}
                   </Button>
                 </li>
               ))}
@@ -273,9 +289,9 @@ function Invitations({
       <FormDialog
         open={creating}
         onOpenChange={setCreating}
-        title="Invite someone"
-        description="You get a one-time link that works for 7 days. Send it to the person you invite."
-        submitLabel="Create link"
+        title={t("members.invitations.invite")}
+        description={t("members.invitations.createDialog.description")}
+        submitLabel={t("members.invitations.createDialog.submit")}
         onSubmit={async (opening) => {
           const res = await createInvitation.mutateAsync({
             organizationId,
@@ -287,17 +303,21 @@ function Invitations({
         }}
       >
         <Select
-          label="Role"
+          label={t("members.invitations.createDialog.role")}
           value={inviteRole}
           onValueChange={(v) => v && setInviteRole(v)}
         >
-          <SelectOption value={String(Role.MEMBER)}>Member</SelectOption>
-          <SelectOption value={String(Role.ADMIN)}>Admin</SelectOption>
+          <SelectOption value={String(Role.MEMBER)}>
+            {t(labels.role[Role.MEMBER])}
+          </SelectOption>
+          <SelectOption value={String(Role.ADMIN)}>
+            {t(labels.role[Role.ADMIN])}
+          </SelectOption>
         </Select>
       </FormDialog>
       <SecretDialog
-        title="Your invitation link"
-        label="Invitation link"
+        title={t("members.invitations.secretDialog.title")}
+        label={t("members.invitations.secretDialog.label")}
         secret={link}
         onClose={() => setLink(undefined)}
       />

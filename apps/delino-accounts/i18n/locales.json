@@ -1,0 +1,38 @@
+{
+  "sourceLang": "en",
+  "context": "User interface text of Delino Accounts, the web app where Delino users manage their profile, organizations, members and billing (payment methods, balances, credits, usage and invoices). Keep product and company names (Delino, Logto, Paddle) unchanged.",
+  "locales": [
+    {
+      "lang": "en",
+      "label": "English"
+    },
+    {
+      "lang": "ko",
+      "label": "한국어"
+    },
+    {
+      "lang": "ja",
+      "label": "日本語"
+    },
+    {
+      "lang": "zh-Hans",
+      "label": "简体中文"
+    },
+    {
+      "lang": "es",
+      "label": "Español"
+    },
+    {
+      "lang": "fr",
+      "label": "Français"
+    },
+    {
+      "lang": "de",
+      "label": "Deutsch"
+    },
+    {
+      "lang": "pt-BR",
+      "label": "Português (Brasil)"
+    }
+  ]
+}

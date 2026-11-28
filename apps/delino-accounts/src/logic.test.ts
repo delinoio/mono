@@ -415,6 +415,7 @@ describe("format", () => {
       month: 1,
     });
     expect(formatMonth({ year: 2026, month: 11 })).toBe("November 2026");
+    expect(formatMonth({ year: 2026, month: 11 }, "ja")).toBe("2026年11月");
   });
 
   test("formats quantities with the unit of the meter", () => {
@@ -422,6 +423,7 @@ describe("format", () => {
       "1,048,576 bytes",
     );
     expect(formatQuantity(5n, undefined)).toBe("5");
+    expect(formatQuantity(1n, Meter.OWNSAND_CLASS_A_RPC)).toBe("1 call");
     expect(meterLabel("ownsand.class_b_rpc")).toBe("Class B API calls");
     expect(meterLabel("other.meter")).toBe("other.meter");
   });

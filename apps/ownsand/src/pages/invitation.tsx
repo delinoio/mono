@@ -6,11 +6,13 @@ import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { SIGN_IN_NOT_CONFIGURED, useAuth } from "../auth.tsx";
+import { PublicTopBar } from "../components/shell.tsx";
 import {
   ErrorNotice,
   PageHeader,
   SignInFailureNotice,
 } from "../components/ui.tsx";
+import { useI18n } from "../i18n.ts";
 import {
   openInvitationFromAddress,
   pendingInvitation,
@@ -29,6 +31,7 @@ import { Link, RouteId, routePath, useRouter } from "../router.tsx";
  */
 export function InvitationPage({ configured }: { configured: boolean }) {
   const auth = useAuth();
+  const { t } = useI18n();
   const { navigate } = useRouter();
   const [invitation, setInvitation] = useState(() => ({
     secret:
@@ -81,25 +84,31 @@ export function InvitationPage({ configured }: { configured: boolean }) {
 
   if (secret === undefined) {
     return (
-      <main className="content content-narrow">
-        <PageHeader
-          title="Invitation"
-          description="This page needs an invitation link. Ask an admin of the organization for a new one."
-        />
-        <Link to="/">Go to your organizations</Link>
-      </main>
+      <>
+        <PublicTopBar />
+        <main className="content content-narrow">
+          <PageHeader
+            title={t("invitation.title")}
+            description={t("invitation.missingLink")}
+          />
+          <Link to="/">{t("common.goToOrganizations")}</Link>
+        </main>
+      </>
     );
   }
 
   if (recoveryGeneration === generation) {
     return (
-      <main className="content content-narrow">
-        <PageHeader title="Join the organization" />
-        <div className="notice">
-          <p role="alert">You may have joined the organization.</p>
-          <Link to="/">Go to your organizations</Link>
-        </div>
-      </main>
+      <>
+        <PublicTopBar />
+        <main className="content content-narrow">
+          <PageHeader title={t("invitation.join")} />
+          <div className="notice">
+            <p role="alert">{t("invitation.mayHaveJoined")}</p>
+            <Link to="/">{t("common.goToOrganizations")}</Link>
+          </div>
+        </main>
+      </>
     );
   }
 
@@ -107,113 +116,124 @@ export function InvitationPage({ configured }: { configured: boolean }) {
     // The secret stays in memory only: there is no sign-in redirect that it
     // would have to survive. The fragment is already gone from the address.
     return (
-      <main className="content content-narrow">
-        <PageHeader title="You are invited to an OwnSand organization" />
-        <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
-      </main>
+      <>
+        <PublicTopBar />
+        <main className="content content-narrow">
+          <PageHeader title={t("invitation.invited")} />
+          <p role="alert">{t(SIGN_IN_NOT_CONFIGURED)}</p>
+        </main>
+      </>
     );
   }
 
   if (!auth.isAuthenticated) {
     return (
-      <main className="content content-narrow">
-        <PageHeader
-          title="You are invited to an OwnSand organization"
-          description="Sign in to accept the invitation."
-        />
-        <Button
-          onClick={async () => {
-            // The fragment does not survive the sign-in redirect, so the
-            // secret waits in sessionStorage until AcceptInvitation returns.
-            pendingInvitation.save(secret);
-            await auth.signIn();
-          }}
-        >
-          Sign in to accept
-        </Button>
-        <SignInFailureNotice />
-      </main>
+      <>
+        <PublicTopBar />
+        <main className="content content-narrow">
+          <PageHeader
+            title={t("invitation.invited")}
+            description={t("invitation.signInToAccept")}
+          />
+          <Button
+            onClick={async () => {
+              // The fragment does not survive the sign-in redirect, so the
+              // secret waits in sessionStorage until AcceptInvitation returns.
+              pendingInvitation.save(secret);
+              await auth.signIn();
+            }}
+          >
+            {t("invitation.signInButton")}
+          </Button>
+          <SignInFailureNotice />
+        </main>
+      </>
     );
   }
 
   return (
-    <main className="content content-narrow">
-      <PageHeader
-        title="Join the organization"
-        description="You join as the signed-in user. The invitation works only once."
-      />
-      {accept.error ? (
-        <ErrorNotice
-          error={accept.error}
-          onSignIn={async () => {
-            // The accept handler cleared the stored copy after the failure.
-            // Store the secret again so that it survives the sign-in redirect.
-            pendingInvitation.save(secret);
-            await auth.signIn();
-          }}
+    <>
+      <PublicTopBar />
+      <main className="content content-narrow">
+        <PageHeader
+          title={t("invitation.join")}
+          description={t("invitation.joinDescription")}
         />
-      ) : null}
-      <div className="actions">
-        <Button
-          key={generation}
-          onClick={async () => {
-            if (invitation !== currentInvitation.current) {
-              return;
-            }
-            const attempt = currentAttempt.current;
-            // Whether the attempt still belongs to the shown invitation,
-            // read the moment its request settles: the navigation below
-            // unmounts the page and so ends the attempt, and a current
-            // success must still delete its stored copy.
-            let current = false;
-            try {
-              let res;
+        {accept.error ? (
+          <ErrorNotice
+            error={accept.error}
+            onSignIn={async () => {
+              // The accept handler cleared the stored copy after the failure.
+              // Store the secret again so that it survives the sign-in redirect.
+              pendingInvitation.save(secret);
+              await auth.signIn();
+            }}
+          />
+        ) : null}
+        <div className="actions">
+          <Button
+            key={generation}
+            onClick={async () => {
+              if (invitation !== currentInvitation.current) {
+                return;
+              }
+              const attempt = currentAttempt.current;
+              // Whether the attempt still belongs to the shown invitation,
+              // read the moment its request settles: the navigation below
+              // unmounts the page and so ends the attempt, and a current
+              // success must still delete its stored copy.
+              let current = false;
               try {
-                res = await accept.mutateAsync({ invitationSecret: secret });
+                let res;
+                try {
+                  res = await accept.mutateAsync({ invitationSecret: secret });
+                } finally {
+                  // The address can change before hashchange runs. Leave the
+                  // fragment in place for the listener to consume.
+                  const addressSecret = secretFromFragment(
+                    window.location.hash,
+                  );
+                  current =
+                    attempt === currentAttempt.current &&
+                    (addressSecret === undefined || addressSecret === secret);
+                }
+                // The server request is not aborted. Only a result that still
+                // belongs to the shown invitation may change the page.
+                if (!current) {
+                  return;
+                }
+                const organizationId = res.organization?.organizationId?.trim();
+                if (!organizationId) {
+                  setRecoveryGeneration(generation);
+                  return;
+                }
+                navigate(
+                  routePath({
+                    id: RouteId.Sandboxes,
+                    organizationId,
+                  }),
+                  { replace: true },
+                );
+              } catch {
+                // accept.error shows the failure above. The in-memory secret
+                // stays so that the user can accept again: the server leaves
+                // the invitation unused when AcceptInvitation fails. Only the
+                // stored copy is deleted (below).
               } finally {
-                // The address can change before hashchange runs. Leave the
-                // fragment in place for the listener to consume.
-                const addressSecret = secretFromFragment(window.location.hash);
-                current =
-                  attempt === currentAttempt.current &&
-                  (addressSecret === undefined || addressSecret === secret);
+                // The stored secret may belong to a newer link whose sign-in
+                // redirect is pending. A settled request of an earlier link
+                // must not delete it.
+                if (current) {
+                  pendingInvitation.clear();
+                }
               }
-              // The server request is not aborted. Only a result that still
-              // belongs to the shown invitation may change the page.
-              if (!current) {
-                return;
-              }
-              const organizationId = res.organization?.organizationId?.trim();
-              if (!organizationId) {
-                setRecoveryGeneration(generation);
-                return;
-              }
-              navigate(
-                routePath({
-                  id: RouteId.Sandboxes,
-                  organizationId,
-                }),
-                { replace: true },
-              );
-            } catch {
-              // accept.error shows the failure above. The in-memory secret
-              // stays so that the user can accept again: the server leaves
-              // the invitation unused when AcceptInvitation fails. Only the
-              // stored copy is deleted (below).
-            } finally {
-              // The stored secret may belong to a newer link whose sign-in
-              // redirect is pending. A settled request of an earlier link
-              // must not delete it.
-              if (current) {
-                pendingInvitation.clear();
-              }
-            }
-          }}
-        >
-          Accept invitation
-        </Button>
-        <Link to="/">Not now</Link>
-      </div>
-    </main>
+            }}
+          >
+            {t("invitation.accept")}
+          </Button>
+          <Link to="/">{t("invitation.notNow")}</Link>
+        </div>
+      </main>
+    </>
   );
 }

@@ -297,6 +297,60 @@ describe("sandboxes", () => {
     ).toBeVisible();
   });
 
+  for (const [field, name, expected, message] of [
+    ["vCPUs", "vcpuCount", 1, "Enter at least 1 vCPU."],
+    ["Disk (GiB)", "diskGib", "1", "Enter the disk size in GiB."],
+  ] as const) {
+    for (const submission of ["Enter", "blur"] as const) {
+      test(`rejects zero sandbox ${field} on ${submission}`, async ({
+        app,
+        screen,
+        browser,
+      }) => {
+        await app.open("/");
+        await screen.getByRole("button", "Sign in with Delino").tap();
+        await app.open(`/orgs/${ACME}/sandboxes`);
+        await screen.getByRole("button", "Create sandbox").tap();
+
+        const dialog = screen.getByRole("dialog", "Create a sandbox");
+        const input = dialog.getByLabel(field);
+        const create = dialog.getByRole("button", "Create");
+        await trackResourceMutation(browser, "CreateSandbox");
+        await input.tap();
+        await browser.keyboard.press("ControlOrMeta+A");
+        await browser.keyboard.type("0");
+        if (submission === "Enter") {
+          await browser.keyboard.press("Enter");
+        } else {
+          await browser.keyboard.press("Tab");
+          await create.tap();
+        }
+
+        await expect(dialog).toBeVisible();
+        await expect(input).toHaveValue("0");
+        await expect(input).toHaveAttribute("aria-invalid", "true");
+        await expect(dialog.getByText(message)).toBeVisible();
+        expect(await resourceWrites(browser)).toHaveLength(0);
+
+        if (submission === "Enter") {
+          await browser.keyboard.press("ArrowUp");
+        } else {
+          await input.tap();
+          await browser.keyboard.press("ControlOrMeta+A");
+          await browser.keyboard.type("1");
+        }
+        await expect(input).toHaveValue("1");
+        expect(await resourceWrites(browser)).toHaveLength(0);
+        await create.tap();
+        await expect(dialog).toBeHidden();
+        await expect(browser).toHaveURL(/\/sandboxes\/[0-9a-f-]+$/);
+        const writes = await resourceWrites(browser);
+        expect(writes).toHaveLength(1);
+        expect(writes[0]?.resources?.[name]).toBe(expected);
+      });
+    }
+  }
+
   for (const [field, name, fraction, correction, expected, message] of [
     [
       "vCPUs",
@@ -1364,6 +1418,8 @@ describe("invitations", () => {
 interface LayoutMetrics {
   scrollWidth: number;
   clientWidth: number;
+  navListPresent: boolean;
+  navListLinkCount: number;
   navListScrollWidth: number;
   navListClientWidth: number;
   navListLinksReachable: boolean;
@@ -1379,6 +1435,7 @@ async function measureLayout(browser: {
     const doc = document.documentElement;
     const nav = document.querySelector(".sidenav");
     const list = document.querySelector(".sidenav ul");
+    const links = list?.querySelectorAll("a[href]") ?? [];
     const offscreen: string[] = [];
     for (const el of Array.from(
       document.querySelectorAll("a, button, input, select, textarea"),
@@ -1397,7 +1454,7 @@ async function measureLayout(browser: {
     let reachable = true;
     if (list) {
       const listBox = list.getBoundingClientRect();
-      for (const a of Array.from(list.querySelectorAll("a"))) {
+      for (const a of links) {
         const box = a.getBoundingClientRect();
         const start = box.left - listBox.left + list.scrollLeft;
         if (start < -0.5 || start + box.width > list.scrollWidth + 0.5) {
@@ -1411,6 +1468,8 @@ async function measureLayout(browser: {
     return {
       scrollWidth: doc.scrollWidth,
       clientWidth: doc.clientWidth,
+      navListPresent: list !== null,
+      navListLinkCount: links.length,
       navListScrollWidth: list ? list.scrollWidth : 0,
       navListClientWidth: list ? list.clientWidth : 0,
       navListLinksReachable: reachable,
@@ -1486,6 +1545,11 @@ describe("narrow screens", () => {
         expect(m.offscreen, `${where}: controls outside the viewport`).toEqual(
           [],
         );
+        expect(m.navListPresent, `${where}: section list exists`).toBe(true);
+        expect(
+          m.navListLinkCount,
+          `${where}: section link count`,
+        ).toBeGreaterThan(0);
         expect(m.navListLinksReachable, `${where}: section links`).toBe(true);
       }
     }
@@ -1526,6 +1590,11 @@ describe("narrow screens", () => {
         expect(m.offscreen, `${where}: controls outside the viewport`).toEqual(
           [],
         );
+        expect(m.navListPresent, `${where}: section list exists`).toBe(true);
+        expect(
+          m.navListLinkCount,
+          `${where}: section link count`,
+        ).toBeGreaterThan(0);
         expect(m.navListLinksReachable, `${where}: section links`).toBe(true);
       }
     }
@@ -1547,6 +1616,60 @@ describe("narrow screens", () => {
     const m = await measureLayout(browser);
     expect(m.navListScrollWidth).toBeGreaterThan(m.navListClientWidth);
     expect(m.navListClientWidth).toBeLessThanOrEqual(m.clientWidth);
+
+    const settingsPath = `/orgs/${ACME}/settings`;
+    const measureSectionScroll = () =>
+      browser.evaluate((path) => {
+        const list = document.querySelector(".sidenav ul");
+        const settings = list?.querySelector(`a[href="${path}"]`);
+        if (!list || !settings) return null;
+
+        const listBox = list.getBoundingClientRect();
+        const settingsBox = settings.getBoundingClientRect();
+        const left = listBox.left + list.clientLeft;
+        const right = left + list.clientWidth;
+        return {
+          pointerX: left + list.clientWidth / 2,
+          pointerY: listBox.top + list.clientTop + list.clientHeight / 2,
+          scrollLeft: list.scrollLeft,
+          documentX: window.scrollX,
+          settingsClippedOnRight: settingsBox.right > right + 0.5,
+          settingsFits:
+            settingsBox.left >= left - 0.5 && settingsBox.right <= right + 0.5,
+        };
+      }, settingsPath);
+
+    const before = await measureSectionScroll();
+    if (!before)
+      throw new Error("The section list must contain the Settings link");
+    expect(before.settingsClippedOnRight).toBe(true);
+    await browser.mouse.move(before.pointerX, before.pointerY);
+    await browser.mouse.wheel(m.navListScrollWidth, 0);
+
+    await expect
+      .poll(async () => {
+        const after = await measureSectionScroll();
+        if (!after) return null;
+        return {
+          listMoved: after.scrollLeft > before.scrollLeft,
+          settingsFits: after.settingsFits,
+          documentX: after.documentX,
+        };
+      })
+      .toEqual({
+        listMoved: true,
+        settingsFits: true,
+        documentX: before.documentX,
+      });
+
+    await screen
+      .getByRole("navigation", "Organization")
+      .getByRole("link", "Settings")
+      .tap();
+    await expect(browser).toHaveURL(settingsPath);
+    await expect(
+      screen.getByRole("heading", "Settings", { level: 1 }),
+    ).toBeVisible();
   });
 
   test("keeps the side column and the vertical list from 761 px", async ({

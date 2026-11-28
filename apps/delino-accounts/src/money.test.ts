@@ -50,6 +50,27 @@ describe("formatUsageCost", () => {
   });
 });
 
+describe("formatting for the selected language", () => {
+  test("formats USD with the conventions of the language and every digit", () => {
+    expect(formatUsd(-1_500_000n, "de")).toBe(
+      new Intl.NumberFormat("de", {
+        style: "currency",
+        currency: "USD",
+      }).format(-1.5),
+    );
+    // Beyond the safe integer range of `number`: no digit is lost.
+    expect(formatUsd(9_223_372_036_854_775_807n, "de")).toMatch(
+      /^9\.223\.372\.036\.854,78\s\$$/,
+    );
+    expect(formatUsd(12_345_678n, "ja")).toBe("$12.35");
+  });
+
+  test("keeps the usage cost precision in every language", () => {
+    expect(formatUsageCost(123n, "fr")).toMatch(/^0,000123\s\$US$/);
+    expect(formatUsageCost(5_000n, "de")).toMatch(/^0,005\s\$$/);
+  });
+});
+
 describe("parseUsd", () => {
   test.each([
     ["25", 25_000_000n],

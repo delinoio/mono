@@ -271,8 +271,29 @@ async function waitFor(run, predicate, what) {
 const events = (output, event) =>
   output
     .split("\n")
+    // The fragment after the last newline can still be incomplete.
+    .slice(0, -1)
     .filter((line) => line.includes(`"event":"${event}"`))
     .map((line) => JSON.parse(line));
+
+test("events parses only newline-terminated records", () => {
+  const event = "fake_signal";
+  let output = '{"event":"fake_signal","n":1}\n{"event":"fake_signal","n":';
+  assert.deepEqual(events(output, event), [{ event, n: 1 }]);
+
+  output += "2}";
+  assert.deepEqual(events(output, event), [{ event, n: 1 }]);
+
+  output += "\n";
+  assert.deepEqual(events(output, event), [
+    { event, n: 1 },
+    { event, n: 2 },
+  ]);
+
+  output += '{"event":"fake_signal",}';
+  assert.equal(events(output, event).length, 2);
+  assert.throws(() => events(output + "\n", event), SyntaxError);
+});
 
 // Waits for the fake server and records its pid, its supervisor and the pid of
 // its descendant, while the launcher is alive.

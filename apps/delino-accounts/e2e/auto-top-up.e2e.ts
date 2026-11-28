@@ -156,6 +156,79 @@ describe("automatic top-up settings", () => {
     });
   });
 
+  test("keeps newer edits when a confirming read arrives before the save response", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/auto-top-up.html");
+    await screen.getByRole("tab", "Settings").click();
+    const form = screen.getByRole("form", "Automatic top-up");
+    const amount = form.getByRole("textbox", "Top-up amount (USD)");
+    const save = form.getByRole("button", "Save");
+
+    await amount.fill("60");
+    await browser.evaluate(() => window.autoTopUpFixture.holdSaveResponse());
+    await save.click();
+    await expect
+      .poll(() => browser.evaluate(() => window.autoTopUpFixture.savedAmount()))
+      .toBe("60000000");
+    await amount.fill("75");
+
+    await browser.evaluate(() => window.autoTopUpFixture.refreshCounters());
+    await expect(form.getByText("$30.00")).toBeVisible();
+    await expect(amount).toHaveValue("75");
+    await expect(save).toBeDisabled();
+
+    const readsBeforeResponse = await browser.evaluate(() =>
+      window.autoTopUpFixture.holdConfirmation(),
+    );
+    await browser.evaluate(() => window.autoTopUpFixture.releaseSaveResponse());
+    await expect
+      .poll(() => browser.evaluate(() => window.autoTopUpFixture.readCount()))
+      .toBe(readsBeforeResponse + 1);
+    await expect(amount).toHaveValue("75");
+    await expect(save).toBeDisabled();
+    await browser.evaluate(() => window.autoTopUpFixture.releaseConfirmation());
+    await expect(save).toBeEnabled();
+    await expect(amount).toHaveValue("75");
+
+    await save.click();
+    await expect(amount).toHaveValue("75.00");
+    const saves = await browser.evaluate(() => window.autoTopUpFixture.saves());
+    expect(saves.map((request) => request?.amount)).toEqual([
+      "60000000",
+      "75000000",
+    ]);
+  });
+
+  test("resets the draft when a read changes editable values during a save", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/auto-top-up.html");
+    await screen.getByRole("tab", "Settings").click();
+    const form = screen.getByRole("form", "Automatic top-up");
+    const amount = form.getByRole("textbox", "Top-up amount (USD)");
+    const save = form.getByRole("button", "Save");
+
+    await amount.fill("60");
+    await browser.evaluate(() => window.autoTopUpFixture.holdSaveResponse());
+    await save.click();
+    await expect
+      .poll(() => browser.evaluate(() => window.autoTopUpFixture.savedAmount()))
+      .toBe("60000000");
+    await amount.fill("75");
+
+    await browser.evaluate(() => window.autoTopUpFixture.refreshAmount());
+    await expect(amount).toHaveValue("40.00");
+    await expect(save).toBeDisabled();
+    await browser.evaluate(() => window.autoTopUpFixture.releaseSaveResponse());
+    await expect(save).toBeEnabled();
+    await expect(amount).toHaveValue("40.00");
+  });
+
   test("canonicalizes an equivalent save when the draft is still current", async ({
     app,
     browser,
@@ -237,5 +310,30 @@ describe("automatic top-up settings", () => {
 
     await browser.evaluate(() => window.autoTopUpFixture.refreshAmount());
     await expect(amount).toHaveValue("40.00");
+  });
+
+  test("resets the draft when a later read matches a rejected save", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/auto-top-up.html");
+    await screen.getByRole("tab", "Settings").click();
+    const form = screen.getByRole("form", "Automatic top-up");
+    const amount = form.getByRole("textbox", "Top-up amount (USD)");
+    const save = form.getByRole("button", "Save");
+
+    await amount.fill("60");
+    await browser.evaluate(() => window.autoTopUpFixture.holdSave());
+    await save.click();
+    await amount.fill("75");
+    await browser.evaluate(() => window.autoTopUpFixture.rejectSave());
+    await expect(save).toBeEnabled();
+    await expect(amount).toHaveValue("75");
+
+    await browser.evaluate(() =>
+      window.autoTopUpFixture.refreshAmount(60_000_000),
+    );
+    await expect(amount).toHaveValue("60.00");
   });
 });

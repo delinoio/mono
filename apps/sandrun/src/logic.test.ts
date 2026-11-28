@@ -24,7 +24,8 @@ import { formatSpan, queueWaitMs } from "./format.ts";
 import {
   emptyProfileForm,
   formFromProfile,
-  profileErrors,
+  type ProfileFormValues,
+  profileErrors as localizedProfileErrors,
   profileFromForm,
   profileUpdateMask,
   SourceKind,
@@ -51,7 +52,16 @@ import {
   canManageMember,
   Permission,
 } from "./roles.ts";
+import { sourceLocalizer } from "./i18n.ts";
 import { parseRoute, RouteId, routePath } from "./router.tsx";
+
+/** The profile form errors in the source language. */
+function profileErrors(
+  values: ProfileFormValues,
+  vendor: AgentVendor | undefined,
+) {
+  return localizedProfileErrors(values, vendor, sourceLocalizer.t);
+}
 
 describe("configuration", () => {
   const malformedAuthorities = [
@@ -861,7 +871,7 @@ describe("queue view", () => {
         99_999,
       ),
     ).toBe(5000);
-    expect(formatSpan(3_900_000)).toBe("1 h 5 min");
+    expect(formatSpan(3_900_000, sourceLocalizer)).toBe("1 h 5 min");
   });
 });
 

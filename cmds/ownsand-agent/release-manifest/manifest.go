@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/delinoio/mono/internal/semver"
@@ -201,11 +202,9 @@ func (m *manifest) validate() error {
 	return nil
 }
 
-// checkHTTPSURL parses raw and requires an absolute https URL with a host
-// that url.Parse accepts, so that a hostless ("https:///x") or malformed
-// (a space in the host, an invalid percent escape or port) URL cannot reach a
-// signed manifest. Queries and fragments are not judged here: a complete
-// artifact URL may carry a query, and newRelease refuses both in a prefix.
+// checkHTTPSURL requires an absolute HTTPS URL with a host and checks the
+// numeric range of a nonempty port. A complete artifact URL may carry a query.
+// newRelease rejects queries and fragments in prefixes.
 func checkHTTPSURL(raw string) error {
 	if !strings.HasPrefix(raw, "https://") || strings.ContainsAny(raw, " \t\r\n") {
 		return errors.New("is not an https URL")
@@ -216,6 +215,11 @@ func checkHTTPSURL(raw string) error {
 	}
 	if u.Scheme != "https" || u.Opaque != "" || u.Hostname() == "" {
 		return errors.New("has no host")
+	}
+	if port := u.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return errors.New("has a port outside the range 0 to 65535")
+		}
 	}
 	return nil
 }

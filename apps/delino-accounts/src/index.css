@@ -113,6 +113,21 @@ h2 {
   font-weight: 700;
 }
 
+/* The language menu shows only its trigger; the field label is visually
+   hidden and the trigger is as compact as the other top bar controls. */
+.topbar-language {
+  min-width: 8.5rem;
+}
+
+.topbar-language .dui-text-field {
+  gap: 0;
+}
+
+.topbar-language .dui-select {
+  min-height: 36px;
+  font-size: 14px;
+}
+
 .content {
   max-width: 1080px;
   margin: 0 auto;
@@ -217,6 +232,7 @@ h2 {
   font-size: 2rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
 .balance-debt {

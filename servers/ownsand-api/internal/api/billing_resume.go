@@ -95,7 +95,7 @@ func (s *Service) settleBillingResume(ctx context.Context, conn *hub.Conn, comma
 		if owner != sandboxID {
 			return nil
 		}
-		applied, err = s.applySandboxEntry(ctx, tx, conn.DeviceID, entry)
+		applied, err = s.applySandboxEntry(ctx, tx, conn.DeviceID, entry, sandboxEntryFromCommandResult)
 		if err != nil || !applied.known {
 			return err
 		}

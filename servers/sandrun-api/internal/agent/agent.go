@@ -397,7 +397,11 @@ func (h *Hub) releaseClaimLocked(ctx context.Context, c *Claim, req *work.Reques
 // A lookup error or an unconfirmed release keeps the organization and its
 // credentials for a retry. The hook resumes its own watchers on error
 // because the core calls Abort only for hooks whose Prepare succeeded.
-func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion) (err error) {
+func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion) error {
+	return h.prepareOrgDeletionWithCleanup(ctx, d, h.releaseOrgClaims)
+}
+
+func (h *Hub) prepareOrgDeletionWithCleanup(ctx context.Context, d api.OrganizationDeletion, cleanup func(context.Context, string) error) (err error) {
 	h.mu.Lock()
 	h.stopped[d.OrganizationID]++
 	for _, w := range h.watchers {
@@ -416,7 +420,11 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 		}
 	}()
 	stopWatchers(stop)
-	claims, err := h.heldClaims(ctx, strictClaimLookup, "c.organization_id = $1", d.OrganizationID)
+	return cleanup(ctx, d.OrganizationID)
+}
+
+func (h *Hub) releaseOrgClaims(ctx context.Context, orgID string) error {
+	claims, err := h.heldClaims(ctx, strictClaimLookup, "c.organization_id = $1", orgID)
 	if err != nil {
 		return err
 	}
@@ -427,7 +435,7 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 			err = errors.New("the vendor did not confirm the release")
 		}
 		if err != nil {
-			h.log.WarnContext(ctx, "agent_claim_release_failed", slog.String("organization_id", d.OrganizationID), slog.String("request_id", hc.claim.RequestID), slog.Any("error", err))
+			h.log.WarnContext(ctx, "agent_claim_release_failed", slog.String("organization_id", orgID), slog.String("request_id", hc.claim.RequestID), slog.Any("error", err))
 			errs = append(errs, fmt.Errorf("release the vendor claim of request %s: %w", hc.claim.RequestID, err))
 		}
 	}

@@ -12,6 +12,7 @@ import {
   DeviceLimitsInputSchema,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { MAX_INT32 } from "./format.ts";
+import { type MessageKey, sourceText, type Text } from "./text.ts";
 
 export const MAX_TTL_SECONDS = 7 * 24 * 3600;
 export const MAX_LABELS = 32;
@@ -22,22 +23,25 @@ export interface TtlInput {
 }
 
 /** Returns field errors of the TTL inputs, or an empty object. */
-export function ttlErrors(input: TtlInput): { idle?: string; max?: string } {
+export function ttlErrors(
+  input: TtlInput,
+  text: Pick<Text, "t"> = sourceText,
+): { idle?: string; max?: string } {
   const errors: { idle?: string; max?: string } = {};
   if (input.idleMinutes === null || !(input.idleMinutes > 0)) {
-    errors.idle = "Enter an idle TTL greater than zero.";
+    errors.idle = text.t("forms.ttl.idleRequired");
   }
   if (input.maxHours === null || !(input.maxHours > 0)) {
-    errors.max = "Enter a maximum TTL greater than zero.";
+    errors.max = text.t("forms.ttl.maxRequired");
   } else if (input.maxHours * 3600 > MAX_TTL_SECONDS) {
-    errors.max = "The maximum TTL is at most 7 days (168 hours).";
+    errors.max = text.t("forms.ttl.maxTooLong");
   }
   if (
     errors.idle === undefined &&
     errors.max === undefined &&
     input.idleMinutes! * 60 > input.maxHours! * 3600
   ) {
-    errors.idle = "The idle TTL must not be longer than the maximum TTL.";
+    errors.idle = text.t("forms.ttl.idleLongerThanMax");
   }
   return errors;
 }
@@ -64,7 +68,10 @@ const MAX_DISK_GIB = 8589934591;
  * Returns field errors before the form sends resources outside the supported
  * ranges, or an empty object when all resources are valid.
  */
-export function resourceErrors(input: ResourceInput): {
+export function resourceErrors(
+  input: ResourceInput,
+  text: Pick<Text, "t"> = sourceText,
+): {
   vcpu?: string;
   memory?: string;
   disk?: string;
@@ -72,22 +79,24 @@ export function resourceErrors(input: ResourceInput): {
   const errors: { vcpu?: string; memory?: string; disk?: string } = {};
   const { vcpu, memory, disk } = input;
   if (vcpu !== null && (!Number.isInteger(vcpu) || vcpu > MAX_INT32)) {
-    errors.vcpu = `Enter a whole number of vCPUs from 1 to ${MAX_INT32}.`;
+    errors.vcpu = text.t("forms.resources.vcpuRange", { max: MAX_INT32 });
   } else if (vcpu === null || vcpu <= 0) {
-    errors.vcpu = "Enter at least 1 vCPU.";
+    errors.vcpu = text.t("forms.resources.vcpuRequired");
   }
   if (
     memory !== null &&
     (!Number.isInteger(memory) || memory > MAX_RESOURCE_INT64)
   ) {
-    errors.memory = `Enter a whole number of MiB from 1 to ${MAX_RESOURCE_INT64}.`;
+    errors.memory = text.t("forms.resources.memoryRange", {
+      max: MAX_RESOURCE_INT64,
+    });
   } else if (memory === null || memory <= 0) {
-    errors.memory = "Enter the memory in MiB.";
+    errors.memory = text.t("forms.resources.memoryRequired");
   }
   if (disk !== null && (!Number.isInteger(disk) || disk > MAX_DISK_GIB)) {
-    errors.disk = `Enter a whole number of GiB from 1 to ${MAX_DISK_GIB}.`;
+    errors.disk = text.t("forms.resources.diskRange", { max: MAX_DISK_GIB });
   } else if (disk === null || disk <= 0) {
-    errors.disk = "Enter the disk size in GiB.";
+    errors.disk = text.t("forms.resources.diskRequired");
   }
   return errors;
 }
@@ -103,6 +112,7 @@ const NUL = "\u0000";
  */
 export function parseLabels(
   text: string,
+  messages: Pick<Text, "t"> = sourceText,
 ): { labels: Record<string, string> } | { error: string } {
   // A Map keeps every key; assigning `labels["__proto__"]` on a plain object
   // would call the prototype setter and silently drop the label.
@@ -114,24 +124,25 @@ export function parseLabels(
     if (at <= 0)
       return {
         // A NUL character in the echo would make the message unreadable.
-        error: `Write each label as key=value: "${line.slice(0, 40).replaceAll(NUL, "")}"`,
+        error: messages.t("forms.labels.format", {
+          line: line.slice(0, 40).replaceAll(NUL, ""),
+        }),
       };
     const key = line.slice(0, at).trim();
     const value = line.slice(at + 1).trim();
     // The control plane rejects U+0000 in a label because PostgreSQL cannot
     // store it, so the form reports it before it sends the request.
-    if (key.includes(NUL))
-      return { error: "A label key must not contain a NUL character." };
+    if (key.includes(NUL)) return { error: messages.t("forms.labels.keyNul") };
     if (value.includes(NUL))
-      return { error: "A label value must not contain a NUL character." };
+      return { error: messages.t("forms.labels.valueNul") };
     if (utf8.encode(key).length > 63)
-      return { error: "A label key has at most 63 bytes." };
+      return { error: messages.t("forms.labels.keyTooLong") };
     if (utf8.encode(value).length > 255)
-      return { error: "A label value has at most 255 bytes." };
+      return { error: messages.t("forms.labels.valueTooLong") };
     labels.set(key, value);
   }
   if (labels.size > MAX_LABELS) {
-    return { error: `Use at most ${MAX_LABELS} labels.` };
+    return { error: messages.t("forms.labels.tooMany", { max: MAX_LABELS }) };
   }
   // `Object.fromEntries` defines own data properties, including `__proto__`.
   return { labels: Object.fromEntries(labels) };
@@ -184,22 +195,20 @@ export interface DeviceLimitsForm {
  */
 export function deviceLimitsInput(
   form: DeviceLimitsForm,
+  text: Pick<Text, "t"> = sourceText,
 ): { limits: DeviceLimitsInput } | { error: string; field: DeviceLimitField } {
   const memory = parseInt64Limit(form.memoryMib);
   const disk = parseInt64Limit(form.diskGib);
-  const blank: [DeviceLimitField, string] | undefined =
+  const blank: [DeviceLimitField, MessageKey] | undefined =
     form.vcpu === null
-      ? [DeviceLimitField.Vcpu, "vCPU limit"]
+      ? [DeviceLimitField.Vcpu, "forms.deviceLimits.vcpuRequired"]
       : "error" in memory && memory.error === "blank"
-        ? [DeviceLimitField.Memory, "Memory limit"]
+        ? [DeviceLimitField.Memory, "forms.deviceLimits.memoryRequired"]
         : "error" in disk && disk.error === "blank"
-          ? [DeviceLimitField.Disk, "Disk limit"]
+          ? [DeviceLimitField.Disk, "forms.deviceLimits.diskRequired"]
           : undefined;
   if (blank !== undefined) {
-    return {
-      error: `${blank[1]} is required. Enter 0 to allow none.`,
-      field: blank[0],
-    };
+    return { error: text.t(blank[1]), field: blank[0] };
   }
   // The vCPU limit is an int32 on the wire: the generated serializer throws on
   // anything else, which the page would show as the generic notice.
@@ -209,19 +218,23 @@ export function deviceLimitsInput(
     form.vcpu! > MAX_INT32
   ) {
     return {
-      error: `vCPU limit must be a whole number from 0 to ${MAX_INT32}.`,
+      error: text.t("forms.deviceLimits.vcpuRange", { max: MAX_INT32 }),
       field: DeviceLimitField.Vcpu,
     };
   }
   if ("error" in memory) {
     return {
-      error: `Memory limit must be a whole number from 0 to ${MAX_INT64}.`,
+      error: text.t("forms.deviceLimits.memoryRange", {
+        max: MAX_INT64.toString(),
+      }),
       field: DeviceLimitField.Memory,
     };
   }
   if ("error" in disk) {
     return {
-      error: `Disk limit must be a whole number from 0 to ${MAX_INT64}.`,
+      error: text.t("forms.deviceLimits.diskRange", {
+        max: MAX_INT64.toString(),
+      }),
       field: DeviceLimitField.Disk,
     };
   }

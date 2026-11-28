@@ -1,0 +1,10 @@
+The theme.* entries of the text catalogs in messages/ originate from the
+default theme texts of @rspress/core 2.1.3
+(https://github.com/web-infra-dev/rspress).
+Copyright (c) 2023-present Bytedance, Inc. and its affiliates.
+These entries, including their translations, remain under the MIT License in
+RSPRESS-LICENSE.
+
+The other catalog entries, the translations of the pages in ../docs and the
+rest of this app are licensed under the Apache License, Version 2.0; see the
+LICENSE file at the repository root.

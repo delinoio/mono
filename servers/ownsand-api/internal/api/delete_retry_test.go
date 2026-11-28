@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
@@ -217,4 +219,133 @@ func TestDeleteSandboxRetryKeepsReplacementCommand(t *testing.T) {
 	}
 	sendDeleteResult(replacement, current, replacement.DefaultAnswer(current))
 	retry(deleted)
+}
+
+func TestIncrementalDeletingProgressDoesNotRedispatch(t *testing.T) {
+	env, org, device, agent, id := setupDeleteRetry(t)
+	running := ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+	deleting := ownsandv1.SandboxState_SANDBOX_STATE_DELETING
+	deleted := ownsandv1.SandboxState_SANDBOX_STATE_DELETED
+	reason := ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER
+
+	waitDelete := func(a *testenv.FakeAgent, sandboxID string, previous *ownsandv1.AgentCommand) *ownsandv1.AgentCommand {
+		t.Helper()
+		cmd := a.WaitFor("delete command", func(e *ownsandv1.AgentEnvelope) bool {
+			cmd := e.GetCommand()
+			return cmd.GetDeleteSandbox().GetSandboxId() == sandboxID && cmd.GetCommandId() != previous.GetCommandId()
+		}).GetCommand()
+		if got := cmd.GetDeleteSandbox().GetEndReason(); got != reason {
+			t.Fatalf("delete reason = %v, want %v", got, reason)
+		}
+		return cmd
+	}
+	flush := func(a *testenv.FakeAgent, sequence uint64) {
+		t.Helper()
+		a.Heartbeat(sequence)
+		a.WaitFor("heartbeat acknowledgement", func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetHeartbeatAck().GetSequence() == sequence
+		})
+	}
+	checkAllocation := func(want int32) {
+		t.Helper()
+		dev, err := org.OwnerClient.Device.GetDevice(t.Context(), connect.NewRequest(&ownsandv1.GetDeviceRequest{
+			OrganizationId: org.ID, DeviceId: device.ID,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := dev.Msg.GetDevice().GetAllocation().GetVcpuCount(); got != want {
+			t.Fatalf("allocated vCPUs = %d, want %d", got, want)
+		}
+	}
+
+	withholdAll(agent)
+	wait := startDeleteSandbox(t, org.OwnerClient, org.ID, id)
+	first := waitDelete(agent, id, nil)
+	sendDeleteResult(agent, first, deleteInternalError())
+	flush(agent, 101)
+	if got := env.App.Service.PendingCommands(); got != 0 {
+		t.Fatalf("pending commands after initial delete error = %d, want 0", got)
+	}
+	wait(deleting)
+
+	progress := agent.SetSandbox(id, deleting, 0)
+	rev := progress.GetRevision()
+	idle := progress.GetIdleDeadline().AsTime().Truncate(time.Microsecond)
+	for i := range 2 {
+		if i == 1 {
+			// The repeated revision must leave the stored deadline intact.
+			progress.IdleDeadline = timestamppb.New(idle.Add(time.Minute))
+		}
+		agent.SendUpdate(progress)
+		flush(agent, 102+uint64(i))
+		var acks int
+		for _, e := range agent.Received() {
+			ack := e.GetStateAck().GetSandboxUpdate()
+			if ack.GetSandboxId() == id && ack.GetRevision().GetEpoch() == rev.GetEpoch() && ack.GetRevision().GetCounter() == rev.GetCounter() {
+				acks++
+			}
+		}
+		if acks != i+1 || len(deleteCommands(agent, id)) != 1 {
+			t.Fatalf("progress update %d: %d matching acknowledgements, %d total delete commands, want %d and 1",
+				i+1, acks, len(deleteCommands(agent, id)), i+1)
+		}
+
+		var state, storedReason, actorKind int16
+		var counter uint64
+		var pending bool
+		var epoch, actor string
+		var deadline time.Time
+		err := env.DB.Pool.QueryRow(t.Context(), `SELECT agent_state, revision_epoch, revision_counter, idle_deadline,
+			delete_pending, delete_end_reason, delete_actor_kind, delete_actor_id FROM sandboxes WHERE sandbox_id = $1`, id).
+			Scan(&state, &epoch, &counter, &deadline, &pending, &storedReason, &actorKind, &actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state != int16(deleting) || epoch != rev.GetEpoch() || counter != rev.GetCounter() {
+			t.Fatalf("progress state and revision = %d, %s/%d, want %v and %v", state, epoch, counter, deleting, rev)
+		}
+		if !deadline.Equal(idle) {
+			t.Fatalf("stored idle deadline = %v, want %v", deadline, idle)
+		}
+		if !pending || storedReason != int16(reason) || actorKind != int16(ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER) || actor != org.Owner {
+			t.Fatalf("delete intent = %v, %d, %d, %q", pending, storedReason, actorKind, actor)
+		}
+		checkAllocation(2)
+	}
+
+	agent.SendUpdate(agent.SetSandbox(id, running, 0))
+	second := waitDelete(agent, id, first)
+	sendDeleteResult(agent, second, deleteInternalError())
+	flush(agent, 104)
+
+	replacement := env.NewFakeAgent(device)
+	replacement.SetSandbox(id, deleting, 0)
+	withholdAll(replacement)
+	replacement.Connect()
+	third := waitDelete(replacement, id, second)
+	sendDeleteResult(replacement, third, deleteInternalError())
+	flush(replacement, 105)
+
+	// Keep the same epoch and continue past the original agent's revision.
+	terminal := agent.SetSandbox(id, deleted, 0)
+	replacement.SendUpdate(terminal)
+	flush(replacement, 106)
+	if got := getSandbox(t, org.OwnerClient, org.ID, id); got.GetState() != deleted || got.GetEndReason() != reason {
+		t.Fatalf("terminal sandbox = %v", got)
+	}
+	var pending bool
+	if err := env.DB.Pool.QueryRow(t.Context(), "SELECT delete_pending FROM sandboxes WHERE sandbox_id = $1", id).Scan(&pending); err != nil || pending {
+		t.Fatalf("delete_pending after terminal update = %v, %v", pending, err)
+	}
+	checkAllocation(0)
+
+	unknown, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement.SendUpdate(agent.SetSandbox(unknown, deleting, 0))
+	waitDelete(replacement, unknown, nil)
+	replacement.SendUpdate(agent.SetSandbox(id, deleting, 0))
+	waitDelete(replacement, id, third)
 }

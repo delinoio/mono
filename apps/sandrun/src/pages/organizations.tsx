@@ -17,26 +17,28 @@ import {
 import { labels } from "../format.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
 import { isNameLengthValid, ORGANIZATION_NAME_LIMIT } from "../name.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { refreshOrganizations, useOrganizations } from "../organizations.ts";
 import { Link, orgPath, RouteId, routePath, useRouter } from "../router.tsx";
 
 /** Route `organizations`: the organization list, creation and invitations. */
 export function OrganizationsPage() {
+  const { t } = useI18n();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const orgs = useOrganizations();
   const create = useMutation(OrganizationService.method.createOrganization);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
-  const [nameError, setNameError] = useState<string>();
+  const [nameError, setNameError] = useState<MessageKey>();
   const [link, setLink] = useState("");
-  const [linkError, setLinkError] = useState<string>();
+  const [linkError, setLinkError] = useState<MessageKey>();
 
   const join = (event: FormEvent) => {
     event.preventDefault();
     const secret = secretFromInput(link);
     if (secret === undefined) {
-      setLinkError("Paste the whole invitation link or the secret.");
+      setLinkError("organizations.join.inputRequired");
       return;
     }
     setLink("");
@@ -50,23 +52,22 @@ export function OrganizationsPage() {
       <TopBar />
       <main className="content content-narrow">
         <PageHeader
-          title="Organizations"
-          description="Choose an organization to see its queue, runners and devices."
+          title={t("organizations.title")}
+          description={t("organizations.description")}
           action={
             <Button onClick={() => setCreating(true)}>
-              Create organization
+              {t("organizations.create")}
             </Button>
           }
         />
-        <QueryBoundary query={orgs} loading="Loading organizations">
+        <QueryBoundary query={orgs} loading={t("organizations.loading")}>
           {(data) =>
             data.length === 0 ? (
-              <Empty title="You are not in an organization yet">
-                Create one, or open an invitation link from an admin. Each
-                SandRun organization links to one OwnSand organization.
+              <Empty title={t("organizations.empty.title")}>
+                {t("organizations.empty.description")}
               </Empty>
             ) : (
-              <ul className="list" aria-label="Your organizations">
+              <ul className="list" aria-label={t("organizations.listLabel")}>
                 {data.map((org) => (
                   <li key={org.organizationId} className="list-row">
                     <Link
@@ -74,7 +75,7 @@ export function OrganizationsPage() {
                       to={orgPath(RouteId.Overview, org.organizationId)}
                     >
                       <span className="list-title">{org.name}</span>
-                      <Badge>{labels.role[org.callerRole]}</Badge>
+                      <Badge>{t(labels.role[org.callerRole])}</Badge>
                     </Link>
                   </li>
                 ))}
@@ -83,30 +84,30 @@ export function OrganizationsPage() {
           }
         </QueryBoundary>
         <section className="section" aria-labelledby="join-title">
-          <h2 id="join-title">Join with an invitation</h2>
+          <h2 id="join-title">{t("organizations.join.title")}</h2>
           <form className="inline-form" onSubmit={join}>
             <PasswordInput
-              label="Invitation link or secret"
-              toggleLabel="Show invitation"
+              label={t("invitation.inputLabel")}
+              toggleLabel={t("invitation.showInput")}
               value={link}
               onValueChange={(value) => {
                 setLink(value);
                 setLinkError(undefined);
               }}
-              error={linkError}
+              error={linkError && t(linkError)}
               autoComplete="off"
             />
             <Button type="submit" variant={ButtonVariant.Secondary}>
-              Continue
+              {t("organizations.join.continue")}
             </Button>
           </form>
         </section>
       </main>
       <FormDialog
         open={creating}
-        title="Create an organization"
-        description="You become its owner. Next, link it to an OwnSand organization and invite members."
-        submitLabel="Create"
+        title={t("organizations.createDialog.title")}
+        description={t("organizations.createDialog.description")}
+        submitLabel={t("organizations.createDialog.submit")}
         onOpenChange={(open) => {
           setCreating(open);
           if (!open) {
@@ -117,9 +118,7 @@ export function OrganizationsPage() {
         onSubmit={async (opening) => {
           const trimmed = name.trim();
           if (!isNameLengthValid(trimmed, ORGANIZATION_NAME_LIMIT)) {
-            setNameError(
-              `Enter an organization name of 1 to ${ORGANIZATION_NAME_LIMIT} characters.`,
-            );
+            setNameError("organizations.createDialog.nameInvalid");
             return;
           }
           const res = await create.mutateAsync({ name: trimmed });
@@ -131,13 +130,13 @@ export function OrganizationsPage() {
         }}
       >
         <TextField
-          label="Organization name"
+          label={t("organizations.createDialog.nameLabel")}
           value={name}
           onValueChange={(value) => {
             setName(value);
             setNameError(undefined);
           }}
-          error={nameError}
+          error={nameError && t(nameError, { max: ORGANIZATION_NAME_LIMIT })}
           required
           autoFocus
         />

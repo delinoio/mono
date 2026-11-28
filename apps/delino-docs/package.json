@@ -14,7 +14,10 @@
     "dev:app": "rspress dev",
     "preview": "node ../../scripts/dev/rspress-preview.mjs",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "e2e run"
+    "test": "delino-i18n check",
+    "test:e2e": "e2e run",
+    "i18n:check": "delino-i18n check",
+    "i18n:translate": "delino-i18n translate"
   },
   "portless": {
     "name": "docs.delino",
@@ -31,6 +34,7 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "ai": "7.0.177",
+    "delino-i18n": "workspace:*",
     "e2e": "0.24.0",
     "portless": "0.18.1",
     "typescript": "6.0.3"

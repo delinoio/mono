@@ -47,6 +47,13 @@ function pageTokens(api: ReturnType<typeof createFakeApi>) {
     .map((c) => c.request.pageToken);
 }
 
+/**
+ * Bound for the notice of the failed second page. The default one-second
+ * `findBy*` timeout expired on a CPU-starved CI runner while the 200 loaded
+ * rows were still rendering; the bound only has to outlast that runner.
+ */
+const NOTICE_WAIT_MS = 20_000;
+
 /** Renders the account list with a second page and arms its failure. */
 async function renderFailingSecondPage(failure: ConnectError) {
   const api = createFakeApi();
@@ -54,9 +61,13 @@ async function renderFailingSecondPage(failure: ConnectError) {
   addBillingAccounts(api, 200);
   api.failContinuation.set("ListBillingAccounts", failure);
   const { signIns } = renderApp("/billing", { api });
-  const notice = (await screen.findByText(/Some items did not load/)).closest(
-    '[role="alert"]',
-  ) as HTMLElement;
+  const notice = (
+    await screen.findByText(
+      /Some items did not load/,
+      {},
+      { timeout: NOTICE_WAIT_MS },
+    )
+  ).closest('[role="alert"]') as HTMLElement;
   const rows = () => listRows("Billing accounts");
   return { api, signIns, notice, rows };
 }

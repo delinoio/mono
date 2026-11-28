@@ -140,8 +140,9 @@ func (m *Metrics) LinkedOrganizations(status string, n int64) {
 const shutdownTimeout = 5 * time.Second
 
 // Serve serves handler, the Prometheus exposition of the metrics, on listener
-// until ctx is done. It returns nil after a shutdown and the listener error
-// otherwise.
+// until ctx is done. On cancellation it drains active requests and closes any
+// remaining connections if the drain deadline expires. It returns any shutdown
+// or unexpected listener errors.
 func Serve(ctx context.Context, listener net.Listener, handler http.Handler, logger *slog.Logger) error {
 	srv := &http.Server{
 		Handler:           handler,
@@ -162,6 +163,9 @@ func Serve(ctx context.Context, listener net.Listener, handler http.Handler, log
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	err := srv.Shutdown(shutdownCtx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = errors.Join(err, srv.Close())
+	}
 	if serveErr := <-errc; !errors.Is(serveErr, http.ErrServerClosed) {
 		err = errors.Join(err, serveErr)
 	}

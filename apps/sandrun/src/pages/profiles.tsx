@@ -40,7 +40,8 @@ import {
   profileUpdateMask,
   SourceKind,
 } from "../forms.ts";
-import { formatDuration, labels } from "../format.ts";
+import { formatDuration, guestOsName, labels, vendorName } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { can, Permission } from "../roles.ts";
 import {
   refreshRunnerProfiles,
@@ -56,18 +57,34 @@ const KINDS = [
 const GUEST_OSES = [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS];
 const PRIORITIES = [Priority.HIGH, Priority.NORMAL, Priority.LOW];
 const RESOURCE_FIELDS = [
-  ["vcpuCount", "vCPUs"],
-  ["memoryMib", "Memory (MiB)"],
-  ["diskGib", "Disk (GiB)"],
-] as const;
+  ["vcpuCount", "profiles.dialog.vcpus"],
+  ["memoryMib", "profiles.dialog.memory"],
+  ["diskGib", "profiles.dialog.disk"],
+] as const satisfies readonly (readonly [
+  keyof ProfileFormValues,
+  MessageKey,
+])[];
 const DURATION_FIELDS = [
-  ["idleTtlMinutes", "Idle TTL (minutes)"],
-  ["maxTtlHours", "Maximum TTL (hours)"],
-  ["maxQueueWaitMinutes", "Maximum queue wait (minutes)"],
-] as const;
+  ["idleTtlMinutes", "profiles.dialog.idleTtl"],
+  ["maxTtlHours", "profiles.dialog.maxTtl"],
+  ["maxQueueWaitMinutes", "profiles.dialog.maxQueueWait"],
+] as const satisfies readonly (readonly [
+  keyof ProfileFormValues,
+  MessageKey,
+])[];
+
+/** The priority part of a profile summary, such as "priority high". */
+const PRIORITY_SUMMARY = {
+  [Priority.UNSPECIFIED]: "profiles.item.priority.unspecified",
+  [Priority.HIGH]: "profiles.item.priority.high",
+  [Priority.NORMAL]: "profiles.item.priority.normal",
+  [Priority.LOW]: "profiles.item.priority.low",
+} as const satisfies Record<Priority, MessageKey>;
 
 /** Route `profiles`: runner profiles; create, change and delete for `admin`. */
 export function ProfilesPage() {
+  const i18n = useI18n();
+  const { t, rich } = i18n;
   const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const admin = can(role, Permission.ManageRunnerProfiles);
@@ -82,10 +99,13 @@ export function ProfilesPage() {
           ? []
           : integrations.map((i) => [
               i.agentIntegrationId,
-              `${i.name} (${labels.vendor[i.vendor]})`,
+              t("profiles.integrationName", {
+                name: i.name,
+                vendor: vendorName(i.vendor, t),
+              }),
             ]),
       ),
-    [integrations, integrationsUnavailable],
+    [integrations, integrationsUnavailable, t],
   );
   const remove = useMutation(RunnerProfileService.method.deleteRunnerProfile, {
     onSuccess: () => refreshRunnerProfiles(queryClient),
@@ -96,12 +116,12 @@ export function ProfilesPage() {
   return (
     <>
       <PageHeader
-        title="Runner profiles"
-        description="A runner profile describes one kind of runner. GitHub jobs select a profile with its runs-on label; agent sessions use the profile of their integration; dev sessions name a profile."
+        title={t("profiles.title")}
+        description={t("profiles.description", { label: "runs-on" })}
         action={
           admin ? (
             <Button onClick={() => setEditing("new")}>
-              Create runner profile
+              {t("profiles.create")}
             </Button>
           ) : undefined
         }
@@ -109,66 +129,80 @@ export function ProfilesPage() {
       {integrationQuery.error ? (
         <QueryBoundary
           query={integrationQuery}
-          loading="Loading agent integrations"
+          loading={t("profiles.loadingIntegrations")}
         >
           {() => null}
         </QueryBoundary>
       ) : null}
       <QueryBoundary
         query={list}
-        loading="Loading runner profiles"
-        errorTitle="Could not load runner profiles."
+        loading={t("profiles.loading")}
+        errorTitle={t("profiles.loadFailed")}
       >
         {(profiles) => {
           return profiles.length === 0 ? (
             <SetupEmpty
               organizationId={organizationId}
-              title="No runner profiles"
+              title={t("profiles.empty.title")}
             >
-              {admin
-                ? "Create a runner profile to start runners for your work."
-                : "Ask an admin to create a runner profile."}
+              {admin ? t("profiles.empty.admin") : t("profiles.empty.member")}
             </SetupEmpty>
           ) : (
-            <ul className="list" aria-label="Runner profiles">
+            <ul className="list" aria-label={t("profiles.title")}>
               {profiles.map((p) => (
                 <li key={p.runnerProfileId} className="list-row">
                   <div className="list-main">
                     <span className="list-title">
-                      {p.name} · {labels.workloadKind[p.workloadKind]} ·{" "}
-                      {labels.guestOs[p.guestOs]}
+                      {p.name} · {t(labels.workloadKind[p.workloadKind])} ·{" "}
+                      {guestOsName(p.guestOs, t)}
                     </span>
                     <span className="muted">
-                      {p.source.case === "ownsandTemplateId"
-                        ? `Template ${p.source.value}`
-                        : "Base image"}{" "}
-                      · {p.resources?.vcpuCount ?? 0} vCPU ·{" "}
-                      {String(p.resources?.memoryMib ?? 0n)} MiB ·{" "}
-                      {String(p.resources?.diskGib ?? 0n)} GiB · priority{" "}
-                      {labels.priority[p.priority].toLowerCase()} · warm{" "}
-                      {p.warmCount} · queue wait at most{" "}
-                      {formatDuration(p.maxQueueWait)}
+                      {[
+                        p.source.case === "ownsandTemplateId"
+                          ? t("profiles.item.template", { id: p.source.value })
+                          : t("profiles.item.baseImage"),
+                        t("profiles.item.vcpus", {
+                          count: p.resources?.vcpuCount ?? 0,
+                        }),
+                        t("profiles.item.memory", {
+                          mib: String(p.resources?.memoryMib ?? 0n),
+                        }),
+                        t("profiles.item.disk", {
+                          gib: String(p.resources?.diskGib ?? 0n),
+                        }),
+                        t(PRIORITY_SUMMARY[p.priority]),
+                        t("profiles.item.warm", { count: p.warmCount }),
+                        t("profiles.item.maxQueueWait", {
+                          duration: formatDuration(p.maxQueueWait, i18n),
+                        }),
+                      ].join(" · ")}
                     </span>
                     {p.workloadKind === WorkloadKind.GITHUB_JOB &&
                     p.githubLabel !== "" ? (
                       <span>
                         runs-on:{" "}
                         <CopyValue
-                          label={`runs-on label of ${p.name}`}
+                          label={t("profiles.item.runsOnLabel", {
+                            name: p.name,
+                          })}
                           value={p.githubLabel}
                         />
                       </span>
                     ) : null}
                     {p.workloadKind === WorkloadKind.AGENT_SESSION ? (
                       <span className="muted">
-                        Integration:{" "}
-                        {integrationNames.get(p.agentIntegrationId) ??
-                          p.agentIntegrationId}
+                        {t("profiles.item.integration", {
+                          name:
+                            integrationNames.get(p.agentIntegrationId) ??
+                            p.agentIntegrationId,
+                        })}
                       </span>
                     ) : null}
                     {p.workloadKind === WorkloadKind.DEV_SESSION ? (
                       <span className="muted">
-                        Workspace: <code>{p.workspacePath}</code>
+                        {rich("profiles.item.workspace", {
+                          path: <code>{p.workspacePath}</code>,
+                        })}
                       </span>
                     ) : null}
                   </div>
@@ -179,14 +213,14 @@ export function ProfilesPage() {
                         size={ButtonSize.Small}
                         onClick={() => setEditing(p)}
                       >
-                        Edit
+                        {t("profiles.edit")}
                       </Button>
                       <Button
                         variant={ButtonVariant.Danger}
                         size={ButtonSize.Small}
                         onClick={() => setDeleting(p)}
                       >
-                        Delete
+                        {t("common.delete")}
                       </Button>
                     </div>
                   ) : null}
@@ -206,9 +240,13 @@ export function ProfilesPage() {
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
-        title={`Delete ${deleting?.name ?? "this profile"}?`}
-        description="Its queued requests end with Canceled, and its warm runners and runners that wait for work are deleted. Busy runners finish their work. This cannot be undone."
-        confirmLabel="Delete profile"
+        title={
+          deleting === undefined
+            ? t("profiles.deleteDialog.titleUnnamed")
+            : t("profiles.deleteDialog.title", { name: deleting.name })
+        }
+        description={t("profiles.deleteDialog.description")}
+        confirmLabel={t("profiles.deleteDialog.confirm")}
         onConfirm={() =>
           remove.mutateAsync({
             organizationId,
@@ -230,6 +268,7 @@ function ProfileDialog({
   agentIntegrations: ReturnType<typeof useAgentIntegrations>;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const initial = useMemo(
@@ -299,13 +338,19 @@ function ProfileDialog({
       open
       wide
       onOpenChange={(open) => !open && onClose()}
-      title={creating ? "Create a runner profile" : `Edit ${profile.name}`}
+      title={
+        creating
+          ? t("profiles.dialog.createTitle")
+          : t("profiles.dialog.editTitle", { name: profile.name })
+      }
       description={
         creating
-          ? "The workload kind and the agent integration cannot change later."
-          : "Changes apply to runners that start after the change."
+          ? t("profiles.dialog.createDescription")
+          : t("profiles.dialog.editDescription")
       }
-      submitLabel={creating ? "Create profile" : "Save changes"}
+      submitLabel={
+        creating ? t("profiles.dialog.createSubmit") : t("common.saveChanges")
+      }
       submitDisabled={
         agentSession &&
         (query.isPending ||
@@ -314,7 +359,7 @@ function ProfileDialog({
           guestOsUnavailable)
       }
       onSubmit={async (opening) => {
-        const found = profileErrors(values, vendor);
+        const found = profileErrors(values, vendor, t);
         if (Object.keys(found).length > 0) {
           setErrors(found);
           return;
@@ -339,8 +384,10 @@ function ProfileDialog({
       }}
     >
       <TextField
-        label="Name"
-        description="Lowercase kebab-case. A GitHub job profile gets the runs-on label sandrun-<name>."
+        label={t("profiles.dialog.name")}
+        description={t("profiles.dialog.nameDescription", {
+          label: "sandrun-<name>",
+        })}
         value={values.name}
         onValueChange={(v) => set("name", v)}
         error={errors.name}
@@ -350,7 +397,7 @@ function ProfileDialog({
       />
       <div className="field-row">
         <Select
-          label="Workload kind"
+          label={t("profiles.dialog.workloadKind")}
           value={String(values.workloadKind)}
           onValueChange={(v) =>
             v &&
@@ -363,41 +410,48 @@ function ProfileDialog({
         >
           {KINDS.map((k) => (
             <SelectOption key={k} value={String(k)}>
-              {labels.workloadKind[k]}
+              {t(labels.workloadKind[k])}
             </SelectOption>
           ))}
         </Select>
         <Select
-          label="Guest OS"
+          label={t("common.column.guestOs")}
           value={
             guestOsOptions.includes(values.guestOs)
               ? String(values.guestOs)
               : null
           }
-          placeholder={guestOsUnavailable ? "Unavailable" : "Select a guest OS"}
+          placeholder={
+            guestOsUnavailable
+              ? t("profiles.dialog.guestOsUnavailable")
+              : t("profiles.dialog.guestOsPlaceholder")
+          }
           onValueChange={(v) => v && set("guestOs", Number(v) as GuestOs)}
           disabled={guestOsUnavailable}
           description={
-            guestOsUnavailable ? CODEX_GUEST_OS_UNAVAILABLE : undefined
+            guestOsUnavailable ? t(CODEX_GUEST_OS_UNAVAILABLE) : undefined
           }
           error={errors.guestOs}
         >
           {guestOsOptions.map((g) => (
             <SelectOption key={g} value={String(g)}>
-              {labels.guestOs[g]}
+              {guestOsName(g, t)}
             </SelectOption>
           ))}
         </Select>
       </div>
       {agentSession ? (
-        <QueryBoundary query={query} loading="Loading agent integrations">
+        <QueryBoundary
+          query={query}
+          loading={t("profiles.loadingIntegrations")}
+        >
           {() => (
             <>
               {isLoadingMore ? (
-                <Loading label="Loading agent integrations" />
+                <Loading label={t("profiles.loadingIntegrations")} />
               ) : null}
               <Select
-                label="Agent integration"
+                label={t("profiles.dialog.agentIntegration")}
                 value={
                   values.agentIntegrationId === ""
                     ? null
@@ -414,7 +468,10 @@ function ProfileDialog({
                     key={i.agentIntegrationId}
                     value={i.agentIntegrationId}
                   >
-                    {`${i.name} (${labels.vendor[i.vendor]})`}
+                    {t("profiles.integrationName", {
+                      name: i.name,
+                      vendor: vendorName(i.vendor, t),
+                    })}
                   </SelectOption>
                 ))}
               </Select>
@@ -424,8 +481,8 @@ function ProfileDialog({
       ) : null}
       {values.workloadKind === WorkloadKind.DEV_SESSION ? (
         <TextField
-          label="Workspace path"
-          description="Required for dev sessions: an absolute guest path. Sync writes into it, and commands start in it."
+          label={t("profiles.dialog.workspacePath")}
+          description={t("profiles.dialog.workspacePathDescription")}
           value={values.workspacePath}
           onValueChange={(v) => set("workspacePath", v)}
           error={errors.workspacePath}
@@ -438,20 +495,20 @@ function ProfileDialog({
       ) : null}
       <div className="field-row">
         <Select
-          label="Source"
+          label={t("profiles.dialog.source")}
           value={values.sourceKind}
           onValueChange={(v) => v && set("sourceKind", v as SourceKind)}
         >
           <SelectOption value={SourceKind.BaseImage}>
-            OwnSand base image of the guest OS
+            {t("profiles.dialog.sourceBaseImage")}
           </SelectOption>
           <SelectOption value={SourceKind.Template}>
-            OwnSand template
+            {t("profiles.dialog.sourceTemplate")}
           </SelectOption>
         </Select>
         {values.sourceKind === SourceKind.Template ? (
           <TextField
-            label="Template ID"
+            label={t("profiles.dialog.templateId")}
             value={values.templateId}
             onValueChange={(v) => set("templateId", v)}
             error={errors.templateId}
@@ -463,7 +520,7 @@ function ProfileDialog({
         {RESOURCE_FIELDS.map(([field, label]) => (
           <TextField
             key={field}
-            label={label}
+            label={t(label)}
             type="number"
             inputMode="decimal"
             step="any"
@@ -480,7 +537,7 @@ function ProfileDialog({
         {DURATION_FIELDS.map(([field, label]) => (
           <TextField
             key={field}
-            label={label}
+            label={t(label)}
             type="number"
             inputMode="decimal"
             step="any"
@@ -495,7 +552,7 @@ function ProfileDialog({
       </div>
       <div className="field-row">
         <Select
-          label="Priority"
+          label={t("common.column.priority")}
           value={String(values.priority)}
           onValueChange={(v) => v && set("priority", Number(v) as Priority)}
         >
@@ -503,18 +560,20 @@ function ProfileDialog({
             // Only CreateRunnerProfile resolves UNSPECIFIED to the default
             // of the workload kind; UpdateRunnerProfile requires a priority.
             <SelectOption value={String(Priority.UNSPECIFIED)}>
-              Default of the workload kind
+              {t("profiles.dialog.priorityDefault")}
             </SelectOption>
           ) : null}
           {PRIORITIES.map((p) => (
             <SelectOption key={p} value={String(p)}>
-              {labels.priority[p]}
+              {t(labels.priority[p])}
             </SelectOption>
           ))}
         </Select>
         <NumberInput
-          label="Warm count"
-          description="Running sandboxes that wait for a request."
+          label={t("profiles.dialog.warmCount")}
+          description={t("profiles.dialog.warmCountDescription")}
+          decrementLabel={t("common.decrease")}
+          incrementLabel={t("common.increase")}
           value={values.warmCount}
           onValueChange={(v) => set("warmCount", v)}
           min={0}
@@ -523,7 +582,9 @@ function ProfileDialog({
         />
       </div>
       <p className="muted">
-        Network: {labels.networkMode[NetworkMode.OUTBOUND]}.
+        {t("profiles.dialog.network", {
+          mode: t(labels.networkMode[NetworkMode.OUTBOUND]),
+        })}
       </p>
     </FormDialog>
   );

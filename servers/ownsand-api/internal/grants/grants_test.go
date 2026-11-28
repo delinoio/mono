@@ -428,27 +428,49 @@ func TestReplacesOfConcurrentRelease(t *testing.T) {
 // deadline plus the delivery margin, or the acknowledgement plus the sent
 // stream deadline duration when that is later.
 func TestRevocableUntil(t *testing.T) {
-	c := &clock{t: time.Unix(1000, 0)}
-	r := New(c.now)
-	g, _, err := r.Reserve(req("a1", "u", "op"), newID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	start := c.t
-	if got, want := g.RevocableUntil(), start.Add(StreamDeadline+DeliveryMargin); !got.Equal(want) {
-		t.Fatalf("pending grant revocable until %v, want %v", got, want)
-	}
-	// A late acknowledgement extends the end past the margin.
-	c.t = start.Add(2 * time.Minute)
-	r.Ack(g.ID, accepted, "")
-	if got, want := r.Get(g.ID).RevocableUntil(), start.Add(2*time.Minute+StreamDeadline); !got.Equal(want) {
-		t.Fatalf("acknowledged grant revocable until %v, want %v", got, want)
-	}
-	// The registry stops matching the grant exactly at that end.
-	c.t = start.Add(2*time.Minute + StreamDeadline - time.Second)
-	cp := r.RemoveMatching(func(*Grant) bool { return true })
-	if len(cp) != 1 || !cp[0].RevocableUntil().Equal(start.Add(2*time.Minute+StreamDeadline)) {
-		t.Fatalf("RemoveMatching before the end returned %v", cp)
+	start := time.Unix(1000, 0)
+	ackTime := start.Add(2 * time.Minute)
+	cutoff := ackTime.Add(StreamDeadline)
+	for _, tc := range []struct {
+		name        string
+		removeAt    time.Time
+		wantMatches int
+	}{
+		{name: "before cutoff", removeAt: cutoff.Add(-time.Second), wantMatches: 1},
+		{name: "at cutoff", removeAt: cutoff, wantMatches: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &clock{t: start}
+			r := New(c.now)
+			g, _, err := r.Reserve(req("a1", "u", "op"), newID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := g.RevocableUntil(), start.Add(StreamDeadline+DeliveryMargin); !got.Equal(want) {
+				t.Fatalf("pending grant revocable until %v, want %v", got, want)
+			}
+
+			c.t = ackTime
+			r.Ack(g.ID, accepted, "")
+			c.t = tc.removeAt
+			registered := r.Get(g.ID)
+			if registered == nil || registered.ID != g.ID || registered.State != Installed {
+				t.Fatalf("expected installed grant %q in the registry before RemoveMatching, got %v", g.ID, registered)
+			}
+			if got := registered.RevocableUntil(); !got.Equal(cutoff) {
+				t.Fatalf("acknowledged grant revocable until %v, want %v", got, cutoff)
+			}
+
+			matches := r.RemoveMatching(func(*Grant) bool { return true })
+			if len(matches) != tc.wantMatches {
+				t.Fatalf("RemoveMatching returned %d matches, want %d", len(matches), tc.wantMatches)
+			}
+			for _, match := range matches {
+				if match.ID != g.ID || !match.RevocableUntil().Equal(cutoff) {
+					t.Fatalf("RemoveMatching returned grant %q revocable until %v, want grant %q revocable until %v", match.ID, match.RevocableUntil(), g.ID, cutoff)
+				}
+			}
+		})
 	}
 }
 

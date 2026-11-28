@@ -450,69 +450,105 @@ func TestPaginationRepeatedStartingToken(t *testing.T) {
 }
 
 func TestWatchQueueReconnects(t *testing.T) {
+	const timeout = 5 * time.Second
 	c, srv, org := newTestClient(t, "")
 	srv.AddRequest(&sandrunv1.Request{RequestId: "r1", OrganizationId: org, State: sandrunv1.RequestState_REQUEST_STATE_QUEUED})
 	srv.WatchEventLimit = 2 // the request and the snapshot end
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var kinds []QueueEventKind
-	err := c.WatchQueue(ctx, org, func(ev QueueEvent) error {
-		kinds = append(kinds, ev.Kind)
-		if ev.Kind == QueueEventGap && ev.Err != nil {
-			t.Errorf("gap after a normal end has error %v", ev.Err)
-		}
-		if len(kinds) >= 8 {
-			return errors.New("stop")
-		}
-		return nil
-	})
-	if err == nil || err.Error() != "stop" {
-		t.Fatalf("WatchQueue = %v, want the handler error", err)
-	}
-	want := []QueueEventKind{QueueEventRequest, QueueEventSnapshotComplete, QueueEventGap, QueueEventRequest, QueueEventSnapshotComplete, QueueEventGap, QueueEventRequest, QueueEventSnapshotComplete}
-	if fmt.Sprint(kinds) != fmt.Sprint(want) {
-		t.Fatalf("events = %v, want %v", kinds, want)
-	}
 
-	// A transient failure is retried with a gap that carries the error; a
-	// terminal one ends the watch.
-	srv.Fail("/delino.sandrun.v1.WorkService/WatchQueue", connect.NewError(connect.CodeUnavailable, errors.New("restart")))
-	var gapErr error
-	_ = c.WatchQueue(ctx, org, func(ev QueueEvent) error {
-		if ev.Kind == QueueEventGap && gapErr == nil {
-			gapErr = ev.Err
+	t.Run("clean_end", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		stop := errors.New("stop after clean ends")
+		want := []QueueEventKind{
+			QueueEventRequest, QueueEventSnapshotComplete, QueueEventGap,
+			QueueEventRequest, QueueEventSnapshotComplete, QueueEventGap,
+			QueueEventRequest, QueueEventSnapshotComplete,
 		}
-		if ev.Kind == QueueEventSnapshotComplete {
-			return errors.New("stop")
+		var kinds []QueueEventKind
+		err := c.WatchQueue(ctx, org, func(ev QueueEvent) error {
+			kinds = append(kinds, ev.Kind)
+			if ev.Kind == QueueEventGap && ev.Err != nil {
+				t.Errorf("gap after a normal end has error %v", ev.Err)
+			}
+			if len(kinds) == len(want) {
+				return stop
+			}
+			return nil
+		})
+		if err != stop {
+			t.Fatalf("WatchQueue = %v, want the handler error", err)
 		}
-		return nil
+		if !slices.Equal(kinds, want) {
+			t.Fatalf("events = %v, want %v", kinds, want)
+		}
 	})
-	if connect.CodeOf(gapErr) != connect.CodeUnavailable {
-		t.Fatalf("gap error = %v", gapErr)
-	}
-	err = c.WatchQueue(ctx, "missing-org", func(QueueEvent) error { return nil })
-	if connect.CodeOf(err) != connect.CodeNotFound {
-		t.Fatalf("terminal watch error = %v", err)
-	}
+
+	t.Run("transient_error", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		stop := errors.New("stop after retry snapshot")
+		srv.Fail(sandrunv1connect.WorkServiceWatchQueueProcedure, connect.NewError(connect.CodeUnavailable, errors.New("restart")))
+		var kinds []QueueEventKind
+		err := c.WatchQueue(ctx, org, func(ev QueueEvent) error {
+			kinds = append(kinds, ev.Kind)
+			switch ev.Kind {
+			case QueueEventGap:
+				if connect.CodeOf(ev.Err) != connect.CodeUnavailable {
+					t.Errorf("gap error = %v, want code %v", ev.Err, connect.CodeUnavailable)
+				}
+			case QueueEventRequest:
+				if id := ev.Request.GetRequestId(); id != "r1" {
+					t.Errorf("request ID = %q, want r1", id)
+				}
+			case QueueEventSnapshotComplete:
+				return stop
+			}
+			return nil
+		})
+		want := []QueueEventKind{QueueEventGap, QueueEventRequest, QueueEventSnapshotComplete}
+		if !slices.Equal(kinds, want) {
+			t.Errorf("events = %v, want %v", kinds, want)
+		}
+		if err != stop {
+			t.Errorf("WatchQueue = %v, want the snapshot handler's sentinel error", err)
+		}
+	})
+
+	t.Run("terminal_error", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		err := c.WatchQueue(ctx, "missing-org", func(QueueEvent) error { return nil })
+		if connect.CodeOf(err) != connect.CodeNotFound {
+			t.Fatalf("terminal watch error = %v, want code %v", err, connect.CodeNotFound)
+		}
+	})
 }
 
 func TestBackoffBounds(t *testing.T) {
-	b := backoff{min: time.Second, max: 30 * time.Second}
-	prev := time.Duration(0)
+	const initial = time.Second
+	const capped = 30 * time.Second
+	b := backoff{min: initial, max: capped}
+	nominalDelays := []time.Duration{
+		initial,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		capped,
+	}
+	checkDelay := func(call string, got, nominal time.Duration) {
+		t.Helper()
+		lower := nominal - nominal/5
+		if got < lower || got > nominal {
+			t.Fatalf("%s: delay = %v, want [%v, %v]", call, got, lower, nominal)
+		}
+	}
 	for i := range 10 {
-		d := b.next()
-		if d > 30*time.Second || d < 800*time.Millisecond {
-			t.Fatalf("delay %d = %v out of bounds", i, d)
-		}
-		if i < 4 && d < prev {
-			t.Fatalf("delay %d = %v below %v", i, d, prev)
-		}
-		prev = d
+		nominal := nominalDelays[min(i, len(nominalDelays)-1)]
+		checkDelay(fmt.Sprintf("call %d", i+1), b.next(), nominal)
 	}
 	b.reset()
-	if d := b.next(); d > time.Second {
-		t.Fatalf("after reset %v", d)
-	}
+	checkDelay("after reset", b.next(), initial)
 }
 
 func TestWaitDevSession(t *testing.T) {

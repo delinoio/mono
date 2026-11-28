@@ -31,6 +31,7 @@ import {
 } from "../components/ui.tsx";
 import { ownsandDevicesUrl } from "../config.ts";
 import { formatSpan, labels, queueWaitMs } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import {
   applyQueueEvent,
   initialQueueView,
@@ -49,12 +50,12 @@ const RUNNER_ORDER = [
   RunnerState.DELETING,
 ];
 
-const LIVE_TEXT: Record<LiveState, string> = {
-  [LiveState.Connecting]: "Connecting",
-  [LiveState.Live]: "Live",
-  [LiveState.Reconnecting]: "Reconnecting",
-  [LiveState.Disconnected]: "Disconnected",
-};
+const LIVE_TEXT = {
+  [LiveState.Connecting]: "overview.live.connecting",
+  [LiveState.Live]: "overview.live.live",
+  [LiveState.Reconnecting]: "overview.live.reconnecting",
+  [LiveState.Disconnected]: "overview.live.disconnected",
+} as const satisfies Record<LiveState, MessageKey>;
 
 /** How often the waiting time of queued requests is redrawn. */
 const CLOCK_TICK_MS = 15_000;
@@ -64,6 +65,8 @@ const CLOCK_TICK_MS = 15_000;
  * SDK helper), runners by state and the device pool from `GetCapacity`.
  */
 export function OverviewPage() {
+  const i18n = useI18n();
+  const { t, plural } = i18n;
   const { organizationId } = useOrg();
   const transport = useTransport();
   const [view, dispatch] = useReducer(
@@ -121,12 +124,16 @@ export function OverviewPage() {
   return (
     <>
       <PageHeader
-        title="Overview"
-        description="The queue of every workload kind, the runners and the device pool of the linked OwnSand organization."
+        title={t("overview.title")}
+        description={t("overview.description")}
         action={
-          <span className="live" role="status" aria-label="Queue updates">
+          <span
+            className="live"
+            role="status"
+            aria-label={t("overview.live.label")}
+          >
             <StateBadge
-              text={LIVE_TEXT[view.live]}
+              text={t(LIVE_TEXT[view.live])}
               tone={
                 view.live === LiveState.Live
                   ? BadgeVariant.Accent
@@ -147,31 +154,30 @@ export function OverviewPage() {
         />
       ) : null}
       <section className="section" aria-labelledby="queue-title">
-        <h2 id="queue-title">Waiting requests</h2>
+        <h2 id="queue-title">{t("overview.queue.title")}</h2>
         <RunnerProfileNotice query={profiles} />
         {view.live === LiveState.Connecting ? (
-          <Loading label="Loading the queue" />
+          <Loading label={t("overview.queue.loading")} />
         ) : !view.hasSnapshot ? null : waiting.length === 0 ? (
-          <Empty title="No request is waiting">
-            New GitHub jobs, agent sessions and dev sessions appear here in
-            queue order.
+          <Empty title={t("overview.queue.empty.title")}>
+            {t("overview.queue.empty.description")}
           </Empty>
         ) : (
           <div
             className="table-wrap"
             role="region"
-            aria-label="Waiting requests table"
+            aria-label={t("overview.queue.tableRegion")}
             tabIndex={0}
           >
-            <table className="table" aria-label="Waiting requests">
+            <table className="table" aria-label={t("overview.queue.title")}>
               <thead>
                 <tr>
-                  <th scope="col">Position</th>
-                  <th scope="col">Request</th>
-                  <th scope="col">Kind</th>
-                  <th scope="col">Profile</th>
-                  <th scope="col">Priority</th>
-                  <th scope="col">Waiting</th>
+                  <th scope="col">{t("overview.queue.column.position")}</th>
+                  <th scope="col">{t("common.column.request")}</th>
+                  <th scope="col">{t("common.column.kind")}</th>
+                  <th scope="col">{t("common.column.profile")}</th>
+                  <th scope="col">{t("common.column.priority")}</th>
+                  <th scope="col">{t("overview.queue.column.waiting")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -181,14 +187,14 @@ export function OverviewPage() {
                     <td>
                       <ShortId id={r.requestId} />
                     </td>
-                    <td>{labels.workloadKind[r.kind]}</td>
+                    <td>{t(labels.workloadKind[r.kind])}</td>
                     <td>
                       {profileNames?.get(r.runnerProfileId) ?? (
                         <ShortId id={r.runnerProfileId} />
                       )}
                     </td>
-                    <td>{labels.priority[r.priority]}</td>
-                    <td>{formatSpan(queueWaitMs(r, now) ?? 0)}</td>
+                    <td>{t(labels.priority[r.priority])}</td>
+                    <td>{formatSpan(queueWaitMs(r, now) ?? 0, i18n)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -197,21 +203,19 @@ export function OverviewPage() {
         )}
         {view.hasSnapshot && running.length > 0 ? (
           <p className="muted">
-            {running.length}{" "}
-            {running.length === 1 ? "request is" : "requests are"} starting or
-            running.
+            {plural("overview.queue.running", running.length)}
           </p>
         ) : null}
       </section>
       <section className="section" aria-labelledby="runners-title">
-        <h2 id="runners-title">Runners by state</h2>
+        <h2 id="runners-title">{t("overview.runners.title")}</h2>
         {view.live === LiveState.Connecting ? (
-          <Loading label="Loading the runners" />
+          <Loading label={t("overview.runners.loading")} />
         ) : view.hasSnapshot ? (
           <dl className="details details-flat">
             {runnersByState.map(({ state, runners }) => (
               <div className="detail" key={state}>
-                <dt>{labels.runnerState[state]}</dt>
+                <dt>{t(labels.runnerState[state])}</dt>
                 <dd>{runners.length}</dd>
               </div>
             ))}
@@ -219,10 +223,9 @@ export function OverviewPage() {
         ) : null}
       </section>
       <section className="section" aria-labelledby="devices-title">
-        <h2 id="devices-title">Device pool</h2>
+        <h2 id="devices-title">{t("overview.devices.title")}</h2>
         <p className="muted">
-          Devices, their limits and the vCPU overcommit are managed in the
-          OwnSand console.
+          {t("overview.devices.description")}
           {link.data?.link !== undefined ? (
             <>
               {" "}
@@ -231,26 +234,26 @@ export function OverviewPage() {
                 target="_blank"
                 rel="noreferrer"
               >
-                Manage devices in OwnSand
+                {t("overview.devices.manage")}
               </a>
             </>
           ) : null}
         </p>
         <QueryBoundary
           query={link}
-          loading="Loading the device pool"
-          errorTitle="Could not load the OwnSand link."
+          loading={t("overview.devices.loading")}
+          errorTitle={t("overview.devices.linkLoadFailed")}
         >
           {({ link: ownSandLink }) =>
             ownSandLink?.state === OwnSandLinkState.ACTIVE ? (
               <DeviceCapacityTable organizationId={organizationId} />
             ) : (
-              <Empty title="OwnSand link required">
+              <Empty title={t("overview.devices.linkRequired.title")}>
                 {ownSandLink === undefined
-                  ? "An admin must link an OwnSand organization to show its devices."
-                  : "An admin must replace the OwnSand API key to show its devices."}{" "}
+                  ? t("overview.devices.linkRequired.missing")
+                  : t("overview.devices.linkRequired.invalid")}{" "}
                 <Link to={orgPath(RouteId.Integrations, organizationId)}>
-                  Go to integrations
+                  {t("common.goToIntegrations")}
                 </Link>
               </Empty>
             )
@@ -262,32 +265,32 @@ export function OverviewPage() {
 }
 
 function DeviceCapacityTable({ organizationId }: { organizationId: string }) {
+  const { t } = useI18n();
   const capacity = useQuery(WorkService.method.getCapacity, { organizationId });
   return (
-    <QueryBoundary query={capacity} loading="Loading the device pool">
+    <QueryBoundary query={capacity} loading={t("overview.devices.loading")}>
       {(data) =>
         data.devices.length === 0 ? (
-          <Empty title="No devices">
-            Link an OwnSand organization with devices, or enroll a device in the
-            OwnSand console.
+          <Empty title={t("overview.devices.empty.title")}>
+            {t("overview.devices.empty.description")}
           </Empty>
         ) : (
           <div
             className="table-wrap"
             role="region"
-            aria-label="Devices table"
+            aria-label={t("overview.devices.tableRegion")}
             tabIndex={0}
           >
-            <table className="table" aria-label="Devices">
+            <table className="table" aria-label={t("overview.devices.table")}>
               <thead>
                 <tr>
-                  <th scope="col">Device</th>
-                  <th scope="col">State</th>
-                  <th scope="col">Platform</th>
-                  <th scope="col">vCPUs</th>
-                  <th scope="col">Memory</th>
-                  <th scope="col">Disk</th>
-                  <th scope="col">SandRun runners</th>
+                  <th scope="col">{t("common.column.device")}</th>
+                  <th scope="col">{t("common.column.state")}</th>
+                  <th scope="col">{t("overview.devices.column.platform")}</th>
+                  <th scope="col">{t("overview.devices.column.vcpus")}</th>
+                  <th scope="col">{t("overview.devices.column.memory")}</th>
+                  <th scope="col">{t("overview.devices.column.disk")}</th>
+                  <th scope="col">{t("overview.devices.column.runners")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -304,13 +307,14 @@ function DeviceCapacityTable({ organizationId }: { organizationId: string }) {
 }
 
 function DeviceRow({ device: d }: { device: DeviceCapacity }) {
+  const { lang, t } = useI18n();
   const runners = d.runners.reduce((sum, r) => sum + r.count, 0);
   return (
     <tr>
       <td>{d.name || <ShortId id={d.ownsandDeviceId} />}</td>
       <td>
         <StateBadge
-          text={labels.deviceState[d.state]}
+          text={t(labels.deviceState[d.state])}
           tone={
             d.state === DeviceState.ONLINE
               ? BadgeVariant.Accent
@@ -322,34 +326,52 @@ function DeviceRow({ device: d }: { device: DeviceCapacity }) {
         {d.hostOs} · {d.arch}
       </td>
       <td>
-        {String(d.allocation?.vcpuCount ?? 0n)} of{" "}
-        {String(d.effectiveVcpuLimit)}
+        {t("overview.devices.vcpuUsage", {
+          used: String(d.allocation?.vcpuCount ?? 0n),
+          limit: String(d.effectiveVcpuLimit),
+        })}
         {d.limits !== undefined && d.limits.vcpuOvercommitPercent !== 100 ? (
           <span className="muted">
             {" "}
-            ({d.limits.vcpuCount} × {d.limits.vcpuOvercommitPercent}%)
+            {t("overview.devices.overcommit", {
+              vcpus: d.limits.vcpuCount,
+              percent: d.limits.vcpuOvercommitPercent,
+            })}
           </span>
         ) : null}
       </td>
       <td>
-        {String(d.allocation?.memoryMib ?? 0n)} of{" "}
-        {String(d.limits?.memoryMib ?? 0n)} MiB
+        {t("overview.devices.memoryUsage", {
+          used: String(d.allocation?.memoryMib ?? 0n),
+          limit: String(d.limits?.memoryMib ?? 0n),
+        })}
       </td>
       <td>
-        {String(d.allocation?.diskGib ?? 0n)} of{" "}
-        {String(d.limits?.diskGib ?? 0n)} GiB
+        {t("overview.devices.diskUsage", {
+          used: String(d.allocation?.diskGib ?? 0n),
+          limit: String(d.limits?.diskGib ?? 0n),
+        })}
       </td>
       <td>
         {runners}
         {d.runners.length > 0 ? (
           <span className="muted">
             {" "}
-            (
-            {d.runners
-              .filter((r) => r.count > 0)
-              .map((r) => `${labels.runnerState[r.state]} ${r.count}`)
-              .join(", ")}
-            )
+            {t("overview.devices.runnerBreakdown", {
+              runners: new Intl.ListFormat(lang, {
+                type: "unit",
+                style: "short",
+              }).format(
+                d.runners
+                  .filter((r) => r.count > 0)
+                  .map((r) =>
+                    t("overview.devices.runnerCount", {
+                      state: t(labels.runnerState[r.state]),
+                      count: r.count,
+                    }),
+                  ),
+              ),
+            })}
           </span>
         ) : null}
       </td>

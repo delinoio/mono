@@ -20,6 +20,7 @@ import {
   ConfirmDialog,
   Empty,
   FormDialog,
+  ListNoun,
   MorePagesNotice,
   PageHeader,
   QueryBoundary,
@@ -28,6 +29,7 @@ import {
   isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import {
   FOLLOW_ALL_PAGES_OPTIONS,
   boundaryOf,
@@ -36,6 +38,7 @@ import {
   useFollowAllPages,
 } from "../pagination.ts";
 import { repeatedPrefixes } from "../revocation.ts";
+import { enumText } from "../text.ts";
 
 /** Token lifetimes that the console offers; the maximum is 24 hours. */
 const TTL_HOURS = [1, 6, 12, 24] as const;
@@ -43,6 +46,8 @@ const TTL_HOURS = [1, 6, 12, 24] as const;
 /** Route `enrollment-tokens`: create, list and revoke enrollment tokens. */
 export function EnrollmentTokensPage() {
   const { organizationId } = useOrg();
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const queryClient = useQueryClient();
   const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, DeviceService);
@@ -111,21 +116,25 @@ export function EnrollmentTokensPage() {
   return (
     <>
       <PageHeader
-        title="Enrollment tokens"
-        description="A token adds exactly one device to this organization. It works once and expires within 24 hours."
-        action={<Button onClick={() => setCreating(true)}>Create token</Button>}
+        title={t("enrollmentTokens.title")}
+        description={t("enrollmentTokens.description")}
+        action={
+          <Button onClick={() => setCreating(true)}>
+            {t("enrollmentTokens.create")}
+          </Button>
+        }
       />
       <QueryBoundary
         query={boundaryOf(list, pages)}
-        loading="Loading enrollment tokens"
+        loading={t("enrollmentTokens.loading")}
       >
         {() =>
           tokens.length === 0 && !pages.isIncomplete ? (
-            <Empty title="No enrollment tokens" />
+            <Empty title={t("enrollmentTokens.empty")} />
           ) : (
             <>
               {tokens.length > 0 ? (
-                <ul className="list" aria-label="Enrollment tokens">
+                <ul className="list" aria-label={t("enrollmentTokens.list")}>
                   {tokens.map((t) => {
                     const pending = t.state === EnrollmentTokenState.PENDING;
                     const showId = pending && collisions.has(t.tokenPrefix);
@@ -133,22 +142,30 @@ export function EnrollmentTokensPage() {
                       <li key={t.enrollmentTokenId} className="list-row">
                         <div className="list-main">
                           <span className="list-title">
-                            <code>{t.tokenPrefix}…</code> ·{" "}
-                            {labels.tokenState[t.state]}
+                            {i18n.rich("enrollmentTokens.rowTitle", {
+                              prefix: <code>{t.tokenPrefix}…</code>,
+                              state: enumText(i18n, labels.tokenState, t.state),
+                            })}
                           </span>
                           <span className="muted">
-                            Created {formatTime(t.createTime)} · expires{" "}
-                            {formatTime(t.expireTime)}
+                            {i18n.t("enrollmentTokens.rowTimes", {
+                              created: formatTime(t.createTime, lang),
+                              expires: formatTime(t.expireTime, lang),
+                            })}
                             {t.deviceId ? (
                               <>
                                 {" "}
-                                · device <ShortId id={t.deviceId} />
+                                {i18n.rich("enrollmentTokens.rowDevice", {
+                                  device: <ShortId id={t.deviceId} />,
+                                })}
                               </>
                             ) : null}
                           </span>
                           {showId ? (
                             <span className="muted list-record-id">
-                              ID <code>{t.enrollmentTokenId}</code>
+                              {i18n.rich("invitations.recordId", {
+                                id: <code>{t.enrollmentTokenId}</code>,
+                              })}
                             </span>
                           ) : null}
                         </div>
@@ -156,10 +173,19 @@ export function EnrollmentTokensPage() {
                           <Button
                             variant={ButtonVariant.Secondary}
                             size={ButtonSize.Small}
-                            aria-label={`Revoke enrollment token ${t.tokenPrefix}${showId ? ` (${t.enrollmentTokenId})` : ""}`}
+                            aria-label={
+                              showId
+                                ? i18n.t("enrollmentTokens.revokeNamedWithId", {
+                                    prefix: t.tokenPrefix,
+                                    id: t.enrollmentTokenId,
+                                  })
+                                : i18n.t("enrollmentTokens.revokeNamed", {
+                                    prefix: t.tokenPrefix,
+                                  })
+                            }
                             onClick={() => setRevoking(t)}
                           >
-                            Revoke
+                            {i18n.t("enrollmentTokens.revoke")}
                           </Button>
                         ) : null}
                       </li>
@@ -167,7 +193,7 @@ export function EnrollmentTokensPage() {
                   })}
                 </ul>
               ) : null}
-              <MorePagesNotice noun="enrollment tokens" pages={pages} />
+              <MorePagesNotice noun={ListNoun.EnrollmentTokens} pages={pages} />
             </>
           )
         }
@@ -175,23 +201,25 @@ export function EnrollmentTokensPage() {
       <ConfirmDialog
         open={revoking !== undefined}
         onOpenChange={(open) => !open && setRevoking(undefined)}
-        title={`Revoke token ${revoking ? `${revoking.tokenPrefix}…${revokingId}` : ""}?`}
-        description="The token stops working at once. It cannot be restored; create a new token instead."
-        confirmLabel="Revoke token"
+        title={t("enrollmentTokens.revokeDialog.title", {
+          token: revoking ? `${revoking.tokenPrefix}…${revokingId}` : "",
+        })}
+        description={t("enrollmentTokens.revokeDialog.description")}
+        confirmLabel={t("enrollmentTokens.revokeDialog.confirm")}
         onConfirm={async () => {
           if (!revoking) return;
           await revoke.mutateAsync({
             organizationId,
             enrollmentTokenId: revoking.enrollmentTokenId,
           });
-          toast.success("The token is revoked.");
+          toast.success(t("enrollmentTokens.revoked"));
         }}
       />
       <FormDialog
         open={creating}
         onOpenChange={setCreating}
-        title="Create an enrollment token"
-        submitLabel="Create token"
+        title={t("enrollmentTokens.createDialog.title")}
+        submitLabel={t("enrollmentTokens.create")}
         onSubmit={async (opening) => {
           const res = await create.mutateAsync({
             organizationId,
@@ -206,22 +234,24 @@ export function EnrollmentTokensPage() {
         }}
       >
         <Select
-          label="Expires after"
+          label={t("enrollmentTokens.createDialog.expiresAfter")}
           value={ttl}
           onValueChange={(v) => v && setTtl(v)}
         >
           {TTL_HOURS.map((h) => (
             <SelectOption key={h} value={String(h)}>
-              {h === 1 ? "1 hour" : `${h} hours`}
+              {i18n.plural("enrollmentTokens.createDialog.hours", h)}
             </SelectOption>
           ))}
         </Select>
       </FormDialog>
       <SecretDialog
-        title="Your new enrollment token"
-        label="Enrollment token"
+        title={t("enrollmentTokens.secret.title")}
+        label={t("enrollmentTokens.secret.label")}
         secret={token}
-        hint="On the device, run ownsand-agent enroll and paste the token on standard input. Do not pass it as a command-line argument."
+        hint={t("enrollmentTokens.secret.hint", {
+          command: "ownsand-agent enroll",
+        })}
         onClose={() => setToken(undefined)}
       />
     </>

@@ -19,6 +19,7 @@ import {
   ConfirmDialog,
   Empty,
   FormDialog,
+  ListNoun,
   MorePagesNotice,
   PageHeader,
   QueryBoundary,
@@ -26,6 +27,7 @@ import {
   isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import {
   FOLLOW_ALL_PAGES_OPTIONS,
   boundaryOf,
@@ -33,10 +35,13 @@ import {
   uniqueRows,
   useFollowAllPages,
 } from "../pagination.ts";
+import { enumText } from "../text.ts";
 
 /** Route `api-keys`: create, list and revoke organization API keys. */
 export function ApiKeysPage() {
   const { organizationId } = useOrg();
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const queryClient = useQueryClient();
   const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, ApiKeyService);
@@ -105,35 +110,51 @@ export function ApiKeysPage() {
   return (
     <>
       <PageHeader
-        title="API keys"
-        description="Programs such as CI jobs and AI agents use API keys to manage sandboxes. A key cannot read members."
+        title={t("apiKeys.title")}
+        description={t("apiKeys.description")}
         action={
-          <Button onClick={() => setCreating(true)}>Create API key</Button>
+          <Button onClick={() => setCreating(true)}>
+            {t("apiKeys.create")}
+          </Button>
         }
       />
-      <QueryBoundary query={boundaryOf(list, pages)} loading="Loading API keys">
+      <QueryBoundary
+        query={boundaryOf(list, pages)}
+        loading={t("apiKeys.loading")}
+      >
         {() =>
           apiKeys.length === 0 && !pages.isIncomplete ? (
-            <Empty title="No API keys" />
+            <Empty title={t("apiKeys.empty")} />
           ) : (
             <>
               {apiKeys.length > 0 ? (
-                <ul className="list" aria-label="API keys">
+                <ul className="list" aria-label={t("apiKeys.list")}>
                   {apiKeys.map((k) => {
                     const showId = collidingIds.has(k.apiKeyId);
                     return (
                       <li key={k.apiKeyId} className="list-row">
                         <div className="list-main">
                           <span className="list-title">
-                            {k.name} · {labels.apiKeyState[k.state]}
+                            {t("apiKeys.rowTitle", {
+                              name: k.name,
+                              state: enumText(
+                                i18n,
+                                labels.apiKeyState,
+                                k.state,
+                              ),
+                            })}
                           </span>
                           <span className="muted">
-                            <code>{k.keyPrefix}…</code> · created{" "}
-                            {formatTime(k.createTime)}
+                            {i18n.rich("apiKeys.rowDetails", {
+                              prefix: <code>{k.keyPrefix}…</code>,
+                              time: formatTime(k.createTime, lang),
+                            })}
                           </span>
                           {showId ? (
                             <span className="muted api-key-metadata">
-                              Key ID <code>{k.apiKeyId}</code>
+                              {i18n.rich("apiKeys.keyId", {
+                                id: <code>{k.apiKeyId}</code>,
+                              })}
                             </span>
                           ) : null}
                         </div>
@@ -141,10 +162,21 @@ export function ApiKeysPage() {
                           <Button
                             variant={ButtonVariant.Danger}
                             size={ButtonSize.Small}
-                            aria-label={`Revoke API key ${k.name} (${k.keyPrefix})${showId ? `, key ID ${k.apiKeyId}` : ""}`}
+                            aria-label={
+                              showId
+                                ? t("apiKeys.revokeNamedWithId", {
+                                    name: k.name,
+                                    prefix: k.keyPrefix,
+                                    id: k.apiKeyId,
+                                  })
+                                : t("apiKeys.revokeNamed", {
+                                    name: k.name,
+                                    prefix: k.keyPrefix,
+                                  })
+                            }
                             onClick={() => setRevoking(k)}
                           >
-                            Revoke
+                            {t("apiKeys.revoke")}
                           </Button>
                         ) : null}
                       </li>
@@ -152,7 +184,7 @@ export function ApiKeysPage() {
                   })}
                 </ul>
               ) : null}
-              <MorePagesNotice noun="API keys" pages={pages} />
+              <MorePagesNotice noun={ListNoun.ApiKeys} pages={pages} />
             </>
           )
         }
@@ -166,13 +198,11 @@ export function ApiKeysPage() {
             setNameError(undefined);
           }
         }}
-        title="Create an API key"
-        submitLabel="Create key"
+        title={t("apiKeys.createDialog.title")}
+        submitLabel={t("apiKeys.createDialog.submit")}
         onSubmit={async (opening) => {
           if (name.trim() === "") {
-            setNameError(
-              "Enter a name, for example the program that uses the key.",
-            );
+            setNameError(t("apiKeys.createDialog.nameRequired"));
             return;
           }
           const res = await create.mutateAsync({
@@ -189,8 +219,8 @@ export function ApiKeysPage() {
         }}
       >
         <TextField
-          label="Name"
-          description="Helps you recognize the key later."
+          label={t("apiKeys.createDialog.name")}
+          description={t("apiKeys.createDialog.nameDescription")}
           value={name}
           onValueChange={(v) => {
             setName(v);
@@ -202,35 +232,42 @@ export function ApiKeysPage() {
         />
       </FormDialog>
       <SecretDialog
-        title="Your new API key"
-        label="API key"
+        title={t("apiKeys.secret.title")}
+        label={t("apiKeys.secret.label")}
         secret={secret}
-        hint="Set it as OWNSAND_API_KEY for the SDK or the CLI."
+        hint={t("apiKeys.secret.hint", { variable: "OWNSAND_API_KEY" })}
         onClose={() => setSecret(undefined)}
       />
       <ConfirmDialog
         open={revoking !== undefined}
         onOpenChange={(open) => !open && setRevoking(undefined)}
-        title={`Revoke ${revoking?.name ?? "this key"}?`}
+        title={
+          revoking
+            ? t("apiKeys.revokeDialog.title", { name: revoking.name })
+            : t("apiKeys.revokeDialog.titleUnnamed")
+        }
         description={
           <>
             {revoking ? (
               <span className="api-key-metadata">
-                Prefix <code>{revoking.keyPrefix}</code>
+                {i18n.rich("apiKeys.prefix", {
+                  prefix: <code>{revoking.keyPrefix}</code>,
+                })}
                 {collidingIds.has(revoking.apiKeyId) ? (
                   <>
                     <br />
-                    Key ID <code>{revoking.apiKeyId}</code>
+                    {i18n.rich("apiKeys.keyId", {
+                      id: <code>{revoking.apiKeyId}</code>,
+                    })}
                   </>
                 ) : null}
                 <br />
               </span>
             ) : null}
-            Programs that use the key stop working at once. This cannot be
-            undone.
+            {t("apiKeys.revokeDialog.description")}
           </>
         }
-        confirmLabel="Revoke key"
+        confirmLabel={t("apiKeys.revokeDialog.confirm")}
         onConfirm={async () => {
           if (!revoking) return;
           await revoke.mutateAsync({

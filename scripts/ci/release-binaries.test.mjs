@@ -20,9 +20,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, matchesGlob } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { plan } from "./deploy-plan.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const script = join(root, "scripts/ci/release-binaries.sh");
@@ -1403,9 +1404,17 @@ test(
   },
 );
 
-// Writes the GitHub API answers for an annotated tag on a version commit
-// whose parent is `parent`.
-function tagApi(f, tag, { type = "tag", parent = sha } = {}) {
+// Writes the GitHub API answers for a tag ref and its target.
+function tagApi(
+  f,
+  tag,
+  {
+    type = "tag",
+    targetType = "commit",
+    targetSha = `${targetType}-${tag}`,
+    parent = sha,
+  } = {},
+) {
   const api = join(f.dir, "gh-api");
   const file = (path) => join(api, `${path.replaceAll("/", "_")}.json`);
   write(
@@ -1414,12 +1423,14 @@ function tagApi(f, tag, { type = "tag", parent = sha } = {}) {
   );
   write(
     file(`repos/owner/repo/git/tags/tagobj-${tag}`),
-    JSON.stringify({ object: { type: "commit", sha: `commit-${tag}` } }),
+    JSON.stringify({ object: { type: targetType, sha: targetSha } }),
   );
-  write(
-    file(`repos/owner/repo/commits/commit-${tag}`),
-    JSON.stringify({ parents: [{ sha: parent }] }),
-  );
+  if (targetType === "commit" && targetSha) {
+    write(
+      file(`repos/owner/repo/commits/${targetSha}`),
+      JSON.stringify({ parents: [{ sha: parent }] }),
+    );
+  }
 }
 
 function assembled(f) {
@@ -1755,6 +1766,47 @@ test(
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, message);
         assert.doesNotMatch(result.log, /gh release (create|upload)/);
+      });
+    }
+  },
+);
+
+test(
+  "github-releases rejects an annotated tag without a commit SHA",
+  { skip },
+  async (t) => {
+    const tag = "ownsand-agent@0.1.0";
+    for (const [label, target] of [
+      ["tree", { targetType: "tree" }],
+      ["blob", { targetType: "blob" }],
+      ["nested tag", { targetType: "tag" }],
+      ["empty commit SHA", { targetSha: "" }],
+    ]) {
+      await t.test(label, (t) => {
+        const f = fixture(t);
+        tagApi(f, tag, target);
+        if (target.targetType === "tree") {
+          // Model a commits endpoint that treats the empty SHA as a list request.
+          write(
+            join(f.dir, "gh-api/repos_owner_repo_commits_.json"),
+            JSON.stringify([{ sha: "abc", parents: [{ sha }] }]),
+          );
+        }
+        const result = f.run(
+          ["github-releases", assembled(f), prepared(f)],
+          {},
+          [agent],
+        );
+        assert.equal(result.status, 1, result.stderr);
+        assert.equal(
+          result.stderr.trimEnd(),
+          `::error::Tag ${tag} is not on the version commit of the deployed revision ${sha} (commit none, parent none).`,
+        );
+        assert.doesNotMatch(
+          result.log,
+          /^gh api repos\/owner\/repo\/commits\//m,
+        );
+        assert.doesNotMatch(result.log, releaseWrites);
       });
     }
   },
@@ -2101,16 +2153,144 @@ test(
   },
 );
 
-// The steps of the `publish-binaries` job of `deploy.yml`, as text.
-function publishSteps() {
+// The steps of a job in `deploy.yml`, as text.
+function deploySteps(name) {
   const workflow = readFileSync(
     join(root, ".github/workflows/deploy.yml"),
     "utf8",
   );
-  const job =
-    workflow.match(/^ {2}publish-binaries:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
+  const job = workflow
+    .split(/^ {2}(?=\S)/m)
+    .find((section) => section.startsWith(`${name}:\n`));
+  assert.ok(job, `expected workflow job ${name}`);
   return job.split(/^ {6}- /m).slice(1);
 }
+
+function publishSteps() {
+  return deploySteps("publish-binaries");
+}
+
+test(
+  "Darwin signing selects unsigned artifacts for the planned revision",
+  { skip: macSkip },
+  async (t) => {
+    const revision = "${{ needs.plan.outputs.sha }}";
+    const prefix = `binaries-unsigned-darwin-${revision}-`;
+    const artifactName = (job, producer) => {
+      const name = `${prefix}${producer}`;
+      assert.ok(
+        deploySteps(job).some(
+          (step) =>
+            step.startsWith("uses: actions/upload-artifact@") &&
+            step.includes(`\n          name: ${name}\n`),
+        ),
+        `expected ${job} to upload ${name}`,
+      );
+      return name;
+    };
+    const cross = artifactName("build-binaries", "cross");
+    const cgo = artifactName("build-macos-binaries", "cgo");
+    const download = deploySteps("sign-macos-binaries").find((step) =>
+      step.startsWith("uses: actions/download-artifact@"),
+    );
+    const pattern = `${prefix}*`;
+    assert.ok(download?.includes(`\n          pattern: ${pattern}\n`));
+    assert.ok(
+      download.includes("\n          path: ${{ runner.temp }}/unsigned\n"),
+    );
+    assert.ok(download.includes("\n          merge-multiple: true\n"));
+
+    const dir = "cmds/sandrun";
+    const manifest = JSON.parse(
+      readFileSync(join(root, dir, "package.json"), "utf8"),
+    );
+    const status = {
+      changesets: [
+        { id: "sandrun", releases: [{ name: manifest.name, type: "patch" }] },
+      ],
+      releases: [
+        {
+          name: manifest.name,
+          type: "patch",
+          newVersion: "0.0.1",
+          changesets: ["sandrun"],
+        },
+      ],
+    };
+    const crossPlan = plan(status, [{ dir, manifest }]).binaries;
+    manifest.deploy.cgoPlatforms = ["darwin-arm64"];
+    const mixedPlan = plan(status, [{ dir, manifest }]).binaries;
+    assert.deepEqual(crossPlan[0].cgoPlatforms, []);
+    assert.deepEqual(mixedPlan[0].cgoPlatforms, ["darwin-arm64"]);
+
+    const arm = "sandrun-cli/sandrun-darwin-arm64";
+    const amd = "sandrun-cli/sandrun-darwin-amd64";
+    const oldSha = "a".repeat(40);
+    const mixedFiles = { [arm]: "old cgo\n", [amd]: "old cross\n" };
+    const oldCgo = [cgo.replace(revision, oldSha), { [arm]: mixedFiles[arm] }];
+    const oldCross = [
+      cross.replace(revision, oldSha),
+      { [amd]: mixedFiles[amd] },
+    ];
+    const currentAmd = { [amd]: "current amd64\n" };
+    const currentFiles = { ...currentAmd, [arm]: "current arm64\n" };
+    const currentCrossName = cross.replace(revision, sha);
+    const currentCross = [currentCrossName, currentFiles];
+
+    for (const [label, plannedSha, binaries, artifacts, expected] of [
+      [
+        "old artifact listed first",
+        sha,
+        crossPlan,
+        [oldCgo, currentCross],
+        currentFiles,
+      ],
+      [
+        "old artifact listed last",
+        sha,
+        crossPlan,
+        [currentCross, oldCgo],
+        currentFiles,
+      ],
+      ["signing-only rerun", oldSha, mixedPlan, [oldCgo, oldCross], mixedFiles],
+      [
+        "missing current output",
+        sha,
+        crossPlan,
+        [oldCgo, [currentCrossName, currentAmd]],
+        null,
+      ],
+    ]) {
+      await t.test(label, (t) => {
+        const f = fixture(t, { bash: macBash });
+        const input = join(f.dir, "unsigned");
+        const out = join(f.dir, "signed");
+        for (const [name, files] of artifacts) {
+          if (!matchesGlob(name, pattern.replace(revision, plannedSha)))
+            continue;
+          for (const [path, bytes] of Object.entries(files)) {
+            write(join(input, path), bytes);
+          }
+        }
+        const result = f.run(["sign-macos", input, out], appleEnv, binaries);
+        if (expected === null) {
+          assert.equal(result.status, 1, result.stderr);
+          assert.ok(
+            result.stderr.includes(
+              `The build artifact has no regular file ${arm}.`,
+            ),
+          );
+          assert.equal(existsSync(join(out, arm)), false);
+        } else {
+          assert.equal(result.status, 0, result.stderr);
+          for (const [path, bytes] of Object.entries(expected)) {
+            assert.equal(readFileSync(join(out, path), "utf8"), bytes);
+          }
+        }
+      });
+    }
+  },
+);
 
 test("publish-binaries checks the signed manifest before it changes a release", () => {
   const steps = publishSteps();

@@ -123,9 +123,15 @@ Organization owners, admins and members who sign in with Logto.
 - UX follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it when it opens.
 - Each form dialog opening starts without a pending request or a submission error. Only the opening that sent a request can show its error, finish its pending state, or act on its success by closing the form, navigating, or showing a one-time secret or link. A failure in the current opening allows a retry. Successful requests refresh the affected data even after dismissal. If the form is still open when key or invitation creation succeeds, the console closes it and shows the copyable result while the list refreshes. A list refresh failure leaves the result available until the user closes it. If the user dismisses the form before creation succeeds, the key or invitation appears in its list and the console does not show its secret or link.
 
+## Localization
+
+- The console follows the [localization contract](repository-localization-contract.md#react-apps) with the [`delino-i18n`](packages-delino-i18n-foundation.md) runtime. The source catalog is `apps/sandrun/i18n/messages/en.json`, the registry is `apps/sandrun/i18n/locales.json`, and `src/i18n.ts` creates the provider. `src/index.tsx` loads the selected catalog before the first render and wraps the whole console, so the sign-in, callback and setup pages are translated too.
+- The language menu is in the top bar: at the start of the account links on signed-in pages, and alone in the top bar of the signed-out sign-in page and of a failed sign-in callback.
+- Product, vendor and guest OS names, identifiers, commands, `runs-on` labels and server error text stay unchanged. Dates, durations and lists use `Intl` with the selected language.
+
 ## Storage
 
-The console stores nothing except the Logto SDK session state in the browser (in a mock build, the fake session of the mock API). It never stores credentials in browser storage. After removing the GitHub `state` and `code` from the address bar, the console keeps them only in memory for the current callback visit.
+The console stores nothing except the Logto SDK session state in the browser (in a mock build, the fake session of the mock API) and the selected language under the `localStorage` key `delino.language`. It never stores credentials in browser storage. After removing the GitHub `state` and `code` from the address bar, the console keeps them only in memory for the current callback visit.
 
 ## Security
 
@@ -143,10 +149,11 @@ The console sends no logs to a service in this version. Browser console messages
 
 ## Build and Test
 
-- Package scripts: `dev` (portless, started as `node node_modules/portless/dist/cli.js run --prefix=` through the shared `scripts/dev/with-infisical.mjs` with the Infisical folder `/apps/sandrun`, according to the [environment contract](repository-environment-contract.md#local-development-injection)), `dev:app` (`rsbuild dev`, which portless starts), `build` (`rsbuild build` into the ignored `dist/`), `preview`, `lint` and `typecheck` (`tsc --noEmit`), `test` (`rstest run` with `happy-dom`) and `test:e2e` (`e2e run`). They run through root Turborepo tasks.
+- Package scripts: `dev` (portless, started as `node node_modules/portless/dist/cli.js run --prefix=` through the shared `scripts/dev/with-infisical.mjs` with the Infisical folder `/apps/sandrun`, according to the [environment contract](repository-environment-contract.md#local-development-injection)), `dev:app` (`rsbuild dev`, which portless starts), `build` (`rsbuild build` into the ignored `dist/`), `preview`, `lint` and `typecheck` (`tsc --noEmit`), `test` (`delino-i18n check`, then `rstest run` with `happy-dom`) and `test:e2e` (`e2e run`). They run through root Turborepo tasks.
 - Unit tests cover the configuration rules, the router, the role matrix and the dev session delete rule, the runner profile form rules (`workspace_path` for `DEV_SESSION`, guest OS path syntax, the OpenAI Codex queue wait, the update mask, the default priority only on create), the queue view across a gap and a manual retry, the queue order, the setup steps, the GitHub callback parsing and address removal, the invitation link handling and the Logto auth bridge, and render the console against the mock API: role-based navigation and actions, the `INVALID` banner, credential forms with password fields that show only "Set at", the OpenAI Codex webhook URL, the `runs-on` label, the GitHub callback, a reconnect of the live overview, the setup guidance, confirmations of destructive actions, and a one-time API key secret that never reaches browser storage and closes with `Esc`.
 - Unit tests cover sign-in session classification and the Logto callback with no pending redirect, a pending redirect, a failed callback and unreadable sessions under either storage key for signed-in and signed-out clients.
 - Unit tests cover sign-in after an `Unauthenticated` response on the organizations page, in the organization shell and from direct member, invitation and GitHub actions. Other failures exercise the retry action or the action toast.
+- A language menu test selects another language with a fake catalog and checks that the text changes without a reload and that the selection is kept; another test checks the menu on the signed-out page.
 - Runner profile tests cover resource ranges, whole-number validation, idle TTL comparison, request serialization at the resource limits, exact serialization of whole-millisecond durations, and field errors that prevent create and edit requests.
 - End-to-end suite: `apps/sandrun/e2e/` according to the [e2e contract](repository-e2e-contract.md), against the development server with the mock flag enabled. The app command uses Node to run the Rsbuild CLI with `dev --no-env --mode development --config e2e/rsbuild.config.ts`, `NODE_ENV=production` and a padded `PUBLIC_SANDRUN_MOCK_API=true` value. The `--no-env` option keeps local `.env` files out of the run. The e2e config wraps the local mock. Tests can hold credential list and create responses or receive an incomplete response after accepting the seeded invitation. The suite does not test a deployed control plane, GitHub or Logto.
 - A browser fixture drives the direct actions against the mock control plane and simulates a failed Logto discovery request. It checks that sign-in stays available, the page data stays visible and the failed action runs once.
@@ -154,7 +161,7 @@ The console sends no logs to a service in this version. Browser console messages
 
 ## Dependencies and Integrations
 
-- Upstream: `sandrun-api`, Logto, `delino-ui`, the generated TypeScript code (`@delino/sandrun-protos`) and the TypeScript SDK (`sandrun-sdk`).
+- Upstream: `sandrun-api`, Logto, `delino-ui`, `delino-i18n`, the generated TypeScript code (`@delino/sandrun-protos`) and the TypeScript SDK (`sandrun-sdk`).
 - Dependencies: the exact pins of the [OwnSand console](apps-ownsand-console-foundation.md#dependencies-and-integrations) (`@connectrpc/connect` and `@connectrpc/connect-web` `2.3.0`, `@connectrpc/connect-query` `2.3.1`, `@tanstack/react-query` `5.106.1`, `@bufbuild/protobuf` `2.16.0`, `@logto/react` `4.1.3`, React `19.3.1`, and the same development tools). The console adds no new third-party dependency.
 - Links to the OwnSand console and to `https://accounts.delino.io`.
 

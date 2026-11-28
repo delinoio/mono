@@ -353,7 +353,7 @@ func (l *Layer) workflowJob(ctx context.Context, tx pgx.Tx, body []byte, o *outc
 		o.after = append(o.after, func(ctx context.Context) {
 			ctx, cancel := context.WithTimeout(ctx, renameCleanupTimeout)
 			defer cancel()
-			l.retireRenamed(ctx, org, profileID, pool)
+			_ = l.retireRenamed(ctx, org, profileID, pool) // Queued events try cleanup on a best-effort basis.
 		})
 		return nil
 	case "in_progress":
@@ -471,11 +471,16 @@ func (l *Layer) jobCompleted(ctx context.Context, tx pgx.Tx, inst *Installation,
 // counts them as runners of the pool, so the new jobs would wait. They are
 // removed with removeIdleRunner (CLEAN_UP), and the dispatcher starts
 // runners with the new label. A runner whose removal GitHub refuses took a
-// job of the old label and stays.
-func (l *Layer) retireRenamed(ctx context.Context, orgID, profileID, pool string) {
+// job of the old label and stays. A false result defers surplus cleanup
+// until a later attempt.
+func (l *Layer) retireRenamed(ctx context.Context, orgID, profileID, pool string) bool {
 	p, err := l.profiles.Get(ctx, l.svc.DB.Pool, orgID, profileID)
+	if connect.CodeOf(err) == connect.CodeNotFound {
+		return true
+	}
 	if err != nil {
-		return
+		l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
+		return false
 	}
 	rows, err := l.svc.DB.Pool.Query(ctx, `SELECT r.runner_id::text FROM runners r JOIN github_runners g ON g.runner_id = r.runner_id
 		WHERE r.organization_id = $1 AND r.runner_profile_id = $2 AND r.pool_key = $3 AND r.request_id IS NULL AND r.state = ANY($4)
@@ -484,7 +489,7 @@ func (l *Layer) retireRenamed(ctx context.Context, orgID, profileID, pool string
 		p.GitHubLabel())
 	if err != nil {
 		l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-		return
+		return false
 	}
 	var ids []string
 	for rows.Next() {
@@ -494,27 +499,31 @@ func (l *Layer) retireRenamed(ctx context.Context, orgID, profileID, pool string
 		}
 	}
 	rows.Close()
-	if err := rows.Err(); err != nil || len(ids) == 0 {
-		if err != nil {
-			l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-		}
-		return
+	if err := rows.Err(); err != nil {
+		l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
+		return false
+	}
+	if len(ids) == 0 {
+		return true
 	}
 	inst, err := l.poolInstallation(ctx, l.svc.DB.Pool, orgID, pool)
 	if err != nil {
 		l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
-		return
+		return false
 	}
+	complete := true
 	for _, id := range ids {
 		deleted, err := l.removeIdleRunner(ctx, inst, orgID, id, sandrunv1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP)
 		if err != nil {
 			l.svc.Logger.WarnContext(ctx, "github_renamed_runner_delete_failed", slog.String("organization_id", orgID), slog.String("runner_id", id), slog.Any("error", err))
+			complete = false
 			continue
 		}
 		if deleted {
 			l.svc.Logger.InfoContext(ctx, "github_renamed_runner_removed", slog.String("organization_id", orgID), slog.String("runner_id", id))
 		}
 	}
+	return complete
 }
 
 // removeIdleRunner deletes a GITHUB_JOB runner of inst's pool with reason

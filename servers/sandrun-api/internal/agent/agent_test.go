@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/delinoio/mono/go/ownsand"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
@@ -62,61 +62,67 @@ func TestPrepareOrgDeletionKeepsOtherAttemptStopped(t *testing.T) {
 }
 
 func TestPrepareOrgDeletionJoinsLeaseDrain(t *testing.T) {
-	orgID := api.NewID()
-	watchCtx, cancelWatch := context.WithCancel(t.Context())
-	defer cancelWatch()
-	w := &watcher{
-		in:     integration.Integration{ID: api.NewID(), OrganizationID: orgID},
-		cancel: cancelWatch,
-		done:   make(chan struct{}),
-	}
-	h := &Hub{
-		svc:      &api.Service{DB: dbtest.New(t)},
-		log:      slog.Default(),
-		timing:   DefaultTiming(),
-		watchers: map[string]*watcher{w.in.ID: w},
-		draining: map[string]map[*watcher]struct{}{},
-		stopped:  map[string]int{},
-	}
-	release := sync.OnceFunc(func() { h.finishWatcher(w) })
-	defer release()
+	svc := &api.Service{DB: dbtest.New(t)}
+	synctest.Test(t, func(t *testing.T) {
+		orgID := api.NewID()
+		watchCtx, cancelWatch := context.WithCancel(t.Context())
+		defer cancelWatch()
+		w := &watcher{
+			in:     integration.Integration{ID: api.NewID(), OrganizationID: orgID},
+			cancel: cancelWatch,
+			done:   make(chan struct{}),
+		}
+		h := &Hub{
+			svc:      svc,
+			log:      slog.Default(),
+			timing:   DefaultTiming(),
+			watchers: map[string]*watcher{w.in.ID: w},
+			draining: map[string]map[*watcher]struct{}{},
+			stopped:  map[string]int{},
+		}
+		release := sync.OnceFunc(func() { h.finishWatcher(w) })
+		defer release()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	leaseCtx, cancelLease := context.WithCancel(ctx)
-	cancelLease()
-	leaseDone := make(chan error, 1)
-	go func() { leaseDone <- h.runWatchers(leaseCtx) }()
-	select {
-	case <-watchCtx.Done():
-	case <-ctx.Done():
-		t.Fatal("lease shutdown did not cancel the watcher")
-	}
+		leaseCtx, cancelLease := context.WithCancel(t.Context())
+		cancelLease()
+		leaseDone := make(chan error, 1)
+		go func() { leaseDone <- h.runWatchers(leaseCtx) }()
+		<-watchCtx.Done()
 
-	prepared := make(chan error, 1)
-	go func() { prepared <- h.prepareOrgDeletion(ctx, api.OrganizationDeletion{OrganizationID: orgID}) }()
-	select {
-	case err := <-prepared:
-		t.Fatalf("deletion preparation returned while the lease watcher was draining: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	release()
-	select {
-	case err := <-prepared:
-		if err != nil {
+		cleanupStarted := make(chan struct{})
+		prepared := make(chan error, 1)
+		go func() {
+			prepared <- h.prepareOrgDeletionWithCleanup(t.Context(), api.OrganizationDeletion{OrganizationID: orgID},
+				func(context.Context, string) error {
+					close(cleanupStarted)
+					return nil
+				})
+		}()
+		synctest.Wait()
+		select {
+		case <-cleanupStarted:
+			t.Error("claim cleanup started while the lease watcher was draining")
+		default:
+		}
+		select {
+		case err := <-prepared:
+			t.Fatalf("deletion preparation returned while the lease watcher was draining: %v", err)
+		default:
+		}
+
+		release()
+		if err := <-prepared; err != nil {
 			t.Fatalf("deletion preparation: %v", err)
 		}
-	case <-ctx.Done():
-		t.Fatal("deletion preparation did not finish after the watcher exited")
-	}
-	select {
-	case err := <-leaseDone:
-		if !errors.Is(err, context.Canceled) {
+		select {
+		case <-cleanupStarted:
+		default:
+			t.Error("deletion preparation did not start claim cleanup")
+		}
+		if err := <-leaseDone; !errors.Is(err, context.Canceled) {
 			t.Fatalf("lease watcher loop: %v", err)
 		}
-	case <-ctx.Done():
-		t.Fatal("the lease watcher loop did not stop")
-	}
+	})
 }
 
 func TestQuote(t *testing.T) {

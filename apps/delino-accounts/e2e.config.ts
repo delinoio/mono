@@ -26,7 +26,10 @@ export default {
   tests: "e2e/**/*.e2e.ts",
   targets: [
     {
-      engine: web(),
+      // The console selects its language from the browser languages
+      // (docs/repository-localization-contract.md). Pin English, so the
+      // suite does not depend on the locale of the machine that runs it.
+      engine: web({ locale: "en-US" }),
       app: {
         // Port 0 selects a free loopback port, so the suite does not conflict
         // with the fixed development port used by `pnpm dev`.

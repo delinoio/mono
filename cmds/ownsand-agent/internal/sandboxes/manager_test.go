@@ -3679,53 +3679,66 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 func TestLockSnapshotImportSerializesOneIDOnly(t *testing.T) {
-	e := newEnv(t)
-	idA, _ := uuidv7.NewString()
-	idB, _ := uuidv7.NewString()
-	unlockA, err := e.m.LockSnapshotImport(context.Background(), idA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unlockA()
-	// Another ID takes its own lock at once.
-	const lockBTimeout = time.Second
-	ctxB, cancelB := context.WithTimeout(t.Context(), lockBTimeout)
-	unlockB, err := e.m.LockSnapshotImport(ctxB, idB)
-	cancelB()
-	if err != nil {
-		t.Fatalf("snapshot B (%s) could not acquire its import lock within %s while snapshot A (%s) was held: %v", idB, lockBTimeout, idA, err)
-	}
-	unlockB()
-	// The same ID waits for the holder.
-	acquired := make(chan error, 1)
-	go func() {
-		unlock, err := e.m.LockSnapshotImport(t.Context(), idA)
-		if err == nil {
-			unlock()
-		}
-		acquired <- err
-	}()
-	select {
-	case err := <-acquired:
-		t.Fatalf("second import of the same ID returned before release: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	unlockA()
-	unlockA() // A second release is a no-op.
-	select {
-	case err := <-acquired:
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		idA, _ := uuidv7.NewString()
+		idB, _ := uuidv7.NewString()
+		unlockA, err := e.m.LockSnapshotImport(context.Background(), idA)
 		if err != nil {
-			t.Fatalf("waiting import failed to acquire the released lock: %v", err)
+			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("waiting import did not acquire the released lock")
-	}
-	e.m.mu.Lock()
-	left := len(e.m.importLocks)
-	e.m.mu.Unlock()
-	if left != 0 {
-		t.Fatalf("%d import locks remain after every release", left)
-	}
+		t.Cleanup(unlockA)
+
+		// Another ID takes its own lock at once.
+		const lockBTimeout = time.Second
+		ctxB, cancelB := context.WithTimeout(t.Context(), lockBTimeout)
+		unlockB, err := e.m.LockSnapshotImport(ctxB, idB)
+		cancelB()
+		if err != nil {
+			t.Fatalf("snapshot B (%s) could not acquire its import lock within %s while snapshot A (%s) was held: %v", idB, lockBTimeout, idA, err)
+		}
+		unlockB()
+
+		ctxA, cancelA := context.WithCancel(t.Context())
+		defer cancelA()
+		acquired := make(chan error, 1)
+		go func() {
+			unlock, err := e.m.LockSnapshotImport(ctxA, idA)
+			if err == nil {
+				defer unlock()
+			}
+			acquired <- err
+			<-ctxA.Done()
+		}()
+
+		// Let the contender run while A is still held.
+		synctest.Wait()
+		select {
+		case err := <-acquired:
+			t.Fatalf("second import of the same ID returned before release: %v", err)
+		default:
+		}
+
+		unlockA()
+		unlockA() // A second release is a no-op.
+		select {
+		case err := <-acquired:
+			if err != nil {
+				t.Fatalf("waiting import failed to acquire the released lock: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("waiting import did not acquire the released lock")
+		}
+		cancelA()
+		synctest.Wait()
+
+		e.m.mu.Lock()
+		left := len(e.m.importLocks)
+		e.m.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("%d import locks remain after every release", left)
+		}
+	})
 }
 
 func TestLockSnapshotImportWaitEndsWithItsContext(t *testing.T) {
