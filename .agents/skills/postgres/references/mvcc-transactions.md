@@ -17,7 +17,9 @@ Ordinary snapshot reads (plain `SELECT`) and ordinary DML do not block each othe
 
 ## XID Wraparound
 
-PostgreSQL compares normal 32-bit transaction IDs (XIDs) in a circular sequence. The comparison treats roughly the preceding `2^31` XIDs as older and the following `2^31` XIDs as newer. `VACUUM FREEZE` replaces old XIDs with FrozenXID (value 2, always visible). Without freeze: after wraparound, old rows appear "in the future" and become **invisible**. Data physically exists but is invisible to all queries — looks like total data loss. XID wraparound should be avoided at all cost.
+PostgreSQL compares normal 32-bit transaction IDs (XIDs) in a circular sequence. The comparison treats roughly the preceding `2^31` XIDs as older and the following `2^31` XIDs as newer. Without freeze: after wraparound, old rows appear "in the future" and become **invisible**. Data physically exists but is invisible to all queries — looks like total data loss. XID wraparound should be avoided at all cost.
+
+In PostgreSQL 9.4 and later, `VACUUM FREEZE` sets a flag on each tuple it freezes and preserves the original `xmin`. For visibility checks, PostgreSQL treats the frozen tuple's insertion XID as `FrozenTransactionId`, which is older than every normal XID even after wraparound. Before 9.4, freezing replaced the stored insertion XID with `FrozenTransactionId` (2). After `pg_upgrade` from a pre-9.4 version, rows frozen before the upgrade can still show `xmin = 2`. [PostgreSQL 18 manual](https://www.postgresql.org/docs/18/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND)
 
 PostgreSQL 14–18 warn when 40 million XIDs remain before wraparound. They refuse to allocate new XIDs when approximately 3 million XIDs remain. [PostgreSQL 14](https://www.postgresql.org/docs/14/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND) · [PostgreSQL 18](https://www.postgresql.org/docs/18/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND)
 
