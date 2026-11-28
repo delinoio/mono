@@ -111,6 +111,8 @@ The control plane serves every public service at `https://sandrun.api.delino.io`
 
 If the selected agent integration is missing during validation or when SandRun saves the profile, `CreateRunnerProfile` returns `not_found` with `agent integration not found`. The failed request creates no profile or profile-created audit event.
 
+Use `base_image` or `ownsand_template_id` to replace the source. If the mask names either member, the request profile must select a member named in the mask. This rule also applies when the mask includes the legacy `source` alias. A mask with `source` alone can select either member. The server replaces the source once regardless of path order. If the request omits the source or selects a member outside the mask when either member path is present, the RPC returns `invalid_argument` and leaves the stored profile and its audit history unchanged.
+
 Use `resources` to replace all resource values. Use `resources.vcpu_count`, `resources.memory_mib` or `resources.disk_gib` to change individual values. The server keeps the current value of each omitted resource and validates the resulting profile.
 
 When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources. `UpdateRunnerProfile` checks a template source when the template ID changes or the mask includes `guest_os`. A missing or `INVALID` link skips this check. If the check fails, the RPC saves no profile changes.

@@ -266,6 +266,36 @@ func applyField(p *Profile, in *sandrunv1.RunnerProfile, path string) error {
 	return err
 }
 
+// applyUpdateMask treats the source paths as a set and replaces the source once.
+func applyUpdateMask(p *Profile, in *sandrunv1.RunnerProfile, paths []string) error {
+	var source, baseImage, templateID bool
+	for _, path := range paths {
+		switch path {
+		case "source":
+			source = true
+		case "base_image":
+			baseImage = true
+		case "ownsand_template_id":
+			templateID = true
+		default:
+			if err := applyField(p, in, path); err != nil {
+				return err
+			}
+		}
+	}
+	if baseImage || templateID {
+		_, hasBaseImage := in.GetSource().(*sandrunv1.RunnerProfile_BaseImage)
+		_, hasTemplateID := in.GetSource().(*sandrunv1.RunnerProfile_OwnsandTemplateId)
+		if !(baseImage && hasBaseImage || templateID && hasTemplateID) {
+			return api.ErrInvalidf("invalid update_mask: source must select a named oneof member")
+		}
+	}
+	if source || baseImage || templateID {
+		return applyField(p, in, "source")
+	}
+	return nil
+}
+
 var settablePaths = []string{"name", "workspace_path", "guest_os", "source", "resources", "network_mode", "idle_ttl", "max_ttl", "priority", "max_queue_wait", "warm_count"}
 
 // vendorOf returns the vendor of the profile's integration.
@@ -544,10 +574,8 @@ func (ps *Profiles) applyUpdate(ctx context.Context, c api.Caller, id string, in
 	}
 	snapshot := *p
 	oldTemplate := p.TemplateID
-	for _, path := range paths {
-		if err := applyField(p, in, path); err != nil {
-			return nil, err
-		}
+	if err := applyUpdateMask(p, in, paths); err != nil {
+		return nil, err
 	}
 	vendor, err := ps.vendorOf(ctx, s.DB.Pool, p)
 	if err != nil {
