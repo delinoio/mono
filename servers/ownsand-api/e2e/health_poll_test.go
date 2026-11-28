@@ -18,22 +18,34 @@ func TestPollHealthyBoundsAHungRequest(t *testing.T) {
 	t.Parallel()
 	arrived := make(chan struct{}, 1)
 	cancelled := make(chan struct{})
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case arrived <- struct{}{}:
 		default:
 		}
-		<-r.Context().Done()
-		close(cancelled)
+		select {
+		case <-r.Context().Done():
+			close(cancelled)
+		case <-release:
+		}
 	}))
-	defer srv.Close()
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
 
-	start := time.Now()
-	if err := pollHealthy(srv.URL, 300*time.Millisecond); err == nil {
-		t.Fatal("pollHealthy succeeded against a server that never answers")
-	}
-	if d := time.Since(start); d > 5*time.Second {
-		t.Fatalf("pollHealthy took %s, want it bounded by the budget", d)
+	result := make(chan error, 1)
+	go func() {
+		result <- pollHealthy(srv.URL, 300*time.Millisecond)
+	}()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("pollHealthy succeeded against a server that never answers")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pollHealthy did not return within five seconds")
 	}
 	select {
 	case <-arrived:
@@ -73,21 +85,36 @@ func TestPollHealthyRetriesUntilReady(t *testing.T) {
 func TestPollHealthyReportsLastStatusOnTimeout(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
 	}))
-	defer srv.Close()
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
 
-	err := pollHealthy(srv.URL, 500*time.Millisecond)
-	if err == nil {
-		t.Fatal("pollHealthy succeeded against a server that never became healthy")
-	}
-	if !strings.Contains(err.Error(), "unexpected status 503") {
-		t.Fatalf("pollHealthy error = %q, want it to report the last status (unexpected status 503)", err)
+	result := make(chan error, 1)
+	go func() {
+		result <- pollHealthy(srv.URL, 500*time.Millisecond)
+	}()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("pollHealthy succeeded against a server that never became healthy")
+		}
+		if !strings.Contains(err.Error(), "unexpected status 503") {
+			t.Fatalf("pollHealthy error = %q, want it to report the last status (unexpected status 503)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pollHealthy did not return within five seconds")
 	}
 	if calls.Load() < 2 {
 		t.Fatalf("calls = %d, want the second probe to be held until the deadline", calls.Load())
@@ -117,12 +144,19 @@ func TestPollReadyWhileCancelsAHungRequestOnProcessExit(t *testing.T) {
 	t.Parallel()
 	arrived := make(chan struct{})
 	canceled := make(chan struct{})
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(arrived)
-		<-r.Context().Done()
-		close(canceled)
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-release:
+		}
 	}))
-	defer srv.Close()
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
 
 	exited := make(chan struct{})
 	result := make(chan error, 1)
