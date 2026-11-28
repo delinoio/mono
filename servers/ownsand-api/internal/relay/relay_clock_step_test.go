@@ -469,8 +469,11 @@ func TestSystemClockMeasuresElapsedMonotonicTime(t *testing.T) {
 	if first < 0 || second < first+5*time.Millisecond {
 		t.Fatalf("mono = %v then %v, want elapsed time since creation to grow by at least 5ms", first, second)
 	}
-	if d := time.Since(clk.Now()); d < 0 || d > time.Second {
-		t.Fatalf("wall is %v behind the current time", d)
+	before := time.Now()
+	got := clk.Now()
+	after := time.Now()
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("wall = %v, want between %v and %v inclusive", got, before, after)
 	}
 }
 
