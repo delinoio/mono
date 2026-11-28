@@ -7,7 +7,7 @@ This contract owns both components of [`delidev`](project-delidev.md):
 - `apps/delidev/package.json`: workspace package `delidev` with the frontend scripts and the `tauri` CLI script.
 - `apps/delidev/tauri.mjs`: the Tauri CLI entry point.
 - `apps/delidev/cef-notices.mjs`: the Debian and macOS CEF notice staging hook.
-- `apps/delidev/tauri-debian-cli.mjs`: the Debian Tauri CLI backport.
+- `apps/delidev/tauri-debian-cli.mjs`: the Tauri CLI backport for Linux bundles with embedded CEF.
 - `apps/delidev/rsbuild.config.ts`, `apps/delidev/index.html`, `apps/delidev/src/` and `apps/delidev/public/`: the `delidev-frontend` web frontend.
 - `apps/delidev/turbo.json`: package-local Turbo task configuration.
 - `apps/delidev/src-tauri/`: the `delidev-shell` Rust crate:
@@ -100,7 +100,7 @@ Run from the repository root:
 
 `tauri dev` and `tauri build` for desktop compile the Rust crate with CEF. Physical Android and iOS devices load the development server through the LAN address in `TAURI_DEV_HOST`, which the Tauri CLI sets; `rsbuild.config.ts` binds to that address instead of the loopback address, and `turbo.json` passes `TAURI_DEV_HOST` to the `dev` task. Remove `apps/delidev/dist/` after validation.
 
-The wrapper uses the explicit bundle list when present, including an empty list. Otherwise it uses the effective Tauri configuration after the Linux platform file and ordered CLI overrides. When the selection includes Debian and embeds CEF, the wrapper builds and caches the pinned Tauri CLI with the Debian portion of the [upstream ANGLE fix](https://github.com/tauri-apps/tauri/commit/6620118f0fe85472abfdccea8d99fd0ec9447c3f). It verifies both published source archives and builds with the CLI's published Cargo lockfile. This path uses Cargo and `tar` and caches the CLI under `$XDG_CACHE_HOME/delidev/tauri-debian-cli` or `~/.cache/delidev/tauri-debian-cli`. The stock CLI handles shared CEF and other selections. Remove the backport when the published CLI pin includes the fix.
+The wrapper uses the explicit bundle list when present, including an empty list. Otherwise it uses the effective Tauri configuration after the platform file and ordered CLI overrides. When a Linux selection includes Debian, RPM or AppImage and embeds CEF, the wrapper builds and caches the pinned Tauri CLI with the Linux portion of the upstream ANGLE fix. The fix removes the two standalone ANGLE libraries from the copy lists for those formats. Debian selections activate the Linux notice hook. The wrapper verifies both published source archives and builds with the CLI's published Cargo lockfile. This path uses Cargo and `tar` and caches the CLI under `$XDG_CACHE_HOME/delidev/tauri-debian-cli` or `~/.cache/delidev/tauri-debian-cli`. The stock CLI handles shared CEF and other selections. Remove the backport when the published CLI pin includes the fix. [Upstream ANGLE fix](https://github.com/tauri-apps/tauri/commit/6620118f0fe85472abfdccea8d99fd0ec9447c3f)
 
 The CEF notice hook reads the CEF version from `Cargo.lock` with LF or CRLF line endings.
 

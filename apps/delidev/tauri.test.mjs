@@ -93,7 +93,7 @@ console.log(JSON.stringify({ cli: "stock", args }));
   );
   writeFileSync(
     join(root, "tauri-debian-cli.mjs"),
-    'import { fileURLToPath } from "node:url"; export const debianCli = () => fileURLToPath(new URL("./cargo-tauri", import.meta.url));',
+    'import { fileURLToPath } from "node:url"; export const linuxCefCli = () => fileURLToPath(new URL("./cargo-tauri", import.meta.url));',
   );
   writeFileSync(
     join(root, "cargo-tauri"),
@@ -132,30 +132,50 @@ console.log(JSON.stringify({ cli: "stock", args }));
 }
 
 const linuxOnly = { skip: process.platform !== "linux" };
+const unixOnly = { skip: !["darwin", "linux"].includes(process.platform) };
+const embedCef = '{"bundle":{"cef":{"embed":true}}}';
 
 test(
-  "uses the stock CLI for shared CEF and selections without Debian",
+  "uses the stock CLI for shared CEF and requests outside the Linux backport",
   linuxOnly,
   (t) => {
     const { run } = fixture(t);
-    const embed = '{"bundle":{"cef":{"embed":true}}}';
-    const rpm = '{"bundle":{"targets":["rpm"]}}';
     for (const args of [
       ["bundle", "--bundles", "deb"],
-      ["bundle", "--config", embed, "--config", rpm],
-      ["bundle", "--config", embed, "--bundles", "rpm"],
-      ["bundle", "--config", embed, "--bundles"],
-      ["build", "--config", embed, "--no-bundle"],
+      ["bundle", "--bundles", "rpm,appimage"],
+      ["bundle", "--config", embedCef, "--bundles", "dmg"],
+      ["bundle", "--config", embedCef, "--bundles"],
+      ["build", "--config", embedCef, "--no-bundle"],
+      ["build", "--help", "--bundles", "rpm"],
       ["build", "--config", '{"bundle":{"active":false,"cef":null}}'],
-      ["build", "--target", "aarch64-linux-android", "--bundles", "deb"],
+      ["build", "--target", "aarch64-linux-android", "--bundles", "rpm"],
+      ["bundle", "--target", "x86_64-pc-windows-msvc", "--bundles", "appimage"],
     ]) {
       assert.deepEqual(run(...args), { cli: "stock", args });
     }
   },
 );
 
-const unixOnly = { skip: !["darwin", "linux"].includes(process.platform) };
-const embedCef = '{"bundle":{"cef":{"embed":true}}}';
+test(
+  "uses the backport without staging Debian notices for RPM and AppImage",
+  linuxOnly,
+  (t) => {
+    const { run } = fixture(t);
+    for (const command of ["build", "bundle"]) {
+      for (const selection of [
+        ["--bundles", "rpm"],
+        ["--bundles=appimage"],
+        ["-brpm,appimage"],
+        ["--bundles", "rpm", "appimage"],
+        ["--config", '{"bundle":{"targets":"rpm"}}'],
+        ["--config", '{"bundle":{"targets":["appimage"]}}'],
+      ]) {
+        const args = [command, "--config", embedCef, ...selection];
+        assert.deepEqual(run(...args), { cli: "patched", args });
+      }
+    }
+  },
+);
 
 test(
   "selects notice staging for embedded macOS apps and DMGs",
@@ -356,7 +376,7 @@ test(
         "--config",
         rpm,
         "--config",
-        '{"bundle":{"targets":["deb","rpm"]}}',
+        '{"bundle":{"targets":["deb","rpm","appimage"]}}',
       ],
       ["bundle", "--config", embed, "--config", rpm, "-bdeb"],
       [
