@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, test } from "@rstest/core";
 
-import { block, findRuleBlock } from "./stylesheet-source.ts";
+import { block, findAtRuleBlock, findRuleBlock } from "./stylesheet-source.ts";
 
 describe("stylesheet source helper", () => {
   test("finds a rule by its complete selector", () => {
@@ -64,6 +64,36 @@ describe("stylesheet source helper", () => {
     const source =
       "@media (min-width: 1px) { .a { top: 1px; } }\n.a { top: 2px; }";
     expect(findRuleBlock(source, ".a")).toBe("top: 1px;");
+  });
+
+  test("limits rule lookup to the complete matching at-rule body", () => {
+    const media = "@media (forced-colors: active)";
+    const source = [
+      "@layer delino-ui {",
+      `  /* ${media} { .ghost { color: red; } } */`,
+      `  ${media} and (min-width: 1px) { .inside { color: red; } }`,
+      "  @media (forced-colors: active) {",
+      "    .first { color: Canvas; }",
+      "    /* Ignore these braces: } { */",
+      "    @supports (color: Highlight) {",
+      "      .inside { color: Highlight; }",
+      "    }",
+      "  }",
+      "  .outside { color: Highlight; }",
+      "}",
+    ].join("\n");
+
+    const body = findAtRuleBlock(source, media);
+    expect(body).not.toBeNull();
+    expect(findRuleBlock(body ?? "", ".first")).toBe("color: Canvas;");
+    expect(findRuleBlock(body ?? "", ".inside")).toBe("color: Highlight;");
+    expect(findRuleBlock(body ?? "", ".outside")).toBeNull();
+  });
+
+  test("returns null for a missing or unclosed at-rule block", () => {
+    const media = "@media (forced-colors: active)";
+    expect(findAtRuleBlock(`/* ${media} {} */ .outside {}`, media)).toBeNull();
+    expect(findAtRuleBlock(`${media} { .inside {}`, media)).toBeNull();
   });
 
   test("block() reads the packaged stylesheet by complete selector", () => {
