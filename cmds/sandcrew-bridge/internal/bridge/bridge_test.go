@@ -1025,9 +1025,14 @@ func TestEventLogFailureStopsTheBridge(t *testing.T) {
 	file.mu.Lock()
 	file.limit = file.writes
 	file.mu.Unlock()
-	h.write(prompt("hello"))
+	id := h.write(prompt("hello"))
 	if code := h.wait(); code != ExitEventLogFailed {
 		t.Fatalf("exit code %d, want %d", code, ExitEventLogFailed)
+	}
+	// The acceptance is not in the log, so the file stays for the next
+	// bridge process.
+	if files := inboxFiles(t, h.stateDir); !slices.Contains(files, id+".json") {
+		t.Fatalf("inbox files %v, want the unlogged input %s", files, id)
 	}
 	events := h.events()
 	last := events[len(events)-1]

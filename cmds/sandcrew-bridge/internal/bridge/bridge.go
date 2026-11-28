@@ -577,6 +577,13 @@ func (b *Bridge) processInbox() {
 		} else {
 			b.apply(item.Input)
 		}
+		if b.failed() {
+			// The acceptance or rejection may be missing from the log. The
+			// file stays, so the next bridge process handles the input; one
+			// that the log holds is deleted there without a new effect.
+			b.logger.Warn("keeping the inbox file after an event log failure", "input_id", item.InputID)
+			return
+		}
 		b.remove(item)
 	}
 }
