@@ -11,12 +11,13 @@ import (
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
-// billingEnforceSlots is the number of pause and resume commands that one
-// enforcement pass keeps in flight (billingEnforceParallel in package api).
+// billingEnforceSlots is the worker limit for one enforcement pass
+// (billingEnforceParallel in package api).
 const billingEnforceSlots = 8
 
 func resumeCommands(agent *testenv.FakeAgent, sandboxID string) int {
@@ -86,16 +87,24 @@ type staleFixture struct {
 	hogAgent, victimAgent *testenv.FakeAgent
 	hogSandboxes          []string
 	victimSandbox         string
+	replyLimit            int
 	passDone              chan error
 }
 
 func newStaleFixture(t *testing.T) *staleFixture {
 	t.Helper()
-	env, _ := billingEnv(t)
+	env, _ := billingEnvWith(t, func(o *app.Options) {
+		// Keep replies pending through the 10-second Eventually window
+		// and the database update that changes the victim's phase.
+		o.Timing.CommandWait = 30 * time.Second
+	})
+	// Each sandbox ordering lock holds one connection. The ordering
+	// limit leaves half the pool free for other work, including setPhase.
+	replyLimit := min(billingEnforceSlots, max(1, int(env.DB.Pool.Config().MaxConns)/2))
 	ctx := context.Background()
 	a := env.NewOrg("alice")
 	b := env.NewOrg("bob")
-	f := &staleFixture{env: env, hog: a, victim: b}
+	f := &staleFixture{env: env, hog: a, victim: b, replyLimit: replyLimit}
 	if b.ID < a.ID {
 		f.hog, f.victim = b, a
 	}
@@ -111,8 +120,8 @@ func newStaleFixture(t *testing.T) *staleFixture {
 		waitState(t, org.OwnerClient, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 		return id
 	}
-	// One more sandbox than slots: the extra one waits for a slot like the
-	// victim does and must still be enforced afterwards.
+	// Fill all worker slots even when the ordering limit is lower. The
+	// extra control sandbox queues like the victim and must still be enforced.
 	for i := 0; i < billingEnforceSlots+1; i++ {
 		f.hogSandboxes = append(f.hogSandboxes, create(f.hog))
 	}
@@ -148,6 +157,12 @@ func (f *staleFixture) startPass() {
 	go func() { f.passDone <- f.env.App.Enforcer.Pass(context.Background()) }()
 }
 
+func (f *staleFixture) waitForHeldReplies(t *testing.T, hold *slotHolder) {
+	t.Helper()
+	testenv.Eventually(t, "the reply barrier to fill", func() bool { return hold.heldCount() == f.replyLimit })
+	t.Logf("reply barrier reached (held=%d, pool_max_conns=%d)", f.replyLimit, f.env.DB.Pool.Config().MaxConns)
+}
+
 func (f *staleFixture) finishPass(t *testing.T) {
 	t.Helper()
 	select {
@@ -169,12 +184,12 @@ func TestBillingPauseDroppedAfterRecoveryWhileQueued(t *testing.T) {
 	t.Parallel()
 	f := newStaleFixture(t)
 	c := f.victim.OwnerClient
-	hold := holdSlots(f.hogAgent, billingEnforceSlots, func(cmd *ownsandv1.AgentCommand) bool { return cmd.GetPauseSandbox() != nil })
+	hold := holdSlots(f.hogAgent, f.replyLimit, func(cmd *ownsandv1.AgentCommand) bool { return cmd.GetPauseSandbox() != nil })
 	f.setPhase(t, f.hog, billing.PhaseSuspended)
 	f.setPhase(t, f.victim, billing.PhaseSuspended)
 
 	f.startPass()
-	testenv.Eventually(t, "every slot of the pass holds an unanswered pause", func() bool { return hold.heldCount() == billingEnforceSlots })
+	f.waitForHeldReplies(t, hold)
 	// The victim's target was selected while it was suspended; its recovery
 	// commits before the sandbox reaches a slot.
 	f.setPhase(t, f.victim, billing.PhaseAllowed)
@@ -224,14 +239,14 @@ func TestBillingResumeDroppedAfterSuspensionWhileQueued(t *testing.T) {
 			t.Fatalf("sandbox %s was not marked", id)
 		}
 	}
-	// Recovery of both organizations; the resumes of the hog organization
-	// keep every slot busy.
-	hold := holdSlots(f.hogAgent, billingEnforceSlots, func(cmd *ownsandv1.AgentCommand) bool { return cmd.GetResumeSandbox() != nil })
+	// The resumes of the recovered hog organization occupy the available
+	// ordering locks and keep the victim queued.
+	hold := holdSlots(f.hogAgent, f.replyLimit, func(cmd *ownsandv1.AgentCommand) bool { return cmd.GetResumeSandbox() != nil })
 	f.setPhase(t, f.hog, billing.PhaseAllowed)
 	f.setPhase(t, f.victim, billing.PhaseAllowed)
 
 	f.startPass()
-	testenv.Eventually(t, "every slot of the pass holds an unanswered resume", func() bool { return hold.heldCount() == billingEnforceSlots })
+	f.waitForHeldReplies(t, hold)
 	f.setPhase(t, f.victim, billing.PhaseSuspended)
 	hold.Release()
 	f.finishPass(t)
