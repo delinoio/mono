@@ -1204,14 +1204,37 @@ for (const { name, skip, breakParent } of [
 }
 
 test("explicit comparison keeps a range-deleted path skipped beside a missing excluded path", (t) => {
-  const { f, base } = missingRangeFixture(t);
+  const f = fixture(t, false);
+  const changedTypeScript = ["c.ts", "kept.ts", "vendor/lib.ts"];
+  for (const name of changedTypeScript) f.write(name, "const value = 1;\n");
+  f.write("pnpm-lock.yaml", "lockfileVersion: 1\n");
   f.write("old.ts", "const old = 1;\n");
-  const middle = f.commit();
+  const base = f.commit();
+
+  for (const name of changedTypeScript) f.write(name, "const value = 2;\n");
+  f.write("pnpm-lock.yaml", "lockfileVersion: 2\n");
   rmSync(join(f.cwd, "old.ts"));
   const head = f.commit();
   f.git("update-index", "--skip-worktree", "vendor/lib.ts");
-  rmSync(join(f.cwd, "vendor"), { recursive: true });
-  assert.deepEqual(changedFormatFiles(f.cwd, middle, head), []);
+  rmSync(join(f.cwd, "vendor/lib.ts"));
+
+  assert.deepEqual(
+    f
+      .git("diff", "--name-status", "--no-renames", base, head, "--")
+      .split("\n"),
+    [
+      "M\tc.ts",
+      "M\tkept.ts",
+      "D\told.ts",
+      "M\tpnpm-lock.yaml",
+      "M\tvendor/lib.ts",
+    ],
+  );
+  assert.equal(
+    f.git("ls-files", "-t", "--", "old.ts", "vendor/lib.ts"),
+    "S vendor/lib.ts",
+  );
+  assert.equal(existsSync(join(f.cwd, "vendor/lib.ts")), false);
   assert.deepEqual(changedFormatFiles(f.cwd, base, head), [
     "c.ts",
     "kept.ts",
