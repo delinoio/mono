@@ -86,11 +86,13 @@ describe("pagination", () => {
       fetch: server.fetch,
       token: "test-token",
     });
+    const received: string[] = [];
     for await (const org of client.iterate.organizations()) {
-      expect(org.organizationId).toBe("o-");
+      received.push(org.organizationId);
       break;
     }
-    expect(seen.length).toBe(1);
+    expect(received).toEqual(["o-"]);
+    expect(seen.map((request) => request.pageToken)).toEqual([""]);
   });
 
   test("ends with an error when the server repeats a page token", async () => {
