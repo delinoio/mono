@@ -423,7 +423,11 @@ func (a *app) finishExec(ctx context.Context, session string, w *execWriter, res
 				stderrOffset = w.stderr.resumeOffset(stderrOffset)
 			}
 			hint := a.attachCommand(session, se.ExecID, stdoutOffset, stderrOffset)
-			return &exitError{code: ExitInterrupted, msg: "interrupted; the command keeps running. Continue with: " + hint}
+			msg := "interrupted. Command start is unconfirmed. Check with: "
+			if se.Started {
+				msg = "interrupted. Detached from the output stream after the command started. Continue with: "
+			}
+			return &exitError{code: ExitInterrupted, msg: msg + hint}
 		}
 		if jsonMode {
 			if err := w.flushAll(se.ExecID); err != nil {

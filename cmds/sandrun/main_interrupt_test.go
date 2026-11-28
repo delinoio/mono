@@ -339,9 +339,10 @@ func interruptAfterExecOutput(t *testing.T, cmd *exec.Cmd, jsonMode bool, stdout
 	case <-time.After(10 * time.Second):
 		t.Fatal("SandRun did not exit after SIGINT")
 	}
-	_, hint, ok := strings.Cut(stderr.buf.String(), "Continue with: ")
+	const detached = "interrupted. Detached from the output stream after the command started. Continue with: "
+	_, hint, ok := strings.Cut(stderr.buf.String(), detached)
 	if !ok {
-		t.Fatalf("missing resume command on stderr: %s", stderr.buf.String())
+		t.Fatalf("missing detachment diagnostic or resume command on stderr: %s", stderr.buf.String())
 	}
 	return strings.TrimSuffix(hint, "\n")
 }
