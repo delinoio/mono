@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -150,6 +151,44 @@ func TestPollReadyWhileCancelsAHungRequestOnProcessExit(t *testing.T) {
 	case <-canceled:
 	case <-timeout:
 		t.Fatal("the server did not observe request cancellation")
+	}
+}
+
+func TestPollReadyWhileRequiresOwnershipBeforeDeadline(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	const lateBudget = 400 * time.Millisecond
+	for _, tc := range []struct {
+		name   string
+		budget time.Duration
+		delay  time.Duration
+		want   error
+	}{
+		{name: "timely", budget: 10 * time.Second},
+		{name: "late", budget: lateBudget, delay: lateBudget, want: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exited := make(chan struct{})
+			checked := false
+			err := pollReadyWhile(srv.URL, tc.budget, exited, func() bool {
+				checked = true
+				time.Sleep(tc.delay)
+				return true
+			})
+			if !checked {
+				t.Fatal("the ownership check did not run")
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("pollReadyWhile = %v, want %v", err, tc.want)
+			}
+			if tc.want != nil && !strings.HasPrefix(err.Error(), "not healthy within 400ms: ") {
+				t.Fatalf("pollReadyWhile = %v, want the startup timeout diagnostic", err)
+			}
+		})
 	}
 }
 

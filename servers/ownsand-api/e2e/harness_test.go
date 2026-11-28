@@ -838,10 +838,8 @@ func pollHealthy(url string, budget time.Duration) error {
 var errProcessExited = errors.New("the process exited")
 
 // pollHealthyWhile is pollHealthy that also stops with errProcessExited when
-// exited closes, so a server that exited is not waited for. It returns nil at
-// the first 200 answer unless exited is closed at that moment, in which case
-// it returns errProcessExited even though the probe answered 200. A nil
-// exited never closes.
+// exited closes. It returns nil when a 200 answer arrives before the deadline
+// and exited is still open. A nil exited never closes.
 //
 // It does not show that the process behind exited gave the answer: while that
 // process still runs, a 200 from another server on the same address counts.
@@ -860,7 +858,7 @@ var errNotOwned = errors.New("answered 200 before the process reported that it o
 // the caller shows that the probed process itself bound the listener, for
 // example by its "server_started" log record, so a 200 from another server
 // that holds the address does not count even before the probed process has
-// exited.
+// exited. Readiness requires the ownership check to finish before the deadline.
 //
 // Process exit cancels any active probe. The poller checks for exit before
 // starting a probe, after it returns, and before accepting readiness or
@@ -914,7 +912,13 @@ func pollReadyWhile(url string, budget time.Duration, exited <-chan struct{}, ow
 			return err
 		}
 		if err == nil && resp.StatusCode == http.StatusOK && (owned == nil || owned()) {
-			return processExit()
+			if err := processExit(); err != nil {
+				return err
+			}
+			if err := pollPhaseContextErr(ctx); err != nil {
+				return fmt.Errorf("not healthy within %s: %w", budget, err)
+			}
+			return nil
 		}
 		select {
 		case <-ctx.Done():
