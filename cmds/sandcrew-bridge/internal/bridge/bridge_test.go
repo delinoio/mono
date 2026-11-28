@@ -1110,6 +1110,24 @@ func TestCodexAuthJSONChangesProduceCredentialUpdates(t *testing.T) {
 	h.checkLog()
 }
 
+func TestCodexAuthJSONRefreshDuringStartIsReported(t *testing.T) {
+	h := newHarness(t, codexAuthJSON)
+	// The interval check does not run in this test.
+	h.cfg.CredentialInterval = time.Hour
+	authFile := filepath.Join(h.stateDir, "codex-home", "auth.json")
+	h.agent.onSessionNew = func() {
+		if err := os.WriteFile(authFile, []byte(`{"tokens":"refreshed"}`), 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	h.run()
+	h.waitIdle()
+	h.waitFor(0, "credential_update 1", func(e *sandcrewv1.BridgeEvent) bool {
+		return e.GetCredentialUpdate().GetRevision() == 1
+	})
+	h.checkLog()
+}
+
 func TestCodexAPIKeyAuthenticates(t *testing.T) {
 	h := newHarness(t, func(h *harness, start *sandcrewv1.BridgeStartConfig) {
 		start.Vendor = sandcrewv1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX

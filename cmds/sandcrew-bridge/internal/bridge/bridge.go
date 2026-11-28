@@ -346,6 +346,14 @@ func (b *Bridge) startAgent(ctx context.Context, startErr error) (ExitCode, bool
 		return fail(sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_CREDENTIAL_MISSING, err.Error())
 	}
 
+	// The credential baseline is read before the agent starts, so a
+	// refresh during initialize or session/new is a change.
+	var credWatcher *credwatch.Watcher
+	var credWatchErr error
+	if launch.CredentialFile != "" {
+		credWatcher, credWatchErr = credwatch.New(launch.CredentialFile, b.cfg.CredentialInterval)
+	}
+
 	installed, err := b.cfg.Install(ctx, b.start.GetVendor())
 	if err != nil {
 		kind := sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_AGENT_INSTALL_FAILED
@@ -416,7 +424,7 @@ func (b *Bridge) startAgent(ctx context.Context, startErr error) (ExitCode, bool
 		b.applyConfigOption(option.GetConfigOptionId(), option.GetValueId())
 	}
 	if launch.CredentialFile != "" {
-		b.watchCredential(ctx, launch.CredentialFile)
+		b.watchCredential(ctx, credWatcher, credWatchErr)
 	}
 	if b.failed() {
 		return ExitEventLogFailed, false
@@ -945,12 +953,13 @@ func (b *Bridge) optionRejected(message string) {
 	b.emitError(sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_OPTION_REJECTED, message)
 }
 
-func (b *Bridge) watchCredential(ctx context.Context, path string) {
+// watchCredential runs watcher, which was created with err before the
+// agent started.
+func (b *Bridge) watchCredential(ctx context.Context, watcher *credwatch.Watcher, err error) {
 	watchFailed := func(err error) {
 		b.logger.Warn("credential watch failed", "error_kind", "CREDENTIAL_WATCH_FAILED", "error", err)
 		b.emitError(sandcrewv1.BridgeErrorKind_BRIDGE_ERROR_KIND_CREDENTIAL_WATCH_FAILED, "the credential file cannot be watched")
 	}
-	watcher, err := credwatch.New(path, b.cfg.CredentialInterval)
 	if err != nil {
 		watchFailed(err)
 		return

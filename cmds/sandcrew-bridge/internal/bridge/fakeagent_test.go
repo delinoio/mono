@@ -56,6 +56,8 @@ type fakeAgent struct {
 	exitCode      int
 	exitSignal    string
 	withoutModes  bool
+	// onSessionNew runs before the session/new answer.
+	onSessionNew func()
 	// rejectModes are offered modes that session/set_mode rejects.
 	rejectModes    []string
 	failSessionNew bool
@@ -231,6 +233,9 @@ func (f *fakeAgent) handle(m rpc) {
 		f.mu.Unlock()
 		f.reply(m.ID, map[string]any{})
 	case "session/new":
+		if f.onSessionNew != nil {
+			f.onSessionNew()
+		}
 		if f.failSessionNew {
 			f.replyError(m.ID, -32000, "Authentication required")
 			return

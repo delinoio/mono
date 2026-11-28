@@ -93,8 +93,8 @@ type Handlers struct {
 	PollingOnly func(error)
 }
 
-// Run checks the file after notifications and at the interval until ctx
-// ends.
+// Run checks the file at once, then after notifications and at the
+// interval until ctx ends. The first check finds a change since New.
 func (w *Watcher) Run(ctx context.Context, handlers Handlers) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -129,6 +129,7 @@ func (w *Watcher) Run(ctx context.Context, handlers Handlers) {
 		}
 	}
 	name := filepath.Base(w.path)
+	check()
 	for {
 		select {
 		case <-ctx.Done():

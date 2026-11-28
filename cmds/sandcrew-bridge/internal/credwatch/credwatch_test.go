@@ -63,6 +63,31 @@ func TestRunReportsTheFirstErrorOnce(t *testing.T) {
 	}
 }
 
+func TestRunReportsAChangeSinceNew(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := New(path, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The agent refreshes the file before Run starts.
+	if err := os.WriteFile(path, []byte("two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var revision uint64
+	w.Run(ctx, Handlers{
+		Change: func(r uint64) { revision = r; cancel() },
+		Error:  func(err error) { t.Errorf("check failed: %v", err) },
+	})
+	if revision != 1 {
+		t.Fatalf("revision %d, want 1", revision)
+	}
+}
+
 func TestRunChecksAfterNotifications(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.json")
 	if err := os.WriteFile(path, []byte("one"), 0o600); err != nil {
