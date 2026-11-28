@@ -1049,6 +1049,38 @@ describe("billing", () => {
 });
 
 describe("agent version policy", () => {
+  test("preserves the saved pin when a new pin exceeds 64 UTF-8 bytes", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+
+    const version = screen.getByRole("textbox", "Pinned version");
+    const save = screen.getByRole("button", "Save policy");
+    const notifications = screen.getByRole("region", "Notifications");
+    const saved = notifications.getByText("The agent version policy is saved.");
+    const acceptedVersion = "a" + "界".repeat(21);
+    await screen.getByRole("radio", "Pin a version").tap();
+    await version.fill(acceptedVersion);
+    await save.tap();
+    await expect(saved).toBeVisible();
+    await expect(saved).toBeHidden();
+
+    const oversizedVersion = "界".repeat(22);
+    await version.fill(oversizedVersion);
+    await save.tap();
+    await expect(notifications).toContainText(
+      "invalid pinned_version: a version is required for PIN",
+    );
+    await expect(version).toHaveValue(oversizedVersion);
+
+    await screen.getByRole("link", "Devices", { exact: true }).tap();
+    await screen.getByRole("link", "Settings", { exact: true }).tap();
+    await expect(version).toHaveValue(acceptedVersion);
+  });
+
   test("keeps a rejected pin as a draft and lets the admin save a correction", async ({
     app,
     screen,
