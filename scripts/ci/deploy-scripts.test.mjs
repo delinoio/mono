@@ -2934,15 +2934,15 @@ test(
   "droplet deploy keeps the alias of a long service name a valid DNS label",
   { skip: skipDroplet },
   (t) => {
-    // The service name may have 63 characters, and cutting the name can leave a
-    // trailing hyphen.
-    const services = [
-      "a".repeat(63),
-      `${"b".repeat(34)}-${"c".repeat(28)}`,
-      "d".repeat(36),
-      "api",
+    const deploymentId = dropletDeploymentUuid.replaceAll("-", "");
+    const cases = [
+      ["a".repeat(63), "a".repeat(30)],
+      [`${"b".repeat(29)}-${"c".repeat(33)}`, "b".repeat(29)],
+      [`${"b".repeat(28)}--${"c".repeat(33)}`, "b".repeat(28)],
+      ["d".repeat(36), "d".repeat(30)],
+      ["api", "api"],
     ];
-    for (const service of services) {
+    for (const [service, expectedPrefix] of cases) {
       const result = runDroplet(
         t,
         [service, dropletImage, "8080", "api.example.com", "http1", "none"],
@@ -2950,17 +2950,14 @@ test(
       );
       assert.equal(result.status, 0, `${service}: ${result.stderr}`);
       const run = result.calls.find((call) => call.startsWith("docker run"));
-      const alias = run.match(/--network-alias (\S+)/)[1];
+      const alias = run?.match(/--network-alias (\S+)/)?.[1];
+      assert.equal(alias, `${expectedPrefix}-${deploymentId}`, service);
       assert.match(alias, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/, service);
-      assert.ok(
-        alias.endsWith(`-${dropletDeploymentUuid.replaceAll("-", "")}`),
-      );
-      assert.ok(!alias.includes("--"), alias);
-      assert.ok(alias.startsWith(service.slice(0, 30).replace(/-+$/, "")));
-      assert.ok(
-        result
-          .read(`caddy/sites/${service}.caddy`)
-          .includes(`reverse_proxy ${alias}:8080 {`),
+      const route = result.read(`caddy/sites/${service}.caddy`);
+      assert.equal(
+        route?.match(/^[ \t]+reverse_proxy (\S+)/m)?.[1],
+        `${alias}:8080`,
+        service,
       );
     }
   },
