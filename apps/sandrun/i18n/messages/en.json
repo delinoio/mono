@@ -533,6 +533,7 @@
   "integrations.github.groupDialog.description": "GitHub's runner group settings control which repositories can use the SandRun runners.",
   "integrations.github.groupDialog.loading": "Loading runner groups",
   "integrations.github.groupDialog.label": "Runner group",
+  "integrations.github.groupDialog.placeholder": "Choose a runner group",
   "integrations.github.groupDialog.option": "{name} · {visibility}",
   "integrations.github.groupDialog.defaultOption": "{name} (default) · {visibility}",
   "integrations.agent.credential.environmentKey": "Environment key",

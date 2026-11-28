@@ -97,6 +97,7 @@ import {
   integrationPermissionFixture,
 } from "../e2e/integration-permission-fixture.ts";
 import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
+import { runnerGroupFixture } from "../e2e/runner-group-transport.ts";
 import {
   linkedSetupTransport,
   setupWithGitHubInstallations,
@@ -6229,46 +6230,150 @@ describe("failed query refreshes", () => {
     }
   });
 
-  test("keeps the selected runner group after a refresh fails inside the dialog", async () => {
-    const fixture = queryFixture("ListGitHubRunnerGroups");
-    const client = renderConsole(
-      `/orgs/${MOCK_IDS.acme}/integrations`,
-      fixture,
-    );
-    const firstInstallation = within(
-      await screen.findByRole("list", { name: "GitHub installations" }),
-    ).getAllByRole("listitem")[0]!;
-    await click(
-      within(firstInstallation).getByRole("button", {
-        name: "Change runner group",
-      }),
-    );
-    const dialog = screen.getByRole("dialog");
-    const group = await within(dialog).findByRole("combobox", {
-      name: "Runner group",
-    });
+  describe("the runner group picker", () => {
     const selectedGroup = "sandrun-private · selected";
-    expect(group.textContent).toBe("Default (default) · all");
-    await click(group);
-    await click(await screen.findByRole("option", { name: selectedGroup }));
-    expect(group.textContent).toBe(selectedGroup);
+    const defaultGroup = "Default (default) · all";
+    const prompt = "Choose a runner group";
 
-    fixture.fail(new ConnectError("offline", Code.Internal));
-    await refetch(client);
+    async function openGroupDialog(transport: Transport) {
+      const client = renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, {
+        transport,
+      });
+      const installation = within(
+        await screen.findByRole("list", { name: "GitHub installations" }),
+      ).getAllByRole("listitem")[0]!;
+      await click(
+        within(installation).getByRole("button", {
+          name: "Change runner group",
+        }),
+      );
+      const dialog = screen.getByRole("dialog");
+      return {
+        client,
+        dialog,
+        save: within(dialog).getByRole("button", { name: "Save" }),
+        form: dialog.querySelector("form")!,
+        findGroup: () =>
+          within(dialog).findByRole("combobox", { name: "Runner group" }),
+      };
+    }
 
-    await within(dialog).findByText(refreshNotice);
-    expect(within(dialog).getByRole("combobox", { name: "Runner group" })).toBe(
-      group,
-    );
-    expect(group.textContent).toBe(selectedGroup);
-    fixture.fail(undefined);
-    await click(within(dialog).getByRole("button", { name: "Try again" }));
-    expect(screen.getByRole("dialog")).toBe(dialog);
-    expect(within(dialog).queryByText(refreshNotice)).toBeNull();
-    expect(
-      within(dialog).getByRole("combobox", { name: "Runner group" })
-        .textContent,
-    ).toBe(selectedGroup);
+    async function choose(group: HTMLElement, name: string) {
+      await click(group);
+      await click(await screen.findByRole("option", { name }));
+    }
+
+    test("requires a new choice after a successful refresh removes the selected group", async () => {
+      const fixture = runnerGroupFixture(createMockTransport());
+      const { client, dialog, save, form, findGroup } = await openGroupDialog(
+        fixture.transport,
+      );
+      const group = await findGroup();
+      await choose(group, selectedGroup);
+
+      fixture.setGroups([1n]);
+      await refetch(client);
+
+      await waitFor(() => expect(group.textContent).toBe(prompt));
+      expect((save as HTMLButtonElement).disabled).toBe(true);
+      await click(group);
+      expect(screen.queryByRole("option", { name: selectedGroup })).toBeNull();
+      await act(async () => {
+        fireEvent.submit(form);
+      });
+      expect(fixture.updates).toHaveLength(0);
+
+      fixture.setGroups();
+      await refetch(client);
+      await screen.findByRole("option", { name: selectedGroup });
+      expect(group.textContent).toBe(prompt);
+      expect((save as HTMLButtonElement).disabled).toBe(true);
+
+      await click(screen.getByRole("option", { name: defaultGroup }));
+      await click(save);
+      await waitFor(() => expect(dialog.isConnected).toBe(false));
+      expect(fixture.updates).toEqual([
+        expect.objectContaining({
+          organizationId: MOCK_IDS.acme,
+          installationId: MOCK_IDS.installation,
+          githubRunnerGroupId: 1n,
+        }),
+      ]);
+    });
+
+    for (const [scenario, ids] of [
+      ["the saved group is absent", [1n]],
+      ["the list is empty", []],
+    ] as const) {
+      test(`blocks submission when ${scenario} on first load`, async () => {
+        const mock = createMockTransport();
+        await createClient(GitHubService, mock).updateGitHubInstallation({
+          organizationId: MOCK_IDS.acme,
+          installationId: MOCK_IDS.installation,
+          githubRunnerGroupId: 7n,
+        });
+        const fixture = runnerGroupFixture(mock);
+        fixture.setGroups(ids);
+        const { save, form, findGroup } = await openGroupDialog(
+          fixture.transport,
+        );
+
+        expect((await findGroup()).textContent).toBe(prompt);
+        expect((save as HTMLButtonElement).disabled).toBe(true);
+        await act(async () => {
+          fireEvent.submit(form);
+        });
+        expect(fixture.updates).toHaveLength(0);
+      });
+    }
+
+    test("keeps a current selection through a transient failure and a successful retry", async () => {
+      const fixture = runnerGroupFixture(createMockTransport());
+      const { client, dialog, save, findGroup } = await openGroupDialog(
+        fixture.transport,
+      );
+      const group = await findGroup();
+      expect(group.textContent).toBe(defaultGroup);
+      await choose(group, selectedGroup);
+
+      fixture.fail(Code.Internal);
+      await refetch(client);
+
+      await within(dialog).findByText(refreshNotice);
+      expect(await findGroup()).toBe(group);
+      expect(group.textContent).toBe(selectedGroup);
+      expect((save as HTMLButtonElement).disabled).toBe(false);
+
+      fixture.fail();
+      await click(within(dialog).getByRole("button", { name: "Try again" }));
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(within(dialog).queryByText(refreshNotice)).toBeNull();
+      expect(group.textContent).toBe(selectedGroup);
+      await click(save);
+      await waitFor(() => expect(dialog.isConnected).toBe(false));
+      expect(fixture.updates).toEqual([
+        expect.objectContaining({ githubRunnerGroupId: 7n }),
+      ]);
+    });
+
+    test("blocks submission when a terminal refresh error hides a cached list", async () => {
+      const fixture = runnerGroupFixture(createMockTransport());
+      const { client, dialog, save, form, findGroup } = await openGroupDialog(
+        fixture.transport,
+      );
+      await findGroup();
+
+      fixture.fail(Code.PermissionDenied);
+      await refetch(client);
+
+      await within(dialog).findByRole("alert");
+      expect(within(dialog).queryByRole("combobox")).toBeNull();
+      expect((save as HTMLButtonElement).disabled).toBe(true);
+      await act(async () => {
+        fireEvent.submit(form);
+      });
+      expect(fixture.updates).toHaveLength(0);
+    });
   });
 
   const infiniteLists = [

@@ -533,6 +533,7 @@
   "integrations.github.groupDialog.description": "GitHub의 러너 그룹 설정에 따라 SandRun 러너를 사용할 수 있는 리포지토리가 결정됩니다.",
   "integrations.github.groupDialog.loading": "러너 그룹을 불러오는 중",
   "integrations.github.groupDialog.label": "러너 그룹",
+  "integrations.github.groupDialog.placeholder": "러너 그룹 선택",
   "integrations.github.groupDialog.option": "{name} · {visibility}",
   "integrations.github.groupDialog.defaultOption": "{name} (기본값) · {visibility}",
   "integrations.agent.credential.environmentKey": "환경 키",

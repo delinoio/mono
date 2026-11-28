@@ -533,6 +533,7 @@
   "integrations.github.groupDialog.description": "GitHub 的运行器组设置决定哪些仓库可以使用 SandRun 运行器。",
   "integrations.github.groupDialog.loading": "正在加载运行器组",
   "integrations.github.groupDialog.label": "运行器组",
+  "integrations.github.groupDialog.placeholder": "选择运行器组",
   "integrations.github.groupDialog.option": "{name} · {visibility}",
   "integrations.github.groupDialog.defaultOption": "{name}（默认）· {visibility}",
   "integrations.agent.credential.environmentKey": "环境密钥",
