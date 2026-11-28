@@ -318,8 +318,9 @@ func TestReconcilePendingAdjustmentsIsExactlyOnce(t *testing.T) {
 	now := f.clock.Now()
 	acct := f.account()
 	oldReleaseGrant(t, f.db, acct, "txn_buy", 10*usd, now)
-	insertPending(t, f.db, "adj_a", "txn_buy", "refund", 6*usd, now)
-	insertPending(t, f.db, "adj_b", "txn_buy", "chargeback", 6*usd, now.Add(time.Second))
+	// The earlier adjustment sorts after the later one by ID.
+	insertPending(t, f.db, "adj_b", "txn_buy", "refund", 6*usd, now)
+	insertPending(t, f.db, "adj_a", "txn_buy", "chargeback", 6*usd, now.Add(time.Second))
 	if err := f.s.ReconcilePendingAdjustments(ctx()); err != nil {
 		t.Fatal(err)
 	}
@@ -330,6 +331,26 @@ func TestReconcilePendingAdjustmentsIsExactlyOnce(t *testing.T) {
 	)
 	if f.pendingCount() != 0 || f.refundCount() != 2 {
 		t.Fatalf("pending %d, refunds %d", f.pendingCount(), f.refundCount())
+	}
+	if balance := f.balance(acct); balance != 0 {
+		t.Errorf("balance = %d micro-USD, want 0", balance)
+	}
+	for _, want := range []struct {
+		id              string
+		amountUSDMicros int64
+	}{
+		{"adj_b", 6 * usd},
+		{"adj_a", 4 * usd},
+	} {
+		var amountUSDMicros int64
+		err := f.db.Pool.QueryRow(ctx(), `SELECT amount_usd_micros FROM credit_refunds
+			WHERE paddle_adjustment_id = $1`, want.id).Scan(&amountUSDMicros)
+		if err != nil {
+			t.Fatalf("read refund for %s: %v", want.id, err)
+		}
+		if amountUSDMicros != want.amountUSDMicros {
+			t.Errorf("refund for %s = %d micro-USD, want %d", want.id, amountUSDMicros, want.amountUSDMicros)
+		}
 	}
 
 	// A pending row left behind although credit_refunds applied it (for
