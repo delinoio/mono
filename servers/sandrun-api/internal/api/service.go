@@ -65,9 +65,10 @@ type DisplayNameSource interface {
 // The service runs as one replica, so in-memory buckets are service-wide.
 type Limits struct {
 	// PerPrefix limits AcceptInvitation per invitation display prefix and
-	// failed personal API key authentications per key display prefix (10
-	// per minute, burst 10). Keys are namespaced ("invitation:",
-	// "apikey:").
+	// personal API key failures per key display prefix (10 per minute,
+	// burst 10). After a failed key validation, authentication charges the
+	// client bucket when present, then checks this bucket. Keys use the
+	// "invitation:" and "apikey:" namespaces.
 	PerPrefix *ratelimit.Limiter
 	// PerUser limits AcceptInvitation per user and the OwnSand link
 	// validation of SetOwnSandLink per user (10 per minute, burst 10). Keys
