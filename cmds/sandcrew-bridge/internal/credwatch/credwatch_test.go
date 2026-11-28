@@ -40,6 +40,32 @@ func TestCheckReportsContentChangesOnly(t *testing.T) {
 	check(true, 2)
 }
 
+func TestCheckFindsARewriteWithTheSameTimeAndSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := New(path, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A quick rewrite can keep the modification time, for example on
+	// Windows.
+	if err := os.WriteFile(path, []byte("two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if changed, revision, err := w.Check(); err != nil || !changed || revision != 1 {
+		t.Fatalf("Check() = %v, %d, %v; want a change with revision 1", changed, revision, err)
+	}
+}
+
 func TestRunReportsTheFirstErrorOnce(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "auth.json")

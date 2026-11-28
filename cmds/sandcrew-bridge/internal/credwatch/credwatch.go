@@ -2,8 +2,7 @@
 
 // Package credwatch detects changes of a credential file (the Codex
 // `auth.json`), which the agent rewrites when it refreshes its token. It
-// compares the modification time and the SHA-256 of the content and never
-// exposes the content. It checks the file after each file system
+// compares the SHA-256 of the content and never exposes the content. It checks the file after each file system
 // notification for it and at a fixed interval. The owning contract is
 // docs/cmds-sandcrew-bridge-foundation.md#credential-updates.
 package credwatch
@@ -30,10 +29,8 @@ const Interval = 10 * time.Second
 const Debounce = 200 * time.Millisecond
 
 type state struct {
-	exists  bool
-	modTime time.Time
-	size    int64
-	digest  [sha256.Size]byte
+	exists bool
+	digest [sha256.Size]byte
 }
 
 // Watcher watches one file.
@@ -52,7 +49,7 @@ func New(path string, interval time.Duration) (*Watcher, error) {
 		interval = Interval
 	}
 	w := &Watcher{path: path, interval: interval, debounce: Debounce}
-	current, err := w.read(state{})
+	current, err := w.read()
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +62,7 @@ func New(path string, interval time.Duration) (*Watcher, error) {
 // same content is not a change. A deleted file is not a change either; its
 // next content is compared with the last content.
 func (w *Watcher) Check() (changed bool, revision uint64, err error) {
-	current, err := w.read(w.last)
+	current, err := w.read()
 	if err != nil {
 		return false, w.revision, err
 	}
@@ -171,9 +168,11 @@ func (w *Watcher) notify() (*fsnotify.Watcher, error) {
 	return watcher, nil
 }
 
-// read returns the state of the file. It hashes the content only when the
-// modification time or the size differs from previous.
-func (w *Watcher) read(previous state) (state, error) {
+// read returns the state of the file. It hashes the content at every
+// check: the file is small, and the modification time can stay the same
+// after a quick rewrite with the same size (on Windows, for example), so
+// the time and the size cannot show a change.
+func (w *Watcher) read() (state, error) {
 	info, err := os.Stat(w.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return state{}, nil
@@ -181,11 +180,10 @@ func (w *Watcher) read(previous state) (state, error) {
 	if err != nil {
 		return state{}, err
 	}
-	current := state{exists: true, modTime: info.ModTime(), size: info.Size()}
-	if previous.exists && previous.modTime.Equal(current.modTime) && previous.size == current.size {
-		current.digest = previous.digest
-		return current, nil
+	if info.IsDir() {
+		return state{}, errors.New("credwatch: the credential path is a directory")
 	}
+	current := state{exists: true}
 	f, err := os.Open(w.path)
 	if err != nil {
 		return state{}, err
