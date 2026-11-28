@@ -6457,6 +6457,8 @@ describe("invitations", () => {
 
 describe("settings", () => {
   const limitPath = "max_dev_sessions_per_user";
+  const limitError =
+    "Enter a whole number of at least 1, or clear the field for no limit.";
 
   async function openLimitForm(initial: number | null) {
     const organizationId = MOCK_IDS.globex;
@@ -6599,6 +6601,49 @@ describe("settings", () => {
     await waitFor(() => expect(save.disabled).toBe(true));
     await act(async () => fireEvent.submit(input.form!));
     expect(calls).toHaveLength(0);
+  });
+
+  test.each([
+    [5, "0"],
+    [5, "1.5"],
+    [1, "0"],
+    [5, "2147483648"],
+  ])("rejects typed %s limit edits of %s", async (stored, invalid) => {
+    const { input, save, calls } = await openLimitForm(stored);
+    await type(input, invalid);
+    expect(save.disabled).toBe(false);
+    await act(async () => fireEvent.blur(input));
+    expect(input.value).toBe(invalid);
+    await act(async () => fireEvent.submit(input.form!));
+    expect(screen.getByText(limitError)).toBeTruthy();
+    expect(calls).toHaveLength(0);
+
+    await type(input, String(stored));
+    expect(screen.queryByText(limitError)).toBeNull();
+    expect(save.disabled).toBe(true);
+    await act(async () => fireEvent.submit(input.form!));
+    expect(calls).toHaveLength(0);
+  });
+
+  test("keeps an invalid draft through a refresh and saves an exact correction", async () => {
+    const { input, save, calls, refetch, settleSave } = await openLimitForm(5);
+    await type(input, "0");
+    await refetch(1);
+    expect(input.value).toBe("0");
+    await act(async () => fireEvent.submit(input.form!));
+    expect(screen.getByText(limitError)).toBeTruthy();
+    expect(calls).toHaveLength(0);
+
+    await type(input, "2147483647");
+    expect(screen.queryByText(limitError)).toBeNull();
+    await click(save);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toMatchObject({
+      settings: { maxDevSessionsPerUser: 2_147_483_647 },
+      updateMask: { paths: [limitPath] },
+    });
+    await settleSave();
+    expect(save.disabled).toBe(true);
   });
 
   test("saves a draft after a refresh and follows later confirmed limits", async () => {

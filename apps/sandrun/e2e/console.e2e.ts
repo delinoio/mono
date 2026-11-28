@@ -533,6 +533,74 @@ describe("organization layout", () => {
 });
 
 describe("organization settings", () => {
+  for (const [stored, invalid] of [
+    [5, "0"],
+    [5, "1.5"],
+    [1, "0"],
+    [1, "1.5"],
+  ] as const) {
+    test(`keeps invalid draft ${invalid} when the saved limit is ${stored}`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await expect(screen.getByRole("link", "Globex Admin")).toBeVisible();
+      await browser.evaluate((initial) => {
+        sessionStorage.setItem("sandrun-e2e-settings-limit", String(initial));
+        return null;
+      }, stored);
+      await app.open(`/orgs/${GLOBEX}/settings`);
+
+      const input = screen.getByLabel("Limit per user");
+      const save = screen.getByRole("button", "Save limit");
+      const error = screen
+        .getByRole("region", "Dev sessions per user")
+        .getByText(
+          "Enter a whole number of at least 1, or clear the field for no limit.",
+        );
+      const updates = () =>
+        browser.evaluate(() => window.sandrunSettingsUpdates ?? null);
+      await expect(input).toHaveValue(String(stored));
+      await input.fill(invalid);
+      await browser.keyboard.press("Tab");
+      await expect(input).toHaveValue(invalid);
+      await save.tap();
+      await expect(error).toBeVisible();
+      expect(await updates()).toEqual([]);
+      await app.screenshot(`settings-${stored}-invalid-${invalid}-after-tab`);
+
+      await input.fill("4");
+      await expect(error).toBeHidden();
+      await input.fill(invalid);
+      await browser.keyboard.press("Enter");
+      await expect(input).toHaveValue(invalid);
+      await expect(error).toBeVisible();
+      expect(await updates()).toEqual([]);
+      await app.screenshot(`settings-${stored}-invalid-${invalid}-after-enter`);
+
+      await input.fill("4");
+      await expect(error).toBeHidden();
+      await expect(save).toBeEnabled();
+      await save.tap();
+      await expect(save).toBeDisabled();
+      await expect(input).toHaveValue("4");
+
+      await input.fill("");
+      await save.tap();
+      await expect(save).toBeDisabled();
+      await expect(input).toHaveValue("");
+      expect(await updates()).toEqual([
+        {
+          settings: { maxDevSessionsPerUser: 4 },
+          paths: ["max_dev_sessions_per_user"],
+        },
+        { settings: {}, paths: ["max_dev_sessions_per_user"] },
+      ]);
+    });
+  }
+
   test("enables saving only when the admin edits the limit", async ({
     app,
     browser,
