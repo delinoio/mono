@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -680,24 +681,41 @@ func TestLegacyWriterTrigger(t *testing.T) {
 	}
 }
 
-// waitForLockWaiters polls until n lock requests of the test database wait,
-// so a test can order the sessions deterministically.
-func waitForLockWaiters(t *testing.T, ctx context.Context, d *db.DB, n int) {
+// waitForOrganizationLock returns the PID of the session waiting behind
+// blockerPID for a lock on organizations in this database.
+func waitForOrganizationLock(t *testing.T, ctx context.Context, observer *pgx.Conn, blockerPID int32, operation string) int32 {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
 	for {
-		var waiting int
-		if err := d.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE NOT granted AND locktype = 'relation'
-			AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&waiting); err != nil {
-			t.Fatal(err)
+		var waiterPID int32
+		err := observer.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE NOT granted AND locktype = 'relation'
+			AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+			AND relation = 'organizations'::regclass AND $1 = ANY(pg_blocking_pids(pid))`, blockerPID).Scan(&waiterPID)
+		if err == nil {
+			t.Logf("observed %s (backend %d blocked by %d)", operation, waiterPID, blockerPID)
+			return waiterPID
 		}
-		if waiting == n {
-			return
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("observe %s: %v", operation, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d lock requests wait, want %d", waiting, n)
+		select {
+		case <-ctx.Done():
+			t.Fatalf("observe %s: %v", operation, ctx.Err())
+		case <-tick.C:
 		}
-		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForMigrationTestWorker(t *testing.T, ctx context.Context, done <-chan error, operation string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s: %v", operation, err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for %s to finish: %v", operation, ctx.Err())
 	}
 }
 
@@ -707,8 +725,10 @@ func waitForLockWaiters(t *testing.T, ctx context.Context, d *db.DB, n int) {
 // and one insert that arrives while the migration waits. Both organizations
 // end with exactly one unlinked status row.
 func TestLegacyWriterMigrationWithConcurrentCreates(t *testing.T) {
-	ctx := context.Background()
-	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, legacyWriterMigration-1))
+	url := dbtest.NewURLAtVersion(t, legacyWriterMigration-1)
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	d, err := db.Open(ctx, url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,48 +737,64 @@ func TestLegacyWriterMigrationWithConcurrentCreates(t *testing.T) {
 	early, late := "018f0000-0000-7000-8000-0000000000e1", "018f0000-0000-7000-8000-0000000000e2"
 	earlyCreate, lateCreate := applied.Add(-time.Hour), applied.Add(time.Hour)
 
+	// Both writers can occupy the entire pool. Observe their locks through a
+	// separate connection to the same fixture database.
+	observeCtx, cancelObservation := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelObservation()
+	observer, err := pgx.ConnectConfig(observeCtx, d.Pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatalf("connect observer for migration and late insert lock waits: %v", err)
+	}
+	defer func() {
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelClose()
+		if err := observer.Close(closeCtx); err != nil {
+			t.Errorf("close lock observer: %v", err)
+		}
+	}()
+
 	// Session 1: a legacy create whose transaction is still open.
 	tx, err := d.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelRollback()
+		if err := tx.Rollback(rollbackCtx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Errorf("roll back early insert: %v", err)
+		}
+		// The workers use ctx. Join them before the fixture closes the pool.
+		workers.Wait()
+	}()
 	if _, err := tx.Exec(ctx, legacyOrg, early, earlyCreate); err != nil {
-		t.Fatal(err)
+		t.Fatalf("insert early organization: %v", err)
 	}
 
 	// The migration waits for the lock behind the open insert.
 	migrated := make(chan error, 1)
-	go func() { migrated <- d.Migrate(ctx, testenv.Discard()) }()
-	waitForLockWaiters(t, ctx, d, 1)
+	workers.Go(func() { migrated <- d.Migrate(ctx, testenv.Discard()) })
+	migrationPID := waitForOrganizationLock(t, observeCtx, observer, int32(tx.Conn().PgConn().PID()), "migration waiting for the early insert")
 
 	// Session 2: a legacy create that arrives while the migration waits
 	// queues behind the migration's lock request.
 	created := make(chan error, 1)
-	go func() {
+	workers.Go(func() {
 		_, err := d.Pool.Exec(ctx, legacyOrg, late, lateCreate)
 		created <- err
-	}()
-	waitForLockWaiters(t, ctx, d, 2)
-	select {
-	case err := <-migrated:
-		t.Fatalf("the migration finished while a legacy create was open: %v", err)
-	case err := <-created:
-		t.Fatalf("a legacy create finished while the migration waited: %v", err)
-	case <-time.After(200 * time.Millisecond):
-	}
+	})
+	waitForOrganizationLock(t, observeCtx, observer, migrationPID, "late insert waiting for the migration")
+	cancelObservation()
 
 	// Session 1 commits: the migration backfills its organization, and the
 	// waiting create runs after the migration with the trigger installed.
 	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+		t.Fatalf("commit early insert: %v", err)
 	}
-	if err := <-migrated; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-created; err != nil {
-		t.Fatal(err)
-	}
+	waitForMigrationTestWorker(t, ctx, migrated, "migration")
+	waitForMigrationTestWorker(t, ctx, created, "late insert")
 	wantBlocked(t, readBilling(t, ctx, d.Pool, early), applied)
 	wantBlocked(t, readBilling(t, ctx, d.Pool, late), lateCreate)
 	var orgs, rows int
