@@ -896,8 +896,12 @@ func TestLinkOrganizationLogsCommittedChanges(t *testing.T) {
 		Message: "billing_organization_linked", Level: "INFO", BillingAccountID: accountID,
 		Service: "ownsand", OrganizationID: org, ActorUserID: owner.ID,
 	}
-	if got := organizationLinkLogs(t, env.Logs.String()[offset:]); len(got) != 1 || got[0] != wantLink {
+	logs := env.Logs.String()[offset:]
+	if got := organizationLinkLogs(t, logs); len(got) != 1 || got[0] != wantLink {
 		t.Errorf("link logs = %+v, want one %+v", got, wantLink)
+	}
+	if got := strings.Count(logs, `"msg":"billing_organization_blocked"`); got != 1 {
+		t.Errorf("blocked status logs = %d, want 1", got)
 	}
 
 	offset = len(env.Logs.String())
@@ -992,6 +996,9 @@ func TestLinkOrganizationDoesNotLogRolledBackChanges(t *testing.T) {
 			}
 			if got := organizationLinkLogs(t, logs); len(got) != 0 {
 				t.Errorf("rolled-back change logs = %+v, want none", got)
+			}
+			if got := strings.Count(logs, `"msg":"billing_organization_blocked"`); got != 0 {
+				t.Errorf("rolled-back blocked status logs = %d, want 0", got)
 			}
 			if n := auditRecordCount(logs, tc.kind); n != 0 {
 				t.Errorf("audit logs = %d, want 0", n)

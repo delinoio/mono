@@ -190,7 +190,7 @@ func testPaddleWebhookAcrossSuspensionDeadline(t *testing.T, workerSuspends bool
 	signature := paddle.SignatureHeaderValue(whSecret, startedAt, body)
 	response := make(chan int, 1)
 	wantSequence := blocked.Sequence + 1
-	f.tx(func(tx pgx.Tx) error {
+	if err := f.s.InObservedTx(ctx(), func(tx pgx.Tx, observations *TxObservations) error {
 		if err := LockAccount(ctx(), tx, accountID); err != nil {
 			return err
 		}
@@ -202,7 +202,7 @@ func testPaddleWebhookAcrossSuspensionDeadline(t *testing.T, workerSuspends bool
 		if workerSuspends {
 			// Use the holding transaction to record the suspension before
 			// the waiting webhook can acquire the account lock.
-			if err := f.s.SyncStatuses(ctx(), tx, accountID); err != nil {
+			if err := f.s.SyncStatuses(ctx(), tx, observations, accountID); err != nil {
 				return err
 			}
 			suspended, ok, err := CurrentStatus(ctx(), tx, "ownsand", org)
@@ -211,7 +211,9 @@ func testPaddleWebhookAcrossSuspensionDeadline(t *testing.T, workerSuspends bool
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if code := <-response; code != http.StatusOK {
 		t.Fatalf("waiting subscription webhook: status %d", code)
 	}

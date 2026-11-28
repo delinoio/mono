@@ -914,8 +914,8 @@ func TestRefundAndSettings(t *testing.T) {
 		txnID = e.GetPaddleTransactionId()
 	}
 	// The usage-report API deducts through billing.Deduct.
-	if err := env.DB.InTx(ctx(), func(tx pgx.Tx) error {
-		_, err := env.Billing.Deduct(ctx(), tx, billing.Deduction{BillingAccountID: f.AccountID, AmountUSDMicros: 4 * usd})
+	if err := env.Billing.InObservedTx(ctx(), func(tx pgx.Tx, observations *billing.TxObservations) error {
+		_, err := env.Billing.Deduct(ctx(), tx, observations, billing.Deduction{BillingAccountID: f.AccountID, AmountUSDMicros: 4 * usd})
 		return err
 	}); err != nil {
 		t.Fatal(err)

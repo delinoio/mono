@@ -135,7 +135,7 @@ func (s *Service) webhookRejected(ctx context.Context, w http.ResponseWriter, st
 // applyEvent records the event ID and applies the event in one transaction.
 func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome, error) {
 	var out eventOutcome
-	err := s.inTopUpTx(ctx, func(tx pgx.Tx, observations *topUpObservations) error {
+	err := s.InObservedTx(ctx, func(tx pgx.Tx, observations *TxObservations) error {
 		now := s.timestamp()
 		out = eventOutcome{}
 		tag, err := tx.Exec(ctx, `INSERT INTO paddle_events (paddle_event_id, event_type, occurred_at, result, process_time)
@@ -166,7 +166,7 @@ func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome
 		if out.BillingAccountID != "" {
 			// Read the clock again with the account lock held, since a
 			// suspension can become due while the webhook waits for it.
-			if err := s.SyncStatuses(ctx, tx, out.BillingAccountID); err != nil {
+			if err := s.SyncStatuses(ctx, tx, observations, out.BillingAccountID); err != nil {
 				return err
 			}
 		}
@@ -318,7 +318,7 @@ func loadTopUpForCharge(ctx context.Context, tx pgx.Tx, accountID, topUpID strin
 
 // onTransactionCompleted adds the tax-exclusive credit of a completed
 // purchase. A subscription payment grants at most $10.
-func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, observations *topUpObservations, ev paddle.Event, now time.Time) (eventOutcome, error) {
+func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, observations *TxObservations, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var txn paddle.Transaction
 	if err := json.Unmarshal(ev.Data, &txn); err != nil || txn.ID == "" {
 		return eventOutcome{Result: webhookInvalidPayload}, nil
@@ -456,7 +456,7 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, observa
 // its top-up, and a failed renewal of the subscription emails the owners and
 // admins. Failed attempts inside the checkout are ignored; the user sees
 // them there.
-func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, observations *topUpObservations, ev paddle.Event, now time.Time) (eventOutcome, error) {
+func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, observations *TxObservations, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var txn paddle.Transaction
 	if err := json.Unmarshal(ev.Data, &txn); err != nil || txn.ID == "" {
 		return eventOutcome{Result: webhookInvalidPayload}, nil
@@ -837,7 +837,7 @@ func (s *Service) pendingAdjustmentPurchases(ctx context.Context, cursor *string
 // reconcilePurchase applies the pending adjustments of one purchase that has
 // a credit grant.
 func (s *Service) reconcilePurchase(ctx context.Context, transactionID string) error {
-	return s.db.InTx(ctx, func(tx pgx.Tx) error {
+	return s.InObservedTx(ctx, func(tx pgx.Tx, observations *TxObservations) error {
 		if err := lockPurchase(ctx, tx, transactionID); err != nil {
 			return err
 		}
@@ -880,6 +880,6 @@ func (s *Service) reconcilePurchase(ctx context.Context, transactionID string) e
 			slog.Int64("balance_after_usd_micros", acct.Balance))
 		// A reversal can change the billing status of the linked
 		// organizations, like the webhook that applies one.
-		return s.syncStatuses(ctx, tx, acct.ID, now)
+		return s.syncStatuses(ctx, tx, observations, acct.ID, now)
 	})
 }

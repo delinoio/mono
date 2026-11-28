@@ -741,7 +741,7 @@ func (s *Service) ExpireGrants(ctx context.Context) error {
 		return err
 	}
 	for _, accountID := range accounts {
-		err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+		err := s.InObservedTx(ctx, func(tx pgx.Tx, observations *TxObservations) error {
 			now := s.timestamp()
 			acct, err := lockAccount(ctx, tx, accountID)
 			if err != nil {
@@ -754,7 +754,7 @@ func (s *Service) ExpireGrants(ctx context.Context) error {
 			if _, err := s.afterDecrease(ctx, tx, acct, before, now, false); err != nil {
 				return err
 			}
-			return s.syncStatuses(ctx, tx, acct.ID, now)
+			return s.syncStatuses(ctx, tx, observations, acct.ID, now)
 		})
 		if err != nil {
 			return err

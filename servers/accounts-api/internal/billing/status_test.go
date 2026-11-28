@@ -29,7 +29,7 @@ func (f *fixture) link(accountID, name string) string {
 		f.t.Fatal(err)
 	}
 	linkID, _ := uuidv7.NewString()
-	f.tx(func(tx pgx.Tx) error {
+	if err := f.s.InObservedTx(ctx(), func(tx pgx.Tx, observations *TxObservations) error {
 		if err := LockAccount(ctx(), tx, accountID); err != nil {
 			return err
 		}
@@ -38,8 +38,10 @@ func (f *fixture) link(accountID, name string) string {
 			linkID, org, accountID, name, f.s.timestamp()); err != nil {
 			return err
 		}
-		return f.s.SyncStatuses(ctx(), tx, accountID)
-	})
+		return f.s.SyncStatuses(ctx(), tx, observations, accountID)
+	}); err != nil {
+		f.t.Fatal(err)
+	}
 	return org
 }
 

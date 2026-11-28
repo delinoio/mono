@@ -199,12 +199,13 @@ func nextSequence(ctx context.Context, tx pgx.Tx, service string) (int64, error)
 // SyncStatuses recomputes the billing status of every current link of the
 // billing account in tx. The caller holds the billing account lock (a
 // SELECT ... FOR UPDATE of the billing account row in tx). A deleted billing
-// account has no current links and is left unchanged.
-func (s *Service) SyncStatuses(ctx context.Context, tx pgx.Tx, accountID string) error {
-	return s.syncStatuses(ctx, tx, accountID, s.timestamp())
+// account has no current links and is left unchanged. The transaction owner
+// flushes observations only after a successful commit.
+func (s *Service) SyncStatuses(ctx context.Context, tx pgx.Tx, observations *TxObservations, accountID string) error {
+	return s.syncStatuses(ctx, tx, observations, accountID, s.timestamp())
 }
 
-func (s *Service) syncStatuses(ctx context.Context, tx pgx.Tx, accountID string, now time.Time) error {
+func (s *Service) syncStatuses(ctx context.Context, tx pgx.Tx, observations *TxObservations, accountID string, now time.Time) error {
 	var balance, due int64
 	var deleted bool
 	var nonpayment *time.Time
@@ -272,22 +273,22 @@ func (s *Service) syncStatuses(ctx context.Context, tx pgx.Tx, accountID string,
 		next := cur
 		next.Status, next.Reason, next.BlockedSince, next.SuspendTime, next.Sequence = status, reason, blocked, suspend, seq
 		next.LastAllowedSequence = lastAllowed
-		if err := s.statusChanged(ctx, tx, cur, next, now); err != nil {
+		if err := s.queueStatusNotification(ctx, tx, cur.Status, next, now); err != nil {
 			return err
 		}
+		observations.pending = append(observations.pending, func() {
+			s.observeStatusChange(ctx, cur.Status, next)
+		})
 	}
 	return nil
 }
 
-// statusChanged logs a status change and queues the blocked or suspended
-// email. The deduplication key holds the link and the start of the block,
-// so each block of a link sends each email at most once.
-func (s *Service) statusChanged(ctx context.Context, tx pgx.Tx, from, to OrganizationStatus, now time.Time) error {
+func (s *Service) observeStatusChange(ctx context.Context, from LinkStatus, to OrganizationStatus) {
 	attrs := []slog.Attr{
 		slog.String("billing_account_id", to.BillingAccountID),
 		slog.String("service", to.Service),
 		slog.String("organization_id", to.OrganizationID),
-		slog.String("from", string(from.Status)),
+		slog.String("from", string(from)),
 		slog.String("to", string(to.Status)),
 		slog.String("reason", string(to.Reason)),
 		slog.Int64("sequence", to.Sequence),
@@ -297,18 +298,23 @@ func (s *Service) statusChanged(ctx context.Context, tx pgx.Tx, from, to Organiz
 	}
 	msg := "billing_status_changed"
 	switch {
-	case to.Status == StatusBlocked && from.Status != StatusBlocked:
+	case to.Status == StatusBlocked && from != StatusBlocked:
 		msg = "billing_organization_blocked"
-	case to.Status == StatusSuspended && from.Status != StatusSuspended:
+	case to.Status == StatusSuspended && from != StatusSuspended:
 		msg = "billing_organization_suspended"
-	case to.Status == StatusAllowed && from.Status != StatusAllowed && from.Status != "":
+	case to.Status == StatusAllowed && from != StatusAllowed && from != "":
 		msg = "billing_organization_resumed"
 	}
 	s.logger.LogAttrs(ctx, slog.LevelInfo, msg, attrs...)
-	if from.Status != to.Status {
+	if from != to.Status {
 		s.metrics.StatusChange(string(to.Status))
 	}
-	if to.Status == from.Status || to.BlockedSince == nil {
+}
+
+// queueStatusNotification deduplicates blocked and suspended emails by link
+// and block start.
+func (s *Service) queueStatusNotification(ctx context.Context, tx pgx.Tx, from LinkStatus, to OrganizationStatus, now time.Time) error {
+	if to.Status == from || to.BlockedSince == nil {
 		return nil
 	}
 	kind := NotifyOrganizationBlocked
@@ -328,12 +334,12 @@ func (s *Service) statusChanged(ctx context.Context, tx pgx.Tx, from, to Organiz
 // SyncAccount recomputes the statuses of one billing account in its own
 // transaction.
 func (s *Service) SyncAccount(ctx context.Context, accountID string) error {
-	return s.db.InTx(ctx, func(tx pgx.Tx) error {
+	return s.InObservedTx(ctx, func(tx pgx.Tx, observations *TxObservations) error {
 		acct, err := lockAccount(ctx, tx, accountID)
 		if err != nil {
 			return err
 		}
-		return s.syncStatuses(ctx, tx, acct.ID, s.timestamp())
+		return s.syncStatuses(ctx, tx, observations, acct.ID, s.timestamp())
 	})
 }
 
@@ -472,7 +478,7 @@ func (s *Service) ReadOrganizationBilling(ctx context.Context, service, organiza
 	for {
 		var snapshot OrganizationBillingSnapshot
 		var found, retry bool
-		err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+		err := s.InObservedTx(ctx, func(tx pgx.Tx, observations *TxObservations) error {
 			candidate, ok, err := CurrentStatus(ctx, tx, service, organizationID)
 			if err != nil || !ok {
 				return err
@@ -501,7 +507,7 @@ func (s *Service) ReadOrganizationBilling(ctx context.Context, service, organiza
 			blockDue := status.Status == StatusAllowed && balance <= 0
 			suspendDue := status.Status == StatusBlocked && status.SuspendTime != nil && !now.Before(*status.SuspendTime)
 			if blockDue || suspendDue {
-				if err := s.syncStatuses(ctx, tx, account.ID, now); err != nil {
+				if err := s.syncStatuses(ctx, tx, observations, account.ID, now); err != nil {
 					return err
 				}
 				status, ok, err = CurrentStatus(ctx, tx, service, organizationID)

@@ -150,6 +150,7 @@ func TestGetOrganizationBillingRechecksLinkAfterLockWait(t *testing.T) {
 			replacement := createAccount(t, f.Owner, "Replacement").GetBillingAccountId()
 
 			var response *connect.Response[accountsv1.GetOrganizationBillingResponse]
+			var observations billing.TxObservations
 			err := raceMembershipChange(t, env, f.AccountID, func(tx pgx.Tx) {
 				now := env.Clock.Now()
 				execTx(t, tx, `UPDATE organization_links SET unlink_time = $2
@@ -161,7 +162,7 @@ func TestGetOrganizationBillingRechecksLinkAfterLockWait(t *testing.T) {
 					execTx(t, tx, `INSERT INTO organization_links
 						(organization_link_id, service, organization_id, billing_account_id, organization_name, link_time)
 						VALUES ($1, 'ownsand', $2, $3, 'Replacement', $4)`, newKey(t), org, replacement, now)
-					if err := env.Billing.SyncStatuses(ctx(), tx, replacement); err != nil {
+					if err := env.Billing.SyncStatuses(ctx(), tx, &observations, replacement); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -172,6 +173,7 @@ func TestGetOrganizationBillingRechecksLinkAfterLockWait(t *testing.T) {
 				}))
 				return err
 			})
+			observations.Flush()
 			if !tc.relink {
 				wantCode(t, err, connect.CodeNotFound)
 				return
