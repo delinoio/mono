@@ -215,6 +215,9 @@ const relayDigestVectors =
 // package sources that the `.go` selector would catch).
 const goTestdata = /^(?:go|cmds|internal|servers)\/(?:.+\/)?testdata\//;
 
+// The golangci-lint configuration that the go-vet job runs.
+const golangciConfig = ".golangci.yml";
+
 // The development launcher of ownsand-api. Its test
 // TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase in
 // `servers/ownsand-api/cmd/ownsand-api` runs the launcher against a Go-built
@@ -258,6 +261,7 @@ export function isGoInput(path) {
     goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
     path === ownsandApiLauncher ||
+    path === golangciConfig ||
     goTestInputs.has(path) ||
     goTestdata.test(path) ||
     // The Go tests of a task package read its embedded data files (for

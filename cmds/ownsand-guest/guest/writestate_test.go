@@ -443,7 +443,7 @@ func TestWriteRecoveryClampsFutureLastChunk(t *testing.T) {
 	}
 }
 
-func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
+func TestWriteRecoveryKeepsReplacedFile(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
 	// that other tests read.
 	t.Run("canonical", func(t *testing.T) {
@@ -604,7 +604,7 @@ func assertWriteNotFound(t *testing.T, h *harness, chunk *ownsandv1.WriteFileReq
 	}
 }
 
-func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
+func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
 	// that other tests read.
 	h := newHarness(t, nil)
@@ -665,7 +665,7 @@ func TestWriteRecoveryFailedPromotionExpiresStagingFile(t *testing.T) {
 	assertWriteNotFound(t, h2, req, "write expired")
 }
 
-func TestWriteRecoveryFailedPromotionRetriesOnRestart(t *testing.T) {
+func TestWriteRecoveryFailedPromotionRetriesOnRestart(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
 	// that other tests read.
 	h := newHarness(t, nil)
@@ -849,7 +849,7 @@ func TestWriteRecoveryRejectsInvalidSplitTimestamp(t *testing.T) {
 	}
 }
 
-func TestWriteRecoveryDropsTempRecordWithoutStagingFile(t *testing.T) {
+func TestWriteRecoveryDropsTempRecordWithoutStagingFile(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (promoteWriteRecord)
 	// that other tests read.
 	t.Run("promoted", func(t *testing.T) {
@@ -924,7 +924,7 @@ func TestWriteRecoveryDropsRecordsWithoutStagingFile(t *testing.T) {
 	}
 }
 
-func TestWriteRecoveryRetriesStaleRecordRemoval(t *testing.T) {
+func TestWriteRecoveryRetriesStaleRecordRemoval(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (promoteWriteRecord, removeRecordFile)
 	// that other tests read.
 	for _, recordType := range []string{"canonical", "temporary"} {
@@ -1080,7 +1080,7 @@ func TestWriteFinishedRecordFailureIsRetriedBySweep(t *testing.T) {
 // (a transient I/O error, a permission denial) does not show that the file is
 // gone. The record is kept and the write is registered, so the sweep retries
 // the cleanup after the lookup works again.
-func TestWriteRecoveryKeepsRecordWhenStagingLookupFails(t *testing.T) {
+func TestWriteRecoveryKeepsRecordWhenStagingLookupFails(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (lstatStaging)
 	// that other tests read.
 	h := newHarness(t, nil)

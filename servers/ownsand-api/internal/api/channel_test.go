@@ -798,7 +798,7 @@ func TestConfigurationPushAndAgentUpdates(t *testing.T) {
 // change back to FOLLOW_DEFAULT sends the target again, a revoked running
 // version still gets the revocation recovery instead of a withdrawal, and an
 // older agent that answers UNIMPLEMENTED only produces a log line.
-func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
+func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test reads the stacks of every goroutine in the
 	// process, so goroutines of a parallel test would change its result.
 	const (
