@@ -69,6 +69,26 @@ describe("client configuration", () => {
   );
 
   test.each([
+    ["tab in the hostname", "https://ap\ti.test"],
+    ["line feed in the hostname", "https://ap\ni.test"],
+    ["carriage return in the hostname", "https://ap\ri.test"],
+    ["tab in the port", "http://api.test:80\t80/"],
+    ["line feed in an IPv6 address", "http://[::\n1]:8080/"],
+  ])("rejects an origin with a %s", (_description, origin) => {
+    const fetch = rstest.fn<typeof globalThis.fetch>();
+    const resolveOrigin = () => resolveApiOrigin(origin);
+    const createClient = () =>
+      new SandRunClient({ origin, token: "test-token", fetch });
+    const expectedMessage =
+      /^origin contains a tab, line feed or carriage return in the authority$/;
+    expect(resolveOrigin).toThrow(SandRunConfigError);
+    expect(resolveOrigin).toThrow(expectedMessage);
+    expect(createClient).toThrow(SandRunConfigError);
+    expect(createClient).toThrow(expectedMessage);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([
     "https://api.example.test\\tenant\\..",
     "https://api.example.test\\",
     "https://api.example.test/tenant/..",

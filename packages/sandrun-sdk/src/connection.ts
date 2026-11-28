@@ -51,16 +51,25 @@ export function resolveApiOrigin(value: string | undefined): string {
     throw new SandRunConfigError("origin must use http or https");
   }
   // Check the written form because the URL parser can normalize a path to "/".
+  const writtenAuthority = /^https?:\/\/([^/?#\\]+)\/?$/i.exec(
+    writtenOrigin,
+  )?.[1];
   if (
     url.pathname !== "/" ||
     url.search !== "" ||
     url.hash !== "" ||
     raw.includes("?") ||
     raw.includes("#") ||
-    !/^https?:\/\/[^/?#\\]+\/?$/i.test(writtenOrigin)
+    writtenAuthority === undefined
   ) {
     throw new SandRunConfigError(
       "origin must not have a path, query or fragment",
+    );
+  }
+  // The URL parser strips these characters before validating the host and port.
+  if (/[\t\n\r]/.test(writtenAuthority)) {
+    throw new SandRunConfigError(
+      "origin contains a tab, line feed or carriage return in the authority",
     );
   }
   return url.origin;
