@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 )
@@ -452,7 +453,11 @@ func takeAdminSnapshot(t *testing.T, admin string) adminSnapshot {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, admin)
+	config, err := pgxpool.ParseConfig(admin)
+	if err != nil {
+		t.Fatalf("parse %s: invalid database configuration", dbtest.EnvTestDatabaseURL)
+	}
+	conn, err := pgx.ConnectConfig(ctx, config.ConnConfig)
 	if err != nil {
 		// pgx connect errors name the host and user but never the password
 		// or the URL.
