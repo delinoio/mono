@@ -122,8 +122,11 @@ service UsageService {
   // a link succeeds and changes nothing. Usage of earlier windows stays
   // attributed to the former billing account.
   rpc UnlinkOrganization(UnlinkOrganizationRequest) returns (UnlinkOrganizationResponse);
-  // List the billing accounts in which a user is owner or admin, ordered by
-  // billing_account_id, for the link flow of the calling service.
+  // List the billing accounts in which a user is owner or admin. New
+  // traversals sort by ascending create_time, then by ascending
+  // billing_account_id. Older ID-only tokens continue in ascending
+  // billing_account_id order. Restart from the first page after a rollback
+  // to a release that ignores the creation time in a token.
   rpc ListManageableBillingAccounts(ListManageableBillingAccountsRequest) returns (ListManageableBillingAccountsResponse);
   // Read the billing of one linked organization: the billing account, its
   // balance, the status and the usage of the current UTC calendar month. An

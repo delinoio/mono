@@ -1050,8 +1050,11 @@ export const UsageService: GenService<{
     output: typeof UnlinkOrganizationResponseSchema;
   },
   /**
-   * List the billing accounts in which a user is owner or admin, ordered by
-   * billing_account_id, for the link flow of the calling service.
+   * List the billing accounts in which a user is owner or admin. New
+   * traversals sort by ascending create_time, then by ascending
+   * billing_account_id. Older ID-only tokens continue in ascending
+   * billing_account_id order. Restart from the first page after a rollback
+   * to a release that ignores the creation time in a token.
    *
    * @generated from rpc delino.accounts.v1.UsageService.ListManageableBillingAccounts
    */
