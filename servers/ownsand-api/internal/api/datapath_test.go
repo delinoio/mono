@@ -18,6 +18,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -738,6 +739,24 @@ func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
 	}
 }
 
+func TestRelayConnectionEcho(t *testing.T) {
+	t.Parallel()
+	limits := relay.DefaultLimits()
+	limits.Keepalive = 100 * time.Millisecond
+	// Keep elapsed time fixed so the periodic writer cannot supply the reply.
+	env := testenv.New(t, func(o *app.Options) {
+		o.RelayClock = testenv.NewClock()
+		o.RelayLimits = &limits
+	})
+	_, agent := setupAgent(t, env, env.NewOrg("alice"), nil)
+	r := agent.ConnectRelay(nil)
+	r.WaitFrame("supported frame kinds", func(f *ownsandv1.DataFrame) bool { return f.GetSupportedFrameKinds() != nil })
+	r.SendFrame(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{EchoRequested: true}))
+	r.WaitFrame("keepalive echo reply", func(f *ownsandv1.DataFrame) bool {
+		return f.GetStreamId() == 0 && f.GetRelayKeepalive() != nil && !f.GetRelayKeepalive().GetEchoRequested()
+	})
+}
+
 func TestRelayConnectionRules(t *testing.T) {
 	t.Parallel()
 	limits := relay.Limits{StreamBuffer: 2 << 20, MaxStreamsPerConn: 64, MaxStreamsPerGrant: 4, Keepalive: 100 * time.Millisecond, IdleTimeout: 400 * time.Millisecond}
@@ -751,10 +770,11 @@ func TestRelayConnectionRules(t *testing.T) {
 		t.Fatalf("api key on Connect: %v", err)
 	}
 	r := agent.ConnectRelay(serveExec)
-	// Echo and keepalives from the server.
-	r.SendFrame(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: &ownsandv1.DataFrame_RelayKeepalive{RelayKeepalive: &ownsandv1.RelayKeepalive{EchoRequested: true}}})
-	r.WaitFrame("keepalive", func(f *ownsandv1.DataFrame) bool { return f.GetRelayKeepalive() != nil })
-	// The 90-second idle close (shortened): the agent sends nothing.
+	// The agent sends nothing after its initial frame. The server sends a
+	// periodic keepalive before closing the connection for receive inactivity.
+	r.WaitFrame("periodic keepalive", func(f *ownsandv1.DataFrame) bool {
+		return f.GetStreamId() == 0 && f.GetRelayKeepalive() != nil && !f.GetRelayKeepalive().GetEchoRequested()
+	})
 	select {
 	case <-r.Closed():
 	case <-time.After(5 * time.Second):
