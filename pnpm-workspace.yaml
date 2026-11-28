@@ -8,3 +8,5 @@ packages:
   - cmds/ownsand
   - cmds/ownsand-agent
   - cmds/sandrun
+  # Go command package with package tasks (docs/repository-workflow-contract.md).
+  - cmds/sandcrew-bridge

@@ -40,9 +40,35 @@
       "matchStrings": [
         "// renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s+const NodeVersion = \"(?<currentValue>[^\"]+)\""
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "The Node.js version that the SandCrew guest bridge installs for the ACP adapters.",
+      "managerFilePatterns": [
+        "/^cmds/sandcrew-bridge/internal/pins/pins\\.json$/"
+      ],
+      "matchStrings": [
+        "\"renovate\": \"datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s\"]+)\",\\s+\"version\": \"(?<currentValue>[^\"]+)\""
+      ]
     }
   ],
   "packageRules": [
+    {
+      "matchManagers": ["npm"],
+      "matchFileNames": ["cmds/sandcrew-bridge/internal/pins/npm/**"],
+      "prBodyNotes": [
+        "Set the adapter version and the agent package version of the updated lockfile in `cmds/sandcrew-bridge/internal/pins/pins.json`, and check the modes, authentication and capabilities that `docs/cmds-sandcrew-bridge-foundation.md#vendors` records against the new adapter; `TestNpmLockfilesMatchPins` fails until the versions match."
+      ]
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["node"],
+      "matchFileNames": ["cmds/sandcrew-bridge/internal/pins/pins.json"],
+      "allowedVersions": "<25",
+      "prBodyNotes": [
+        "Copy the sha256 values of the five archives (linux-x64 and linux-arm64 `.tar.gz`, darwin-arm64 `.tar.gz`, win-x64 and win-arm64 `.zip`) from the release's `SHASUMS256.txt` into `cmds/sandcrew-bridge/internal/pins/pins.json`, update the URLs, roots and `reportedVersion`, and set `checksumsVersion`; `TestEmbeddedPinsAreComplete` fails until then."
+      ]
+    },
     {
       "matchManagers": ["custom.regex"],
       "matchPackageNames": ["actions/runner"],

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      "cache": false,
+      "passThroughEnv": ["SANDCREW_BRIDGE_VERSION", "SANDCREW_BRIDGE_COMMIT"]
+    },
+    "lint": {
+      "cache": false
+    },
+    "test": {
+      "cache": false,
+      "passThroughEnv": ["TMPDIR"]
+    }
+  }
+}

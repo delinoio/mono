@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandcrew.v1;
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1";
+
+// Common enums of the SandCrew API and the bridge schema. The owning
+// contract is docs/protos-sandcrew-api-contract.md. The schemas do not
+// import SandRun or OwnSand schemas; they copy the values they need.
+
+// Vendor of the coding agent of a session.
+enum AgentVendor {
+  AGENT_VENDOR_UNSPECIFIED = 0;
+  // Claude Code through its ACP adapter.
+  AGENT_VENDOR_CLAUDE_CODE = 1;
+  // OpenAI Codex through its ACP adapter.
+  AGENT_VENDOR_OPENAI_CODEX = 2;
+}
+
+// Operating system of the session's guest (a copy of the SandRun values).
+enum GuestOs {
+  GUEST_OS_UNSPECIFIED = 0;
+  GUEST_OS_LINUX = 1;
+  GUEST_OS_MACOS = 2;
+  GUEST_OS_WINDOWS = 3;
+}
+
+// How the bridge answers agent permission requests.
+enum PermissionMode {
+  PERMISSION_MODE_UNSPECIFIED = 0;
+  // The vendor's auto-approve mode, and the bridge allows every remaining
+  // request.
+  PERMISSION_MODE_AUTO_APPROVE = 1;
+  // The user answers each request.
+  PERMISSION_MODE_ASK = 2;
+}
+
+// Kind of a vendor credential.
+enum VendorCredentialKind {
+  VENDOR_CREDENTIAL_KIND_UNSPECIFIED = 0;
+  // A model API key of the vendor.
+  VENDOR_CREDENTIAL_KIND_API_KEY = 1;
+  // The Claude Code token of `claude setup-token`.
+  VENDOR_CREDENTIAL_KIND_CLAUDE_OAUTH_TOKEN = 2;
+  // The OpenAI Codex ChatGPT sign-in file `auth.json`.
+  VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON = 3;
+}

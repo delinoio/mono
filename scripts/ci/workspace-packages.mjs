@@ -17,16 +17,28 @@ import { isAbsolute, join, posix, relative, sep } from "node:path";
 // plan.test.mjs cross-checks them.
 export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
 
-// Single workspace packages outside the workspace roots: the release-only Go
-// command packages under `cmds/`. Their manifests declare no package tasks
-// and exist so that Changesets versions them and `deploy.yml` releases them
-// (see the deployment workflow contract), so only the manifest, not the Go
-// source, is a workspace input. plan.test.mjs checks that they declare no
-// scripts and that `pnpm-workspace.yaml` lists exactly these directories.
-export const workspacePackageDirs = [
+// Release-only single workspace packages: Go command packages under `cmds/`
+// whose manifests declare no package tasks and exist so that Changesets
+// versions them and `deploy.yml` releases them (see the deployment workflow
+// contract), so only the manifest, not the Go source, is a workspace input.
+// plan.test.mjs checks that they declare no scripts.
+export const releaseOnlyPackageDirs = [
   "cmds/ownsand",
   "cmds/ownsand-agent",
   "cmds/sandrun",
+];
+
+// Task single workspace packages: Go command packages under `cmds/` whose
+// manifests declare package tasks that wrap the Go toolchain (for example the
+// cross-compilation of the SandCrew guest bridge). Every path inside them is
+// a workspace input, like a package under a workspace root.
+export const taskPackageDirs = ["cmds/sandcrew-bridge"];
+
+// Single workspace packages outside the workspace roots. plan.test.mjs checks
+// that `pnpm-workspace.yaml` lists exactly these directories.
+export const workspacePackageDirs = [
+  ...releaseOnlyPackageDirs,
+  ...taskPackageDirs,
 ];
 
 // Reads the manifest of every workspace package under `repoRoot`.
