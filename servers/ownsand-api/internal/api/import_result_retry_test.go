@@ -12,6 +12,7 @@ import (
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -101,26 +102,28 @@ func TestImportResultAppliesAfterTransientError(t *testing.T) {
 // delete_snapshot to the importer, like a result that arrives late.
 func TestImportResultRetryAfterSnapshotDeletionSendsDelete(t *testing.T) {
 	t.Parallel()
-	// A long backoff leaves time to delete the snapshot before the next attempt.
-	env := testenv.New(t, retryTiming(10*time.Second, 600*time.Millisecond))
+	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
 	snapID, devB, agentB := importFixture(t, env, org)
 	importID := withholdImportResult(agentB)
 	cmdID := startWithheldImport(t, org, snapID, devB.ID, agentB, importID)
+	// Keep the fault active so retries before deletion cannot register the copy.
 	fault := importCopyFault(t, env)
 	fault.on("40001", 1<<30)
 
 	sendImportResult(agentB, cmdID)
 	waitLog(t, env, `"msg":"import_result_apply_retry"`)
 	deleteSnapshotRPC(t, org, snapID)
-	if n := deleteSnapshotCommands(agentB, snapID); n != 0 {
-		t.Fatalf("the importer got %d delete commands before the retry", n)
-	}
-	fault.off()
 
 	agentB.WaitFor("delete snapshot command", func(e *ownsandv1.AgentEnvelope) bool {
 		return e.GetCommand().GetDeleteSnapshot().GetSnapshotId() == snapID
 	})
+	// The late-result handler sends cleanup directly. The events record the deletion's fanout recipients.
+	if n := countRows(t, env, `SELECT count(*) FROM control_events
+		WHERE organization_id = $1 AND snapshot_id = $2 AND device_id = $3 AND kind = $4`,
+		org.ID, snapID, devB.ID, int16(events.KindSnapshotDeleted)); n != 0 {
+		t.Fatalf("snapshot-deleted events for the untracked importer = %d, want 0", n)
+	}
 	agentB.Eventually("local copy removed", func() bool { return !agentB.HasSnapshot(snapID) })
 	waitLog(t, env, `"msg":"import_result_apply_recovered"`)
 	waitLog(t, env, `"snapshot_import_result_late"`)
