@@ -2627,6 +2627,7 @@ type retainedCreateRuntime struct {
 	failDeletes int
 	deleteCalls int
 	firstDelete func()
+	thirdDelete func()
 }
 
 func (r *retainedCreateRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
@@ -2646,6 +2647,9 @@ func (r *retainedCreateRuntime) Delete(ctx context.Context, id string) error {
 	}
 	if attempt <= r.failDeletes {
 		return errors.New("injected stop failure")
+	}
+	if attempt == 3 && r.thirdDelete != nil {
+		r.thirdDelete()
 	}
 	return r.Runtime.Delete(ctx, id)
 }
@@ -2773,11 +2777,24 @@ func testRemovalRetriesRetainedFailedCreate(t *testing.T, runtimeForStore func(*
 func TestFailedCreateRetainedVMIsStoppedByRunningAgent(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
+	thirdDeleteEntered := make(chan struct{})
+	resumeDelete := make(chan struct{})
 	var rt *retainedCreateRuntime
 	h := startWith(t, cp, st, id, func(o *Options) {
-		rt = &retainedCreateRuntime{Runtime: o.Runtime, failDeletes: 2}
+		rt = &retainedCreateRuntime{
+			Runtime:     o.Runtime,
+			failDeletes: 2,
+			thirdDelete: func() {
+				close(thirdDeleteEntered)
+				<-resumeDelete
+			},
+		}
 		o.Runtime = rt
 	})
+	release := sync.OnceFunc(func() { close(resumeDelete) })
+	// Release the blocked Delete before the harness waits for the agent to exit.
+	t.Cleanup(release)
+
 	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
 	sandboxID, _ := uuidv7.NewString()
@@ -2785,19 +2802,22 @@ func TestFailedCreateRetainedVMIsStoppedByRunningAgent(t *testing.T) {
 	if res.GetError() == nil {
 		t.Fatalf("create result %v, want a failure", res)
 	}
+	waitClosed(t, thirdDeleteEntered, "the agent to enter the third Delete")
 	vmDir := st.Path(store.VMsDir, sandboxID)
 	running, err := rt.Runtime.Running(context.Background())
 	if err != nil || len(running) != 1 || running[0] != sandboxID {
-		t.Fatalf("VMs after the failed create: %v, %v; want the retained VM", running, err)
+		t.Fatalf("VMs before the third Delete proceeds = %v, %v, want [%s]", running, err, sandboxID)
 	}
+	info, err := os.Stat(vmDir)
+	if err != nil {
+		t.Fatalf("stat retained VM directory: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("retained VM path %q is not a directory", vmDir)
+	}
+	release()
 
 	deadline := time.Now().Add(20 * time.Second)
-	for rt.calls() < 3 {
-		if time.Now().After(deadline) {
-			t.Fatalf("the agent retried the stop %d times, want 3", rt.calls())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	for {
 		running, err = rt.Runtime.Running(context.Background())
 		_, statErr := os.Stat(vmDir)
@@ -2809,9 +2829,11 @@ func TestFailedCreateRetainedVMIsStoppedByRunningAgent(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	calls := rt.calls()
+	if got := rt.calls(); got != 3 {
+		t.Fatalf("Delete calls after cleanup = %d, want 3", got)
+	}
 	time.Sleep(2500 * time.Millisecond)
-	if got := rt.calls(); got != calls {
-		t.Fatalf("the agent kept stopping after success: %d Delete calls, want %d", got, calls)
+	if got := rt.calls(); got != 3 {
+		t.Fatalf("the agent kept stopping after success: %d Delete calls, want 3", got)
 	}
 }
