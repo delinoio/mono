@@ -558,9 +558,11 @@ func TestInvitationRules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListInvitations page %d: %v", page, err)
 		}
-		for _, inv := range resp.Msg.GetInvitations() {
-			ids = append(ids, inv.GetInvitationId())
+		invitations := resp.Msg.GetInvitations()
+		if len(invitations) != 1 {
+			t.Fatalf("ListInvitations page %d returned %d invitations, want 1", page, len(invitations))
 		}
+		ids = append(ids, invitations[0].GetInvitationId())
 		if token = resp.Msg.GetNextPageToken(); token == "" {
 			break
 		}
