@@ -3,7 +3,9 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"strings"
 	"testing"
 	"time"
@@ -30,11 +32,13 @@ func TestPersonalAPIKeyLifecycle(t *testing.T) {
 		key.GetState() != sandrunv1.ApiKeyState_API_KEY_STATE_ACTIVE || key.GetExpiresAt() != nil || key.GetLastUsedAt() != nil {
 		t.Fatalf("key %v / secret of %d bytes", key, len(secret))
 	}
-	// The secret is not stored; only its hash is.
-	var plain int
-	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM api_keys WHERE position($1::bytea in secret_sha256) > 0", []byte(secret)).Scan(&plain)
-	if plain != 0 {
-		t.Fatal("secret stored")
+	var storedDigest []byte
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT secret_sha256 FROM api_keys WHERE api_key_id = $1", key.GetApiKeyId()).Scan(&storedDigest); err != nil {
+		t.Fatal("read stored API key digest")
+	}
+	wantDigest := sha256.Sum256([]byte(secret))
+	if !bytes.Equal(storedDigest, wantDigest[:]) {
+		t.Fatal("stored API key digest does not match SHA-256 of the returned secret")
 	}
 
 	for _, name := range []string{"", strings.Repeat("k", 65)} {
