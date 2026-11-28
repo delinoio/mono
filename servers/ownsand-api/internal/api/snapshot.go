@@ -744,6 +744,9 @@ func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Reques
 		if err != nil {
 			return err
 		}
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
 		sn, err := loadSnapshot(ctx, tx, orgID, snapshotID, true)
 		if err != nil {
 			return err
