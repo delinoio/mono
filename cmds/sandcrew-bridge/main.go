@@ -26,6 +26,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/sandcrew-bridge/internal/bridge"
 	"github.com/delinoio/mono/cmds/sandcrew-bridge/internal/logfile"
+	"github.com/delinoio/mono/cmds/sandcrew-bridge/internal/logging"
 	"github.com/delinoio/mono/cmds/sandcrew-bridge/internal/pins"
 	"github.com/delinoio/mono/cmds/sandcrew-bridge/internal/version"
 	sandcrewv1 "github.com/delinoio/mono/protos/delino/sandcrew/v1"
@@ -72,7 +73,8 @@ func run(args []string, stdout, stderr io.Writer) bridge.ExitCode {
 	}
 
 	// bridge.log and stderr carry the same structured JSON records without
-	// ANSI color: they are machine-read.
+	// ANSI color: they are machine-read. The records also go through the
+	// OpenTelemetry log bridge (internal/logging).
 	logWriter := stderr
 	if file, err := logfile.Open(filepath.Join(dir, "bridge.log"), logfile.MaxSize); err != nil {
 		fmt.Fprintf(stderr, "sandcrew-bridge: bridge.log: %v\n", err)
@@ -80,7 +82,9 @@ func run(args []string, stdout, stderr io.Writer) bridge.ExitCode {
 		defer file.Close()
 		logWriter = io.MultiWriter(stderr, file)
 	}
-	logger := slog.New(slog.NewJSONHandler(logWriter, &slog.HandlerOptions{Level: slog.LevelInfo})).With(
+	logger, shutdownLogs := logging.New(logWriter, slog.LevelInfo)
+	defer shutdownLogs()
+	logger = logger.With(
 		"bridge_version", version.String(),
 		"protocol_version", fmt.Sprintf("%d.%d", bridge.ProtocolMajor, bridge.ProtocolMinor),
 	)

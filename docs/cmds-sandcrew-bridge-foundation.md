@@ -122,6 +122,7 @@ The bridge keeps its files in `<workspace>/.sandcrew/`, where `<workspace>` is t
 ## Logging
 
 - `bridge.log` and stderr carry structured JSON records (`log/slog`) with the session ID, the bridge version, the protocol version, the vendor, the agent version, the event kind and sequence, input IDs and error kinds. They are machine-read, so they use no ANSI color.
+- The same records also go through the OpenTelemetry log bridge (`otelslog`) to a Logs SDK provider with the service name `sandcrew-bridge` (`internal/logging`), as the [repository defaults](repository-defaults.md#repository-wide-rules) require. The provider has no exporter: the bridge has no network connection to SandCrew, and the control plane collects `bridge.log` and the events. Exporting the records is a later decision of the control plane.
 - Never log prompts, agent messages, thoughts, tool input or output, diffs, file contents, credentials or secrets.
 
 ## Build and Test
