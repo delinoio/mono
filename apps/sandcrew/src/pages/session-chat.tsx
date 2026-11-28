@@ -24,6 +24,7 @@ import { Textarea } from "delino-ui/textarea";
 import {
   type FormEvent,
   type KeyboardEvent,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -354,7 +355,15 @@ export function StateBanner({
   }
 }
 
-function TranscriptView({
+/**
+ * How far below the bottom of the window the end of the transcript can be
+ * while the view still follows new output, in pixels. The sticky composer
+ * covers the end of the transcript.
+ */
+const FOLLOW_SLACK_PX = 240;
+
+/** Renders the transcript and follows new output like a chat. */
+export function TranscriptView({
   transcript,
   loaded,
   loadError,
@@ -369,10 +378,24 @@ function TranscriptView({
 }) {
   const end = useRef<HTMLDivElement>(null);
   const count = transcript.items.length;
+  // True while the end of the transcript is in view. Content that is added
+  // or that grows (streamed message chunks merge into one item) scrolls the
+  // view only then, so a user who scrolled away keeps their position.
+  const following = useRef(true);
+  useEffect(() => {
+    const onScroll = () => {
+      const marker = end.current;
+      if (!marker) return;
+      following.current =
+        marker.getBoundingClientRect().top <=
+        window.innerHeight + FOLLOW_SLACK_PX;
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
   useLayoutEffect(() => {
-    // Follow new items like a chat.
-    end.current?.scrollIntoView?.({ block: "end" });
-  }, [count]);
+    if (following.current) end.current?.scrollIntoView?.({ block: "end" });
+  }, [transcript]);
   if (loadError !== undefined && !loaded) {
     return (
       <ErrorNotice

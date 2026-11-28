@@ -3,6 +3,7 @@ import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import { TransportProvider } from "@connectrpc/connect-query";
 import { Role } from "@delino/sandcrew-protos/v1/common_pb";
 import { OrganizationSchema } from "@delino/sandcrew-protos/v1/organization_pb";
+import { TranscriptEventSchema } from "@delino/sandcrew-protos/v1/session_pb";
 import { create } from "@bufbuild/protobuf";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
@@ -26,8 +27,10 @@ import {
   type MockTransportOptions,
   SESSION_LIMIT_MESSAGE,
 } from "./mock/mock-api.ts";
+import { TranscriptView } from "./pages/session-chat.tsx";
 import { UserSettingsPage } from "./pages/settings-user.tsx";
 import { RouterProvider } from "./router.tsx";
+import { buildTranscript } from "./transcript.ts";
 import type { PushEnvironment } from "./web-push.ts";
 
 const config = {
@@ -976,5 +979,52 @@ describe("web push opt-in", () => {
         name: "Turn on notifications on this browser",
       }),
     ).toBeNull();
+  });
+});
+
+describe("transcript scrolling", () => {
+  const chunks = (...values: string[]) =>
+    buildTranscript(
+      values.map((value, index) =>
+        create(TranscriptEventSchema, {
+          sequence: BigInt(index + 1),
+          event: {
+            case: "agentMessageChunk",
+            value: { content: { block: { case: "text", value } } },
+          },
+        }),
+      ),
+    );
+
+  test("follows a streamed message that grows, until the user scrolls away", () => {
+    const scrolls: unknown[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (arg) {
+      scrolls.push(arg);
+    };
+    try {
+      const view = (values: string[]) => (
+        <TranscriptView
+          transcript={chunks(...values)}
+          loaded
+          loadError={undefined}
+          onRetry={() => {}}
+        />
+      );
+      const { rerender, container } = render(view(["Hi"]));
+      expect(scrolls).toHaveLength(1);
+      // The chunk merges into the same message: no new item, but new output.
+      rerender(view(["Hi", " there"]));
+      expect(scrolls).toHaveLength(2);
+      // The user scrolls up: the end of the transcript is far below the window.
+      const marker = container.querySelector(".chat")!.lastElementChild!;
+      marker.getBoundingClientRect = () =>
+        ({ top: window.innerHeight + 2000 }) as DOMRect;
+      fireEvent.scroll(window);
+      rerender(view(["Hi", " there", "!"]));
+      expect(scrolls).toHaveLength(2);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
   });
 });
