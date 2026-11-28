@@ -820,73 +820,148 @@ func TestAcceptedSilentContinuationsKeepClockPaused(t *testing.T) {
 	}
 }
 
-func TestExecPausedWaitsForResume(t *testing.T) {
-	t.Parallel()
+// runPausedRelayExec interrupts an already running exec and waits for the SDK
+// to poll the paused sandbox before changing its state.
+func runPausedRelayExec(t *testing.T, firstOutput string, resume bool) (*ExecResult, string) {
+	t.Helper()
 	cp := newFakeCP(t)
-	gate := make(chan struct{})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	stdoutReceived := make(chan struct{})
+	pausedSent := make(chan struct{})
+	pausedPolled := make(chan struct{})
+	resumed := make(chan struct{})
 	cp.agent.run = func(_ []string, e *fakeExec) {
-		e.write(0, []byte("before\n"))
-		<-gate
+		e.write(0, []byte(firstOutput))
+		select {
+		case <-ctx.Done():
+			return
+		case <-resumed:
+		}
 		e.write(0, []byte("after\n"))
 		e.finish(exitedEvent(0))
 	}
 	cp.relayScript = func(method string, n int) relayAction {
-		if method == "Exec" {
-			return relayAction{abortAfter: 1}
+		switch {
+		case method == "Exec":
+			return relayAction{abortAfter: 1, execAbortGate: stdoutReceived}
+		case method == "AttachExec" && n == 1:
+			select {
+			case <-stdoutReceived:
+				return relayAction{afterPaused: func() { close(pausedSent) }}
+			default:
+				return relayAction{err: connect.NewError(connect.CodeInternal, errors.New("AttachExec arrived before the first stdout callback"))}
+			}
+		default:
+			return relayAction{}
 		}
-		return relayAction{}
 	}
+	markPausedPoll := sync.OnceFunc(func() { close(pausedPolled) })
+	cp.onGetSandbox = func(sb *ownsandv1.Sandbox) {
+		select {
+		case <-pausedSent:
+			if isPaused(sb) {
+				markPausedPoll()
+			}
+		default:
+		}
+	}
+
 	c := cp.client(t, TransportRelay)
 	s := cp.handle(t, c)
-	// Pause right after the first chunk; resume later than the window.
-	go func() {
-		for cp.relayCount("Exec") == 0 {
-			time.Sleep(time.Millisecond)
-		}
-		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
-		time.Sleep(c.timing.recoveryWindow + 300*time.Millisecond)
-		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-		close(gate)
-	}()
 	r := &recorder{}
-	res, err := s.Exec(context.Background(), ExecParams{Command: []string{"x"}, OnEvent: r.on})
-	if err != nil {
-		t.Fatal(err)
+	pauseAfterStdout := sync.OnceFunc(func() {
+		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
+		close(stdoutReceived)
+	})
+	result := make(chan execResult, 1)
+	go func() {
+		res, err := s.Exec(ctx, ExecParams{
+			Command: []string{"x"},
+			OnEvent: func(ev ExecEvent) error {
+				if err := r.on(ev); err != nil {
+					return err
+				}
+				if ev.Kind == ExecEventStdout {
+					pauseAfterStdout()
+				}
+				return nil
+			},
+		})
+		result <- execResult{res: res, err: err}
+	}()
+	waitFor := func(stage string, done <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatalf("waiting for %s: %v", stage, ctx.Err())
+		case got := <-result:
+			t.Fatalf("exec ended while waiting for %s: result %+v, error %v", stage, got.res, got.err)
+		}
 	}
-	if res.ExitCode == nil || r.stdout.String() != "before\nafter\n" {
-		t.Fatalf("result %+v %q", res, r.stdout.String())
+	waitFor("first stdout callback", stdoutReceived)
+	waitFor("Paused send on first AttachExec", pausedSent)
+	waitFor("GetSandbox poll while paused", pausedPolled)
+
+	wantCalls := []string{"Exec", "AttachExec"}
+	if resume {
+		if err := sleep(ctx, c.timing.recoveryWindow+300*time.Millisecond); err != nil {
+			t.Fatalf("holding the sandbox paused past the recovery window: %v", err)
+		}
+		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+		close(resumed)
+		wantCalls = append(wantCalls, "AttachExec")
+	} else {
+		cp.mu.Lock()
+		cp.endReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED
+		cp.mu.Unlock()
+		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	}
+
+	var got execResult
+	select {
+	case got = <-result:
+	case <-ctx.Done():
+		t.Fatalf("waiting for exec result: %v", ctx.Err())
+	}
+	if got.err != nil {
+		t.Fatalf("exec: %v", got.err)
+	}
+	if n := cp.agent.totalRuns(); n != 1 {
+		t.Fatalf("command ran %d times, want 1", n)
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if !slices.Equal(cp.relayLog, wantCalls) {
+		t.Fatalf("relay calls %v, want %v", cp.relayLog, wantCalls)
+	}
+	if len(cp.relayExecs) != 1 || len(cp.relayAttaches) != len(wantCalls)-1 {
+		t.Fatalf("recorded %d Exec and %d AttachExec requests, want 1 and %d", len(cp.relayExecs), len(cp.relayAttaches), len(wantCalls)-1)
+	}
+	execID := cp.relayExecs[0].GetExecId()
+	for i, req := range cp.relayAttaches {
+		if req.GetExecId() != execID || req.GetStdoutOffset() != int64(len(firstOutput)) || req.GetStderrOffset() != 0 {
+			t.Fatalf("AttachExec %d: exec ID %q and offsets (%d, %d), want %q and (%d, 0)", i+1, req.GetExecId(), req.GetStdoutOffset(), req.GetStderrOffset(), execID, len(firstOutput))
+		}
+	}
+	return got.res, r.stdout.String()
+}
+
+func TestExecPausedWaitsForResume(t *testing.T) {
+	t.Parallel()
+	res, stdout := runPausedRelayExec(t, "before\n", true)
+	if res == nil || res.Kind != ExecResultExited || res.ExitCode == nil || *res.ExitCode != 0 || stdout != "before\nafter\n" {
+		t.Fatalf("result %+v, stdout %q", res, stdout)
 	}
 }
 
 func TestExecPausedSandboxEnds(t *testing.T) {
 	t.Parallel()
-	cp := newFakeCP(t)
-	cp.agent.run = func(_ []string, e *fakeExec) { e.write(0, []byte("x\n")) }
-	cp.relayScript = func(method string, n int) relayAction {
-		if method == "Exec" {
-			return relayAction{abortAfter: 1}
-		}
-		return relayAction{}
-	}
-	c := cp.client(t, TransportRelay)
-	s := cp.handle(t, c)
-	go func() {
-		for cp.relayCount("Exec") == 0 {
-			time.Sleep(time.Millisecond)
-		}
-		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
-		time.Sleep(200 * time.Millisecond)
-		cp.mu.Lock()
-		cp.endReason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED
-		cp.mu.Unlock()
-		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
-	}()
-	res, err := s.Exec(context.Background(), ExecParams{Command: []string{"x"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Kind != ExecResultSandboxEnded || res.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
-		t.Fatalf("result %+v", res)
+	res, stdout := runPausedRelayExec(t, "x\n", false)
+	if res == nil || res.Kind != ExecResultSandboxEnded || res.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED || stdout != "x\n" {
+		t.Fatalf("result %+v, stdout %q", res, stdout)
 	}
 }
 
