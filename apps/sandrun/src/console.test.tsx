@@ -5835,7 +5835,22 @@ describe("personal API keys", () => {
   });
 });
 
-describe("display name limits", () => {
+describe("display name validation", () => {
+  async function expectControlCharacterError(
+    form: ReturnType<typeof within>,
+    input: HTMLInputElement,
+    submit: HTMLElement,
+  ) {
+    const invalid = "Demo\u0085Team";
+    await type(input, invalid);
+    await click(submit);
+    expect(input.value).toBe(invalid);
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(
+      form.getByText("Remove control characters from the name."),
+    ).toBeTruthy();
+  }
+
   const creates = [
     {
       path: `/orgs/${MOCK_IDS.acme}/api-keys`,
@@ -5884,6 +5899,9 @@ describe("display name limits", () => {
             "synthetic-agent-key",
           );
         }
+
+        await expectControlCharacterError(form, input, submit);
+        expect(calls).toHaveLength(0);
 
         const tooLong = ` ${character.repeat(fixture.limit + 1)} `;
         await type(input, tooLong);
@@ -5934,6 +5952,9 @@ describe("display name limits", () => {
         name: "Name",
       });
       const submit = dialog.getByRole("button", { name: "Save changes" });
+
+      await expectControlCharacterError(dialog, input, submit);
+      expect(calls).toHaveLength(0);
 
       const tooLong = ` ${character.repeat(65)} `;
       await type(input, tooLong);

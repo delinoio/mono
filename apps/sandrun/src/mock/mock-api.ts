@@ -119,8 +119,9 @@ import {
 import {
   AGENT_INTEGRATION_NAME_LIMIT,
   API_KEY_NAME_LIMIT,
-  isNameLengthValid,
+  DisplayNameError,
   ORGANIZATION_NAME_LIMIT,
+  validateDisplayName,
 } from "../name.ts";
 import { compareQueueOrder } from "../queue.ts";
 import { can, Permission } from "../roles.ts";
@@ -857,6 +858,17 @@ function validateListFilter(
   }
 }
 
+function requireValidDisplayName(name: string, limit: number): void {
+  const error = validateDisplayName(name, limit);
+  if (error === undefined) return;
+  throw new ConnectError(
+    error === DisplayNameError.ControlCharacter
+      ? "invalid name: must not contain control characters"
+      : `name must have 1 to ${limit} characters`,
+    Code.InvalidArgument,
+  );
+}
+
 function hasPath(mask: FieldMask | undefined, path: string): boolean {
   return mask?.paths.includes(path) ?? false;
 }
@@ -1093,11 +1105,7 @@ export function createMockTransport(
     router.service(OrganizationService, {
       createOrganization(req) {
         const name = req.name.trim();
-        if (!isNameLengthValid(name, ORGANIZATION_NAME_LIMIT))
-          throw new ConnectError(
-            "name must have 1 to 100 characters",
-            Code.InvalidArgument,
-          );
+        requireValidDisplayName(name, ORGANIZATION_NAME_LIMIT);
         const id = uuidV7();
         const org = emptyOrg(id, name);
         org.members.push(member(id, userId, Role.OWNER, "Mina Kim"));
@@ -1651,11 +1659,7 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
         const name = req.name.trim();
-        if (!isNameLengthValid(name, AGENT_INTEGRATION_NAME_LIMIT))
-          throw new ConnectError(
-            "name must have 1 to 64 characters",
-            Code.InvalidArgument,
-          );
+        requireValidDisplayName(name, AGENT_INTEGRATION_NAME_LIMIT);
         if (org.integrations.some((i) => i.name === name))
           throw new ConnectError(
             "an agent integration with this name exists",
@@ -1710,11 +1714,7 @@ export function createMockTransport(
         let name = i.name;
         if (updateName) {
           name = req.name.trim();
-          if (!isNameLengthValid(name, AGENT_INTEGRATION_NAME_LIMIT))
-            throw new ConnectError(
-              "name must have 1 to 64 characters",
-              Code.InvalidArgument,
-            );
+          requireValidDisplayName(name, AGENT_INTEGRATION_NAME_LIMIT);
           if (
             org.integrations.some((other) => other !== i && other.name === name)
           )
@@ -2169,11 +2169,7 @@ export function createMockTransport(
       createApiKey(req) {
         const { org } = membership(req.organizationId);
         const name = req.name.trim();
-        if (!isNameLengthValid(name, API_KEY_NAME_LIMIT))
-          throw new ConnectError(
-            "name must have 1 to 64 characters",
-            Code.InvalidArgument,
-          );
+        requireValidDisplayName(name, API_KEY_NAME_LIMIT);
         if (
           req.expiresAt !== undefined &&
           compareTimestamps(req.expiresAt, timestampFromMs(now())) <= 0

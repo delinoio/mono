@@ -16,7 +16,11 @@ import {
 } from "../components/ui.tsx";
 import { labels } from "../format.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
-import { isNameLengthValid, ORGANIZATION_NAME_LIMIT } from "../name.ts";
+import {
+  ORGANIZATION_NAME_LIMIT,
+  DisplayNameError,
+  validateDisplayName,
+} from "../name.ts";
 import { type MessageKey, useI18n } from "../i18n.ts";
 import { refreshOrganizations, useOrganizations } from "../organizations.ts";
 import { Link, orgPath, RouteId, routePath, useRouter } from "../router.tsx";
@@ -117,8 +121,13 @@ export function OrganizationsPage() {
         }}
         onSubmit={async (opening) => {
           const trimmed = name.trim();
-          if (!isNameLengthValid(trimmed, ORGANIZATION_NAME_LIMIT)) {
-            setNameError("organizations.createDialog.nameInvalid");
+          const error = validateDisplayName(trimmed, ORGANIZATION_NAME_LIMIT);
+          if (error !== undefined) {
+            setNameError(
+              error === DisplayNameError.ControlCharacter
+                ? "common.nameControlCharacter"
+                : "organizations.createDialog.nameInvalid",
+            );
             return;
           }
           const res = await create.mutateAsync({ name: trimmed });

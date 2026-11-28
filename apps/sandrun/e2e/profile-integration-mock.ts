@@ -18,6 +18,7 @@ import {
   REQUEST_CANCELLATION_FIXTURE,
   requestCancellationFixture,
 } from "./request-cancellation-fixture.ts";
+import { observeDisplayNameWrites } from "./display-name-fixture.ts";
 import { createMockTransport as createSettingsMock } from "./settings-mock.ts";
 import {
   pagedProfileIntegrations,
@@ -136,7 +137,7 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
 
   const mode = sessionStorage.getItem(PROFILE_INTEGRATION_FIXTURE);
   if (mode !== "codex" && mode !== "claude" && mode !== "missing") {
-    return createSettingsMock(options);
+    return observeDisplayNameWrites(createSettingsMock(options));
   }
   const { transport, ...fixture } = pagedProfileIntegrations(
     createSettingsMock({

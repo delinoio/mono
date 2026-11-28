@@ -29,7 +29,11 @@ import {
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
 import { type MessageKey, useI18n } from "../i18n.ts";
-import { API_KEY_NAME_LIMIT, isNameLengthValid } from "../name.ts";
+import {
+  API_KEY_NAME_LIMIT,
+  DisplayNameError,
+  validateDisplayName,
+} from "../name.ts";
 
 /** Expiry choices of a new key, in days; 0 means no expiry. */
 export const EXPIRY_DAYS = [30, 90, 365, 0] as const;
@@ -160,8 +164,13 @@ export function ApiKeysPage() {
         submitLabel={t("apiKeys.createDialog.submit")}
         onSubmit={async (opening) => {
           const trimmed = name.trim();
-          if (!isNameLengthValid(trimmed, API_KEY_NAME_LIMIT)) {
-            setNameError("apiKeys.createDialog.nameInvalid");
+          const error = validateDisplayName(trimmed, API_KEY_NAME_LIMIT);
+          if (error !== undefined) {
+            setNameError(
+              error === DisplayNameError.ControlCharacter
+                ? "common.nameControlCharacter"
+                : "apiKeys.createDialog.nameInvalid",
+            );
             return;
           }
           const days = Number(expiry);

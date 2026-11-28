@@ -62,7 +62,11 @@ import {
 import { ownsandDevicesUrl } from "../config.ts";
 import { formatTime, labels, vendorName } from "../format.ts";
 import { type Localizer, type MessageKey, useI18n } from "../i18n.ts";
-import { AGENT_INTEGRATION_NAME_LIMIT, isNameLengthValid } from "../name.ts";
+import {
+  AGENT_INTEGRATION_NAME_LIMIT,
+  DisplayNameError,
+  validateDisplayName,
+} from "../name.ts";
 import { externalNavigation } from "../navigation.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
@@ -1008,10 +1012,17 @@ function IntegrationDialog({
         if (!can(role, Permission.ManageIntegrations)) return;
         const found: Record<string, string> = {};
         const trimmedName = name.trim();
-        if (!isNameLengthValid(trimmedName, AGENT_INTEGRATION_NAME_LIMIT)) {
-          found.name = t("integrations.agent.dialog.nameInvalid", {
-            max: AGENT_INTEGRATION_NAME_LIMIT,
-          });
+        const nameError = validateDisplayName(
+          trimmedName,
+          AGENT_INTEGRATION_NAME_LIMIT,
+        );
+        if (nameError !== undefined) {
+          found.name =
+            nameError === DisplayNameError.ControlCharacter
+              ? t("common.nameControlCharacter")
+              : t("integrations.agent.dialog.nameInvalid", {
+                  max: AGENT_INTEGRATION_NAME_LIMIT,
+                });
         }
         if (label !== undefined && setting.trim() === "") {
           found.setting = t(

@@ -14,6 +14,7 @@ import {
 import { ORGANIZATION_CREATION_FIXTURE } from "./organization-creation-fixture.ts";
 import { MOCK_IDS } from "../src/mock/mock-api.ts";
 import { REQUEST_CANCELLATION_FIXTURE } from "./request-cancellation-fixture.ts";
+import { DISPLAY_NAME_FIXTURE } from "./display-name-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
@@ -639,6 +640,95 @@ function measureOrganizationHeading() {
     documentFits: root.scrollWidth === root.clientWidth,
   };
 }
+
+describe("display name validation", () => {
+  for (const scenario of [
+    {
+      method: "CreateOrganization",
+      path: "/",
+      button: "Create organization",
+      dialog: "Create an organization",
+      label: "Organization name",
+      submit: "Create",
+    },
+    {
+      method: "CreateApiKey",
+      path: `/orgs/${ACME}/api-keys`,
+      button: "Create API key",
+      dialog: "Create a personal API key",
+      label: "Name",
+      submit: "Create key",
+    },
+    {
+      method: "CreateAgentIntegration",
+      path: `/orgs/${GLOBEX}/integrations`,
+      button: "Create agent integration",
+      dialog: "Create an agent integration",
+      label: "Name",
+      submit: "Create integration",
+    },
+    {
+      method: "UpdateAgentIntegration",
+      path: `/orgs/${ACME}/integrations`,
+      button: "Edit",
+      row: "claude-team · Claude Code",
+      dialog: "Edit claude-team",
+      label: "Name",
+      submit: "Save changes",
+    },
+  ]) {
+    test(`${scenario.method} blocks a control character and sends a trimmed correction`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await expect(
+        screen.getByRole("link", "Acme Robotics Owner"),
+      ).toBeVisible();
+      await browser.evaluate((key) => {
+        sessionStorage.setItem(key, "true");
+        return null;
+      }, DISPLAY_NAME_FIXTURE);
+      await app.open(scenario.path);
+
+      const actions = scenario.row
+        ? screen.getByRole("listitem").filter({ hasText: scenario.row })
+        : screen;
+      await actions.getByRole("button", scenario.button).tap();
+      const dialog = screen.getByRole("dialog", scenario.dialog);
+      if (scenario.method === "CreateAgentIntegration") {
+        await dialog
+          .getByLabel("Environment key", { exact: true })
+          .fill("fixture-key");
+      }
+      const input = dialog.getByLabel(scenario.label, { exact: true });
+      const submit = dialog.getByRole("button", scenario.submit, {
+        exact: true,
+      });
+      const writes = () =>
+        browser.evaluate(() => window.sandrunDisplayNameWrites ?? null);
+      const invalid = "Demo\u0085Team";
+
+      await input.fill(invalid);
+      await submit.tap();
+      await expect(input).toHaveValue(invalid);
+      await expect(input).toHaveAttribute("aria-invalid", "true");
+      await expect(
+        dialog.getByText("Remove control characters from the name."),
+      ).toBeVisible();
+      expect(await writes()).toEqual([]);
+
+      await input.fill(" Demo Team ");
+      await submit.tap();
+      await expect(dialog).toBeHidden();
+      expect(await writes()).toEqual([
+        { method: scenario.method, name: "Demo Team" },
+      ]);
+    });
+  }
+});
 
 describe("organization layout", () => {
   test("keeps the translated top bar within the page width", async ({
