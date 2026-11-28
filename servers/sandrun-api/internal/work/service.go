@@ -15,6 +15,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -46,27 +47,56 @@ type Handler struct {
 
 var _ sandrunv1connect.WorkServiceHandler = (*Handler)(nil)
 
-// offsetToken is the opaque page token of the lists whose order is not a
-// UUID order: `o1:` and the number of rows before the page, in unpadded
-// base64url.
-func offsetToken(n int) string {
-	return base64.RawURLEncoding.EncodeToString([]byte("o1:" + strconv.Itoa(n)))
+const (
+	offsetTokenPrefix = "o1:"
+	queueTokenPrefix  = "q1:"
+)
+
+type requestPageBoundary struct {
+	priority  int16
+	queueTime time.Time
+	requestID pgtype.UUID
 }
 
-func parseOffsetToken(size int32, token string) (int32, int, error) {
-	limit, _, err := api.PageArgs(size, "")
-	if err != nil || token == "" {
-		return limit, 0, err
+func offsetToken(n int) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(offsetTokenPrefix + strconv.Itoa(n)))
+}
+
+func queueToken(r *Request) string {
+	token := queueTokenPrefix + strconv.Itoa(int(r.Priority)) + "," + r.QueueTime.UTC().Format(time.RFC3339Nano) + "," + r.ID
+	return base64.RawURLEncoding.EncodeToString([]byte(token))
+}
+
+func parseRequestPageToken(token string, activeOnly bool) (legacy bool, offset int, boundary *requestPageBoundary, err error) {
+	if token == "" {
+		return false, 0, nil, nil
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(token)
-	if err != nil || !strings.HasPrefix(string(raw), "o1:") {
-		return 0, 0, api.ErrInvalidf("invalid page_token")
+	raw, decodeErr := base64.RawURLEncoding.DecodeString(token)
+	if decodeErr != nil {
+		return false, 0, nil, api.ErrInvalidf("invalid page_token")
 	}
-	n, err := strconv.Atoi(strings.TrimPrefix(string(raw), "o1:"))
-	if err != nil || n < 0 {
-		return 0, 0, api.ErrInvalidf("invalid page_token")
+	if value, ok := strings.CutPrefix(string(raw), offsetTokenPrefix); ok {
+		n, parseErr := strconv.Atoi(value)
+		if parseErr != nil || n < 0 {
+			return false, 0, nil, api.ErrInvalidf("invalid page_token")
+		}
+		return true, n, nil, nil
 	}
-	return limit, n, nil
+	value, ok := strings.CutPrefix(string(raw), queueTokenPrefix)
+	if !ok || !activeOnly {
+		return false, 0, nil, api.ErrInvalidf("invalid page_token")
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) != 3 {
+		return false, 0, nil, api.ErrInvalidf("invalid page_token")
+	}
+	priority, priorityErr := strconv.ParseInt(parts[0], 10, 16)
+	queueTime, timeErr := time.Parse(time.RFC3339Nano, parts[1])
+	var id pgtype.UUID
+	if priorityErr != nil || timeErr != nil || id.Scan(parts[2]) != nil || id.String() != parts[2] {
+		return false, 0, nil, api.ErrInvalidf("invalid page_token")
+	}
+	return false, 0, &requestPageBoundary{priority: int16(priority), queueTime: queueTime, requestID: id}, nil
 }
 
 // RequestStateFilter returns the SQL state filter for requests and dev sessions.
@@ -100,7 +130,7 @@ func (h *Handler) ListRequests(ctx context.Context, req *connect.Request[sandrun
 	if err != nil {
 		return nil, err
 	}
-	limit, offset, err := parseOffsetToken(m.GetPageSize(), m.GetPageToken())
+	limit, _, err := api.PageArgs(m.GetPageSize(), "")
 	if err != nil {
 		return nil, err
 	}
@@ -118,30 +148,57 @@ func (h *Handler) ListRequests(ctx context.Context, req *connect.Request[sandrun
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.DB.Pool.Query(ctx, "SELECT "+requestColumns+` FROM requests
-		WHERE organization_id = $1 AND ($2 = '' OR runner_profile_id::text = $2) AND ($3 = 0 OR kind = $3) AND ($4::smallint[] IS NULL OR state = ANY($4))
-		ORDER BY (state IN (4, 5, 6, 7)),
-			CASE WHEN state IN (1, 2, 3) THEN priority END, CASE WHEN state IN (1, 2, 3) THEN queue_time END,
-			CASE WHEN state IN (4, 5, 6, 7) THEN end_time END DESC, request_id
-		LIMIT $5 OFFSET $6`, c.OrganizationID, profileID, int16(kind), states, limit, offset)
+	activeOnly := len(states) > 0 && !slices.ContainsFunc(states, func(state int16) bool {
+		return !slices.Contains(openRequestStates, state)
+	})
+	legacy, offset, boundary, err := parseRequestPageToken(m.GetPageToken(), activeOnly)
+	if err != nil {
+		return nil, err
+	}
+
+	query := "SELECT " + requestColumns + ` FROM requests
+		WHERE organization_id = $1 AND ($2 = '' OR runner_profile_id::text = $2) AND ($3 = 0 OR kind = $3) AND ($4::smallint[] IS NULL OR state = ANY($4))`
+	args := []any{c.OrganizationID, profileID, int16(kind), states, limit}
+	useQueueToken := activeOnly && !legacy
+	if useQueueToken {
+		if boundary != nil {
+			query += " AND (priority, queue_time, request_id) > ($6::smallint, $7::timestamptz, $8::uuid)"
+			args = append(args, boundary.priority, boundary.queueTime, boundary.requestID)
+		}
+		query += " ORDER BY priority, queue_time, request_id LIMIT $5"
+	} else {
+		query += `
+			ORDER BY (state IN (4, 5, 6, 7)),
+				CASE WHEN state IN (1, 2, 3) THEN priority END, CASE WHEN state IN (1, 2, 3) THEN queue_time END,
+				CASE WHEN state IN (4, 5, 6, 7) THEN end_time END DESC, request_id
+			LIMIT $5 OFFSET $6`
+		args = append(args, offset)
+	}
+	rows, err := s.DB.Pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, s.Internal(ctx, "list requests", err)
 	}
 	defer rows.Close()
 	resp := &sandrunv1.ListRequestsResponse{}
+	var last *Request
 	for rows.Next() {
 		r, err := scanRequest(rows)
 		if err != nil {
 			return nil, s.Internal(ctx, "list requests", err)
 		}
 		resp.Requests = append(resp.Requests, r.Proto())
+		last = r
 	}
 	if err := rows.Err(); err != nil {
 		return nil, s.Internal(ctx, "list requests", err)
 	}
 	h.e.decorate(ctx, c.OrganizationID, resp.Requests...)
 	if len(resp.Requests) == int(limit) {
-		resp.NextPageToken = offsetToken(offset + int(limit))
+		if useQueueToken {
+			resp.NextPageToken = queueToken(last)
+		} else {
+			resp.NextPageToken = offsetToken(offset + int(limit))
+		}
 	}
 	return connect.NewResponse(resp), nil
 }

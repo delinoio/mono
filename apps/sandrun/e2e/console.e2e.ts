@@ -1649,6 +1649,30 @@ describe("keyboard scrolling in tables", () => {
 });
 
 describe("requests", () => {
+  test("shows both remaining requests after Show more", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await browser.evaluate(() => {
+      sessionStorage.setItem("sandrun.request-pagination", "enabled");
+      return null;
+    });
+    await app.open(`/orgs/${NORTHWIND}/requests`);
+
+    const table = screen.getByRole("table", "Requests");
+    const showMore = screen.getByRole("button", "Show more");
+    await expect(table.getByText("request-50", { exact: true })).toBeVisible();
+    await expect(table.getByText("request-51", { exact: true })).toBeHidden();
+    await showMore.tap();
+
+    await expect(table.getByText("request-51", { exact: true })).toBeVisible();
+    await expect(table.getByText("request-52", { exact: true })).toBeVisible();
+    await expect(showMore).toBeHidden();
+  });
+
   test("shows only requests that match the selected kind and state", async ({
     app,
     screen,
