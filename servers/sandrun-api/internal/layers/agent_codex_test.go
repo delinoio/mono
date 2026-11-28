@@ -609,7 +609,11 @@ func TestCodexSessionFailedReleasesCompute(t *testing.T) {
 	if code := w.deliver(t, "wh_q2", codexfake.Event("agent.session.failed", "sess_q")); code != http.StatusOK {
 		t.Fatal(code)
 	}
-	w.waitRequest(t, queued.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_CANCELED)
+	canceled := w.waitRequest(t, queued.GetRequestId(), sandrunv1.RequestState_REQUEST_STATE_CANCELED)
+	if canceled.GetEndReason() != sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE || canceled.GetRunnerId() != "" {
+		t.Fatalf("canceled queued request: %v", canceled)
+	}
+	t.Log("queued request without a runner ended as CANCELED with CANCELED_BY_SOURCE")
 }
 
 // TestCodexMaxTTLEndsSession: the executor does not exit by itself, so a

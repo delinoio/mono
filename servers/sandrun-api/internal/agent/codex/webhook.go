@@ -118,7 +118,7 @@ type outcome struct {
 	integrationID, organizationID  string
 	sessionID, requestID, runnerID string
 	detail                         string
-	after                          []func(context.Context)
+	after                          []func()
 }
 
 func (o *outcome) ignore(detail string) {
@@ -283,7 +283,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	answer(http.StatusOK, o.result)
 	for _, fn := range o.after {
-		fn(context.WithoutCancel(ctx))
+		fn()
 	}
 }
 
@@ -336,7 +336,7 @@ func (v *Vendor) connectionRequired(ctx context.Context, tx pgx.Tx, in integrati
 		return nil
 	}
 	orgID := in.OrganizationID
-	o.after = append(o.after, func(context.Context) { v.hub.Service().WorkChanged(orgID) })
+	o.after = append(o.after, func() { v.hub.Service().WorkChanged(orgID) })
 	return nil
 }
 
@@ -412,9 +412,11 @@ func (v *Vendor) sessionFailed(ctx context.Context, tx pgx.Tx, in integration.In
 		if err != nil {
 			return err
 		}
-		o.after = append(o.after, func(ctx context.Context) { engine.FinishDeletion(ctx, d) })
+		if d != nil {
+			o.after = append(o.after, func() { engine.RunnerChanged(runnerID) })
+		}
 	}
 	orgID := in.OrganizationID
-	o.after = append(o.after, func(context.Context) { v.hub.Service().WorkChanged(orgID) })
+	o.after = append(o.after, func() { v.hub.Service().WorkChanged(orgID) })
 	return nil
 }

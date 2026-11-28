@@ -828,7 +828,8 @@ type Deletion struct {
 // transaction, as DeleteRunner, DeleteDevSession and the clean-up hooks
 // require: the runner is DELETING with reason and its request ends as the
 // adapter says for cause, in one transaction. It returns nil when the runner
-// is already ended or being deleted. After the commit, call FinishDeletion.
+// is already ended or being deleted. After the commit, call FinishDeletion
+// or, for a cause-zero deletion left to the reconciler, RunnerChanged.
 func (e *Engine) DeleteRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason sandrunv1.RunnerEndReason, cause DeleteCause) (*Deletion, error) {
 	cur, err := e.LockOrganizationRunner(ctx, tx, orgID, runnerID)
 	if err != nil {
