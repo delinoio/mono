@@ -11,28 +11,50 @@ The React Server/Client boundary serializes all object properties into strings a
 
 **Incorrect (serializes all 50 fields):**
 
+`page.tsx` (Server Component)
+
 ```tsx
-async function Page() {
+import { fetchUser } from './data'
+import { Profile } from './profile'
+
+export default async function Page() {
   const user = await fetchUser()  // 50 fields
   return <Profile user={user} />
 }
+```
 
+`profile.tsx` (Client Component)
+
+```tsx
 'use client'
-function Profile({ user }: { user: User }) {
+
+import type { User } from './data'
+
+export function Profile({ user }: { user: User }) {
   return <div>{user.name}</div>  // uses 1 field
 }
 ```
 
 **Correct (serializes only 1 field):**
 
+`page.tsx` (Server Component)
+
 ```tsx
-async function Page() {
+import { fetchUser } from './data'
+import { Profile } from './profile'
+
+export default async function Page() {
   const user = await fetchUser()
   return <Profile name={user.name} />
 }
+```
 
+`profile.tsx` (Client Component)
+
+```tsx
 'use client'
-function Profile({ name }: { name: string }) {
+
+export function Profile({ name }: { name: string }) {
   return <div>{name}</div>
 }
 ```
