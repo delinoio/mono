@@ -167,6 +167,9 @@ importers:
       ai:
         specifier: 7.0.177
         version: 7.0.177(zod@4.6.7)
+      delino-i18n:
+        specifier: workspace:*
+        version: link:../../packages/delino-i18n
       e2e:
         specifier: 0.24.0
         version: 0.24.0(ai@7.0.177(zod@4.6.7))
@@ -204,6 +207,9 @@ importers:
       ai:
         specifier: 7.0.177
         version: 7.0.177(zod@4.6.7)
+      delino-i18n:
+        specifier: workspace:*
+        version: link:../../packages/delino-i18n
       e2e:
         specifier: 0.24.0
         version: 0.24.0(ai@7.0.177(zod@4.6.7))
