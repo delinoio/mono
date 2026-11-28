@@ -1774,30 +1774,123 @@ func TestTerminalSandboxCleanupBeforeTeardown(t *testing.T) {
 	}
 }
 
-// TestStalledCreateSandbox: a CreateSandbox call that OwnSand never
-// answers ends at CreateTimeout, so the dispatcher goes on; the runner keeps
-// its key and its driver creates the sandbox.
+// TestStalledCreateSandbox verifies that another session can queue while
+// OwnSand stalls and that the first runner retries with its stored key.
 func TestStalledCreateSandbox(t *testing.T) {
 	t.Parallel()
-	w := newWorkWorld(t, devsession.Timing{})
+	timing := testenv.FastWorkTiming()
+	timing.CreateTimeout = 5 * time.Second
+	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
-	var stalled sync.Once
-	w.fake.SetCreateHook(func(ctx context.Context) error {
-		first := false
-		stalled.Do(func() { first = true })
-		if !first {
+
+	testCtx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	type createAttempt struct {
+		deadline    time.Time
+		hasDeadline bool
+		runnerID    string
+		key         string
+	}
+	entered := make(chan createAttempt, 1)
+	finished := make(chan error, 1)
+	retried := make(chan string, 1)
+	var first sync.Once
+	var firstRunnerID string
+	w.fake.SetCreateRequestHook(func(ctx context.Context, req *ownsandv1.CreateSandboxRequest) error {
+		runnerID := req.GetLabels()[ownsandclient.LabelRunnerID]
+		key := req.GetIdempotencyKey()
+		initial := false
+		first.Do(func() {
+			initial = true
+			firstRunnerID = runnerID
+			deadline, hasDeadline := ctx.Deadline()
+			entered <- createAttempt{deadline: deadline, hasDeadline: hasDeadline, runnerID: runnerID, key: key}
+		})
+		if !initial {
+			if runnerID == firstRunnerID {
+				select {
+				case retried <- key:
+				default:
+				}
+			}
 			return nil
 		}
-		<-ctx.Done()
-		return connect.NewError(connect.CodeDeadlineExceeded, ctx.Err())
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			finished <- err
+			return connect.NewError(connect.CodeDeadlineExceeded, err)
+		case <-testCtx.Done():
+			return testCtx.Err()
+		}
 	})
-	a := w.createSession(t, w.env.User(w.org.Member), profileID)
-	eventually(t, "the stalled call", func() bool { return w.fake.Calls("CreateSandbox") >= 1 })
-	b := w.createSession(t, w.env.User(w.org.Admin), profileID)
-	w.waitState(t, b.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
-	w.waitState(t, a.GetDevSessionId(), sandrunv1.RequestState_REQUEST_STATE_RUNNING)
+
+	createSession := func(user string) (*sandrunv1.DevSession, time.Time) {
+		t.Helper()
+		resp, err := w.env.User(user).DevSession.CreateDevSession(testCtx, connect.NewRequest(&sandrunv1.CreateDevSessionRequest{
+			OrganizationId:  w.org.ID,
+			RunnerProfileId: profileID,
+			Label:           "build",
+		}))
+		receivedAt := time.Now()
+		if err != nil {
+			t.Fatalf("queue dev session: %v", err)
+		}
+		return resp.Msg.GetDevSession(), receivedAt
+	}
+
+	a, _ := createSession(w.org.Member)
+	var stalled createAttempt
+	select {
+	case stalled = <-entered:
+	case <-testCtx.Done():
+		t.Fatal("first sandbox create did not enter the hook")
+	}
+	if !stalled.hasDeadline {
+		t.Fatal("first sandbox create has no deadline")
+	}
+	if stalled.runnerID == "" || stalled.key == "" {
+		t.Fatal("first sandbox create has no runner ID or idempotency key")
+	}
+	b, queuedAt := createSession(w.org.Admin)
+	if b.GetState() != sandrunv1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("second session create returned %s, want QUEUED", b.GetState())
+	}
+	if !queuedAt.Before(stalled.deadline) {
+		t.Fatalf("second session queue response arrived %v after the first sandbox create deadline", queuedAt.Sub(stalled.deadline))
+	}
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("first sandbox create ended with %v, want context.DeadlineExceeded", err)
+		}
+	case <-testCtx.Done():
+		t.Fatal("first sandbox create did not reach its deadline")
+	}
+	select {
+	case key := <-retried:
+		if key != stalled.key {
+			t.Fatalf("retry for runner %s used idempotency key %q, want %q", stalled.runnerID, key, stalled.key)
+		}
+	case <-testCtx.Done():
+		t.Fatalf("sandbox create for runner %s was not retried", stalled.runnerID)
+	}
+
+	for _, session := range []*sandrunv1.DevSession{a, b} {
+		id := session.GetDevSessionId()
+		eventually(t, "dev session "+id+" to reach RUNNING", func() bool {
+			resp, err := w.env.User(w.org.Owner).DevSession.GetDevSession(testCtx, connect.NewRequest(&sandrunv1.GetDevSessionRequest{
+				OrganizationId: w.org.ID,
+				DevSessionId:   id,
+			}))
+			if err != nil {
+				t.Fatalf("get dev session %s: %v", id, err)
+			}
+			return resp.Msg.GetDevSession().GetState() == sandrunv1.RequestState_REQUEST_STATE_RUNNING
+		})
+	}
 	if n := len(w.fake.Sandboxes(w.osOrg)); n != 2 {
-		t.Fatalf("%d sandboxes", n)
+		t.Fatalf("got %d sandboxes, want 2", n)
 	}
 }
 
