@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
 import { ChatGPT } from "./chatgpt.mjs";
-import { generate, inspect, loadProject } from "./catalog.mjs";
+import {
+  generate,
+  inspect,
+  loadProject,
+  parseConcurrency,
+} from "./catalog.mjs";
 
 const [command, argument, ...extra] = process.argv
   .slice(2)
@@ -21,7 +26,11 @@ try {
     ["login", "logout", "models", "profiles", "translate"].includes(command)
   ) {
     let project;
+    let concurrency;
     if (command === "translate") {
+      concurrency = parseConcurrency(
+        process.env.DELINO_TRANSLATION_CONCURRENCY,
+      );
       project = await loadProject(process.cwd());
       if (
         argument &&
@@ -92,6 +101,7 @@ try {
           }
         },
         argument,
+        concurrency,
       );
     };
     const client = new ChatGPT();

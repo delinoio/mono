@@ -25,6 +25,7 @@ import {
   inspect,
   loadProject,
   localizeLinks,
+  parseConcurrency,
   validateTranslation,
   writeJson,
 } from "./catalog.mjs";
@@ -775,4 +776,43 @@ test("the registry context is optional and must be nonempty text", async (t) => 
     context: " ",
   });
   await assert.rejects(loadProject(root), /context must be a nonempty string/u);
+});
+
+test("request concurrency defaults to two and accepts 1 to 8", async (t) => {
+  assert.equal(parseConcurrency(undefined), 2);
+  assert.equal(parseConcurrency(""), 2);
+  assert.equal(parseConcurrency("6"), 6);
+  for (const text of ["0", "9", "2.5", "two"])
+    assert.throws(() => parseConcurrency(text), /from 1 to 8/u);
+
+  const root = await temporary(t);
+  await writeJson(join(root, "i18n/locales.json"), {
+    sourceLang: "en",
+    locales: [
+      { lang: "en", label: "English" },
+      { lang: "ko", label: "Korean" },
+    ],
+  });
+  await writeJson(
+    join(root, "i18n/messages/en.json"),
+    Object.fromEntries(
+      Array.from({ length: 200 }, (_, index) => [
+        `key${index}`,
+        `Text ${index}`,
+      ]),
+    ),
+  );
+  let active = 0;
+  let peak = 0;
+  const translate = async (_locale, input) => {
+    peak = Math.max(peak, ++active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active--;
+    return input;
+  };
+  assert.equal(
+    await generate(await loadProject(root), translate, undefined, 5),
+    200,
+  );
+  assert.equal(peak, 5);
 });

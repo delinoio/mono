@@ -445,7 +445,27 @@ export async function inspect(project) {
   return { issues, pending };
 }
 
-export async function generate(project, translate, lang) {
+/** The default and maximum number of concurrent requests per app. */
+export const DEFAULT_CONCURRENCY = 2;
+export const MAX_CONCURRENCY = 8;
+
+/** Reads a request concurrency from text, for example an environment value. */
+export function parseConcurrency(text) {
+  if (text === undefined || text === "") return DEFAULT_CONCURRENCY;
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_CONCURRENCY)
+    throw new Error(
+      `DELINO_TRANSLATION_CONCURRENCY must be an integer from 1 to ${MAX_CONCURRENCY}.`,
+    );
+  return value;
+}
+
+export async function generate(
+  project,
+  translate,
+  lang,
+  concurrency = DEFAULT_CONCURRENCY,
+) {
   // A per-checkout lock protects catalogs and state while other apps translate.
   const lock = join(
     tmpdir(),
@@ -466,13 +486,14 @@ export async function generate(project, translate, lang) {
       await loadProject(project.root),
       translate,
       lang,
+      concurrency,
     );
   } finally {
     await rm(lock, { recursive: true, force: true });
   }
 }
 
-async function generateProject(project, translate, lang) {
+async function generateProject(project, translate, lang, concurrency) {
   if (
     lang &&
     !project.locales.some(
@@ -503,10 +524,10 @@ async function generateProject(project, translate, lang) {
     batches.push(
       ...needed.filter((unit) => unit.markdown).map((unit) => [unit]),
     );
-    for (let index = 0; index < batches.length; index += 2) {
+    for (let index = 0; index < batches.length; index += concurrency) {
       // Drain each bounded group before writing. Successful peers remain resumable
       // even when another request fails; do not start the next group on failure.
-      const group = batches.slice(index, index + 2);
+      const group = batches.slice(index, index + concurrency);
       const results = await Promise.allSettled(
         group.map(async (batch) => {
           const input = Object.fromEntries(

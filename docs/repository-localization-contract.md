@@ -28,7 +28,7 @@ Run these commands from the repository root:
 
 - `pnpm i18n:login`: continue with ChatGPT in the system browser and authorize ChatGPT plan usage. `pnpm i18n:login --new` adds a registration and `pnpm i18n:login <profile-id>` reauthorizes and selects one; `pnpm i18n:profiles` lists them.
 - `pnpm i18n:models`: list the models available to the account.
-- `pnpm i18n:translate [lang]`: generate missing or source-changed translations in every app, two apps at a time. Set `DELINO_TRANSLATION_MODEL` to a model slug from `pnpm i18n:models`; otherwise the first listed model is used.
+- `pnpm i18n:translate [lang]`: generate missing or source-changed translations in every app, two apps at a time. Set `DELINO_TRANSLATION_MODEL` to a model slug from `pnpm i18n:models`; otherwise the first listed model is used. Set `DELINO_TRANSLATION_CONCURRENCY` (1 to 8, default 2) to change the number of concurrent requests per app; a higher value finishes sooner but uses the plan's usage limits faster.
 - `pnpm i18n:check`: run the offline check in every app.
 - `pnpm i18n:logout`: end the session and clear local credentials.
 
