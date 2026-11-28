@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPsFixture } from "./fixture-portless-ps.mjs";
 import { spawnProcessGroup } from "./fixture-process.mjs";
 
@@ -259,7 +259,11 @@ function run(
   if (stateDir !== undefined) env.PORTLESS_STATE_DIR = stateDir;
   const result = spawnSync(
     process.execPath,
-    ["--import", join(dir, "probe.mjs"), join(dir, "scripts", "dev", script)],
+    [
+      "--import",
+      pathToFileURL(join(dir, "probe.mjs")).href,
+      join(dir, "scripts", "dev", script),
+    ],
     { encoding: "utf8", env, cwd: dir },
   );
   const calls = existsSync(record)
