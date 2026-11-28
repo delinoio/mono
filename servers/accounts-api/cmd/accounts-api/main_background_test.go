@@ -263,6 +263,7 @@ type backgroundRig struct {
 	publicAddr    string
 	logs          *syncBuffer
 	workerStarted chan struct{}
+	workerStopped atomic.Bool
 	result        chan error
 }
 
@@ -285,6 +286,7 @@ func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) 
 	worker := func(background context.Context) {
 		close(rig.workerStarted)
 		<-background.Done()
+		rig.workerStopped.Store(true)
 	}
 	srv := newServer(http.NewServeMux(), logger)
 	go func() {
