@@ -1579,6 +1579,7 @@ export function createMockTransport(
             s.state !== SandboxState.DELETED
           ) {
             s.state = SandboxState.DELETED;
+            delete s.lastKnownState;
             s.endReason = SandboxEndReason.DEVICE_REMOVED;
             s.endTime = endTime;
           }

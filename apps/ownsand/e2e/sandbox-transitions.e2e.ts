@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code } from "@connectrpc/connect";
-import { SandboxState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  SandboxEndReason,
+  SandboxState,
+} from "@delino/ownsand-protos/v1/common_pb";
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { MOCK_IDS } from "../src/mock/mock-api.ts";
@@ -52,6 +55,36 @@ describe("sandbox transitions", () => {
       });
     });
   }
+
+  test("removing an offline device clears its sandbox's last known state", async ({
+    app,
+    browser,
+  }) => {
+    await app.open("/sandbox-offline.html");
+
+    const result = await browser.evaluate(() =>
+      window.removeOfflineSandboxDevice(),
+    );
+
+    expect(result.before).toEqual({
+      state: SandboxState.UNREACHABLE,
+      lastKnownState: SandboxState.RUNNING,
+    });
+    const endTimeMs = result.detail?.endTimeMs;
+    if (endTimeMs == null) throw new Error("GetSandbox returned no end time");
+    expect(endTimeMs).toBeGreaterThanOrEqual(result.startedAt);
+    expect(endTimeMs).toBeLessThanOrEqual(result.finishedAt);
+    const ended = {
+      state: SandboxState.DELETED,
+      endReason: SandboxEndReason.DEVICE_REMOVED,
+      endTimeMs,
+      hasLastKnownState: false,
+    };
+    expect(result.detail).toEqual(ended);
+    expect(result.includeEnded).toEqual(ended);
+    expect(result.onlyDeleted).toEqual(ended);
+    expect(result.inDefaultList).toBe(false);
+  });
 
   for (const {
     action,
