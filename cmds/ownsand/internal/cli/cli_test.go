@@ -115,6 +115,57 @@ func TestUsageErrors(t *testing.T) {
 	}
 }
 
+func TestUsageErrorsRespectParsedColor(t *testing.T) {
+	const (
+		unknownFlag = "org list: flag provided but not defined: -unknown"
+		badFormat   = `unknown format "yaml" (want text or json)`
+		badBoolean  = `org list: invalid boolean value "invalid" for -no-color: parse error`
+		badSandbox  = "sandbox-id: invalid sandbox-id: must be a canonical UUID v7"
+	)
+	empty, nonempty := "", "1"
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		noColor *string
+		message string
+		color   bool
+	}{
+		{"flag error after opt-out", []string{"org", "list", "--no-color", "--unknown"}, nil, unknownFlag, false},
+		{"format error after opt-out", []string{"org", "list", "--no-color", "--format", "yaml"}, &empty, badFormat, false},
+		{"root opt-out", []string{"--no-color", "org", "list", "--unknown"}, nil, unknownFlag, false},
+		{"nonempty environment", []string{"org", "list", "--no-color=false", "--unknown"}, &nonempty, unknownFlag, false},
+		{"unset environment", []string{"org", "list", "--unknown"}, nil, unknownFlag, true},
+		{"empty environment", []string{"org", "list", "--unknown"}, &empty, unknownFlag, true},
+		{"stop at first flag error", []string{"org", "list", "--unknown", "--no-color"}, nil, unknownFlag, true},
+		{"flag error before format validation", []string{"org", "list", "--no-color", "--format", "yaml", "--unknown"}, nil, unknownFlag, false},
+		{"subcommand overrides root", []string{"--no-color", "org", "list", "--no-color=false", "--unknown"}, nil, unknownFlag, true},
+		{"invalid value keeps prior opt-out", []string{"org", "list", "--no-color", "--no-color=invalid"}, nil, badBoolean, false},
+		{"option terminator", []string{"org", "list", "--", "--no-color"}, nil, "usage: ownsand org list [flags]", true},
+		{"guest argument", []string{"sandbox", "exec", "not-an-id", "echo", "--no-color"}, nil, badSandbox, true},
+		{"root parse error", []string{"--unknown"}, nil, "ownsand: flag provided but not defined: -unknown", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			if tc.noColor != nil {
+				r.env[EnvNoColor] = *tc.noColor
+			}
+			prefix := "error:"
+			if tc.color {
+				prefix = "\x1b[31merror:\x1b[0m"
+			}
+			wantStderr := prefix + " " + tc.message + "\nRun 'ownsand help' for usage.\n"
+			res := r.run(tc.args...)
+			if res.code != ExitUsage || res.stdout != "" || res.stderr != wantStderr {
+				t.Errorf("exit %d, stdout %q, stderr %q; want exit %d, empty stdout, stderr %q",
+					res.code, res.stdout, res.stderr, ExitUsage, wantStderr)
+			}
+			if calls := r.f.callNames(); len(calls) != 0 {
+				t.Errorf("sent RPCs for a usage error: %v", calls)
+			}
+		})
+	}
+}
+
 // TestFileWriteMode checks that file write rejects a zero mode before any RPC
 // and names --mode in the error. It also checks that the relay receives the
 // default and explicit modes.
