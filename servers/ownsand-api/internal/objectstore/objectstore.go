@@ -61,6 +61,7 @@ const (
 	algorithm     = "AWS4-HMAC-SHA256"
 	unsignedBody  = "UNSIGNED-PAYLOAD"
 	amzDateFormat = "20060102T150405Z"
+	minPresignTTL = time.Second
 	maxPresignTTL = 7 * 24 * time.Hour
 )
 
@@ -152,7 +153,7 @@ func (r *R2) objectURL(key string) (*url.URL, error) {
 // X-Amz-Date and X-Amz-Expires values, so it matches what the storage service
 // enforces even when the clock has a fractional second.
 func (r *R2) presign(method, key string, ttl time.Duration, now time.Time) (string, time.Time, error) {
-	if ttl <= 0 || ttl > maxPresignTTL {
+	if ttl < minPresignTTL || ttl > maxPresignTTL {
 		return "", time.Time{}, errors.New("objectstore: invalid signed URL lifetime")
 	}
 	u, err := r.objectURL(key)
