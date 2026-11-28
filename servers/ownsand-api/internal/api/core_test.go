@@ -1628,28 +1628,34 @@ func TestClientAddressModes(t *testing.T) {
 		return err
 	}
 	for _, tc := range []struct {
-		name   string
-		mode   config.ClientAddressMode
-		header http.Header
+		name            string
+		mode            config.ClientAddressMode
+		firstForwarded  string
+		secondForwarded string
 		// limited reports whether the second request from the same peer is
 		// rejected by the client bucket.
 		limited bool
 	}{
-		{"none ignores the peer", config.ClientAddressNone, nil, false},
-		{"none ignores forwarded headers", config.ClientAddressNone, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, false},
-		{"direct uses the peer", config.ClientAddressDirect, nil, true},
-		{"direct ignores forwarded headers", config.ClientAddressDirect, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, true},
-		{"verified proxy uses the forwarded address", config.ClientAddressVerifiedProxy, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, true},
-		{"verified proxy without the header has no address", config.ClientAddressVerifiedProxy, nil, false},
-		{"verified proxy with an invalid final value has no address", config.ClientAddressVerifiedProxy, http.Header{"X-Forwarded-For": []string{"203.0.113.9, not-an-ip"}}, false},
+		{"none ignores the peer", config.ClientAddressNone, "", "", false},
+		{"none ignores forwarded headers", config.ClientAddressNone, "203.0.113.9", "203.0.113.9", false},
+		{"direct uses the peer", config.ClientAddressDirect, "", "", true},
+		{"direct ignores forwarded headers", config.ClientAddressDirect, "203.0.113.9", "203.0.113.10", true},
+		{"verified proxy uses the forwarded address", config.ClientAddressVerifiedProxy, "203.0.113.9", "203.0.113.9", true},
+		{"verified proxy without the header has no address", config.ClientAddressVerifiedProxy, "", "", false},
+		{"verified proxy with an invalid final value has no address", config.ClientAddressVerifiedProxy, "203.0.113.9, not-an-ip", "203.0.113.9, not-an-ip", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testenv.New(t, addressBurstLimits(tc.mode))
-			c := env.ClientsWith("", tc.header)
-			if err := challenge(c); err != nil {
+			client := func(forwarded string) *testenv.Clients {
+				if forwarded == "" {
+					return env.Clients("")
+				}
+				return fromAddress(env, "", forwarded)
+			}
+			if err := challenge(client(tc.firstForwarded)); err != nil {
 				t.Fatalf("first request: %v", err)
 			}
-			err := challenge(c)
+			err := challenge(client(tc.secondForwarded))
 			if tc.limited {
 				if rateLimitRetry(t, err) <= 0 {
 					t.Fatalf("second request: want resource_exhausted with a retry delay, got %v", err)
