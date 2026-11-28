@@ -203,6 +203,7 @@
   "githubSetup.description": "SandRun GitHub App をインストールした GitHub 組織を連携します。",
   "githubSetup.missingDetails": "URL に GitHub のインストール情報が含まれていません。組織の連携設定からインストールをやり直してください。",
   "githubSetup.singleUse": "インストールリンクは一度しか使用できません。組織の連携設定からインストールをやり直してください。",
+  "githubSetup.organizationMismatch": "GitHub のインストールを開始した SandRun 組織を選択してください。",
   "githubSetup.linking": "GitHub のインストールを連携中",
   "githubSetup.loadingOrganizations": "所属する組織を読み込み中",
   "githubSetup.notAdmin": "GitHub のインストールを連携できるのは、SandRun 組織のオーナーまたは管理者のみです。",

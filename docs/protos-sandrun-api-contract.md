@@ -103,7 +103,7 @@ The control plane serves every public service at `https://sandrun.api.delino.io`
 ### OwnSand link and GitHub messages
 
 - `SetOwnSandLinkRequest` carries `ownsand_organization_id` and the credential `ownsand_api_key`. `OwnSandLink` carries the state, `credential_set` and `credential_set_at`. `GetOwnSandLinkResponse` has no `link` when the organization has no link.
-- `GitHubInstallation` carries `installation_id`, `github_installation_id`, the GitHub account login and ID, the state, and the runner group (`github_runner_group_id` and its name). `LinkGitHubInstallation` takes `github_installation_id`, `code` and `state` from the GitHub callback.
+- `GitHubInstallation` carries `installation_id`, `github_installation_id`, the GitHub account login and ID, the state, and the runner group (`github_runner_group_id` and its name). `LinkGitHubInstallation` takes `github_installation_id`, `code` and `state` from the GitHub callback. An `invalid_argument` error can include the empty typed detail `GitHubInstallOrganizationMismatch`. The detail means the callback state is still unused and unexpired, belongs to the caller, and was issued for a different organization where the caller can still manage integrations.
 
 ### Runner profile messages
 

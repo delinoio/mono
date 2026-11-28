@@ -419,6 +419,44 @@ func (x *LinkGitHubInstallationResponse) GetInstallation() *GitHubInstallation {
 	return nil
 }
 
+// LinkGitHubInstallation error detail for an unused callback issued to the
+// caller for a different organization they can still manage.
+type GitHubInstallOrganizationMismatch struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GitHubInstallOrganizationMismatch) Reset() {
+	*x = GitHubInstallOrganizationMismatch{}
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GitHubInstallOrganizationMismatch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GitHubInstallOrganizationMismatch) ProtoMessage() {}
+
+func (x *GitHubInstallOrganizationMismatch) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GitHubInstallOrganizationMismatch.ProtoReflect.Descriptor instead.
+func (*GitHubInstallOrganizationMismatch) Descriptor() ([]byte, []int) {
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{6}
+}
+
 type ListGitHubInstallationsRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
@@ -430,7 +468,7 @@ type ListGitHubInstallationsRequest struct {
 
 func (x *ListGitHubInstallationsRequest) Reset() {
 	*x = ListGitHubInstallationsRequest{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[6]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -442,7 +480,7 @@ func (x *ListGitHubInstallationsRequest) String() string {
 func (*ListGitHubInstallationsRequest) ProtoMessage() {}
 
 func (x *ListGitHubInstallationsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[6]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -455,7 +493,7 @@ func (x *ListGitHubInstallationsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListGitHubInstallationsRequest.ProtoReflect.Descriptor instead.
 func (*ListGitHubInstallationsRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{6}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ListGitHubInstallationsRequest) GetOrganizationId() string {
@@ -489,7 +527,7 @@ type ListGitHubInstallationsResponse struct {
 
 func (x *ListGitHubInstallationsResponse) Reset() {
 	*x = ListGitHubInstallationsResponse{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[7]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -501,7 +539,7 @@ func (x *ListGitHubInstallationsResponse) String() string {
 func (*ListGitHubInstallationsResponse) ProtoMessage() {}
 
 func (x *ListGitHubInstallationsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[7]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -514,7 +552,7 @@ func (x *ListGitHubInstallationsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListGitHubInstallationsResponse.ProtoReflect.Descriptor instead.
 func (*ListGitHubInstallationsResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{7}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ListGitHubInstallationsResponse) GetInstallations() []*GitHubInstallation {
@@ -541,7 +579,7 @@ type ListGitHubRunnerGroupsRequest struct {
 
 func (x *ListGitHubRunnerGroupsRequest) Reset() {
 	*x = ListGitHubRunnerGroupsRequest{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[8]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -553,7 +591,7 @@ func (x *ListGitHubRunnerGroupsRequest) String() string {
 func (*ListGitHubRunnerGroupsRequest) ProtoMessage() {}
 
 func (x *ListGitHubRunnerGroupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[8]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -566,7 +604,7 @@ func (x *ListGitHubRunnerGroupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListGitHubRunnerGroupsRequest.ProtoReflect.Descriptor instead.
 func (*ListGitHubRunnerGroupsRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{8}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListGitHubRunnerGroupsRequest) GetOrganizationId() string {
@@ -592,7 +630,7 @@ type ListGitHubRunnerGroupsResponse struct {
 
 func (x *ListGitHubRunnerGroupsResponse) Reset() {
 	*x = ListGitHubRunnerGroupsResponse{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[9]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -604,7 +642,7 @@ func (x *ListGitHubRunnerGroupsResponse) String() string {
 func (*ListGitHubRunnerGroupsResponse) ProtoMessage() {}
 
 func (x *ListGitHubRunnerGroupsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[9]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -617,7 +655,7 @@ func (x *ListGitHubRunnerGroupsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListGitHubRunnerGroupsResponse.ProtoReflect.Descriptor instead.
 func (*ListGitHubRunnerGroupsResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{9}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListGitHubRunnerGroupsResponse) GetRunnerGroups() []*GitHubRunnerGroup {
@@ -638,7 +676,7 @@ type UpdateGitHubInstallationRequest struct {
 
 func (x *UpdateGitHubInstallationRequest) Reset() {
 	*x = UpdateGitHubInstallationRequest{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[10]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -650,7 +688,7 @@ func (x *UpdateGitHubInstallationRequest) String() string {
 func (*UpdateGitHubInstallationRequest) ProtoMessage() {}
 
 func (x *UpdateGitHubInstallationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[10]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -663,7 +701,7 @@ func (x *UpdateGitHubInstallationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateGitHubInstallationRequest.ProtoReflect.Descriptor instead.
 func (*UpdateGitHubInstallationRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{10}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *UpdateGitHubInstallationRequest) GetOrganizationId() string {
@@ -696,7 +734,7 @@ type UpdateGitHubInstallationResponse struct {
 
 func (x *UpdateGitHubInstallationResponse) Reset() {
 	*x = UpdateGitHubInstallationResponse{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[11]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -708,7 +746,7 @@ func (x *UpdateGitHubInstallationResponse) String() string {
 func (*UpdateGitHubInstallationResponse) ProtoMessage() {}
 
 func (x *UpdateGitHubInstallationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[11]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -721,7 +759,7 @@ func (x *UpdateGitHubInstallationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateGitHubInstallationResponse.ProtoReflect.Descriptor instead.
 func (*UpdateGitHubInstallationResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{11}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *UpdateGitHubInstallationResponse) GetInstallation() *GitHubInstallation {
@@ -741,7 +779,7 @@ type UnlinkGitHubInstallationRequest struct {
 
 func (x *UnlinkGitHubInstallationRequest) Reset() {
 	*x = UnlinkGitHubInstallationRequest{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[12]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -753,7 +791,7 @@ func (x *UnlinkGitHubInstallationRequest) String() string {
 func (*UnlinkGitHubInstallationRequest) ProtoMessage() {}
 
 func (x *UnlinkGitHubInstallationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[12]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -766,7 +804,7 @@ func (x *UnlinkGitHubInstallationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnlinkGitHubInstallationRequest.ProtoReflect.Descriptor instead.
 func (*UnlinkGitHubInstallationRequest) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{12}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *UnlinkGitHubInstallationRequest) GetOrganizationId() string {
@@ -791,7 +829,7 @@ type UnlinkGitHubInstallationResponse struct {
 
 func (x *UnlinkGitHubInstallationResponse) Reset() {
 	*x = UnlinkGitHubInstallationResponse{}
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[13]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -803,7 +841,7 @@ func (x *UnlinkGitHubInstallationResponse) String() string {
 func (*UnlinkGitHubInstallationResponse) ProtoMessage() {}
 
 func (x *UnlinkGitHubInstallationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_sandrun_v1_github_proto_msgTypes[13]
+	mi := &file_delino_sandrun_v1_github_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -816,7 +854,7 @@ func (x *UnlinkGitHubInstallationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnlinkGitHubInstallationResponse.ProtoReflect.Descriptor instead.
 func (*UnlinkGitHubInstallationResponse) Descriptor() ([]byte, []int) {
-	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{13}
+	return file_delino_sandrun_v1_github_proto_rawDescGZIP(), []int{14}
 }
 
 var File_delino_sandrun_v1_github_proto protoreflect.FileDescriptor
@@ -855,7 +893,8 @@ const file_delino_sandrun_v1_github_proto_rawDesc = "" +
 	"\x04code\x18\x03 \x01(\tR\x04code\x12\x14\n" +
 	"\x05state\x18\x04 \x01(\tR\x05state\"k\n" +
 	"\x1eLinkGitHubInstallationResponse\x12I\n" +
-	"\finstallation\x18\x01 \x01(\v2%.delino.sandrun.v1.GitHubInstallationR\finstallation\"\x85\x01\n" +
+	"\finstallation\x18\x01 \x01(\v2%.delino.sandrun.v1.GitHubInstallationR\finstallation\"#\n" +
+	"!GitHubInstallOrganizationMismatch\"\x85\x01\n" +
 	"\x1eListGitHubInstallationsRequest\x12'\n" +
 	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12\x1b\n" +
 	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
@@ -899,45 +938,46 @@ func file_delino_sandrun_v1_github_proto_rawDescGZIP() []byte {
 	return file_delino_sandrun_v1_github_proto_rawDescData
 }
 
-var file_delino_sandrun_v1_github_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_delino_sandrun_v1_github_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_delino_sandrun_v1_github_proto_goTypes = []any{
-	(*GitHubInstallation)(nil),               // 0: delino.sandrun.v1.GitHubInstallation
-	(*GitHubRunnerGroup)(nil),                // 1: delino.sandrun.v1.GitHubRunnerGroup
-	(*CreateGitHubInstallUrlRequest)(nil),    // 2: delino.sandrun.v1.CreateGitHubInstallUrlRequest
-	(*CreateGitHubInstallUrlResponse)(nil),   // 3: delino.sandrun.v1.CreateGitHubInstallUrlResponse
-	(*LinkGitHubInstallationRequest)(nil),    // 4: delino.sandrun.v1.LinkGitHubInstallationRequest
-	(*LinkGitHubInstallationResponse)(nil),   // 5: delino.sandrun.v1.LinkGitHubInstallationResponse
-	(*ListGitHubInstallationsRequest)(nil),   // 6: delino.sandrun.v1.ListGitHubInstallationsRequest
-	(*ListGitHubInstallationsResponse)(nil),  // 7: delino.sandrun.v1.ListGitHubInstallationsResponse
-	(*ListGitHubRunnerGroupsRequest)(nil),    // 8: delino.sandrun.v1.ListGitHubRunnerGroupsRequest
-	(*ListGitHubRunnerGroupsResponse)(nil),   // 9: delino.sandrun.v1.ListGitHubRunnerGroupsResponse
-	(*UpdateGitHubInstallationRequest)(nil),  // 10: delino.sandrun.v1.UpdateGitHubInstallationRequest
-	(*UpdateGitHubInstallationResponse)(nil), // 11: delino.sandrun.v1.UpdateGitHubInstallationResponse
-	(*UnlinkGitHubInstallationRequest)(nil),  // 12: delino.sandrun.v1.UnlinkGitHubInstallationRequest
-	(*UnlinkGitHubInstallationResponse)(nil), // 13: delino.sandrun.v1.UnlinkGitHubInstallationResponse
-	(GitHubInstallationState)(0),             // 14: delino.sandrun.v1.GitHubInstallationState
-	(*timestamppb.Timestamp)(nil),            // 15: google.protobuf.Timestamp
+	(*GitHubInstallation)(nil),                // 0: delino.sandrun.v1.GitHubInstallation
+	(*GitHubRunnerGroup)(nil),                 // 1: delino.sandrun.v1.GitHubRunnerGroup
+	(*CreateGitHubInstallUrlRequest)(nil),     // 2: delino.sandrun.v1.CreateGitHubInstallUrlRequest
+	(*CreateGitHubInstallUrlResponse)(nil),    // 3: delino.sandrun.v1.CreateGitHubInstallUrlResponse
+	(*LinkGitHubInstallationRequest)(nil),     // 4: delino.sandrun.v1.LinkGitHubInstallationRequest
+	(*LinkGitHubInstallationResponse)(nil),    // 5: delino.sandrun.v1.LinkGitHubInstallationResponse
+	(*GitHubInstallOrganizationMismatch)(nil), // 6: delino.sandrun.v1.GitHubInstallOrganizationMismatch
+	(*ListGitHubInstallationsRequest)(nil),    // 7: delino.sandrun.v1.ListGitHubInstallationsRequest
+	(*ListGitHubInstallationsResponse)(nil),   // 8: delino.sandrun.v1.ListGitHubInstallationsResponse
+	(*ListGitHubRunnerGroupsRequest)(nil),     // 9: delino.sandrun.v1.ListGitHubRunnerGroupsRequest
+	(*ListGitHubRunnerGroupsResponse)(nil),    // 10: delino.sandrun.v1.ListGitHubRunnerGroupsResponse
+	(*UpdateGitHubInstallationRequest)(nil),   // 11: delino.sandrun.v1.UpdateGitHubInstallationRequest
+	(*UpdateGitHubInstallationResponse)(nil),  // 12: delino.sandrun.v1.UpdateGitHubInstallationResponse
+	(*UnlinkGitHubInstallationRequest)(nil),   // 13: delino.sandrun.v1.UnlinkGitHubInstallationRequest
+	(*UnlinkGitHubInstallationResponse)(nil),  // 14: delino.sandrun.v1.UnlinkGitHubInstallationResponse
+	(GitHubInstallationState)(0),              // 15: delino.sandrun.v1.GitHubInstallationState
+	(*timestamppb.Timestamp)(nil),             // 16: google.protobuf.Timestamp
 }
 var file_delino_sandrun_v1_github_proto_depIdxs = []int32{
-	14, // 0: delino.sandrun.v1.GitHubInstallation.state:type_name -> delino.sandrun.v1.GitHubInstallationState
-	15, // 1: delino.sandrun.v1.GitHubInstallation.create_time:type_name -> google.protobuf.Timestamp
-	15, // 2: delino.sandrun.v1.CreateGitHubInstallUrlResponse.expire_time:type_name -> google.protobuf.Timestamp
+	15, // 0: delino.sandrun.v1.GitHubInstallation.state:type_name -> delino.sandrun.v1.GitHubInstallationState
+	16, // 1: delino.sandrun.v1.GitHubInstallation.create_time:type_name -> google.protobuf.Timestamp
+	16, // 2: delino.sandrun.v1.CreateGitHubInstallUrlResponse.expire_time:type_name -> google.protobuf.Timestamp
 	0,  // 3: delino.sandrun.v1.LinkGitHubInstallationResponse.installation:type_name -> delino.sandrun.v1.GitHubInstallation
 	0,  // 4: delino.sandrun.v1.ListGitHubInstallationsResponse.installations:type_name -> delino.sandrun.v1.GitHubInstallation
 	1,  // 5: delino.sandrun.v1.ListGitHubRunnerGroupsResponse.runner_groups:type_name -> delino.sandrun.v1.GitHubRunnerGroup
 	0,  // 6: delino.sandrun.v1.UpdateGitHubInstallationResponse.installation:type_name -> delino.sandrun.v1.GitHubInstallation
 	2,  // 7: delino.sandrun.v1.GitHubService.CreateGitHubInstallUrl:input_type -> delino.sandrun.v1.CreateGitHubInstallUrlRequest
 	4,  // 8: delino.sandrun.v1.GitHubService.LinkGitHubInstallation:input_type -> delino.sandrun.v1.LinkGitHubInstallationRequest
-	6,  // 9: delino.sandrun.v1.GitHubService.ListGitHubInstallations:input_type -> delino.sandrun.v1.ListGitHubInstallationsRequest
-	8,  // 10: delino.sandrun.v1.GitHubService.ListGitHubRunnerGroups:input_type -> delino.sandrun.v1.ListGitHubRunnerGroupsRequest
-	10, // 11: delino.sandrun.v1.GitHubService.UpdateGitHubInstallation:input_type -> delino.sandrun.v1.UpdateGitHubInstallationRequest
-	12, // 12: delino.sandrun.v1.GitHubService.UnlinkGitHubInstallation:input_type -> delino.sandrun.v1.UnlinkGitHubInstallationRequest
+	7,  // 9: delino.sandrun.v1.GitHubService.ListGitHubInstallations:input_type -> delino.sandrun.v1.ListGitHubInstallationsRequest
+	9,  // 10: delino.sandrun.v1.GitHubService.ListGitHubRunnerGroups:input_type -> delino.sandrun.v1.ListGitHubRunnerGroupsRequest
+	11, // 11: delino.sandrun.v1.GitHubService.UpdateGitHubInstallation:input_type -> delino.sandrun.v1.UpdateGitHubInstallationRequest
+	13, // 12: delino.sandrun.v1.GitHubService.UnlinkGitHubInstallation:input_type -> delino.sandrun.v1.UnlinkGitHubInstallationRequest
 	3,  // 13: delino.sandrun.v1.GitHubService.CreateGitHubInstallUrl:output_type -> delino.sandrun.v1.CreateGitHubInstallUrlResponse
 	5,  // 14: delino.sandrun.v1.GitHubService.LinkGitHubInstallation:output_type -> delino.sandrun.v1.LinkGitHubInstallationResponse
-	7,  // 15: delino.sandrun.v1.GitHubService.ListGitHubInstallations:output_type -> delino.sandrun.v1.ListGitHubInstallationsResponse
-	9,  // 16: delino.sandrun.v1.GitHubService.ListGitHubRunnerGroups:output_type -> delino.sandrun.v1.ListGitHubRunnerGroupsResponse
-	11, // 17: delino.sandrun.v1.GitHubService.UpdateGitHubInstallation:output_type -> delino.sandrun.v1.UpdateGitHubInstallationResponse
-	13, // 18: delino.sandrun.v1.GitHubService.UnlinkGitHubInstallation:output_type -> delino.sandrun.v1.UnlinkGitHubInstallationResponse
+	8,  // 15: delino.sandrun.v1.GitHubService.ListGitHubInstallations:output_type -> delino.sandrun.v1.ListGitHubInstallationsResponse
+	10, // 16: delino.sandrun.v1.GitHubService.ListGitHubRunnerGroups:output_type -> delino.sandrun.v1.ListGitHubRunnerGroupsResponse
+	12, // 17: delino.sandrun.v1.GitHubService.UpdateGitHubInstallation:output_type -> delino.sandrun.v1.UpdateGitHubInstallationResponse
+	14, // 18: delino.sandrun.v1.GitHubService.UnlinkGitHubInstallation:output_type -> delino.sandrun.v1.UnlinkGitHubInstallationResponse
 	13, // [13:19] is the sub-list for method output_type
 	7,  // [7:13] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
@@ -957,7 +997,7 @@ func file_delino_sandrun_v1_github_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_sandrun_v1_github_proto_rawDesc), len(file_delino_sandrun_v1_github_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   14,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

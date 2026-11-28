@@ -1565,6 +1565,129 @@ func TestLinkFlow(t *testing.T) {
 	}
 }
 
+func TestLinkFlowOrganizationRecovery(t *testing.T) {
+	t.Parallel()
+	w := newGHWorld(t, worldOpts{})
+	issuer := w.env.NewOrg("issuer")
+	w.env.Join(issuer.ID, issuer.Owner, w.org.Admin, sandrunv1.Role_ROLE_ADMIN)
+	client := w.env.User(w.org.Admin).GitHub
+	ctx := t.Context()
+	w.gh.AddInstallation(501, "recovery", "Organization", "octo")
+	w.gh.AddCode("recovery-code", "octo")
+	w.gh.AddInstallation(502, "concurrent", "Organization", "octo")
+	w.gh.AddCode("concurrent-code", "octo")
+
+	issue := func(user string) string {
+		t.Helper()
+		res, err := w.env.User(user).GitHub.CreateGitHubInstallUrl(ctx, connect.NewRequest(&sandrunv1.CreateGitHubInstallUrlRequest{OrganizationId: issuer.ID}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, state, _ := strings.Cut(res.Msg.GetUrl(), "?state=")
+		return state
+	}
+	link := func(orgID, state, code string, installationID int64) error {
+		_, err := client.LinkGitHubInstallation(ctx, connect.NewRequest(&sandrunv1.LinkGitHubInstallationRequest{
+			OrganizationId: orgID, GithubInstallationId: installationID, Code: code, State: state,
+		}))
+		return err
+	}
+	assertFailure := func(label string, err error, mismatch bool) {
+		t.Helper()
+		wantCode(t, label, err, connect.CodeInvalidArgument)
+		var failure *connect.Error
+		if !errors.As(err, &failure) {
+			t.Fatalf("%s: expected a Connect error", label)
+		}
+		details := failure.Details()
+		if !mismatch {
+			if len(details) != 0 {
+				t.Fatalf("%s: received %d details for terminal state", label, len(details))
+			}
+			return
+		}
+		if len(details) != 1 || len(details[0].Bytes()) != 0 {
+			t.Fatalf("%s: expected one empty mismatch detail", label)
+		}
+		value, err := details[0].Value()
+		if _, ok := value.(*sandrunv1.GitHubInstallOrganizationMismatch); err != nil || !ok {
+			t.Fatalf("%s: expected mismatch detail, got %T (%v)", label, value, err)
+		}
+	}
+	list := func(orgID string) []*sandrunv1.GitHubInstallation {
+		t.Helper()
+		res, err := client.ListGitHubInstallations(ctx, connect.NewRequest(&sandrunv1.ListGitHubInstallationsRequest{OrganizationId: orgID}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Msg.GetInstallations()
+	}
+	assertExchanges := func(want int) {
+		t.Helper()
+		if got := w.gh.Calls("exchange_oauth_code"); got != want {
+			t.Fatalf("GitHub code exchanges = %d, want %d", got, want)
+		}
+	}
+
+	expired := issue(w.org.Admin)
+	w.env.Clock.Advance(10 * time.Minute)
+	state := issue(w.org.Admin)
+	assertFailure("unknown state", link(w.org.ID, "unknown", "recovery-code", 501), false)
+	assertFailure("expired state", link(w.org.ID, expired, "recovery-code", 501), false)
+	assertFailure("other user's state", link(w.org.ID, issue(issuer.Owner), "recovery-code", 501), false)
+	assertFailure("wrong organization", link(w.org.ID, state, "recovery-code", 501), true)
+	assertExchanges(0)
+	if len(list(w.org.ID)) != 0 || len(list(issuer.ID)) != 0 {
+		t.Fatal("the wrong organization choice created a link")
+	}
+
+	wantCode(t, "correct organization", link(issuer.ID, state, "recovery-code", 501), 0)
+	assertFailure("replay in wrong organization", link(w.org.ID, state, "recovery-code", 501), false)
+	assertExchanges(1)
+	linked := list(issuer.ID)
+	if len(linked) != 1 || linked[0].GetGithubInstallationId() != 501 || len(list(w.org.ID)) != 0 {
+		t.Fatal("the corrected choice did not link only the issuing organization")
+	}
+
+	concurrentState := issue(w.org.Admin)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			results <- link(issuer.ID, concurrentState, "concurrent-code", 502)
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if first != nil {
+		first, second = second, first
+	}
+	wantCode(t, "winning concurrent request", first, 0)
+	assertFailure("losing concurrent request", second, false)
+	assertExchanges(2)
+	if len(list(issuer.ID)) != 2 {
+		t.Fatal("the concurrent attempts did not create exactly one additional link")
+	}
+
+	postExchangeFailure := issue(w.org.Admin)
+	assertFailure("bad code after consumption", link(issuer.ID, postExchangeFailure, "rejected-code", 501), false)
+	assertFailure("wrong organization after code rejection", link(w.org.ID, postExchangeFailure, "recovery-code", 501), false)
+	assertExchanges(3)
+
+	// Refill the per-user limit for the membership change scenario.
+	w.env.Clock.Advance(time.Minute)
+	revoked := issue(w.org.Admin)
+	_, err := w.env.User(issuer.Owner).Member.UpdateMemberRole(ctx, connect.NewRequest(&sandrunv1.UpdateMemberRoleRequest{
+		OrganizationId: issuer.ID, UserId: w.org.Admin, Role: sandrunv1.Role_ROLE_MEMBER,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFailure("issuer access lost", link(w.org.ID, revoked, "recovery-code", 501), false)
+	assertExchanges(3)
+}
+
 func TestUpdateGitHubInstallationAfterLifecycleChange(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

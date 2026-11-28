@@ -1878,6 +1878,69 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
+  test("the GitHub callback recovers from a wrong SandRun organization choice", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+    await browser.evaluate(() => {
+      // Return to the same mock API instance that issues the callback state.
+      window.navigation.addEventListener(
+        "navigate",
+        (event) => {
+          const destination = new URL(event.destination.url);
+          if (destination.origin !== "https://github.com") return;
+          event.preventDefault();
+          const state = destination.searchParams.get("state");
+          if (!state) throw new Error("Expected issued state");
+          const query = new URLSearchParams({
+            installation_id: "51000001",
+            code: "fixture-code",
+            state,
+          });
+          setTimeout(() => {
+            window.history.pushState(null, "", `/github/setup?${query}`);
+            window.dispatchEvent(new PopStateEvent("popstate"));
+          }, 0);
+        },
+        { once: true },
+      );
+      return null;
+    });
+    await screen.getByRole("button", "Connect GitHub").tap();
+    await expect(browser).toHaveURL("/github/setup");
+    const historyLength = await browser.evaluate(() => window.history.length);
+    const picker = screen.getByRole("combobox", "SandRun organization");
+    const submit = screen.getByRole("button", "Link installation");
+    await picker.tap();
+    await screen.getByRole("option", "Acme Robotics (owner)").tap();
+    await submit.tap();
+
+    await expect(screen.getByRole("main").getByRole("alert")).toContainText(
+      "Choose the SandRun organization where you started the GitHub installation.",
+    );
+    await expect(browser).toHaveURL("/github/setup");
+    await expect(picker).toBeVisible();
+    await expect(submit).toBeDisabled();
+    await expect(picker).toBeFocused();
+    await app.screenshot("github-organization-mismatch-recovery");
+
+    await picker.tap();
+    await screen.getByRole("option", "Globex (admin)").tap();
+    await submit.tap();
+    await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
+    await expect(
+      screen.getByText("github-org-51000001", { exact: false }),
+    ).toBeVisible();
+    expect(await browser.evaluate(() => window.history.length)).toBe(
+      historyLength,
+    );
+    await app.screenshot("github-organization-recovery-success");
+  });
+
   test("the GitHub callback rejects an installation linked to another organization", async ({
     app,
     browser,
