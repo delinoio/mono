@@ -3863,6 +3863,155 @@ describe("peer-to-peer data path", () => {
         expectNoRelay(h);
       }
 
+      test("a closed peer handle rejects before acquiring the write source", async () => {
+        const { h, rtc } = p2pSetup(hanging, {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        let acquisitions = 0;
+        const source = {
+          [Symbol.asyncIterator]() {
+            acquisitions++;
+            return {
+              next: () => new Promise<IteratorResult<Uint8Array>>(() => {}),
+            };
+          },
+        };
+        sandbox.close();
+        const reason = new Error("caller aborted");
+        await expect(
+          sandbox.writeFile("/a", source, {
+            signal: AbortSignal.abort(reason),
+          }),
+        ).rejects.toBe(reason);
+        await expect(
+          h.clock.run(sandbox.writeFile("/a", source), 0),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        expect(acquisitions).toBe(0);
+        expect(rtc.connections).toHaveLength(0);
+        expect(h.api.calls).toHaveLength(0);
+      });
+
+      test("close cancels a pending stream read and releases the reader lock", async () => {
+        const { h, rtc } = p2pSetup(hanging);
+        const sandbox = h.client.sandbox(SANDBOX);
+        const reading = Promise.withResolvers<void>();
+        let cancellation: unknown;
+        const stream = new ReadableStream<Uint8Array>(
+          {
+            pull() {
+              reading.resolve();
+              return new Promise(() => {});
+            },
+            cancel(reason) {
+              cancellation = reason;
+              return new Promise(() => {});
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        const write = sandbox.writeFile("/a", stream).catch((error) => error);
+        await h.clock.run(reading.promise, 0);
+        expect(stream.locked).toBe(true);
+        sandbox.close();
+        const error = await h.clock.run(write, 0);
+        expect(error).toBeInstanceOf(OwnSandHandleClosedError);
+        expect(cancellation).toBe(error);
+        expect(stream.locked).toBe(false);
+        expect(rtc.connections).toHaveLength(0);
+        expect(h.api.calls).toHaveLength(0);
+      });
+
+      for (const close of ["close", "delete"] as const) {
+        test(`${close} releases a pending iterator after a peer write acknowledgement`, async () => {
+          const { h, rtc } = p2pSetup(hanging);
+          h.api.unary(SandboxService, "DeleteSandbox", (request) => ({
+            sandbox: { sandboxId: request.sandboxId },
+          }));
+          const sandbox = h.client.sandbox(SANDBOX);
+          const reading = Promise.withResolvers<void>();
+          let reads = 0;
+          let returns = 0;
+          const source: AsyncIterable<Uint8Array> = {
+            [Symbol.asyncIterator]() {
+              return {
+                async next() {
+                  if (++reads === 1) {
+                    // Lookahead allows the first chunk to be sent without finish.
+                    return { done: false, value: new Uint8Array(2 << 20) };
+                  }
+                  reading.resolve();
+                  return new Promise<IteratorResult<Uint8Array>>(() => {});
+                },
+                return() {
+                  returns++;
+                  return new Promise<IteratorResult<Uint8Array>>(() => {});
+                },
+              };
+            },
+          };
+          const write = sandbox.writeFile("/a", source).catch((error) => error);
+          await h.clock.run(reading.promise);
+          if (close === "close") {
+            sandbox.close();
+          } else {
+            await h.clock.run(sandbox.delete());
+          }
+          expect(await h.clock.run(write, 0)).toBeInstanceOf(
+            OwnSandHandleClosedError,
+          );
+          expect(returns).toBe(1);
+          const writes = rtc.frames.flatMap(({ payload }) =>
+            payload.case === "fileWriteChunk" ? [payload.value] : [],
+          );
+          expect(writes.map((chunk) => chunk.offset)).toEqual([0n]);
+          expect(writes[0]?.finish).toBeUndefined();
+          expectNoRelay(h);
+        });
+      }
+
+      for (const forced of [true, false]) {
+        test(`a pending source completes after close with ${forced ? "forced" : "automatic"} relay`, async () => {
+          const { h } = p2pSetup((_frame, peer) => peer.fail(), {
+            transport: forced ? DataPathTransport.RELAY : undefined,
+          });
+          h.api.unary(RelayService, "WriteFile", (request) => ({
+            writeId: request.writeId,
+            offset: request.offset,
+            length: BigInt(request.data.length),
+            finished: request.finish !== undefined,
+            sizeBytes: request.finish?.sizeBytes ?? 0n,
+          }));
+          const sandbox = h.client.sandbox(SANDBOX);
+          const reading = Promise.withResolvers<void>();
+          const release = Promise.withResolvers<void>();
+          const stream = new ReadableStream<Uint8Array>(
+            {
+              async pull(controller) {
+                reading.resolve();
+                await release.promise;
+                controller.enqueue(Uint8Array.of(7));
+                controller.close();
+              },
+            },
+            { highWaterMark: 0 },
+          );
+          const write = sandbox.writeFile("/a", stream).catch((error) => error);
+          await h.clock.run(reading.promise, 0);
+          if (!forced) {
+            expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+            await h.clock.run(sandbox.writeFile("/other", "fallback"));
+          }
+          expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+          sandbox.close();
+          release.resolve();
+          expect(await h.clock.run(write)).toMatchObject({ sizeBytes: 1n });
+          expect(stream.locked).toBe(false);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(forced ? 0 : 1);
+          expect(h.api.callsOf("WriteFile")).toHaveLength(forced ? 1 : 2);
+        });
+      }
+
       let current: ReturnType<typeof p2pSetup> | undefined;
 
       for (const name of Object.keys(operations)) {
