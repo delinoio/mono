@@ -48,6 +48,7 @@
 - Do not guess; search the web instead.
 - Follow `docs/repository-dependency-security-contract.md` for dependency security updates, validation evidence, and unresolved upstream constraints. Keep unresolved advisories visible; a fixed runtime pin or an unavailable patch is not a vulnerability fix.
 - All Go code belongs to the single root Go module `github.com/delinoio/mono` defined in root `go.mod`. Do not add nested `go.mod` or `go.work` files.
+- In the Go test packages that root `.golangci.yml` lists, every top-level test calls `t.Parallel()`. A test that must stay serial puts `//nolint:paralleltest // <reason>` on its `func` line and explains why in a `Not parallel:` comment. Follow `docs/repository-workflow-contract.md`.
 - Put Go packages that external users import under root `go/` (one tree per `go/<name>/`); keep repository-only Go code in its owning project directory. Generated protobuf Go bindings stay under `protos/`. Follow `docs/repository-workflow-contract.md#public-go-packages`.
 - Put generic repository-only Go packages that several projects or components share under root `internal/` (Apache-2.0), or under `servers/internal/` (FSL-1.1-ALv2) when only servers use them. Follow `docs/repository-workflow-contract.md#shared-internal-go-packages`.
 - Prioritize Connect RPC-based communication for business flows over Tauri-specific bindings.

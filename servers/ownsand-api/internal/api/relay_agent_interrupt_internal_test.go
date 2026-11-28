@@ -152,7 +152,7 @@ func (c *relayInterruptClock) Elapsed() time.Duration {
 // blocked on the agent. The handler must return only after that send ended:
 // returning earlier lets the HTTP/2 server finish the response while the send
 // still writes to it (a data race inside net/http).
-func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
+func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test reads the stacks of every goroutine in the
 	// process, so goroutines of a parallel test would change its result.
 	for _, tc := range []struct {

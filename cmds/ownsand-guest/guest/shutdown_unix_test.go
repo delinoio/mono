@@ -62,7 +62,7 @@ func TestRunWaitsForOpenStreamAfterContextEnds(t *testing.T) {
 	}
 }
 
-func TestRunClosesConnectionsAfterGrace(t *testing.T) {
+func TestRunClosesConnectionsAfterGrace(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (shutdownGrace)
 	// that other tests read.
 	setShutdownGrace(t, 600*time.Millisecond)

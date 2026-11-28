@@ -210,7 +210,7 @@ func requireStagingHandleClosed(t *testing.T, staging *os.File) {
 	t.Fatalf("staging handle at handoff: %v, want a closed handle", err)
 }
 
-func TestRunWriteShutdownLockHandoff(t *testing.T) {
+func TestRunWriteShutdownLockHandoff(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (renameFile, shutdownGrace)
 	// that other tests read.
 	for _, forced := range []bool{false, true} {

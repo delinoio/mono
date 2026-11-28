@@ -150,7 +150,7 @@ func (f *reopenFixture) stageAndFailClose(t *testing.T) {
 	}
 }
 
-func TestWriteCloseClosesModeFile(t *testing.T) {
+func TestWriteCloseClosesModeFile(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (closeStagingFile)
 	// that other tests read.
 	if runtime.GOOS == "windows" {
@@ -190,7 +190,7 @@ func TestWriteCloseClosesModeFile(t *testing.T) {
 	requireWriteArtifacts(t, h.srv, chunk, false)
 }
 
-func TestWriteFinishRetryReopensStagingFileAfterFailedClose(t *testing.T) {
+func TestWriteFinishRetryReopensStagingFileAfterFailedClose(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (closeStagingFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0)
@@ -207,7 +207,7 @@ func TestWriteFinishRetryReopensStagingFileAfterFailedClose(t *testing.T) {
 	}
 }
 
-func TestWriteChunkReopensStagingFileAfterFailedClose(t *testing.T) {
+func TestWriteChunkReopensStagingFileAfterFailedClose(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (closeStagingFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0o444)
@@ -262,7 +262,7 @@ func (f *reopenFixture) stageAndFailFinish(t *testing.T) {
 	}
 }
 
-func TestWriteFinishRetryReopensStagingFileAfterFailedReopen(t *testing.T) {
+func TestWriteFinishRetryReopensStagingFileAfterFailedReopen(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0o444)
@@ -291,7 +291,7 @@ func TestWriteFinishRetryReopensStagingFileAfterFailedReopen(t *testing.T) {
 	}
 }
 
-func TestWriteChunkReopensStagingFileAfterFailedReopen(t *testing.T) {
+func TestWriteChunkReopensStagingFileAfterFailedReopen(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0)
@@ -319,7 +319,7 @@ func TestWriteChunkReopensStagingFileAfterFailedReopen(t *testing.T) {
 	}
 }
 
-func TestWriteReopenFailureStaysRetryable(t *testing.T) {
+func TestWriteReopenFailureStaysRetryable(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0)
@@ -343,7 +343,7 @@ func TestWriteReopenFailureStaysRetryable(t *testing.T) {
 	}
 }
 
-func TestWriteRetiresWriteWhenStagingFileIsGone(t *testing.T) {
+func TestWriteRetiresWriteWhenStagingFileIsGone(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0)
@@ -383,7 +383,7 @@ func TestWriteRetiresWriteWhenStagingFileIsGone(t *testing.T) {
 	wantOpError(t, err, ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write expired")
 }
 
-func TestWriteRetiresWriteWhenReopenReportsMissingFile(t *testing.T) {
+func TestWriteRetiresWriteWhenReopenReportsMissingFile(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0)
@@ -397,7 +397,7 @@ func TestWriteRetiresWriteWhenReopenReportsMissingFile(t *testing.T) {
 	}
 }
 
-func TestWriteDoesNotReopenReplacedStagingFile(t *testing.T) {
+func TestWriteDoesNotReopenReplacedStagingFile(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
 	// that other tests read.
 	f := newReopenFixture(t, 0)
@@ -410,7 +410,7 @@ func TestWriteDoesNotReopenReplacedStagingFile(t *testing.T) {
 	f.checkRejectedReplacement(t)
 }
 
-func TestWriteDoesNotReopenReplacedStagingFileDuringModeRestore(t *testing.T) {
+func TestWriteDoesNotReopenReplacedStagingFileDuringModeRestore(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (chmodStagingFile, openStagingFile, renameFile)
 	// that other tests read.
 	if runtime.GOOS == "windows" {
@@ -493,7 +493,7 @@ func (f *reopenFixture) checkRejectedReplacement(t *testing.T) {
 	}
 }
 
-func TestWriteFinishRetryWithoutOwnerReadOrWriteMode(t *testing.T) {
+func TestWriteFinishRetryWithoutOwnerReadOrWriteMode(t *testing.T) { //nolint:paralleltest // See the "Not parallel" comment below.
 	// Not parallel: the test replaces package-level variables (openStagingFile, renameFile)
 	// that other tests read.
 	if runtime.GOOS == "windows" {

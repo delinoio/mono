@@ -887,6 +887,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "servers/sandrun-api/internal/db/migrations/00001_core.sql",
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
     "servers/ownsand-api/scripts/dev.mjs",
+    ".golangci.yml",
     "cmds/ownsand-agent/images/linux/build-rootfs.sh",
     "cmds/ownsand-agent/images/linux/fetch-kernel-source.sh",
     "cmds/ownsand-agent/images/linux/fetch-kernel.sh",
@@ -931,6 +932,8 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("docs/testdata/example.json");
   f.write("go/example/mytestdata/example.json");
   f.write("go/example/testdata.json");
+  // Only the root golangci-lint configuration is read.
+  f.write("servers/example/.golangci.yml");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
@@ -2141,6 +2144,8 @@ test("CI workflow runs each Go check in its own job", () => {
   const vetJob = jobs.get("go-vet");
   assert.match(vetJob, /^\s+run: go vet \.\/\.\.\.$/m);
   assert.match(vetJob, /^\s+cache: false$/m);
+  assert.match(vetJob, /golangci\/golangci-lint-action@[0-9a-f]{40} # v/);
+  assert.match(vetJob, /^\s+skip-cache: true$/m);
   const testJob = jobs.get("go-test");
   assert.match(testJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
   assert.match(testJob, /^\s+cache: false$/m);
