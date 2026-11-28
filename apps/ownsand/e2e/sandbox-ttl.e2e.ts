@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { fromJsonString } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
+import { CreateSandboxRequestSchema } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 
@@ -60,20 +62,52 @@ describe("sandbox create TTLs", () => {
     browser,
     screen,
   }) => {
+    const sandboxesPath =
+      "/orgs/0193a000-0000-7000-8000-000000000001/sandboxes";
     await app.open("/");
     await screen.getByRole("button", "Sign in with Delino").tap();
-    await app.open("/orgs/0193a000-0000-7000-8000-000000000001/sandboxes");
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await browser.evaluate(() => {
+      sessionStorage.setItem("ownsand-e2e-create-response", "valid");
+      return true;
+    });
+    await app.open(sandboxesPath);
     await screen.getByRole("button", "Create sandbox").tap();
     const dialog = screen.getByRole("dialog", "Create a sandbox");
     await dialog.getByRole("button", "Create").tap();
 
     await expect(browser).toHaveURL(/\/sandboxes\/[0-9a-f-]+$/);
-    await expect(
-      screen.getByText("Idle deadline", { exact: true }),
-    ).toBeVisible();
-    await expect(
-      screen.getByText("Maximum deadline", { exact: true }),
-    ).toBeVisible();
+    const [recordedCreate] = await browser.evaluate(
+      () =>
+        JSON.parse(sessionStorage.getItem("ownsand-e2e-creates") ?? "[]") as {
+          request: string;
+          sandboxId: string;
+        }[],
+    );
+    assert(recordedCreate, "The fixture did not record CreateSandbox");
+    await expect(browser).toHaveURL(
+      `${sandboxesPath}/${recordedCreate.sandboxId}`,
+    );
+
+    const { idleTtl, maxTtl } = fromJsonString(
+      CreateSandboxRequestSchema,
+      recordedCreate.request,
+    );
+    expect(idleTtl?.seconds, "Idle TTL seconds").toBe(3_600n);
+    expect(idleTtl?.nanos, "Idle TTL nanoseconds").toBe(0);
+    expect(maxTtl?.seconds, "Maximum TTL seconds").toBe(86_400n);
+    expect(maxTtl?.nanos, "Maximum TTL nanoseconds").toBe(0);
+
+    const detail = (term: string) =>
+      browser.locator(`dt:text-is("${term}") + dd`);
+    await expect(detail("Idle TTL")).toHaveText("1 h");
+    await expect(detail("Maximum TTL")).toHaveText("1 d");
+    for (const term of ["Idle deadline", "Maximum deadline"]) {
+      const deadline = detail(term);
+      await expect(deadline).toBeVisible();
+      await expect(deadline).toHaveText(/\S/);
+      await expect(deadline).not.toHaveText("—");
+    }
     await app.screenshot("sandbox-created-with-default-ttls");
   });
 });
