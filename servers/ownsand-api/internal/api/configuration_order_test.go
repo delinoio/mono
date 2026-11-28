@@ -12,19 +12,17 @@ import (
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
-// TestConfigurationSendsKeepTheNewestLimitsLast pauses the configuration send
-// of the channel handler right after it read the limits, commits new limits
-// and lets the control event processor send the change, then releases the
-// first send. The channel handler and the event processor send to one channel
-// without any other order, so without the per-channel configuration lock the
-// older limits reach the agent last and the agent keeps them.
+// TestConfigurationSendsKeepTheNewestLimitsLast pauses a configuration send
+// after it reads the limits. It commits new limits and checks that the event
+// processor waits for the first send before sending the new limits.
 func TestConfigurationSendsKeepTheNewestLimitsLast(t *testing.T) {
 	t.Parallel()
 	env := testenv.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	org := env.NewOrg("alice")
 	dev, agent := setupAgent(t, env, org, nil)
 	agent.WaitFor("initial configuration", func(e *ownsandv1.AgentEnvelope) bool { return e.GetConfiguration() != nil })
@@ -41,6 +39,31 @@ func TestConfigurationSendsKeepTheNewestLimitsLast(t *testing.T) {
 		}
 		return out
 	}
+
+	latestDeliveryID := func(phase string) int64 {
+		t.Helper()
+		lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		id, err := events.LatestID(lookupCtx, env.DB.Pool)
+		if err != nil {
+			t.Fatalf("read %s delivery ID: %v", phase, err)
+		}
+		return id
+	}
+	waitForDelivery := func(phase string, id int64, sequence uint64) {
+		t.Helper()
+		testenv.Eventually(t, phase+" event processing", func() bool {
+			cursor, ok := env.App.Control.ProcessedCursor()
+			return ok && cursor >= id
+		})
+		// The heartbeat acknowledgement follows the queued configurations on
+		// the same stream. Its receipt confirms that the agent read them.
+		agent.Heartbeat(sequence)
+		agent.WaitFor(phase+" heartbeat acknowledgement", func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetHeartbeatAck().GetSequence() == sequence
+		})
+	}
+	waitForDelivery("setup", latestDeliveryID("setup"), 1)
 	before := len(configs())
 
 	// The first send to read the limits pauses; later sends do not. A later
@@ -85,6 +108,7 @@ func TestConfigurationSendsKeepTheNewestLimitsLast(t *testing.T) {
 		Limits: &ownsandv1.DeviceLimits{VcpuCount: 6, MemoryMib: 8192, DiskGib: 100, VcpuOvercommitPercent: 200}})); err != nil {
 		t.Fatal(err)
 	}
+	updateID := latestDeliveryID("limits update")
 	// Wait until the event processor's send is blocked on the configuration
 	// lock behind the paused first send. Without the lock it reads the limits
 	// at once, which the hook records.
@@ -95,21 +119,24 @@ func TestConfigurationSendsKeepTheNewestLimitsLast(t *testing.T) {
 		t.Fatal("the second configuration send read the limits without the configuration lock")
 	}
 	releaseFirst()
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("manual configuration send: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the manual configuration send")
 	}
 
-	// Both sends deliver one configuration each.
-	deadline := time.Now().Add(10 * time.Second)
-	for len(configs()) < before+2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("received %d configurations, want %d", len(configs())-before, 2)
-		}
-		time.Sleep(10 * time.Millisecond)
+	waitForDelivery("limits update", updateID, 2)
+	after := configs()[before:]
+	if len(after) != 2 {
+		t.Fatalf("received %d configurations after setup, want 2", len(after))
 	}
-	all := configs()
-	if last := all[len(all)-1].GetLimits().GetVcpuCount(); last != 6 {
-		t.Fatalf("the last configuration has %d vCPUs, want the committed 6", last)
+	first := after[0].GetLimits().GetVcpuCount()
+	last := after[1].GetLimits().GetVcpuCount()
+	if first != 4 || last != 6 {
+		t.Fatalf("received configurations with %d then %d vCPUs, want 4 then 6", first, last)
 	}
 	var stored int32
 	if err := env.DB.Pool.QueryRow(ctx, "SELECT limit_vcpu_count FROM devices WHERE device_id = $1", dev.ID).Scan(&stored); err != nil || stored != 6 {
