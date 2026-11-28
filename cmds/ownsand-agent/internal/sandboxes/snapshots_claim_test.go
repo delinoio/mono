@@ -93,21 +93,14 @@ func TestDeleteWhileCreateWaitsForSandboxLockAbortsCreate(t *testing.T) {
 	e := newEnv(t)
 	sandboxID := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	snapID, _ := uuidv7.NewString()
-	unlock := lockSandbox(t, e, sandboxID)
-	claim := e.m.ClaimSnapshotCreate(snapID)
-	defer claim.Release()
-	done := make(chan claimedCreateResult, 1)
-	go func() {
-		entry, err := e.m.CreateClaimedSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}, claim)
-		done <- claimedCreateResult{entry, err}
-	}()
+	cmd := &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}
+	finish, done := startSnapshotCreatesWaitingForLock(t, e, cmd, 1)
 	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
 		t.Fatalf("delete = %v", err)
 	}
-	unlock()
+	finish()
 	res := <-done
 	requireErrCode(t, res.err, ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "create after a delete")
-	claim.Release()
 	requireNoSnapshotTrace(t, e, snapID)
 }
 
@@ -221,25 +214,14 @@ func TestDeleteCancelsEveryReceivedCreateOfTheSnapshot(t *testing.T) {
 	e := newEnv(t)
 	sandboxID := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	snapID, _ := uuidv7.NewString()
-	unlock := lockSandbox(t, e, sandboxID)
-	done := make(chan claimedCreateResult, 2)
-	claims := []*SnapshotCreateClaim{e.m.ClaimSnapshotCreate(snapID), e.m.ClaimSnapshotCreate(snapID)}
-	for _, claim := range claims {
-		defer claim.Release()
-		go func() {
-			entry, err := e.m.CreateClaimedSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}, claim)
-			done <- claimedCreateResult{entry, err}
-		}()
-	}
+	cmd := &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}
+	finish, done := startSnapshotCreatesWaitingForLock(t, e, cmd, 2)
 	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
 		t.Fatalf("delete = %v", err)
 	}
-	unlock()
-	for range claims {
+	finish()
+	for range 2 {
 		requireErrCode(t, (<-done).err, ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "create after a delete")
-	}
-	for _, claim := range claims {
-		claim.Release()
 	}
 	requireNoSnapshotTrace(t, e, snapID)
 }
