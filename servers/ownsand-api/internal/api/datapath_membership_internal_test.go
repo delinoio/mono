@@ -41,6 +41,15 @@ func TestMembershipRevocationCursor(t *testing.T) {
 				}
 			}
 			p.Grants.Ack("installed", ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED, "")
+			if p.Grants.Get("pending") == nil {
+				t.Fatal("pending grant is missing from the registry")
+			}
+			if p.Grants.Admittable("pending") != nil {
+				t.Fatal("pending grant must not be admittable")
+			}
+			if p.Grants.Admittable("installed") == nil {
+				t.Fatal("acknowledged grant must be admittable")
+			}
 
 			p.HandleEvent(t.Context(), e, channelGenerations{})
 
