@@ -125,7 +125,7 @@ The bridge keeps its files in `<workspace>/.sandcrew/`, where `<workspace>` is t
 
 ## Build and Test
 
-- A workspace package `cmds/sandcrew-bridge/package.json` with `build` (cross-compilation of the five targets) and `test` scripts that wrap the Go toolchain, created with the path.
+- The workspace package `cmds/sandcrew-bridge/package.json` (`sandcrew-bridge`, private) has `build` (`scripts/build.mjs`: cross-compilation of the five targets with `CGO_ENABLED=0` into `dist/<target>/`, with the version and commit set through `-ldflags`), `lint` (`go vet`) and `test` (`go test`) scripts that wrap the Go toolchain.
 - Unit tests with a fake ACP agent that speaks JSON-RPC over pipes (`internal/bridge`), and package tests for the ACP connection, the event log, the installer (fake archives, checksums and a fake HTTP server), the credential watcher, the vendor environment and the pins: the mapping of every event kind and of unknown updates, inbox handling (prompt, queued prompt, permission answer, cancel, mode change, configuration option, repeated input, malformed file), event log sequence numbers and offsets, auto-approval and its record, `ASK` mode, the `hello` event and its version, pinned component checks with a digest mismatch and a download failure, `auth.json` change detection, and the exit codes.
 - Run `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l`, `go vet ./...` and `go test ./...` from the repository root according to `cmds/AGENTS.md`.
 - Acceptance on real Linux, macOS and Windows guests with real vendor accounts is not performed in the MVP and is recorded as not performed.

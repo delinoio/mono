@@ -370,6 +370,8 @@ importers:
 
   cmds/ownsand-agent: {}
 
+  cmds/sandcrew-bridge: {}
+
   cmds/sandrun: {}
 
   packages/delino-ui:
