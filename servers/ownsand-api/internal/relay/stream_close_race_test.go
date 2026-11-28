@@ -258,7 +258,9 @@ func TestFullQueueCloseNeverBlocksAndOtherStreamsEnqueue(t *testing.T) {
 	if got := len(c.out); got != outboundQueue+1 {
 		t.Fatalf("queued frames = %d, want %d (the ordinary queue plus the final frame)", got, outboundQueue+1)
 	}
-	if err := a.Send(context.Background(), raceKeepalive()); !errors.Is(err, ErrStreamClosed) {
+	lateCtx, cancelLate := context.WithTimeout(context.Background(), time.Second)
+	defer cancelLate()
+	if err := a.Send(lateCtx, raceKeepalive()); !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("late send = %v, want ErrStreamClosed", err)
 	}
 	if got := len(c.out); got != outboundQueue+1 {
