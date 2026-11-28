@@ -274,27 +274,32 @@ func TestCreateGetListBillingAccounts(t *testing.T) {
 	// Pages of 2 return every account in creation order.
 	var listed []string
 	token := ""
-	for pages := 0; ; pages++ {
-		if pages > 5 {
-			t.Fatal("pagination does not end")
-		}
+	pageSizes := []int{2, 2, 1}
+	for page, wantSize := range pageSizes {
 		resp, err := alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageSize: 2, PageToken: token}))
 		if err != nil {
-			t.Fatalf("ListBillingAccounts: %v", err)
+			t.Fatalf("ListBillingAccounts(2) page %d: %v", page+1, err)
 		}
-		for _, a := range resp.Msg.GetBillingAccounts() {
+		accounts := resp.Msg.GetBillingAccounts()
+		if len(accounts) != wantSize {
+			t.Fatalf("ListBillingAccounts(2) page %d has %d accounts, want %d", page+1, len(accounts), wantSize)
+		}
+		for _, a := range accounts {
 			if a.GetCallerRole() != roleOwner {
 				t.Fatalf("caller_role = %v", a.GetCallerRole())
 			}
 			listed = append(listed, a.GetBillingAccountId())
 		}
 		token = resp.Msg.GetNextPageToken()
-		if token == "" {
-			break
+		wantToken := page < len(pageSizes)-1
+		if (token != "") != wantToken {
+			t.Fatalf("ListBillingAccounts(2) page %d has next page token = %t, want %t", page+1, token != "", wantToken)
 		}
-		// Another caller cannot use the token.
-		_, err = bob.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageToken: token}))
-		wantCode(t, err, connect.CodeInvalidArgument)
+		if wantToken {
+			// Another caller cannot use the token.
+			_, err = bob.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageToken: token}))
+			wantCode(t, err, connect.CodeInvalidArgument)
+		}
 	}
 	if strings.Join(listed, ",") != strings.Join(ids, ",") {
 		t.Fatalf("listed %v, want %v", listed, ids)
@@ -303,9 +308,31 @@ func TestCreateGetListBillingAccounts(t *testing.T) {
 	wantCode(t, err, connect.CodeInvalidArgument)
 	_, err = alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageToken: "garbage"}))
 	wantCode(t, err, connect.CodeInvalidArgument)
-	resp, err := alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageSize: 500}))
-	if err != nil || len(resp.Msg.GetBillingAccounts()) != 5 || resp.Msg.GetNextPageToken() != "" {
-		t.Fatalf("ListBillingAccounts(500) = %v, %v", resp, err)
+
+	for i := range 196 {
+		ids = append(ids, createAccount(t, alice, fmt.Sprintf("Extra account %d", i)).GetBillingAccountId())
+	}
+	// A request above the cap returns 200 accounts and leaves the last account for the next page.
+	token = ""
+	for page, wantIDs := range [][]string{ids[:200], ids[200:]} {
+		resp, err := alice.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{PageSize: 500, PageToken: token}))
+		if err != nil {
+			t.Fatalf("ListBillingAccounts(500) page %d: %v", page+1, err)
+		}
+		accounts := resp.Msg.GetBillingAccounts()
+		if len(accounts) != len(wantIDs) {
+			t.Fatalf("ListBillingAccounts(500) page %d has %d accounts, want %d", page+1, len(accounts), len(wantIDs))
+		}
+		for i, account := range accounts {
+			if gotID := account.GetBillingAccountId(); gotID != wantIDs[i] {
+				t.Fatalf("ListBillingAccounts(500) page %d account %d ID = %q, want %q", page+1, i+1, gotID, wantIDs[i])
+			}
+		}
+		token = resp.Msg.GetNextPageToken()
+		wantToken := page == 0
+		if (token != "") != wantToken {
+			t.Fatalf("ListBillingAccounts(500) page %d has next page token = %t, want %t", page+1, token != "", wantToken)
+		}
 	}
 
 	renamed, err := alice.Client.UpdateBillingAccount(ctx(), connect.NewRequest(&accountsv1.UpdateBillingAccountRequest{BillingAccountId: id, Name: " New name "}))
