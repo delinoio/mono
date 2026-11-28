@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -299,20 +300,57 @@ func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	}
 }
 
+func newMetricsErrorGate(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return gate, release
+}
+
+func TestRunServersKeepsMetricsErrorAfterFixtureCleanup(t *testing.T) {
+	var rig *backgroundRig
+	if !t.Run("fixture", func(fixture *testing.T) {
+		gate, release := newMetricsErrorGate(fixture)
+		// Release the gate from the parent if the fixture cleanup fails to do so.
+		t.Cleanup(release)
+		atGate := make(chan struct{})
+		rig = startBackgroundRig(fixture, func(context.Context) error {
+			close(atGate)
+			<-gate
+			return errMetricsAccept
+		})
+		select {
+		case <-atGate:
+		case <-time.After(handlerStartTimeout):
+			fixture.Fatal("metrics callback did not reach the release gate")
+		}
+	}) || rig == nil {
+		return
+	}
+
+	if err := rig.await(t); !errors.Is(err, errMetricsAccept) {
+		t.Fatalf("runServers error = %v, want the metrics Accept error", err)
+	}
+	if !rig.workerStopped.Load() {
+		t.Fatal("runServers returned before the billing worker finished")
+	}
+}
+
 // TestRunServersKeepsMetricsErrorWhenShutdownSignalRaces verifies that the
 // metrics listener error is not lost when the shutdown trigger fires first,
 // or at the same time, and runServers has already started the drain.
 func TestRunServersKeepsMetricsErrorWhenShutdownSignalRaces(t *testing.T) {
 	for i := 0; i < 20; i++ {
-		release := make(chan struct{})
+		gate, release := newMetricsErrorGate(t)
 		rig := startBackgroundRig(t, func(context.Context) error {
-			<-release
+			<-gate
 			return errMetricsAccept
 		})
 		// The signal arrives, the drain starts and the metrics listener fails
 		// in the same moment. Which of them runServers observes first varies.
 		rig.cancel()
-		close(release)
+		release()
 
 		err := rig.await(t)
 		if !errors.Is(err, errMetricsAccept) {
