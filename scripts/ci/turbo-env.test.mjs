@@ -44,6 +44,7 @@ const expectedPassThroughEnv = {
     "LOGTO_M2M_CLIENT_ID",
     "LOGTO_M2M_CLIENT_SECRET",
     "LOGTO_MANAGEMENT_ENDPOINT",
+    "LOGTO_MANAGEMENT_RESOURCE",
     "LOG_LEVEL",
     "METRICS_ADDR",
     "OTEL_*",

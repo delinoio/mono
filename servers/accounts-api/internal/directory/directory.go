@@ -42,11 +42,16 @@ type Directory interface {
 
 // LogtoConfig configures the Management API client.
 type LogtoConfig struct {
-	// Endpoint is the default Logto endpoint of the tenant,
-	// `https://<tenant-id>.logto.app`. The client gets its token from
-	// `<Endpoint>/oidc/token` for the resource `<Endpoint>/api` with the scope
-	// `all`, and calls `<Endpoint>/api/users/{id}`.
-	Endpoint     string
+	// Endpoint is the Logto endpoint that serves the Management API of the
+	// tenant: `https://<tenant-id>.logto.app` on Logto Cloud, or the core
+	// endpoint of a self-hosted Logto. The client gets its token from
+	// `<Endpoint>/oidc/token` and calls `<Endpoint>/api/users/{id}`.
+	Endpoint string
+	// Resource is the API resource indicator of the Management API, which the
+	// token request names with the scope `all`. Empty selects
+	// `<Endpoint>/api`, the indicator on Logto Cloud. A self-hosted Logto uses
+	// `https://default.logto.app/api` for its default tenant instead.
+	Resource     string
 	ClientID     string
 	ClientSecret string
 	Client       *http.Client
@@ -98,6 +103,9 @@ type tokenRefresh struct {
 // first call.
 func NewLogto(cfg LogtoConfig) *Logto {
 	cfg.Endpoint = strings.TrimRight(cfg.Endpoint, "/")
+	if cfg.Resource == "" {
+		cfg.Resource = cfg.Endpoint + "/api"
+	}
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -178,7 +186,7 @@ func (l *Logto) runRefresh(ctx context.Context, refresh *tokenRefresh) {
 func (l *Logto) fetchToken(ctx context.Context) (tokenResponse, error) {
 	form := url.Values{
 		"grant_type": {"client_credentials"},
-		"resource":   {l.cfg.Endpoint + "/api"},
+		"resource":   {l.cfg.Resource},
 		"scope":      {"all"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.cfg.Endpoint+"/oidc/token", strings.NewReader(form.Encode()))

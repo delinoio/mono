@@ -29,6 +29,7 @@ const (
 	EnvLogtoIssuer             = "LOGTO_ISSUER"
 	EnvLogtoAudience           = "LOGTO_AUDIENCE"
 	EnvLogtoManagementEndpoint = "LOGTO_MANAGEMENT_ENDPOINT"
+	EnvLogtoManagementResource = "LOGTO_MANAGEMENT_RESOURCE"
 	EnvLogtoM2MClientID        = "LOGTO_M2M_CLIENT_ID"
 	EnvLogtoM2MClientSecret    = "LOGTO_M2M_CLIENT_SECRET"
 	EnvCORSOrigins             = "CORS_ORIGINS"
@@ -123,11 +124,17 @@ type Config struct {
 	LogtoIssuer string
 	// LogtoAudience is the expected `aud` of access tokens.
 	LogtoAudience string
-	// LogtoManagementEndpoint is the default Logto endpoint of the tenant
-	// (`https://<tenant-id>.logto.app`), without a trailing slash. The
-	// Management API lives under `/api` there, and its token comes from
-	// `/oidc/token`.
+	// LogtoManagementEndpoint is the Logto endpoint that serves the
+	// Management API of the tenant (`https://<tenant-id>.logto.app` on Logto
+	// Cloud, or the core endpoint of a self-hosted Logto), without a trailing
+	// slash. The Management API lives under `/api` there, and its token comes
+	// from `/oidc/token`.
 	LogtoManagementEndpoint string
+	// LogtoManagementResource is the API resource indicator of the Management
+	// API in the token request, exactly as configured. Empty selects
+	// `<LogtoManagementEndpoint>/api`, the indicator on Logto Cloud; a
+	// self-hosted Logto needs `https://default.logto.app/api`.
+	LogtoManagementResource string
 	LogtoM2MClientID        string
 	// LogtoM2MClientSecret is the secret of the Management API
 	// machine-to-machine application. Secret.
@@ -235,6 +242,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if cfg.LogtoManagementEndpoint, err = httpURL(EnvLogtoManagementEndpoint, cfg.LogtoManagementEndpoint); err != nil {
 		return Config{}, err
+	}
+	if value := lookupNonEmpty(lookup, EnvLogtoManagementResource); value != "" {
+		// The indicator must match the Logto resource exactly, so only the
+		// URL is checked and the value is kept without trimming a slash.
+		if _, err := httpURL(EnvLogtoManagementResource, value); err != nil {
+			return Config{}, err
+		}
+		cfg.LogtoManagementResource = value
 	}
 	if cfg.LogtoM2MClientID, err = required(EnvLogtoM2MClientID); err != nil {
 		return Config{}, err
