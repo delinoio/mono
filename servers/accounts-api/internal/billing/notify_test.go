@@ -4,13 +4,16 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/delinoio/mono/servers/accounts-api/internal/directory"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 )
 
@@ -54,19 +57,20 @@ func (f *fixture) queueExpiryNotice(acct string, amount int64, expiry time.Time)
 }
 
 type noticeState struct {
-	Attempts   int
-	Sent       bool
-	Abandoned  bool
-	Next       time.Time
-	Recipients []string
+	Attempts          int
+	Sent              bool
+	Abandoned         bool
+	Next              time.Time
+	Recipients        []string
+	ResumeAfterUserID *string
 }
 
 func (f *fixture) noticeState(id string) noticeState {
 	f.t.Helper()
 	var st noticeState
 	if err := f.db.Pool.QueryRow(ctx(), `SELECT attempts, send_time IS NOT NULL, abandon_time IS NOT NULL,
-		COALESCE(expiry_next_attempt_time, next_attempt_time)
-		FROM billing_notifications WHERE notification_id = $1`, id).Scan(&st.Attempts, &st.Sent, &st.Abandoned, &st.Next); err != nil {
+		COALESCE(expiry_next_attempt_time, next_attempt_time), resume_after_user_id
+		FROM billing_notifications WHERE notification_id = $1`, id).Scan(&st.Attempts, &st.Sent, &st.Abandoned, &st.Next, &st.ResumeAfterUserID); err != nil {
 		f.t.Fatal(err)
 	}
 	rows, err := f.db.Pool.Query(ctx(), `SELECT user_id FROM billing_notification_deliveries WHERE notification_id = $1 ORDER BY user_id`, id)
@@ -107,7 +111,7 @@ func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 		t.Fatalf("emails before the deadline: %d, want 1", len(first))
 	}
 	st := f.noticeState(interrupted)
-	if st.Sent || st.Abandoned || st.Attempts != 0 || len(st.Recipients) != 1 {
+	if st.Sent || st.Abandoned || st.Attempts != 0 || len(st.Recipients) != 1 || st.ResumeAfterUserID != nil {
 		t.Fatalf("state after the deadline: %+v", st)
 	}
 	if want := f.clock.Now().Add(notificationDeferDelay); !st.Next.Equal(want) {
@@ -157,6 +161,152 @@ func TestNotificationDeadlineKeepsDeliveryProgress(t *testing.T) {
 	}
 	if userID == "" || got.IdempotencyKey != key+"/"+userID {
 		t.Fatalf("resumed message %+v", got)
+	}
+}
+
+func TestNotificationDeadlineResumesAfterLastStartedRecipient(t *testing.T) {
+	for _, boundary := range []string{"pending", "removed", "recorded"} {
+		t.Run(boundary, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			key := "low_balance/test"
+			now := f.clock.Now()
+			f.tx(func(tx pgx.Tx) error {
+				if _, err := tx.Exec(t.Context(), `DELETE FROM billing_account_members WHERE billing_account_id = $1`, acct); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(t.Context(), `INSERT INTO billing_account_members (billing_account_id, user_id, role, create_time)
+					VALUES ($1, 'a', 'owner', $2), ($1, 'b', 'admin', $2), ($1, 'c', 'admin', $2),
+						($1, 'd', 'admin', $2), ($1, 'viewer', 'viewer', $2)`, acct, now); err != nil {
+					return err
+				}
+				return f.s.enqueue(t.Context(), tx, acct, NotifyLowBalance, key, nil, now)
+			})
+			var id string
+			if err := f.db.Pool.QueryRow(t.Context(), `SELECT notification_id::text FROM billing_notifications WHERE dedup_key = $1`, key).Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			if st := f.noticeState(id); st.ResumeAfterUserID != nil {
+				t.Fatalf("new notice has a resume ID: %q", *st.ResumeAfterUserID)
+			}
+
+			var lookedUp []string
+			f.s.notificationDeliveryBudget = time.Second
+			f.s.directory = notificationDirectoryFunc(func(ctx context.Context, userID string) (directory.User, error) {
+				lookedUp = append(lookedUp, userID)
+				if userID == "c" {
+					<-ctx.Done()
+				}
+				return directory.User{}, context.DeadlineExceeded
+			})
+			if err := f.s.deliverWorkerNotifications(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("delivery deadline: %v", err)
+			}
+			if !slices.Equal(lookedUp, []string{"a", "b", "c"}) {
+				t.Fatalf("first pass looked up %v", lookedUp)
+			}
+			checkDeferred := func() {
+				t.Helper()
+				st := f.noticeState(id)
+				if st.Sent || st.Abandoned || st.Attempts != 0 || len(st.Recipients) != 0 ||
+					!st.Next.Equal(f.clock.Now().Add(notificationDeferDelay)) ||
+					st.ResumeAfterUserID == nil || *st.ResumeAfterUserID != "c" {
+					t.Fatalf("deferred notice = %+v, want resume ID c, one minute delay, no attempts or receipts", st)
+				}
+			}
+			checkDeferred()
+
+			// A claim that runs out of time before any lookup keeps the saved ID.
+			f.clock.Advance(notificationDeferDelay)
+			n, ok, err := f.s.claimNotification(t.Context())
+			if err != nil || !ok {
+				t.Fatalf("claim: %v %v", ok, err)
+			}
+			expired, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+			defer cancel()
+			if err := f.s.deliver(expired, n); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("already expired pass: %v", err)
+			}
+			checkDeferred()
+
+			// Parent shutdown during d's lookup keeps c as the starting boundary.
+			f.clock.Advance(notificationDeferDelay)
+			parent, stop := context.WithCancel(t.Context())
+			defer stop()
+			lookedUp = nil
+			f.s.directory = notificationDirectoryFunc(func(ctx context.Context, userID string) (directory.User, error) {
+				lookedUp = append(lookedUp, userID)
+				stop()
+				return directory.User{}, ctx.Err()
+			})
+			if err := f.s.deliverWorkerNotifications(parent); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled delivery: %v", err)
+			}
+			if !slices.Equal(lookedUp, []string{"d"}) {
+				t.Fatalf("canceled pass looked up %v", lookedUp)
+			}
+			checkDeferred()
+
+			wantOrder := []string{"d", "a", "b", "c"}
+			switch boundary {
+			case "removed":
+				wantOrder = wantOrder[:3]
+				if _, err := f.db.Pool.Exec(t.Context(), `DELETE FROM billing_account_members
+					WHERE billing_account_id = $1 AND user_id = 'c'`, acct); err != nil {
+					t.Fatal(err)
+				}
+			case "recorded":
+				wantOrder = wantOrder[:3]
+				if _, err := f.db.Pool.Exec(t.Context(), `INSERT INTO billing_notification_deliveries (notification_id, user_id, send_time)
+					VALUES ($1, 'c', $2)`, id, f.clock.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			f.clock.Advance(notificationDeferDelay)
+			worker := newFixtureOn(t, f.db)
+			worker.clock.Set(f.clock.Now())
+			lookedUp = nil
+			worker.s.directory = notificationDirectoryFunc(func(_ context.Context, userID string) (directory.User, error) {
+				lookedUp = append(lookedUp, userID)
+				if userID == "d" {
+					return directory.User{PrimaryEmail: "d@example.com"}, nil
+				}
+				return directory.User{}, errSendTest
+			})
+			if err := worker.s.deliverWorkerNotifications(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(lookedUp, wantOrder) {
+				t.Fatalf("resumed pass looked up %v, want %v", lookedUp, wantOrder)
+			}
+			if msgs := worker.email.Messages(); len(msgs) != 1 || msgs[0].To != "d@example.com" || msgs[0].IdempotencyKey != key+"/d" {
+				t.Fatalf("resumed pass sent %v, want one email to d with the original key", msgs)
+			}
+			wantRecipients := []string{"d"}
+			if boundary == "recorded" {
+				wantRecipients = []string{"c", "d"}
+			}
+			st := worker.noticeState(id)
+			if st.Attempts != 1 || st.Sent || st.Abandoned || st.ResumeAfterUserID != nil ||
+				!st.Next.Equal(worker.clock.Now().Add(time.Minute)) || !slices.Equal(st.Recipients, wantRecipients) {
+				t.Fatalf("ordinary failure after resuming: %+v, want one attempt, one minute backoff, cleared resume ID and receipts %v", st, wantRecipients)
+			}
+
+			worker.clock.Advance(time.Minute)
+			lookedUp = nil
+			worker.s.directory = notificationDirectoryFunc(func(_ context.Context, userID string) (directory.User, error) {
+				lookedUp = append(lookedUp, userID)
+				return directory.User{PrimaryEmail: userID + "@example.com"}, nil
+			})
+			if err := worker.s.deliverWorkerNotifications(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			st = worker.noticeState(id)
+			if !slices.Equal(lookedUp, wantOrder[1:]) || !st.Sent || st.Attempts != 2 || len(st.Recipients) != len(wantOrder)+len(wantRecipients)-1 {
+				t.Fatalf("completed retry looked up %v and saved %+v", lookedUp, st)
+			}
+		})
 	}
 }
 
