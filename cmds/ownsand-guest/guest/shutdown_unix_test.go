@@ -6,8 +6,11 @@ package guest
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +79,18 @@ func TestRunClosesConnectionsAfterGrace(t *testing.T) { //nolint:paralleltest //
 	if f := s.recv(); f.GetExecEvent().GetStarted() == nil {
 		t.Fatalf("first frame %v", f)
 	}
+	const ready = "ready"
+	for stdout := ""; stdout != ready; {
+		f := s.recv()
+		chunk := f.GetExecEvent().GetStdout()
+		if chunk == nil {
+			t.Fatalf("expected stdout while waiting for %q, got %v", ready, f)
+		}
+		stdout += string(chunk.GetData())
+		if !strings.HasPrefix(ready, stdout) {
+			t.Fatalf("expected stdout %q, got %q", ready, stdout)
+		}
+	}
 
 	start := time.Now()
 	rig.stop()
@@ -91,22 +106,21 @@ func TestRunClosesConnectionsAfterGrace(t *testing.T) { //nolint:paralleltest //
 		t.Fatalf("Run returned after %v, before the grace period ended", d)
 	}
 
-	// Drain buffered output while the exec remains blocked and the request stays open.
 	// A pending HTTP/2 read can outlast the client context deadline.
 	receiveErr := make(chan error, 1)
 	go func() {
-		for {
-			if _, err := s.s.Receive(); err != nil {
-				receiveErr <- err
-				return
-			}
-		}
+		_, err := s.s.Receive()
+		receiveErr <- err
 	}()
 	select {
 	case err := <-receiveErr:
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			t.Fatalf("exec stream did not close before the client context ended: receive: %v, context: %v", err, ctxErr)
 		}
+		if err == nil || errors.Is(err, io.EOF) {
+			t.Fatalf("expected an exec stream interruption after shutdown, got %v", err)
+		}
+		t.Logf("exec stream interrupted with the client context active: %v", err)
 	case <-ctx.Done():
 		t.Fatalf("exec stream did not close before the client context ended: %v", ctx.Err())
 	}
