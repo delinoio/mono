@@ -497,14 +497,25 @@ func (s *Service) onPaymentFailed(ctx context.Context, tx pgx.Tx, observations *
 		out.Result = webhookIgnored
 		return out, nil
 	case txn.SubscriptionID != "" && source == accountSourceSubscription:
-		// Only the recorded subscription of the billing account sends the
-		// email; custom data alone can name any account.
+		// The historical mapping finds the account. Its current subscription
+		// determines eligibility for a failed-renewal notice.
+		sub, err := LoadSubscription(ctx, tx, accountID, false)
+		if err != nil {
+			return out, err
+		}
+		if sub.PaddleSubscriptionID != txn.SubscriptionID {
+			out.Result = webhookIgnored
+			return out, nil
+		}
 		s.logger.WarnContext(ctx, "billing_subscription_payment_failed",
 			slog.String("billing_account_id", accountID),
 			slog.String("paddle_subscription_id", txn.SubscriptionID),
 			slog.String("paddle_transaction_id", txn.ID))
 		if err := s.enqueue(ctx, tx, accountID, NotifyPaymentFailed, "payment_failed/subscription/"+txn.ID,
-			map[string]string{notifyDetailPaymentScope: notifyScopeSubscription}, now); err != nil {
+			map[string]string{
+				notifyDetailPaymentScope:   notifyScopeSubscription,
+				notifyDetailSubscriptionID: txn.SubscriptionID,
+			}, now); err != nil {
 			return out, err
 		}
 	default:

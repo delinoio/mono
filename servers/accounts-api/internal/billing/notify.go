@@ -208,6 +208,9 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			return nil
 		})
 	}
+	if stop, err := s.checkSubscriptionFailure(ctx, n, nil); stop {
+		return err
+	}
 	// Sort IDs above the saved boundary first, then wrap to the remaining
 	// pending IDs. The boundary need not be in the result set.
 	rows, err := s.db.Pool.Query(ctx, `SELECT m.user_id FROM billing_account_members m
@@ -313,6 +316,9 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			if n.Kind == NotifyCreditExpiry && !recipientExpiry.After(s.timestamp()) {
 				return s.abandonCreditExpiryNotice(ctx, n, "credit_expired")
 			}
+			if stop, err := s.checkSubscriptionFailure(ctx, n, lastStarted); stop {
+				return err
+			}
 			err = s.email.Send(ctx, msg)
 			switch {
 			case err == nil:
@@ -412,6 +418,44 @@ func (s *Service) staleTopUpFailure(ctx context.Context, n notification) (bool, 
 		return false, nil
 	}
 	return completed, err
+}
+
+// checkSubscriptionFailure stops delivery after a subscription change or a
+// read error. The read holds no lock across the send, so a replacement can
+// still commit between the final check and the send.
+func (s *Service) checkSubscriptionFailure(ctx context.Context, n notification, lastStarted *string) (stop bool, err error) {
+	if n.Kind != NotifyPaymentFailed || n.Details[notifyDetailPaymentScope] != notifyScopeSubscription {
+		return false, nil
+	}
+	subscriptionID, ok := n.Details[notifyDetailSubscriptionID]
+	if !ok {
+		// Let legacy notices drain. Their failed transaction IDs cannot
+		// reliably identify the original subscription.
+		return false, nil
+	}
+	sub, err := LoadSubscription(ctx, s.db.Pool, n.BillingAccountID, false)
+	if err != nil {
+		if ctx.Err() != nil {
+			return true, s.deferNotification(ctx, n, lastStarted)
+		}
+		return true, fmt.Errorf("read current subscription: %w", err)
+	}
+	if subscriptionID != "" && sub.PaddleSubscriptionID == subscriptionID {
+		return false, nil
+	}
+	return true, s.settle(ctx, func(ctx context.Context) error {
+		if _, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2, resume_after_user_id = NULL
+			WHERE notification_id = $1`, n.ID, s.timestamp()); err != nil {
+			return err
+		}
+		s.logger.InfoContext(ctx, "billing_notification_suppressed",
+			slog.String("billing_account_id", n.BillingAccountID),
+			slog.String("kind", string(n.Kind)),
+			slog.String("notification_id", n.ID),
+			slog.String("paddle_subscription_id", subscriptionID),
+			slog.String("reason", "subscription_not_current"))
+		return nil
+	})
 }
 
 // interruptedOr defers n when err is the effect of a pass context that ended,
