@@ -17,7 +17,6 @@ import { InvitationState, Role } from "@delino/sandrun-protos/v1/common_pb";
 import {
   type Invitation,
   ListInvitationsResponseSchema,
-  type Member,
   MemberService,
 } from "@delino/sandrun-protos/v1/member_pb";
 import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
@@ -34,6 +33,7 @@ import {
   PageHeader,
   QueryBoundary,
   SecretDialog,
+  showsFullError,
   useActionSignInNotice,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
@@ -58,8 +58,22 @@ export function MembersPage() {
     onSuccess: refresh,
   });
   const removeMember = useMutation(MemberService.method.removeMember);
-  const [removing, setRemoving] = useState<Member>();
+  const [removingUserId, setRemovingUserId] = useState<string>();
   const [leaving, setLeaving] = useState(false);
+
+  const selectedMember =
+    removingUserId === undefined
+      ? undefined
+      : roster.members.find((member) => member.userId === removingUserId);
+  const removalInvalid =
+    showsFullError(roster.query) ||
+    !can(role, Permission.ManageMembers) ||
+    (selectedMember
+      ? !canManageMember(role, userId, selectedMember)
+      : roster.query.isSuccess && !roster.query.hasNextPage);
+  if (removingUserId !== undefined && removalInvalid) {
+    setRemovingUserId(undefined);
+  }
 
   return (
     <>
@@ -126,7 +140,7 @@ export function MembersPage() {
                     <Button
                       variant={ButtonVariant.Danger}
                       size={ButtonSize.Small}
-                      onClick={() => setRemoving(m)}
+                      onClick={() => setRemovingUserId(m.userId)}
                     >
                       {t("members.remove")}
                     </Button>
@@ -143,17 +157,23 @@ export function MembersPage() {
         <Invitations reportActionError={reportActionError} />
       ) : null}
       <ConfirmDialog
-        open={removing !== undefined}
-        onOpenChange={(open) => !open && setRemoving(undefined)}
+        open={removingUserId !== undefined && !removalInvalid}
+        onOpenChange={(open) => {
+          if (!open) setRemovingUserId(undefined);
+        }}
         title={t("members.removeDialog.title", {
-          name: removing ? displayName(removing) : "",
+          name: selectedMember
+            ? displayName(selectedMember)
+            : (removingUserId ?? ""),
         })}
         description={t("members.removeDialog.description")}
         confirmLabel={t("members.removeDialog.confirm")}
+        confirmDisabled={selectedMember === undefined}
         onConfirm={async () => {
+          if (!selectedMember || removalInvalid) return;
           await removeMember.mutateAsync({
             organizationId,
-            userId: removing!.userId,
+            userId: selectedMember.userId,
           });
           await refresh();
         }}
