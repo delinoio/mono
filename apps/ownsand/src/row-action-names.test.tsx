@@ -18,7 +18,7 @@ import {
 } from "@testing-library/react";
 import { shortIdText } from "./components/ui.tsx";
 import { createMockTransport, MOCK_IDS } from "./mock/mock-api.ts";
-import { renderConsole, settle } from "./test-support.tsx";
+import { holdingTransport, renderConsole, settle } from "./test-support.tsx";
 
 beforeEach(() => {
   window.sessionStorage.clear();
@@ -43,7 +43,7 @@ async function press(element: HTMLElement) {
 
 describe("snapshot and template rows", () => {
   async function twoSnapshots() {
-    const transport: Transport = createMockTransport();
+    const { transport, seen } = holdingTransport([]);
     const snapshots = createClient(SnapshotService, transport);
     const second = (
       await snapshots.createSnapshot({
@@ -59,11 +59,11 @@ describe("snapshot and template rows", () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/snapshots`, { transport });
     await screen.findByRole("list", { name: "Snapshots" });
     await settle(60);
-    return second.snapshotId;
+    return { secondId: second.snapshotId, seen };
   }
 
   test("every row button names its row and starts with its visible text", async () => {
-    const secondId = await twoSnapshots();
+    const { secondId } = await twoSnapshots();
     const firstShort = shortIdText(MOCK_IDS.snapshot);
     const secondShort = shortIdText(secondId);
     const rows = within(screen.getByRole("list", { name: "Snapshots" }))
@@ -101,7 +101,7 @@ describe("snapshot and template rows", () => {
   });
 
   test("the snapshot delete confirmation names the snapshot, Cancel deletes nothing and confirm deletes only that snapshot", async () => {
-    const secondId = await twoSnapshots();
+    const { secondId, seen } = await twoSnapshots();
     const secondShort = shortIdText(secondId);
     await press(
       screen.getByRole("button", { name: `Delete snapshot ${secondShort}` }),
@@ -109,11 +109,13 @@ describe("snapshot and template rows", () => {
     let dialog = await screen.findByRole("alertdialog", {
       name: `Delete the snapshot ${secondShort}?`,
     });
+    expect(seen.DeleteSnapshot ?? 0).toBe(0);
     await press(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(
       screen.getByRole("button", { name: `Delete snapshot ${secondShort}` }),
     ).toBeTruthy();
+    expect(seen.DeleteSnapshot ?? 0).toBe(0);
 
     // A snapshot with a template cannot be deleted; delete that template
     // first, then the snapshot.
@@ -135,6 +137,7 @@ describe("snapshot and template rows", () => {
     await press(
       within(dialog).getByRole("button", { name: "Delete snapshot" }),
     );
+    expect(seen.DeleteSnapshot).toBe(1);
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(
       screen.queryByRole("button", { name: `Delete snapshot ${secondShort}` }),
