@@ -339,7 +339,8 @@ func TestSessionExecJSONResumesBufferedUTF8(t *testing.T) {
 		execJSONLine{Event: "stderr", Offset: 0, Data: "ok"},
 		execJSONLine{Event: "stdout", Offset: 0, Data: "a"},
 	)
-	_, hint, ok := strings.Cut(stderr.String(), "Continue with: sandrun ")
+	const detached = "interrupted. Detached from the output stream after the command started. Continue with: sandrun "
+	_, hint, ok := strings.Cut(stderr.String(), detached)
 	if !ok || !strings.HasSuffix(strings.TrimSpace(hint), "--stdout-offset 1 --stderr-offset 2") {
 		t.Fatalf("attach hint = %s", stderr.String())
 	}
@@ -351,6 +352,127 @@ func TestSessionExecJSONResumesBufferedUTF8(t *testing.T) {
 		execJSONLine{Event: "stdout", Offset: 1, Data: "€"},
 		execJSONLine{Event: "exited"},
 	)
+}
+
+func TestExecAttachAfterUnconfirmedStart(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		retained bool
+	}{
+		{name: "no admission"},
+		{name: "retained terminal result", retained: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			f := &unconfirmedExecFixture{
+				cancel: cancel, retained: tc.retained,
+				requested: make(chan string, 1),
+				attached:  make(chan *sandrunv1.AttachDevSessionExecRequest, 1),
+			}
+			_, handler := sandrunv1connect.NewDevSessionServiceHandler(f)
+			srv := httptest.NewUnstartedServer(handler)
+			srv.Config.Protocols = new(http.Protocols)
+			srv.Config.Protocols.SetUnencryptedHTTP2(true)
+			srv.Start()
+			t.Cleanup(srv.Close)
+
+			env := func(key string) (string, bool) {
+				switch key {
+				case EnvAPIKey:
+					return sandruntest.DefaultAPIKey, true
+				case EnvNoColor:
+					return "1", true
+				default:
+					return "", false
+				}
+			}
+			var stdout, stderr bytes.Buffer
+			code := Run(ctx, Env{
+				Args:      []string{"--api-url", srv.URL, "--org", "org", "--output", "text", "session", "exec", "session", "--", "command"},
+				Stdout:    &stdout,
+				Stderr:    &stderr,
+				LookupEnv: env,
+			})
+			var execID string
+			select {
+			case execID = <-f.requested:
+				if execID == "" {
+					t.Fatal("exec request omitted its ID")
+				}
+			default:
+				t.Fatalf("fixture did not receive the exec request: exit %d, stderr %q", code, &stderr)
+			}
+			wantHint := "session attach session " + execID + " --org=org --api-url=" + srv.URL + " --output=text --stdout-offset 0 --stderr-offset 0"
+			const unconfirmed = "interrupted. Command start is unconfirmed. Check with: sandrun "
+			_, hint, ok := strings.Cut(stderr.String(), unconfirmed)
+			if code != ExitInterrupted || stdout.Len() != 0 || !ok || strings.TrimSpace(hint) != wantHint {
+				t.Fatalf("exec = %d, stdout %q, stderr %q, want interrupt and hint %q", code, &stdout, &stderr, wantHint)
+			}
+
+			attachCtx, cancelAttach := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancelAttach()
+			stdout.Reset()
+			stderr.Reset()
+			code = Run(attachCtx, Env{Args: strings.Fields(hint), Stdout: &stdout, Stderr: &stderr, LookupEnv: env})
+			select {
+			case req := <-f.attached:
+				if req.GetExecId() != execID || req.GetStdoutOffset() != 0 || req.GetStderrOffset() != 0 {
+					t.Fatalf("attach request = %v, want exec ID %s and zero offsets", req, execID)
+				}
+			default:
+				t.Fatalf("fixture did not receive the attach request: exit %d, stderr %q", code, &stderr)
+			}
+			if tc.retained {
+				if code != ExitOK || stdout.String() != "retained output" || stderr.Len() != 0 {
+					t.Fatalf("attach = %d, stdout %q, stderr %q, want retained output", code, &stdout, &stderr)
+				}
+			} else if code != ExitDataPath || stdout.Len() != 0 || !strings.Contains(stderr.String(), "not_found: exec is not retained") {
+				t.Fatalf("attach = %d, stdout %q, stderr %q, want not_found", code, &stdout, &stderr)
+			}
+		})
+	}
+}
+
+type unconfirmedExecFixture struct {
+	sandrunv1connect.UnimplementedDevSessionServiceHandler
+	cancel    context.CancelFunc
+	retained  bool
+	requested chan string
+	attached  chan *sandrunv1.AttachDevSessionExecRequest
+}
+
+func (f *unconfirmedExecFixture) ExecDevSession(ctx context.Context, req *connect.Request[sandrunv1.ExecDevSessionRequest], _ *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
+	select {
+	case f.requested <- req.Msg.GetExecId():
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	f.cancel()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *unconfirmedExecFixture) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest], stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
+	select {
+	case f.attached <- req.Msg:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if !f.retained {
+		return connect.NewError(connect.CodeNotFound, errors.New("exec is not retained"))
+	}
+	output := &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stdout{
+		Stdout: &sandrunv1.DevSessionExecOutput{Data: []byte("retained output")},
+	}}
+	if err := stream.Send(&sandrunv1.AttachDevSessionExecResponse{Event: output}); err != nil {
+		return err
+	}
+	return stream.Send(&sandrunv1.AttachDevSessionExecResponse{Event: &sandrunv1.DevSessionExecEvent{
+		Event: &sandrunv1.DevSessionExecEvent_Exited{
+			Exited: &sandrunv1.DevSessionExecExited{Status: &sandrunv1.DevSessionExecExited_ExitCode{}},
+		},
+	}})
 }
 
 func TestExecAttachCommandQuotesArguments(t *testing.T) {
