@@ -121,15 +121,15 @@ func execTx(t *testing.T, tx pgx.Tx, sql string, args ...any) {
 // the wait.
 func TestMutationUsesMembershipAfterLockWait(t *testing.T) {
 	t.Parallel()
-	demote := func(member func(f fixture) person) func(f fixture) func(tx pgx.Tx) {
-		return func(f fixture) func(tx pgx.Tx) {
+	demote := func(member func(f fixture) person) func(t *testing.T, f fixture) func(tx pgx.Tx) {
+		return func(t *testing.T, f fixture) func(tx pgx.Tx) {
 			return func(tx pgx.Tx) {
 				execTx(t, tx, `UPDATE billing_account_members SET role = 'viewer' WHERE billing_account_id = $1 AND user_id = $2`, f.AccountID, member(f).ID)
 			}
 		}
 	}
-	remove := func(member func(f fixture) person) func(f fixture) func(tx pgx.Tx) {
-		return func(f fixture) func(tx pgx.Tx) {
+	remove := func(member func(f fixture) person) func(t *testing.T, f fixture) func(tx pgx.Tx) {
+		return func(t *testing.T, f fixture) func(tx pgx.Tx) {
 			return func(tx pgx.Tx) {
 				execTx(t, tx, `DELETE FROM billing_account_members WHERE billing_account_id = $1 AND user_id = $2`, f.AccountID, member(f).ID)
 			}
@@ -137,7 +137,7 @@ func TestMutationUsesMembershipAfterLockWait(t *testing.T) {
 	}
 	// A committed TransferOwnership: the viewer becomes the owner and the
 	// previous owner an admin.
-	transfer := func(f fixture) func(tx pgx.Tx) {
+	transfer := func(t *testing.T, f fixture) func(tx pgx.Tx) {
 		return func(tx pgx.Tx) {
 			execTx(t, tx, `UPDATE billing_account_members SET role = 'admin' WHERE billing_account_id = $1 AND user_id = $2`, f.AccountID, f.Owner.ID)
 			execTx(t, tx, `UPDATE billing_account_members SET role = 'owner' WHERE billing_account_id = $1 AND user_id = $2`, f.AccountID, f.Viewer.ID)
@@ -166,7 +166,7 @@ func TestMutationUsesMembershipAfterLockWait(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		change func(f fixture) func(tx pgx.Tx)
+		change func(t *testing.T, f fixture) func(tx pgx.Tx)
 		caller func(f fixture) person
 		call   func(p person, f fixture) func() error
 		want   connect.Code
@@ -182,7 +182,7 @@ func TestMutationUsesMembershipAfterLockWait(t *testing.T) {
 			env := testenv.New(t)
 			f := newFixture(t, env)
 			before := readBusinessState(t, env, f.AccountID)
-			err := raceMembershipChange(t, env, f.AccountID, tc.change(f), tc.call(tc.caller(f), f))
+			err := raceMembershipChange(t, env, f.AccountID, tc.change(t, f), tc.call(tc.caller(f), f))
 			wantCode(t, err, tc.want)
 
 			// The holder's membership change is the only business change; the
