@@ -568,6 +568,161 @@ func TestListBillingStatusChangesPagination(t *testing.T) {
 	}
 }
 
+func TestListBillingStatusChangesPersistsDueSuspensionsBeforePaging(t *testing.T) {
+	t.Parallel()
+	const (
+		account = "ba-1"
+		user    = "owner"
+		service = accountsv1.ServiceId_SERVICE_ID_OWNSAND
+	)
+	start := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	var elapsed atomic.Int64
+	f := New(t, func() time.Time { return start.Add(time.Duration(elapsed.Load())) })
+	f.AddAccount(account, "Account", map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	client := f.Client()
+	for _, org := range []string{"org-b", "org-a"} {
+		if _, err := client.LinkOrganization(t.Context(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+			Service: service, BillingAccountId: account, OrganizationId: org, UserId: user,
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.SetAccountStatus(account, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, start)
+	blockedA, blockedB := f.Status("org-a"), f.Status("org-b")
+	cursor := blockedB.GetSequence()
+	poll := func(after int64) *accountsv1.ListBillingStatusChangesResponse {
+		t.Helper()
+		resp, err := client.ListBillingStatusChanges(t.Context(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
+			Service: service, AfterSequence: after, PageSize: 1,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Msg
+	}
+
+	elapsed.Store(int64(72*time.Hour - time.Second))
+	if page := poll(cursor); len(page.GetStatuses()) != 0 || page.GetNextSequence() != cursor {
+		t.Fatalf("poll before deadline = %v, want empty page at cursor %d", page, cursor)
+	}
+
+	elapsed.Store(int64(72 * time.Hour))
+	if _, err := client.ListBillingStatusChanges(t.Context(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
+		Service: service, AfterSequence: cursor, PageSize: -1,
+	})); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("poll with negative page size error = %v, want InvalidArgument", err)
+	}
+	for _, before := range []*accountsv1.OrganizationBillingStatus{blockedA, blockedB} {
+		if got := f.Status(before.GetOrganizationId()); !proto.Equal(got, before) {
+			t.Fatalf("stored status after invalid poll = %v, want %v", got, before)
+		}
+	}
+
+	for _, before := range []*accountsv1.OrganizationBillingStatus{blockedA, blockedB} {
+		page := poll(cursor)
+		if len(page.GetStatuses()) != 1 || page.GetNextSequence() != cursor+1 {
+			t.Fatalf("poll after %d = %v, want one status at sequence %d", cursor, page, cursor+1)
+		}
+		assertSuspendedStatus(t, before, page.GetStatuses()[0], cursor+1)
+		cursor = page.GetNextSequence()
+	}
+	if page := poll(cursor); len(page.GetStatuses()) != 0 || page.GetNextSequence() != cursor {
+		t.Fatalf("poll after suspensions = %v, want empty page at cursor %d", page, cursor)
+	}
+}
+
+func TestGetOrganizationBillingPersistsDueSuspensionsForItsAccount(t *testing.T) {
+	t.Parallel()
+	const (
+		account = "ba-1"
+		other   = "ba-2"
+		user    = "owner"
+		service = accountsv1.ServiceId_SERVICE_ID_OWNSAND
+	)
+	start := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	var elapsed atomic.Int64
+	f := New(t, func() time.Time { return start.Add(time.Duration(elapsed.Load())) })
+	for _, id := range []string{account, other} {
+		f.AddAccount(id, "Account", map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+		f.SetAccountStatus(id, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, start)
+	}
+	client := f.Client()
+	linkOrg := func(org, accountID string) *accountsv1.OrganizationBillingStatus {
+		t.Helper()
+		resp, err := client.LinkOrganization(t.Context(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+			Service: service, BillingAccountId: accountID, OrganizationId: org, UserId: user,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Msg.GetStatus()
+	}
+	first := linkOrg("org-a", account)
+	peer := linkOrg("org-b", account)
+	unrelated := linkOrg("org-c", other)
+	elapsed.Store(int64(time.Hour))
+	later := linkOrg("org-d", account)
+	billing := func(org string) *accountsv1.OrganizationBillingStatus {
+		t.Helper()
+		resp, err := client.GetOrganizationBilling(t.Context(), connect.NewRequest(&accountsv1.GetOrganizationBillingRequest{
+			Service: service, OrganizationId: org,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Msg.GetStatus()
+	}
+
+	elapsed.Store(int64(72*time.Hour - time.Second))
+	if got := billing(first.GetOrganizationId()); !proto.Equal(got, first) {
+		t.Fatalf("billing status before deadline = %v, want %v", got, first)
+	}
+	elapsed.Store(int64(72 * time.Hour))
+	if got := billing(later.GetOrganizationId()); !proto.Equal(got, later) {
+		t.Fatalf("billing status for later link = %v, want %v", got, later)
+	}
+	if got := f.Status(first.GetOrganizationId()); !proto.Equal(got, first) {
+		t.Fatalf("stored status after reading later link = %v, want %v", got, first)
+	}
+
+	cursor := later.GetSequence()
+	assertSuspendedStatus(t, first, billing(first.GetOrganizationId()), cursor+1)
+	assertSuspendedStatus(t, first, billing(first.GetOrganizationId()), cursor+1)
+	assertSuspendedStatus(t, peer, f.Status(peer.GetOrganizationId()), cursor+2)
+	for _, before := range []*accountsv1.OrganizationBillingStatus{unrelated, later} {
+		if got := f.Status(before.GetOrganizationId()); !proto.Equal(got, before) {
+			t.Fatalf("stored status after billing read = %v, want %v", got, before)
+		}
+	}
+
+	resp, err := client.ListBillingStatusChanges(t.Context(), connect.NewRequest(&accountsv1.ListBillingStatusChangesRequest{
+		Service: service, AfterSequence: cursor,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := resp.Msg.GetStatuses()
+	if len(statuses) != 3 || resp.Msg.GetNextSequence() != cursor+3 {
+		t.Fatalf("poll after billing read = %v, want three statuses ending at sequence %d", resp.Msg, cursor+3)
+	}
+	for i, before := range []*accountsv1.OrganizationBillingStatus{first, peer, unrelated} {
+		assertSuspendedStatus(t, before, statuses[i], cursor+int64(i)+1)
+	}
+
+	elapsed.Store(int64(73*time.Hour + time.Second))
+	assertSuspendedStatus(t, later, billing(later.GetOrganizationId()), cursor+4)
+}
+
+func assertSuspendedStatus(t *testing.T, before, got *accountsv1.OrganizationBillingStatus, sequence int64) {
+	t.Helper()
+	want := proto.CloneOf(before)
+	want.Status = accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED
+	want.Sequence = sequence
+	if !proto.Equal(got, want) {
+		t.Fatalf("suspended status = %v, want %v", got, want)
+	}
+}
+
 func TestReportUsageRefreshesBillingStatusOnBalanceExhaustion(t *testing.T) {
 	const (
 		account   = "ba-1"
