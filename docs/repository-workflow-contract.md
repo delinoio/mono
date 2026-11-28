@@ -10,6 +10,22 @@ The repository contains shared instructions, skills, documentation templates, fo
 
 Agent instructions live only in `AGENTS.md` files: the root file for repository-wide rules and one file in each directory that has scoped rules. Codex and Claude Code (v2.1.277 or later) read these files directly. Both read the files from the working directory up to the repository root at session start, and Claude Code reads the `AGENTS.md` of a subdirectory when it opens a file there. Claude Code reads `AGENTS.md` only when no `CLAUDE.md`, `.claude/CLAUDE.md` or `CLAUDE.local.md` exists in the working directory or a directory above it, and it reads a subdirectory's `AGENTS.md` only when that subdirectory has none of these files. Do not commit these Claude-only files: they would hide the `AGENTS.md` rules from Claude Code. A developer who keeps a personal, uncommitted `CLAUDE.local.md` sets the Claude Code **Project instructions** setting to `claude-md-and-agents-md` so that Claude Code reads both. The `AGENTS.md` files inside imported skill directories are upstream skill content, not repository instructions.
 
+## AI commit attribution
+
+A commit that an AI model wrote or changed names that model in a `Co-Authored-By:` Git trailer at the end of the commit message. This applies to every AI agent and harness (for example Claude Code and Codex). The trailer gives the exact model name and version that the agent used, not only the product or harness name, and the no-reply email address of the model provider:
+
+| Provider  | Email address           | Example trailer                                            |
+| --------- | ----------------------- | ---------------------------------------------------------- |
+| Anthropic | `noreply@anthropic.com` | `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`  |
+| OpenAI    | `noreply@openai.com`    | `Co-Authored-By: GPT-6.2 Sol (Codex) <noreply@openai.com>` |
+
+An OpenAI model that runs in Codex adds `(Codex)` after the model name, as in the example.
+
+- Add one trailer for each model that wrote or changed the commit content. Do not add a trailer for a model that only reviewed or read the change.
+- Use the model that actually ran. When a session changes models, name each model that contributed to the commit.
+- Keep the trailer together with the other trailers in the last paragraph of the commit message. Do not quote the email address in backticks; GitHub reads the trailer address as written (see the [mention quoting rules](../AGENTS.md#github-mention-quoting-rules)).
+- A human who amends, rebases or squashes AI-written commits keeps their trailers.
+
 ## Agent skills
 
 `.agents/skills/` owns the shared workspace-local agent skills. `.claude/skills` is a tracked relative symlink to `../.agents/skills` so that Claude Code discovers the same skills as Codex. Add, edit and remove skills only in `.agents/skills/`; do not replace the symlink with a copy or add Claude-only skill directories. Checkouts on platforms without symlink support (for example, Windows without `core.symlinks`) get a plain file instead and do not expose the skills to Claude Code.
