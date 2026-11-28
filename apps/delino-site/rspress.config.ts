@@ -112,7 +112,12 @@ export default defineConfig({
         };
       }
     }
-    return defaults;
+    return {
+      ...defaults,
+      darkModeLabel: Object.fromEntries(
+        catalogs.map(({ lang, messages }) => [lang, messages["nav.darkMode"]]),
+      ),
+    };
   },
   title: "Delino",
   description: "Delino",

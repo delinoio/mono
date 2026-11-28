@@ -1,0 +1,26 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+.site-nav-screen,
+.site-nav-popover {
+  display: none;
+}
+
+@media (width <= 768px) {
+  .site-nav-screen {
+    display: block;
+  }
+
+  /* The screen follows its trigger in the header so Tab enters the menu.
+   * Set its height explicitly because the header constrains its fixed box. */
+  .site-nav-screen .rp-nav-screen {
+    height: calc(100dvh - var(--rp-nav-height) - var(--rp-banner-height, 0px));
+  }
+}
+
+@media (769px <= width <= 1280px) {
+  .site-nav-popover {
+    display: flex;
+    align-items: center;
+    height: 100%;
+  }
+}

@@ -34,5 +34,6 @@
   "theme.promptCopyText": "프롬프트 복사",
   "theme.promptCopiedText": "복사됨",
   "theme.promptExpandText": "펼치기",
-  "theme.promptCollapseText": "접기"
+  "theme.promptCollapseText": "접기",
+  "nav.darkMode": "다크 모드"
 }
