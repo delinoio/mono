@@ -1051,7 +1051,7 @@ func TestListManageableBillingAccounts(t *testing.T) {
 		}
 	}
 	if strings.Join(got, ",") != strings.Join(ids, ",") {
-		t.Fatalf("accounts = %v, want %v (in ID order, without the viewer account)", got, ids)
+		t.Fatalf("accounts = %v, want %v (in creation order, without the viewer account)", got, ids)
 	}
 
 	// The last page has no continuation token, so the page token checks use
