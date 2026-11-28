@@ -1,5 +1,10 @@
 ---
 "ownsand-console": patch
+"ownsand-api": patch
+"ownsand-cli": patch
+"@delino/ownsand-protos": patch
 ---
 
-Save the device limits with the strict ReplaceDeviceLimits RPC, so an explicit zero is stored as zero and a limit that the form does not have is never sent as a silent zero.
+The OwnSand API adds the strict `ReplaceDeviceLimits` RPC. It replaces all four limits together, requires all four fields, and preserves an explicit zero for vCPU, memory, or disk.
+
+The `ownsand device set-limits` command and the console's device settings use this RPC to save limits. The console reports missing limits before sending a request. The generated TypeScript bindings expose `ReplaceDeviceLimits` on `DeviceService`.
