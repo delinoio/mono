@@ -2139,17 +2139,17 @@ async function measureDialog(browser: {
   evaluate<T extends import("e2e").JsonValue>(fn: () => T): Promise<T>;
 }): Promise<DialogMetrics> {
   return browser.evaluate(() => {
-    const panel = document.querySelector(".dui-dialog-content[data-open]");
-    const title = panel?.querySelector(".dui-dialog-title");
-    if (!panel || !title) {
-      return {
-        panelScrollWidth: -1,
-        panelClientWidth: -1,
-        titleScrollWidth: -1,
-        titleClientWidth: -1,
-        titleHeight: -1,
-        titleLineHeight: -1,
-      };
+    const panelSelector = ".dui-dialog-content[data-open]";
+    const panel = document.querySelector(panelSelector);
+    if (!panel) {
+      throw new Error(`Open dialog panel not found: ${panelSelector}`);
+    }
+    const titleSelector = ".dui-dialog-title";
+    const title = panel.querySelector(titleSelector);
+    if (!title) {
+      throw new Error(
+        `Dialog title not found inside the open panel: ${titleSelector}`,
+      );
     }
     const style = getComputedStyle(title);
     return {
