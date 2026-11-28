@@ -9,6 +9,7 @@
   "common.tryAgain": "Volver a intentar",
   "common.showMore": "Mostrar más",
   "common.loading": "Cargando",
+  "common.nameControlCharacter": "Elimina los caracteres de control del nombre.",
   "errors.generic": "Algo salió mal. Inténtalo de nuevo.",
   "errors.unauthenticated": "Tu sesión ha finalizado. Vuelve a iniciar sesión.",
   "errors.permissionDenied": "No tienes permiso para realizar esta acción.",

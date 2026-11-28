@@ -9,6 +9,7 @@
   "common.tryAgain": "再試行",
   "common.showMore": "もっと表示",
   "common.loading": "読み込み中",
+  "common.nameControlCharacter": "名前から制御文字を削除してください。",
   "errors.generic": "エラーが発生しました。もう一度お試しください。",
   "errors.unauthenticated": "セッションが終了しました。もう一度サインインしてください。",
   "errors.permissionDenied": "この操作を行う権限がありません。",

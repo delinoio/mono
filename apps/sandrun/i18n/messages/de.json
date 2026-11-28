@@ -9,6 +9,7 @@
   "common.tryAgain": "Erneut versuchen",
   "common.showMore": "Mehr anzeigen",
   "common.loading": "Wird geladen",
+  "common.nameControlCharacter": "Entfernen Sie Steuerzeichen aus dem Namen.",
   "errors.generic": "Etwas ist schiefgelaufen. Versuchen Sie es erneut.",
   "errors.unauthenticated": "Ihre Sitzung ist abgelaufen. Melden Sie sich erneut an.",
   "errors.permissionDenied": "Sie haben dafür keine Berechtigung.",

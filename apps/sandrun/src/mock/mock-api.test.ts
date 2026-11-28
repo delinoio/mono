@@ -1899,6 +1899,63 @@ test("GitHub unlink sends a terminal runner event and omits the runner from fres
   }
 });
 
+test.each([0x1f, 0x7f, 0x85, 0x9f])(
+  "mock display name writes reject control code point %i without changing records or audit history",
+  async (control) => {
+    const transport = createMockTransport();
+    const organizations = createClient(OrganizationService, transport);
+    const keys = createClient(ApiKeyService, transport);
+    const integrations = createClient(AgentIntegrationService, transport);
+    const audit = createClient(AuditService, transport);
+    const organization = { organizationId: MOCK_IDS.acme };
+    const integration = {
+      ...organization,
+      agentIntegrationId: MOCK_IDS.claudeIntegration,
+    };
+    const snapshot = async () =>
+      structuredClone({
+        organizations: await organizations.listOrganizations({}),
+        keys: await keys.listApiKeys(organization),
+        integrations: await integrations.listAgentIntegrations(organization),
+        integration: await integrations.getAgentIntegration(integration),
+        audit: await audit.listAuditEvents(organization),
+      });
+    const before = await snapshot();
+    const name = ` Demo${String.fromCodePoint(control)}Team `;
+    const invalid = {
+      code: Code.InvalidArgument,
+      rawMessage: "invalid name: must not contain control characters",
+    };
+
+    await expect(
+      organizations.createOrganization({ name }),
+    ).rejects.toMatchObject(invalid);
+    await expect(
+      keys.createApiKey({ ...organization, name }),
+    ).rejects.toMatchObject(invalid);
+    await expect(
+      integrations.createAgentIntegration({
+        ...organization,
+        name,
+        vendor: AgentVendor.CLAUDE_CODE,
+        credentials: {
+          case: "claudeCodeCredentials",
+          value: { environmentKey: "synthetic-agent-key" },
+        },
+      }),
+    ).rejects.toMatchObject(invalid);
+    await expect(
+      integrations.updateAgentIntegration({
+        ...integration,
+        name,
+        updateMask: { paths: ["name"] },
+      }),
+    ).rejects.toMatchObject(invalid);
+
+    expect(await snapshot()).toEqual(before);
+  },
+);
+
 test("an agent integration name conflict preserves the integration list and audit history", async () => {
   const transport = createMockTransport();
   const integrations = createClient(AgentIntegrationService, transport);
@@ -2169,6 +2226,7 @@ test("credential-only and settings-only edits add one audit event each", async (
     const { integration: replaced } = await integrations.updateAgentIntegration(
       {
         ...id,
+        name: "Ignored\u0085name",
         updateMask: { paths: ["credentials"] },
         credentials: {
           case: "cursorCredentials",

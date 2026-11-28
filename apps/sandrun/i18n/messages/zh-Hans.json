@@ -9,6 +9,7 @@
   "common.tryAgain": "重试",
   "common.showMore": "显示更多",
   "common.loading": "正在加载",
+  "common.nameControlCharacter": "请移除名称中的控制字符。",
   "errors.generic": "出了点问题，请重试。",
   "errors.unauthenticated": "你的会话已结束，请重新登录。",
   "errors.permissionDenied": "你没有权限执行此操作。",
