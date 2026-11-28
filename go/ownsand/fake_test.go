@@ -115,6 +115,10 @@ type relayAction struct {
 	// readAbortGate delays a scripted read abort until the client receives
 	// the sent chunks or the request context ends.
 	readAbortGate <-chan struct{}
+	// execAbortGate delays abortAfter until the SDK receives the output.
+	execAbortGate <-chan struct{}
+	// afterPaused runs after the relay successfully sends a Paused event.
+	afterPaused func()
 }
 
 // p2pAction scripts one data channel request.
@@ -176,6 +180,8 @@ type fakeCP struct {
 
 	beforeGetSandbox func(context.Context) error
 	onExecRequest    func(*ownsandv1.ExecRequest)
+	// onGetSandbox observes the sandbox snapshot with cp.mu held.
+	onGetSandbox func(*ownsandv1.Sandbox)
 
 	mu          sync.Mutex
 	orgID       string
@@ -206,6 +212,8 @@ type fakeCP struct {
 	relayLog    []string
 	relayExecs  []*ownsandv1.ExecRequest
 	readOffsets []int64
+
+	relayAttaches []*ownsandv1.AttachExecRequest
 	// heldEnded records when a held (holdOpen or keepalivesOnly) relay
 	// stream ended because the caller cancelled it, and when it began.
 	heldStarts  []time.Time
@@ -517,7 +525,11 @@ func (f *fakeSandboxes) GetSandbox(ctx context.Context, req *connect.Request[own
 	if canonicalFakeID(req.Msg.GetSandboxId()) != cp.sandboxID {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("sandbox not found"))
 	}
-	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: f.record()}), nil
+	sb := f.record()
+	if cp.onGetSandbox != nil {
+		cp.onGetSandbox(sb)
+	}
+	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: sb}), nil
 }
 
 func (f *fakeSandboxes) PauseSandbox(_ context.Context, _ *connect.Request[ownsandv1.PauseSandboxRequest]) (*connect.Response[ownsandv1.PauseSandboxResponse], error) {
@@ -808,9 +820,20 @@ func (r *relaySender) sendEvent(ev *ownsandv1.ExecEvent) error {
 		return errRotate
 	}
 	switch ev.GetEvent().(type) {
+	case *ownsandv1.ExecEvent_Paused:
+		if r.act.afterPaused != nil {
+			r.act.afterPaused()
+		}
 	case *ownsandv1.ExecEvent_Stdout, *ownsandv1.ExecEvent_Stderr, *ownsandv1.ExecEvent_OutputTruncated:
 		r.outputs++
 		if r.act.abortAfter > 0 && r.outputs >= r.act.abortAfter {
+			if r.act.execAbortGate != nil {
+				select {
+				case <-r.act.execAbortGate:
+				case <-r.ctx.Done():
+					return r.ctx.Err()
+				}
+			}
 			panic(http.ErrAbortHandler)
 		}
 		if r.act.endAfter > 0 && r.outputs >= r.act.endAfter {
@@ -963,6 +986,10 @@ func (f *fakeRelay) Exec(ctx context.Context, req *connect.Request[ownsandv1.Exe
 }
 
 func (f *fakeRelay) AttachExec(ctx context.Context, req *connect.Request[ownsandv1.AttachExecRequest], stream *connect.ServerStream[ownsandv1.AttachExecResponse]) error {
+	cp := f.cp
+	cp.mu.Lock()
+	cp.relayAttaches = append(cp.relayAttaches, proto.Clone(req.Msg).(*ownsandv1.AttachExecRequest))
+	cp.mu.Unlock()
 	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	return f.execLike(ctx, "AttachExec", req.Header(), req.Msg, nil, func(ev *ownsandv1.ExecEvent) error {
 		return stream.Send(&ownsandv1.AttachExecResponse{Event: ev})
