@@ -94,21 +94,105 @@ const noChecks = {
   workflows: false,
 };
 
-test("comparison events are the CI.yml triggers", () => {
-  assert.deepEqual(Object.values(ComparisonEvent), [
-    "pull_request",
-    "push",
-    "workflow_dispatch",
-    "schedule",
-  ]);
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  const triggers = workflow.slice(
-    workflow.indexOf("\non:\n") + 1,
-    workflow.indexOf("\npermissions:"),
+// Read the workflow's block mapping and keep duplicate event keys.
+function assertWorkflowEvents(workflow) {
+  const lines = workflow
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*(?:#|$)/u.test(line));
+  const onHeader = /^(["']?)on\1:(?=$|[ \t])/u;
+  const headers = lines.filter((line) => onHeader.test(line));
+  assert.equal(headers.length, 1, "Expected one top-level CI on block");
+  const header = headers[0];
+  assert.match(
+    header.replace(onHeader, ""),
+    /^(?:[ \t]+(?:#.*)?)?$/u,
+    "Expected CI on to use a block mapping",
   );
-  for (const event of Object.values(ComparisonEvent)) {
-    assert.match(triggers, new RegExp(`^  ${event}:`, "mu"), event);
+
+  const blockStart = lines.indexOf(header) + 1;
+  const indent = lines[blockStart]?.match(/^ +(?=\S)/u)?.[0].length;
+  assert.ok(indent, "Expected an indented CI event key");
+
+  // The first event sets the indentation of the direct children of on.
+  const events = [];
+  for (const line of lines.slice(blockStart)) {
+    if (!/^\s/u.test(line)) break;
+    const lineIndent = line.match(/^ */u)[0].length;
+    assert.ok(lineIndent >= indent, `Invalid CI on block indentation: ${line}`);
+    if (lineIndent > indent) continue;
+
+    const key = /^(["']?)([\w-]+)\1:(?=$|[ \t])/u.exec(line.slice(indent));
+    assert.ok(key, `Cannot read CI event key: ${line}`);
+    events.push(key[2]);
   }
+  assert.deepEqual(events.sort(), Object.values(ComparisonEvent).sort());
+}
+
+test("comparison events are the CI.yml triggers", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+  assertWorkflowEvents(workflow);
+});
+
+test("the trigger check ignores event order, nested settings, and comments", () => {
+  const workflow = `name: CI
+on: # Workflow triggers
+  schedule:
+    - cron: "0 18 * * *"
+
+  # merge_group:
+  workflow_dispatch:
+    inputs:
+      base:
+        type: string
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  merge_group:
+`;
+  assertWorkflowEvents(workflow);
+});
+
+test("the trigger check rejects extra, missing, and repeated events", () => {
+  const workflow = `on:
+  pull_request:
+  push:
+  workflow_dispatch:
+  schedule:
+`;
+  const pullRequest = "  pull_request:\n";
+  assert.throws(
+    () =>
+      assertWorkflowEvents(
+        workflow.replace(pullRequest, `${pullRequest}  merge_group:\n`),
+      ),
+    { operator: "deepStrictEqual", message: /merge_group/u },
+  );
+  assert.throws(() => assertWorkflowEvents(workflow.replace(pullRequest, "")), {
+    operator: "deepStrictEqual",
+  });
+  assert.throws(
+    () =>
+      assertWorkflowEvents(
+        workflow.replace(pullRequest, pullRequest.repeat(2)),
+      ),
+    { operator: "deepStrictEqual" },
+  );
+});
+
+test("the trigger check fails when it cannot read the on block", () => {
+  assert.throws(
+    () => assertWorkflowEvents("name: CI\n"),
+    /Expected one top-level CI on block/u,
+  );
+  assert.throws(
+    () => assertWorkflowEvents("on: [pull_request, push]\n"),
+    /Expected CI on to use a block mapping/u,
+  );
+  assert.throws(
+    () => assertWorkflowEvents("on:\n  - pull_request\n"),
+    /Cannot read CI event key/u,
+  );
 });
 
 test("a pull request compares the first parent of its test merge commit", (t) => {
