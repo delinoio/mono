@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 
@@ -63,4 +64,44 @@ describe("development server configuration", () => {
       });
     }
   }
+});
+
+describe("preview server configuration", () => {
+  test("reports missing build output with the mock flag enabled", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "sandrun-preview-"));
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [
+          rsbuild,
+          "preview",
+          "--no-env",
+          "--mode",
+          "production",
+          "--dist-path",
+          join(fixture, "dist"),
+        ],
+        {
+          cwd: new URL("..", import.meta.url),
+          env: {
+            PATH: process.env.PATH,
+            HOME: process.env.HOME,
+            TMPDIR: process.env.TMPDIR,
+            TMP: process.env.TMP,
+            TEMP: process.env.TEMP,
+            PUBLIC_SANDRUN_MOCK_API: "true",
+          },
+          encoding: "utf8",
+          timeout: 15_000,
+        },
+      );
+
+      const output = result.stdout + result.stderr;
+      expect(result.status, output).toBe(1);
+      expect(output).toContain("The output directory");
+      expect(output).toContain("does not exist, please build the project");
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
 });

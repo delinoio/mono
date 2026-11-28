@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
-import { createRsbuild, type RsbuildMode } from "@rsbuild/core";
+import {
+  createRsbuild,
+  type InitConfigsOptions,
+  type RsbuildMode,
+} from "@rsbuild/core";
 import { describe, expect, test } from "@rstest/core";
 import { pluginConsoleConfig } from "./config-plugin.ts";
 import type { ConsoleBuildEnv } from "./config.ts";
 
-async function initConsoleConfig(mode: RsbuildMode, env: ConsoleBuildEnv) {
+async function initConsoleConfig(
+  mode: RsbuildMode,
+  env: ConsoleBuildEnv,
+  action?: InitConfigsOptions["action"],
+) {
   const rsbuild = await createRsbuild({
     rsbuildConfig: {
       mode,
       plugins: [pluginConsoleConfig(env)],
     },
   });
-  await rsbuild.initConfigs();
+  await rsbuild.initConfigs({ action });
   return rsbuild;
 }
 
@@ -25,6 +33,19 @@ async function readMockDefine(mode: RsbuildMode, value: string | undefined) {
 }
 
 describe("console configuration plugin", () => {
+  test("skips the mock definition in a production-mode preview", async () => {
+    const rsbuild = await initConsoleConfig(
+      "production",
+      { PUBLIC_SANDRUN_MOCK_API: "true" },
+      "preview",
+    );
+    expect(
+      rsbuild.getNormalizedConfig().environments.web.source.define[
+        "import.meta.env.PUBLIC_SANDRUN_MOCK_API"
+      ],
+    ).toBeUndefined();
+  });
+
   test.each(["true", " true "])(
     "rejects the mock flag %j in production mode",
     async (value) => {
