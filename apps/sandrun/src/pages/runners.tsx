@@ -99,6 +99,9 @@ export function RunnersPage() {
       invalidateServices(queryClient, WorkService, DevSessionService),
   });
   const admin = can(role, Permission.DeleteRunners);
+  if (!admin && deleting !== undefined) {
+    setDeleting(undefined);
+  }
 
   return (
     <>
@@ -227,14 +230,18 @@ export function RunnersPage() {
       </QueryBoundary>
       <ListPagination query={list} />
       <ConfirmDialog
-        open={deleting !== undefined}
+        open={admin && deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
         title={t("runners.deleteDialog.title")}
         description={t("runners.deleteDialog.description")}
         confirmLabel={t("runners.deleteDialog.confirm")}
-        onConfirm={() =>
-          remove.mutateAsync({ organizationId, runnerId: deleting!.runnerId })
-        }
+        onConfirm={async () => {
+          if (!admin || deleting === undefined) return;
+          await remove.mutateAsync({
+            organizationId,
+            runnerId: deleting.runnerId,
+          });
+        }}
       />
     </>
   );

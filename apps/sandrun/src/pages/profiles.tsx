@@ -113,6 +113,10 @@ export function ProfilesPage() {
   });
   const [editing, setEditing] = useState<RunnerProfile | "new">();
   const [deleting, setDeleting] = useState<RunnerProfile>();
+  if (!admin && (editing !== undefined || deleting !== undefined)) {
+    setEditing(undefined);
+    setDeleting(undefined);
+  }
 
   return (
     <>
@@ -236,7 +240,7 @@ export function ProfilesPage() {
           );
         }}
       </QueryBoundary>
-      {editing !== undefined ? (
+      {admin && editing !== undefined ? (
         <ProfileDialog
           profile={editing === "new" ? undefined : editing}
           agentIntegrations={agentIntegrations}
@@ -244,7 +248,7 @@ export function ProfilesPage() {
         />
       ) : null}
       <ConfirmDialog
-        open={deleting !== undefined}
+        open={admin && deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
         title={
           deleting === undefined
@@ -253,12 +257,13 @@ export function ProfilesPage() {
         }
         description={t("profiles.deleteDialog.description")}
         confirmLabel={t("profiles.deleteDialog.confirm")}
-        onConfirm={() =>
-          remove.mutateAsync({
+        onConfirm={async () => {
+          if (!admin || deleting === undefined) return;
+          await remove.mutateAsync({
             organizationId,
-            runnerProfileId: deleting!.runnerProfileId,
-          })
-        }
+            runnerProfileId: deleting.runnerProfileId,
+          });
+        }}
       />
     </>
   );
@@ -275,7 +280,7 @@ function ProfileDialog({
   onClose: () => void;
 }) {
   const { t } = useI18n();
-  const { organizationId } = useOrg();
+  const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const initial = useMemo(
     () =>
@@ -366,6 +371,7 @@ function ProfileDialog({
           guestOsUnavailable)
       }
       onSubmit={async (opening) => {
+        if (!can(role, Permission.ManageRunnerProfiles)) return;
         const submitted = warmCountDraft.current?.isInvalid()
           ? { ...values, warmCount: null }
           : values;

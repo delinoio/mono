@@ -79,6 +79,11 @@ export function DevSessionsPage() {
     onSuccess: () =>
       invalidateServices(queryClient, DevSessionService, WorkService),
   });
+  const canDeleteSelection =
+    deleting !== undefined && canDeleteDevSession(role, userId, deleting);
+  if (deleting !== undefined && !canDeleteSelection) {
+    setDeleting(undefined);
+  }
 
   return (
     <>
@@ -196,17 +201,18 @@ export function DevSessionsPage() {
       </QueryBoundary>
       <ListPagination query={list} />
       <ConfirmDialog
-        open={deleting !== undefined}
+        open={canDeleteSelection}
         onOpenChange={(open) => !open && setDeleting(undefined)}
         title={t("devSessions.deleteDialog.title")}
         description={t("devSessions.deleteDialog.description")}
         confirmLabel={t("devSessions.deleteDialog.confirm")}
-        onConfirm={() =>
-          remove.mutateAsync({
+        onConfirm={async () => {
+          if (!canDeleteSelection) return;
+          await remove.mutateAsync({
             organizationId,
-            devSessionId: deleting!.devSessionId,
-          })
-        }
+            devSessionId: deleting.devSessionId,
+          });
+        }}
       />
     </>
   );
