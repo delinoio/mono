@@ -191,8 +191,8 @@ function SessionSecretsSection() {
           setErrors(nextErrors);
           if (nextErrors.name || nextErrors.value) return;
           await set.mutateAsync({ organizationId, name: trimmedName, value });
-          // The value never stays in the form after it is saved.
-          setValue("");
+          // The value never stays in the form after it is saved. A dismissal
+          // already cleared it, and a later opening keeps its own draft.
           if (opening.isCurrent()) close();
         }}
       >

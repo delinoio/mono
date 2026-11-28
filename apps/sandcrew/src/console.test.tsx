@@ -738,6 +738,51 @@ describe("settings", () => {
     expect(storedText()).not.toContain("sk-ant-oat-secret-value");
   });
 
+  test("keeps a new credential draft when an earlier dismissed save finishes", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transport: Transport = {
+      ...base,
+      async unary(method, ...rest) {
+        if (method.name === "SetVendorCredential") await held;
+        return base.unary(method, ...rest);
+      },
+    };
+    renderConsole(`/orgs/${ACME}/settings`, { transport });
+    const open = async () => {
+      await click(
+        await screen.findByRole("button", {
+          name: "Set the Claude Code credential",
+        }),
+      );
+      const dialog = await screen.findByRole("dialog");
+      await choose(
+        within(dialog).getByRole("combobox", { name: "Kind" }),
+        "Claude Code token",
+      );
+      return dialog;
+    };
+    let dialog = await open();
+    await type(within(dialog).getByLabelText("Claude Code token"), "first");
+    await click(
+      within(dialog).getByRole("button", { name: "Save credential" }),
+    );
+    await act(async () => fireEvent.keyDown(dialog, { key: "Escape" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    dialog = await open();
+    const input = within(dialog).getByLabelText(
+      "Claude Code token",
+    ) as HTMLInputElement;
+    await type(input, "second");
+    await act(async () => release());
+    await settle();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(input.value).toBe("second");
+  });
+
   test("rejects an auth.json file that is not a JSON object", async () => {
     renderConsole(`/orgs/${ACME}/settings`);
     await click(

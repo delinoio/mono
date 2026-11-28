@@ -255,9 +255,12 @@ function CredentialDialog({
           kind: selected,
           value: bytes,
         });
-        // The value never stays in the form after it is saved.
-        reset();
-        if (opening.isCurrent()) onClose();
+        // The value never stays in the form after it is saved. A dismissal
+        // already cleared it, and a later opening keeps its own draft.
+        if (opening.isCurrent()) {
+          reset();
+          onClose();
+        }
       }}
     >
       {kinds.length > 1 ? (
