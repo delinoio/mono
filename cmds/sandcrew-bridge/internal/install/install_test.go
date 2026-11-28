@@ -30,6 +30,7 @@ import (
 const (
 	testVersion = "24.22.3"
 	adapterName = "@agentclientprotocol/claude-agent-acp"
+	agentName   = "@anthropic-ai/claude-agent-sdk"
 )
 
 var claude = sandcrewv1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE
@@ -402,8 +403,10 @@ func TestNpmFailureFailsAfterThreeAttempts(t *testing.T) {
 	}
 }
 
-// preinstalledNode creates a Node.js prefix like an image would have.
-func preinstalledNode(t *testing.T, adapterVersion string) string {
+// preinstalledNode creates a Node.js prefix like an image would have, with
+// the adapter and its agent installed globally (the agent hoisted next to
+// the adapter). An empty version leaves the package out.
+func preinstalledNode(t *testing.T, adapterVersion, agentVersion string) string {
 	t.Helper()
 	prefix := t.TempDir()
 	for _, file := range []string{"bin/node", "lib/node_modules/npm/bin/npm-cli.js"} {
@@ -416,19 +419,26 @@ func preinstalledNode(t *testing.T, adapterVersion string) string {
 		}
 	}
 	if adapterVersion != "" {
-		dir := filepath.Join(prefix, "lib", "node_modules", filepath.FromSlash(adapterName))
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"version":"`+adapterVersion+`"}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writePackage(t, filepath.Join(prefix, "lib", "node_modules", filepath.FromSlash(adapterName)), adapterVersion)
+	}
+	if agentVersion != "" {
+		writePackage(t, filepath.Join(prefix, "lib", "node_modules", filepath.FromSlash(agentName)), agentVersion)
 	}
 	return prefix
 }
 
+func writePackage(t *testing.T, dir, version string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"version":"`+version+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPreinstalledComponentsWithThePinnedVersion(t *testing.T) {
-	prefix := preinstalledNode(t, "0.113.0")
+	prefix := preinstalledNode(t, "0.113.0", "0.3.331")
 	srv := newServer(t, nil, 100)
 	runner := &fakeRunner{version: "v" + testVersion}
 	installer := newInstaller(t, testPins(t, srv.URL+"/node", strings.Repeat("0", 64)), pins.TargetLinuxAMD64, runner)
@@ -453,7 +463,7 @@ func TestPreinstalledComponentsWithThePinnedVersion(t *testing.T) {
 }
 
 func TestPreinstalledRuntimeWithAnotherAdapterVersion(t *testing.T) {
-	prefix := preinstalledNode(t, "0.100.0")
+	prefix := preinstalledNode(t, "0.100.0", "0.3.331")
 	srv := newServer(t, nil, 100)
 	runner := &fakeRunner{version: "v" + testVersion}
 	installer := newInstaller(t, testPins(t, srv.URL+"/node", strings.Repeat("0", 64)), pins.TargetLinuxAMD64, runner)
@@ -467,8 +477,44 @@ func TestPreinstalledRuntimeWithAnotherAdapterVersion(t *testing.T) {
 	}
 }
 
+func TestPreinstalledAdapterWithAnotherAgentVersion(t *testing.T) {
+	cases := map[string]func(prefix string){
+		// The hoisted agent has another patch version.
+		"hoisted": func(prefix string) {
+			writePackage(t, filepath.Join(prefix, "lib", "node_modules", filepath.FromSlash(agentName)), "0.3.332")
+		},
+		// A nested copy wins over the matching hoisted one.
+		"nested": func(prefix string) {
+			writePackage(t, filepath.Join(prefix, "lib", "node_modules", filepath.FromSlash(adapterName), "node_modules", filepath.FromSlash(agentName)), "0.3.330")
+		},
+		// No agent package at all.
+		"missing": func(prefix string) {
+			if err := os.RemoveAll(filepath.Join(prefix, "lib", "node_modules", filepath.FromSlash(agentName))); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			prefix := preinstalledNode(t, "0.113.0", "0.3.331")
+			change(prefix)
+			srv := newServer(t, nil, 100)
+			runner := &fakeRunner{version: "v" + testVersion}
+			installer := newInstaller(t, testPins(t, srv.URL+"/node", strings.Repeat("0", 64)), pins.TargetLinuxAMD64, runner)
+			installer.LookPath = func(string) (string, error) { return filepath.Join(prefix, "bin", "node"), nil }
+			result, err := installer.Install(context.Background(), claude)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.RuntimePreinstalled || result.AdapterPreinstalled || len(runner.npmRuns) != 1 {
+				t.Fatalf("result %+v, %d npm runs; want the locked adapter installation", result, len(runner.npmRuns))
+			}
+		})
+	}
+}
+
 func TestPreinstalledRuntimeWithAnotherVersionIsNotUsed(t *testing.T) {
-	prefix := preinstalledNode(t, "0.113.0")
+	prefix := preinstalledNode(t, "0.113.0", "0.3.331")
 	archive := nodeTarGz(t, "node-linux")
 	srv := newServer(t, archive, 0)
 	runner := &fakeRunner{version: "v22.0.0"}

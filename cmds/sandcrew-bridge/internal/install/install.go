@@ -174,12 +174,22 @@ func (i *Installer) Install(ctx context.Context, vendor sandcrewv1.AgentVendor) 
 	result.RuntimePath = filepath.Join(runtimeRoot, filepath.FromSlash(archive.Executable))
 
 	if preinstalled {
-		pkgDir := filepath.Join(runtimeRoot, filepath.FromSlash(archive.GlobalModules), filepath.FromSlash(spec.Adapter.Name))
-		if packageVersion(pkgDir) == spec.Adapter.Version {
+		globalModules := filepath.Join(runtimeRoot, filepath.FromSlash(archive.GlobalModules))
+		pkgDir := filepath.Join(globalModules, filepath.FromSlash(spec.Adapter.Name))
+		// The adapter depends on the agent through a version range, so a
+		// global installation can resolve another agent version than the
+		// embedded lockfile. Both must match the pins; hello reports them.
+		adapterVersion := packageVersion(pkgDir)
+		agentVersion := resolvedVersion(pkgDir, globalModules, spec.Agent.Name)
+		if adapterVersion == spec.Adapter.Version && agentVersion == spec.Agent.Version {
 			result.AdapterPreinstalled = true
 			result.AdapterEntry = filepath.Join(pkgDir, filepath.FromSlash(spec.Adapter.Entry))
-			i.Logger.Info("using preinstalled adapter", "adapter", spec.Adapter.Name, "version", spec.Adapter.Version)
+			i.Logger.Info("using preinstalled adapter", "adapter", spec.Adapter.Name, "version", spec.Adapter.Version, "agent", spec.Agent.Name, "agent_version", agentVersion)
 			return result, nil
+		}
+		if adapterVersion != "" {
+			i.Logger.Info("preinstalled adapter does not match the pins", "adapter_version", adapterVersion, "agent_version", agentVersion,
+				"pinned_adapter_version", spec.Adapter.Version, "pinned_agent_version", spec.Agent.Version)
 		}
 	}
 	pkgRoot, err := i.installAdapter(ctx, spec, result.RuntimePath, filepath.Join(runtimeRoot, filepath.FromSlash(archive.NpmCli)))
@@ -188,6 +198,22 @@ func (i *Installer) Install(ctx context.Context, vendor sandcrewv1.AgentVendor) 
 	}
 	result.AdapterEntry = filepath.Join(pkgRoot, "node_modules", filepath.FromSlash(spec.Adapter.Name), filepath.FromSlash(spec.Adapter.Entry))
 	return result, nil
+}
+
+// resolvedVersion returns the version of the package name that Node.js
+// resolves from the package in pkgDir inside the global node_modules
+// directory globalModules: a copy nested in pkgDir/node_modules first, then
+// the hoisted copy in globalModules. It returns "" when neither exists.
+func resolvedVersion(pkgDir, globalModules, name string) string {
+	for _, dir := range []string{
+		filepath.Join(pkgDir, "node_modules", filepath.FromSlash(name)),
+		filepath.Join(globalModules, filepath.FromSlash(name)),
+	} {
+		if _, err := os.Stat(filepath.Join(dir, "package.json")); err == nil {
+			return packageVersion(dir)
+		}
+	}
+	return ""
 }
 
 // findRuntime returns the root of a preinstalled runtime whose reported
