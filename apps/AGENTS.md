@@ -31,4 +31,5 @@
 - `apps/delidev/`: [project index](../docs/project-delidev.md) and [foundation contract](../docs/apps-delidev-foundation.md)
 - `apps/ownsand/`: [project index](../docs/project-ownsand.md) and [web console foundation contract](../docs/apps-ownsand-console-foundation.md)
 - `apps/sandrun/`: [project index](../docs/project-sandrun.md) and [web console foundation contract](../docs/apps-sandrun-console-foundation.md)
+- `apps/sandcrew/` (planned): [project index](../docs/project-sandcrew.md) and [web console foundation contract](../docs/apps-sandcrew-console-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.
