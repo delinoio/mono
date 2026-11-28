@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
@@ -42,6 +43,16 @@ func queueRunner(org, id string) *sandrunv1.WatchQueueResponse {
 		Event: &sandrunv1.WatchQueueResponse_Runner{Runner: &sandrunv1.Runner{
 			OrganizationId: org, RunnerId: id,
 		}},
+	}
+}
+
+func queueKeepalive(sequence int) *sandrunv1.WatchQueueResponse {
+	keepalive := &sandrunv1.WatchQueueKeepalive{}
+	// Keepalives have no declared fields. Use an unknown field to verify order.
+	tag := protowire.AppendTag(nil, 99, protowire.VarintType)
+	keepalive.ProtoReflect().SetUnknown(protowire.AppendVarint(tag, uint64(sequence)))
+	return &sandrunv1.WatchQueueResponse{
+		Event: &sandrunv1.WatchQueueResponse_Keepalive{Keepalive: keepalive},
 	}
 }
 
@@ -92,6 +103,142 @@ func TestWatchQueueQueuesBurstBeforeWatch(t *testing.T) {
 		requireQueueUpdate(t, watch, queueRequest(org, strconv.Itoa(i)))
 	}
 	requireQueueEOF(t, watch)
+}
+
+func TestWatchQueueQueuesUnscopedBurstBeforeWatch(t *testing.T) {
+	t.Parallel()
+
+	const updates = 65
+	s := New()
+	t.Cleanup(s.Close)
+	s.WatchEventLimit = updates + 1
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	org := s.AddOrganization("burst").GetOrganizationId()
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+
+	enqueued := make(chan struct{})
+	go func() {
+		defer close(enqueued)
+		for i := range updates {
+			s.SendQueueEvent(queueKeepalive(i))
+		}
+	}()
+	select {
+	case <-enqueued:
+	case <-ctx.Done():
+		// Drain the queue so a blocked sender can finish if the fixed
+		// buffer returns.
+		drainCtx, cancelDrain := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancelDrain()
+		drain := openQueueWatch(t, drainCtx, client, org)
+		for drain.Receive() {
+		}
+		t.Fatal("queuing 65 unscoped events blocked before the watch started")
+	}
+
+	watch := openQueueWatch(t, ctx, client, org)
+	for i := range updates {
+		requireQueueUpdate(t, watch, queueKeepalive(i))
+	}
+	requireQueueEOF(t, watch)
+}
+
+func TestWatchQueueSendsUnscopedEventToOneWatch(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	t.Cleanup(s.Close)
+	s.WatchEventLimit = 2
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	type receipt struct {
+		index int
+		event *sandrunv1.WatchQueueResponse
+		extra bool
+		err   error
+	}
+	results := make(chan receipt, 2)
+	var cancels [2]context.CancelFunc
+	for i, name := range []string{"first", "second"} {
+		watchCtx, cancelWatch := context.WithCancel(ctx)
+		cancels[i] = cancelWatch
+		t.Cleanup(cancelWatch)
+		watch := openQueueWatch(t, watchCtx, client, s.AddOrganization(name).GetOrganizationId())
+		go func() {
+			result := receipt{index: i}
+			if watch.Receive() {
+				result.event = watch.Msg()
+				result.extra = watch.Receive()
+			}
+			result.err = watch.Err()
+			results <- result
+		}()
+	}
+
+	keepalive := queueKeepalive(0)
+	s.SendQueueEvent(keepalive)
+	first := <-results
+	if !proto.Equal(first.event, keepalive) || first.extra || first.err != nil {
+		t.Fatalf("watch %d got %v (extra message: %t, error: %v), want a keepalive and successful end", first.index, first.event, first.extra, first.err)
+	}
+	cancels[1-first.index]()
+	second := <-results
+	if second.event != nil || connect.CodeOf(second.err) != connect.CodeCanceled {
+		t.Fatalf("watch %d got %v (error: %v), want only cancellation", second.index, second.event, second.err)
+	}
+}
+
+func TestWatchQueueShutdownDiscardsUnscopedEvents(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	update := queueKeepalive(0)
+	s.SendQueueEvent(update)
+
+	start := make(chan struct{})
+	enqueued, closed := make(chan struct{}), make(chan struct{})
+	sendBurst := func(done chan struct{}) {
+		defer close(done)
+		for range 65 {
+			s.SendQueueEvent(update)
+		}
+	}
+	go func() {
+		<-start
+		sendBurst(enqueued)
+	}()
+	go func() {
+		<-start
+		s.Close()
+		close(closed)
+	}()
+	close(start)
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("shutdown blocked with queued unscoped events")
+	}
+	select {
+	case <-enqueued:
+	case <-ctx.Done():
+		t.Fatal("unscoped sends blocked during shutdown")
+	}
+
+	late := make(chan struct{})
+	go sendBurst(late)
+	select {
+	case <-late:
+	case <-ctx.Done():
+		t.Fatal("unscoped sends blocked after shutdown")
+	}
+	if len(s.unscopedQueue.events) != 0 {
+		t.Fatal("unscoped events remained after shutdown")
+	}
 }
 
 func TestWatchQueueExitsWhenCanceledWhileWaiting(t *testing.T) {
