@@ -85,6 +85,94 @@ describe("home", () => {
   );
 });
 
+describe("compact navigation focus", () => {
+  function readTriggerOutline(selector: string) {
+    const trigger = document.querySelector<HTMLButtonElement>(selector);
+    if (!trigger) {
+      throw new Error(`Missing navigation button: ${selector}`);
+    }
+    const style = getComputedStyle(trigger);
+    return {
+      focused: document.activeElement === trigger,
+      hovered: trigger.matches(":hover"),
+      open: Boolean(
+        document.querySelector(
+          ".rp-nav-screen--open, .rp-nav-hamburger__md .rp-hover-group:not(.rp-hover-group--hidden)",
+        ),
+      ),
+      dark: document.documentElement.classList.contains("rp-dark"),
+      style: style.outlineStyle,
+      width: parseFloat(style.outlineWidth),
+      offset: parseFloat(style.outlineOffset),
+    };
+  }
+
+  for (const colorScheme of ["light", "dark"] as const) {
+    for (const { width, variant, tabCount } of [
+      { width: 768, variant: "sm", tabCount: 2 },
+      { width: 769, variant: "md", tabCount: 4 },
+    ]) {
+      test(`shows a keyboard focus outline at ${width}px in ${colorScheme} mode`, async ({
+        app,
+        browser,
+        screen,
+      }) => {
+        await browser.setViewport({ width, height: 800 });
+        await browser.emulateMedia({ colorScheme });
+        await app.open("/");
+        await browser.mouse.move(10, 200);
+
+        const trigger = screen.getByRole("button", "mobile hamburger");
+        await expect(trigger).toBeVisible();
+        for (let step = 0; step < tabCount; step++) {
+          await browser.keyboard.press("Tab");
+        }
+        await expect(trigger).toBeFocused();
+
+        const selector = `.rp-nav-hamburger__${variant}`;
+        const focused = await browser.evaluate(readTriggerOutline, selector);
+        expect(focused.focused).toBe(true);
+        expect(focused.hovered).toBe(false);
+        expect(focused.open).toBe(false);
+        expect(focused.dark).toBe(colorScheme === "dark");
+        expect(focused.style).toBe("solid");
+        expect(focused.width).toBeGreaterThanOrEqual(2);
+        expect(focused.offset).toBeGreaterThan(0);
+
+        await browser.keyboard.press("Tab");
+        await expect(screen.getByRole("link", "Read the docs")).toBeFocused();
+        const blurred = await browser.evaluate(readTriggerOutline, selector);
+        expect(blurred.style).toBe("none");
+      });
+    }
+  }
+
+  test("skips both hidden navigation buttons at 1281px", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await browser.setViewport({ width: 1281, height: 800 });
+    await app.open("/");
+
+    const buttons = await browser.evaluate(() =>
+      Array.from(
+        document.querySelectorAll(".rp-nav-hamburger"),
+        (button) => getComputedStyle(button).display,
+      ),
+    );
+    expect(buttons).toEqual(["none", "none"]);
+
+    const header = screen.getByRole("banner");
+    for (const name of ["Delino", /^Docs\b/, /^GitHub\b/]) {
+      await browser.keyboard.press("Tab");
+      await expect(header.getByRole("link", name)).toBeFocused();
+    }
+    await browser.keyboard.press("Tab");
+    await expect(screen.getByRole("link", "Read the docs")).toBeFocused();
+  });
+});
+
 describe("brand colors", () => {
   // Reads the resolved brand custom properties and the Rspress dark surfaces
   // in the page, then computes WCAG 2.1 contrast ratios. Adding the `rp-dark`
