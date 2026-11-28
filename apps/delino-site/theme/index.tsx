@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import "./index.css";
+import "./nav-focus.css";
 
 export * from "@rspress/core/theme-original";
 
