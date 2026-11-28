@@ -301,18 +301,37 @@ describe("peer-to-peer data path", () => {
       }
     });
     const sandbox = h.client.sandbox(SANDBOX);
-    const controller = new AbortController();
-    const results = await h.clock.run(
-      Promise.all([
-        sandbox.run({ command: ["a"] }),
-        sandbox.run({ command: ["b"], signal: controller.signal }),
-      ]),
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const first = sandbox.run({
+      command: ["a"],
+      signal: firstController.signal,
+    });
+    const second = sandbox.run({
+      command: ["b"],
+      signal: secondController.signal,
+    });
+    const results = await h.clock.run(Promise.all([first, second]));
+
+    for (const { result } of results) {
+      expect(result).toMatchObject({
+        kind: ExecResultKind.Exited,
+        exitCode: 0n,
+      });
+    }
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(rtc.connections).toHaveLength(1);
+
+    const requests = rtc.frames.filter(
+      (frame) => frame.kind === DataFrameKind.EXEC_REQUEST,
     );
-    expect(results.map((r) => r.result.kind)).toEqual([
-      ExecResultKind.Exited,
-      ExecResultKind.Exited,
-    ]);
-    expect(rtc.frames).toHaveLength(2);
+    expect(requests).toHaveLength(2);
+    expect(
+      requests.map(({ payload }) =>
+        payload.case === "execRequest" ? payload.value.command : undefined,
+      ),
+    ).toEqual(expect.arrayContaining([["a"], ["b"]]));
+    expect(new Set(requests.map(({ streamId }) => streamId)).size).toBe(2);
   });
 
   test("falls back to the relay when the data channel does not open within 10 seconds", async () => {
