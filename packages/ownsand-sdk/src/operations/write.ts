@@ -57,7 +57,8 @@ export async function* chunkSource(
   // input size. The caller's buffers are never aliased: an unacknowledged
   // chunk can be resent after a failure while the caller mutates its own
   // buffer.
-  const pieces: Uint8Array[] = [];
+  let pieces: (Uint8Array | undefined)[] = [];
+  let head = 0;
   let offset = 0;
   let pendingLength = 0;
   let held: Uint8Array | undefined;
@@ -65,15 +66,24 @@ export async function* chunkSource(
     const out = new Uint8Array(n);
     let filled = 0;
     while (filled < n) {
-      const head = pieces[0]!;
-      const count = Math.min(n - filled, head.length - offset);
-      out.set(head.subarray(offset, offset + count), filled);
+      const piece = pieces[head]!;
+      const count = Math.min(n - filled, piece.length - offset);
+      out.set(piece.subarray(offset, offset + count), filled);
       filled += count;
       offset += count;
-      if (offset === head.length) {
-        pieces.shift();
+      if (offset === piece.length) {
+        pieces[head] = undefined;
+        head++;
         offset = 0;
       }
+    }
+    if (head === pieces.length) {
+      pieces.length = 0;
+      head = 0;
+    } else if (head >= pieces.length - head) {
+      // Copy at most one unread reference per consumed entry.
+      pieces = pieces.slice(head);
+      head = 0;
     }
     pendingLength -= n;
     return out;
