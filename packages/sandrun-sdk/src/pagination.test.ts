@@ -17,12 +17,67 @@ import {
   type ListRequestsRequest,
   WorkService,
 } from "@delino/sandrun-protos/v1/work_pb";
-import { createSandRunIterators, SandRunClient } from "./client.ts";
+import { SandRunClient } from "./client.ts";
 import { SandRunError } from "./errors.ts";
 import { collect } from "./pagination.ts";
 import { FAKE_ORIGIN, fakeServer } from "./testing/fake-server.ts";
 
 const ORG = "0193a000-0000-7000-8000-000000000001";
+const RPC_PREFIX = "/delino.sandrun.v1.";
+
+const iteratorCases = {
+  organizations: {
+    path: `${RPC_PREFIX}OrganizationService/ListOrganizations`,
+    item: { organizationId: ORG },
+  },
+  invitations: {
+    path: `${RPC_PREFIX}MemberService/ListInvitations`,
+    item: { invitationId: "invitation" },
+  },
+  members: {
+    path: `${RPC_PREFIX}MemberService/ListMembers`,
+    item: { userId: "member" },
+  },
+  gitHubInstallations: {
+    path: `${RPC_PREFIX}GitHubService/ListGitHubInstallations`,
+    item: { installationId: "installation" },
+  },
+  agentIntegrations: {
+    path: `${RPC_PREFIX}AgentIntegrationService/ListAgentIntegrations`,
+    item: { agentIntegrationId: "integration" },
+  },
+  runnerProfiles: {
+    path: `${RPC_PREFIX}RunnerProfileService/ListRunnerProfiles`,
+    item: { runnerProfileId: "runner-profile" },
+  },
+  requests: {
+    path: `${RPC_PREFIX}WorkService/ListRequests`,
+    item: { requestId: "request" },
+  },
+  runners: {
+    path: `${RPC_PREFIX}WorkService/ListRunners`,
+    item: { runnerId: "runner" },
+  },
+  apiKeys: {
+    path: `${RPC_PREFIX}ApiKeyService/ListApiKeys`,
+    item: { apiKeyId: "api-key" },
+  },
+  devSessionProfiles: {
+    path: `${RPC_PREFIX}DevSessionService/ListDevSessionProfiles`,
+    item: { runnerProfileId: "dev-session-profile" },
+  },
+  devSessions: {
+    path: `${RPC_PREFIX}DevSessionService/ListDevSessions`,
+    item: { devSessionId: "dev-session" },
+  },
+  auditEvents: {
+    path: `${RPC_PREFIX}AuditService/ListAuditEvents`,
+    item: { auditEventId: "audit-event" },
+  },
+};
+const iteratorNames = Object.keys(
+  iteratorCases,
+) as (keyof typeof iteratorCases)[];
 
 describe("pagination", () => {
   test("follows next_page_token until it is empty and keeps the filters", async () => {
@@ -153,8 +208,8 @@ describe("pagination", () => {
     expect((error as ConnectError).code).toBe(Code.NotFound);
   });
 
-  test("has an iterator for every paginated list RPC", () => {
-    const paginated = [
+  test("maps the public iterators to all paginated list RPCs one to one", () => {
+    const paginatedPaths = [
       OrganizationService,
       MemberService,
       OwnSandLinkService,
@@ -166,14 +221,112 @@ describe("pagination", () => {
       DevSessionService,
       AuditService,
     ].flatMap((service) =>
-      service.methods.filter((method) =>
-        method.input.fields.some((field) => field.name === "page_token"),
-      ),
+      service.methods
+        .filter((method) =>
+          method.input.fields.some((field) => field.name === "page_token"),
+        )
+        .map((method) => `/${service.typeName}/${method.name}`),
     );
-    const iterators = createSandRunIterators(
-      new SandRunClient({ origin: FAKE_ORIGIN, token: "test-token" }),
+    const expectedPaths = Object.values(iteratorCases).map(({ path }) => path);
+    const client = new SandRunClient({
+      origin: FAKE_ORIGIN,
+      token: "test-token",
+    });
+    expect(Object.keys(client.iterate).sort()).toEqual(
+      [...iteratorNames].sort(),
     );
-    expect(Object.keys(iterators).length).toBe(paginated.length);
-    expect(paginated.length).toBe(12);
+    expect(new Set(expectedPaths).size).toBe(expectedPaths.length);
+    expect(paginatedPaths.sort()).toEqual(expectedPaths.sort());
   });
+
+  test.each(iteratorNames)(
+    "%s calls its RPC and yields its item",
+    async (name) => {
+      const lastPage = { nextPageToken: "" };
+      const server = fakeServer((router) => {
+        router.service(OrganizationService, {
+          listOrganizations: () => ({
+            ...lastPage,
+            organizations: [iteratorCases.organizations.item],
+          }),
+        });
+        router.service(MemberService, {
+          listInvitations: () => ({
+            ...lastPage,
+            invitations: [iteratorCases.invitations.item],
+          }),
+          listMembers: () => ({
+            ...lastPage,
+            members: [iteratorCases.members.item],
+          }),
+        });
+        router.service(GitHubService, {
+          listGitHubInstallations: () => ({
+            ...lastPage,
+            installations: [iteratorCases.gitHubInstallations.item],
+          }),
+        });
+        router.service(AgentIntegrationService, {
+          listAgentIntegrations: () => ({
+            ...lastPage,
+            integrations: [iteratorCases.agentIntegrations.item],
+          }),
+        });
+        router.service(RunnerProfileService, {
+          listRunnerProfiles: () => ({
+            ...lastPage,
+            profiles: [iteratorCases.runnerProfiles.item],
+          }),
+        });
+        router.service(WorkService, {
+          listRequests: () => ({
+            ...lastPage,
+            requests: [iteratorCases.requests.item],
+          }),
+          listRunners: () => ({
+            ...lastPage,
+            runners: [iteratorCases.runners.item],
+          }),
+        });
+        router.service(ApiKeyService, {
+          listApiKeys: () => ({
+            ...lastPage,
+            apiKeys: [iteratorCases.apiKeys.item],
+          }),
+        });
+        router.service(DevSessionService, {
+          listDevSessionProfiles: () => ({
+            ...lastPage,
+            profiles: [iteratorCases.devSessionProfiles.item],
+          }),
+          listDevSessions: () => ({
+            ...lastPage,
+            devSessions: [iteratorCases.devSessions.item],
+          }),
+        });
+        router.service(AuditService, {
+          listAuditEvents: () => ({
+            ...lastPage,
+            events: [iteratorCases.auditEvents.item],
+          }),
+        });
+      });
+      const client = new SandRunClient({
+        origin: FAKE_ORIGIN,
+        fetch: server.fetch,
+        token: "test-token",
+      });
+      const items = await collect<unknown>(
+        name === "organizations"
+          ? client.iterate.organizations()
+          : client.iterate[name]({ organizationId: ORG }),
+      );
+
+      expect(server.calls.map(({ path }) => path)).toEqual([
+        iteratorCases[name].path,
+      ]);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject(iteratorCases[name].item);
+    },
+  );
 });
