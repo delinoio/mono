@@ -840,12 +840,32 @@ RSC→client serialization deduplicates by object reference, not value. Same ref
 **Correct: sends 3 strings**
 
 ```tsx
-// RSC: send once
-<ClientList usernames={usernames} />
+// UserList.tsx (Server Component)
+import { ClientList } from './ClientList'
 
-// Client: transform there
+export default function UserList() {
+  const usernames = ['zoe', 'amy', 'mika']
+  return <ClientList usernames={usernames} />
+}
+```
+
+```tsx
+// ClientList.tsx (Client Component)
 'use client'
-const sorted = useMemo(() => [...usernames].sort(), [usernames])
+
+import { useMemo } from 'react'
+
+export function ClientList({ usernames }: { usernames: string[] }) {
+  const sorted = useMemo(() => [...usernames].sort(), [usernames])
+
+  return (
+    <ol>
+      {sorted.map(username => (
+        <li key={username}>{username}</li>
+      ))}
+    </ol>
+  )
+}
 ```
 
 **Nested deduplication behavior:**
