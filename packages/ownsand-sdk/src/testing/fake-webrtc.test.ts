@@ -77,19 +77,58 @@ describe("fakeWebRtc open timing", () => {
   });
 
   test("keeps a channel that opened before the answer open exactly once", async () => {
-    const { clock, connection, channel, opens } = connect({
+    const { clock, rtc, connection, channel, opens } = connect({
+      hold: ["createOffer"],
       openBeforeAnswer: true,
       openDelayMs: 0,
     });
 
-    await connection.createOffer();
-    await clock.settle();
+    const offer = connection.createOffer();
+    expect(rtc.held("createOffer")).toBe(1);
+    expect(channel.readyState).toBe("connecting");
+    expect(opens()).toBe(0);
+
+    rtc.release("createOffer");
+    await offer;
     expect(channel.readyState).toBe("open");
+    expect(opens()).toBe(1);
 
     await connection.setRemoteDescription({ type: "answer" });
     await clock.advance(1_000);
     expect(channel.readyState).toBe("open");
     expect(opens()).toBe(1);
+  });
+
+  test("resolves a held offer without reopening a closed channel", async () => {
+    const { clock, rtc, connection, channel, opens } = connect({
+      hold: ["createOffer"],
+      openBeforeAnswer: true,
+    });
+
+    const offer = connection.createOffer();
+    expect(rtc.held("createOffer")).toBe(1);
+    connection.close();
+    expect(channel.readyState).toBe("closed");
+
+    rtc.release("createOffer");
+    expect(await offer).toEqual({ type: "offer", sdp: "v=0 fake-offer" });
+    await clock.settle();
+    expect(channel.readyState).toBe("closed");
+    expect(opens()).toBe(0);
+  });
+
+  test("keeps the channel closed when it closes before the queued open runs", async () => {
+    const { connection, channel, opens } = connect({ openBeforeAnswer: true });
+
+    const offer = connection.createOffer();
+    // Let createOffer queue the early open before closing the connection.
+    await Promise.resolve();
+    expect(channel.readyState).toBe("connecting");
+    connection.close();
+
+    await offer;
+    expect(channel.readyState).toBe("closed");
+    expect(opens()).toBe(0);
   });
 });
 
