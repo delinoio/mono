@@ -72,10 +72,11 @@ func (l *CleanupLock) Reset() error {
 func ResetDir(dir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), resetEnrollmentLockWait)
 	defer cancel()
-	return resetDir(ctx, dir)
+	return ResetDirContext(ctx, dir)
 }
 
-func resetDir(ctx context.Context, dir string) error {
+// ResetDirContext is like ResetDir and uses ctx to bound the lock wait.
+func ResetDirContext(ctx context.Context, dir string) error {
 	if dir == "" {
 		return errors.New("store: state directory is required")
 	}

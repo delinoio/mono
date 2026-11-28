@@ -275,7 +275,7 @@ func TestImageBuildLockAcrossProcesses(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	if err := resetDir(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
+	if err := ResetDirContext(ctx, dir); !errors.Is(err, ErrEnrollmentBusy) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("reset with an active build: %v, want ErrEnrollmentBusy and DeadlineExceeded", err)
 	}
 	if _, err := os.Stat(stage); err != nil {
