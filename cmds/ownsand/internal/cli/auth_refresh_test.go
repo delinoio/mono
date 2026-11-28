@@ -3,16 +3,20 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/cmds/internal/logto"
 	ownsand "github.com/delinoio/mono/go/ownsand"
 )
 
@@ -24,12 +28,17 @@ const gatedRefreshToken = "gated-refresh"
 // gatedRefreshToken, so a test can run other commands while a refresh is in
 // flight. Other refresh tokens (the one of a login) answer at once.
 type gatedLogto struct {
-	started chan struct{}
-	release chan struct{}
+	started     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
 }
 
 func newGatedLogto() *gatedLogto {
 	return &gatedLogto{started: make(chan struct{}, 4), release: make(chan struct{})}
+}
+
+func (g *gatedLogto) releaseRefresh() {
+	g.releaseOnce.Do(func() { close(g.release) })
 }
 
 func (g *gatedLogto) handler(t *testing.T) http.Handler {
@@ -43,7 +52,10 @@ func (g *gatedLogto) handler(t *testing.T) http.Handler {
 			fmt.Fprint(w, `{"access_token":"opaque","refresh_token":"login-refresh-1","expires_in":3600}`)
 		case r.URL.Path == "/oidc/token" && r.Form.Get("grant_type") == "refresh_token":
 			if r.Form.Get("refresh_token") == gatedRefreshToken {
-				g.started <- struct{}{}
+				select {
+				case g.started <- struct{}{}:
+				default:
+				}
 				select {
 				case <-g.release:
 				case <-time.After(15 * time.Second):
@@ -74,6 +86,8 @@ func newRefreshFixture(t *testing.T) *refreshFixture {
 	g := newGatedLogto()
 	ls := httptest.NewServer(g.handler(t))
 	t.Cleanup(ls.Close)
+	// Run the release first so Close can wait for the active handlers.
+	t.Cleanup(g.releaseRefresh)
 	r.env[EnvLogtoEndpoint] = ls.URL
 	r.env[EnvLogtoAppID] = "app"
 	st := credstore.Store{Dir: r.env[EnvConfigDir]}
@@ -120,7 +134,7 @@ func TestLogoutDuringRefreshKeepsCredentialsDeleted(t *testing.T) {
 	if res := f.r.run("logout"); res.code != 0 {
 		t.Fatalf("logout: %+v", res)
 	}
-	close(f.g.release)
+	f.g.releaseRefresh()
 	res := wait()
 	if res.code != ExitError || !strings.Contains(res.stderr, "signed out") || !strings.Contains(res.stderr, "ownsand login") {
 		t.Fatalf("want a signed-out error, got %+v", res)
@@ -145,7 +159,7 @@ func TestLoginDuringRefreshKeepsNewerSession(t *testing.T) {
 	if res := f.r.run("login"); res.code != 0 {
 		t.Fatalf("login: %+v", res)
 	}
-	close(f.g.release)
+	f.g.releaseRefresh()
 	res := wait()
 	if res.code != ExitError || !strings.Contains(res.stderr, "replaced") {
 		t.Fatalf("want a replaced-credentials error, got %+v", res)
@@ -164,7 +178,7 @@ func TestLoginDuringRefreshKeepsNewerSession(t *testing.T) {
 
 func TestRefreshWithoutConcurrentChangeStoresRotation(t *testing.T) {
 	f := newRefreshFixture(t)
-	close(f.g.release)
+	f.g.releaseRefresh()
 	res := f.r.run("org", "get")
 	if res.code != 0 {
 		t.Fatalf("%+v", res)
@@ -180,7 +194,7 @@ func TestRefreshWithoutConcurrentChangeStoresRotation(t *testing.T) {
 
 func TestRefreshOfCredentialsWithoutSessionIDStoresRotation(t *testing.T) {
 	f := newRefreshFixture(t)
-	close(f.g.release)
+	f.g.releaseRefresh()
 	// A file written before session identifiers existed.
 	cur, err := f.st.Load()
 	if err != nil {
@@ -197,4 +211,87 @@ func TestRefreshOfCredentialsWithoutSessionIDStoresRotation(t *testing.T) {
 	if err != nil || got.RefreshToken != "gated-refresh-2" {
 		t.Fatalf("rotation not stored: %+v %v", got, err)
 	}
+}
+
+const gatedRefreshRequestTimeout = 5 * time.Second
+
+func TestGatedLogtoReleasesDuringCleanup(t *testing.T) {
+	ctx := t.Context()
+	done := make(chan error, 1)
+	t.Run("refresh in flight", func(t *testing.T) {
+		f := newRefreshFixture(t)
+		endpoint := f.r.env[EnvLogtoEndpoint]
+		go func() { done <- requestGatedRefresh(ctx, endpoint) }()
+
+		select {
+		case <-f.g.started:
+		case <-time.After(gatedRefreshRequestTimeout):
+			t.Fatal("the refresh request never reached the issuer")
+		}
+	})
+	if err := <-done; err != nil {
+		t.Fatalf("the refresh did not finish during cleanup: %v", err)
+	}
+}
+
+func TestGatedLogtoReleasesWithFullStartChannel(t *testing.T) {
+	g := newGatedLogto()
+	requestCount := cap(g.started) + 1
+	arrived := make(chan struct{}, requestCount)
+	handler := g.handler(t)
+	ls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() {
+		// Drain only during cleanup so a blocking send cannot hang Close.
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			for {
+				select {
+				case <-g.started:
+				case <-stop:
+					return
+				}
+			}
+		}()
+		g.releaseRefresh()
+		ls.Close()
+	})
+
+	ctx := t.Context()
+	done := make(chan error, requestCount)
+	for range requestCount {
+		go func() { done <- requestGatedRefresh(ctx, ls.URL) }()
+	}
+	deadline := time.NewTimer(gatedRefreshRequestTimeout)
+	defer deadline.Stop()
+	for range requestCount {
+		select {
+		case <-arrived:
+		case <-deadline.C:
+			t.Fatal("the issuer did not receive all refresh requests")
+		}
+	}
+	g.releaseRefresh()
+	for range requestCount {
+		if err := <-done; err != nil {
+			t.Fatalf("a refresh did not finish after release: %v", err)
+		}
+	}
+}
+
+func requestGatedRefresh(ctx context.Context, endpoint string) error {
+	ctx, cancel := context.WithTimeout(ctx, gatedRefreshRequestTimeout)
+	defer cancel()
+	cfg := logto.Config{Endpoint: endpoint, AppID: "app"}
+	token, err := cfg.Refresh(ctx, gatedRefreshToken)
+	if err != nil {
+		return err
+	}
+	if token.AccessToken != "gated-jwt" || token.RefreshToken != "gated-refresh-2" {
+		return errors.New("refresh returned unexpected tokens")
+	}
+	return nil
 }
