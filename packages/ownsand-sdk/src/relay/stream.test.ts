@@ -3,7 +3,7 @@ import { getEventListeners } from "node:events";
 import { describe, expect, test } from "@rstest/core";
 import { ActivityRegistry } from "../connection.ts";
 import { VirtualClock } from "../testing/virtual-clock.ts";
-import type { OperationContext } from "./context.ts";
+import { type OperationContext, Timing } from "./context.ts";
 import {
   AttemptDeadlineError,
   ConsumerHold,
@@ -24,6 +24,64 @@ const count = (signal: AbortSignal) =>
   getEventListeners(signal, "abort").length;
 
 describe("relayCallWithDeadline caller signal listeners", () => {
+  test.each([
+    { elapsed: 329_999, canceled: false },
+    { elapsed: 330_000, canceled: false },
+    { elapsed: 330_001, canceled: false },
+    { elapsed: 330_000, canceled: true },
+  ])(
+    "handles a fulfilled call at $elapsed ms (canceled: $canceled)",
+    async ({ elapsed, canceled }) => {
+      const { clock, ctx: baseContext } = setup();
+      const caller = new AbortController();
+      const reason = new Error("caller stop");
+      const reply = Promise.withResolvers<string>();
+      let now = 0;
+      // Move the monotonic clock independently of the pending timer.
+      let timerSignal: AbortSignal | undefined;
+      const ctx: OperationContext = {
+        ...baseContext,
+        clock: {
+          now: () => now,
+          wallNow: () => clock.wallNow(),
+          sleep(ms, signal) {
+            timerSignal = signal;
+            return clock.sleep(ms, signal);
+          },
+        },
+      };
+      let attemptSignal: AbortSignal | undefined;
+      const result = relayCallWithDeadline(
+        ctx,
+        "g",
+        caller.signal,
+        Timing.writeAttemptDeadlineMs,
+        ({ signal }) => {
+          attemptSignal = signal;
+          return reply.promise;
+        },
+      );
+      now = elapsed;
+      if (canceled) caller.abort(reason);
+      expect(timerSignal?.aborted).toBe(false);
+      reply.resolve("acknowledged");
+
+      if (canceled) {
+        await expect(result).rejects.toBe(reason);
+        expect(attemptSignal?.reason).toBe(reason);
+      } else if (elapsed >= Timing.writeAttemptDeadlineMs) {
+        await expect(result).rejects.toBeInstanceOf(AttemptDeadlineError);
+        expect(attemptSignal?.reason).toBeInstanceOf(AttemptDeadlineError);
+      } else {
+        await expect(result).resolves.toBe("acknowledged");
+        expect(attemptSignal?.aborted).toBe(false);
+      }
+      expect(timerSignal?.aborted).toBe(true);
+      expect(count(timerSignal!)).toBe(0);
+      expect(count(caller.signal)).toBe(0);
+    },
+  );
+
   test("leaves no listener after 12 sequential calls", async () => {
     const { ctx } = setup();
     const caller = new AbortController();

@@ -6,7 +6,7 @@ import {
   OwnSandError,
   RelayStreamCompletedError,
 } from "../errors.ts";
-import { type OperationContext, Timing } from "./context.ts";
+import { type OperationContext, throwIfAborted, Timing } from "./context.ts";
 import type { RecoveryWindow } from "./recovery.ts";
 
 /**
@@ -320,26 +320,38 @@ export async function relayCallWithDeadline<T>(
 ): Promise<T> {
   const { controller, dispose: unlink } = linkedController(callerSignal);
   const stopTimer = new AbortController();
-  let deadlinePassed = false;
+  const deadline = ctx.clock.now() + deadlineMs;
+  const deadlineError = new AttemptDeadlineError("WriteFile attempt deadline");
   const timer = ctx.clock
     .sleep(deadlineMs, stopTimer.signal)
-    .then(() => {
-      deadlinePassed = true;
-      controller.abort(new AttemptDeadlineError("WriteFile attempt deadline"));
-    })
+    .then(() => controller.abort(deadlineError))
     .catch(() => {});
   try {
-    return await call({
-      signal: controller.signal,
-      headers: { [RELAY_GRANT_HEADER]: grantId },
-    });
-  } catch (error) {
-    if (deadlinePassed && !callerSignal?.aborted) {
-      throw new AttemptDeadlineError("WriteFile attempt deadline", {
-        cause: error,
+    let response: T;
+    try {
+      response = await call({
+        signal: controller.signal,
+        headers: { [RELAY_GRANT_HEADER]: grantId },
       });
+    } catch (error) {
+      if (
+        !callerSignal?.aborted &&
+        controller.signal.reason === deadlineError
+      ) {
+        throw new AttemptDeadlineError(deadlineError.message, { cause: error });
+      }
+      throw error;
     }
-    throw error;
+    throwIfAborted(callerSignal);
+    // A response can reach this handler before an overdue timer callback.
+    if (
+      controller.signal.reason === deadlineError ||
+      ctx.clock.now() >= deadline
+    ) {
+      controller.abort(deadlineError);
+      throw deadlineError;
+    }
+    return response;
   } finally {
     stopTimer.abort();
     await timer;
