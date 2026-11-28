@@ -37,10 +37,6 @@ import (
 // OWNSAND_HV_TEST_STATE_DIR keeps the VM directories, as for the Linux test.
 const envWindowsImage = "OWNSAND_HV_TEST_WINDOWS_IMAGE"
 
-// windowsDiskGiB is larger than the default 32 GiB image, so the test sees
-// the disk growth.
-const windowsDiskGiB = 40
-
 func windowsCommand(sandboxID, snapshotID string, vcpus int32, memMiB int64, network ownsandv1.NetworkMode) *ownsandv1.CreateSandboxCommand {
 	now := time.Now()
 	cmd := &ownsandv1.CreateSandboxCommand{
@@ -213,20 +209,18 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 		t.Fatalf("read marker %q", out)
 	}
 	// The guest helper extends C: to the grown disk at start.
-	var size int64
-	deadline := time.Now().Add(5 * time.Minute)
-	for {
-		out, _ := e.exec(sb.GetSandboxId(), "powershell.exe", "-NoProfile", "-Command", "(Get-Partition -DriveLetter C).Size")
-		size, _ = strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-		if size > (windowsDiskGiB-2)<<30 || time.Now().After(deadline) {
-			break
+	growthStart := time.Now()
+	size, err := waitForWindowsPartitionGrowth(5*time.Minute, func(ctx context.Context) (string, error) {
+		out, exited, err := e.execContext(ctx, sb.GetSandboxId(), "powershell.exe", "-NoProfile", "-Command", "(Get-Partition -DriveLetter C).Size")
+		if err != nil || !execSucceeded(exited) {
+			return "", err
 		}
-		time.Sleep(5 * time.Second)
+		return out, nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if size <= (windowsDiskGiB-2)<<30 {
-		t.Fatalf("C: did not grow to the %d GiB disk: %d bytes", windowsDiskGiB, size)
-	}
-	t.Logf("C: is %d bytes after %v", size, time.Since(start))
+	t.Logf("C: is %d bytes after %v of growth polling", size, time.Since(growthStart))
 	// No network adapter in a NONE sandbox.
 	if out, _ := e.exec(sb.GetSandboxId(), "powershell.exe", "-NoProfile", "-Command", "@(Get-NetAdapter).Count"); strings.TrimSpace(out) != "0" {
 		t.Fatalf("NONE Windows sandbox has network adapters: %q", out)

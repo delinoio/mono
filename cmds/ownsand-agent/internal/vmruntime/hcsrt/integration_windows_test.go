@@ -114,15 +114,30 @@ func createCommand(snapshotID string, memMiB, diskGiB int64, network ownsandv1.N
 
 func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExited) {
 	e.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), integrationExecTimeout)
+	defer cancel()
+	out, exited, err := e.execContext(ctx, sandboxID, cmd...)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return out, exited
+}
+
+func (e *env) execContext(ctx context.Context, sandboxID string, cmd ...string) (string, *ownsandv1.ExecExited, error) {
 	id, _ := uuidv7.NewString()
 	salt := make([]byte, 32)
 	rand.Read(salt)
 	s := &sink{}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	e.d.Handle(ctx, ops.Request{Frame: datapath.MustNewFrame(1, sandboxID, &ownsandv1.ExecRequest{
+	request := ops.Request{Frame: datapath.MustNewFrame(1, sandboxID, &ownsandv1.ExecRequest{
 		OrganizationId: orgID, SandboxId: sandboxID, ExecId: id, Command: cmd, BindingSalt: salt,
-	}), SandboxID: sandboxID}, s)
+	}), SandboxID: sandboxID}
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return "", nil, context.DeadlineExceeded
+	}
+	e.d.Handle(ctx, request, s)
 	var out strings.Builder
 	var exited *ownsandv1.ExecExited
 	for _, f := range s.frames {
@@ -132,10 +147,10 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 			exited = ex
 		}
 		if f.GetError() != nil {
-			e.t.Fatalf("exec error %v", f.GetError())
+			return "", nil, fmt.Errorf("exec error %v", f.GetError())
 		}
 	}
-	return out.String(), exited
+	return out.String(), exited, nil
 }
 
 func execSucceeded(exited *ownsandv1.ExecExited) bool {
