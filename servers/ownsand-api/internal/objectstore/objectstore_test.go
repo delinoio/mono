@@ -393,7 +393,7 @@ func TestMemoryListPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.SetListFail(nil)
-	if got, _ := m.ListPrefix(context.Background(), "a/"); len(got) != 0 {
-		t.Fatalf("after DeletePrefix = %v", got)
+	if got, err := m.ListPrefix(context.Background(), "a/"); err != nil || len(got) != 0 {
+		t.Fatalf("ListPrefix after DeletePrefix = (%v, %v), want (empty, nil)", got, err)
 	}
 }
