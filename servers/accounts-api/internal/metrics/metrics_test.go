@@ -97,6 +97,10 @@ func serveListener(t *testing.T, listener net.Listener, handler http.Handler) (c
 }
 
 func TestServeAndShutdown(t *testing.T) {
+	// The SDK reads resource settings directly from the process environment.
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+
 	tel, err := telemetry.New(context.Background(), telemetry.Options{
 		ServiceName: "accounts-api",
 		Stdout:      io.Discard,
