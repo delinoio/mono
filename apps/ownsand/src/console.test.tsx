@@ -48,6 +48,7 @@ import type {
 import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
   type GetOrganizationResponse,
+  type ListOrganizationsResponse,
   ListOrganizationsResponseSchema,
   OrganizationService,
 } from "@delino/ownsand-protos/v1/organization_pb";
@@ -55,7 +56,11 @@ import {
   ListSnapshotsResponseSchema,
   SnapshotSchema,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
-import { focusManager, QueryClient } from "@tanstack/react-query";
+import {
+  focusManager,
+  type InfiniteData,
+  QueryClient,
+} from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { Console } from "./App.tsx";
 import { createQueryClient, invalidateServices } from "./api.ts";
@@ -4159,31 +4164,92 @@ describe("leaving and deleting an organization", () => {
     },
   );
 
-  test("leaving as a member never shows the not-found notice and ends at /", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.northwind}/members`, {
-      transport: slowTransport(),
-      queryClient: createQueryClient(),
-    });
-    const watcher = watchNotice();
-    try {
-      await act(async () => {
-        fireEvent.click(
-          await screen.findByRole("button", { name: "Leave organization" }),
-        );
+  test.each([
+    {
+      scenario: "leaving as a member",
+      path: `/orgs/${MOCK_IDS.northwind}/members`,
+      action: "Leave organization",
+      removedLink: { name: /Northwind Labs/ },
+      survivingLink: { name: /Acme Robotics/ },
+    },
+    {
+      scenario: "deleting as the owner",
+      path: `/orgs/${MOCK_IDS.acme}/settings`,
+      action: "Delete organization",
+      removedLink: { name: /Acme Robotics/ },
+      survivingLink: { name: /Northwind Labs/ },
+    },
+  ])(
+    "$scenario never shows the not-found notice and ends at /",
+    async ({ path, action, removedLink, survivingLink }) => {
+      const listMethod = OrganizationService.method.listOrganizations;
+      const queryKey = createConnectQueryKey({
+        schema: listMethod,
+        cardinality: "infinite",
       });
-      await confirmIn("Leave organization");
-      await settle(400);
-    } finally {
-      watcher.stop();
-    }
-    expect(watcher.seen.notice).toBe(false);
-    expect(window.location.pathname).toBe("/");
-    expect(
-      await screen.findByRole("link", { name: /Acme Robotics/ }),
-    ).toBeTruthy();
-    // The organization list was refetched after the navigation.
-    expect(screen.queryByRole("link", { name: /Northwind Labs/ })).toBeNull();
-  });
+      const queryClient = createQueryClient();
+      let holdList = true;
+      const { transport, calls } = holdMockTransport(
+        [listMethod.name],
+        () => holdList,
+      );
+      const releaseList = () =>
+        act(async () => {
+          holdList = false;
+          for (const call of calls.ListOrganizations ?? []) call.settle();
+        });
+      const watcher = watchNotice();
+
+      try {
+        renderConsole(path, { transport, queryClient });
+        await waitFor(() => expect(calls.ListOrganizations).toHaveLength(1));
+        await act(async () => calls.ListOrganizations[0]!.settle());
+        await waitFor(() => {
+          const cachedList = queryClient
+            .getQueryCache()
+            .find<InfiniteData<ListOrganizationsResponse>>({
+              queryKey,
+              exact: false,
+            })?.state.data;
+          expect(
+            cachedList?.pages.flatMap((page) =>
+              page.organizations.map(
+                (organization) => organization.organizationId,
+              ),
+            ),
+          ).toEqual(
+            expect.arrayContaining([MOCK_IDS.acme, MOCK_IDS.northwind]),
+          );
+        });
+
+        const opener = await screen.findByRole("button", { name: action });
+        await act(async () => fireEvent.click(opener));
+        expect(calls.ListOrganizations).toHaveLength(1);
+        await confirmIn(action);
+
+        const listRole = { name: "Your organizations" };
+        // The route change can cancel and restart the refresh. Keep all
+        // follow-up calls held until the destination renders the cached list.
+        await waitFor(() => {
+          expect(calls.ListOrganizations.length).toBeGreaterThan(1);
+          expect(window.location.pathname).toBe("/");
+          const list = within(screen.getByRole("list", listRole));
+          expect(list.getByRole("link", removedLink)).toBeTruthy();
+        });
+        await releaseList();
+
+        await waitFor(() => {
+          const list = within(screen.getByRole("list", listRole));
+          expect(list.getByRole("link", survivingLink)).toBeTruthy();
+          expect(list.queryByRole("link", removedLink)).toBeNull();
+        });
+        expect(watcher.seen.notice).toBe(false);
+      } finally {
+        watcher.stop();
+        await releaseList();
+      }
+    },
+  );
 
   test("leaving as an admin never shows the not-found notice and ends at /", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/members`, {
@@ -4205,31 +4271,6 @@ describe("leaving and deleting an organization", () => {
     }
     expect(watcher.seen.notice).toBe(false);
     expect(window.location.pathname).toBe("/");
-  });
-
-  test("deleting as the owner never shows the not-found notice and ends at /", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
-      transport: slowTransport(),
-      queryClient: createQueryClient(),
-    });
-    const watcher = watchNotice();
-    try {
-      await act(async () => {
-        fireEvent.click(
-          await screen.findByRole("button", { name: "Delete organization" }),
-        );
-      });
-      await confirmIn("Delete organization");
-      await settle(400);
-    } finally {
-      watcher.stop();
-    }
-    expect(watcher.seen.notice).toBe(false);
-    expect(window.location.pathname).toBe("/");
-    expect(
-      await screen.findByRole("link", { name: /Northwind Labs/ }),
-    ).toBeTruthy();
-    expect(screen.queryByRole("link", { name: /Acme Robotics/ })).toBeNull();
   });
 
   test("a failed leave shows the error in the dialog and keeps the path", async () => {
