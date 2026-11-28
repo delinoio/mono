@@ -2150,6 +2150,76 @@ describe("runner profiles", () => {
   });
 
   for (const mode of ["create", "edit"] as const) {
+    test(`rejects invalid warm count drafts in ${mode} mode`, async ({
+      app,
+      screen,
+      browser,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${ACME}/profiles`);
+
+      const creating = mode === "create";
+      const row = screen.getByRole("listitem").filter({
+        hasText: creating ? "warm-count-check ·" : "linux-build ·",
+      });
+      if (creating) {
+        await screen.getByRole("button", "Create runner profile").tap();
+      } else {
+        await row.getByRole("button", "Edit").tap();
+      }
+      const dialog = screen.getByRole(
+        "dialog",
+        creating ? "Create a runner profile" : "Edit linux-build",
+      );
+      if (creating) await dialog.getByLabel("Name").fill("warm-count-check");
+      const submit = dialog.getByRole(
+        "button",
+        creating ? "Create profile" : "Save changes",
+      );
+      const warmCount = dialog.getByLabel("Warm count");
+      const error = dialog.getByText("Enter a warm count from 0 to 10.");
+
+      for (const [draft, action] of [
+        ["11", "tab"],
+        ["11", "click"],
+        ["1.5", "enter"],
+        ["", "enter"],
+      ] as const) {
+        await warmCount.fill(draft);
+        if (action === "tab") {
+          await browser.keyboard.press("Tab");
+          await expect(warmCount).toHaveValue(draft);
+        }
+        if (action === "enter") {
+          await browser.keyboard.press("Enter");
+        } else {
+          await submit.tap();
+        }
+        await expect(error).toBeVisible();
+        await expect(warmCount).toHaveValue(draft);
+        await expect(warmCount).toHaveAttribute("aria-invalid", "true");
+      }
+
+      const boundary = creating ? "10" : "0";
+      const outwardArrow = creating ? "ArrowUp" : "ArrowDown";
+      await warmCount.fill(boundary);
+      await browser.keyboard.press(outwardArrow);
+      await expect(warmCount).toHaveValue(boundary);
+      await dialog
+        .getByRole("button", creating ? "Decrease" : "Increase")
+        .tap();
+      await expect(warmCount).toHaveValue(creating ? "9" : "1");
+      await warmCount.tap();
+      await browser.keyboard.press(outwardArrow);
+      await expect(warmCount).toHaveValue(boundary);
+      await expect(error).toBeHidden();
+
+      await submit.tap();
+      await expect(dialog).toBeHidden();
+      await expect(row).toContainText(`· warm ${boundary} ·`);
+    });
+
     test(`rejects invalid resources and saves corrected values in ${mode} mode`, async ({
       app,
       screen,
