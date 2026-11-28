@@ -162,9 +162,10 @@ type Manager struct {
 	// waits for the running snapshot imports and wipes the local data, and
 	// nothing clears it, because the removal notice is final (a failed
 	// removal retries in the same process or after a restart that sets the
-	// fence again). While it is set, fresh creates, periodic sandbox ends,
-	// snapshot captures and snapshot imports cannot start. imports counts
-	// the imports that passed BeginSnapshotImport and have yet to end.
+	// fence again). While it is set, fresh creates, ordinary deletes,
+	// periodic sandbox ends, snapshot captures and snapshot imports cannot
+	// start. imports counts the imports that passed BeginSnapshotImport and
+	// have yet to end.
 	// importsDrained is closed and cleared when the count reaches zero
 	// while RemoveAll waits for it.
 	removing       bool
@@ -1063,6 +1064,10 @@ func (m *Manager) Delete(ctx context.Context, cmd *ownsandv1.DeleteSandboxComman
 		reason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER
 	}
 	m.mu.Lock()
+	if m.removing {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "device removal is in progress")
+	}
 	sb, ok := m.sandboxes[id]
 	if !ok {
 		sb = &sandbox{rec: Record{SandboxID: id, State: ownsandv1.SandboxState_SANDBOX_STATE_DELETED, EndReason: reason, DeleteMarker: true, CreateTime: m.now()}}
@@ -1097,13 +1102,22 @@ func (m *Manager) Delete(ctx context.Context, cmd *ownsandv1.DeleteSandboxComman
 	m.mu.Unlock()
 	sb.cmdMu.Lock()
 	defer sb.cmdMu.Unlock()
+	// Removal waits on cmdMu for teardown that passed the fence.
 	m.mu.Lock()
-	terminal := sb.rec.Terminal()
-	entry := sb.rec.Entry(m.epoch)
-	m.mu.Unlock()
-	if terminal {
+	if m.removing {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "device removal is in progress")
+	}
+	if sb.rec.Terminal() {
+		entry := sb.rec.Entry(m.epoch)
+		m.mu.Unlock()
 		return entry, nil
 	}
+	if m.sandboxes[id] != sb {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "sandbox is unknown on this device")
+	}
+	m.mu.Unlock()
 	return m.endLocked(ctx, sb, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, reason)
 }
 
