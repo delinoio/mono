@@ -1386,6 +1386,7 @@ describe("createSandbox", () => {
         .catch((e) => e);
       expect(error).toBeInstanceOf(ConnectError);
       expect(error.code).toBe(Code.ResourceExhausted);
+      expect(h.clock.now()).toBe(0);
       expect(times).toEqual([0]);
     });
 
