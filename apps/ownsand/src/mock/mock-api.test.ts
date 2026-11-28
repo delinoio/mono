@@ -124,6 +124,51 @@ describe("mock agent version policy", () => {
   });
 
   test.each([
+    ["ASCII", "v".repeat(64), "v".repeat(65)],
+    ["multibyte", "a" + "界".repeat(21), "界".repeat(22)],
+  ])(
+    "saves a 64-byte %s pin and preserves it after rejecting a longer pin",
+    async (_, pinnedVersion, oversizedVersion) => {
+      rs.useFakeTimers();
+      const savedAt = Date.UTC(2026, 0, 1);
+      rs.setSystemTime(savedAt);
+      const client = createClient(
+        DeviceService,
+        createMockTransport({ userId: "user-admin-jun" }),
+      );
+      const request = { organizationId: MOCK_IDS.acme };
+      const pin = { ...request, mode: AgentVersionPolicyMode.PIN };
+      const { policy } = await client.updateAgentVersionPolicy({
+        ...pin,
+        pinnedVersion,
+      });
+      expect(policy).toMatchObject({
+        ...pin,
+        pinnedVersion,
+        updateTime: timestampFromMs(savedAt),
+        updatedBy: { id: "user-admin-jun" },
+      });
+      expect((await client.getAgentVersionPolicy(request)).policy).toEqual(
+        policy,
+      );
+
+      rs.setSystemTime(savedAt + 1000);
+      await expect(
+        client.updateAgentVersionPolicy({
+          ...pin,
+          pinnedVersion: oversizedVersion,
+        }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage: "invalid pinned_version: a version is required for PIN",
+      });
+      expect((await client.getAgentVersionPolicy(request)).policy).toEqual(
+        policy,
+      );
+    },
+  );
+
+  test.each([
     ["space", " "],
     ["tab", "\t"],
     ["carriage return", "\r"],
