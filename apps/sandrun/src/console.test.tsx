@@ -90,6 +90,7 @@ import {
 import { QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { StrictMode } from "react";
+import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
 import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -2640,6 +2641,9 @@ describe("GitHub setup callback", () => {
 });
 
 describe("runner profiles", () => {
+  const missingIntegration =
+    "You cannot save this profile because its agent integration is missing.";
+
   async function selectProfileOption(
     form: HTMLElement,
     name: string,
@@ -2648,6 +2652,162 @@ describe("runner profiles", () => {
     await click(within(form).getByRole("combobox", { name }));
     await click(await screen.findByRole("option", { name: option }));
   }
+
+  function renderPagedIntegrationProfiles(
+    mode: "codex" | "claude" | "missing",
+  ) {
+    const fixture = pagedProfileIntegrations(
+      createMockTransport({ agentIntegrationPageSize: 1 }),
+      mode,
+    );
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`, {
+      staleTime: 10_000,
+      transport: fixture.transport,
+    });
+    return fixture;
+  }
+
+  async function editProfile(name: string) {
+    const row = (await screen.findByText(new RegExp(`^${name} · `))).closest(
+      "li",
+    )!;
+    await click(within(row).getByRole("button", { name: "Edit" }));
+    return screen.getByRole("dialog", { name: `Edit ${name}` });
+  }
+
+  async function submitProfileForm(dialog: HTMLElement) {
+    await act(async () => fireEvent.submit(dialog.querySelector("form")!));
+  }
+
+  test("blocks edits until the Codex integration loads, then enforces the queue wait", async () => {
+    await rs.mocked(getVerifiedCodexGuestOses).withImplementation(
+      () => [GuestOs.LINUX],
+      async () => {
+        const { updates, pageTokens, continuations } =
+          renderPagedIntegrationProfiles("codex");
+        const dialog = await editProfile("codex-linux");
+        const form = within(dialog);
+        const name = form.getByRole("textbox", { name: "Name" });
+        const wait = form.getByLabelText("Maximum queue wait (minutes)");
+        const save = form.getByRole("button", { name: "Save changes" });
+        await waitFor(() => expect(pageTokens).toEqual(["", "1"]));
+        await type(name, "codex-renamed");
+        await type(wait, "6");
+        expect(save).toHaveProperty("disabled", true);
+        expect(form.queryByText(missingIntegration)).toBeNull();
+        await submitProfileForm(dialog);
+        expect(updates).toHaveLength(0);
+
+        await act(async () => continuations[0]!());
+        await waitFor(() => expect(save).toHaveProperty("disabled", false));
+        expect(name).toHaveProperty("value", "codex-renamed");
+        expect(wait).toHaveProperty("value", "6");
+        await click(save);
+        expect(
+          form.getByText("OpenAI waits at most 5 minutes for an executor."),
+        ).toBeTruthy();
+        expect(updates).toHaveLength(0);
+
+        await type(wait, "5");
+        await click(save);
+        await screen.findByText("codex-renamed · Agent session · Linux");
+        expect(updates).toMatchObject([
+          {
+            runnerProfileId: MOCK_IDS.codexProfile,
+            profile: {
+              name: "codex-renamed",
+              maxQueueWait: durationFromMs(300_000),
+            },
+            updateMask: { paths: ["name"] },
+          },
+        ]);
+      },
+    );
+  });
+
+  test("retains a Claude Code edit through a failed continuation and validates it after retry", async () => {
+    const { updates, pageTokens, continuations } =
+      renderPagedIntegrationProfiles("claude");
+    const dialog = await editProfile("claude-linux");
+    const form = within(dialog);
+    const save = form.getByRole("button", { name: "Save changes" });
+    await waitFor(() => expect(pageTokens).toEqual(["", "1"]));
+    await selectProfileOption(dialog, "Guest OS", "Windows");
+    expect(save).toHaveProperty("disabled", true);
+    await submitProfileForm(dialog);
+    expect(updates).toHaveLength(0);
+
+    await act(async () => continuations[0]!(true));
+    const retry = await form.findByRole("button", { name: "Try again" });
+    expect(save).toHaveProperty("disabled", true);
+    expect(form.queryByText(missingIntegration)).toBeNull();
+    await submitProfileForm(dialog);
+    expect(updates).toHaveLength(0);
+
+    await click(retry);
+    await waitFor(() => expect(pageTokens).toEqual(["", "1", "1"]));
+    expect(save).toHaveProperty("disabled", true);
+    expect(form.queryByText(missingIntegration)).toBeNull();
+    await act(async () => continuations[1]!());
+    await waitFor(() => expect(save).toHaveProperty("disabled", false));
+    expect(
+      form.getByRole("combobox", { name: "Guest OS" }).textContent,
+    ).toContain("Windows");
+    await click(save);
+    expect(
+      form.getByText(
+        "The vendor of this integration does not run on this guest OS.",
+      ),
+    ).toBeTruthy();
+    expect(updates).toHaveLength(0);
+
+    await selectProfileOption(dialog, "Guest OS", "Linux");
+    await type(form.getByRole("textbox", { name: "Name" }), "claude-renamed");
+    await click(save);
+    await screen.findByText("claude-renamed · Agent session · Linux");
+    expect(updates).toHaveLength(1);
+  });
+
+  test.each(["claude-linux", "linux-build", "windows-dev"])(
+    "saves %s while an unrelated integration page is pending",
+    async (name) => {
+      const { updates, pageTokens, continuations } =
+        renderPagedIntegrationProfiles("codex");
+      const dialog = await editProfile(name);
+      const form = within(dialog);
+      const edited = `${name}-renamed`;
+      await waitFor(() => expect(pageTokens).toEqual(["", "1"]));
+      await type(form.getByRole("textbox", { name: "Name" }), edited);
+      await click(form.getByRole("button", { name: "Save changes" }));
+      await screen.findByText(new RegExp(`^${edited} · `));
+      expect(updates).toHaveLength(1);
+      await act(async () => continuations[0]!());
+    },
+  );
+
+  test("explains a missing saved integration only after a successful final page", async () => {
+    const { updates, pageTokens, continuations } =
+      renderPagedIntegrationProfiles("missing");
+    const dialog = await editProfile("claude-linux");
+    const form = within(dialog);
+    const name = form.getByRole("textbox", { name: "Name" });
+    await type(name, "claude-renamed");
+    await waitFor(() => expect(pageTokens).toEqual(["", "1"]));
+    expect(form.queryByText(missingIntegration)).toBeNull();
+
+    await act(async () => continuations[0]!());
+    expect(await form.findByRole("alert")).toHaveProperty(
+      "textContent",
+      missingIntegration,
+    );
+    expect(name).toHaveProperty("value", "claude-renamed");
+    expect(form.getByRole("button", { name: "Save changes" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    await submitProfileForm(dialog);
+    expect(updates).toHaveLength(0);
+  });
 
   test.each(["create", "edit"] as const)(
     "blocks the %s request when no Codex guest OS is verified",

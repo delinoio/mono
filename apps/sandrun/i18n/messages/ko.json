@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "사용할 수 없음",
   "profiles.dialog.guestOsPlaceholder": "게스트 OS 선택",
   "profiles.dialog.agentIntegration": "에이전트 연동",
+  "profiles.dialog.savedIntegrationMissing": "이 프로필의 에이전트 연동을 찾을 수 없어 프로필을 저장할 수 없습니다.",
   "profiles.dialog.workspacePath": "작업 공간 경로",
   "profiles.dialog.workspacePathDescription": "개발 세션에는 게스트 OS의 절대 경로가 필요합니다. 동기화 시 이 경로에 데이터를 쓰며, 명령도 이 경로에서 실행을 시작합니다.",
   "profiles.dialog.source": "소스",

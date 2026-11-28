@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "Unavailable",
   "profiles.dialog.guestOsPlaceholder": "Select a guest OS",
   "profiles.dialog.agentIntegration": "Agent integration",
+  "profiles.dialog.savedIntegrationMissing": "You cannot save this profile because its agent integration is missing.",
   "profiles.dialog.workspacePath": "Workspace path",
   "profiles.dialog.workspacePathDescription": "Required for dev sessions: an absolute guest path. Sync writes into it, and commands start in it.",
   "profiles.dialog.source": "Source",

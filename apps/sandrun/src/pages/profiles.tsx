@@ -278,7 +278,7 @@ function ProfileDialog({
   );
   const [values, setValues] = useState<ProfileFormValues>(initial);
   const [errors, setErrors] = useState<ProfileErrors>({});
-  const { integrations, isLoadingMore, query } = agentIntegrations;
+  const { integrations, hasNextPage, isLoadingMore, query } = agentIntegrations;
   const refresh = () => refreshRunnerProfiles(queryClient);
   const createProfile = useMutation(
     RunnerProfileService.method.createRunnerProfile,
@@ -449,6 +449,16 @@ function ProfileDialog({
             <>
               {isLoadingMore ? (
                 <Loading label={t("profiles.loadingIntegrations")} />
+              ) : null}
+              {!creating &&
+              values.agentIntegrationId !== "" &&
+              vendor === undefined &&
+              !hasNextPage &&
+              !query.isFetching &&
+              query.error === null ? (
+                <div className="notice notice-error" role="alert">
+                  <p>{t("profiles.dialog.savedIntegrationMissing")}</p>
+                </div>
               ) : null}
               <Select
                 label={t("profiles.dialog.agentIntegration")}

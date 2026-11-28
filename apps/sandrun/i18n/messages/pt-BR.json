@@ -468,6 +468,7 @@
   "profiles.dialog.guestOsUnavailable": "Indisponível",
   "profiles.dialog.guestOsPlaceholder": "Selecione um sistema operacional convidado",
   "profiles.dialog.agentIntegration": "Integração do agente",
+  "profiles.dialog.savedIntegrationMissing": "Você não pode salvar este perfil porque a integração do agente está ausente.",
   "profiles.dialog.workspacePath": "Caminho da área de trabalho",
   "profiles.dialog.workspacePathDescription": "Obrigatório para sessões de desenvolvimento: informe um caminho absoluto no sistema convidado. A sincronização grava nesse caminho, e os comandos são iniciados nele.",
   "profiles.dialog.source": "Origem",
