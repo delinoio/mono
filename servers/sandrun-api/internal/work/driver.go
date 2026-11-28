@@ -545,9 +545,7 @@ func (e *Engine) removeSandbox(ctx context.Context, client ownsandclient.Client,
 			return true
 		}
 	}
-	deleteCtx, cancel := context.WithTimeout(ctx, e.timing.deleteTimeout())
-	defer cancel()
-	if _, err := client.DeleteSandbox(deleteCtx, id); err != nil {
+	if err := e.deleteSandboxAttempt(ctx, client, id); err != nil {
 		switch code := connect.CodeOf(err); code {
 		case connect.CodeNotFound:
 			return true
@@ -561,6 +559,13 @@ func (e *Engine) removeSandbox(ctx context.Context, client ownsandclient.Client,
 		}
 	}
 	return true
+}
+
+func (e *Engine) deleteSandboxAttempt(ctx context.Context, client ownsandclient.Client, sandboxID string) error {
+	attempt, cancel := context.WithTimeout(ctx, e.timing.deleteTimeout())
+	defer cancel()
+	_, err := client.DeleteSandbox(attempt, sandboxID)
+	return err
 }
 
 // resolveCreate finds the sandbox of a runner that has no stored sandbox ID
