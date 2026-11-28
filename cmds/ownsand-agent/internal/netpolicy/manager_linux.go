@@ -38,6 +38,13 @@ const (
 	nftTableAbsent
 )
 
+type refreshMode uint8
+
+const (
+	refreshDirect refreshMode = iota
+	refreshPeriodic
+)
+
 // Manager attaches OUTBOUND sandboxes to tap devices and keeps the
 // nftables table of the agent current. It needs CAP_NET_ADMIN and the `ip`
 // (iproute2) and `nft` commands.
@@ -63,10 +70,10 @@ type Manager struct {
 	// clean-up ran meanwhile, so that a refresh in flight cannot apply the
 	// table again after the device removal deleted it.
 	cleanups uint64
-	// interval and refresh are RefreshInterval and Refresh; tests replace
+	// interval and refresh are RefreshInterval and refreshPolicy; tests replace
 	// them.
 	interval time.Duration
-	refresh  func() error
+	refresh  func(refreshMode) error
 	// resolvConf is the host resolver file. Tests use a temporary file.
 	resolvConf string
 	// Tests replace these host operations so that the manager runs without
@@ -98,7 +105,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		hostRoutes:    HostRoutes,
 		applyRules:    applyNftRules,
 	}
-	m.refresh = m.Refresh
+	m.refresh = m.refreshPolicy
 	m.tableState = m.probeNftTable
 	return m
 }
@@ -218,9 +225,19 @@ func HostRoutes() ([]Route, []netip.Prefix, error) {
 // Concurrent calls run one after the other, so the ruleset of the call that
 // read the routes last is the one that stays applied.
 func (m *Manager) Refresh() error {
+	return m.refreshPolicy(refreshDirect)
+}
+
+func (m *Manager) refreshPolicy(mode refreshMode) error {
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
 	m.mu.Lock()
+	// Check eligibility and capture the generation together. A tick that
+	// waited for another refresh may enter after device removal cleaned up.
+	if mode == refreshPeriodic && len(m.attached) == 0 {
+		m.mu.Unlock()
+		return nil
+	}
 	cleanups := m.cleanups
 	m.mu.Unlock()
 	routes, onLink, err := m.hostRoutes()
@@ -295,7 +312,7 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 		// does nothing when the ruleset never held the exception.
 		m.unstage(tap)
 		if staged {
-			if rerr := m.refresh(); rerr != nil {
+			if rerr := m.refresh(refreshDirect); rerr != nil {
 				m.logger.Error("network policy refresh after failed setup failed", "sandbox_id", sandboxID, "tap", tap, "error", rerr)
 			}
 		}
@@ -322,7 +339,7 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	m.gateways[tap] = TapGateway{Tap: tap, Gateway: link.Gateway, Guest: link.Guest}
 	staged = true
 	m.mu.Unlock()
-	if err := m.refresh(); err != nil {
+	if err := m.refresh(refreshDirect); err != nil {
 		return fail(err)
 	}
 	// Hold the lock from resolver selection through attachment publication.
@@ -359,7 +376,7 @@ func (m *Manager) Detach(sandboxID string) {
 	}
 	// Remove the DNS exception of the tap first, so that a reused tap name
 	// never inherits a stale gateway rule. Other taps keep their rules.
-	if err := m.refresh(); err != nil {
+	if err := m.refresh(refreshDirect); err != nil {
 		m.logger.Error("network policy refresh after detach failed", "sandbox_id", sandboxID, "tap", a.tap, "error", err)
 	}
 	a.dns.Close()
@@ -391,28 +408,25 @@ func (m *Manager) removeTap(sandboxID, tap string, idx int) {
 	m.mu.Unlock()
 }
 
-// refreshDNS updates running forwarders and reports whether any sandboxes
-// are attached. An unreadable file or an invalid nameserver list leaves
-// their upstreams intact.
-func (m *Manager) refreshDNS() bool {
+// refreshDNS updates running forwarders. An unreadable file or an invalid
+// nameserver list leaves their upstreams intact.
+func (m *Manager) refreshDNS() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.attached) == 0 {
-		return false
+		return
 	}
 	if upstream := readHostResolver(m.resolvConf); upstream != "" {
 		for _, a := range m.attached {
 			a.dns.setUpstream(upstream)
 		}
 	}
-	return true
 }
 
 func (m *Manager) poll() {
-	if m.refreshDNS() {
-		if err := m.refresh(); err != nil {
-			m.logger.Error("network policy refresh failed", "error", err)
-		}
+	m.refreshDNS()
+	if err := m.refresh(refreshPeriodic); err != nil {
+		m.logger.Error("network policy refresh failed", "error", err)
 	}
 }
 
