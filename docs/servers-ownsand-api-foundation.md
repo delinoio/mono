@@ -486,6 +486,8 @@ Add each `planned` variable to `.env.example` (name and placeholder only) and to
 
 At startup, the server rejects a percent sign in the decoded hostname of any `CORS_ORIGINS` entry.
 
+When the server reads an unset, empty or ASCII-whitespace-only `CORS_ORIGINS` value, it uses the default console origin. An explicit list replaces the default, and the server ignores empty entries. If no entries remain after trimming, the server stops before opening a listener and reports `CORS_ORIGINS must list at least one origin`. This includes a list of only commas and spaces or a value of only U+00A0.
+
 `ADDR` and `STUN_ADDR` must be `host:port` addresses with a port from 0 to 65535. The host must be empty (all interfaces), an IP address (IPv6 in brackets, with an optional zone) or an RFC 1123 hostname. Configuration validation checks only the syntax and does not resolve the host, so a hostname that does not resolve still fails when the server listens. `accounts-api` applies the same rule to its `ADDR` through the shared `servers/internal/listenaddr` package.
 
 The server removes only ASCII white space (space, tab, line feed, vertical tab, form feed and carriage return) from the start and end of `LOG_LEVEL`. A value that consists only of ASCII white space counts as unset and selects the default. The server matches `LOG_LEVEL` against the level names with ASCII letter case folding only (`INFO` and `iNfO` select `info`). Any other character makes the value not valid, so a value that lower-cases to a level name only under Unicode case mapping, such as `İNFO` (U+0130 followed by `NFO`), stops the server at startup like any other invalid value.

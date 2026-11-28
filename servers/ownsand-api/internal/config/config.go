@@ -327,6 +327,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			}
 			cfg.CORSOrigins = append(cfg.CORSOrigins, canonical)
 		}
+		if len(cfg.CORSOrigins) == 0 {
+			return Config{}, fmt.Errorf("%s must list at least one origin", EnvCORSOrigins)
+		}
 	}
 	if v := get(EnvTrustProxyClientAddress); v != "" {
 		b, err := strconv.ParseBool(v)

@@ -133,6 +133,40 @@ func TestLoadAcceptsValidEndpointPorts(t *testing.T) {
 	}
 }
 
+func TestLoadCORSOriginOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		want        []string
+	}{
+		{"empty", "", []string{"https://sandrun.delino.io"}},
+		{"ASCII whitespace", " \t\n\v\f\r ", []string{"https://sandrun.delino.io"}},
+		{"commas", ",,", nil},
+		{"commas with spaces", ", ,", nil},
+		{"non-breaking space", "\u00a0", nil},
+		{"origins with empty entries", ", HTTPS://Console.Example.ORG:443 ,, http://127.0.0.1:13300 ,",
+			[]string{"https://console.example.org", "http://127.0.0.1:13300"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values := baseEnv(t)
+			values[EnvCORSOrigins] = tc.value
+			cfg, err := Load(lookup(values))
+			if tc.want == nil {
+				const wantErr = "CORS_ORIGINS must list at least one origin"
+				if err == nil || err.Error() != wantErr {
+					t.Fatalf("Load() error = %v, want %q", err, wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(cfg.CORSOrigins, tc.want) {
+				t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadCanonicalizesCORSOrigins(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

@@ -276,6 +276,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			}
 			cfg.CORSOrigins = append(cfg.CORSOrigins, canonical)
 		}
+		if len(cfg.CORSOrigins) == 0 {
+			return Config{}, fmt.Errorf("%s must list at least one origin", EnvCORSOrigins)
+		}
 	}
 	if cfg.TrustProxyClientAddress, err = parseBool(EnvTrustProxyClientAddress, get(EnvTrustProxyClientAddress), false); err != nil {
 		return Config{}, err
