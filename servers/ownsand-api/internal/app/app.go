@@ -68,6 +68,8 @@ type Options struct {
 	SnapshotPartSizeBytes int64
 	// Timing overrides the contract durations (tests).
 	Timing *api.Timing
+	// ExportVerifyTicks overrides the verifier ticker for tests.
+	ExportVerifyTicks <-chan time.Time
 	// InstanceID names this instance in the lease; empty selects a new
 	// UUID v7.
 	InstanceID string
@@ -168,6 +170,7 @@ func New(opts Options) (*App, error) {
 		Timing:                timing,
 	}
 	control := api.NewControl(svc)
+	control.ExportVerifyTicks = opts.ExportVerifyTicks
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Logger: opts.Logger,
 		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost}
 	svc.Lease = l

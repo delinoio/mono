@@ -28,6 +28,7 @@ type exportVerifyFixture struct {
 	env    *testenv.Env
 	org    *testenv.Org
 	snapID string
+	ticks  chan<- time.Time
 	// prefix is the attempt prefix; part1 and part2 are the keys of its parts.
 	prefix, part1, part2 string
 	// exportedAt is the clock reading at the end of the export.
@@ -36,7 +37,9 @@ type exportVerifyFixture struct {
 
 func newExportVerifyFixture(t *testing.T) *exportVerifyFixture {
 	t.Helper()
+	ticks := make(chan time.Time)
 	env := testenv.New(t, func(opts *app.Options) {
+		opts.ExportVerifyTicks = ticks
 		opts.Timing.ExportVerifyPoll = verifyPoll
 	})
 	org := env.NewOrg("alice")
@@ -45,7 +48,7 @@ func newExportVerifyFixture(t *testing.T) *exportVerifyFixture {
 	snapID := exportedSnapshot(t, org)
 	command, _ := exportColumns(t, env, snapID)
 	prefix := attemptPrefixOf(org.ID, snapID, command)
-	return &exportVerifyFixture{env: env, org: org, snapID: snapID, prefix: prefix, part1: prefix + "1", part2: prefix + "2", exportedAt: exportedAt}
+	return &exportVerifyFixture{env: env, org: org, snapID: snapID, ticks: ticks, prefix: prefix, part1: prefix + "1", part2: prefix + "2", exportedAt: exportedAt}
 }
 
 // verification returns the export state and the verification columns.
@@ -116,6 +119,30 @@ func (f *exportVerifyFixture) wantFailed(t *testing.T, reason, key string) {
 		t.Fatalf("no clean-up job for %s: %v", f.prefix, cleanupJobs(t, f.env))
 	}
 	f.wantLog(t, `"msg":"export_verification_failed"`, `"reason":"`+reason+`"`, `"object_key":"`+key+`"`, `"snapshot_id":"`+f.snapID+`"`)
+}
+
+func TestExportVerifierControlledTick(t *testing.T) {
+	t.Parallel()
+	f := newExportVerifyFixture(t)
+	f.env.Clock.Advance(verifyDelay)
+	f.wantExported(t, false)
+	if got := f.env.Objects.ListCalls(); got != 0 {
+		t.Fatalf("list calls before tick = %d, want 0", got)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	select {
+	case f.ticks <- f.env.Clock.Now():
+	case <-ctx.Done():
+		t.Fatal("export verifier did not receive the tick")
+	}
+
+	waitLog(t, f.env, `"msg":"export_verified"`)
+	f.wantExported(t, true)
+	if got := f.env.Objects.ListCalls(); got != 1 {
+		t.Fatalf("list calls after tick = %d, want 1", got)
+	}
 }
 
 // TestExportVerificationPassesMatchingParts checks that the export becomes
