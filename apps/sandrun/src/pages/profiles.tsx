@@ -202,7 +202,11 @@ export function ProfilesPage() {
                     {p.workloadKind === WorkloadKind.DEV_SESSION ? (
                       <span className="muted">
                         {rich("profiles.item.workspace", {
-                          path: <code>{p.workspacePath}</code>,
+                          path: (
+                            <code className="profile-workspace-path">
+                              {p.workspacePath}
+                            </code>
+                          ),
                         })}
                       </span>
                     ) : null}

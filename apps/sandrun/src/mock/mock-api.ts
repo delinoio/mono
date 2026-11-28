@@ -752,6 +752,15 @@ function seed(
       source: { case: "baseImage", value: GuestOs.MACOS },
       priority: Priority.HIGH,
     }),
+    profile(MOCK_IDS.northwind, {
+      runnerProfileId: uuidV7(),
+      name: "linux-dev",
+      workloadKind: WorkloadKind.DEV_SESSION,
+      workspacePath: `/home/dev/${"x".repeat(180)}/sentinel`,
+      guestOs: GuestOs.LINUX,
+      source: { case: "baseImage", value: GuestOs.LINUX },
+      priority: Priority.NORMAL,
+    }),
   );
   northwind.installations.push(
     create(GitHubInstallationSchema, {
