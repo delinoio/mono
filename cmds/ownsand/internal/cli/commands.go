@@ -560,10 +560,10 @@ func (a *app) deviceGet(ctx context.Context, name string, args []string) error {
 
 func (a *app) deviceSetLimits(ctx context.Context, name string, args []string) error {
 	fs := a.newFlags(name)
-	vcpu := int32Var(fs, "vcpu", -1, "vCPU limit (required)")
-	memory := fs.Int64("memory", -1, "memory limit in MiB (required)")
-	disk := fs.Int64("disk", -1, "disk limit in GiB (required)")
-	overcommit := int32Var(fs, "vcpu-overcommit", -1, "vCPU overcommit percentage, 100 to 400 in steps of 25 (default: the current value)")
+	vcpu := int32Var(fs, "vcpu", 0, "vCPU limit (required)")
+	memory := fs.Int64("memory", 0, "memory limit in MiB (required)")
+	disk := fs.Int64("disk", 0, "disk limit in GiB (required)")
+	overcommit := int32Var(fs, "vcpu-overcommit", 0, "vCPU overcommit percentage, 100 to 400 in steps of 25 (default: the current value)")
 	rest, err := a.positional(fs, args, "device-id")
 	if err != nil {
 		return err
@@ -571,38 +571,39 @@ func (a *app) deviceSetLimits(ctx context.Context, name string, args []string) e
 	if err := idArg("device-id", rest[0]); err != nil {
 		return err
 	}
-	if *vcpu < 0 || *memory < 0 || *disk < 0 {
+	seen := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { seen[f.Name] = true })
+	if !seen["vcpu"] || !seen["memory"] || !seen["disk"] {
 		return usageErr("--vcpu, --memory and --disk are required")
 	}
-	org, err := a.orgSetup()
-	if err != nil {
-		return err
+	overcommitGiven := seen["vcpu-overcommit"]
+	percent := *overcommit
+	if !overcommitGiven {
+		// Use a valid placeholder to check the other limits before setup.
+		percent = validate.MinVCPUOvercommitPercent
 	}
 	// ReplaceDeviceLimits needs every value to be present, so an explicit zero
 	// (for example --vcpu 0) reaches the server as zero.
 	limits := &ownsandv1.DeviceLimitsInput{
 		VcpuCount: proto.Int32(*vcpu), MemoryMib: proto.Int64(*memory), DiskGib: proto.Int64(*disk),
-		VcpuOvercommitPercent: proto.Int32(*overcommit),
+		VcpuOvercommitPercent: proto.Int32(percent),
 	}
-	// Only an absent flag falls back to the current value. An explicit
-	// negative value is validated like any other so it is never replaced
-	// silently by the stored percentage.
-	overcommitGiven := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "vcpu-overcommit" {
-			overcommitGiven = true
-		}
-	})
+	if _, err := validate.DeviceLimitsInput(limits); err != nil {
+		return deviceLimitsUsageErr(err)
+	}
+	org, err := a.orgSetup()
+	if err != nil {
+		return err
+	}
 	if !overcommitGiven {
-		// Every value is required: keep the device's current overcommit.
 		dev, err := a.client.Devices().Get(ctx, &ownsandv1.GetDeviceRequest{OrganizationId: org, DeviceId: rest[0]})
 		if err != nil {
 			return err
 		}
 		limits.VcpuOvercommitPercent = proto.Int32(dev.GetDevice().GetLimits().GetVcpuOvercommitPercent())
-	}
-	if _, err := validate.DeviceLimitsInput(limits); err != nil {
-		return deviceLimitsUsageErr(err)
+		if _, err := validate.DeviceLimitsInput(limits); err != nil {
+			return deviceLimitsUsageErr(err)
+		}
 	}
 	res, err := a.client.Devices().ReplaceLimits(ctx, &ownsandv1.ReplaceDeviceLimitsRequest{OrganizationId: org, DeviceId: rest[0], Limits: limits})
 	if err != nil {
