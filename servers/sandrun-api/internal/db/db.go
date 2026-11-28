@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -62,6 +63,8 @@ const watchTransactionVersion int64 = 9
 // ErrQuiescedV9UpgradeRequired means that the database has pre-v9 history.
 var ErrQuiescedV9UpgradeRequired = errors.New("migration v9 requires maintenance: stop all SandRun processes using this database, confirm their transactions have ended, then run sandrun-api migrate-quiesced-v9")
 
+var errPlanetScaleTransactionPooler = errors.New("DATABASE_URL requires a session-preserving PostgreSQL endpoint (use the PlanetScale direct primary endpoint on port 5432)")
+
 // DB is the Postgres pool of the control plane.
 type DB struct {
 	Pool *pgxpool.Pool
@@ -74,6 +77,16 @@ func Open(ctx context.Context, url string) (*DB, error) {
 		// The parser error can contain secrets from the connection string.
 		return nil, errors.New("parse database url: invalid connection string")
 	}
+	// Organization deletion holds a session advisory lock across transactions,
+	// even when startup migrations are disabled.
+	if isPlanetScaleTransactionPooler(cfg.ConnConfig.Host, cfg.ConnConfig.Port) {
+		return nil, errPlanetScaleTransactionPooler
+	}
+	for _, fallback := range cfg.ConnConfig.Fallbacks {
+		if isPlanetScaleTransactionPooler(fallback.Host, fallback.Port) {
+			return nil, errPlanetScaleTransactionPooler
+		}
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -83,6 +96,11 @@ func Open(ctx context.Context, url string) (*DB, error) {
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 	return &DB{Pool: pool}, nil
+}
+
+func isPlanetScaleTransactionPooler(host string, port uint16) bool {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	return port == 6432 && (host == "psdb.cloud" || strings.HasSuffix(host, ".psdb.cloud"))
 }
 
 // Close closes the pool.
