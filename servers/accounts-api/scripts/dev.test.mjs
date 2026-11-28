@@ -1032,19 +1032,20 @@ test(
   },
 );
 
-// The window between the launcher's module-level signal handlers and the start
-// of the build is a few hundred microseconds wide (one `mkdtemp`), so a test
-// cannot hit it by timing. This preload module widens it: it delays `mkdtemp`
-// and announces the delayed call on standard error, which proves the launcher
-// has installed its signal handlers (they are installed before `main` runs).
-const MkdtempDelayMs = 1500;
-const mkdtempDelayPreload = `
+// The launcher installs its signal handlers before calling mkdtemp. Hold that
+// call until the test observes the signal acknowledgement so a delay in the
+// test runner cannot let the build start early.
+const mkdtempHoldPreload = `
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
+import { setTimeout } from "node:timers/promises";
 const mkdtemp = fs.mkdtemp;
 fs.mkdtemp = async (...args) => {
-  console.error(JSON.stringify({ event: "test_mkdtemp_delayed" }));
-  await new Promise((resolve) => setTimeout(resolve, ${MkdtempDelayMs}));
+  console.error(JSON.stringify({ event: "test_mkdtemp_waiting" }));
+  while (!existsSync(process.env.MKDTEMP_RELEASE_FILE)) {
+    await setTimeout(50);
+  }
   return mkdtemp(...args);
 };
 // Propagate the replacement to the named ESM imports of node:fs/promises.
@@ -1058,8 +1059,9 @@ test(
     const port = await freePort();
     const supportDir = mkdtempSync(join(tmpdir(), "accounts-api-preload-"));
     t.after(() => rmSync(supportDir, { recursive: true, force: true }));
-    const preload = join(supportDir, "delay-mkdtemp.mjs");
-    writeFileSync(preload, mkdtempDelayPreload);
+    const preload = join(supportDir, "hold-mkdtemp.mjs");
+    const releaseFile = join(supportDir, "release-mkdtemp");
+    writeFileSync(preload, mkdtempHoldPreload);
     const marker = join(supportDir, "go-started");
     // Any invocation of go leaves the marker. It exits non-zero at once so a
     // launcher that wrongly starts the build does not hang the test.
@@ -1067,19 +1069,34 @@ test(
       port,
       env: {
         MARKER: marker,
+        MKDTEMP_RELEASE_FILE: releaseFile,
         NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
       },
       pathPrefix: fakeGo(t, ['touch "$MARKER"', "exit 1"].join("\n")),
     });
     await waitFor(
       run,
-      () => countEvents(run.stderr, "test_mkdtemp_delayed") > 0,
-      "the delayed mkdtemp call",
+      () => countEvents(run.stderr, "test_mkdtemp_waiting") > 0,
+      "mkdtemp to wait for release",
     );
 
     // The launcher is waiting for mkdtemp, so there is no child to forward the
     // signal to; the launcher has to act on it before it starts the build.
     process.kill(run.child.pid, "SIGTERM");
+    await waitFor(
+      run,
+      () =>
+        run.stderr
+          .split("\n")
+          .slice(0, -1)
+          .some(
+            (line) =>
+              line.includes('"event":"accounts_api_dev_signal"') &&
+              JSON.parse(line).signal === "SIGTERM",
+          ),
+      "the launcher's SIGTERM acknowledgement",
+    );
+    writeFileSync(releaseFile, "");
     const { code } = await run.exited;
 
     assert.equal(code, StatusSigterm, run.stderr);
