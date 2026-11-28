@@ -8,7 +8,9 @@ import {
 } from "@connectrpc/connect";
 import { createConnectQueryKey } from "@connectrpc/connect-query";
 import {
+  BillingMeter,
   BillingService,
+  type GetBillingUsageResponse,
   type UnlinkBillingAccountRequest,
 } from "@delino/ownsand-protos/v1/billing_pb";
 import { QueryClient } from "@tanstack/react-query";
@@ -21,7 +23,11 @@ import {
   within,
 } from "@testing-library/react";
 import { toast } from "delino-ui/toast";
-import { MOCK_IDS, createMockTransport } from "./mock/mock-api.ts";
+import {
+  MOCK_IDS,
+  MockBillingState,
+  createMockTransport,
+} from "./mock/mock-api.ts";
 import {
   DEFAULT_WAIT_MS,
   TEST_SETUP_MS,
@@ -180,50 +186,74 @@ describe("the unlink action without usage", () => {
   );
 
   test(
-    "a stale confirmation keeps its original target and requires a new opening",
+    "relinking hides stale usage and preserves the captured unlink target",
     async () => {
       const mock = createMockTransport();
       const client = createClient(BillingService, mock);
       const organizationId = MOCK_IDS.acme;
-      const { billingAccountId: accountA } = await client.getBillingStatus({
-        organizationId,
-      });
-      const accounts = await client.listLinkableBillingAccounts({
-        organizationId,
-      });
-      const accountB = accounts.billingAccounts.find(
-        (account) => account.billingAccountId !== accountA,
-      )!;
+      const accountA = MOCK_IDS.acmeBillingAccount;
+      const accountB = MOCK_IDS.labBillingAccount;
       const queryClient = new QueryClient({
         defaultOptions: { queries: { retry: false } },
       });
       const requestedIds: (string | undefined)[] = [];
       let statusCalls = 0;
+      let holdUsage = false;
       let failUsage = false;
-      const transport: Transport = {
+      const fixture: Transport = {
         ...mock,
         async unary(method, ...rest) {
           if (method.name === "GetBillingStatus") statusCalls++;
-          if (method.name === "GetBillingUsage" && failUsage) {
-            throw new ConnectError("usage is unavailable", Code.Unavailable);
-          }
           if (method.name === "UnlinkBillingAccount") {
             requestedIds.push(
               (rest[3] as UnlinkBillingAccountRequest).expectedBillingAccountId,
             );
           }
-          return mock.unary(method, ...rest);
+          if (method.name === "GetBillingUsage" && failUsage) {
+            throw new ConnectError("usage is unavailable", Code.Unavailable);
+          }
+          const response = await mock.unary(method, ...rest);
+          if (method.name === "GetBillingUsage") {
+            const usage =
+              response.message as unknown as GetBillingUsageResponse;
+            if (usage.billingAccountId === accountB) {
+              usage.meterUsages = [
+                {
+                  ...usage.meterUsages[0]!,
+                  meter: BillingMeter.CLASS_A_RPC,
+                  quantity: 9_999n,
+                  amountUsdMicros: 2_500_000n,
+                },
+              ];
+            }
+          }
+          return response;
         },
       };
+      const { transport, calls } = holdingTransport(
+        ["GetBillingUsage"],
+        () => holdUsage,
+        fixture,
+      );
       renderConsole(SETTINGS, { transport, queryClient });
       const section = await billing();
-      await within(section).findByText(
-        "Acme Robotics billing",
-        undefined,
-        WAIT,
-      );
+      const content = within(section);
+      const table = { name: "Usage this month" };
+      await content.findByText("Acme Robotics billing", undefined, WAIT);
+      expect(content.getByText("$42.52")).toBeTruthy();
+      expect(content.getByText("$1.17")).toBeTruthy();
+      expect(content.getByRole("table", table)).toBeTruthy();
+
+      // The dialog's captured name is outside the usage section.
+      const expectPreviousUsageHidden = () => {
+        expect(content.queryByText("Acme Robotics billing")).toBeNull();
+        expect(content.queryByText("$42.52")).toBeNull();
+        expect(content.queryByText("$1.17")).toBeNull();
+        expect(content.queryByRole("table", table)).toBeNull();
+      };
       const unlink = () =>
-        within(section).getByRole("button", { name: "Unlink billing account" });
+        content.getByRole("button", { name: "Unlink billing account" });
+      const retry = { name: "Try again" };
       const confirm = (dialog: HTMLElement) =>
         click(
           within(dialog).getByRole("button", {
@@ -238,7 +268,7 @@ describe("the unlink action without usage", () => {
       await client.unlinkBillingAccount({ organizationId });
       await client.linkBillingAccount({
         organizationId,
-        billingAccountId: accountB.billingAccountId,
+        billingAccountId: accountB,
       });
       await act(async () => {
         await queryClient.invalidateQueries({
@@ -248,14 +278,35 @@ describe("the unlink action without usage", () => {
           }),
         });
       });
-      expect(within(section).getByText("Acme Robotics billing")).toBeTruthy();
+      await content.findByText("Something went wrong. Try again.");
+      expectPreviousUsageHidden();
       expect(
         within(opening).getByRole("heading", {
           name: "Unlink Acme Robotics billing?",
         }),
       ).toBeTruthy();
 
+      holdUsage = true;
+      const usageRefresh = queryClient.invalidateQueries({
+        queryKey: createConnectQueryKey({
+          schema: BillingService.method.getBillingUsage,
+          cardinality: undefined,
+        }),
+      });
+      await content.findByRole("status", {
+        name: "Loading the billing usage",
+      });
+      expectPreviousUsageHidden();
+      holdUsage = false;
       failUsage = true;
+      await act(async () => {
+        calls.GetBillingUsage![0]!.settle(
+          new ConnectError("usage is unavailable", Code.Unavailable),
+        );
+        await usageRefresh;
+      });
+      expectPreviousUsageHidden();
+
       const priorStatusCalls = statusCalls;
       await confirm(opening);
       await screen.findByText(
@@ -269,22 +320,95 @@ describe("the unlink action without usage", () => {
       expect(requestedIds).toEqual([accountA]);
       expect(
         (await client.getBillingStatus({ organizationId })).billingAccountId,
-      ).toBe(accountB.billingAccountId);
+      ).toBe(accountB);
+      expectPreviousUsageHidden();
+      expect(content.getAllByRole("button", retry)).toHaveLength(1);
 
       await click(unlink());
       const newOpening = await screen.findByRole("alertdialog", {
         name: "Unlink the billing account?",
       });
-      await confirm(newOpening);
-      await within(section).findByRole(
+      await click(within(newOpening).getByRole("button", { name: "Cancel" }));
+      failUsage = false;
+      await click(await content.findByRole("button", retry));
+      await content.findByText("Research lab credits", undefined, WAIT);
+      expect(content.getByText("-$1.23 (debt)")).toBeTruthy();
+      expect(content.getByText("$2.50", { selector: "dd" })).toBeTruthy();
+      expect(
+        within(content.getByRole("table", table)).getByText("9,999 calls"),
+      ).toBeTruthy();
+      expect(content.queryByRole("button", retry)).toBeNull();
+
+      await click(unlink());
+      await confirm(
+        await screen.findByRole("alertdialog", {
+          name: "Unlink Research lab credits?",
+        }),
+      );
+      await content.findByRole(
         "button",
         { name: "Link a billing account" },
         WAIT,
       );
-      expect(requestedIds).toEqual([accountA, accountB.billingAccountId]);
+      expect(requestedIds).toEqual([accountA, accountB]);
     },
-    3 * WAIT.timeout + 4 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
+    4 * WAIT.timeout + 8 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
   );
+
+  test("a transient refresh failure keeps usage for the same account", async () => {
+    const { transport, state } = usageFailingTransport();
+    state.failUsage = false;
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    renderConsole(SETTINGS, { transport, queryClient });
+    const content = within(await billing());
+    await content.findByText("Acme Robotics billing");
+
+    state.failUsage = true;
+    await act(() =>
+      queryClient.invalidateQueries({
+        queryKey: createConnectQueryKey({
+          schema: BillingService.method.getBillingUsage,
+          cardinality: undefined,
+        }),
+      }),
+    );
+    await content.findByRole("button", { name: "Try again" });
+    expect(content.getByText("Acme Robotics billing")).toBeTruthy();
+    expect(
+      content.getByRole("table", { name: "Usage this month" }),
+    ).toBeTruthy();
+  });
+
+  test("an admin sees usage when status omits the account ID", async () => {
+    const transport = createMockTransport({ userId: ADMIN });
+    const client = createClient(BillingService, transport);
+    const status = await client.getBillingStatus({
+      organizationId: MOCK_IDS.acme,
+    });
+    expect(status.billingAccountId).toBeUndefined();
+    renderConsole(SETTINGS, { transport });
+    const content = within(await billing());
+    await content.findByText("Acme Robotics billing");
+    expect(
+      content.getByRole("table", { name: "Usage this month" }),
+    ).toBeTruthy();
+  });
+
+  test("an unlinked organization skips usage", async () => {
+    const { transport, state } = usageFailingTransport(
+      createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedUnlinked },
+      }),
+    );
+    renderConsole(SETTINGS, { transport });
+    const section = await billing();
+    await within(section).findByRole("button", {
+      name: "Link a billing account",
+    });
+    expect(state.calls.GetBillingUsage).toBeUndefined();
+  });
 
   test("the owner cannot confirm with a status that has no linked account ID", async () => {
     const mock = createMockTransport();
