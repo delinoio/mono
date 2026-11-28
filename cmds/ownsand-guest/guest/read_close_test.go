@@ -43,7 +43,7 @@ func filesUnder(t *testing.T, root string) []string {
 
 func newCloseTestServer(t *testing.T, dir string) *Server {
 	t.Helper()
-	srv, err := New(Config{StateDir: dir})
+	srv, err := newAfterRelease(Config{StateDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}

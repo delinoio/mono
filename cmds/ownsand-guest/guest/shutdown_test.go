@@ -173,7 +173,7 @@ func openReplacement(t *testing.T, cfg Config, wait time.Duration) *Server {
 	t.Helper()
 	deadline := time.Now().Add(wait)
 	for {
-		replacement, err := New(cfg)
+		replacement, err := newAfterRelease(cfg)
 		if err == nil {
 			t.Cleanup(func() { replacement.Close() })
 			return replacement
