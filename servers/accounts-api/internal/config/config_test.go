@@ -102,6 +102,7 @@ func TestLoadRejectsInvalidAddrHost(t *testing.T) {
 		"label too long":       {strings.Repeat("a", 64) + ":8100", strings.Repeat("a", 64)},
 		"hostname too long":    {strings.Repeat("a.", 127) + "a:8100", strings.Repeat("a.", 127) + "a"},
 		"bad IPv6 in brackets": {"[::1%]:8100", "::1%"},
+		"invalid IPv4 octet":   {"256.0.0.1:8100", "256.0.0.1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(lookupFrom(map[string]string{EnvAddr: tc.addr}))
