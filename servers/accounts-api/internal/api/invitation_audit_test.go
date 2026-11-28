@@ -3,6 +3,9 @@
 package api_test
 
 import (
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -102,6 +105,157 @@ func TestInvitationCreationAuditFailureRollsBackInvitation(t *testing.T) {
 	}
 	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 1 {
 		t.Errorf("%d invitation_created rows after the retry, want 1", n)
+	}
+}
+
+func TestInvitationDeliveryFailureWithRevocationCommitFailure(t *testing.T) {
+	t.Parallel()
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+	const address = "guest@example.com"
+	const commitFailure = "forced invitation revocation commit failure"
+
+	// Let the revocation update and audit insert run before failing at commit.
+	// Manual revocations do not have the delivery_failed reason.
+	for _, stmt := range []string{
+		`CREATE FUNCTION fail_delivery_revocation_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN RAISE EXCEPTION '` + commitFailure + `'; END $$`,
+		`CREATE CONSTRAINT TRIGGER fail_delivery_revocation_commit AFTER INSERT ON billing_audit_events
+			DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+			WHEN (NEW.kind = 'invitation_revoked' AND NEW.details->>'reason' = 'delivery_failed')
+			EXECUTE FUNCTION fail_delivery_revocation_commit()`,
+	} {
+		if _, err := env.DB.Pool.Exec(ctx(), stmt); err != nil {
+			t.Fatalf("install the deferred revocation trigger: %v", err)
+		}
+	}
+
+	pendingID := func() string {
+		t.Helper()
+		resp, err := owner.Client.ListInvitations(ctx(), connect.NewRequest(&accountsv1.ListInvitationsRequest{BillingAccountId: accountID}))
+		if err != nil {
+			t.Fatalf("ListInvitations: %v", err)
+		}
+		invitations := resp.Msg.GetInvitations()
+		if len(invitations) != 1 {
+			t.Fatalf("ListInvitations returned %d invitations, want 1", len(invitations))
+		}
+		inv := invitations[0]
+		if inv.GetInvitationId() == "" || inv.GetEmail() != address || inv.GetState() != accountsv1.InvitationState_INVITATION_STATE_PENDING {
+			t.Fatalf("ListInvitations returned %v, want a pending invitation for %s", inv, address)
+		}
+		return inv.GetInvitationId()
+	}
+	wantCreationAudits := func(want int) {
+		t.Helper()
+		if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != want {
+			t.Errorf("%d invitation_created audit rows, want %d", n, want)
+		}
+		if n := auditRecordCount(env.Logs.String(), api.AuditInvitationCreated); n != want {
+			t.Errorf("%d invitation_created audit log records, want %d", n, want)
+		}
+	}
+
+	request := &accountsv1.CreateInvitationRequest{BillingAccountId: accountID, Email: address, Role: roleViewer}
+	env.Email.SetErr(errors.New("resend down"))
+	_, err := owner.Client.CreateInvitation(ctx(), connect.NewRequest(request))
+	wantCode(t, err, connect.CodeUnavailable)
+
+	originalID := pendingID()
+	if got := invitationRows(t, env, accountID); strings.Join(got, ",") != address+"=pending" {
+		t.Errorf("stored invitations after failed revocation = %v, want one pending", got)
+	}
+	wantCreationAudits(1)
+	var createdID string
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT invitation_id::text FROM billing_audit_events
+		WHERE billing_account_id = $1 AND kind = $2`, accountID, api.AuditInvitationCreated).Scan(&createdID); err != nil || createdID != originalID {
+		t.Errorf("creation audit invitation ID = %q, %v, want %q", createdID, err, originalID)
+	}
+	logs := env.Logs.String()
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationRevoked); n != 0 {
+		t.Errorf("%d invitation_revoked audit rows after failed revocation, want 0", n)
+	}
+	if n := auditRecordCount(logs, api.AuditInvitationRevoked); n != 0 {
+		t.Errorf("%d invitation_revoked audit log records after failed revocation, want 0", n)
+	}
+	if n := len(env.Email.Messages()); n != 0 {
+		t.Errorf("%d emails after failed delivery, want 0", n)
+	}
+
+	var creationLogs, failureLogs int
+	for line := range strings.SplitSeq(logs, "\n") {
+		if line == "" {
+			continue
+		}
+		var record struct {
+			Message          string        `json:"msg"`
+			Level            string        `json:"level"`
+			Kind             api.AuditKind `json:"kind"`
+			BillingAccountID string        `json:"billing_account_id"`
+			InvitationID     string        `json:"invitation_id"`
+			Reason           string        `json:"reason"`
+			Error            string        `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode log record: %v", err)
+		}
+		switch record.Message {
+		case "billing_audit_event":
+			if record.Kind == api.AuditInvitationCreated && record.BillingAccountID == accountID && record.InvitationID == originalID {
+				creationLogs++
+			}
+		case "invitation_revoke_failed":
+			failureLogs++
+			if record.Level != slog.LevelError.String() || record.BillingAccountID != accountID ||
+				record.InvitationID != originalID || record.Reason != "delivery_failed" || !strings.Contains(record.Error, commitFailure) {
+				t.Errorf("unexpected invitation_revoke_failed record: %s", line)
+			}
+		}
+	}
+	if creationLogs != 1 || failureLogs != 1 {
+		t.Errorf("creation audit logs for invitation %s = %d, revocation failure logs = %d, want 1 of each", originalID, creationLogs, failureLogs)
+	}
+
+	env.Email.SetErr(nil)
+	_, err = owner.Client.CreateInvitation(ctx(), connect.NewRequest(request))
+	wantCode(t, err, connect.CodeAlreadyExists)
+	if id := pendingID(); id != originalID {
+		t.Errorf("pending invitation after duplicate request = %s, want %s", id, originalID)
+	}
+	wantCreationAudits(1)
+	if n := len(env.Email.Messages()); n != 0 {
+		t.Errorf("%d emails after duplicate request, want 0", n)
+	}
+
+	revoked, err := owner.Client.RevokeInvitation(ctx(), connect.NewRequest(&accountsv1.RevokeInvitationRequest{
+		BillingAccountId: accountID, InvitationId: originalID,
+	}))
+	if err != nil {
+		t.Fatalf("RevokeInvitation with the deferred trigger installed: %v", err)
+	}
+	if state := revoked.Msg.GetInvitation().GetState(); state != accountsv1.InvitationState_INVITATION_STATE_REVOKED {
+		t.Errorf("RevokeInvitation state = %s, want revoked", state)
+	}
+	var manualAudits int
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_audit_events
+		WHERE billing_account_id = $1 AND kind = $2 AND invitation_id = $3
+		AND details->>'reason' IS DISTINCT FROM 'delivery_failed'`,
+		accountID, api.AuditInvitationRevoked, originalID).Scan(&manualAudits); err != nil || manualAudits != 1 {
+		t.Errorf("manual revocation audit rows for invitation %s = %d, %v, want 1", originalID, manualAudits, err)
+	}
+
+	newID := invite(t, owner, accountID, address, roleViewer).GetInvitationId()
+	if id := pendingID(); id != newID || id == originalID {
+		t.Errorf("pending invitation after reinvite = %s, want new invitation %s distinct from %s", id, newID, originalID)
+	}
+	wantCreationAudits(2)
+	messages := env.Email.Messages()
+	if len(messages) != 1 {
+		t.Fatalf("%d emails after reinvite, want 1", len(messages))
+	}
+	if msg := messages[0]; msg.To != address || msg.IdempotencyKey != "invitation/"+newID {
+		t.Errorf("reinvite email recipient and key = %q, %q, want %q, %q", msg.To, msg.IdempotencyKey, address, "invitation/"+newID)
 	}
 }
 
