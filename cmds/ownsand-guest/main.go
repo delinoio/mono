@@ -63,9 +63,13 @@ func main() {
 	os.Exit(code)
 }
 
-// run serves the GuestService until ctx ends. openLog returns the log
-// output for the state directory; nil logs to standard error.
-func run(ctx context.Context, args []string, openLog func(stateDir string) (logOutput, error), processors ...sdklog.Processor) int {
+type serviceLogs struct {
+	openLog            func(stateDir string) (logOutput, error)
+	reportStartupError func(string) error
+}
+
+// run serves the GuestService until ctx ends. A nil logs argument uses standard error.
+func run(ctx context.Context, args []string, logs *serviceLogs, processors ...sdklog.Processor) int {
 	fs := flag.NewFlagSet("ownsand-guest", flag.ContinueOnError)
 	listen := fs.String("listen", envOr(envListen, guestlisten.DefaultSpec), "listener spec: vsock://:<port>, hvsock://<service GUID>, unix://<path> or tcp://<host:port> (env "+envListen+")")
 	stateDir := fs.String("state-dir", envOr(envStateDir, defaultStateDir()), "directory for read snapshots and write records on the guest disk (env "+envStateDir+")")
@@ -82,13 +86,17 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (logO
 	}
 	level, err := loglevel.Parse(*logLevel)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ownsand-guest: invalid log level %q\n", *logLevel)
+		if logs == nil {
+			fmt.Fprintf(os.Stderr, "ownsand-guest: invalid log level %q\n", *logLevel)
+		} else {
+			_ = logs.reportStartupError("Invalid log level. Set --log-level or " + envLogLevel + " to debug, info, warn or error.")
+		}
 		return 2
 	}
 	var logOut io.Writer = os.Stderr
 	var notes []func(*slog.Logger)
-	if openLog != nil {
-		out, err := openLog(*stateDir)
+	if logs != nil {
+		out, err := logs.openLog(*stateDir)
 		if err != nil {
 			return 1
 		}
@@ -112,7 +120,11 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (logO
 	case "ignore":
 		mode = guest.ClockModeIgnore
 	default:
-		fmt.Fprintf(os.Stderr, "ownsand-guest: invalid clock mode %q\n", *clock)
+		if logs == nil {
+			fmt.Fprintf(os.Stderr, "ownsand-guest: invalid clock mode %q\n", *clock)
+		} else {
+			logger.Error("Invalid clock mode. Set --clock or " + envClock + " to set or ignore.")
+		}
 		return 2
 	}
 	// Take the listener before the state directory: a helper that cannot
