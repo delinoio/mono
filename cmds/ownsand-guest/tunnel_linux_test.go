@@ -151,6 +151,18 @@ func readFrame(t *testing.T, c net.Conn) []byte {
 	return payload
 }
 
+func expectTapFrame(t *testing.T, tap *fakeTap, want []byte) {
+	t.Helper()
+	select {
+	case got := <-tap.written:
+		if !bytes.Equal(got, want) {
+			t.Fatalf("TAP frame = %q, want %q", got, want)
+		}
+	case <-time.After(testTimeout):
+		t.Fatalf("timed out after %s waiting for TAP frame %q", testTimeout, want)
+	}
+}
+
 // expectClosed fails the test unless the peer observes that c was closed.
 func expectClosed(t *testing.T, c net.Conn) {
 	t.Helper()
@@ -292,14 +304,7 @@ func TestTunnelAcceptErrorIsFatalAndClosesEverything(t *testing.T) {
 	if _, err := agent.Write(frame([]byte("hello"))); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case got := <-tap.written:
-		if string(got) != "hello" {
-			t.Fatalf("TAP frame %q", got)
-		}
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the TAP frame from the agent")
-	}
+	expectTapFrame(t, tap, []byte("hello"))
 
 	acceptErr := errors.New("vsock listener failed")
 	l.failC <- acceptErr
@@ -350,14 +355,7 @@ func TestTunnelPeerDropIsNotFatalAndReplacementWorks(t *testing.T) {
 	if _, err := second.Write(frame([]byte("back"))); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case got := <-tap.written:
-		if !bytes.Equal(got, []byte("back")) {
-			t.Fatalf("TAP frame %q", got)
-		}
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the TAP frame from the replacement agent")
-	}
+	expectTapFrame(t, tap, []byte("back"))
 	expectNoFatal(t, tun)
 }
 
