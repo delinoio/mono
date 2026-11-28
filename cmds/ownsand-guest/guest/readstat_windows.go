@@ -13,57 +13,66 @@ import (
 
 // longPathLimit is the length from which os.Open (fixLongPath in the standard
 // library) switches a path to the extended-length form. It is the Windows
-// MAX_PATH of 260 minus the 12 bytes of an 8.3 file name. statSource uses the
-// same limit, so that it and the os.Open that follows it name the file in the
-// same way.
+// MAX_PATH of 260 minus the 12 bytes of an 8.3 file name.
 const longPathLimit = 248
 
 func isPathSeparator(c byte) bool { return c == '\\' || c == '/' }
 
-// extendedPath returns the form of path that syscall.CreateFile accepts when
-// path is longer than the Win32 path limit.
-//
-// os.Open and os.Stat add the extended-length prefix on their own, but
-// syscall.CreateFile does not, so a path of 248 bytes or more that works with
-// os.Open fails in statSource. extendedPath cleans a long path, and adds the
-// \\?\ prefix to a drive path or the \\?\UNC\ prefix to a UNC path. It
-// returns a short path, a path that has the extended-length prefix (\\?\ or
-// \??\) and a device path (\\.\) unchanged: the operating system does not
-// normalize an extended-length path, and a prefix on a device path changes its
-// meaning. A relative path is made absolute first, as os.Open does, and keeps
-// its form when the absolute path is short.
-//
-// The result is only for the call that opens the file. Errors and the
-// *os.File keep the path that the caller passed.
-func extendedPath(path string) string {
+// absoluteLongPath returns the absolute form of an ordinary path long enough
+// to need an extended-length prefix. Explicit extended-length and device paths
+// already specify how Windows should interpret them.
+func absoluteLongPath(path string) (string, bool) {
 	if len(path) >= 4 {
 		switch {
 		case path[:4] == `\??\`:
-			return path
+			return "", false
 		case isPathSeparator(path[0]) && isPathSeparator(path[1]) && path[2] == '?' && isPathSeparator(path[3]):
-			return path
+			return "", false
 		case isPathSeparator(path[0]) && isPathSeparator(path[1]) && path[2] == '.' && isPathSeparator(path[3]):
-			return path
+			return "", false
 		}
 	}
 	abs := path
 	if !filepath.IsAbs(abs) {
 		a, err := filepath.Abs(abs)
 		if err != nil {
-			return path
+			return "", false
 		}
 		abs = a
 	}
-	if len(abs) < longPathLimit {
+	return abs, len(abs) >= longPathLimit
+}
+
+// extendedPath preserves the lexical conversion used by write recovery to
+// identify a staging path.
+func extendedPath(path string) string {
+	abs, ok := absoluteLongPath(path)
+	if !ok {
 		return path
 	}
-	// The operating system does not resolve "." and ".." or a "/" in an
-	// extended-length path, so clean the path before it gets the prefix.
-	clean := filepath.Clean(abs)
-	if strings.HasPrefix(clean, `\\`) {
-		return `\\?\UNC\` + clean[2:]
+	return prefixLongPath(filepath.Clean(abs))
+}
+
+// extendedReadPath uses Win32 normalization before adding a prefix that
+// disables it. This matches the name that os.Open resolves, including when
+// the last component ends in a period or an ASCII space.
+func extendedReadPath(path string) string {
+	abs, ok := absoluteLongPath(path)
+	if !ok {
+		return path
 	}
-	return `\\?\` + clean
+	full, err := syscall.FullPath(abs)
+	if err != nil {
+		return path
+	}
+	return prefixLongPath(full)
+}
+
+func prefixLongPath(path string) string {
+	if strings.HasPrefix(path, `\\`) {
+		return `\\?\UNC\` + path[2:]
+	}
+	return `\\?\` + path
 }
 
 // statSource returns the file information of the file at path, following a
@@ -82,12 +91,11 @@ func extendedPath(path string) string {
 // blocks a file that is open elsewhere.
 //
 // CreateFile does not convert a long path as os.Open does, so statSource
-// converts it with extendedPath. Without that, the stat of a path that the
-// open below accepts would fail.
+// converts it with extendedReadPath.
 func statSource(path string) (os.FileInfo, error) {
 	// The prefix is only for CreateFile. The errors and the file below keep
 	// the path that the caller passed.
-	p, err := syscall.UTF16PtrFromString(extendedPath(path))
+	p, err := syscall.UTF16PtrFromString(extendedReadPath(path))
 	if err != nil {
 		return nil, &os.PathError{Op: "stat", Path: path, Err: err}
 	}
