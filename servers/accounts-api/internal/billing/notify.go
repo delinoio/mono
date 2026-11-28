@@ -72,13 +72,14 @@ func (s *Service) enqueue(ctx context.Context, tx pgx.Tx, accountID string, kind
 
 // notification is a queued notification.
 type notification struct {
-	ID               string
-	BillingAccountID string
-	Kind             NotificationKind
-	DedupKey         string
-	Details          map[string]string
-	Attempts         int
-	SaveExpiryAmount bool
+	ID                string
+	BillingAccountID  string
+	Kind              NotificationKind
+	DedupKey          string
+	Details           map[string]string
+	Attempts          int
+	SaveExpiryAmount  bool
+	ResumeAfterUserID *string
 }
 
 // DeliverNotifications sends the due notifications. A notification is
@@ -117,12 +118,12 @@ func (s *Service) claimNotification(ctx context.Context) (notification, bool, er
 		var details []byte
 		var kind string
 		err := tx.QueryRow(ctx, `SELECT notification_id::text, billing_account_id::text, kind, dedup_key, details, attempts,
-			expiry_next_attempt_time IS NOT NULL
+			expiry_next_attempt_time IS NOT NULL, resume_after_user_id
 			FROM billing_notifications
 			WHERE send_time IS NULL AND abandon_time IS NULL
 				AND COALESCE(expiry_next_attempt_time, next_attempt_time) <= $1
 			ORDER BY COALESCE(expiry_next_attempt_time, next_attempt_time) LIMIT 1 FOR UPDATE SKIP LOCKED`, now).Scan(
-			&n.ID, &n.BillingAccountID, &kind, &n.DedupKey, &details, &n.Attempts, &n.SaveExpiryAmount)
+			&n.ID, &n.BillingAccountID, &kind, &n.DedupKey, &details, &n.Attempts, &n.SaveExpiryAmount, &n.ResumeAfterUserID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -185,7 +186,7 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 	}
 	if deleted {
 		return s.settle(ctx, func(ctx context.Context) error {
-			_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2 WHERE notification_id = $1`,
+			_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2, resume_after_user_id = NULL WHERE notification_id = $1`,
 				n.ID, s.timestamp())
 			return err
 		})
@@ -194,7 +195,7 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 		return s.interruptedOr(ctx, n, err)
 	} else if stale {
 		return s.settle(ctx, func(ctx context.Context) error {
-			if _, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2 WHERE notification_id = $1`,
+			if _, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET abandon_time = $2, resume_after_user_id = NULL WHERE notification_id = $1`,
 				n.ID, s.timestamp()); err != nil {
 				return err
 			}
@@ -207,11 +208,13 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 			return nil
 		})
 	}
+	// Sort IDs above the saved boundary first, then wrap to the remaining
+	// pending IDs. The boundary need not be in the result set.
 	rows, err := s.db.Pool.Query(ctx, `SELECT m.user_id FROM billing_account_members m
 		WHERE m.billing_account_id = $1 AND m.role IN ('owner', 'admin')
 			AND NOT EXISTS (SELECT 1 FROM billing_notification_deliveries d
 				WHERE d.notification_id = $2 AND d.user_id = m.user_id)
-		ORDER BY m.user_id`, n.BillingAccountID, n.ID)
+		ORDER BY (m.user_id <= $3::text), m.user_id`, n.BillingAccountID, n.ID, n.ResumeAfterUserID)
 	if err != nil {
 		return s.interruptedOr(ctx, n, err)
 	}
@@ -223,7 +226,7 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 		grant, err := s.readCreditExpiryGrant(ctx, n, grantID, expiry)
 		if err != nil {
 			if ctx.Err() != nil {
-				return s.deferNotification(ctx, n)
+				return s.deferNotification(ctx, n, nil)
 			}
 			return s.settle(ctx, func(ctx context.Context) error {
 				return s.finish(ctx, n, err, 0)
@@ -244,10 +247,12 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 	// notification is then deferred, not counted as a failed attempt.
 	var failed error
 	failedRecipients := 0
+	var lastStarted *string
 	for _, userID := range recipients {
 		if ctx.Err() != nil {
-			return s.deferNotification(ctx, n)
+			return s.deferNotification(ctx, n, lastStarted)
 		}
+		lastStarted = &userID
 		user, lookupErr := s.directory.User(ctx, userID)
 		// A profile lookup can cross the expiry even if it returns no email.
 		if n.Kind == NotifyCreditExpiry && !expiry.After(s.timestamp()) {
@@ -283,7 +288,7 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 		}
 		if recipientErr != nil {
 			if ctx.Err() != nil {
-				return s.deferNotification(ctx, n)
+				return s.deferNotification(ctx, n, lastStarted)
 			}
 			failedRecipients++
 			if failed == nil {
@@ -319,7 +324,7 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 					// The pass ended while the send was in flight, so the
 					// outcome is unknown. The next attempt sends again with
 					// the same idempotency key.
-					return s.deferNotification(ctx, n)
+					return s.deferNotification(ctx, n, lastStarted)
 				}
 				s.metrics.Email(string(n.Kind), "failed")
 				failedRecipients++
@@ -413,7 +418,7 @@ func (s *Service) staleTopUpFailure(ctx context.Context, n notification) (bool, 
 // and returns err otherwise.
 func (s *Service) interruptedOr(ctx context.Context, n notification, err error) error {
 	if ctx.Err() != nil {
-		return s.deferNotification(ctx, n)
+		return s.deferNotification(ctx, n, nil)
 	}
 	return err
 }
@@ -422,14 +427,19 @@ func (s *Service) interruptedOr(ctx context.Context, n notification, err error) 
 // recipients that are not recorded stay pending, the attempt count stays as
 // it is, and the notification waits notificationDeferDelay, so that a
 // notification that became due meanwhile runs first and the same one does
-// not block the queue. It returns the error of ctx.
-func (s *Service) deferNotification(ctx context.Context, n notification) error {
+// not block the queue. A non-expiry notice stopped by the delivery deadline
+// saves the last recipient that started, if any. It returns the error of ctx.
+func (s *Service) deferNotification(ctx context.Context, n notification, lastStarted *string) error {
+	if ctx.Err() != context.DeadlineExceeded || n.Kind == NotifyCreditExpiry {
+		lastStarted = nil
+	}
 	err := s.settle(ctx, func(ctx context.Context) error {
 		_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET
 			next_attempt_time = CASE WHEN expiry_next_attempt_time IS NULL THEN $2 ELSE next_attempt_time END,
+			resume_after_user_id = COALESCE($3, resume_after_user_id),
 			expiry_next_attempt_time = CASE WHEN expiry_next_attempt_time IS NOT NULL THEN $2::timestamptz END
 			WHERE notification_id = $1`,
-			n.ID, s.timestamp().Add(notificationDeferDelay))
+			n.ID, s.timestamp().Add(notificationDeferDelay), lastStarted)
 		return err
 	})
 	s.logger.WarnContext(ctx, "billing_notification_deferred",
@@ -448,7 +458,7 @@ func (s *Service) deferNotification(ctx context.Context, n notification) error {
 func (s *Service) finish(ctx context.Context, n notification, failed error, failedRecipients int) error {
 	now := s.timestamp()
 	if failed == nil {
-		_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET send_time = $2, attempts = attempts + 1
+		_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET send_time = $2, attempts = attempts + 1, resume_after_user_id = NULL
 			WHERE notification_id = $1`, n.ID, now)
 		if err == nil {
 			s.logger.InfoContext(ctx, "billing_notification_sent",
@@ -472,7 +482,7 @@ func (s *Service) finish(ctx context.Context, n notification, failed error, fail
 		slog.Bool("abandoned", abandon != nil),
 		slog.Int("failed_recipients", failedRecipients),
 		slog.Any("error", failed))
-	_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET attempts = $2, abandon_time = $4,
+	_, err := s.db.Pool.Exec(ctx, `UPDATE billing_notifications SET attempts = $2, abandon_time = $4, resume_after_user_id = NULL,
 		next_attempt_time = CASE WHEN expiry_next_attempt_time IS NULL THEN $3 ELSE next_attempt_time END,
 		expiry_next_attempt_time = CASE WHEN expiry_next_attempt_time IS NOT NULL THEN $3::timestamptz END
 		WHERE notification_id = $1`, n.ID, attempts, now.Add(backoff), abandon)
