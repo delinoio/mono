@@ -167,12 +167,16 @@ afterEach(() => {
   cleanup();
   // The toaster and its screen reader announcers are module state outside
   // the rendered tree: a toast or an announcement of one test must not
-  // appear in the document of the next one.
+  // appear in the document of the next one. The UI SDK writes an
+  // announcement 100 ms after the toast, so a test that ends sooner leaves a
+  // pending write. Remove the live regions instead of clearing them: that
+  // write then goes to a detached region, and the next announcement creates
+  // a new one.
   toast.dismiss();
   for (const announcer of document.querySelectorAll(
     "[data-ui-sdk-announcer]",
   )) {
-    announcer.textContent = "";
+    announcer.remove();
   }
 });
 
