@@ -192,12 +192,8 @@ func (a *authInterceptor) authenticate(ctx context.Context, procedure string, he
 		}
 		info.mu.Unlock()
 	}
-	if p.IsAPIKey() {
-		if !authz.APIKeyAcceptedForProcedure(procedure) {
-			return ctx, ErrPermission("a personal API key is accepted only on DevSessionService RPCs")
-		}
-		// Only an accepted use counts as the last use of the key.
-		a.authn.recordAPIKeyUse(ctx, p.APIKeyID)
+	if p.IsAPIKey() && !authz.APIKeyAcceptedForProcedure(procedure) {
+		return ctx, ErrPermission("a personal API key is accepted only on DevSessionService RPCs")
 	}
 	return auth.WithPrincipal(ctx, p), nil
 }
@@ -340,35 +336,4 @@ func (a *Authenticator) allowPrefixWarning(prefix string) bool {
 	}
 	a.prefixWarnings[prefix] = now.Add(interval)
 	return true
-}
-
-// apiKeyUseCache remembers when this process last wrote the last use time of
-// each key, so most calls skip the database write.
-type apiKeyUseCache struct {
-	mu      sync.Mutex
-	written map[string]time.Time
-}
-
-// recordAPIKeyUse writes the last use time of a key at most once per minute.
-// The UPDATE condition keeps the limit across instances too. A failed write
-// is logged and does not fail the RPC.
-func (a *Authenticator) recordAPIKeyUse(ctx context.Context, keyID string) {
-	s := a.Service
-	now := s.NowUTC()
-	c := &s.apiKeyUses
-	c.mu.Lock()
-	if last, ok := c.written[keyID]; ok && now.Sub(last) < apiKeyUseWriteInterval {
-		c.mu.Unlock()
-		return
-	}
-	if c.written == nil || len(c.written) > 100_000 {
-		c.written = map[string]time.Time{}
-	}
-	c.written[keyID] = now
-	c.mu.Unlock()
-	_, err := s.DB.Pool.Exec(ctx, `UPDATE api_keys SET last_used_time = $2
-		WHERE api_key_id = $1 AND (last_used_time IS NULL OR last_used_time <= $2::timestamptz - interval '1 minute')`, keyID, now)
-	if err != nil {
-		s.Logger.WarnContext(ctx, "api_key_last_use_write_failed", slog.String("api_key_id", keyID), slog.Any("error", err))
-	}
 }
