@@ -1742,9 +1742,17 @@ test("provider waits for the Pages deploy stage", { skip: skipWait }, (t) => {
     },
   });
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.match(
-    result.calls,
-    /curl .*accounts\/account\/pages\/projects\/site\/deployments\/pages-1/,
+  const calls = result.calls.trimEnd().split("\n");
+  assert.equal(calls.length, 3, result.calls);
+  for (const call of calls) {
+    assert.match(
+      call,
+      /^curl .* https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/account\/pages\/projects\/site\/deployments\/pages-1$/,
+    );
+  }
+  assert.equal(
+    result.stdout.replace(/\n$/, "").split("\n").at(-1),
+    "Pages deployment pages-1 of site: production deploy success",
   );
 });
 
