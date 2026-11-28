@@ -94,12 +94,22 @@ describe("pagination", () => {
   });
 
   test("ends with an error when the server repeats a page token", async () => {
+    let requestNumber = 0;
     const server = fakeServer((router) => {
       router.service(AuditService, {
-        listAuditEvents: () => ({
-          events: [{ auditEventId: "a" }],
-          nextPageToken: "same",
-        }),
+        listAuditEvents: (req) => {
+          requestNumber += 1;
+          if (requestNumber > 2) {
+            throw new ConnectError(
+              `Repeated-token fixture received unexpected ListAuditEvents request ${requestNumber} with page token ${JSON.stringify(req.pageToken)}`,
+              Code.FailedPrecondition,
+            );
+          }
+          return {
+            events: [{ auditEventId: "a" }],
+            nextPageToken: "same",
+          };
+        },
       });
     });
     const client = new SandRunClient({
