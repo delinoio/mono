@@ -763,51 +763,86 @@ func TestCursorWatchRelistsWhileClaimIsBlocked(t *testing.T) {
 }
 
 func TestCursorWatchResumesAfterAdmissionOverflow(t *testing.T) {
-	w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
-	resume := make(chan struct{})
-	w.cursor.HoldClaim("blocked", resume)
-	w.cursor.AddRequest("blocked", true)
-	eventually(t, "the blocked Cursor claim", func() bool {
-		_, attempts, _ := w.cursor.WatchCalls()
-		return len(attempts) > 0
-	})
-	missed := w.cursor.AddRequest("missed", false)
+	for _, scenario := range []string{"stable prefix", "shrunken list", "changed marker"} {
+		t.Run(scenario, func(t *testing.T) {
+			w := newCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
+			resume := make(chan struct{})
+			w.cursor.HoldClaim("blocked", resume)
+			w.cursor.AddRequest("blocked", true)
+			eventually(t, "the blocked Cursor claim", func() bool {
+				_, attempts, _ := w.cursor.WatchCalls()
+				return len(attempts) > 0
+			})
+			missed := w.cursor.AddRequest("missed", false)
 
-	// Fill the whole queue with entries that stay visible in the scripted
-	// list but return 404 from the claim endpoint.
-	prefix := make([]cursorfake.Request, 100)
-	want := []string{"blocked"}
-	for i := range prefix {
-		prefix[i].ID = "stale-" + strconv.Itoa(i)
-		want = append(want, prefix[i].ID)
+			// Fill the queue with entries that remain in the scripted list
+			// but return 404 when the worker tries to claim them.
+			prefix := make([]cursorfake.Request, 100)
+			want := []string{"blocked"}
+			for i := range prefix {
+				prefix[i].ID = "stale-" + strconv.Itoa(i)
+				want = append(want, prefix[i].ID)
+			}
+			w.cursor.ScriptPages(
+				cursorfake.Page{Requests: prefix, NextPageToken: "later"},
+				cursorfake.Page{Requests: []cursorfake.Request{missed}, StreamCursor: "overflow"},
+			)
+			w.cursor.DropStreams()
+			eventually(t, "the stream after the full queue", func() bool {
+				_, _, cursors := w.cursor.WatchCalls()
+				return slices.Contains(cursors, "overflow") && w.cursor.Streams() == 1
+			})
+			if !strings.Contains(w.env.Logs.String(), `"cause":"admission_queue_full"`) {
+				t.Fatal("the later page did not overflow the admission queue")
+			}
+			close(resume)
+			eventually(t, "the first batch of claim attempts", func() bool {
+				_, attempts, _ := w.cursor.WatchCalls()
+				return len(attempts) == len(want)
+			})
+
+			var recovery []cursorfake.Request
+			var changed cursorfake.Request
+			switch scenario {
+			case "stable prefix":
+				recovery = prefix
+			case "changed marker":
+				changed = w.cursor.AddRequest(prefix[0].ID, false)
+				recovery = []cursorfake.Request{prefix[1], changed}
+				want = append(want, changed.ID)
+			}
+			w.cursor.ScriptPages(
+				cursorfake.Page{Requests: recovery, NextPageToken: "later", StreamCursor: "intermediate"},
+				cursorfake.Page{Requests: []cursorfake.Request{missed}, StreamCursor: "recovered"},
+			)
+			w.cursor.DropStreams()
+			eventually(t, "the recovery stream", func() bool {
+				_, _, cursors := w.cursor.WatchCalls()
+				return slices.Contains(cursors, "recovered")
+			})
+			w.requestBySource(t, missed.ID)
+			wantRequests := 2
+			if changed.ID != "" {
+				wantRequests++
+				req := w.requestBySource(t, changed.ID)
+				claim, err := w.l.Agents.Claim(t.Context(), req.GetRequestId())
+				if err != nil || claim.DemandMarker != strconv.FormatInt(changed.CreatedAtMs, 10) {
+					t.Fatalf("stored claim for changed demand = %+v, error = %v", claim, err)
+				}
+			}
+			if n := len(w.requests(t)); n != wantRequests {
+				t.Errorf("SandRun requests = %d, want %d", n, wantRequests)
+			}
+			_, attempts, cursors := w.cursor.WatchCalls()
+			want = append(want, missed.ID)
+			if !slices.Equal(attempts, want) {
+				t.Fatalf("claim attempts = %q, want %q", attempts, want)
+			}
+			if len(cursors) != 3 || !slices.Equal(cursors[1:], []string{"overflow", "recovered"}) {
+				t.Fatalf("stream cursors = %q, want the initial cursor then overflow and recovered", cursors)
+			}
+		})
 	}
-	w.cursor.ScriptPages(
-		cursorfake.Page{Requests: prefix, NextPageToken: "later"},
-		cursorfake.Page{Requests: []cursorfake.Request{missed}, StreamCursor: "overflow"},
-		cursorfake.Page{Requests: prefix, NextPageToken: "later"},
-		cursorfake.Page{Requests: []cursorfake.Request{missed}, StreamCursor: "retried"},
-	)
-	w.cursor.DropStreams()
-	eventually(t, "the stream after the full queue", func() bool {
-		_, _, cursors := w.cursor.WatchCalls()
-		return slices.Contains(cursors, "overflow") && w.cursor.Streams() == 1
-	})
-	if !strings.Contains(w.env.Logs.String(), `"cause":"admission_queue_full"`) {
-		t.Fatal("the later page did not overflow the admission queue")
-	}
-	close(resume)
-	eventually(t, "the first batch of claim attempts", func() bool {
-		_, attempts, _ := w.cursor.WatchCalls()
-		return len(attempts) >= len(want)
-	})
-	w.cursor.DropStreams()
-	w.requestBySource(t, missed.ID)
-	_, attempts, _ := w.cursor.WatchCalls()
-	want = append(want, missed.ID)
-	if !slices.Equal(attempts, want) {
-		t.Fatalf("claim attempts = %q, want one pass through the prefix before %q", attempts, missed.ID)
-	}
-	t.Logf("The watcher kept %d queued admissions, then claimed %q from a later page without retrying the unchanged prefix", len(prefix), missed.ID)
 }
 
 func TestCursorWatchStopCancelsAdmission(t *testing.T) {

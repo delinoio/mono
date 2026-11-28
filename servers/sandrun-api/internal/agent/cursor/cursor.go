@@ -138,14 +138,14 @@ func (v *Vendor) Watch(ctx context.Context, w *agent.Watch) {
 		admissions.run(ctx, func(a pendingAdmission) { v.admit(ctx, w, a.client, a.request) })
 	}()
 
-	var listStart int
-	w.Run(ctx, func() error { return v.watchSession(ctx, w, admissions, &listStart) })
+	var offeredPrefix map[demandKey]struct{}
+	w.Run(ctx, func() error { return v.watchSession(ctx, w, admissions, &offeredPrefix) })
 	<-done
 }
 
 // watchSession lists pending requests and follows the final page's cursor.
 // A relist timeout or an expired cursor ends the session on schedule.
-func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch, admissions *admissionQueue, listStart *int) error {
+func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch, admissions *admissionQueue, offeredPrefix *map[demandKey]struct{}) error {
 	c, err := v.api(ctx, w.In)
 	if err != nil {
 		return err
@@ -154,7 +154,8 @@ func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch, admissions *a
 	cursor := ""
 	token := ""
 	usedTokens := make(map[string]struct{})
-	position, nextStart := 0, -1
+	nextPrefix := make(map[demandKey]struct{})
+	overflowed := false
 	var listedAt time.Time
 	for {
 		q := url.Values{"pool": {pool}, "limit": {"100"}}
@@ -173,28 +174,31 @@ func (v *Vendor) watchSession(ctx context.Context, w *agent.Watch, admissions *a
 		if token == "" {
 			listedAt = time.Now()
 		}
-		// Continue listing even when the queue is full. On the next
-		// complete list, resume offering entries at the first omitted
-		// position so a persistent prefix cannot starve later pages.
-		for _, r := range page.Requests {
-			if r.ClaimedWorkerID != "" {
-				continue
+		// After the first failed offer, keep listing for the final cursor.
+		if !overflowed {
+			for _, r := range page.Requests {
+				if r.ClaimedWorkerID != "" {
+					continue
+				}
+				key := r.key()
+				if _, bypass := (*offeredPrefix)[key]; !bypass && !admissions.offer(c, r) {
+					overflowed = true
+					break
+				}
+				nextPrefix[key] = struct{}{}
 			}
-			if position >= *listStart && nextStart < 0 && !admissions.offer(c, r) {
-				nextStart = position
-			}
-			position++
 		}
 		cursor = page.StreamCursor
 		if token == "" {
 			break
 		}
 	}
-	if nextStart >= 0 {
+	// Update recovery state only after the list completes.
+	if overflowed {
 		w.Logger.DebugContext(ctx, "agent_demand_deferred", slog.String("cause", "admission_queue_full"))
-		*listStart = nextStart
+		*offeredPrefix = nextPrefix
 	} else {
-		*listStart = 0
+		*offeredPrefix = nil
 	}
 	relist := v.opts.RelistInterval
 	if relist == 0 {
