@@ -63,9 +63,54 @@ describe("fake billing history pagination", () => {
       pageToken: first.nextPageToken,
     });
     expect(last.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
-      "org-0201",
+      "org-0001",
     ]);
     expect(last.nextPageToken).toBe("");
+  });
+
+  test("ListLedgerEntries traverses the stored rows newest first without reordering them", async () => {
+    const api = createFakeApi();
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    addLedgerEntries(account, 2);
+    const storedLedger = account.ledger;
+    const storedIds = storedLedger.map((entry) => entry.ledgerEntryId);
+    const [newest, oldest, firstUsage, secondUsage] = storedLedger;
+    const credit = createClient(CreditService, api.transport);
+
+    let pageToken = "";
+    for (const expected of [newest, secondUsage, firstUsage, oldest]) {
+      const response = await credit.listLedgerEntries({
+        billingAccountId: ACCOUNT_ID,
+        pageSize: 1,
+        pageToken,
+      });
+      expect(
+        response.ledgerEntries.map((entry) => entry.ledgerEntryId),
+      ).toEqual([expected.ledgerEntryId]);
+      pageToken = response.nextPageToken;
+    }
+    expect(pageToken).toBe("");
+    expect(account.ledger).toBe(storedLedger);
+    expect(storedLedger.map((entry) => entry.ledgerEntryId)).toEqual(storedIds);
+  });
+
+  test("ListLedgerEntries compares nanoseconds before IDs when seconds match", async () => {
+    const api = createFakeApi();
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    account.ledger = [];
+    addLedgerEntries(account, 3);
+    account.ledger[0].createTime = {
+      ...account.ledger[0].createTime!,
+      nanos: 1,
+    };
+    const credit = createClient(CreditService, api.transport);
+
+    const response = await credit.listLedgerEntries({
+      billingAccountId: ACCOUNT_ID,
+    });
+    expect(response.ledgerEntries.map((entry) => entry.organizationId)).toEqual(
+      ["org-0001", "org-0003", "org-0002"],
+    );
   });
 
   test("ListLedgerEntries continues at the next row when the page size changes", async () => {
@@ -78,8 +123,8 @@ describe("fake billing history pagination", () => {
 
     const first = await credit.listLedgerEntries({ ...request, pageSize: 2 });
     expect(first.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
-      "org-0001",
-      "org-0002",
+      "org-0006",
+      "org-0005",
     ]);
     expect(first.nextPageToken).not.toBe("");
 
@@ -89,9 +134,9 @@ describe("fake billing history pagination", () => {
       pageSize: 3,
     });
     expect(larger.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
-      "org-0003",
       "org-0004",
-      "org-0005",
+      "org-0003",
+      "org-0002",
     ]);
     expect(larger.nextPageToken).not.toBe("");
 
@@ -101,7 +146,7 @@ describe("fake billing history pagination", () => {
       pageToken: larger.nextPageToken,
     });
     expect(last.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
-      "org-0006",
+      "org-0001",
     ]);
     expect(last.nextPageToken).toBe("");
 
@@ -110,7 +155,7 @@ describe("fake billing history pagination", () => {
       pageSize: 1,
     });
     expect(smaller.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
-      "org-0003",
+      "org-0004",
     ]);
     expect(smaller.nextPageToken).not.toBe("");
 
@@ -119,8 +164,8 @@ describe("fake billing history pagination", () => {
       pageSize: 2,
     });
     expect(same.ledgerEntries.map((entry) => entry.organizationId)).toEqual([
-      "org-0003",
       "org-0004",
+      "org-0003",
     ]);
     expect(same.nextPageToken).not.toBe("");
   });
