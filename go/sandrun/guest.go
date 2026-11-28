@@ -112,7 +112,14 @@ if [ -n "$SANDRUN_SYNC_PRUNE_ALIAS_LIST" ]; then
       if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 255; fi
     fi' sandrun < "$SANDRUN_SYNC_PRUNE_ALIAS_LIST"
 fi
-if [ -n "$SANDRUN_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$SANDRUN_SYNC_ARCHIVE"; fi`,
+if [ -n "$SANDRUN_SYNC_ARCHIVE" ]; then
+  # GNU tar otherwise applies archive parent metadata to existing directories.
+  tar_version=$(LC_ALL=C tar --version 2>/dev/null) || tar_version=
+  case "$tar_version" in
+    "tar (GNU tar) "*) tar --no-overwrite-dir -x -m -o -f "$SANDRUN_SYNC_ARCHIVE" ;;
+    *) tar -x -m -o -f "$SANDRUN_SYNC_ARCHIVE" ;;
+  esac
+fi`,
 	opCleanup: `status=0
 for f in "$SANDRUN_SYNC_ARCHIVE" "$SANDRUN_SYNC_DELETE_LIST" "$SANDRUN_SYNC_REPLACE_FILE_LIST" "$SANDRUN_SYNC_REPLACE_ALIAS_LIST" "$SANDRUN_SYNC_PRUNE_LIST" "$SANDRUN_SYNC_PRUNE_ALIAS_LIST"; do
   if [ -n "$f" ]; then rm -f "$f" || status=1; fi
