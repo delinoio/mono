@@ -9,14 +9,26 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-// This file holds the attach and detach logic of the Windows installation ISO
-// without a build tag, so that unit tests exercise it on every host. Only the
-// Windows build (winiso_windows.go) wires it to PowerShell.
+// This file holds path validation and attach and detach logic for the Windows
+// installation ISO without a build tag, so unit tests can exercise it on every
+// host. Only the Windows build (winiso_windows.go) wires it to PowerShell.
+
+func validateISOFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("imagebuild: the ISO file is not readable: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("imagebuild: --iso requires a regular file")
+	}
+	return nil
+}
 
 // isoMountTimeout bounds the Mount-DiskImage step. The step runs on a context
 // that the build cancellation does not reach: a canceled Mount-DiskImage may

@@ -7,11 +7,43 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestValidateISOFile(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("directory", func(t *testing.T) {
+		const want = "imagebuild: --iso requires a regular file"
+		if err := validateISOFile(dir); err == nil || err.Error() != want {
+			t.Errorf("validateISOFile(directory) = %v, want %q", err, want)
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		path := filepath.Join(dir, "missing.iso")
+		err := validateISOFile(path)
+		statErr, ok := errors.AsType[*os.PathError](err)
+		if !ok || statErr.Path != path || !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), statErr.Error()) {
+			t.Errorf("validateISOFile(missing file) = %v, want the filesystem error for %q", err, path)
+		}
+	})
+
+	t.Run("regular file", func(t *testing.T) {
+		path := filepath.Join(dir, "installer.iso")
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateISOFile(path); err != nil {
+			t.Errorf("validateISOFile(regular file) = %v, want nil", err)
+		}
+	})
+}
 
 // dismountRecorder is a mountedISO.run that records its calls and returns the
 // scripted results in order, then nil.

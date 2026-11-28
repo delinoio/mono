@@ -73,8 +73,8 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 	if err != nil {
 		return err
 	}
-	if st, err := os.Stat(iso); err != nil || !st.Mode().IsRegular() {
-		return fmt.Errorf("imagebuild: the ISO file is not readable: %v", err)
+	if err := validateISOFile(iso); err != nil {
+		return err
 	}
 	diskGiB := opts.DiskGiB
 	if diskGiB == 0 {
