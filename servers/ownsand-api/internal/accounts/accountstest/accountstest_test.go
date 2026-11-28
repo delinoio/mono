@@ -19,6 +19,113 @@ import (
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 )
 
+func TestListManageableBillingAccountsRejectsNegativePageSize(t *testing.T) {
+	t.Parallel()
+	const userID = "fixture-user"
+	const accountID = "019b76da-a800-7000-8000-000000000001"
+	const owner = accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER
+	f := New(t, nil)
+	f.AddAccount(accountID, "Account", map[string]accountsv1.BillingAccountRole{userID: owner})
+	client := f.Client()
+
+	for _, tc := range []struct {
+		size  int32
+		token string
+	}{
+		{size: -1},
+		{size: math.MinInt32},
+		{size: -1, token: "invalid token"},
+	} {
+		resp, err := client.ListManageableBillingAccounts(t.Context(), connect.NewRequest(&accountsv1.ListManageableBillingAccountsRequest{
+			UserId: userID, PageSize: tc.size, PageToken: tc.token,
+		}))
+		var connectErr *connect.Error
+		if resp != nil || !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeInvalidArgument ||
+			connectErr.Message() != "page_size must not be negative" {
+			t.Errorf("size %d with token %q returned %v, %v; want no page and InvalidArgument with page_size must not be negative", tc.size, tc.token, resp, err)
+		}
+	}
+
+	resp, err := client.ListManageableBillingAccounts(t.Context(), connect.NewRequest(&accountsv1.ListManageableBillingAccountsRequest{
+		UserId: userID, PageSize: 1,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := resp.Msg.GetBillingAccounts()
+	if len(accounts) != 1 || accounts[0].GetBillingAccountId() != accountID ||
+		accounts[0].GetCallerRole() != owner || resp.Msg.GetNextPageToken() != "" {
+		t.Fatalf("size 1 returned %v; want the owner's account and an empty token", resp.Msg)
+	}
+}
+
+func TestListManageableBillingAccountsPaginates(t *testing.T) {
+	t.Parallel()
+	const userID = "fixture-user"
+	const otherUserID = "other-user"
+	const (
+		owner  = accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER
+		admin  = accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN
+		viewer = accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_VIEWER
+	)
+	f := New(t, nil)
+	type accountRow struct {
+		id   string
+		role accountsv1.BillingAccountRole
+	}
+	var want [201]accountRow
+	for i := len(want); i >= 1; i-- {
+		id := fmt.Sprintf("019b76da-a800-7000-8000-%012d", i)
+		role := owner
+		if i%2 == 0 {
+			role = admin
+		}
+		want[i-1] = accountRow{id: id, role: role}
+		f.AddAccount(id, "Manageable", map[string]accountsv1.BillingAccountRole{userID: role, otherUserID: role})
+	}
+	f.AddAccount("019b76da-a800-7000-8000-000000000202", "Viewable", map[string]accountsv1.BillingAccountRole{userID: viewer})
+	client := f.Client()
+
+	checkPage := func(size int32, token string, rows []accountRow, wantNext bool) string {
+		t.Helper()
+		resp, err := client.ListManageableBillingAccounts(t.Context(), connect.NewRequest(&accountsv1.ListManageableBillingAccountsRequest{
+			UserId: userID, PageSize: size, PageToken: token,
+		}))
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		accounts := resp.Msg.GetBillingAccounts()
+		if len(accounts) != len(rows) {
+			t.Fatalf("size %d returned %d accounts; want %d", size, len(accounts), len(rows))
+		}
+		for i, row := range rows {
+			if id, role := accounts[i].GetBillingAccountId(), accounts[i].GetCallerRole(); id != row.id || role != row.role {
+				t.Errorf("size %d row %d = (%q, %v); want (%q, %v)", size, i, id, role, row.id, row.role)
+			}
+		}
+		next := resp.Msg.GetNextPageToken()
+		if (next != "") != wantNext {
+			t.Fatalf("size %d returned token %q; want a continuation token: %t", size, next, wantNext)
+		}
+		return next
+	}
+
+	checkPage(0, "", want[:50], true)
+	checkPage(1, "", want[:1], true)
+	checkPage(137, "", want[:137], true)
+	checkPage(200, "", want[:200], true)
+	next := checkPage(201, "", want[:200], true)
+	checkPage(math.MaxInt32, "", want[:200], true)
+	checkPage(201, next, want[200:], false)
+
+	resp, err := client.ListManageableBillingAccounts(t.Context(), connect.NewRequest(&accountsv1.ListManageableBillingAccountsRequest{
+		UserId: otherUserID, PageSize: 201, PageToken: next,
+	}))
+	if resp != nil || connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("another user's token returned %v, %v; want no page and InvalidArgument", resp, err)
+	}
+}
+
 func TestGetOrganizationBillingCountsOnlyTheCurrentMonth(t *testing.T) {
 	const (
 		org     = "org-1"
