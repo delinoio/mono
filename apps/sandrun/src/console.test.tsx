@@ -992,6 +992,8 @@ describe("organization member pagination", () => {
   });
 }, 20_000);
 
+// The Members page renders the full Acme roster of more than 200 rows, and the
+// UpdateMemberRole case exceeded the 5-second default in CI.
 describe("direct action failures", () => {
   const membersPath = `/orgs/${MOCK_IDS.acme}/members`;
   const integrationsPath = `/orgs/${MOCK_IDS.acme}/integrations`;
@@ -1150,7 +1152,7 @@ describe("direct action failures", () => {
     expect(screen.queryByText(sessionEnded)).toBeNull();
     expect(screen.queryByRole("button", signInButton)).toBeNull();
   });
-});
+}, 20_000);
 
 describe("failed requests", () => {
   test.each([
