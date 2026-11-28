@@ -199,6 +199,7 @@ describe("sign-in callback with a redirect in progress", () => {
     pendingInvitation.save(TOKEN);
     renderCallback({ strict: true });
     await settle();
+    expect(completions).toBe(1);
     expect(window.location.pathname).toBe("/billing/invitations/accept");
     expect(pendingInvitation.read()).toBe(TOKEN);
   });
