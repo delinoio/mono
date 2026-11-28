@@ -680,17 +680,45 @@ func TestSurplusWhileStarting(t *testing.T) {
 		eventually(t, "unregistered surplus runner marked for deletion", func() bool {
 			return w.runner(t, id).GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETING
 		})
-		w.gh.Update(func() { w.gh.JITGate = nil })
+		runnerName := "sandrun-" + id
+		type deletion struct {
+			requestedID  int64
+			registration githubfake.Runner
+			registered   bool
+		}
+		deletions := make(chan deletion, 1)
+		w.gh.Update(func() {
+			w.gh.DeleteGate = func(requestedID int64) {
+				reg, registered := w.gh.RunnerByName(runnerName)
+				select {
+				case deletions <- deletion{requestedID, reg, registered}:
+				default:
+				}
+			}
+			w.gh.JITGate = nil
+		})
 		close(release)
 		released = true
+		select {
+		case d := <-deletions:
+			if !d.registered || d.requestedID != d.registration.ID {
+				t.Fatalf("GitHub DELETE targeted ID %d, want ID %d of runner %q (registered: %t)",
+					d.requestedID, d.registration.ID, runnerName, d.registered)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("timed out waiting for the late GitHub registration delete request")
+		}
 		eventually(t, "the late registration removed", func() bool {
-			_, ok := w.gh.RunnerByName("sandrun-" + id)
-			return w.gh.Calls("generate_jitconfig") == 1 && !ok
+			_, registered := w.gh.RunnerByName(runnerName)
+			return !registered
 		})
 		eventually(t, "surplus runner sandbox deleted", func() bool {
 			r := w.runner(t, id)
 			return r.GetState() == sandrunv1.RunnerState_RUNNER_STATE_DELETED && r.GetEndReason() == sandrunv1.RunnerEndReason_RUNNER_END_REASON_SURPLUS
 		})
+		if calls := w.gh.Calls("generate_jitconfig"); calls != 1 {
+			t.Errorf("generated %d JIT configurations, want 1", calls)
+		}
 		stays(t, "no runner program", func() bool {
 			for _, cmd := range w.progs.all() {
 				if strings.Contains(strings.Join(cmd, " "), "--jitconfig") {
