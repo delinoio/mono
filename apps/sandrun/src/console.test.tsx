@@ -5641,6 +5641,32 @@ describe("work", () => {
       },
     );
 
+    test("passes the opaque continuation to load the last two requests", async () => {
+      const continuation = "cTE6MiwyMDI2LTExLTI4VDAwOjAwOjAwWiw1MA";
+      const { transport, calls } = requestPages((token) => {
+        if (token === "") {
+          return { requests: firstPage, nextPageToken: continuation };
+        }
+        if (token === continuation) {
+          return { requests: [request(51), request(52)] };
+        }
+        throw new ConnectError("Unexpected page token", Code.InvalidArgument);
+      });
+      renderConsole(path(MOCK_IDS.northwind), { transport });
+
+      const showMore = await screen.findByRole("button", { name: "Show more" });
+      expect(sources()).toEqual(firstPage.map((row) => row.sourceKey));
+
+      await click(showMore);
+
+      expect(calls.map(({ pageToken }) => pageToken)).toEqual([
+        "",
+        continuation,
+      ]);
+      expect(sources().slice(-2)).toEqual(["request-51", "request-52"]);
+      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    });
+
     test("keeps the next token after a duplicate-only page", async () => {
       const { transport, calls } = requestPages((token) => {
         switch (token) {

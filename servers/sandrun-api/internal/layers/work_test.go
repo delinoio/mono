@@ -5,7 +5,9 @@ package layers_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"slices"
@@ -733,7 +735,7 @@ func TestWorkService(t *testing.T) {
 
 	// Pagination with ended requests: open first, then ended.
 	all, err := owner.Work.ListRequests(ctx, connect.NewRequest(&sandrunv1.ListRequestsRequest{OrganizationId: w.org.ID, IncludeEnded: true, PageSize: 2}))
-	if err != nil || len(all.Msg.GetRequests()) != 2 || all.Msg.GetNextPageToken() == "" {
+	if err != nil || len(all.Msg.GetRequests()) != 2 || all.Msg.GetNextPageToken() != requestPageToken("o1:2") {
 		t.Fatalf("page 1 %v %v", all, err)
 	}
 	page2, err := owner.Work.ListRequests(ctx, connect.NewRequest(&sandrunv1.ListRequestsRequest{OrganizationId: w.org.ID, IncludeEnded: true, PageSize: 2, PageToken: all.Msg.GetNextPageToken()}))
@@ -771,6 +773,150 @@ func TestWorkService(t *testing.T) {
 	wantCode(t, "personal API key", err, connect.CodePermissionDenied)
 	_, err = w.env.User("outsider").Work.GetRequest(ctx, connect.NewRequest(&sandrunv1.GetRequestRequest{OrganizationId: w.org.ID, RequestId: high.GetDevSessionId()}))
 	wantCode(t, "outsider", err, connect.CodeNotFound)
+}
+
+func TestWorkServiceRequestQueueBoundary(t *testing.T) {
+	t.Parallel()
+	for _, cancelAt := range []int{0, 1} {
+		t.Run(fmt.Sprintf("cancel row %d", cancelAt+1), func(t *testing.T) {
+			t.Parallel()
+			var services layers.Layers
+			env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &services))
+			org := env.NewOrg("queue")
+			queuedAt := env.Clock.Now().Truncate(time.Second)
+			profileID := "0193b000-0000-7000-8000-000000000100"
+			rows := []struct {
+				priority sandrunv1.Priority
+				time     time.Time
+			}{
+				{sandrunv1.Priority_PRIORITY_HIGH, queuedAt.Add(time.Second)},
+				{sandrunv1.Priority_PRIORITY_NORMAL, queuedAt},
+				{sandrunv1.Priority_PRIORITY_NORMAL, queuedAt.Add(time.Microsecond)},
+				{sandrunv1.Priority_PRIORITY_LOW, queuedAt},
+			}
+			ids := make([]string, len(rows))
+			for i, row := range rows {
+				ids[i] = seedListRequest(t, env, org.ID, profileID, i+1, sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, row.priority, row.time)
+			}
+
+			first := listRequestPage(t, env, org, &sandrunv1.ListRequestsRequest{PageSize: 2}, ids[:2])
+			if first == "" {
+				t.Fatal("first page has no continuation")
+			}
+			_, err := env.User(org.Admin).Work.CancelRequest(t.Context(), connect.NewRequest(&sandrunv1.CancelRequestRequest{
+				OrganizationId: org.ID, RequestId: ids[cancelAt],
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			listRequestPage(t, env, org, &sandrunv1.ListRequestsRequest{PageSize: 2, PageToken: first}, ids[2:])
+		})
+	}
+}
+
+func TestWorkServiceRequestQueueFiltersAndTokens(t *testing.T) {
+	t.Parallel()
+	var services layers.Layers
+	env := testenv.New(t, testenv.WithLayers(ownsandfake.New(), &services))
+	org := env.NewOrg("queue")
+	otherOrg := env.NewOrg("other")
+	profileID := "0193b000-0000-7000-8000-000000000100"
+	otherProfileID := "0193b000-0000-7000-8000-000000000101"
+	queuedAt := env.Clock.Now().Truncate(time.Microsecond)
+	const (
+		kind     = sandrunv1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION
+		priority = sandrunv1.Priority_PRIORITY_NORMAL
+		queued   = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+		ended    = sandrunv1.RequestState_REQUEST_STATE_CANCELED
+	)
+	ids := make([]string, 4)
+	for i := len(ids) - 1; i >= 0; i-- {
+		ids[i] = seedListRequest(t, env, org.ID, profileID, 2*i+2, kind, priority, queuedAt)
+	}
+	seedListRequest(t, env, otherOrg.ID, profileID, 3, kind, priority, queuedAt)
+	seedListRequest(t, env, org.ID, otherProfileID, 5, kind, priority, queuedAt)
+	seedListRequest(t, env, org.ID, profileID, 7, sandrunv1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION, priority, queuedAt)
+
+	for _, includeEnded := range []bool{false, true} {
+		req := &sandrunv1.ListRequestsRequest{PageSize: 2, RunnerProfileId: profileID, Kind: kind, IncludeEnded: includeEnded}
+		if includeEnded {
+			req.States = []sandrunv1.RequestState{queued}
+		}
+		token := listRequestPage(t, env, org, req, ids[:2])
+		wantToken := requestPageToken(fmt.Sprintf("q1:%d,%s,%s", priority, queuedAt.UTC().Format(time.RFC3339Nano), ids[1]))
+		if token != wantToken {
+			t.Fatalf("next token = %q, want queue boundary %q", token, wantToken)
+		}
+		req.PageToken = token
+		req.PageToken = listRequestPage(t, env, org, req, ids[2:])
+		if req.PageToken != "" {
+			listRequestPage(t, env, org, req, nil)
+		}
+	}
+
+	req := &sandrunv1.ListRequestsRequest{PageSize: 1, RunnerProfileId: profileID, Kind: kind, PageToken: requestPageToken("o1:2")}
+	if got := listRequestPage(t, env, org, req, ids[2:3]); got != requestPageToken("o1:3") {
+		t.Fatalf("legacy continuation returned token %q, want offset 3", got)
+	}
+	req.PageToken = ""
+	queueToken := listRequestPage(t, env, org, req, ids[:1])
+	for _, tc := range []struct {
+		name         string
+		token        string
+		includeEnded bool
+		states       []sandrunv1.RequestState
+	}{
+		{name: "malformed base64", token: "!"},
+		{name: "malformed offset", token: requestPageToken("o1:-1")},
+		{name: "unknown version", token: requestPageToken("q2:")},
+		{name: "missing tuple fields", token: requestPageToken("q1:2")},
+		{name: "out of range priority", token: requestPageToken("q1:32768,2026-11-28T00:00:00Z," + ids[0])},
+		{name: "malformed timestamp", token: requestPageToken("q1:2,yesterday," + ids[0])},
+		{name: "malformed UUID", token: requestPageToken("q1:2,2026-11-28T00:00:00Z,invalid")},
+		{name: "all states", token: queueToken, includeEnded: true},
+		{name: "explicit ended state", token: queueToken, states: []sandrunv1.RequestState{ended}},
+		{name: "active and ended states", token: queueToken, states: []sandrunv1.RequestState{queued, ended}},
+	} {
+		_, err := env.User(org.Member).Work.ListRequests(t.Context(), connect.NewRequest(&sandrunv1.ListRequestsRequest{
+			OrganizationId: org.ID, PageToken: tc.token, IncludeEnded: tc.includeEnded, States: tc.states,
+		}))
+		wantCode(t, tc.name, err, connect.CodeInvalidArgument)
+	}
+}
+
+func requestPageToken(payload string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(payload))
+}
+
+func listRequestPage(t *testing.T, env *testenv.Env, org testenv.Org, req *sandrunv1.ListRequestsRequest, want []string) string {
+	t.Helper()
+	req.OrganizationId = org.ID
+	resp, err := env.User(org.Member).Work.ListRequests(t.Context(), connect.NewRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, request := range resp.Msg.GetRequests() {
+		got = append(got, request.GetRequestId())
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("requests = %v, want %v", got, want)
+	}
+	return resp.Msg.GetNextPageToken()
+}
+
+func seedListRequest(t *testing.T, env *testenv.Env, orgID, profileID string, number int, kind sandrunv1.WorkloadKind, priority sandrunv1.Priority, queuedAt time.Time) string {
+	t.Helper()
+	id := fmt.Sprintf("0193b000-0000-7000-8000-%012x", number)
+	_, err := env.DB.Pool.Exec(t.Context(), `INSERT INTO requests (request_id, organization_id, runner_profile_id,
+		kind, source, source_key, state, priority, queue_time, queue_deadline, create_time, update_time)
+		VALUES ($1, $2, $3, $4, $5, $1::uuid::text, $6, $7, $8, $9, $8, $8)`,
+		id, orgID, profileID, int16(kind), int16(work.SourceDevSession), int16(sandrunv1.RequestState_REQUEST_STATE_QUEUED),
+		int16(priority), queuedAt, queuedAt.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func TestDeleteRunnerUsesLockedState(t *testing.T) {

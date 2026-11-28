@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { Transport } from "@connectrpc/connect";
-import { GitHubInstallationState } from "@delino/sandrun-protos/v1/common_pb";
+import {
+  Code,
+  ConnectError,
+  createRouterTransport,
+  type Transport,
+} from "@connectrpc/connect";
+import {
+  GitHubInstallationState,
+  RequestState,
+} from "@delino/sandrun-protos/v1/common_pb";
+import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
+import { PAGE_SIZE } from "../src/api.ts";
 import type { MockTransportOptions } from "../src/mock/mock-api.ts";
 import {
   DEV_SESSION_REFRESH_FIXTURE,
@@ -73,6 +83,47 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
     window.sandrunRequestCancellationFixture = fixture;
     return transport;
   }
+
+  if (sessionStorage.getItem("sandrun.request-pagination") === "enabled") {
+    const base = createSettingsMock(options);
+    const continuation = "opaque-queue-boundary";
+    const pages = createRouterTransport((router) => {
+      router.service(WorkService, {
+        listRequests({ pageSize, pageToken }) {
+          if (
+            pageSize !== PAGE_SIZE ||
+            (pageToken !== "" && pageToken !== continuation)
+          ) {
+            throw new ConnectError(
+              "Unexpected request page",
+              Code.InvalidArgument,
+            );
+          }
+          const start = pageToken === "" ? 1 : PAGE_SIZE + 1;
+          return {
+            requests: Array.from(
+              { length: pageToken === "" ? PAGE_SIZE : 2 },
+              (_, i) => ({
+                requestId: `fixture-${start + i}`,
+                sourceKey: `request-${start + i}`,
+                state: RequestState.QUEUED,
+              }),
+            ),
+            nextPageToken: pageToken === "" ? continuation : "",
+          };
+        },
+      });
+    });
+    return {
+      ...base,
+      unary: (method, ...args) =>
+        (method.name === WorkService.method.listRequests.name
+          ? pages
+          : base
+        ).unary(method, ...args),
+    };
+  }
+
   const createMode = sessionStorage.getItem(ORGANIZATION_CREATION_FIXTURE);
   if (
     createMode === "hold-list" ||
