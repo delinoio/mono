@@ -60,17 +60,41 @@ type DownloadResult struct {
 // next to the workspace, read with ReadDevSessionFile and extracted
 // locally. The SDK removes the guest archive after the probe completes and
 // the archive is no longer needed. A file above 500 MiB or
-// a transfer above 2 GiB fails (*LimitError): the SDK checks the size of
-// the file or the archive before it reads it and every archive entry during
+// a transfer above 2 GiB fails (*LimitError). The SDK checks the file or archive
+// size before and during the read. It checks every archive entry during
 // extraction. Extraction rejects absolute entries, entries outside the
 // destination and symbolic links that point outside it. The result is
 // written to a temporary location next to LocalPath and moved into place
 // only after the download succeeded.
 func (c *Client) Download(ctx context.Context, p DownloadParams) (*DownloadResult, error) {
-	return c.download(ctx, p, archiveExtractor{fileLimit: DownloadFileLimit, totalLimit: DownloadTotalLimit, link: (*os.Root).Link})
+	return c.download(ctx, p, downloadLimits{file: DownloadFileLimit, total: DownloadTotalLimit},
+		archiveExtractor{fileLimit: DownloadFileLimit, totalLimit: DownloadTotalLimit, link: (*os.Root).Link})
 }
 
-func (c *Client) download(ctx context.Context, p DownloadParams, extractor archiveExtractor) (*DownloadResult, error) {
+type downloadLimits struct {
+	file  int64
+	total int64
+}
+
+func (l downloadLimits) exceeded(dir bool, guestPath string, size int64) error {
+	err := &LimitError{Operation: "download", FileLimit: l.file, TotalLimit: l.total}
+	if dir {
+		err.Total = size
+	} else {
+		err.Paths = []PathSize{{Path: guestPath, Size: size}}
+	}
+	return localError(connect.CodeFailedPrecondition, err)
+}
+
+func (l downloadLimits) readError(err error, dir bool, guestPath string) error {
+	var limitErr *readLimitError
+	if errors.As(err, &limitErr) {
+		return l.exceeded(dir, guestPath, limitErr.observed)
+	}
+	return err
+}
+
+func (c *Client) download(ctx context.Context, p DownloadParams, limits downloadLimits, extractor archiveExtractor) (*DownloadResult, error) {
 	report := func(tp TransferProgress) {
 		if p.Progress != nil {
 			p.Progress(tp)
@@ -109,11 +133,8 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 		return nil, localError(connect.CodeInternal, errors.New("sandrun: the guest probe returned an unexpected result"))
 	}
 	dir := kind == "dir"
-	switch {
-	case !dir && probeSize > DownloadFileLimit:
-		return nil, localError(connect.CodeFailedPrecondition, &LimitError{Operation: "download", FileLimit: DownloadFileLimit, TotalLimit: DownloadTotalLimit, Paths: []PathSize{{Path: guestPath, Size: probeSize}}})
-	case dir && probeSize > DownloadTotalLimit:
-		return nil, localError(connect.CodeFailedPrecondition, &LimitError{Operation: "download", FileLimit: DownloadFileLimit, TotalLimit: DownloadTotalLimit, Total: probeSize})
+	if (!dir && probeSize > limits.file) || (dir && probeSize > limits.total) {
+		return nil, limits.exceeded(dir, guestPath, probeSize)
 	}
 
 	dest, err := filepath.Abs(p.LocalPath)
@@ -141,13 +162,13 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 		if err != nil {
 			return nil, err
 		}
-		wireBytes, err = c.readGuestFile(ctx, s, archive, DownloadTotalLimit, af, progress)
+		wireBytes, err = c.readGuestFile(ctx, s, archive, limits.total, af, progress)
 		if err == nil {
 			_, err = af.Seek(0, 0)
 		}
 		if err != nil {
 			af.Close()
-			return nil, wrapLimit(err)
+			return nil, limits.readError(err, true, guestPath)
 		}
 		report(TransferProgress{Phase: TransferApplying, BytesDone: wireBytes, BytesTotal: wireBytes})
 		staged = filepath.Join(tmp, "result")
@@ -171,12 +192,12 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 		if err != nil {
 			return nil, err
 		}
-		wireBytes, err = c.readGuestFile(ctx, s, guestPath, DownloadFileLimit, f, progress)
+		wireBytes, err = c.readGuestFile(ctx, s, guestPath, limits.file, f, progress)
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
 		if err != nil {
-			return nil, wrapLimit(err)
+			return nil, limits.readError(err, false, guestPath)
 		}
 		res.Files, res.Bytes = 1, wireBytes
 	}
