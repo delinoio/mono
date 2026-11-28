@@ -67,6 +67,12 @@ type link struct {
 	status     *accountsv1.OrganizationBillingStatus
 }
 
+func (l *link) suspensionDue(now time.Time) bool {
+	deadline := l.status.GetSuspendTime()
+	return l.status.GetStatus() == accountsv1.BillingStatus_BILLING_STATUS_BLOCKED &&
+		deadline != nil && !now.Before(deadline.AsTime())
+}
+
 // usageKey identifies the usage of one organization and meter in one UTC
 // calendar month. The accounts API counts a report in the month in which its
 // window starts, so the month is part of the key.
@@ -274,6 +280,23 @@ func (f *Server) refreshLocked(org string) {
 		st.SuspendTime = timestamppb.New(start.Add(72 * time.Hour))
 	}
 	l.status = st
+}
+
+// suspendDueLinksLocked updates due links of a, or of every account if a is nil.
+func (f *Server) suspendDueLinksLocked(a *account, now time.Time) {
+	var orgs []string
+	for org, l := range f.links {
+		if (a == nil || l.account == a.id) && l.suspensionDue(now) {
+			orgs = append(orgs, org)
+		}
+	}
+	slices.Sort(orgs)
+	for _, org := range orgs {
+		f.seq++
+		status := f.links[org].status
+		status.Status = accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED
+		status.Sequence = f.seq
+	}
 }
 
 // Fail makes every later call of method fail with err; nil clears it.
@@ -514,6 +537,7 @@ func (h handler) ListBillingStatusChanges(_ context.Context, req *connect.Reques
 	size = min(size, 200)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.suspendDueLinksLocked(nil, f.now())
 	var out []*accountsv1.OrganizationBillingStatus
 	for _, l := range f.links {
 		if l.status.GetSequence() > req.Msg.GetAfterSequence() {
@@ -690,12 +714,16 @@ func (h handler) GetOrganizationBilling(_ context.Context, req *connect.Request[
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("the organization has no link"))
 	}
 	a := f.accounts[l.account]
-	now := f.now().UTC()
+	now := f.now()
+	if l.suspensionDue(now) {
+		f.suspendDueLinksLocked(a, now)
+	}
+	month := utcMonth(now)
 	resp := &accountsv1.GetOrganizationBillingResponse{BillingAccountId: a.id, BillingAccountName: a.name, BalanceUsdMicros: a.balance,
-		Status: proto.Clone(l.status).(*accountsv1.OrganizationBillingStatus), MonthStart: timestamppb.New(utcMonth(now))}
+		Status: proto.Clone(l.status).(*accountsv1.OrganizationBillingStatus), MonthStart: timestamppb.New(month)}
 	for _, m := range []accountsv1.Meter{accountsv1.Meter_METER_OWNSAND_RELAY_EGRESS, accountsv1.Meter_METER_OWNSAND_R2_STORAGE,
 		accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC} {
-		u := f.usage[usageKey{org: org, meter: m, month: utcMonth(now)}]
+		u := f.usage[usageKey{org: org, meter: m, month: month}]
 		resp.MeterUsages = append(resp.MeterUsages, &accountsv1.MeterUsage{Meter: m, Quantity: u[0], AmountUsdMicros: u[1]})
 	}
 	return connect.NewResponse(resp), nil
