@@ -356,6 +356,43 @@ export function createMockTransport(): Transport {
   return {
     ...base,
     async unary(method, signal, timeout, header, input, contextValues) {
+      if (method.name === "ListSnapshots" || method.name === "ListTemplates") {
+        const key = `ownsand-e2e-hold-initial-${method.name}`;
+        const state = sessionStorage.getItem(key);
+        const { organizationId, pageToken = "" } = input as {
+          organizationId: string;
+          pageToken?: string;
+        };
+        if (
+          organizationId === MOCK_IDS.acme &&
+          pageToken === "" &&
+          (state === "hold" || state === "held")
+        ) {
+          const response = await base.unary(
+            method,
+            signal,
+            timeout,
+            header,
+            input,
+            contextValues,
+          );
+          // Strict Mode may abort the first request before it can be held.
+          if (!signal?.aborted && sessionStorage.getItem(key) !== "released") {
+            await new Promise<void>((resolve) => {
+              window.addEventListener(
+                `${key}-release`,
+                () => {
+                  sessionStorage.setItem(key, "released");
+                  resolve();
+                },
+                { once: true },
+              );
+              sessionStorage.setItem(key, "held");
+            });
+          }
+          return response;
+        }
+      }
       const staleTemplateDelete = "ownsand-e2e-stale-template-delete";
       if (
         method.name === "DeleteTemplate" &&
