@@ -68,7 +68,7 @@ func r2RetryControl(t *testing.T, env *testenv.Env, prefix string, pages []r2Lis
 	t.Cleanup(server.Close)
 	store := &objectstore.R2{Endpoint: server.URL, Bucket: "bucket", AccessKeyID: "fixture", SecretAccessKey: "test", Client: server.Client()}
 	control := api.NewControl(&api.Service{
-		DB: env.DB, Logger: env.Logger, Now: env.Clock.Now, Objects: store,
+		DB: env.DB, Logger: env.Logger, Now: env.Clock.Now, Objects: store, Lease: env.App.Lease,
 		Timing: api.Timing{ExportVerifyPoll: verifyPoll},
 	})
 	return control, func() []string {
