@@ -139,6 +139,7 @@ export function InvoicesSection() {
                   aria-label={t("invoices.openLabel", {
                     date: formatDate(invoice.createTime, lang),
                     amount: formatUsd(invoice.amountUsdMicros, lang),
+                    transaction: invoice.paddleTransactionId,
                   })}
                   onClick={() => open(invoice)}
                 >

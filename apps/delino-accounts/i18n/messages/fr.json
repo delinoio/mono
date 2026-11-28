@@ -218,7 +218,7 @@
   "invoices.summary": "{kind} · {amount}",
   "invoices.dateAndTransaction": "{date} · {transaction}",
   "invoices.open": "Ouvrir la facture",
-  "invoices.openLabel": "Ouvrir la facture du {date} d’un montant de {amount}",
+  "invoices.openLabel": "Ouvrir la facture du {date} d’un montant de {amount} (transaction {transaction})",
   "invoices.showOlder": "Afficher les factures plus anciennes",
   "settings.readOnly": "Seuls les propriétaires et les administrateurs peuvent modifier ces paramètres.",
   "settings.name.title": "Nom",

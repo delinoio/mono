@@ -143,7 +143,9 @@ describe("invoices", () => {
     });
     await openTab("Invoices");
     const list = await screen.findByRole("list", { name: "Invoices" });
-    await click(within(list).getByRole("button", { name: /Open the invoice/ }));
+    await click(
+      within(list).getByRole("button", { name: /^Open invoice dated / }),
+    );
     return { ...rendered, stub };
   }
 
@@ -176,7 +178,9 @@ describe("invoices", () => {
     const { stub } = await openInvoice(unauthenticated());
     expectSessionNotice();
     const list = screen.getByRole("list", { name: "Invoices" });
-    await click(within(list).getByRole("button", { name: /Open the invoice/ }));
+    await click(
+      within(list).getByRole("button", { name: /^Open invoice dated / }),
+    );
     expect(stub.tabs).toHaveLength(2);
     expect(stub.tabs[1]!.closeCalls).toBe(0);
     expect(stub.tabs[1]!.replaced).toEqual([

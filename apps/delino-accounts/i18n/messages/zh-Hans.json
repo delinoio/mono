@@ -218,7 +218,7 @@
   "invoices.summary": "{kind} · {amount}",
   "invoices.dateAndTransaction": "{date} · {transaction}",
   "invoices.open": "打开发票",
-  "invoices.openLabel": "打开 {date} 金额为 {amount} 的发票",
+  "invoices.openLabel": "打开发票：{date}，{amount}（交易 {transaction}）",
   "invoices.showOlder": "显示更早的发票",
   "settings.readOnly": "只有所有者和管理员可以更改这些设置。",
   "settings.name.title": "名称",

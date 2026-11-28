@@ -218,7 +218,7 @@
   "invoices.summary": "{kind} · {amount}",
   "invoices.dateAndTransaction": "{date} · {transaction}",
   "invoices.open": "청구서 열기",
-  "invoices.openLabel": "{date}자 {amount} 청구서 열기",
+  "invoices.openLabel": "청구서 열기: {date}, {amount} (거래 {transaction})",
   "invoices.showOlder": "이전 청구서 보기",
   "settings.readOnly": "소유자와 관리자만 이 설정을 변경할 수 있습니다.",
   "settings.name.title": "이름",

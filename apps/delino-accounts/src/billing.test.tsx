@@ -1069,6 +1069,33 @@ describe("organizations", () => {
 });
 
 describe("invoices", () => {
+  function invoiceButtonName(transactionId: string) {
+    const date = new Date("2026-11-01T00:00:00Z").toLocaleDateString("en", {
+      dateStyle: "medium",
+    });
+    return `Open invoice dated ${date} for $25.00 (transaction ${transactionId})`;
+  }
+
+  /** Stands in for the blank tab that the click reserves. */
+  function fakeTab() {
+    const tab = {
+      opener: "app" as unknown,
+      closed: false,
+      replaced: [] as string[],
+      closeCalls: 0,
+      location: {
+        replace(url: string) {
+          tab.replaced.push(url);
+        },
+      },
+      close() {
+        tab.closeCalls += 1;
+        tab.closed = true;
+      },
+    };
+    return tab;
+  }
+
   test("a viewer has no invoices tab", async () => {
     await renderAccount(VIEWER);
     expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
@@ -1130,43 +1157,26 @@ describe("invoices", () => {
   });
 
   test("opens the invoice link that GetInvoiceUrl returns without storing it", async () => {
-    const opened: { replaced?: string; opener: unknown; closed: boolean } = {
-      opener: "app",
-      closed: false,
-    };
+    const opened = fakeTab();
     const originalOpen = window.open;
-    window.open = (() => ({
-      get opener() {
-        return opened.opener;
-      },
-      set opener(value: unknown) {
-        opened.opener = value;
-      },
-      closed: false,
-      location: {
-        replace(url: string) {
-          opened.replaced = url;
-        },
-      },
-      close() {
-        opened.closed = true;
-      },
-    })) as unknown as typeof window.open;
+    window.open = (() => opened) as unknown as typeof window.open;
     try {
       const { api } = await renderAccount(ADMIN);
       await openTab("Invoices");
       const list = await screen.findByRole("list", { name: "Invoices" });
       expect(list.textContent).toContain("Top-up · $25.00");
-      await click(
-        within(list).getByRole("button", { name: /Open the invoice/ }),
-      );
+      const button = within(list).getByRole("button", {
+        name: invoiceButtonName("txn_top1"),
+      });
+      expect(button.textContent).toBe("Open invoice");
+      await click(button);
       await settle(60);
       expect(calls(api, "GetInvoiceUrl")).toEqual([
         expect.objectContaining({ paddleTransactionId: "txn_top1" }),
       ]);
-      expect(opened.replaced).toBe(
+      expect(opened.replaced).toEqual([
         "https://sandbox-invoice.paddle.test/txn_top1.pdf",
-      );
+      ]);
       expect(opened.opener).toBeNull();
       const stored = JSON.stringify({
         ...window.sessionStorage,
@@ -1178,31 +1188,55 @@ describe("invoices", () => {
     }
   });
 
+  test("names and opens each invoice when dates and amounts match", async () => {
+    const api = createFakeApi();
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    const [topUp] = account.invoices;
+    const transactionIds = ["txn_fixture_a", "txn_fixture_b"];
+    account.invoices = transactionIds.map((paddleTransactionId) => ({
+      ...topUp!,
+      paddleTransactionId,
+    }));
+
+    const tabs: ReturnType<typeof fakeTab>[] = [];
+    const originalOpen = window.open;
+    window.open = (() => {
+      const tab = fakeTab();
+      tabs.push(tab);
+      return tab;
+    }) as unknown as typeof window.open;
+    try {
+      await renderAccount(ADMIN, { api });
+      await openTab("Invoices");
+      const list = await screen.findByRole("list", { name: "Invoices" });
+
+      for (const id of transactionIds) {
+        const buttons = within(list).getAllByRole("button", {
+          name: invoiceButtonName(id),
+        });
+        expect(buttons).toHaveLength(1);
+        expect(buttons[0]!.textContent).toBe("Open invoice");
+        await click(buttons[0]!);
+      }
+      expect(calls(api, "GetInvoiceUrl")).toEqual(
+        transactionIds.map((paddleTransactionId) =>
+          expect.objectContaining({ paddleTransactionId }),
+        ),
+      );
+      await waitFor(() =>
+        expect(tabs.map((tab) => tab.replaced)).toEqual(
+          transactionIds.map((id) => [
+            `https://sandbox-invoice.paddle.test/${id}.pdf`,
+          ]),
+        ),
+      );
+    } finally {
+      window.open = originalOpen;
+    }
+  });
+
   describe("while the link is in flight", () => {
     const INVOICE_URL = "https://sandbox-invoice.paddle.test/txn_top1.pdf";
-
-    /**
-     * Stands in for the blank tab that the click reserves. `closed` flips
-     * when the test plays the user closing the tab.
-     */
-    function fakeTab() {
-      const tab = {
-        opener: "app" as unknown,
-        closed: false,
-        replaced: [] as string[],
-        closeCalls: 0,
-        location: {
-          replace(url: string) {
-            tab.replaced.push(url);
-          },
-        },
-        close() {
-          tab.closeCalls += 1;
-          tab.closed = true;
-        },
-      };
-      return tab;
-    }
 
     /**
      * Opens the invoice with the given `window.open` result and holds the
@@ -1246,7 +1280,9 @@ describe("invoices", () => {
         await openTab("Invoices");
         const list = await screen.findByRole("list", { name: "Invoices" });
         await click(
-          within(list).getByRole("button", { name: /Open the invoice/ }),
+          within(list).getByRole("button", {
+            name: invoiceButtonName("txn_top1"),
+          }),
         );
         await settle(60);
         expect(calls(api, "GetInvoiceUrl")).toHaveLength(1);

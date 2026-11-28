@@ -218,7 +218,7 @@
   "invoices.summary": "{kind} · {amount}",
   "invoices.dateAndTransaction": "{date} · {transaction}",
   "invoices.open": "Rechnung öffnen",
-  "invoices.openLabel": "Rechnung vom {date} über {amount} öffnen",
+  "invoices.openLabel": "Rechnung öffnen: {date}, {amount} (Transaktion {transaction})",
   "invoices.showOlder": "Ältere Rechnungen anzeigen",
   "settings.readOnly": "Nur Inhaber und Admins können diese Einstellungen ändern.",
   "settings.name.title": "Name",

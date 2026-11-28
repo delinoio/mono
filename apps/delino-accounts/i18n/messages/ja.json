@@ -218,7 +218,7 @@
   "invoices.summary": "{kind} · {amount}",
   "invoices.dateAndTransaction": "{date} · {transaction}",
   "invoices.open": "請求書を開く",
-  "invoices.openLabel": "{date}付の請求書（{amount}）を開く",
+  "invoices.openLabel": "請求書を開く：{date}、{amount}（取引 {transaction}）",
   "invoices.showOlder": "過去の請求書を表示",
   "settings.readOnly": "これらの設定を変更できるのは、オーナーと管理者のみです。",
   "settings.name.title": "名前",
