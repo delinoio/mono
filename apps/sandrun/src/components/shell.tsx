@@ -139,12 +139,16 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
         <ErrorNotice error={orgs.error} onRetry={() => void orgs.refetch()} />
       );
     } else if (orgs.data !== undefined) {
+      const normalizedId = organizationId.toLowerCase();
+      const selectedOrganization = orgs.data.find(
+        (org) => org.organizationId.toLowerCase() === normalizedId,
+      );
       switcher = (
         <>
           {orgs.error ? <RefreshFailedNotice query={orgs} /> : null}
           <Select
             label={t("topBar.organization")}
-            value={organizationId}
+            value={selectedOrganization?.organizationId ?? organizationId}
             onValueChange={(value) => {
               if (value === null) return;
               navigate(orgPath(section, value));

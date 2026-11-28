@@ -102,6 +102,10 @@ import {
   integrationPermissionFixture,
 } from "../e2e/integration-permission-fixture.ts";
 import { organizationCreationFixture } from "../e2e/organization-creation-fixture.ts";
+import {
+  ACME_UUID_SPELLINGS,
+  caseInsensitiveAcmeTransport,
+} from "../e2e/organization-switcher-fixture.ts";
 import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
 import { requestCancellationFixture } from "../e2e/request-cancellation-fixture.ts";
 import { runnerGroupFixture } from "../e2e/runner-group-transport.ts";
@@ -6283,6 +6287,54 @@ describe("personal API key pages", () => {
       await screen.findByText(new RegExp(`agent-${PAGE_SIZE} `)),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+  });
+});
+
+describe("organization switcher UUIDs", () => {
+  const members = { name: "Members", level: 1 };
+  const organization = { name: "Organization" };
+
+  function openMembers(organizationId: string) {
+    const path = `/orgs/${organizationId}/members`;
+    renderConsole(path, {
+      transport: caseInsensitiveAcmeTransport(createMockTransport()),
+    });
+    return path;
+  }
+
+  test.each(Object.entries(ACME_UUID_SPELLINGS))(
+    "selects Acme by name from the %s Members URL",
+    async (_spelling, organizationId) => {
+      const path = openMembers(organizationId);
+      await screen.findByRole("heading", members);
+
+      const switcher = await screen.findByRole("combobox", organization);
+      await waitFor(() =>
+        expect(switcher.textContent).toContain("Acme Robotics"),
+      );
+      await click(switcher);
+      const acme = await screen.findByRole("option", {
+        name: "Acme Robotics",
+        selected: true,
+      });
+      expect(acme).toBeTruthy();
+      expect(window.location.pathname).toBe(path);
+    },
+  );
+
+  test("keeps Members active when switching from a mixed-case URL", async () => {
+    openMembers(ACME_UUID_SPELLINGS.mixed);
+    await screen.findByRole("heading", members);
+    await click(await screen.findByRole("combobox", organization));
+    await click(await screen.findByRole("option", { name: "Northwind Labs" }));
+
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.northwind}/members`,
+    );
+    await screen.findByRole("heading", members);
+    expect(
+      (await screen.findByRole("combobox", organization)).textContent,
+    ).toContain("Northwind Labs");
   });
 });
 
