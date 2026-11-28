@@ -157,6 +157,14 @@ function runGuard(t, responses, blobs, runNumber = "7") {
   return { ...result, calls, args };
 }
 
+function requestedPages(args, endpoint) {
+  return args
+    .split("\n")
+    .map((path) => new URL(path, "https://api.github.com/"))
+    .filter((url) => url.pathname === endpoint)
+    .map((url) => url.searchParams.get("page"));
+}
+
 const runPage = (entries) => ({
   body: {
     workflow_runs: entries.map(
@@ -370,6 +378,13 @@ test("guard reads further pages until it reaches this run", { skip }, (t) => {
     result.stdout,
     /plan is stale: run #8 .* started after this run #7/,
   );
+  assert.deepEqual(
+    requestedPages(
+      result.args,
+      "/repos/owner/repo/actions/workflows/deploy.yml/runs",
+    ),
+    ["1", "2"],
+  );
 });
 
 test("guard lists only runs on main", { skip }, (t) => {
@@ -454,6 +469,10 @@ test("guard reads every jobs page of a cancelled newer run", { skip }, (t) => {
   );
   assert.equal(result.status, 1, result.stdout + result.stderr);
   assert.match(result.stdout, /plan is stale: run #8/);
+  assert.deepEqual(
+    requestedPages(result.args, "/repos/owner/repo/actions/runs/1008/jobs"),
+    ["1", "2"],
+  );
 });
 
 test("guard rejects a missing or malformed changeset map", { skip }, (t) => {
