@@ -56,7 +56,7 @@ func TestRunServersSkipsPreCanceledStartup(t *testing.T) {
 				}
 			}
 
-			if err := runServers(ctx, stop, srv, listener, logger, time.Second, onStart, worker, serveMetrics); err != nil {
+			if err := runServers(ctx, stop, srv, listener, logger, time.Second, onStart, worker, runAsync, serveMetrics); err != nil {
 				t.Fatalf("runServers error = %v, want nil", err)
 			}
 			if stopCalls != 1 || workerCalls.Load() != 0 || metricsCalls.Load() != 0 {
@@ -117,7 +117,7 @@ func TestRunServersClosesActivePublicConnectionAtDrainDeadline(t *testing.T) {
 			}
 			const drainTimeout = 200 * time.Millisecond
 			result := runAsync(func() error {
-				return runServers(ctx, noStop, srv, listener, logger, drainTimeout, nil, worker, nil)
+				return runServers(ctx, noStop, srv, listener, logger, drainTimeout, nil, worker, runAsync, nil)
 			})
 
 			conn, err := net.DialTimeout("tcp", publicListener.Addr().String(), handlerStartTimeout)
@@ -220,7 +220,7 @@ func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) 
 	}
 	srv := newServer(http.NewServeMux(), logger)
 	go func() {
-		rig.result <- runServers(ctx, noStop, srv, listener, logger, 5*time.Second, nil, worker, serveMetrics)
+		rig.result <- runServers(ctx, noStop, srv, listener, logger, 5*time.Second, nil, worker, runAsync, serveMetrics)
 	}()
 	select {
 	case <-rig.workerStarted:

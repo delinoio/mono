@@ -52,13 +52,17 @@ const (
 func main() {
 	// Keep startup failures in the same JSON format as the server logs.
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	if err := run(); err != nil {
+	if err := run(runAsync); err != nil {
 		slog.Error("server_exited", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
 
-func run() error {
+// workerDispatcher starts the billing worker and returns a channel that
+// receives the worker's result after it finishes.
+type workerDispatcher func(func() error) <-chan error
+
+func run(dispatchWorker workerDispatcher) error {
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
 		return err
@@ -149,7 +153,7 @@ func run() error {
 		stop()
 		return nil
 	}
-	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, onStart, worker, serveMetrics)
+	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, onStart, worker, dispatchWorker, serveMetrics)
 }
 
 // runServers serves the public srv on listener together with the background
@@ -172,7 +176,7 @@ func run() error {
 // has drained. runServers takes them as functions so tests can inject failures
 // without OS signals.
 func runServers(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration,
-	onStart func(), worker func(context.Context), serveMetrics func(context.Context) error) error {
+	onStart func(), worker func(context.Context), dispatchWorker workerDispatcher, serveMetrics func(context.Context) error) error {
 	if ctx.Err() != nil {
 		stop()
 		_ = listener.Close()
@@ -188,7 +192,7 @@ func runServers(ctx context.Context, stop func(), srv *http.Server, listener net
 
 	background, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
-	backgroundErrs := []<-chan error{runAsync(func() error {
+	backgroundErrs := []<-chan error{dispatchWorker(func() error {
 		worker(background)
 		return nil
 	})}
