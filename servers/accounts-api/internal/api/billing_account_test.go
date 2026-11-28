@@ -1317,6 +1317,15 @@ func TestCORSPreflight(t *testing.T) {
 	if resp.StatusCode != 204 || resp.Header.Get("Access-Control-Allow-Origin") != testenv.WebOrigin {
 		t.Fatalf("preflight = %d %v", resp.StatusCode, resp.Header)
 	}
+	allowList := resp.Header.Get("Access-Control-Allow-Headers")
+	allowedHeaders := strings.Split(allowList, ",")
+	for requestedHeader := range strings.SplitSeq(req.Header.Get("Access-Control-Request-Headers"), ",") {
+		if !slices.ContainsFunc(allowedHeaders, func(header string) bool {
+			return strings.EqualFold(strings.TrimSpace(header), requestedHeader)
+		}) {
+			t.Errorf("preflight: missing %q in Access-Control-Allow-Headers %q", requestedHeader, allowList)
+		}
+	}
 }
 
 // acceptanceRows counts the rows an acceptance writes for one billing account,

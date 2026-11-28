@@ -7,10 +7,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 )
 
 func TestCORS(t *testing.T) {
+	const requestedHeaders = "authorization,content-type"
+
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	h := NewHandler(logger,
 		WithCORSOrigins([]string{"https://accounts.delino.io"}),
@@ -25,6 +29,7 @@ func TestCORS(t *testing.T) {
 		}
 		if preflight {
 			req.Header.Set("Access-Control-Request-Method", "POST")
+			req.Header.Set("Access-Control-Request-Headers", requestedHeaders)
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -32,9 +37,17 @@ func TestCORS(t *testing.T) {
 	}
 
 	rec := do(http.MethodOptions, "https://accounts.delino.io", true)
-	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != "https://accounts.delino.io" ||
-		rec.Header().Get("Access-Control-Allow-Headers") == "" {
+	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != "https://accounts.delino.io" {
 		t.Fatalf("allowed preflight: %d %v", rec.Code, rec.Header())
+	}
+	allowList := rec.Header().Get("Access-Control-Allow-Headers")
+	allowedHeaders := strings.Split(allowList, ",")
+	for requestedHeader := range strings.SplitSeq(requestedHeaders, ",") {
+		if !slices.ContainsFunc(allowedHeaders, func(header string) bool {
+			return strings.EqualFold(strings.TrimSpace(header), requestedHeader)
+		}) {
+			t.Errorf("allowed preflight: missing %q in Access-Control-Allow-Headers %q", requestedHeader, allowList)
+		}
 	}
 	rec = do(http.MethodOptions, "https://evil.example", true)
 	if rec.Code != http.StatusForbidden || rec.Header().Get("Access-Control-Allow-Origin") != "" {
