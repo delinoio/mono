@@ -539,7 +539,10 @@ check_tag() {
   fi
   object="${ref#*$'\t'}"
   commit="$(gh api "repos/$REPOSITORY/git/tags/$object" --jq 'select(.object.type == "commit") | .object.sha' < /dev/null)"
-  parent="$(gh api "repos/$REPOSITORY/commits/$commit" --jq '.parents[0].sha' < /dev/null)"
+  parent=""
+  if [[ -n "$commit" ]]; then
+    parent="$(gh api "repos/$REPOSITORY/commits/$commit" --jq '.parents[0].sha' < /dev/null)"
+  fi
   if [[ -z "$commit" || "$parent" != "$SHA" ]]; then
     echo "::error::Tag $tag is not on the version commit of the deployed revision $SHA (commit ${commit:-none}, parent ${parent:-none})." >&2
     exit 1
