@@ -337,6 +337,178 @@ func TestNotificationCanceledPassDefers(t *testing.T) {
 	}
 }
 
+func TestNotificationFinalDeliverySettlement(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		failFirst     bool
+		cancelPass    bool
+		wantErr       error
+		wantAbandoned bool
+	}{
+		{name: "canceled with a failure", failFirst: true, cancelPass: true, wantErr: context.Canceled},
+		{name: "expired with a failure", failFirst: true, wantErr: context.DeadlineExceeded},
+		{name: "live with a failure", failFirst: true, wantAbandoned: true},
+		{name: "canceled after all sends succeeded", cancelPass: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			id, key := f.queueNotice(acct)
+			first := fmt.Sprintf("admin-%d", f.lastAccountSeq)
+			last := fmt.Sprintf("owner-%d", f.lastAccountSeq)
+			if _, err := f.db.Pool.Exec(t.Context(), `UPDATE billing_notifications SET attempts = 9 WHERE notification_id = $1`, id); err != nil {
+				t.Fatal(err)
+			}
+			if tc.failFirst {
+				f.email.SetErrFor(first+"@example.com", errSendTest)
+			}
+			var attemptedKeys []string
+			f.s.email = &hookSender{next: f.email, before: func(_ context.Context, msg email.Message) error {
+				attemptedKeys = append(attemptedKeys, msg.IdempotencyKey)
+				return nil
+			}}
+
+			passErr := f.deliverWithFinalReceiptBlocked(last+"@example.com", tc.cancelPass, tc.wantErr == context.DeadlineExceeded)
+			st := f.noticeState(id)
+			t.Logf("blocked final receipt settled with pass error %v and notice state %+v", passErr, st)
+			if !errors.Is(passErr, tc.wantErr) {
+				t.Fatalf("pass error: %v, want %v", passErr, tc.wantErr)
+			}
+			if !slices.Equal(attemptedKeys, []string{key + "/" + first, key + "/" + last}) {
+				t.Fatalf("pass attempted keys %v, want one send attempt per recipient in order", attemptedKeys)
+			}
+			if tc.wantErr == nil {
+				wantRecipients := []string{last}
+				if !tc.failFirst {
+					wantRecipients = []string{first, last}
+				}
+				if st.Attempts != 10 || st.Sent == tc.failFirst || st.Abandoned != tc.wantAbandoned || !slices.Equal(st.Recipients, wantRecipients) {
+					t.Fatalf("finalized pass: %+v, want attempt ten and receipts %v", st, wantRecipients)
+				}
+				return
+			}
+
+			if st.Attempts != 9 || st.Sent || st.Abandoned || !slices.Equal(st.Recipients, []string{last}) {
+				t.Fatalf("deferred pass: %+v, want nine attempts and only the last receipt", st)
+			}
+			if want := f.clock.Now().Add(time.Minute); !st.Next.Equal(want) {
+				t.Fatalf("effective due time: %v, want %v", st.Next, want)
+			}
+
+			f.email.SetErrFor(first+"@example.com", nil)
+			attemptedKeys = nil
+			if err := f.s.DeliverNotifications(t.Context()); err != nil || len(attemptedKeys) != 0 {
+				t.Fatalf("pass before the deferred time: %v, attempted keys %v", err, attemptedKeys)
+			}
+			f.clock.Advance(time.Minute)
+			if err := f.s.DeliverNotifications(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(attemptedKeys, []string{key + "/" + first}) {
+				t.Fatalf("retry attempted keys %v, want only the original key for the first recipient", attemptedKeys)
+			}
+			if st := f.noticeState(id); !st.Sent || st.Abandoned || st.Attempts != 10 || !slices.Equal(st.Recipients, []string{first, last}) {
+				t.Fatalf("completed retry: %+v, want attempt ten and both receipts", st)
+			}
+		})
+	}
+}
+
+func (f *fixture) deliverWithFinalReceiptBlocked(lastAddress string, cancelPass, expirePass bool) error {
+	t := f.t
+	t.Helper()
+	waitCtx, stopWaiting := context.WithTimeout(t.Context(), 8*time.Second)
+	defer stopWaiting()
+	n, ok, err := f.s.claimNotification(waitCtx)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	tx, err := f.db.Pool.Begin(waitCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	// Take a SHARE lock just before the last send succeeds. It permits reads
+	// and blocks the INSERT that records this delivery.
+	lockErr := make(chan error, 1)
+	f.email.SetOnSend(func(msg email.Message) {
+		if msg.To == lastAddress {
+			_, err := tx.Exec(waitCtx, `LOCK TABLE billing_notification_deliveries IN SHARE MODE`)
+			lockErr <- err
+		}
+	})
+	defer f.email.SetOnSend(nil)
+	newPass := context.WithCancel
+	if expirePass {
+		newPass = func(parent context.Context) (context.Context, context.CancelFunc) {
+			return context.WithTimeout(parent, 2*time.Second)
+		}
+	}
+	passCtx, cancel := newPass(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.s.deliver(passCtx, n) }()
+	select {
+	case err := <-lockErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case err := <-done:
+		t.Fatalf("pass finished before the final send: %v", err)
+	case <-waitCtx.Done():
+		t.Fatal("final send did not start")
+	}
+	f.waitForFinalReceiptLock(waitCtx, done)
+	if passCtx.Err() != nil {
+		t.Fatalf("pass ended before observing the blocked receipt: %v", passCtx.Err())
+	}
+	if cancelPass {
+		cancel()
+	}
+	if expirePass {
+		<-passCtx.Done()
+	}
+	if err := tx.Commit(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-waitCtx.Done():
+		t.Fatal("pass did not finish after releasing the receipt lock")
+		return nil
+	}
+}
+
+func (f *fixture) waitForFinalReceiptLock(ctx context.Context, done <-chan error) {
+	t := f.t
+	t.Helper()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		var blocked bool
+		if err := f.db.Pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_locks
+			WHERE relation = 'billing_notification_deliveries'::regclass
+				AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+				AND mode = 'RowExclusiveLock' AND NOT granted)`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("pass finished before the final receipt waited: %v", err)
+		case <-ctx.Done():
+			t.Fatal("final receipt did not wait on the lock")
+		case <-poll.C:
+		}
+	}
+}
+
 // Two workers never process one notification at the same time: while the
 // first worker is in a send, the second finds nothing due.
 func TestNotificationConcurrentWorkersSkipLeased(t *testing.T) {
