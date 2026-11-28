@@ -98,6 +98,7 @@ func TestLoadCORSOrigins(t *testing.T) {
 		{"hostless with port", "https://:443", false},
 		{"hostless after valid", "https://a.example, https://:443", false},
 		{"percent in host", "https://exa%25mple.test", false},
+		{"whitespace in host", "https://exam%C2%A0ple.test", false},
 		{"bare query", "https://console.example.org?", false},
 		{"user info", "https://user@console.example.org", false},
 		{"user and password", "https://user:pw@console.example.org", false},
