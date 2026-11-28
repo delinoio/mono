@@ -30,6 +30,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
@@ -896,6 +897,61 @@ func (p *pausedSandboxes) State(id string) (ownsandv1.SandboxState, bool) {
 		<-p.release
 	})
 	return state, ok
+}
+
+// restartCleanupRuntime has no live VMs and cannot remove the retained files.
+type restartCleanupRuntime struct{ vmruntime.Runtime }
+
+func (restartCleanupRuntime) Running(context.Context) ([]string, error) { return nil, nil }
+
+func (restartCleanupRuntime) Delete(context.Context, string) error { return os.ErrPermission }
+
+func TestExecRejectsRestartPendingCleanup(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := newID(t)
+	now := time.Now()
+	record := sandboxes.Record{
+		SandboxID:    id,
+		State:        ownsandv1.SandboxState_SANDBOX_STATE_RUNNING,
+		IdleTTL:      time.Hour,
+		IdleDeadline: now.Add(30 * time.Minute),
+		MaxDeadline:  now.Add(2 * time.Hour),
+	}
+	if err := st.SaveSandbox(id, record); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	m, err := sandboxes.New(context.Background(), sandboxes.Options{Store: st, Runtime: restartCleanupRuntime{}, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	if state, ok := m.State(id); !ok || state != record.State {
+		t.Fatalf("retained state = %v, present = %v, want RUNNING", state, ok)
+	}
+	d, err := ops.New(m, st, ops.Options{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	m.SetExecTracker(d)
+	e := &env{t: t, st: st, d: d, sandbox: id}
+
+	req := e.execReq("/bin/true")
+	out, frames, accepted := e.handle(req, nil)
+	if accepted || !out.Terminal || out.Finished || out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION ||
+		len(frames) != 1 || !proto.Equal(frames[0].GetError(), out.Error) {
+		t.Errorf("outcome = %+v, frames = %v, accepted = %v, want one terminal FAILED_PRECONDITION error", out, frames, accepted)
+	}
+	if _, kept := d.ExecContextErr(req.GetExecId()); kept || d.HasRunningExec(id) || e.savedExecIDs()[req.GetExecId()] {
+		t.Error("exec was recorded for a sandbox without a VM")
+	}
+	if deadline := m.Entries()[0].GetIdleDeadline().AsTime(); !deadline.Equal(record.IdleDeadline) {
+		t.Errorf("idle deadline = %v, want %v", deadline, record.IdleDeadline)
+	}
 }
 
 // TestExecAdmissionRacesSandboxEnd covers an exec that read a running state

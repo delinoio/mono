@@ -492,8 +492,8 @@ func (m *Manager) State(id string) (ownsandv1.SandboxState, bool) {
 	return sb.rec.State, true
 }
 
-// WithRunning calls fn while the sandbox is running and not ending, holding
-// m.mu, and returns false without calling fn otherwise. Every end path sets
+// WithRunning calls fn under m.mu when the sandbox is RUNNING, has a VM,
+// and is not ending. It reports whether it called fn. Every end path sets
 // sb.ending under m.mu before it notifies the exec tracker, so an exec that
 // registers in fn is visible to that notification, and an exec that comes
 // later sees the end and is refused. fn must not call the Manager. It may take
@@ -503,7 +503,7 @@ func (m *Manager) WithRunning(id string, fn func()) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sb, ok := m.sandboxes[id]
-	if !ok || sb.ending || sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+	if !ok || sb.ending || sb.vm == nil || sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		return false
 	}
 	fn()
@@ -521,13 +521,13 @@ func (m *Manager) Guest(id string) (*guestclient.Client, bool) {
 	return sb.guest, true
 }
 
-// Touch records activity: the idle deadline of a running sandbox moves to
-// now plus its idle TTL.
+// Touch moves the idle deadline of a running sandbox with a VM to now plus
+// its idle TTL.
 func (m *Manager) Touch(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sb, ok := m.sandboxes[id]
-	if !ok || sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+	if !ok || sb.vm == nil || sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		return
 	}
 	sb.rec.IdleDeadline = m.now().Add(sb.rec.IdleTTL)
@@ -1299,7 +1299,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			}
 			continue
 		}
-		if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && !sb.vmExitPending &&
+		if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && sb.vm != nil && !sb.vmExitPending &&
 			execs != nil && !now.Before(sb.rec.IdleDeadline) && execs.HasRunningExec(sb.rec.SandboxID) {
 			// A running exec keeps the sandbox active until the VM exits.
 			sb.rec.IdleDeadline = now.Add(sb.rec.IdleTTL)
