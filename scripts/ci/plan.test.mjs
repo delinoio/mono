@@ -793,7 +793,7 @@ test("single workspace package manifests select workspace and fixture checks", (
   assert.equal(result.workspace, false);
 });
 
-test("task single workspace packages declare tasks and select workspace checks", (t) => {
+test("task single workspace packages declare tasks and select workspace checks", async (t) => {
   for (const dir of taskPackageDirs) {
     const manifest = JSON.parse(
       readFileSync(join(root, dir, "package.json"), "utf8"),
@@ -812,13 +812,23 @@ test("task single workspace packages declare tasks and select workspace checks",
     }
     assert.ok(!releaseOnlyPackageDirs.includes(dir));
   }
-  const f = fixture(t);
-  f.write("cmds/sandcrew-bridge/main.go");
-  const base = f.commit();
-  f.write("cmds/sandcrew-bridge/main.go", "package main // changed\n");
-  const result = plan(f.cwd, base, f.commit());
-  assert.equal(result.workspace, true);
-  assert.equal(result.go, true);
+  // Go source and the data files that its Go tests embed both select the Go
+  // checks, because the package tasks run no Go.
+  for (const path of [
+    "cmds/sandcrew-bridge/main.go",
+    "cmds/sandcrew-bridge/internal/pins/pins.json",
+    "cmds/sandcrew-bridge/internal/pins/npm/openai-codex/package-lock.json",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      const base = f.commit();
+      f.write(path, "changed\n");
+      const result = plan(f.cwd, base, f.commit());
+      assert.equal(result.workspace, true);
+      assert.equal(result.go, true);
+    });
+  }
 });
 
 test("workspace glob parser rejects an empty packages block", () => {
