@@ -363,9 +363,17 @@ func waitForInstallationTestBlock(t *testing.T, w *ghWorld, ctx context.Context,
 	var pid uint32
 	var query string
 	eventually(t, what, func() bool {
+		// The query text comes from the pg_stat_activity snapshot of this
+		// statement, but pg_blocking_pids reads the lock manager later. A
+		// backend can run a statement when the snapshot is taken, move on and
+		// block on the next one before pg_blocking_pids runs, so the row would
+		// show the earlier statement. The wait event comes from the same
+		// snapshot as the query, so requiring a lock wait keeps only rows whose
+		// query is the statement that waits.
 		err := w.env.DB.Pool.QueryRow(ctx, `
 			SELECT pid, query FROM pg_stat_activity
-			WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+				AND $1 = ANY(pg_blocking_pids(pid))
 		`, blocker).Scan(&pid, &query)
 		if err == pgx.ErrNoRows {
 			return false
