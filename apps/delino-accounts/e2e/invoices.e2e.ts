@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import {
   BillingAccountRole,
   GetBillingAccountResponseSchema,
   ListBillingAccountsResponseSchema,
 } from "@delino/accounts-protos/v1/billing_account_pb";
 import {
+  GetInvoiceUrlRequestSchema,
   GetInvoiceUrlResponseSchema,
   LedgerEntryKind,
   ListInvoicesResponseSchema,
@@ -18,11 +20,21 @@ const INVOICE_PATH = "/fixture-invoice.pdf";
 const ACCOUNT_ID = "0193a1b2-0000-7000-8000-000000000001";
 const ACCOUNT_PATH = `/billing/${ACCOUNT_ID}`;
 const ACCOUNT_NAME = "Example billing account";
+const INVOICE_DATE = new Date("2026-11-01T12:00:00Z");
+
+function invoiceButtonName(transactionId = "txn_fixture") {
+  const date = INVOICE_DATE.toLocaleDateString("en", { dateStyle: "medium" });
+  return `Open invoice dated ${date} for $25.00 (transaction ${transactionId})`;
+}
 
 async function installInvoiceFixture(
   browser: Browser,
   appOrigin: string,
-  { popupBlocked = false, unauthenticatedFirst = false } = {},
+  {
+    popupBlocked = false,
+    unauthenticatedFirst = false,
+    transactionIds = ["txn_fixture"],
+  } = {},
 ) {
   await seedFixtureSession(browser, appOrigin);
   if (popupBlocked) {
@@ -59,13 +71,12 @@ async function installInvoiceFixture(
       toBinary(
         ListInvoicesResponseSchema,
         create(ListInvoicesResponseSchema, {
-          invoices: [
-            {
-              paddleTransactionId: "txn_fixture",
-              amountUsdMicros: 25_000_000n,
-              kind: LedgerEntryKind.MANUAL_TOP_UP,
-            },
-          ],
+          invoices: transactionIds.map((paddleTransactionId) => ({
+            paddleTransactionId,
+            amountUsdMicros: 25_000_000n,
+            kind: LedgerEntryKind.MANUAL_TOP_UP,
+            createTime: timestampFromDate(INVOICE_DATE),
+          })),
         }),
       ),
     ],
@@ -82,6 +93,7 @@ async function installInvoiceFixture(
 
   let failNextInvoiceRequest = unauthenticatedFirst;
   let invoiceRequests = 0;
+  const requestedTransactionIds: string[] = [];
   await browser.route(`${API_ORIGIN}/**`, async (route) => {
     const path = new URL(route.request.url).pathname;
     if (path === INVOICE_PATH) {
@@ -103,6 +115,11 @@ async function installInvoiceFixture(
     }
     const method = path.split("/").pop()!;
     if (method === "GetInvoiceUrl") {
+      const { paddleTransactionId } = fromBinary(
+        GetInvoiceUrlRequestSchema,
+        Buffer.from(route.request.postData ?? ""),
+      );
+      requestedTransactionIds.push(paddleTransactionId);
       if (failNextInvoiceRequest) {
         failNextInvoiceRequest = false;
         await route.fulfill({
@@ -136,6 +153,7 @@ async function installInvoiceFixture(
     get invoiceRequests() {
       return invoiceRequests;
     },
+    requestedTransactionIds,
     async refetchAs(role: BillingAccountRole) {
       account.callerRole = role;
       await browser.evaluate(async () => {
@@ -207,6 +225,41 @@ describe("invoice access", () => {
 });
 
 describe("invoice navigation", () => {
+  test("opens the selected invoice when dates and amounts match", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const transactionIds = ["txn_fixture_a", "txn_fixture_b"];
+    const invoice = await installInvoiceFixture(browser, app.baseUrl, {
+      transactionIds,
+    });
+    invoice.release();
+    await app.open(ACCOUNT_PATH);
+    await screen.getByRole("tab", "Invoices").click();
+    const [billingTab] = browser.tabs();
+    const buttons = transactionIds.map((id) =>
+      screen.getByRole("button", invoiceButtonName(id), { exact: true }),
+    );
+    for (const button of buttons) {
+      await expect(button).toHaveCount(1);
+      await expect(button).toHaveText("Open invoice");
+    }
+    await app.screenshot("invoice-buttons-with-matching-date-and-amount");
+
+    for (const button of buttons) {
+      const popup = await browser.waitForPopup(() => button.click());
+      await popup.activate();
+      await expect(
+        screen.getByRole("heading", "Fixture invoice"),
+      ).toBeVisible();
+      await expect(browser).toHaveURL(API_ORIGIN + INVOICE_PATH);
+      await popup.close();
+      await billingTab!.activate();
+    }
+    expect(invoice.requestedTransactionIds).toEqual(transactionIds);
+  });
+
   for (const reopen of [false, true]) {
     test(
       reopen
@@ -219,7 +272,9 @@ describe("invoice navigation", () => {
         try {
           await app.open(ACCOUNT_PATH);
           await screen.getByRole("tab", "Invoices").click();
-          await screen.getByRole("button", /Open the invoice/).click();
+          await screen
+            .getByRole("button", invoiceButtonName(), { exact: true })
+            .click();
           await invoice.started;
           await screen.getByRole("link", "Billing accounts").click();
           await expect(
@@ -266,7 +321,9 @@ describe("invoice navigation", () => {
     try {
       await app.open(ACCOUNT_PATH);
       await screen.getByRole("tab", "Invoices").click();
-      await screen.getByRole("button", /Open the invoice/).click();
+      await screen
+        .getByRole("button", invoiceButtonName(), { exact: true })
+        .click();
       await invoice.started;
 
       await invoice.respond();
@@ -291,7 +348,9 @@ describe("invoice navigation", () => {
       await screen.getByRole("tab", "Invoices").click();
       const [billingTab] = browser.tabs();
       const popup = await browser.waitForPopup(() =>
-        screen.getByRole("button", /Open the invoice/).click(),
+        screen
+          .getByRole("button", invoiceButtonName(), { exact: true })
+          .click(),
       );
       await invoice.started;
       await billingTab!.activate();
@@ -323,7 +382,9 @@ describe("invoice navigation", () => {
       await app.open(ACCOUNT_PATH);
       const invoices = screen.getByRole("tab", "Invoices");
       const invoicePanel = screen.getByRole("tabpanel", "Invoices");
-      const openInvoice = screen.getByRole("button", /Open the invoice/);
+      const openInvoice = screen.getByRole("button", invoiceButtonName(), {
+        exact: true,
+      });
       const sessionEnded = screen.getByText(
         "Your session ended. Sign in again.",
       );

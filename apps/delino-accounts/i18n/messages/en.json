@@ -218,7 +218,7 @@
   "invoices.summary": "{kind} · {amount}",
   "invoices.dateAndTransaction": "{date} · {transaction}",
   "invoices.open": "Open invoice",
-  "invoices.openLabel": "Open the invoice of {date} for {amount}",
+  "invoices.openLabel": "Open invoice dated {date} for {amount} (transaction {transaction})",
   "invoices.showOlder": "Show older invoices",
   "settings.readOnly": "Only owners and admins can change these settings.",
   "settings.name.title": "Name",
