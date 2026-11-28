@@ -855,8 +855,19 @@ func TestTCPFlowLimit(t *testing.T) {
 func TestUDPFlowLimit(t *testing.T) {
 	sink := udpEchoSink(t)
 	rd := &routeDial{udpAddr: sink.LocalAddr().String()}
-	n, g := newLimitedNetwork(t, flowLimits{maxUDPFlows: 2, udpIdle: 600 * time.Millisecond}, nil, rd.dial)
+	logger, records := newCaptureLogger()
+	n, g := newLimitedNetwork(t, flowLimits{maxUDPFlows: 2, udpIdle: 1500 * time.Millisecond}, logger, rd.dial)
 	warmUp(t, g)
+
+	checkAdmittedFlows := func(stage string) {
+		t.Helper()
+		if got := rd.udp.Load(); got != 2 {
+			t.Fatalf("%s: UDP host dials = %d, want 2", stage, got)
+		}
+		if got := n.limiter.inUse(TransportUDP); got != 2 {
+			t.Fatalf("%s: UDP slots in use = %d, want 2", stage, got)
+		}
+	}
 
 	c1 := g.dialUDP(t, "203.0.113.10:9000")
 	c2 := g.dialUDP(t, "203.0.113.10:9000")
@@ -864,16 +875,37 @@ func TestUDPFlowLimit(t *testing.T) {
 	if !echoed(t, c1, 2*time.Second) || !echoed(t, c2, 2*time.Second) {
 		t.Fatal("an admitted UDP flow got no echo")
 	}
-	if echoed(t, c3, 500*time.Millisecond) {
+	checkAdmittedFlows("after admitting the first two UDP flows")
+
+	if _, err := c3.Write([]byte("ping")); err != nil {
+		t.Fatalf("write to the third UDP flow: %v", err)
+	}
+	waitFor(t, "the UDP rejection warning", func() bool { return len(capacityRecords(records())) == 1 })
+	record := capacityRecords(records())[0]
+	if record.level != slog.LevelWarn || record.attrs["transport"] != "udp" ||
+		record.attrs["rejected"] != int64(1) || record.attrs["limit"] != int64(2) {
+		t.Fatalf("UDP rejection record = %+v, want warning with transport=udp, rejected=1, limit=2", record)
+	}
+	if err := c3.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline for the third UDP flow: %v", err)
+	}
+	var buf [16]byte
+	_, err := c3.Read(buf[:])
+	if err == nil {
 		t.Fatal("the flow beyond the limit was relayed")
 	}
-	if got := rd.udp.Load(); got != 2 {
-		t.Fatalf("host dials = %d, want 2", got)
+	var timeout net.Error
+	if !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Fatalf("read from the third UDP flow = %v, want a timeout", err)
 	}
+	checkAdmittedFlows("after rejecting the third UDP flow")
+
 	// The first two flows keep relaying in both directions.
 	if !echoed(t, c1, 2*time.Second) || !echoed(t, c2, 2*time.Second) {
 		t.Fatal("an admitted UDP flow stopped relaying after a rejection")
 	}
+	checkAdmittedFlows("after rechecking both admitted UDP flows")
+
 	waitFor(t, "the UDP slots to return", func() bool { return n.limiter.inUse(TransportUDP) == 0 })
 	c4 := g.dialUDP(t, "203.0.113.10:9000")
 	if !echoed(t, c4, 2*time.Second) {
