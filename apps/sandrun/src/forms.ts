@@ -415,6 +415,8 @@ export function profileUpdateMask(
   return create(FieldMaskSchema, { paths });
 }
 
+export const DEV_SESSION_LIMIT_MAX = 2_147_483_647;
+
 /**
  * Validates a positive whole number for the per-user dev session limit and
  * returns the catalog key of the error.
@@ -423,7 +425,7 @@ export function devSessionLimitError(
   value: number | null,
 ): MessageKey | undefined {
   if (value === null) return undefined;
-  if (!Number.isInteger(value) || value < 1 || value > 2_147_483_647) {
+  if (!Number.isInteger(value) || value < 1 || value > DEV_SESSION_LIMIT_MAX) {
     return "settings.devSessionLimit.invalid";
   }
   return undefined;

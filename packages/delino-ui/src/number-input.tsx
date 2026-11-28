@@ -27,6 +27,8 @@ export interface NumberInputDraft {
   hasFraction: () => boolean;
   /** The typed value below `min` when `preserveBelowMin` is enabled. */
   valueBelowMin: () => number | null;
+  /** Whether the draft has a fraction or fails enabled bounds validation. */
+  isInvalid: () => boolean;
 }
 
 export type NumberInputProps = Omit<
@@ -58,6 +60,13 @@ export type NumberInputProps = Omit<
   draftRef?: React.Ref<NumberInputDraft>;
   /** With `draftRef`, keeps typed values below `min` for form validation. */
   preserveBelowMin?: boolean;
+  /**
+   * Preserves nonempty drafts outside the bounds or without a numeric value.
+   * Use with draftRef for a plain decimal field that requires whole numbers.
+   */
+  validateDraftBounds?: boolean;
+  /** Reports the validity of the text each time the user types or clears it. */
+  onDraftChange?: (invalid: boolean) => void;
 };
 
 function draftLocale(input: HTMLInputElement, locale: string | undefined) {
@@ -67,8 +76,7 @@ function draftLocale(input: HTMLInputElement, locale: string | undefined) {
   );
 }
 
-function hasFraction(input: HTMLInputElement, locale: string) {
-  const value = parseNumber(input.value, locale);
+function hasFraction(text: string, value: number | null, locale: string) {
   if (value !== null && !Number.isInteger(value)) return true;
 
   // Parsing can round a fractional draft to an integer. Check the typed
@@ -78,7 +86,7 @@ function hasFraction(input: HTMLInputElement, locale: string) {
     .formatToParts(0.1)
     .find((part) => part.type === "decimal")?.value;
   if (!separator) return false;
-  const [, fraction] = input.value.split(separator);
+  const [, fraction] = text.split(separator);
   if (!fraction) return false;
   return Boolean(
     parseNumber(fraction.replaceAll(formatter.format(0), ""), locale),
@@ -99,9 +107,9 @@ function valueBelowMin(
  * A labeled number field with minus and plus buttons, built from UI SDK
  * `Field` and `NumberInput`. Typing, arrow keys and the buttons change the
  * value; Enter or leaving the input clamps it to `min` and `max` and snaps
- * it to `step`. Forms can use `draftRef` to keep fractional drafts and
- * `preserveBelowMin` to keep drafts below `min`. An empty input has the
- * value `null`.
+ * it to `step` unless draft validation preserves the text. Forms can use
+ * `draftRef` and `preserveBelowMin` to validate fractional and below-minimum
+ * drafts. An empty input has the value `null`.
  */
 export function NumberInput({
   label,
@@ -115,6 +123,8 @@ export function NumberInput({
   disabled,
   draftRef,
   preserveBelowMin,
+  validateDraftBounds = false,
+  onDraftChange,
   ...props
 }: NumberInputProps) {
   // A caller `data-autofocus` would be spread onto the non-tabbable root
@@ -145,16 +155,16 @@ export function NumberInput({
     disabled,
   );
   const inputRef = useRef<HTMLInputElement>(null);
-  const { locale, format } = rootProps;
-  const draftMin = draftRef && preserveBelowMin ? rootProps.min : undefined;
+  const { min, max, locale, format } = rootProps;
+  const draftMin =
+    draftRef && (preserveBelowMin || validateDraftBounds) ? min : undefined;
   useEffect(() => {
     const input = inputRef.current;
     if (!input || draftMin === undefined || draftMin < 0) return;
 
-    // The SDK's native beforeinput listener blocks the minus sign at a
-    // nonnegative minimum. Let valid negative drafts reach its input handler
-    // so the form can report them. Remove when the SDK supports validating
-    // typed values before clamping.
+    // The SDK blocks a minus sign at a nonnegative minimum. Let negative
+    // drafts reach its input handler so a form can report them. Remove when
+    // the SDK supports validating typed values before clamping.
     const allowNegativeDraft = (event: InputEvent) => {
       if (
         event.defaultPrevented ||
@@ -180,28 +190,42 @@ export function NumberInput({
     return () =>
       input.removeEventListener("beforeinput", allowNegativeDraft, true);
   }, [draftMin, format, locale]);
+  function checkDraft(
+    input: HTMLInputElement,
+    checkBounds = validateDraftBounds,
+  ) {
+    const inputLocale = draftLocale(input, locale);
+    const text = input.value;
+    const value = parseNumber(text, inputLocale);
+    return (
+      (checkBounds &&
+        text.trim() !== "" &&
+        (value === null ||
+          value < (min ?? -Infinity) ||
+          value > (max ?? Infinity))) ||
+      hasFraction(text, value, inputLocale)
+    );
+  }
   useImperativeHandle(
     draftRef,
     () => ({
       hasFraction: () =>
-        inputRef.current !== null &&
-        hasFraction(inputRef.current, draftLocale(inputRef.current, locale)),
+        inputRef.current !== null && checkDraft(inputRef.current, false),
       valueBelowMin: () => {
         const input = inputRef.current;
         return input
           ? valueBelowMin(input, draftLocale(input, locale), draftMin)
           : null;
       },
+      isInvalid: () =>
+        inputRef.current !== null && checkDraft(inputRef.current),
     }),
     [draftMin, locale],
   );
-  const keepDraft = (input: HTMLInputElement) => {
-    const inputLocale = draftLocale(input, locale);
-    return (
-      valueBelowMin(input, inputLocale, draftMin) !== null ||
-      hasFraction(input, inputLocale)
-    );
-  };
+  const keepDraft = (input: HTMLInputElement) =>
+    valueBelowMin(input, draftLocale(input, locale), draftMin) !== null ||
+    checkDraft(input);
+  const validateDraft = draftRef || onDraftChange || validateDraftBounds;
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -244,16 +268,23 @@ export function NumberInput({
             aria-label={ariaLabel}
             aria-labelledby={ariaLabelledBy}
             data-autofocus={marker}
-            // The UI SDK clamps and snaps the draft on Enter or blur. Skip
-            // those handlers when the form needs to validate the draft.
+            // The UI SDK snaps typed text before the form submits on Enter or
+            // after blur. Skip those SDK handlers while the draft is invalid.
             // The browser still submits on Enter and the SDK still handles steps.
             // Remove when the UI SDK supports validating unsnapped typed values.
             ref={draftRef ? inputRef : undefined}
             render={
-              draftRef
-                ? ({ onKeyDown, onBlur, ...control }) => (
+              validateDraft
+                ? ({ onInput, onKeyDown, onBlur, ...control }) => (
                     <input
                       {...control}
+                      onInput={(event) => {
+                        const invalid = onDraftChange
+                          ? checkDraft(event.currentTarget)
+                          : false;
+                        onInput?.(event);
+                        onDraftChange?.(invalid);
+                      }}
                       onKeyDown={(event) => {
                         if (
                           event.key !== "Enter" ||

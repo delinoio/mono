@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import { createSliderController } from "@ui-sdk/react/slider";
 import { readFileSync } from "node:fs";
+import { createRef } from "react";
 import type * as React from "react";
 import {
   Accordion,
@@ -40,7 +41,7 @@ import {
   MenuTrigger,
 } from "./menu.tsx";
 import { Meter } from "./meter.tsx";
-import { NumberInput } from "./number-input.tsx";
+import { NumberInput, type NumberInputDraft } from "./number-input.tsx";
 import { Pagination } from "./pagination.tsx";
 import { PasswordInput } from "./password-input.tsx";
 import {
@@ -1316,6 +1317,42 @@ describe("NumberInput", () => {
         .getByRole("textbox", { name: "Tickets" })
         .getAttribute("aria-invalid"),
     ).toBe("true");
+  });
+
+  test("preserves drafts outside the bounds only when bounds validation is enabled", async () => {
+    const draftRef = createRef<NumberInputDraft>();
+    const { rerender } = render(
+      <NumberInput
+        label="Tickets"
+        defaultValue={5}
+        min={1}
+        draftRef={draftRef}
+      />,
+    );
+    const input = screen.getByRole<HTMLInputElement>("textbox", {
+      name: "Tickets",
+    });
+    await act(async () => fireEvent.input(input, { target: { value: "0" } }));
+    expect(draftRef.current?.isInvalid()).toBe(false);
+    await act(async () => fireEvent.blur(input));
+    expect(input.value).toBe("1");
+
+    rerender(
+      <NumberInput
+        label="Tickets"
+        defaultValue={5}
+        min={1}
+        draftRef={draftRef}
+        validateDraftBounds
+      />,
+    );
+    await act(async () => fireEvent.input(input, { target: { value: "0" } }));
+    expect(draftRef.current?.isInvalid()).toBe(true);
+    await act(async () => fireEvent.keyDown(input, { key: "Enter" }));
+    await act(async () => fireEvent.blur(input));
+    expect(input.value).toBe("0");
+    await act(async () => fireEvent.input(input, { target: { value: "" } }));
+    expect(draftRef.current?.isInvalid()).toBe(false);
   });
 
   test.each(["help", "a b"])(

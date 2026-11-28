@@ -9,12 +9,12 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { Button, ButtonVariant } from "delino-ui/button";
-import { NumberInput } from "delino-ui/number-input";
+import { NumberInput, type NumberInputDraft } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { Role } from "@delino/sandrun-protos/v1/common_pb";
 import { MemberService } from "@delino/sandrun-protos/v1/member_pb";
 import { OrganizationService } from "@delino/sandrun-protos/v1/organization_pb";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { MemberListStatus } from "../components/member-list-status.tsx";
 import { useOrg } from "../components/shell.tsx";
@@ -24,7 +24,7 @@ import {
   PageHeader,
   showsFullError,
 } from "../components/ui.tsx";
-import { devSessionLimitError } from "../forms.ts";
+import { DEV_SESSION_LIMIT_MAX, devSessionLimitError } from "../forms.ts";
 import { type MessageKey, useI18n } from "../i18n.ts";
 import { displayName, useMembers } from "../members.ts";
 import { can, Permission } from "../roles.ts";
@@ -52,9 +52,13 @@ function DevSessionLimit() {
   const queryClient = useQueryClient();
   const transport = useTransport();
   const stored = organization.settings?.maxDevSessionsPerUser ?? null;
-  const [draft, setDraft] = useState<{ value: number | null }>();
+  const inputDraft = useRef<NumberInputDraft>(null);
+  const [draft, setDraft] = useState<{
+    value: number | null;
+    invalid: boolean;
+  }>();
   const value = draft ? draft.value : stored;
-  const hasChanges = draft !== undefined && draft.value !== stored;
+  const hasChanges = draft !== undefined && (draft.invalid || value !== stored);
   const [error, setError] = useState<MessageKey>();
   const update = useMutation(
     OrganizationService.method.updateOrganizationSettings,
@@ -88,7 +92,9 @@ function DevSessionLimit() {
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!hasChanges || update.isPending) return;
-    const found = devSessionLimitError(value);
+    const found = devSessionLimitError(
+      inputDraft.current?.isInvalid() ? Number.NaN : value,
+    );
     if (found !== undefined) {
       setError(found);
       return;
@@ -123,10 +129,22 @@ function DevSessionLimit() {
           incrementLabel={t("common.increase")}
           value={value}
           onValueChange={(v) => {
-            setDraft({ value: v });
+            setDraft({ value: v, invalid: false });
+            setError(undefined);
+          }}
+          onDraftChange={(invalid) => {
+            // The SDK emits no numeric change for text outside the bounds.
+            setDraft((current) =>
+              invalid || current?.invalid
+                ? { value: current ? current.value : stored, invalid }
+                : current,
+            );
             setError(undefined);
           }}
           min={1}
+          max={DEV_SESSION_LIMIT_MAX}
+          draftRef={inputDraft}
+          validateDraftBounds
           error={error && t(error)}
           autoFocus
         />
