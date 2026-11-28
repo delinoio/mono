@@ -162,6 +162,18 @@ func TestCopyConsoleLoopStopClosesLiveConnection(t *testing.T) {
 			}
 			var out bytes.Buffer
 			done := runConsoleLoop(dial, &out, stopping, exited)
+			stop := sync.OnceFunc(func() { tc.stop(stopping, exited) })
+			t.Cleanup(func() {
+				stop()
+				select {
+				case <-done:
+					return
+				default:
+					// Release the blocked read if the loop did not close the connection.
+					_ = conn.Close()
+				}
+				waitConsoleLoop(t, done)
+			})
 
 			waitConsoleClosers(t, 1)
 			select {
@@ -169,7 +181,7 @@ func TestCopyConsoleLoopStopClosesLiveConnection(t *testing.T) {
 				t.Fatal("copyConsoleLoop returned before the VM stopped")
 			case <-time.After(50 * time.Millisecond):
 			}
-			tc.stop(stopping, exited)
+			stop()
 			waitConsoleLoop(t, done)
 
 			if conn.closeCount() == 0 {
