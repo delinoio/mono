@@ -74,6 +74,9 @@ type Options struct {
 	// LeaseDeadlineNow is the clock of the local lease ownership deadline;
 	// nil selects the real clock (tests).
 	LeaseDeadlineNow func() time.Time
+	// LeaseRenew and LeaseRenewTicks override lease renewal in tests.
+	LeaseRenew      lease.RenewHook
+	LeaseRenewTicks <-chan time.Time
 
 	// RelayLimits and RelayTiming override the relay limits and durations
 	// (tests).
@@ -169,7 +172,8 @@ func New(opts Options) (*App, error) {
 	}
 	control := api.NewControl(svc)
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Logger: opts.Logger,
-		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost}
+		DeadlineNow: opts.LeaseDeadlineNow, OnLose: control.LeaseLost,
+		Renew: opts.LeaseRenew, RenewTicks: opts.LeaseRenewTicks}
 	svc.Lease = l
 	statuses := billing.NewStatuses(billing.StatusOptions{
 		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Ownership: l.Ownership, WhileHeld: l.WhileHeld, Client: opts.UsageClient,
