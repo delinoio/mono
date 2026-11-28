@@ -344,6 +344,48 @@ describe("mock device list", () => {
     }
   });
 
+  test("clears the last known state when removing an unreachable sandbox's device", async () => {
+    rs.useFakeTimers({ toFake: ["Date"] });
+    rs.setSystemTime(removalTime);
+    const transport = createMockTransport({ userId: "user-admin-jun" });
+    const devices = createClient(DeviceService, transport);
+    const sandboxes = createClient(SandboxService, transport);
+    const sandboxId = MOCK_IDS.unreachableSandbox;
+    const request = { organizationId, sandboxId };
+    const { sandbox: before } = await sandboxes.getSandbox(request);
+    expect(before?.state).toBe(SandboxState.UNREACHABLE);
+    expect(before?.lastKnownState).toBe(SandboxState.RUNNING);
+
+    await devices.removeDevice({
+      organizationId,
+      deviceId: MOCK_IDS.studioMac,
+    });
+
+    const { sandbox } = await sandboxes.getSandbox(request);
+    const { sandboxes: includeEnded } = await sandboxes.listSandboxes({
+      organizationId,
+      includeEnded: true,
+    });
+    const { sandboxes: onlyDeleted } = await sandboxes.listSandboxes({
+      organizationId,
+      state: SandboxState.DELETED,
+    });
+    for (const ended of [
+      sandbox,
+      includeEnded.find((s) => s.sandboxId === sandboxId),
+      onlyDeleted.find((s) => s.sandboxId === sandboxId),
+    ]) {
+      expect(ended?.state).toBe(SandboxState.DELETED);
+      expect(ended?.endReason).toBe(SandboxEndReason.DEVICE_REMOVED);
+      expect(ended?.endTime).toEqual(timestampFromMs(removalTime));
+      expect(ended?.lastKnownState).toBeUndefined();
+    }
+    const defaults = await sandboxes.listSandboxes({ organizationId });
+    expect(defaults.sandboxes.some((s) => s.sandboxId === sandboxId)).toBe(
+      false,
+    );
+  });
+
   test("preserves an already deleted sandbox and a sandbox on another device", async () => {
     rs.useFakeTimers({ toFake: ["Date"] });
     rs.setSystemTime(removalTime - 1000);
@@ -365,7 +407,10 @@ describe("mock device list", () => {
     expect(sandbox?.state).toBe(SandboxState.DELETED);
     expect(sandbox?.endReason).toBe(SandboxEndReason.DELETED_BY_CALLER);
     expect(sandbox?.endTime).toEqual(timestampFromMs(removalTime - 1000));
-    expect(await sandboxes.getSandbox(other)).toEqual(unaffected);
+    const otherAfter = await sandboxes.getSandbox(other);
+    expect(otherAfter.sandbox?.state).toBe(SandboxState.UNREACHABLE);
+    expect(otherAfter.sandbox?.lastKnownState).toBe(SandboxState.RUNNING);
+    expect(otherAfter).toEqual(unaffected);
   });
 });
 
