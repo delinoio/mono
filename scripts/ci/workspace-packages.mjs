@@ -109,7 +109,7 @@ export function entitlementsPath(dir, raw) {
 
 // Walk each path component so we can record links to directories and retain
 // missing destinations. Deployment validation checks the final file.
-function* entitlementsInputs(repoRoot, declaredPath) {
+function* releaseFileInputs(repoRoot, declaredPath, { followLeafSymlink }) {
   yield declaredPath;
   let parent = ".";
   let remaining = declaredPath.split("/");
@@ -125,6 +125,10 @@ function* entitlementsInputs(repoRoot, declaredPath) {
     }
 
     const path = posix.join(parent, part);
+    if (remaining.length === 0 && !followLeafSymlink) {
+      yield path;
+      return;
+    }
     const absolute = join(repoRoot, path);
     try {
       const stat = lstatSync(absolute, { throwIfNoEntry: false });
@@ -173,12 +177,18 @@ function declaredReleasePaths(repoRoot, { dir, manifest }) {
   const paths = [];
   const entitlements = entitlementsPath(dir, deploy.entitlements);
   if (entitlements !== undefined) {
-    paths.push(...entitlementsInputs(repoRoot, entitlements));
+    paths.push(
+      ...releaseFileInputs(repoRoot, entitlements, { followLeafSymlink: true }),
+    );
   }
   if (Array.isArray(deploy.licenseFiles)) {
     for (const file of deploy.licenseFiles) {
       const path = relativePath(file);
-      if (path !== undefined) paths.push(path);
+      if (path !== undefined) {
+        paths.push(
+          ...releaseFileInputs(repoRoot, path, { followLeafSymlink: false }),
+        );
+      }
     }
   }
   return paths;
