@@ -259,19 +259,45 @@ func dnsTCPConn(t *testing.T, f *DNSForwarder, q string) net.Conn {
 
 func TestDNSForwarderBoundsUDPQueries(t *testing.T) {
 	g := startGatedUpstream(t)
-	var logs bytes.Buffer
+	var logs syncBuffer
 	f := startTestDNS(t, g.addr, slog.New(slog.NewJSONHandler(&logs, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
 	defer f.Close()
 
 	first := dnsUDPQuery(t, f, "first")
 	waitForCount(t, "first udp query", &g.udpQueries, 1)
 
-	// The slot is held: the next queries start no upstream work.
+	// Keep the first reply gated until both excess queries are rejected.
 	dropped := dnsUDPQuery(t, f, "secret-payload-1")
 	dnsUDPQuery(t, f, "secret-payload-2")
-	time.Sleep(200 * time.Millisecond)
+	// Leave time for the admitted queries to finish before the UDP timeout.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.udpRej.mu.Lock()
+		firstLogged, pending := !f.udpRej.last.IsZero(), f.udpRej.rejected
+		f.udpRej.mu.Unlock()
+		if firstLogged && pending == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for both UDP rejections (first logged: %t, pending: %d)", firstLogged, pending)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if n := g.udpQueries.Load(); n != 1 {
 		t.Fatalf("upstream udp queries while at capacity: %d", n)
+	}
+
+	// The first rejection produces a warning. The second falls within the
+	// same log interval.
+	out := logs.String()
+	if got := strings.Count(out, "rejected work"); got != 1 {
+		t.Fatalf("rejection log records: %d\n%s", got, out)
+	}
+	if !strings.Contains(out, `"transport":"udp"`) || !strings.Contains(out, `"rejected":1`) {
+		t.Fatalf("rejection log lacks transport or count: %s", out)
+	}
+	if strings.Contains(out, "secret-payload") {
+		t.Fatalf("rejection log contains a payload: %s", out)
 	}
 
 	// The TCP limit is separate: a TCP connection still reaches the upstream.
@@ -283,42 +309,23 @@ func TestDNSForwarderBoundsUDPQueries(t *testing.T) {
 	if n, err := first.Read(buf); err != nil || string(buf[:n]) != "ok:first" {
 		t.Fatalf("admitted udp answer %q %v", buf[:n], err)
 	}
-	got := make([]byte, 5)
-	if _, err := io.ReadFull(tcp, got); err != nil || string(got[2:]) != "tcp" {
-		t.Fatalf("admitted tcp answer %q %v", got, err)
-	}
+	requireDNSAnswer(t, tcp, "tcp")
 	dropped.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	if n, err := dropped.Read(buf); err == nil {
-		t.Fatalf("dropped query got an answer %q", buf[:n])
+	if n, err := dropped.Read(buf); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("dropped query read %q, want timeout: %v", buf[:n], err)
 	}
 
-	// After the release the next query forwards, with its content unchanged.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		c := dnsUDPQuery(t, f, "after")
-		c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		if n, err := c.Read(buf); err == nil {
-			if string(buf[:n]) != "ok:after" {
-				t.Fatalf("answer after release %q", buf[:n])
-			}
-			break
-		}
+	// The worker can release its slot after the client receives the reply.
+	deadline = time.Now().Add(5 * time.Second)
+	for len(f.udpSlots) != 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("no answer after the slot was released")
+			t.Fatal("UDP slot was not released")
 		}
+		time.Sleep(5 * time.Millisecond)
 	}
-
-	// Rejections are logged with transport and count, without payload, and
-	// at most once per interval.
-	out := logs.String()
-	if got := strings.Count(out, "rejected work"); got != 1 {
-		t.Fatalf("rejection log records: %d\n%s", got, out)
-	}
-	if !strings.Contains(out, `"transport":"udp"`) || !strings.Contains(out, `"rejected":1`) {
-		t.Fatalf("rejection log lacks transport or count: %s", out)
-	}
-	if strings.Contains(out, "secret-payload") {
-		t.Fatalf("rejection log contains a payload: %s", out)
+	after := dnsUDPQuery(t, f, "after")
+	if n, err := after.Read(buf); err != nil || string(buf[:n]) != "ok:after" {
+		t.Fatalf("answer after release %q %v", buf[:n], err)
 	}
 }
 
@@ -1122,6 +1129,12 @@ func (b *syncBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // socketErrorRecords returns the retry log records of one transport.
