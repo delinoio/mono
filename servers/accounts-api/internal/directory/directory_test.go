@@ -433,7 +433,9 @@ func TestLogtoCanceledWaiterReturnsWhileRefreshRuns(t *testing.T) {
 	s.waitStarted(t)
 
 	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	t.Cleanup(cancelWaiter)
 	waiter := startUser(waiterCtx, l)
+	waitWaiters(t, l, 2)
 	cancelWaiter()
 	if r := receive(t, waiter, "canceled waiter"); !errors.Is(r.err, context.Canceled) {
 		t.Fatalf("waiter error = %v, want context.Canceled", r.err)
