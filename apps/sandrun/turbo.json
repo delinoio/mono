@@ -22,6 +22,9 @@
         "PUBLIC_SANDRUN_MOCK_API"
       ],
       "inputs": ["$TURBO_DEFAULT$", ".env", ".env.*"]
+    },
+    "test:e2e": {
+      "dependsOn": ["^build"]
     }
   }
 }
