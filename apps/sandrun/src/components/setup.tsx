@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useQuery } from "@connectrpc/connect-query";
+import {
+  callUnaryMethod,
+  createConnectQueryKey,
+  useQuery,
+  useTransport,
+} from "@connectrpc/connect-query";
 import { AgentIntegrationService } from "@delino/sandrun-protos/v1/agent_integration_pb";
-import { OwnSandLinkState } from "@delino/sandrun-protos/v1/common_pb";
+import {
+  GitHubInstallationState,
+  OwnSandLinkState,
+} from "@delino/sandrun-protos/v1/common_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
+import { useQuery as useReactQuery } from "@tanstack/react-query";
+import { MAX_PAGE_SIZE } from "../api.ts";
 import { type MessageKey, useI18n } from "../i18n.ts";
 import { Link, orgPath, RouteId } from "../router.tsx";
 import { Empty } from "./ui.tsx";
@@ -86,14 +96,48 @@ const ORDER = [
   SetupStep.CreateRunnerProfile,
 ] as const;
 
+const listGitHubInstallations = GitHubService.method.listGitHubInstallations;
+
+function useActiveGitHubInstallation(organizationId: string) {
+  const transport = useTransport();
+  return useReactQuery({
+    queryKey: [
+      ...createConnectQueryKey({
+        schema: listGitHubInstallations,
+        input: { organizationId },
+        cardinality: "finite",
+        transport,
+      }),
+      "active-source",
+    ],
+    queryFn: async ({ signal }) => {
+      let pageToken = "";
+      do {
+        const page = await callUnaryMethod(
+          transport,
+          listGitHubInstallations,
+          { organizationId, pageSize: MAX_PAGE_SIZE, pageToken },
+          { signal },
+        );
+        if (
+          page.installations.some(
+            ({ state }) => state === GitHubInstallationState.ACTIVE,
+          )
+        ) {
+          return true;
+        }
+        pageToken = page.nextPageToken;
+      } while (pageToken !== "");
+      return false;
+    },
+  }).data;
+}
+
 function useSetupGuidance(organizationId: string) {
   const link = useQuery(OwnSandLinkService.method.getOwnSandLink, {
     organizationId,
   });
-  const installations = useQuery(GitHubService.method.listGitHubInstallations, {
-    organizationId,
-    pageSize: 1,
-  });
+  const hasGitHubInstallation = useActiveGitHubInstallation(organizationId);
   const integrations = useQuery(
     AgentIntegrationService.method.listAgentIntegrations,
     { organizationId, pageSize: 1 },
@@ -105,8 +149,7 @@ function useSetupGuidance(organizationId: string) {
   const linkState = link.data && (link.data.link?.state ?? null);
   const step = nextSetupStep({
     linkState,
-    hasGitHubInstallation:
-      installations.data && installations.data.installations.length > 0,
+    hasGitHubInstallation,
     hasAgentIntegration:
       integrations.data && integrations.data.integrations.length > 0,
     hasRunnerProfile: profiles.data && profiles.data.profiles.length > 0,
