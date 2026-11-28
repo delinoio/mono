@@ -92,6 +92,10 @@ import {
 import { QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { StrictMode } from "react";
+import {
+  integrationOpenings,
+  integrationPermissionFixture,
+} from "../e2e/integration-permission-fixture.ts";
 import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
 import {
   linkedSetupTransport,
@@ -1616,6 +1620,116 @@ describe("OwnSand link", () => {
 });
 
 describe("integrations", () => {
+  function renderIntegrationPermissionFixture(unlinked = false) {
+    const fixture = integrationPermissionFixture(
+      createMockTransport(),
+      unlinked,
+    );
+    const queryClient = renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, {
+      transport: fixture.transport,
+    });
+    return {
+      ...fixture,
+      async refreshRole(role: Role) {
+        const readCount = fixture.organizationReads.length;
+        fixture.setRole(role);
+        await act(() => invalidateServices(queryClient, OrganizationService));
+        expect(fixture.organizationReads.slice(readCount)).toEqual([role]);
+      },
+    };
+  }
+
+  async function openIntegrationDialog(
+    opening: (typeof integrationOpenings)[number],
+  ) {
+    const scope = opening.row
+      ? within((await screen.findByText(opening.row)).closest("li")!)
+      : screen;
+    await click(await scope.findByRole("button", { name: opening.opener }));
+    return screen.findByRole(opening.role, { name: opening.title });
+  }
+
+  test.each(integrationOpenings)(
+    "closes $title on loss of integration management access",
+    async (opening) => {
+      const { mutations, refreshRole } = renderIntegrationPermissionFixture(
+        opening.opener === "Link OwnSand",
+      );
+      const dialog = await openIntegrationDialog(opening);
+      const form = within(dialog);
+      if (opening.draftField) {
+        await type(form.getByLabelText(opening.draftField), "unsent-draft");
+      }
+      if (opening.credential) {
+        await type(
+          form.getByLabelText(opening.credential),
+          "synthetic-unsent-key",
+        );
+      }
+      const submit = form.getByRole("button", { name: opening.action });
+      if (opening.opener === "Change runner group") {
+        await form.findByRole("combobox", { name: "Runner group" });
+      }
+
+      await refreshRole(Role.MEMBER);
+      await waitFor(() => expect(screen.queryByRole(opening.role)).toBeNull());
+      expect(dialog.isConnected).toBe(false);
+      expect(
+        screen.getByRole("heading", { name: "Integrations" }),
+      ).toBeTruthy();
+      expect(
+        screen.queryByRole("button", { name: "Connect GitHub" }),
+      ).toBeNull();
+      expect(
+        screen.getByText(
+          opening.opener === "Link OwnSand"
+            ? "OwnSand is not linked"
+            : MOCK_IDS.ownsandAcme,
+        ),
+      ).toBeTruthy();
+      expect(screen.getByText("acme-robotics · Active")).toBeTruthy();
+      expect(screen.getByText("claude-team · Claude Code")).toBeTruthy();
+      await click(submit);
+      expect(mutations).toEqual([]);
+
+      await refreshRole(Role.ADMIN);
+      await screen.findByRole("button", { name: "Connect GitHub" });
+      expect(screen.queryByRole(opening.role)).toBeNull();
+      const reopened = within(await openIntegrationDialog(opening));
+      if (opening.credential) {
+        expect(
+          reopened.getByLabelText<HTMLInputElement>(opening.credential).value,
+        ).toBe("");
+      }
+      if (opening.draftField) {
+        expect(
+          reopened.getByLabelText<HTMLInputElement>(opening.draftField).value,
+        ).toBe("");
+      }
+      expect(mutations).toEqual([]);
+    },
+  );
+
+  test("keeps a valid credential draft across an admin refresh and submits it once", async () => {
+    const { mutations, refreshRole } = renderIntegrationPermissionFixture();
+    const opening = integrationOpenings.find(
+      ({ opener }) => opener === "Replace API key",
+    )!;
+    const dialog = await openIntegrationDialog(opening);
+    const form = within(dialog);
+    const key = form.getByLabelText<HTMLInputElement>("OwnSand API key");
+    await type(key, "osk_synthetic_replacement");
+
+    await refreshRole(Role.ADMIN);
+
+    expect(screen.getByRole("dialog", { name: opening.title })).toBe(dialog);
+    expect(key.value).toBe("osk_synthetic_replacement");
+    expect(mutations).toEqual([]);
+    await click(form.getByRole("button", { name: opening.action }));
+    expect(mutations).toEqual(["SetOwnSandLink"]);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
   function renderCreateIntegrationFixture({ holdFirstPage = false } = {}) {
     const { transport, calls } = gatedTransport("CreateAgentIntegration");
     const listRequested = rs.fn();

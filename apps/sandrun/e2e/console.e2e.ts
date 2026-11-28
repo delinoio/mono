@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
+import { Role } from "@delino/sandrun-protos/v1/common_pb";
+import {
+  INTEGRATION_PERMISSION_FIXTURE,
+  integrationOpenings,
+} from "./integration-permission-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
@@ -1198,6 +1203,121 @@ describe("requests", () => {
 });
 
 describe("integrations", () => {
+  for (const opening of integrationOpenings) {
+    test(`closes ${opening.title} when the organization role becomes member`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await expect(
+        screen.getByRole("link", "Acme Robotics Owner"),
+      ).toBeVisible();
+      await browser.evaluate(
+        ({ key, mode }) => {
+          sessionStorage.setItem(key, mode);
+          return null;
+        },
+        {
+          key: INTEGRATION_PERMISSION_FIXTURE,
+          mode: opening.opener === "Link OwnSand" ? "unlinked" : "linked",
+        },
+      );
+      const path = `/orgs/${ACME}/integrations`;
+      await app.open(path);
+
+      const scope = opening.row
+        ? screen.getByRole("listitem").filter({ hasText: opening.row })
+        : screen;
+      const opener = scope.getByRole("button", opening.opener);
+      const dialog = screen.getByRole(opening.role, opening.title);
+      await opener.tap();
+      await expect(dialog).toBeVisible();
+      if (opening.draftField) {
+        await dialog
+          .getByLabel(opening.draftField, { exact: true })
+          .fill("unsent-draft");
+      }
+      if (opening.credential) {
+        await dialog
+          .getByLabel(opening.credential, { exact: true })
+          .fill("synthetic-unsent-key");
+      }
+      if (opening.opener === "Change runner group") {
+        await expect(
+          dialog.getByRole("combobox", "Runner group"),
+        ).toBeVisible();
+      }
+
+      const refreshRole = async (role: Role) => {
+        const readCount = await browser.evaluate((next) => {
+          const fixture = window.sandrunIntegrationPermissionFixture!;
+          const count = fixture.organizationReads.length;
+          fixture.setRole(next);
+          // Make the cached role stale and exercise React Query's tab-focus refresh.
+          const now = Date.now;
+          Date.now = () => now() + 10_001;
+          Object.defineProperty(document, "visibilityState", {
+            configurable: true,
+            value: "hidden",
+          });
+          window.dispatchEvent(new Event("visibilitychange"));
+          Reflect.deleteProperty(document, "visibilityState");
+          window.dispatchEvent(new Event("visibilitychange"));
+          return count;
+        }, role);
+        await expect
+          .poll(() =>
+            browser.evaluate(
+              (previous) =>
+                window.sandrunIntegrationPermissionFixture!.organizationReads.slice(
+                  previous,
+                ),
+              readCount,
+            ),
+          )
+          .toEqual([role]);
+      };
+
+      if (opening.opener === "Replace API key") {
+        await refreshRole(Role.ADMIN);
+        await expect(dialog).toBeVisible();
+        await app.screenshot("integration-admin-refresh-retains-draft");
+      }
+
+      await refreshRole(Role.MEMBER);
+      await expect(dialog).toBeHidden();
+      await expect(opener).toBeHidden();
+      await expect(browser).toHaveURL(path);
+      await expect(
+        screen.getByRole("heading", "Integrations", { level: 1 }),
+      ).toBeVisible();
+      await expect(screen.getByText("acme-robotics · Active")).toBeVisible();
+      await expect(screen.getByText("claude-team · Claude Code")).toBeVisible();
+      await app.screenshot(`integration-member-${opening.mutation}`);
+
+      await refreshRole(Role.ADMIN);
+      await expect(opener).toBeVisible();
+      await expect(dialog).toBeHidden();
+      await opener.tap();
+      await expect(dialog).toBeVisible();
+      if (opening.draftField) {
+        await expect(
+          dialog.getByLabel(opening.draftField, { exact: true }),
+        ).toHaveValue("");
+      }
+      if (opening.opener === "Replace API key") {
+        await app.screenshot("integration-admin-reopen-empty");
+      }
+      expect(
+        await browser.evaluate(
+          () => window.sandrunIntegrationPermissionFixture!.mutations,
+        ),
+      ).toEqual([]);
+    });
+  }
+
   test("offers a newly created integration in the runner profile form", async ({
     app,
     browser,

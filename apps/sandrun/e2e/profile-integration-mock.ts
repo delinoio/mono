@@ -2,6 +2,10 @@
 import type { Transport } from "@connectrpc/connect";
 import { GitHubInstallationState } from "@delino/sandrun-protos/v1/common_pb";
 import type { MockTransportOptions } from "../src/mock/mock-api.ts";
+import {
+  INTEGRATION_PERMISSION_FIXTURE,
+  integrationPermissionFixture,
+} from "./integration-permission-fixture.ts";
 import { createMockTransport as createSettingsMock } from "./settings-mock.ts";
 import {
   pagedProfileIntegrations,
@@ -15,6 +19,10 @@ import {
 
 declare global {
   interface Window {
+    sandrunIntegrationPermissionFixture?: Omit<
+      ReturnType<typeof integrationPermissionFixture>,
+      "transport"
+    >;
     sandrunProfileIntegrationFixture?: Omit<
       ReturnType<typeof pagedProfileIntegrations>,
       "transport"
@@ -58,6 +66,16 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
         existingAgentIntegration:
           setup === "failed-github-continuation-with-agent",
       });
+  }
+
+  const permission = sessionStorage.getItem(INTEGRATION_PERMISSION_FIXTURE);
+  if (permission === "linked" || permission === "unlinked") {
+    const { transport, ...fixture } = integrationPermissionFixture(
+      createSettingsMock(options),
+      permission === "unlinked",
+    );
+    window.sandrunIntegrationPermissionFixture = fixture;
+    return transport;
   }
 
   const mode = sessionStorage.getItem(PROFILE_INTEGRATION_FIXTURE);
