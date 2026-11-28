@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/delinoio/mono/go/ownsand/validate"
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts"
@@ -637,10 +638,11 @@ func (h handler) ListManageableBillingAccounts(_ context.Context, req *connect.R
 	if err := f.begin(MethodListManageableBillingAccounts); err != nil {
 		return nil, err
 	}
-	size := int(req.Msg.GetPageSize())
-	if size <= 0 {
-		size = 50
+	pageSize, err := validate.PageSize(req.Msg.GetPageSize())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("page_size must not be negative"))
 	}
+	size := int(pageSize)
 	userID := req.Msg.GetUserId()
 	after, err := decodeManageablePageToken(userID, req.Msg.GetPageToken())
 	if err != nil {
