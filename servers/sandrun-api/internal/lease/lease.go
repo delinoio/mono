@@ -70,11 +70,12 @@ type Lease struct {
 	// holding mu.
 	transitionMu sync.Mutex
 
-	mu       sync.Mutex
-	held     bool
-	expireAt time.Time // confirmed expiry of the current ownership period
-	epoch    uint64    // changes at every acquisition and every loss
-	acquired chan struct{}
+	mu            sync.Mutex
+	held          bool
+	expireAt      time.Time // confirmed expiry of the current ownership period
+	epoch         uint64    // changes at every acquisition and every loss
+	acquired      chan struct{}
+	pendingExpiry chan struct{} // shared expiry request for the current period
 }
 
 func (l *Lease) init() {
@@ -127,7 +128,8 @@ func (l *Lease) WhileHeld(fn func()) bool {
 }
 
 // Wait blocks until the instance holds a lease whose confirmed deadline is
-// still in the future or ctx ends.
+// still in the future or ctx ends. An expired period requests loss
+// asynchronously so ctx can end while a transition or OnLose is pending.
 func (l *Lease) Wait(ctx context.Context) error {
 	l.init()
 	for {
@@ -136,20 +138,19 @@ func (l *Lease) Wait(ctx context.Context) error {
 			l.mu.Unlock()
 			return nil
 		}
-		if l.held {
-			// The lease expired before the watcher recorded the loss.
-			l.mu.Unlock()
-			l.expireIfDue()
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			continue
-		}
 		ch := l.acquired
+		if l.held {
+			// The closed acquisition channel refers to an expired period.
+			if l.pendingExpiry == nil {
+				l.pendingExpiry = make(chan struct{})
+				go l.expireIfDue(l.pendingExpiry)
+			}
+			ch = l.pendingExpiry
+		}
 		l.mu.Unlock()
 		select {
 		case <-ch:
-			// Recheck ownership. The signaled period may already be over.
+			// Recheck ownership after acquisition or expiry.
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -185,6 +186,7 @@ func (l *Lease) loseLocked(reason string) {
 	l.expireAt = time.Time{}
 	l.epoch++
 	l.acquired = make(chan struct{})
+	l.completeExpiryRequestLocked()
 	l.mu.Unlock()
 	l.Logger.Warn("lease_lost", slog.String("instance_id", l.InstanceID), slog.String("reason", reason))
 	if l.OnLose != nil {
@@ -206,13 +208,29 @@ func (l *Lease) lose(reason string) bool {
 	return true
 }
 
-// expireIfDue ends the ownership period when the confirmed expiry has passed.
-func (l *Lease) expireIfDue() {
+// completeExpiryRequestLocked wakes the waiters so they can recheck ownership.
+func (l *Lease) completeExpiryRequestLocked() {
+	if l.pendingExpiry != nil {
+		close(l.pendingExpiry)
+		l.pendingExpiry = nil
+	}
+}
+
+// expireIfDue ends ownership when the confirmed deadline has passed. A
+// request from Wait applies only while it is pending for the same period.
+func (l *Lease) expireIfDue(request <-chan struct{}) {
 	l.init()
 	l.transitionMu.Lock()
 	defer l.transitionMu.Unlock()
 	l.mu.Lock()
+	if request != nil && request != l.pendingExpiry {
+		l.mu.Unlock()
+		return
+	}
 	if !l.held || l.deadlineNow().Before(l.expireAt) {
+		if request != nil {
+			l.completeExpiryRequestLocked()
+		}
 		l.mu.Unlock()
 		return
 	}
@@ -289,7 +307,7 @@ func (l *Lease) watch(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		l.expireIfDue()
+		l.expireIfDue(nil)
 		wait := poll
 		if _, expireAt, held := l.snapshot(); held {
 			if remaining := expireAt.Sub(l.deadlineNow()); remaining < wait {
@@ -306,7 +324,7 @@ func (l *Lease) watch(ctx context.Context) {
 func (l *Lease) renewOnce(ctx context.Context) {
 	epoch, expireAt, held := l.snapshot()
 	if held && !l.deadlineNow().Before(expireAt) {
-		l.expireIfDue()
+		l.expireIfDue(nil)
 		epoch, expireAt, held = l.snapshot()
 	}
 	// The expiry of a successful call is TTL after the moment before the
