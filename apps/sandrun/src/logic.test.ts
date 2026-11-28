@@ -871,6 +871,12 @@ describe("queue view", () => {
         99_999,
       ),
     ).toBe(5000);
+    expect(
+      queueWaitMs(
+        { queuedAt: timestampFromMs(1000), endedAt: timestampFromMs(5000) },
+        61_000,
+      ),
+    ).toBe(4000);
     expect(formatSpan(3_900_000, sourceLocalizer)).toBe("1 h 5 min");
   });
 });
