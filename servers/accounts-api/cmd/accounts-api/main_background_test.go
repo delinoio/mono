@@ -11,9 +11,11 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
@@ -194,21 +196,79 @@ func TestRunServersClosesActivePublicConnectionAtDrainDeadline(t *testing.T) {
 	}
 }
 
+type channelListener struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (l *channelListener) Accept() (net.Conn, error) {
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *channelListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *channelListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+}
+
+func TestRunServersWaitsForBillingWorker(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		listener := &channelListener{closed: make(chan struct{})}
+		workerStarted := make(chan struct{})
+		workerCanceled := make(chan struct{})
+		workerRelease := make(chan struct{})
+		releaseWorker := sync.OnceFunc(func() { close(workerRelease) })
+		defer releaseWorker()
+
+		worker := func(ctx context.Context) {
+			close(workerStarted)
+			<-ctx.Done()
+			close(workerCanceled)
+			<-workerRelease
+		}
+		logger := newTestLogger()
+		srv := newServer(http.NewServeMux(), logger)
+		result := runAsync(func() error {
+			return runServers(ctx, noStop, srv, listener, logger, time.Second, nil, worker, runAsync, nil)
+		})
+
+		<-workerStarted
+		synctest.Wait() // Let the public server reach Accept before shutdown.
+		cancel()
+		<-workerCanceled
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("runServers returned %v while the billing worker was still held", err)
+		default:
+		}
+
+		releaseWorker()
+		if err := <-result; err != nil {
+			t.Fatalf("runServers error = %v, want nil after the billing worker finished", err)
+		}
+	})
+}
+
 // backgroundRig is a runServers call with a live public server, a billing
 // worker stand-in and a metrics listener under the control of the test.
 type backgroundRig struct {
 	cancel        context.CancelFunc
 	publicAddr    string
 	logs          *syncBuffer
-	workerStopped atomic.Bool
 	workerStarted chan struct{}
+	workerStopped atomic.Bool
 	result        chan error
 }
 
 // startBackgroundRig starts runServers. serveMetrics may be nil, which
-// disables the metrics listener like an empty METRICS_ADDR. The worker stand-in
-// finishes its "in-progress work" for workerDrain after its context is
-// cancelled, so a runServers that returns early is observable.
+// disables the metrics listener like an empty METRICS_ADDR.
 func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) *backgroundRig {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -223,11 +283,9 @@ func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) 
 		workerStarted: make(chan struct{}),
 		result:        make(chan error, 1),
 	}
-	const workerDrain = 150 * time.Millisecond
 	worker := func(background context.Context) {
 		close(rig.workerStarted)
 		<-background.Done()
-		time.Sleep(workerDrain)
 		rig.workerStopped.Store(true)
 	}
 	srv := newServer(http.NewServeMux(), logger)
@@ -254,16 +312,6 @@ func (r *backgroundRig) await(t *testing.T) error {
 	}
 }
 
-// publicRefusesConnections reports whether the public listener is closed.
-func (r *backgroundRig) publicRefusesConnections() bool {
-	conn, err := net.DialTimeout("tcp", r.publicAddr, time.Second)
-	if err == nil {
-		_ = conn.Close()
-		return false
-	}
-	return true
-}
-
 // permanentAcceptMetrics serves the metrics handler on a listener whose Accept
 // fails with errMetricsAccept, after the bind has succeeded.
 func permanentAcceptMetrics(t *testing.T) func(context.Context) error {
@@ -276,8 +324,7 @@ func permanentAcceptMetrics(t *testing.T) func(context.Context) error {
 
 // TestRunServersShutsDownOnTerminalMetricsListenerError verifies that a
 // metrics listener that fails after a successful bind stops the public server
-// without any signal or public listener failure, waits for the billing worker,
-// and reports the original error.
+// without any signal or public listener failure and reports the original error.
 func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	rig := startBackgroundRig(t, permanentAcceptMetrics(t))
 
@@ -288,8 +335,12 @@ func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	if !rig.workerStopped.Load() {
 		t.Error("runServers returned before the billing worker finished its in-progress work")
 	}
-	if !rig.publicRefusesConnections() {
-		t.Error("public listener still accepts connections after runServers returned")
+	dialer := net.Dialer{Timeout: listenerProbeTimeout}
+	refused, err := probeTCPRefusal(rig.publicAddr, dialer.Dial)
+	if err != nil {
+		t.Errorf("after runServers returned: %v", err)
+	} else if !refused {
+		t.Errorf("public listener at %s still accepts connections after runServers returned", rig.publicAddr)
 	}
 	logs := rig.logs.String()
 	for _, want := range []string{"metrics_listener_failed", "server_shutdown_started", "server_shutdown_completed", errMetricsAccept.Error()} {
@@ -299,27 +350,61 @@ func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	}
 }
 
+func newMetricsErrorGate(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return gate, release
+}
+
+func TestRunServersKeepsMetricsErrorAfterFixtureCleanup(t *testing.T) {
+	var rig *backgroundRig
+	if !t.Run("fixture", func(fixture *testing.T) {
+		gate, release := newMetricsErrorGate(fixture)
+		// Release the gate from the parent if the fixture cleanup fails to do so.
+		t.Cleanup(release)
+		atGate := make(chan struct{})
+		rig = startBackgroundRig(fixture, func(context.Context) error {
+			close(atGate)
+			<-gate
+			return errMetricsAccept
+		})
+		select {
+		case <-atGate:
+		case <-time.After(handlerStartTimeout):
+			fixture.Fatal("metrics callback did not reach the release gate")
+		}
+	}) || rig == nil {
+		return
+	}
+
+	if err := rig.await(t); !errors.Is(err, errMetricsAccept) {
+		t.Fatalf("runServers error = %v, want the metrics Accept error", err)
+	}
+	if !rig.workerStopped.Load() {
+		t.Fatal("runServers returned before the billing worker finished")
+	}
+}
+
 // TestRunServersKeepsMetricsErrorWhenShutdownSignalRaces verifies that the
 // metrics listener error is not lost when the shutdown trigger fires first,
 // or at the same time, and runServers has already started the drain.
 func TestRunServersKeepsMetricsErrorWhenShutdownSignalRaces(t *testing.T) {
 	for i := 0; i < 20; i++ {
-		release := make(chan struct{})
+		gate, release := newMetricsErrorGate(t)
 		rig := startBackgroundRig(t, func(context.Context) error {
-			<-release
+			<-gate
 			return errMetricsAccept
 		})
 		// The signal arrives, the drain starts and the metrics listener fails
 		// in the same moment. Which of them runServers observes first varies.
 		rig.cancel()
-		close(release)
+		release()
 
 		err := rig.await(t)
 		if !errors.Is(err, errMetricsAccept) {
 			t.Fatalf("iteration %d: runServers error = %v; want the metrics Accept error", i, err)
-		}
-		if !rig.workerStopped.Load() {
-			t.Fatalf("iteration %d: runServers returned before the billing worker finished", i)
 		}
 	}
 }
@@ -337,9 +422,6 @@ func TestRunServersCleanShutdownWithMetricsReturnsNil(t *testing.T) {
 	if err := rig.await(t); err != nil {
 		t.Fatalf("runServers error = %v; want nil after a clean shutdown", err)
 	}
-	if !rig.workerStopped.Load() {
-		t.Error("runServers returned before the billing worker finished its in-progress work")
-	}
 	if !strings.Contains(rig.logs.String(), "server_shutdown_completed") {
 		t.Errorf("logs lack server_shutdown_completed; logs: %s", rig.logs.String())
 	}
@@ -354,8 +436,5 @@ func TestRunServersWithoutMetricsListener(t *testing.T) {
 	rig.cancel()
 	if err := rig.await(t); err != nil {
 		t.Fatalf("runServers error = %v; want nil", err)
-	}
-	if !rig.workerStopped.Load() {
-		t.Error("runServers returned before the billing worker finished its in-progress work")
 	}
 }

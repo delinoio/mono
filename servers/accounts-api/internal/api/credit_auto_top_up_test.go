@@ -17,6 +17,59 @@ import (
 	"github.com/delinoio/mono/servers/accounts-api/internal/testenv"
 )
 
+func TestGetAutoTopUpSettingsWithNoSettingsRow(t *testing.T) {
+	t.Parallel()
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	viewer := env.Credit(f.Viewer.ID)
+	read := func(wantTotal int64) {
+		t.Helper()
+		response, err := viewer.GetAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.GetAutoTopUpSettingsRequest{
+			BillingAccountId: f.AccountID,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := &accountsv1.AutoTopUpSettings{MonthToDateUsdMicros: wantTotal}
+		if got := response.Msg.GetSettings(); !proto.Equal(got, want) {
+			t.Fatalf("settings = %v, want %v", got, want)
+		}
+	}
+	read(0)
+
+	now := env.Clock.Now()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	env.Clock.Advance(monthStart.AddDate(0, 0, 14).Sub(now) - time.Millisecond)
+	if _, err := env.DB.Pool.Exec(ctx(), `INSERT INTO top_ups
+		(top_up_id, billing_account_id, kind, status, amount_usd_micros, create_time, update_time, cap_time, idempotency_key)
+		VALUES
+		('01900000-0000-7000-8000-0000000000a1', $1, 'auto', 'completed', $2, $3, $3, NULL, NULL),
+		('01900000-0000-7000-8000-0000000000a2', $1, 'auto', 'failed', $2, $3, $3, $3, NULL),
+		('01900000-0000-7000-8000-0000000000a3', $1, 'manual', 'completed', $2, $3, $3, NULL, '01900000-0000-7000-8000-0000000000b3'),
+		('01900000-0000-7000-8000-0000000000a4', $1, 'auto', 'completed', $2, $4, $4, $4, NULL)`,
+		f.AccountID, 25*usd, monthStart, monthStart.Add(-time.Microsecond)); err != nil {
+		t.Fatal(err)
+	}
+	read(25 * usd)
+}
+
+func TestGetAutoTopUpSettingsReadFailure(t *testing.T) {
+	t.Parallel()
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	accountID := createAccount(t, owner, "Fixture").GetBillingAccountId()
+	if _, err := env.DB.Pool.Exec(ctx(), `ALTER TABLE top_ups RENAME TO top_ups_unavailable`); err != nil {
+		t.Fatal(err)
+	}
+	response, err := env.Credit(owner.ID).GetAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.GetAutoTopUpSettingsRequest{
+		BillingAccountId: accountID,
+	}))
+	wantCode(t, err, connect.CodeInternal)
+	if response != nil {
+		t.Fatalf("response = %v, want no response on database error", response)
+	}
+}
+
 // storedAutoTopUp reads the saved automatic top-up columns directly.
 func storedAutoTopUp(t *testing.T, env *testenv.Env, accountID string) (enabled bool, threshold, amount, cap int64, found bool) {
 	t.Helper()
