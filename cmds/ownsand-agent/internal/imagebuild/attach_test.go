@@ -51,6 +51,34 @@ const attachPlist = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `
 
+const attachPlistSlicesFirst = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>system-entities</key>
+	<array>
+		<dict>
+			<key>content-hint</key>
+			<string>C12A7328-F81F-11D2-BA4B-00A0C93EC93B</string>
+			<key>dev-entry</key>
+			<string>/dev/disk4s1</string>
+		</dict>
+		<dict>
+			<key>content-hint</key>
+			<string>7C3457EF-0000-11AA-AA11-00306543ECAC</string>
+			<key>dev-entry</key>
+			<string>/dev/disk4s2</string>
+		</dict>
+		<dict>
+			<key>content-hint</key>
+			<string>GUID_partition_scheme</string>
+			<key>dev-entry</key>
+			<string>/dev/disk4</string>
+		</dict>
+	</array>
+</dict>
+</plist>
+`
+
 const attachPlistNoGUID = `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
@@ -79,7 +107,8 @@ func TestAttachedWholeDisk(t *testing.T) {
 		guid             bool
 	}{
 		{"guid entity", attachPlist, "disk4", true},
-		{"guid entity after its slices", strings.Replace(attachPlist, "/dev/disk4<", "/dev/disk4s9<", 1), "disk4", true},
+		{"guid entity after its slices", attachPlistSlicesFirst, "disk4", true},
+		{"guid entity with a slice suffix", strings.Replace(attachPlist, "/dev/disk4<", "/dev/disk4s9<", 1), "disk4", true},
 		{"no guid entity", attachPlistNoGUID, "disk7", false},
 		{"truncated plist", attachPlist[:strings.Index(attachPlist, "</array>")], "disk4", true},
 		{"not a plist", "attached /dev/disk12s1\n", "disk12", false},
