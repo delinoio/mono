@@ -922,6 +922,47 @@ describe("settings", () => {
     ).toBeTruthy();
   });
 
+  test("drops a credential file read that ends after the dialog closes", async () => {
+    renderConsole(`/orgs/${ACME}/settings`);
+    const open = async () => {
+      await click(
+        await screen.findByRole("button", {
+          name: "Set the OpenAI Codex credential",
+        }),
+      );
+      const dialog = await screen.findByRole("dialog");
+      await choose(
+        within(dialog).getByRole("combobox", { name: "Kind" }),
+        "Codex auth.json",
+      );
+      return dialog;
+    };
+    let dialog = await open();
+    const file = new File(['{"OPENAI_API_KEY":"k"}'], "auth.json", {
+      type: "application/json",
+    });
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = file.arrayBuffer.bind(file);
+    file.arrayBuffer = async () => {
+      await held;
+      return read();
+    };
+    await act(async () => {
+      fireEvent.change(within(dialog).getByLabelText("auth.json file"), {
+        target: { files: [file] },
+      });
+    });
+    await act(async () => fireEvent.keyDown(dialog, { key: "Escape" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    dialog = await open();
+    await act(async () => release());
+    await settle();
+    expect(within(dialog).queryByText("Selected: auth.json")).toBeNull();
+  });
+
   test("adds a session secret and shows only its name", async () => {
     renderConsole(`/orgs/${ACME}/settings`);
     await click(await screen.findByRole("button", { name: "Add secret" }));

@@ -14,7 +14,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { PasswordInput } from "delino-ui/password-input";
 import { Select, SelectOption } from "delino-ui/select";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import {
   formatTime,
@@ -221,10 +221,14 @@ function CredentialDialog({
   const [value, setValue] = useState("");
   const [file, setFile] = useState<{ name: string; bytes: Uint8Array }>();
   const [error, setError] = useState<MessageKey>();
+  // Counts file selections and resets. A file read applies only when no
+  // newer selection, kind change or dismissal happened while it ran.
+  const fileReads = useRef(0);
   const selected = kind !== undefined && kinds.includes(kind) ? kind : kinds[0];
   const isFile = selected === VendorCredentialKind.CODEX_AUTH_JSON;
 
   const reset = () => {
+    fileReads.current++;
     setKind(undefined);
     setValue("");
     setFile(undefined);
@@ -295,6 +299,7 @@ function CredentialDialog({
             if (v === null) return;
             setKind(Number(v) as VendorCredentialKind);
             setValue("");
+            fileReads.current++;
             setFile(undefined);
             setError(undefined);
           }}
@@ -317,12 +322,14 @@ function CredentialDialog({
             accept="application/json,.json"
             onChange={(event) => {
               const chosen = event.target.files?.[0];
+              const read = ++fileReads.current;
               setError(undefined);
               if (chosen === undefined) {
                 setFile(undefined);
                 return;
               }
               void chosen.arrayBuffer().then((buffer) => {
+                if (fileReads.current !== read) return;
                 setFile({ name: chosen.name, bytes: new Uint8Array(buffer) });
               });
               // Clear the input so the browser keeps no reference.
