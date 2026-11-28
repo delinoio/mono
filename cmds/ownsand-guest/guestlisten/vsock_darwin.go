@@ -13,24 +13,29 @@ func socketCloexec() (int, error) {
 	}, setCloseOnExec)
 }
 
-// acceptNonblock accepts a connection. macOS has no accept4, so the
+// acceptVsockNonblock accepts a connection. macOS has no accept4, so the
 // connection is marked close-on-exec under syscall.ForkLock right after the
 // accept (see createCloexec) and made non-blocking after the lock is
 // released. The listener must be non-blocking, because the lock is held for
 // reading during the accept.
-func acceptNonblock(fd int) (int, unix.Sockaddr, error) {
+func acceptVsockNonblock(fd int) (int, unix.Sockaddr, error) {
 	var sa unix.Sockaddr
+	var accepted bool
 	nfd, err := createCloexec(func() (int, error) {
 		nfd, peer, err := unix.Accept(fd)
 		sa = peer
+		accepted = err == nil
 		return nfd, err
 	}, setCloseOnExec)
 	if err != nil {
+		if accepted {
+			return -1, nil, acceptSetupError{err}
+		}
 		return -1, nil, err
 	}
 	if err := unix.SetNonblock(nfd, true); err != nil {
 		unix.Close(nfd)
-		return -1, nil, err
+		return -1, nil, acceptSetupError{err}
 	}
 	return nfd, sa, nil
 }
