@@ -1024,7 +1024,7 @@ func TestAutoTopUpShutoffAfterTwoFailures(t *testing.T) {
 	if kinds[email.KindPaymentFailed] != 4 || kinds[email.KindAutoTopUpDisabled] != 2 || kinds[email.KindLowBalance] != 2 {
 		t.Fatalf("emails = %v", kinds)
 	}
-	// Enabling again resets the count; a success resets it too.
+	// Re-enabling automatic top-ups clears the failure count.
 	f.paddle.FailCharges(nil)
 	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
 	st, _ = loadSettings(ctx(), f.db.Pool, acct)
@@ -1064,15 +1064,25 @@ func TestAutoTopUpPastDueAndTimeout(t *testing.T) {
 	if got := f.topUpStatuses(acct); got[0] != "failed:subscription_past_due" || got[1] != "failed:timed_out" {
 		t.Fatalf("top-ups = %v", got)
 	}
-	st, _ := loadSettings(ctx(), f.db.Pool, acct)
-	if st.AutoEnabled {
-		t.Fatalf("still enabled after two failures: %+v", st)
+	st, err := loadSettings(ctx(), f.db.Pool, acct)
+	if err != nil {
+		t.Fatalf("load settings after timeout: %v", err)
+	}
+	if st.AutoEnabled || st.ConsecutiveFailures != 2 {
+		t.Fatalf("after timeout: AutoEnabled = %t, ConsecutiveFailures = %d, want false and 2", st.AutoEnabled, st.ConsecutiveFailures)
 	}
 	// A late webhook still adds the credit and completes the top-up.
 	charges := f.paddle.Charges()
 	f.completeCharge(charges[len(charges)-1], 2500)
 	if got := f.topUpStatuses(acct); got[1] != "completed" || f.balance(acct) != 23*usd {
 		t.Fatalf("after the late webhook: %v, balance %d", got, f.balance(acct))
+	}
+	st, err = loadSettings(ctx(), f.db.Pool, acct)
+	if err != nil {
+		t.Fatalf("load settings after the late webhook: %v", err)
+	}
+	if st.AutoEnabled || st.ConsecutiveFailures != 0 {
+		t.Fatalf("after the late webhook: AutoEnabled = %t, ConsecutiveFailures = %d, want false and 0", st.AutoEnabled, st.ConsecutiveFailures)
 	}
 }
 
