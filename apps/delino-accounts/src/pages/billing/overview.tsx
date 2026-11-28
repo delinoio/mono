@@ -30,6 +30,7 @@ import {
   type Subscription,
   SubscriptionStatus,
 } from "@delino/accounts-protos/v1/credit_pb";
+import { useI18n } from "../../i18n.ts";
 import { formatUsd, usd } from "../../money.ts";
 import { useCheckout } from "../../paddle.tsx";
 import { can, Permission } from "../../roles.ts";
@@ -79,18 +80,19 @@ function BalanceCard() {
     billingAccountId,
   });
   const [toppingUp, setToppingUp] = useState(false);
+  const { lang, t } = useI18n();
   const active =
     subscription.data?.subscription?.status === SubscriptionStatus.ACTIVE;
   const canPay = can(role, Permission.ManagePayments);
   return (
     <section className="section" aria-labelledby="balance-title">
-      <h2 id="balance-title">Balance</h2>
+      <h2 id="balance-title">{t("balance.title")}</h2>
       <RefetchNotice
         error={balance.isRefetchError ? balance.error : undefined}
         onRetry={() => void balance.refetch()}
       />
       {balance.isPending ? (
-        <Loading label="Loading the balance" />
+        <Loading label={t("balance.loading")} />
       ) : balance.isLoadingError ? (
         <ErrorNotice
           error={balance.error}
@@ -105,22 +107,20 @@ function BalanceCard() {
                 : "balance"
             }
           >
-            {formatUsd(balance.data.balanceUsdMicros)}
+            {formatUsd(balance.data.balanceUsdMicros, lang)}
           </p>
           {balance.data.balanceUsdMicros < 0n ? (
-            <p className="muted">
-              The balance is negative. The next credit pays off the debt first.
-            </p>
+            <p className="muted">{t("balance.negative")}</p>
           ) : null}
         </>
       )}
       {canPay ? (
         <div className="actions">
           <Button disabled={!active} onClick={() => setToppingUp(true)}>
-            Top up
+            {t("balance.topUp")}
           </Button>
           {!active && subscription.data !== undefined ? (
-            <span className="muted">Top-ups need an active subscription.</span>
+            <span className="muted">{t("balance.topUpNeedsSubscription")}</span>
           ) : null}
         </div>
       ) : null}
@@ -146,6 +146,8 @@ function TopUpDialog({
   const { billingAccountId } = useBillingAccount();
   const queryClient = useQueryClient();
   const topUp = useMutation(CreditService.method.createTopUp);
+  const i18n = useI18n();
+  const { lang, t } = i18n;
   const [amount, setAmount] = useState("25.00");
   const [error, setError] = useState<string>();
   const [idempotencyKey, setIdempotencyKey] = useState("");
@@ -163,11 +165,14 @@ function TopUpDialog({
     <FormDialog
       open={open}
       onOpenChange={onOpenChange}
-      title="Top up credit"
-      description={`Charge the subscription's payment method once. Enter ${formatUsd(TOP_UP_MIN_USD_MICROS)} to ${formatUsd(TOP_UP_MAX_USD_MICROS)}; tax is added on top. The credit appears when Paddle confirms the payment.`}
-      submitLabel="Top up"
+      title={t("topUp.title")}
+      description={t("topUp.description", {
+        min: formatUsd(TOP_UP_MIN_USD_MICROS, lang),
+        max: formatUsd(TOP_UP_MAX_USD_MICROS, lang),
+      })}
+      submitLabel={t("topUp.submit")}
       onSubmit={async () => {
-        const checked = checkTopUpAmount(amount);
+        const checked = checkTopUpAmount(amount, i18n);
         if (!checked.ok) {
           setError(checked.error);
           return formInvalid();
@@ -185,13 +190,13 @@ function TopUpDialog({
         return formSubmitted(() => {
           onOpenChange(false);
           toast.success(
-            `Paddle accepted the ${formatUsd(checked.value)} top-up. The credit appears when the payment is confirmed.`,
+            t("topUp.accepted", { amount: formatUsd(checked.value, lang) }),
           );
         });
       }}
     >
       <TextField
-        label="Amount (USD)"
+        label={t("topUp.amount")}
         value={amount}
         // The key stays the same when the amount changes: after a request
         // whose result is unknown, the server rejects the same key with
@@ -206,7 +211,8 @@ function TopUpDialog({
   );
 }
 
-function subscriptionBadge(subscription: Subscription) {
+function SubscriptionBadge({ subscription }: { subscription: Subscription }) {
+  const { t } = useI18n();
   const variant =
     subscription.status === SubscriptionStatus.ACTIVE
       ? BadgeVariant.Accent
@@ -215,7 +221,7 @@ function subscriptionBadge(subscription: Subscription) {
         : BadgeVariant.Neutral;
   return (
     <Badge variant={variant}>
-      {labels.subscriptionStatus[subscription.status]}
+      {t(labels.subscriptionStatus[subscription.status])}
     </Badge>
   );
 }
@@ -225,6 +231,7 @@ function SubscriptionCard() {
   const queryClient = useQueryClient();
   const checkout = useCheckout();
   const actionFailure = useActionFailure();
+  const { lang, t } = useI18n();
   const subscription = useQuery(
     CreditService.method.getSubscription,
     { billingAccountId },
@@ -294,6 +301,7 @@ function SubscriptionCard() {
         res.paddleTransactionId,
         () => void refresh(),
         signal,
+        lang,
       );
     } catch (error) {
       if (!signal?.aborted) setStartError(error);
@@ -302,14 +310,14 @@ function SubscriptionCard() {
 
   if (subscription.isPending) {
     return (
-      <section className="section" aria-label="Subscription">
-        <Loading label="Loading the subscription" />
+      <section className="section" aria-label={t("subscription.title")}>
+        <Loading label={t("subscription.loading")} />
       </section>
     );
   }
   if (subscription.isLoadingError) {
     return (
-      <section className="section" aria-label="Subscription">
+      <section className="section" aria-label={t("subscription.title")}>
         <ErrorNotice
           error={subscription.error}
           onRetry={() => void subscription.refetch()}
@@ -339,31 +347,26 @@ function SubscriptionCard() {
         onRetry={() => void subscription.refetch()}
       />
       <div className="section-header">
-        <h2 id="subscription-title">Subscription</h2>
-        {sub !== undefined ? subscriptionBadge(sub) : null}
+        <h2 id="subscription-title">{t("subscription.title")}</h2>
+        {sub !== undefined ? <SubscriptionBadge subscription={sub} /> : null}
       </div>
       <p className="muted">
-        {formatUsd(price)} per month. Each payment adds {formatUsd(price)} of
-        credit. Services need an active subscription.
+        {t("subscription.price", { price: formatUsd(price, lang) })}
       </p>
       {status === SubscriptionStatus.PENDING ? (
-        <p role="status">
-          Waiting for Paddle to confirm the first payment. This page updates
-          when the payment is confirmed. If you closed the checkout before
-          paying, continue the checkout.
-        </p>
+        <p role="status">{t("subscription.pending")}</p>
       ) : null}
       {status === SubscriptionStatus.PAST_DUE ? (
-        <p role="status">
-          A renewal payment failed, and Paddle retries it. Check the payment
-          method in the email from Paddle.
-        </p>
+        <p role="status">{t("subscription.pastDue")}</p>
       ) : null}
       {current && sub?.currentPeriodEnd !== undefined ? (
         <p>
-          {sub.cancelAtPeriodEnd
-            ? `Ends on ${formatDate(sub.currentPeriodEnd)}.`
-            : `Renews on ${formatDate(sub.currentPeriodEnd)}.`}
+          {t(
+            sub.cancelAtPeriodEnd
+              ? "subscription.endsOn"
+              : "subscription.renewsOn",
+            { date: formatDate(sub.currentPeriodEnd, lang) },
+          )}
         </p>
       ) : null}
       {startError !== undefined ? <ErrorNotice error={startError} /> : null}
@@ -372,12 +375,14 @@ function SubscriptionCard() {
         <div className="actions">
           {startable ? (
             checkout === undefined ? (
-              <p role="alert">Checkout is not configured for this build.</p>
+              <p role="alert">{t("subscription.checkoutNotConfigured")}</p>
             ) : (
               <Button onClick={startCheckout}>
-                {status === SubscriptionStatus.PENDING
-                  ? "Continue checkout"
-                  : "Start subscription"}
+                {t(
+                  status === SubscriptionStatus.PENDING
+                    ? "subscription.continueCheckout"
+                    : "subscription.start",
+                )}
               </Button>
             )
           ) : null}
@@ -386,7 +391,7 @@ function SubscriptionCard() {
               variant={ButtonVariant.Secondary}
               onClick={() => setCanceling(true)}
             >
-              Cancel subscription
+              {t("subscription.cancel")}
             </Button>
           ) : null}
           {current && sub!.cancelAtPeriodEnd ? (
@@ -395,13 +400,13 @@ function SubscriptionCard() {
                 try {
                   await resume.mutateAsync({ billingAccountId });
                   actionFailure.clear();
-                  toast.success("The subscription continues.");
+                  toast.success(t("subscription.resumed"));
                 } catch (error) {
                   actionFailure.report(error);
                 }
               }}
             >
-              Resume subscription
+              {t("subscription.resume")}
             </Button>
           ) : null}
         </div>
@@ -409,13 +414,15 @@ function SubscriptionCard() {
       <ConfirmDialog
         open={cancelOpen}
         onOpenChange={setCanceling}
-        title="Cancel the subscription?"
+        title={t("subscription.cancelDialog.title")}
         description={
           sub?.currentPeriodEnd !== undefined
-            ? `It stays active until ${formatDate(sub.currentPeriodEnd)}. After that, linked organizations cannot use paid features. You can resume it before then.`
-            : "It stays active until the end of the paid period. After that, linked organizations cannot use paid features."
+            ? t("subscription.cancelDialog.descriptionWithDate", {
+                date: formatDate(sub.currentPeriodEnd, lang),
+              })
+            : t("subscription.cancelDialog.description")
         }
-        confirmLabel="Cancel subscription"
+        confirmLabel={t("subscription.cancel")}
         onConfirm={async () => {
           if (!cancelOpen) return;
           await cancel.mutateAsync({ billingAccountId });
@@ -430,45 +437,48 @@ function CreditGrants() {
   const balance = useQuery(CreditService.method.getBalance, {
     billingAccountId,
   });
+  const { lang, t, rich } = useI18n();
   return (
     <section className="section" aria-labelledby="grants-title">
-      <h2 id="grants-title">Credit</h2>
-      <p className="muted">
-        Credit expires 12 months after purchase. Usage takes the credit that
-        expires first.
-      </p>
+      <h2 id="grants-title">{t("credit.title")}</h2>
+      <p className="muted">{t("credit.description")}</p>
       <RefetchNotice
         error={balance.isRefetchError ? balance.error : undefined}
         onRetry={() => void balance.refetch()}
       />
       {balance.isPending ? (
-        <Loading label="Loading credit" />
+        <Loading label={t("credit.loading")} />
       ) : balance.isLoadingError ? (
         <ErrorNotice
           error={balance.error}
           onRetry={() => void balance.refetch()}
         />
       ) : balance.data.creditGrants.length === 0 ? (
-        <Empty title="No credit left" />
+        <Empty title={t("credit.empty")} />
       ) : (
-        <ul className="list" aria-label="Credit grants">
+        <ul className="list" aria-label={t("credit.list")}>
           {balance.data.creditGrants.map((grant) => (
             <li key={grant.creditGrantId} className="list-row">
               <div className="list-main">
                 <span className="list-title">
-                  {labels.ledgerKind[grant.source]}
+                  {t(labels.ledgerKind[grant.source])}
                 </span>
                 <span className="muted">
-                  Bought {formatDate(grant.createTime)} · Expires{" "}
-                  {formatDate(grant.expireTime)}
+                  {t("credit.dates", {
+                    bought: formatDate(grant.createTime, lang),
+                    expires: formatDate(grant.expireTime, lang),
+                  })}
                 </span>
               </div>
               <span className="amount">
-                {formatUsd(grant.remainingUsdMicros)}
-                <span className="muted">
-                  {" "}
-                  of {formatUsd(grant.originalUsdMicros)}
-                </span>
+                {rich("credit.remainingOf", {
+                  remaining: formatUsd(grant.remainingUsdMicros, lang),
+                  original: (
+                    <span className="muted">
+                      {formatUsd(grant.originalUsdMicros, lang)}
+                    </span>
+                  ),
+                })}
               </span>
             </li>
           ))}

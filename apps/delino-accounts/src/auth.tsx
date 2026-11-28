@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { API_RESOURCE, type LogtoSettings } from "./config.ts";
+import { useI18n } from "./i18n.ts";
 
 /** The signed-in state that the pages need, independent of the provider. */
 export interface Auth {
@@ -202,6 +203,9 @@ function LogtoBridge({ children }: { children: ReactNode }) {
     signIn,
     signOut,
   } = useLogto();
+  // Logto shows its sign-in pages in the selected language when the tenant
+  // enables it (OIDC `ui_locales`), otherwise in its own default.
+  const { lang } = useI18n();
   // The SDK `signIn` never rejects. It stores a failure in the provider's
   // `error` state, which the SDK never clears, and resolves. The bridge
   // therefore compares that state with its value at the start of the attempt:
@@ -249,7 +253,10 @@ function LogtoBridge({ children }: { children: ReactNode }) {
         const id = ++attemptCount.current;
         const baseline = sdkErrorRef.current;
         setAttempt({ id, baseline, settled: false, failed: undefined });
-        await signIn(window.location.origin + CALLBACK_PATH);
+        await signIn({
+          redirectUri: window.location.origin + CALLBACK_PATH,
+          extraParams: { ui_locales: lang },
+        });
         // A newer attempt replaced this one while it ran.
         if (id === attemptCount.current) {
           setAttempt({ id, baseline, settled: true, failed: undefined });
@@ -268,6 +275,7 @@ function LogtoBridge({ children }: { children: ReactNode }) {
       isAuthenticated,
       userId,
       attempt?.failed,
+      lang,
       signIn,
       signOut,
       getAccessToken,

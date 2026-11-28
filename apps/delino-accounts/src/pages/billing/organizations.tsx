@@ -8,7 +8,8 @@ import {
   Loading,
   MorePages,
 } from "../../components/ui.tsx";
-import { formatDate, labels } from "../../format.ts";
+import { formatDate, labels, serviceName } from "../../format.ts";
+import { useI18n } from "../../i18n.ts";
 import { useAllPages } from "../../paging.ts";
 import {
   BillingStatus,
@@ -16,15 +17,19 @@ import {
   type LinkedOrganization,
 } from "@delino/accounts-protos/v1/usage_pb";
 
-function statusBadge(org: LinkedOrganization) {
+function StatusBadge({ org }: { org: LinkedOrganization }) {
+  const { t } = useI18n();
   const status = org.status?.status ?? BillingStatus.UNSPECIFIED;
   const reason = org.status
     ? labels.billingStatusReason[org.status.reason]
-    : "";
+    : undefined;
   const text =
-    reason === ""
-      ? labels.billingStatus[status]
-      : `${labels.billingStatus[status]}: ${reason}`;
+    reason === undefined
+      ? t(labels.billingStatus[status])
+      : t("organizations.statusWithReason", {
+          status: t(labels.billingStatus[status]),
+          reason: t(reason),
+        });
   return (
     <Badge
       variant={
@@ -52,23 +57,22 @@ export function OrganizationsSection() {
     }),
     (org) => `${org.service}/${org.organizationId}`,
   );
+  const i18n = useI18n();
+  const { lang, t } = i18n;
   return (
     <section className="section" aria-labelledby="organizations-title">
-      <h2 id="organizations-title">Linked organizations</h2>
-      <p className="muted">
-        This billing account pays for these organizations. Link or unlink an
-        organization in its service, for example in the OwnSand console.
-      </p>
+      <h2 id="organizations-title">{t("organizations.title")}</h2>
+      <p className="muted">{t("organizations.description")}</p>
       <RefetchNotice error={orgs.refreshError} onRetry={orgs.refetch} />
       {orgs.isPending ? (
-        <Loading label="Loading linked organizations" />
+        <Loading label={t("organizations.loading")} />
       ) : orgs.error ? (
         <ErrorNotice error={orgs.error} onRetry={orgs.refetch} />
       ) : orgs.items.length === 0 ? (
-        <Empty title="No linked organizations" />
+        <Empty title={t("organizations.empty")} />
       ) : (
         <>
-          <ul className="list" aria-label="Linked organizations">
+          <ul className="list" aria-label={t("organizations.title")}>
             {orgs.items.map((org) => (
               <li
                 key={`${org.service}/${org.organizationId}`}
@@ -81,11 +85,13 @@ export function OrganizationsSection() {
                       : org.organizationId}
                   </span>
                   <span className="muted">
-                    {labels.service[org.service]} · Linked{" "}
-                    {formatDate(org.linkTime)}
+                    {t("organizations.details", {
+                      service: serviceName(org.service, i18n),
+                      date: formatDate(org.linkTime, lang),
+                    })}
                   </span>
                 </div>
-                {statusBadge(org)}
+                <StatusBadge org={org} />
               </li>
             ))}
           </ul>

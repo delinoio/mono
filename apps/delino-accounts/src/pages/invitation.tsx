@@ -11,6 +11,7 @@ import {
   SignInFailureNotice,
 } from "../components/ui.tsx";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
+import { useI18n } from "../i18n.ts";
 import {
   openInvitationFromAddress,
   pendingInvitation,
@@ -26,6 +27,7 @@ import { Link, parseRoute, RouteId, routePath, useRouter } from "../router.tsx";
 export function InvitationPage({ configured }: { configured: boolean }) {
   const auth = useAuth();
   const { navigate } = useRouter();
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const [token, setToken] = useState<string | undefined>(() => {
     const fromAddress = openInvitationFromAddress(
@@ -83,11 +85,11 @@ export function InvitationPage({ configured }: { configured: boolean }) {
     return (
       <Page narrow>
         <PageHeader
-          title="Invitation"
-          description="This page needs the link from an invitation email. Ask an owner or admin of the billing account to invite you again."
+          title={t("invitation.missing.title")}
+          description={t("invitation.missing.description")}
         />
         <Link to={routePath({ id: RouteId.Billing })}>
-          Go to your billing accounts
+          {t("common.goToBillingAccounts")}
         </Link>
       </Page>
     );
@@ -96,11 +98,11 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   if (needsRecovery) {
     return (
       <Page narrow>
-        <PageHeader title="Join the billing account" />
+        <PageHeader title={t("invitation.join.title")} />
         <div className="notice">
-          <p role="alert">You may have joined the billing account.</p>
+          <p role="alert">{t("invitation.mayHaveJoined")}</p>
           <Link to={routePath({ id: RouteId.Billing })}>
-            Go to your billing accounts
+            {t("common.goToBillingAccounts")}
           </Link>
         </div>
       </Page>
@@ -119,16 +121,18 @@ export function InvitationPage({ configured }: { configured: boolean }) {
     return (
       <Page narrow>
         <PageHeader
-          title="You are invited to a billing account"
-          description="Sign in with the email address that received the invitation to accept it."
+          title={t("invitation.signIn.title")}
+          description={t("invitation.signIn.description")}
         />
         {configured ? (
           <>
-            <Button onClick={() => signIn(token)}>Sign in to accept</Button>
+            <Button onClick={() => signIn(token)}>
+              {t("invitation.signIn.action")}
+            </Button>
             <SignInFailureNotice />
           </>
         ) : (
-          <p role="alert">Sign-in is not configured for this build.</p>
+          <p role="alert">{t("auth.notConfigured")}</p>
         )}
       </Page>
     );
@@ -137,8 +141,8 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   return (
     <Page narrow>
       <PageHeader
-        title="Join the billing account"
-        description="You join as the signed-in user. The invitation works only once and only for the invited email address."
+        title={t("invitation.join.title")}
+        description={t("invitation.join.description")}
       />
       {accept.error ? (
         <ErrorNotice error={accept.error} onSignIn={() => signIn(token)} />
@@ -191,9 +195,11 @@ export function InvitationPage({ configured }: { configured: boolean }) {
             );
           }}
         >
-          Accept invitation
+          {t("invitation.accept")}
         </Button>
-        <Link to={routePath({ id: RouteId.Billing })}>Not now</Link>
+        <Link to={routePath({ id: RouteId.Billing })}>
+          {t("invitation.notNow")}
+        </Link>
       </div>
     </Page>
   );

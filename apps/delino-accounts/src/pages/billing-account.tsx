@@ -16,6 +16,8 @@ import {
   RefetchNotice,
 } from "../components/ui.tsx";
 import { labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
+import type { MessageKey } from "../text.ts";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
@@ -36,17 +38,17 @@ export enum BillingTab {
   Settings = "settings",
 }
 
-const TABS: { id: BillingTab; title: string; permission?: Permission }[] = [
-  { id: BillingTab.Overview, title: "Overview" },
-  { id: BillingTab.Usage, title: "Usage" },
-  { id: BillingTab.Members, title: "Members" },
-  { id: BillingTab.Organizations, title: "Organizations" },
+const TABS: { id: BillingTab; title: MessageKey; permission?: Permission }[] = [
+  { id: BillingTab.Overview, title: "billingAccount.tab.overview" },
+  { id: BillingTab.Usage, title: "billingAccount.tab.usage" },
+  { id: BillingTab.Members, title: "billingAccount.tab.members" },
+  { id: BillingTab.Organizations, title: "billingAccount.tab.organizations" },
   {
     id: BillingTab.Invoices,
-    title: "Invoices",
+    title: "billingAccount.tab.invoices",
     permission: Permission.ReadInvoices,
   },
-  { id: BillingTab.Settings, title: "Settings" },
+  { id: BillingTab.Settings, title: "billingAccount.tab.settings" },
 ];
 
 /**
@@ -60,6 +62,7 @@ export function BillingAccountPage({
 }) {
   const transport = useTransport();
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const accountQuery = createQueryOptions(
     BillingAccountService.method.getBillingAccount,
     { billingAccountId },
@@ -73,7 +76,7 @@ export function BillingAccountPage({
   if (account.isPending) {
     return (
       <Page>
-        <Loading label="Loading the billing account" />
+        <Loading label={t("billingAccount.loading")} />
       </Page>
     );
   }
@@ -92,7 +95,7 @@ export function BillingAccountPage({
           onRetry={() => void account.refetch()}
         />
         <Link to={routePath({ id: RouteId.Billing })}>
-          Go to your billing accounts
+          {t("common.goToBillingAccounts")}
         </Link>
       </Page>
     );
@@ -135,28 +138,33 @@ function accountGone(error: unknown): boolean {
 
 function BillingAccountBody() {
   const { name, role } = useBillingAccount();
+  const { t } = useI18n();
   const [tab, setTab] = useState<BillingTab>(BillingTab.Overview);
   const visible = TABS.filter(
-    (t) => t.permission === undefined || can(role, t.permission),
+    (item) => item.permission === undefined || can(role, item.permission),
   );
   // Persist the fallback so restoring access cannot reopen the hidden tab.
-  if (!visible.some((t) => t.id === tab)) {
+  if (!visible.some((item) => item.id === tab)) {
     setTab(BillingTab.Overview);
   }
   return (
     <>
       <p className="breadcrumb">
-        <Link to={routePath({ id: RouteId.Billing })}>Billing accounts</Link>
+        <Link to={routePath({ id: RouteId.Billing })}>
+          {t("billingAccounts.title")}
+        </Link>
       </p>
       <PageHeader
         title={name}
-        description={`Your role: ${labels.role[role]}`}
+        description={t("billingAccount.yourRole", {
+          role: t(labels.role[role]),
+        })}
       />
       <Tabs value={tab} onValueChange={(value) => setTab(value as BillingTab)}>
-        <TabsList aria-label="Billing account sections">
-          {visible.map((t) => (
-            <TabsTab key={t.id} value={t.id}>
-              {t.title}
+        <TabsList aria-label={t("billingAccount.sections")}>
+          {visible.map((item) => (
+            <TabsTab key={item.id} value={item.id}>
+              {t(item.title)}
             </TabsTab>
           ))}
         </TabsList>

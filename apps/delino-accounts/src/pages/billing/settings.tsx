@@ -46,11 +46,10 @@ import {
   CreditService,
 } from "@delino/accounts-protos/v1/credit_pb";
 import { BillingUsageService } from "@delino/accounts-protos/v1/usage_pb";
+import { useI18n } from "../../i18n.ts";
 import { formatUsd, toAmountInput } from "../../money.ts";
 import { can, Permission } from "../../roles.ts";
 import { parseRoute, RouteId, routePath, useRouter } from "../../router.tsx";
-
-const READ_ONLY_NOTE = "Only owners and admins can change these settings.";
 
 /** The settings tab: name, automatic top-up, alerts and deletion. */
 export function SettingsSection() {
@@ -83,6 +82,7 @@ function SettingsForm({
 }) {
   const [error, setError] = useState<unknown>();
   const [pending, setPending] = useState(false);
+  const { t } = useI18n();
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (pending) return;
@@ -106,11 +106,11 @@ function SettingsForm({
         {editable ? (
           <div className="actions">
             <Button type="submit" disabled={pending}>
-              Save
+              {t("common.save")}
             </Button>
           </div>
         ) : (
-          <p className="muted">{READ_ONLY_NOTE}</p>
+          <p className="muted">{t("settings.readOnly")}</p>
         )}
       </form>
     </section>
@@ -122,6 +122,8 @@ function NameSettings() {
     useBillingAccount();
   const queryClient = useQueryClient();
   const update = useMutation(BillingAccountService.method.updateBillingAccount);
+  const i18n = useI18n();
+  const { t } = i18n;
   const [draft, setDraft] = useState<{ value: string }>();
   const [savedName, setSavedName] = useState<{
     value: string;
@@ -138,11 +140,11 @@ function NameSettings() {
   const value = draft?.value ?? (awaitingRead ? savedName.value : name);
   return (
     <SettingsForm
-      title="Name"
+      title={t("settings.name.title")}
       id="name-title"
       editable={editable}
       onSubmit={async () => {
-        const checked = checkAccountName(value);
+        const checked = checkAccountName(value, i18n);
         if (!checked.ok) {
           setError(checked.error);
           return;
@@ -162,14 +164,14 @@ function NameSettings() {
           // Each edit creates a new draft, even if the user types the same text.
           setDraft((latest) => (latest === draft ? undefined : latest));
           await invalidateServices(queryClient, BillingAccountService);
-          toast.success("The name is saved.");
+          toast.success(t("settings.name.saved"));
         } finally {
           setSaving(false);
         }
       }}
     >
       <TextField
-        label="Billing account name"
+        label={t("settings.name.label")}
         value={value}
         onChange={(event) => {
           const value = event.target.value;
@@ -197,6 +199,7 @@ function AutoTopUpSection() {
   const { year, month } = useCurrentUtcMonth();
   const currentMonth = year * 12 + month;
   const previousMonth = useRef(currentMonth);
+  const { t } = useI18n();
 
   useEffect(() => {
     if (previousMonth.current === currentMonth) return;
@@ -215,11 +218,11 @@ function AutoTopUpSection() {
   }, [billingAccountId, currentMonth, queryClient, refetch, schema, transport]);
 
   return settings.isPending ? (
-    <section className="section" aria-label="Automatic top-up">
-      <Loading label="Loading automatic top-up" />
+    <section className="section" aria-label={t("autoTopUp.title")}>
+      <Loading label={t("autoTopUp.loading")} />
     </section>
   ) : settings.isLoadingError ? (
-    <section className="section" aria-label="Automatic top-up">
+    <section className="section" aria-label={t("autoTopUp.title")}>
       <ErrorNotice error={settings.error} onRetry={() => void refetch()} />
     </section>
   ) : (
@@ -274,6 +277,8 @@ function AutoTopUpForm({
   const { billingAccountId, role } = useBillingAccount();
   const queryClient = useQueryClient();
   const update = useMutation(CreditService.method.updateAutoTopUpSettings);
+  const i18n = useI18n();
+  const { lang, t } = i18n;
   const editable = can(role, Permission.ManagePayments);
   const settingsKey = autoTopUpSettingsKey(settings);
   const [form, setForm] = useState<AutoTopUpFormState>(() => ({
@@ -300,12 +305,12 @@ function AutoTopUpForm({
 
   return (
     <SettingsForm
-      title="Automatic top-up"
+      title={t("autoTopUp.title")}
       id="auto-top-up-title"
-      description="Buy credit automatically when a usage charge makes the balance fall below the threshold. The monthly cap limits automatic top-ups in one UTC calendar month. Automatic top-ups in progress count toward the cap. After 2 failed top-ups in a row, automatic top-up turns off."
+      description={t("autoTopUp.description")}
       editable={editable}
       onSubmit={async () => {
-        const checked = checkAutoTopUp(draft);
+        const checked = checkAutoTopUp(draft, i18n);
         if (!checked.ok) {
           setErrors(checked.errors);
           return;
@@ -328,25 +333,27 @@ function AutoTopUpForm({
               : current.draft,
         }));
         await invalidateServices(queryClient, CreditService);
-        toast.success("Automatic top-up is saved.");
+        toast.success(t("autoTopUp.saved"));
       }}
     >
       <Switch
-        label="Automatic top-up"
+        label={t("autoTopUp.title")}
         description={
           draft.enabled
             ? undefined
-            : "Enter amounts of $0.00 or more in whole cents. Blank fields save as $0.00. Saved values are available when you turn automatic top-up on."
+            : t("autoTopUp.disabledHint", { zero: formatUsd(0n, lang) })
         }
         checked={draft.enabled}
         onCheckedChange={(enabled) => editDraft({ enabled })}
         disabled={!editable}
       />
       <TextField
-        label="Threshold (USD)"
+        label={t("autoTopUp.threshold")}
         description={
           draft.enabled
-            ? `At least ${formatUsd(AUTO_TOP_UP_MIN_THRESHOLD_USD_MICROS)}.`
+            ? t("autoTopUp.thresholdHint", {
+                amount: formatUsd(AUTO_TOP_UP_MIN_THRESHOLD_USD_MICROS, lang),
+              })
             : undefined
         }
         value={draft.threshold}
@@ -357,11 +364,14 @@ function AutoTopUpForm({
         autoComplete="off"
       />
       <TextField
-        label="Top-up amount (USD)"
+        label={t("autoTopUp.amount")}
         description={
           draft.enabled
-            ? `${formatUsd(AUTO_TOP_UP_MIN_AMOUNT_USD_MICROS)} to ${formatUsd(TOP_UP_MAX_USD_MICROS)}. Tax is added on top.`
-            : "Tax is added on top."
+            ? t("autoTopUp.amountHint", {
+                min: formatUsd(AUTO_TOP_UP_MIN_AMOUNT_USD_MICROS, lang),
+                max: formatUsd(TOP_UP_MAX_USD_MICROS, lang),
+              })
+            : t("autoTopUp.taxHint")
         }
         value={draft.amount}
         onChange={(event) => editDraft({ amount: event.target.value })}
@@ -371,10 +381,8 @@ function AutoTopUpForm({
         autoComplete="off"
       />
       <TextField
-        label="Monthly cap (USD)"
-        description={
-          draft.enabled ? "Required. At least the top-up amount." : undefined
-        }
+        label={t("autoTopUp.monthlyCap")}
+        description={draft.enabled ? t("autoTopUp.monthlyCapHint") : undefined}
         value={draft.monthlyCap}
         onChange={(event) => editDraft({ monthlyCap: event.target.value })}
         error={errors.monthlyCap}
@@ -383,11 +391,11 @@ function AutoTopUpForm({
         autoComplete="off"
       />
       <dl className="details">
-        <Detail term="Monthly cap usage">
-          {formatUsd(settings?.monthToDateUsdMicros ?? 0n)}
+        <Detail term={t("autoTopUp.monthlyCapUsage")}>
+          {formatUsd(settings?.monthToDateUsdMicros ?? 0n, lang)}
         </Detail>
-        <Detail term="Failed top-ups in a row">
-          {formatCount(BigInt(settings?.consecutiveFailures ?? 0))}
+        <Detail term={t("autoTopUp.failures")}>
+          {formatCount(BigInt(settings?.consecutiveFailures ?? 0), lang)}
         </Detail>
       </dl>
     </SettingsForm>
@@ -399,12 +407,13 @@ function AlertSection() {
   const settings = useQuery(CreditService.method.getAlertSettings, {
     billingAccountId,
   });
+  const { t } = useI18n();
   return settings.isPending ? (
-    <section className="section" aria-label="Low-balance alert">
-      <Loading label="Loading the low-balance alert" />
+    <section className="section" aria-label={t("alert.title")}>
+      <Loading label={t("alert.loading")} />
     </section>
   ) : settings.isLoadingError ? (
-    <section className="section" aria-label="Low-balance alert">
+    <section className="section" aria-label={t("alert.title")}>
       <ErrorNotice
         error={settings.error}
         onRetry={() => void settings.refetch()}
@@ -438,6 +447,8 @@ function AlertForm({
   const { billingAccountId, role } = useBillingAccount();
   const queryClient = useQueryClient();
   const update = useMutation(CreditService.method.updateAlertSettings);
+  const i18n = useI18n();
+  const { lang, t } = i18n;
   const editable = can(role, Permission.ManagePayments);
   const [draft, setDraft] = useState<{ value: string }>();
   const [lastRead, setLastRead] = useState<{
@@ -457,12 +468,12 @@ function AlertForm({
     draft?.value ?? toAmountInput(lastRead.savedThreshold ?? fetchedThreshold);
   return (
     <SettingsForm
-      title="Low-balance alert"
+      title={t("alert.title")}
       id="alert-title"
-      description="While automatic top-up is off, owners and admins get an email when the balance falls below this amount."
+      description={t("alert.description")}
       editable={editable}
       onSubmit={async () => {
-        const checked = checkAlertThreshold(threshold);
+        const checked = checkAlertThreshold(threshold, i18n);
         if (!checked.ok) {
           setError(checked.error);
           return;
@@ -480,12 +491,15 @@ function AlertForm({
         // Each edit creates a separate draft, even if its text is the same.
         setDraft((latest) => (latest === draft ? undefined : latest));
         await invalidateServices(queryClient, CreditService);
-        toast.success("The alert is saved.");
+        toast.success(t("alert.saved"));
       }}
     >
       <TextField
-        label="Alert threshold (USD)"
-        description="At least $0.00. The default is $10.00."
+        label={t("alert.threshold")}
+        description={t("alert.thresholdHint", {
+          min: formatUsd(0n, lang),
+          default: formatUsd(DEFAULT_ALERT_THRESHOLD_USD_MICROS, lang),
+        })}
         value={threshold}
         onChange={(event) => setDraft({ value: event.target.value })}
         error={error}
@@ -503,26 +517,25 @@ function DeleteSection() {
   const queryClient = useQueryClient();
   const remove = useMutation(BillingAccountService.method.deleteBillingAccount);
   const [confirming, setConfirming] = useState(false);
+  const { lang, t } = useI18n();
   return (
     <section className="section danger-zone" aria-labelledby="delete-title">
-      <h2 id="delete-title">Delete billing account</h2>
+      <h2 id="delete-title">{t("deleteAccount.title")}</h2>
       <p className="muted">
-        You can delete the billing account only when its balance is $0.00 or
-        more and no organization is linked. Deletion cancels the subscription at
-        once, and the remaining credit is not refunded.
+        {t("deleteAccount.description", { zero: formatUsd(0n, lang) })}
       </p>
       <Button
         variant={ButtonVariant.Danger}
         onClick={() => setConfirming(true)}
       >
-        Delete billing account
+        {t("deleteAccount.title")}
       </Button>
       <ConfirmDialog
         open={confirming}
         onOpenChange={setConfirming}
-        title={`Delete ${name}?`}
-        description="The subscription ends now, the remaining credit is lost and every member loses access. This cannot be undone."
-        confirmLabel="Delete billing account"
+        title={t("deleteAccount.dialog.title", { name })}
+        description={t("deleteAccount.dialog.description")}
+        confirmLabel={t("deleteAccount.title")}
         onConfirm={async () => {
           await remove.mutateAsync({ billingAccountId });
           // Read the live route after the RPC. Move off this account before
