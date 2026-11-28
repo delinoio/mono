@@ -3698,7 +3698,7 @@ describe("setup guidance", () => {
       });
       return within(checklist).getByRole("link", { name: "Link OwnSand" });
     }
-    await screen.findByText(/Next step: link ownsand/);
+    await screen.findByText(/Next step: link OwnSand\./);
     return screen.getByRole("link", { name: "Link OwnSand" });
   }
 

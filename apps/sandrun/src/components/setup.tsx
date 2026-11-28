@@ -5,6 +5,7 @@ import { OwnSandLinkState } from "@delino/sandrun-protos/v1/common_pb";
 import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
 import { OwnSandLinkService } from "@delino/sandrun-protos/v1/ownsand_link_pb";
 import { RunnerProfileService } from "@delino/sandrun-protos/v1/runner_profile_pb";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { Link, orgPath, RouteId } from "../router.tsx";
 import { Empty } from "./ui.tsx";
 
@@ -43,38 +44,40 @@ export function nextSetupStep(state: SetupState): SetupStep | undefined {
 }
 
 interface StepText {
-  title: string;
-  detail: string;
+  title: MessageKey;
+  detail: MessageKey;
+  /** The sentence that names the step as the next one. */
+  next: MessageKey;
   route: RouteId.Integrations | RouteId.Profiles;
-  action?: string;
+  action?: MessageKey;
 }
 
-const STEP_TEXT: Record<Exclude<SetupStep, SetupStep.Done>, StepText> = {
+const STEP_TEXT = {
   [SetupStep.LinkOwnSand]: {
-    title: "Link OwnSand",
-    detail:
-      "Link the OwnSand organization whose devices run your work, with an OwnSand organization API key.",
+    title: "setup.linkOwnSand.title",
+    detail: "setup.linkOwnSand.detail",
+    next: "setup.linkOwnSand.next",
     route: RouteId.Integrations,
   },
   [SetupStep.ConnectWorkSource]: {
-    title: "Connect GitHub or create an agent integration",
-    detail:
-      "Install the SandRun GitHub App for GitHub Actions jobs, or add a Claude Code, Cursor, OpenAI Codex or Devin integration for agent sessions.",
+    title: "setup.connectWorkSource.title",
+    detail: "setup.connectWorkSource.detail",
+    next: "setup.connectWorkSource.next",
     route: RouteId.Integrations,
   },
   [SetupStep.CreateRunnerProfile]: {
-    title: "Create a runner profile",
-    detail:
-      "A runner profile describes one kind of runner: its workload, guest OS, resources and priority.",
+    title: "setup.createRunnerProfile.title",
+    detail: "setup.createRunnerProfile.detail",
+    next: "setup.createRunnerProfile.next",
     route: RouteId.Profiles,
   },
-};
+} as const satisfies Record<Exclude<SetupStep, SetupStep.Done>, StepText>;
 
 const INVALID_LINK_TEXT: StepText = {
   ...STEP_TEXT[SetupStep.LinkOwnSand],
-  action: "Replace OwnSand API key",
-  detail:
-    "OwnSand rejected the saved API key. An admin must replace it to resume dispatch.",
+  action: "setup.invalidLink.action",
+  detail: "setup.invalidLink.detail",
+  next: "setup.invalidLink.next",
 };
 
 const ORDER = [
@@ -109,7 +112,7 @@ function useSetupGuidance(organizationId: string) {
     hasRunnerProfile: profiles.data && profiles.data.profiles.length > 0,
   });
   if (step === undefined || step === SetupStep.Done) return undefined;
-  const text =
+  const text: StepText =
     linkState === OwnSandLinkState.INVALID
       ? INVALID_LINK_TEXT
       : STEP_TEXT[step];
@@ -118,29 +121,34 @@ function useSetupGuidance(organizationId: string) {
 
 /** The setup checklist of the overview, while a step is not done. */
 export function SetupGuide({ organizationId }: { organizationId: string }) {
+  const { t } = useI18n();
   const guidance = useSetupGuidance(organizationId);
   if (guidance === undefined) return null;
   const nextIndex = ORDER.indexOf(guidance.step);
   return (
     <section className="section" aria-labelledby="setup-title">
-      <h2 id="setup-title">Set up SandRun</h2>
+      <h2 id="setup-title">{t("setup.title")}</h2>
       <ol className="setup-steps">
         {ORDER.map((step, index) => {
           const current = index === nextIndex;
-          const text = current ? guidance.text : STEP_TEXT[step];
+          const text: StepText = current ? guidance.text : STEP_TEXT[step];
           const done = index < nextIndex;
           return (
             <li key={step} className="setup-step" data-done={done}>
-              <span className="muted">{done ? "Done" : `${index + 1}.`}</span>
+              <span className="muted">
+                {done
+                  ? t("setup.stepDone")
+                  : t("setup.stepNumber", { number: index + 1 })}
+              </span>
               <span>
-                <span className="setup-step-title">{text.title}</span>
+                <span className="setup-step-title">{t(text.title)}</span>
                 {current ? (
                   <>
                     <br />
-                    <span className="muted">{text.detail}</span>
+                    <span className="muted">{t(text.detail)}</span>
                     <br />
                     <Link to={orgPath(text.route, organizationId)}>
-                      {text.action ?? text.title}
+                      {t(text.action ?? text.title)}
                     </Link>
                   </>
                 ) : null}
@@ -165,17 +173,18 @@ export function SetupEmpty({
   title: string;
   children?: React.ReactNode;
 }) {
+  const { t } = useI18n();
   const guidance = useSetupGuidance(organizationId);
   if (guidance === undefined) {
     return <Empty title={title}>{children}</Empty>;
   }
   const { text } = guidance;
-  const action = text.action ?? text.title;
+  const action = t(text.action ?? text.title);
   return (
     <div className="empty">
       <p className="empty-title">{title}</p>
       <p className="muted">
-        Next step: {action.toLowerCase()}. {text.detail}
+        {t(text.next)} {t(text.detail)}
       </p>
       <Link to={orgPath(text.route, organizationId)}>{action}</Link>
     </div>

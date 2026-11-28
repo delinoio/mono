@@ -520,6 +520,13 @@ h2 {
     order: 3;
     width: 100%;
   }
+
+  /* The language menu, the account links and the sign-out button wrap
+     instead of widening the page. */
+  .topbar-links {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
 }
 
 /* The banner of an organization whose OwnSand link is invalid. */
@@ -588,4 +595,24 @@ h2 {
   align-items: center;
   gap: 8px;
   overflow-wrap: anywhere;
+}
+
+/* The language menu of the top bar. Its visible label is redundant next to
+   the language names; keep it for assistive technology only. */
+.language-select {
+  min-width: 160px;
+}
+
+.language-select .dui-text-field-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The signed-out top bar holds only the language menu, at the end. */
+.topbar-signed-out {
+  justify-content: flex-end;
 }
