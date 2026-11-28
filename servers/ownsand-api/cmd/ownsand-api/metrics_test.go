@@ -17,6 +17,10 @@ import (
 // TestMetricsServer checks that the internal listener serves only
 // GET /metrics from the OpenTelemetry meter provider.
 func TestMetricsServer(t *testing.T) {
+	// The SDK reads resource settings from the process environment.
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+
 	ctx := context.Background()
 	tel, err := telemetry.New(ctx, telemetry.Options{
 		ServiceName: "ownsand-api",
