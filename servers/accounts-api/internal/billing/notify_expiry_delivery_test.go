@@ -5,6 +5,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -58,11 +59,78 @@ func TestCreditExpiryNotificationRetriesOnlyBeforeExpiry(t *testing.T) {
 					!slices.Equal(after.Recipients, first.Recipients) || len(messages) != 1 {
 					t.Fatalf("expired retry changed delivery progress: state %+v, %d sends", after, len(messages))
 				}
-			} else if after.Abandoned || !after.Sent || after.Attempts != 2 || len(after.Recipients) != 2 ||
+				return
+			}
+			if after.Abandoned || !after.Sent || after.Attempts != 2 || len(after.Recipients) != 2 ||
 				len(messages) != 2 || !strings.HasPrefix(messages[1].To, "admin-") {
 				t.Fatalf("timely retry did not send only to the admin: state %+v, %d sends", after, len(messages))
 			}
+			assertCreditExpiryMessage(t, messages[1], "$5.00 of credit expires on May 11, 2026 12:00 UTC.")
 		})
+	}
+}
+
+func assertCreditExpiryMessage(t *testing.T, msg email.Message, wantBody string) {
+	t.Helper()
+	if msg.Kind != email.KindCreditExpiry || msg.Subject != "Your Delino credit expires soon" {
+		t.Errorf("expiry notice kind = %q, subject = %q", msg.Kind, msg.Subject)
+	}
+	if !strings.Contains(msg.Text, wantBody) || !strings.Contains(msg.HTML, wantBody) {
+		t.Errorf("expiry notice bodies should both contain %q; text = %q, HTML = %q", wantBody, msg.Text, msg.HTML)
+	}
+}
+
+func TestCreditExpiryNotificationRetriesAcrossSubjectChange(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	account := f.account()
+	id, key := f.queueNotice(account)
+	first, second := f.resendRecipients(account)
+	firstKey, secondKey := key+"/"+first, key+"/"+second
+	provider := &notificationProvider{responses: map[string][]providerResponse{
+		secondKey: {{http.StatusServiceUnavailable, `{"message":"temporarily unavailable"}`}},
+	}}
+	logs := f.useNotificationProvider(provider)
+	resend := f.s.email
+	f.s.email = &hookSender{next: resend, before: func(ctx context.Context, msg email.Message) error {
+		if msg.IdempotencyKey != firstKey {
+			return nil
+		}
+		msg.Subject = "Delino credit expires in 7 days"
+		if err := resend.Send(ctx, msg); err != nil {
+			t.Fatalf("send old subject: %v", err)
+		}
+		// Simulate a lost acknowledgement after the provider accepts the old subject.
+		return errors.New("Resend acknowledgement lost")
+	}}
+
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.noticeState(id); st.Sent || st.Abandoned || st.Attempts != 1 || len(st.Recipients) != 0 {
+		t.Fatalf("state after the failed pass = %+v", st)
+	}
+
+	f.s.email = resend
+	f.clock.Advance(time.Minute)
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.noticeState(id); !st.Sent || st.Abandoned || st.Attempts != 2 ||
+		!slices.Equal(st.Recipients, []string{first, second}) {
+		t.Fatalf("state after the retry = %+v", st)
+	}
+	if !strings.Contains(logs.String(), `"reason":"idempotency_payload_conflict"`) {
+		t.Fatal("the retry should record the provider payload conflict")
+	}
+	provider.assertKeys(t, firstKey, secondKey, firstKey, secondKey)
+
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.accepted) != 2 ||
+		!strings.Contains(string(provider.accepted[firstKey].payload), "Delino credit expires in 7 days") ||
+		!strings.Contains(string(provider.accepted[secondKey].payload), "Your Delino credit expires soon") {
+		t.Fatal("the provider should accept one message per recipient and keep the first payload")
 	}
 }
 

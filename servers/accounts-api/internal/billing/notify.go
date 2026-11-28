@@ -702,9 +702,8 @@ func (s *Service) QueueExpiryNotices(ctx context.Context) error {
 				return nil
 			}
 			// The lock waits above can cross the expiry. Read a fresh time
-			// under the locks: an expired grant gets no "expires in 7 days"
-			// notice and stays unmarked, because ExpireGrants removes its
-			// credit and the next run does not select it.
+			// under the locks. Leave an expired grant unmarked and queue no
+			// notice. ExpireGrants removes the expired credit.
 			fresh := s.timestamp()
 			if !expire.After(fresh) {
 				return nil

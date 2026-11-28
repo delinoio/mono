@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -377,7 +378,7 @@ func TestLedgerExpiry(t *testing.T) {
 	young := f.grant(acct, LedgerManualTopUp, 25*usd)
 	f.deduct(acct, 4*usd)
 
-	// 7 days before the expiry the owners and admins get one email.
+	// Six days before expiry, the owner and admin each get one email.
 	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(-6 * 24 * time.Hour))
 	for range 2 {
 		if err := f.s.QueueExpiryNotices(ctx()); err != nil {
@@ -388,13 +389,14 @@ func TestLedgerExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	msgs := f.email.Messages()
-	if len(msgs) != 2 || msgs[0].Kind != email.KindCreditExpiry {
+	if len(msgs) != 2 {
 		t.Fatalf("expiry notices = %+v", msgs)
 	}
 	for _, m := range msgs {
-		if m.To == "" || m.To[:6] == "viewer" {
+		if m.To == "" || strings.HasPrefix(m.To, "viewer-") {
 			t.Fatalf("expiry notice to %q", m.To)
 		}
+		assertCreditExpiryMessage(t, m, "$6.00 of credit expires on May 10, 2027 12:00 UTC.")
 	}
 
 	// At the expiry the rest leaves the balance as an EXPIRY entry.
