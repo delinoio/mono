@@ -549,10 +549,13 @@ func TestRelayRecoveryWhileUnreachable(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE)
-	go func() {
-		time.Sleep(400 * time.Millisecond)
-		cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	}()
+	cp.authScript = func(n int, _ *ownsandv1.AuthorizeRelayRequest) authAction {
+		if n == 1 {
+			// The handler already captured UNREACHABLE for this request.
+			cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+		}
+		return authAction{}
+	}
 	s := cp.handle(t, cp.client(t, TransportRelay))
 	res, r := runExec(t, s)
 	checkLines(t, res, r, 3)
