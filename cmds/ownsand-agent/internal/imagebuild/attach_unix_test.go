@@ -167,9 +167,10 @@ func TestWithAttachedDiskRealProcesses(t *testing.T) {
 			if rerr != nil {
 				t.Fatal(rerr)
 			}
-			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-			if len(lines) < 1 || !strings.HasPrefix(lines[0], "hdiutil attach ") {
-				t.Fatalf("call log = %q", lines)
+			lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+			const wantAttach = "hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount -plist /build/disk.img"
+			if got := lines[0]; got != wantAttach {
+				t.Fatalf("attach log line = %q, want %q", got, wantAttach)
 			}
 			if got, want := strings.Join(lines[1:], "|"), strings.Join(tc.wantLogLines, "|"); got != want {
 				t.Fatalf("calls after the attach = %q, want %q", got, want)
