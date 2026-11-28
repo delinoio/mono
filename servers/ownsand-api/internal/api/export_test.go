@@ -89,9 +89,9 @@ func (c *Control) PollEventsForTest(ctx context.Context) {
 }
 
 // SetAfterWriteResponseDequeuedForTest sets a hook that WriteFile runs with
-// the call context after dequeuing a result or terminal frame and before
-// checking the deadline. A nil hook removes it.
-func (p *DataPlane) SetAfterWriteResponseDequeuedForTest(fn func(cctx context.Context)) {
+// the caller and call contexts after dequeuing a result or terminal frame
+// and before checking cancellation. A nil hook removes it.
+func (p *DataPlane) SetAfterWriteResponseDequeuedForTest(fn func(caller, call context.Context)) {
 	if fn == nil {
 		p.afterWriteResponseDequeued.Store(nil)
 		return
