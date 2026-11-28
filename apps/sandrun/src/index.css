@@ -79,8 +79,11 @@ h2 {
   top: 0;
   z-index: 10;
   display: flex;
+  /* Translated labels and the language menu can be wider than one row at
+     any viewport width; wrap them instead of widening the page. */
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
+  gap: 8px 16px;
   padding: 12px var(--app-gap);
   background: var(--dui-color-surface);
   border-bottom: 1px solid var(--dui-color-neutral-hover);
@@ -109,8 +112,10 @@ h2 {
 
 .topbar-links {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
+  justify-content: flex-end;
+  gap: 8px 16px;
   margin-inline-start: auto;
 }
 
@@ -512,20 +517,9 @@ h2 {
     white-space: nowrap;
   }
 
-  .topbar {
-    flex-wrap: wrap;
-  }
-
   .org-switcher {
     order: 3;
     width: 100%;
-  }
-
-  /* The language menu, the account links and the sign-out button wrap
-     instead of widening the page. */
-  .topbar-links {
-    flex-wrap: wrap;
-    row-gap: 8px;
   }
 }
 
