@@ -3,18 +3,28 @@
 package billing
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 )
 
-// cancelSubscription applies a fresh subscription.canceled webhook for the
-// subscription of the billing account.
-func (f *fixture) cancelSubscription(subID string) {
+// cancelSubscription delivers a fresh cancellation webhook and verifies that
+// the billing account's subscription is canceled.
+func (f *fixture) cancelSubscription(accountID, subID string) {
 	f.t.Helper()
 	f.clock.Advance(time.Minute)
-	f.webhook("subscription.canceled", map[string]any{"id": subID, "status": "canceled", "updated_at": f.clock.Now()})
+	if code := f.webhook("subscription.canceled", map[string]any{"id": subID, "status": "canceled", "updated_at": f.clock.Now()}); code != http.StatusOK {
+		f.t.Fatalf("subscription.canceled webhook status = %d, want %d", code, http.StatusOK)
+	}
+	sub, err := LoadSubscription(ctx(), f.db.Pool, accountID, false)
+	if err != nil {
+		f.t.Fatalf("load subscription after cancellation: %v", err)
+	}
+	if sub.PaddleSubscriptionID != subID || sub.Status != SubscriptionCanceled {
+		f.t.Fatalf("stored subscription after cancellation: ID %q, status %q, want ID %q and status %q", sub.PaddleSubscriptionID, sub.Status, subID, SubscriptionCanceled)
+	}
 }
 
 // A queued top-up that the current settings no longer allow closes as
@@ -31,7 +41,7 @@ func TestPendingAutoTopUpClosedAsObsoleteWithCanceledSubscription(t *testing.T) 
 		t.Fatal("no top-up queued")
 	}
 	f.updateAutoTopUp(acct, false, 0, 0, 0)
-	f.cancelSubscription(subID)
+	f.cancelSubscription(acct, subID)
 	f.wantObsoleteTopUp(acct)
 }
 
@@ -48,7 +58,7 @@ func TestPendingAutoTopUpFailsWithCanceledSubscriptionWhenSettingsAllow(t *testi
 	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
 		t.Fatal("no top-up queued")
 	}
-	f.cancelSubscription(subID)
+	f.cancelSubscription(acct, subID)
 	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
 		t.Fatal(err)
 	}
