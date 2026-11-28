@@ -41,9 +41,29 @@ describe("table scroll regions", () => {
 
     const ring = await browser.evaluate(() => {
       const style = getComputedStyle(document.activeElement as Element);
-      return `${style.outlineStyle} ${style.outlineWidth}`;
+      // Sample the color without relying on a specific CSS color syntax.
+      const canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext("2d");
+      if (context === null) {
+        throw new Error("Could not create a canvas to measure outline alpha");
+      }
+      context.fillStyle = style.outlineColor;
+      context.fillRect(0, 0, 1, 1);
+
+      return {
+        style: style.outlineStyle,
+        width: style.outlineWidth,
+        color: style.outlineColor,
+        alpha: context.getImageData(0, 0, 1, 1).data[3],
+      };
     });
-    expect(ring).toBe("solid 2px");
+    expect(ring.style).toBe("solid");
+    expect(ring.width).toBe("2px");
+    expect(ring.alpha, "The region outline has nonzero alpha").toBeGreaterThan(
+      0,
+    );
 
     // With focus on the region, the arrow keys scroll it sideways.
     expect(
@@ -69,14 +89,19 @@ describe("table scroll regions", () => {
 
     // The next Tab goes to the first sandbox link inside the region.
     await browser.keyboard.press("Tab");
-    const inside = await browser.evaluate(() => {
+    const link = await browser.evaluate(() => {
       const active = document.activeElement;
-      return (
-        active?.tagName === "A" &&
-        active.closest('[aria-label="Sandbox list"]') !== null
-      );
+      return {
+        inside:
+          active?.tagName === "A" &&
+          active.closest('[aria-label="Sandbox list"]') !== null,
+        color: active && getComputedStyle(active).outlineColor,
+      };
     });
-    expect(inside).toBe(true);
+    expect(link.inside).toBe(true);
+    expect(link.color, "The link outline matches the region outline").toBe(
+      ring.color,
+    );
   });
 
   test("a mouse click inside the sandbox list shows no focus ring", async ({
