@@ -27,6 +27,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// clearResourceEnv isolates the SDK resource detector, which reads the process
+// environment directly.
+func clearResourceEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+}
+
 func noEnv(string) (string, bool) { return "", false }
 
 func scrape(t *testing.T, tel *Telemetry) string {
@@ -49,6 +57,7 @@ func scrape(t *testing.T, tel *Telemetry) string {
 // _total suffix on counters, a unit suffix, no scope labels, and the Go
 // runtime metrics.
 func TestPrometheusNames(t *testing.T) {
+	clearResourceEnv(t)
 	ctx := context.Background()
 	var out bytes.Buffer
 	tel, err := New(ctx, Options{ServiceName: "test-api", Stdout: &out, LookupEnv: noEnv})
@@ -186,6 +195,7 @@ func (s *otlpServer) assertTestCounter(t *testing.T) {
 // TestOTLPExport checks that OTEL_EXPORTER_OTLP_ENDPOINT turns on the export
 // of metrics and of the log records at or above the logger level.
 func TestOTLPExport(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	collector := &otlpServer{}
@@ -261,6 +271,7 @@ func stalledCollector(t *testing.T) *httptest.Server {
 // collector that never answers does not use up the shutdown deadline before
 // the log export starts: both exports run in parallel under the one deadline.
 func TestShutdownFlushesLogsWhileMetricsExportStalls(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	stalled := stalledCollector(t)
@@ -302,6 +313,7 @@ func TestShutdownFlushesLogsWhileMetricsExportStalls(t *testing.T) {
 // TestShutdownReportsBothExportErrors checks that Shutdown joins the errors of
 // the metrics and the log export when both collectors stall.
 func TestShutdownReportsBothExportErrors(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	t.Setenv(EnvOTLPMetricsEndpoint, stalledCollector(t).URL)
@@ -332,6 +344,7 @@ func TestShutdownReportsBothExportErrors(t *testing.T) {
 // TestShutdownWithoutLogExport checks that Shutdown works when only metrics
 // are exported, so that there is no logger provider.
 func TestShutdownWithoutLogExport(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	collector := &otlpServer{}
@@ -365,6 +378,7 @@ func TestShutdownWithoutLogExport(t *testing.T) {
 // of the fixture tests. The requests reach only the fixture collector, with
 // no inherited headers or compression.
 func TestOTLPExportIgnoresInheritedSettings(t *testing.T) {
+	clearResourceEnv(t)
 	alternate := &otlpServer{}
 	altSrv := httptest.NewServer(alternate)
 	defer altSrv.Close()
