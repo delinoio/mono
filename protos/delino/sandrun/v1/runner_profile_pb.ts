@@ -325,8 +325,11 @@ export type UpdateRunnerProfileRequest = Message<"delino.sandrun.v1.UpdateRunner
 
   /**
    * Paths of RunnerProfile to change. `workload_kind` and
-   * `agent_integration_id` are rejected with `invalid_argument`. `source`
-   * changes the source oneof. `resources` replaces all resource values.
+   * `agent_integration_id` are rejected with `invalid_argument`.
+   * Use `base_image` or `ownsand_template_id` to replace the source. If the
+   * mask names either member, the profile must select a member named in the
+   * mask. The server also accepts `source` as a legacy alias for the oneof.
+   * `resources` replaces all resource values.
    * `resources.vcpu_count`, `resources.memory_mib` and `resources.disk_gib`
    * each change only the named value.
    *

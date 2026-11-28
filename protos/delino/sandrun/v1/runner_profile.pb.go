@@ -586,8 +586,11 @@ type UpdateRunnerProfileRequest struct {
 	RunnerProfileId string                 `protobuf:"bytes,2,opt,name=runner_profile_id,json=runnerProfileId,proto3" json:"runner_profile_id,omitempty"`
 	Profile         *RunnerProfile         `protobuf:"bytes,3,opt,name=profile,proto3" json:"profile,omitempty"`
 	// Paths of RunnerProfile to change. `workload_kind` and
-	// `agent_integration_id` are rejected with `invalid_argument`. `source`
-	// changes the source oneof. `resources` replaces all resource values.
+	// `agent_integration_id` are rejected with `invalid_argument`.
+	// Use `base_image` or `ownsand_template_id` to replace the source. If the
+	// mask names either member, the profile must select a member named in the
+	// mask. The server also accepts `source` as a legacy alias for the oneof.
+	// `resources` replaces all resource values.
 	// `resources.vcpu_count`, `resources.memory_mib` and `resources.disk_gib`
 	// each change only the named value.
 	UpdateMask    *fieldmaskpb.FieldMask `protobuf:"bytes,4,opt,name=update_mask,json=updateMask,proto3" json:"update_mask,omitempty"`

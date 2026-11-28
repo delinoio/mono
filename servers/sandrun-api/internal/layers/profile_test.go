@@ -403,6 +403,132 @@ func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 	}
 }
 
+func TestRunnerProfileSourceMasks(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	ctx := t.Context()
+	admin := w.env.User(w.org.Admin)
+	ownsandOrg, linuxTemplateID, macTemplateID := api.NewID(), api.NewID(), api.NewID()
+	w.fake.AddOrg(ownsandOrg, ownsandKey('a'))
+	w.fake.SetTemplate(ownsandOrg, linuxTemplateID, ownsandv1.GuestOs_GUEST_OS_LINUX)
+	w.fake.SetTemplate(ownsandOrg, macTemplateID, ownsandv1.GuestOs_GUEST_OS_MACOS)
+	if _, err := w.setLink(w.org.Admin, ownsandOrg, ownsandKey('a')); err != nil {
+		t.Fatal(err)
+	}
+
+	base := &sandrunv1.RunnerProfile{Source: &sandrunv1.RunnerProfile_BaseImage{BaseImage: sandrunv1.GuestOs_GUEST_OS_LINUX}}
+	template := &sandrunv1.RunnerProfile{Source: &sandrunv1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: linuxTemplateID}}
+	mismatch := &sandrunv1.RunnerProfile{Source: &sandrunv1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: macTemplateID}}
+
+	descriptorMask := func(paths ...string) *fieldmaskpb.FieldMask {
+		t.Helper()
+		mask, err := fieldmaskpb.New(&sandrunv1.RunnerProfile{}, paths...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mask
+	}
+	legacyMask := &fieldmaskpb.FieldMask{Paths: []string{"source"}}
+	baseMask := descriptorMask("base_image")
+	templateMask := descriptorMask("ownsand_template_id")
+	create := func(t *testing.T) *sandrunv1.RunnerProfile {
+		t.Helper()
+		input := linuxDevProfile()
+		input.Name = t.Name()[strings.LastIndex(t.Name(), "/")+1:]
+		input.Resources.VcpuCount = 4
+		resp, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&sandrunv1.CreateRunnerProfileRequest{
+			OrganizationId: w.org.ID, Profile: input,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Msg.GetProfile()
+	}
+	update := func(id string, input *sandrunv1.RunnerProfile, mask *fieldmaskpb.FieldMask) (*sandrunv1.RunnerProfile, error) {
+		resp, err := admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&sandrunv1.UpdateRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: id, Profile: input, UpdateMask: mask,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		return resp.Msg.GetProfile(), nil
+	}
+	assertStored := func(t *testing.T, want *sandrunv1.RunnerProfile) {
+		t.Helper()
+		resp, err := admin.Profile.GetRunnerProfile(ctx, connect.NewRequest(&sandrunv1.GetRunnerProfileRequest{
+			OrganizationId: w.org.ID, RunnerProfileId: want.GetRunnerProfileId(),
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := resp.Msg.GetProfile(); !proto.Equal(got, want) {
+			t.Fatalf("stored profile = %v, want %v", got, want)
+		}
+	}
+
+	for _, tc := range []struct {
+		name                string
+		toTemplate, toImage *fieldmaskpb.FieldMask
+	}{
+		{"canonical", templateMask, baseMask},
+		{"legacy", legacyMask, legacyMask},
+		{"both-members", descriptorMask("base_image", "ownsand_template_id"), descriptorMask("base_image", "ownsand_template_id")},
+		{"both-members-reversed", descriptorMask("ownsand_template_id", "base_image"), descriptorMask("ownsand_template_id", "base_image")},
+		{"member-and-alias", &fieldmaskpb.FieldMask{Paths: []string{"ownsand_template_id", "source"}}, &fieldmaskpb.FieldMask{Paths: []string{"base_image", "source"}}},
+		{"alias-and-member", &fieldmaskpb.FieldMask{Paths: []string{"source", "ownsand_template_id"}}, &fieldmaskpb.FieldMask{Paths: []string{"source", "base_image"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := create(t)
+			for _, step := range []struct {
+				input *sandrunv1.RunnerProfile
+				mask  *fieldmaskpb.FieldMask
+			}{{template, tc.toTemplate}, {base, tc.toImage}} {
+				got, err := update(original.GetRunnerProfileId(), step.input, step.mask)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := proto.CloneOf(original)
+				want.Source = step.input.Source
+				want.UpdateTime = got.GetUpdateTime()
+				if !proto.Equal(got, want) {
+					t.Fatalf("update response = %v, want %v", got, want)
+				}
+				assertStored(t, want)
+			}
+		})
+	}
+
+	t.Run("rejected", func(t *testing.T) {
+		original := create(t)
+		action := sandrunv1.AuditAction_AUDIT_ACTION_RUNNER_PROFILE_UPDATED
+		before := countAudit(t, w.env, w.org.ID, action)
+		for _, tc := range []struct {
+			name  string
+			input *sandrunv1.RunnerProfile
+			mask  *fieldmaskpb.FieldMask
+		}{
+			{"uncovered-source", template, baseMask},
+			{"uncovered-source-with-alias", template, &fieldmaskpb.FieldMask{Paths: []string{"source", "base_image"}}},
+			{"missing-source", &sandrunv1.RunnerProfile{}, templateMask},
+			{"template-guest-os-mismatch", mismatch, templateMask},
+			{"unknown-path", template, &fieldmaskpb.FieldMask{Paths: []string{"ownsand_template_id", "unknown"}}},
+			{"empty-mask", template, &fieldmaskpb.FieldMask{}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := update(original.GetRunnerProfileId(), tc.input, tc.mask)
+				wantCode(t, tc.name, err, connect.CodeInvalidArgument)
+				if tc.input == mismatch {
+					wantTemplateError(t, err, connect.CodeInvalidArgument, "invalid source.ownsand_template_id: the template's guest OS is not guest_os")
+				}
+				assertStored(t, original)
+				if got := countAudit(t, w.env, w.org.ID, action); got != before {
+					t.Fatalf("profile update audit count = %d, want %d", got, before)
+				}
+			})
+		}
+	})
+}
+
 func TestRunnerProfileResourceUpdates(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
