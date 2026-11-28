@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,14 +43,26 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 
 			var calls atomic.Int32
 			requests := make(chan *ownsandv1.CreateSandboxRequest, 2)
+			firstPassCtx, cancelFirstPass := context.WithCancel(ctx)
+			defer cancelFirstPass()
 			firstResponse := make(chan struct{})
+			releaseFirstResponse := sync.OnceFunc(func() { close(firstResponse) })
+			watchdogExpired := make(chan struct{})
 			factory := newCreateSandboxPeer(t, func(_ context.Context, req *ownsandv1.CreateSandboxRequest) error {
 				call := calls.Add(1)
 				if call <= 2 {
 					requests <- req
 				}
 				if call == 1 {
-					<-firstResponse
+					// Bound the fixture's hold even if the client loses its RPC deadline.
+					watchdog := time.NewTimer(5 * time.Second)
+					defer watchdog.Stop()
+					select {
+					case <-firstResponse:
+					case <-watchdog.C:
+						close(watchdogExpired)
+						cancelFirstPass()
+					}
 					return context.DeadlineExceeded
 				}
 				if scenario == "capacity" {
@@ -57,6 +70,8 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 				}
 				return connect.NewError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
 			})
+			// Cleanup runs in reverse order. Release the handler before closing the peer.
+			t.Cleanup(releaseFirstResponse)
 			client, err := factory.New(w.osOrg, "osk_"+strings.Repeat("a", 43))
 			if err != nil {
 				t.Fatal(err)
@@ -67,8 +82,13 @@ func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
 				initialError <- err
 				return err
 			})
-			w.l.Engine.Pass(ctx, w.org.ID)
-			close(firstResponse)
+			w.l.Engine.Pass(firstPassCtx, w.org.ID)
+			releaseFirstResponse()
+			select {
+			case <-watchdogExpired:
+				t.Fatal("first create exceeded the 5-second watchdog while waiting for the RPC deadline")
+			default:
+			}
 			select {
 			case err := <-initialError:
 				if connect.IsWireError(err) || connect.CodeOf(err) != connect.CodeDeadlineExceeded {
