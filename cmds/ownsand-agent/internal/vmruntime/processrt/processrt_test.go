@@ -94,35 +94,120 @@ func TestGroupsBelow(t *testing.T) {
 	}
 }
 
-// processState returns the `ps` state of pid, or "" when the process does
-// not exist. A zombie reports "Z".
-func processState(t *testing.T, pid int) string {
-	t.Helper()
-	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return ""
+// processState returns the trimmed `ps` state of pid. Blank output on both
+// streams with exit status 1 means the process is absent.
+func processState(ctx context.Context, pid int) (string, error) {
+	cmd := exec.CommandContext(ctx, "ps", "-o", "stat=", "-p", strconv.Itoa(pid))
+	// A descendant of a fixture can keep the output pipes open after ps exits.
+	cmd.WaitDelay = 100 * time.Millisecond
+	out, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", fmt.Errorf("ps: %w", ctxErr)
 	}
-	return strings.TrimSpace(string(out))
+	state := strings.TrimSpace(string(out))
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		stderr := strings.TrimSpace(string(exitErr.Stderr))
+		if exitErr.ExitCode() == 1 && state == "" && stderr == "" {
+			return "", nil
+		}
+		return "", fmt.Errorf("ps: %w (stdout %q, stderr %q)", err, state, stderr)
+	}
+	if err != nil {
+		return "", fmt.Errorf("ps: %w", err)
+	}
+	if state == "" {
+		return "", errors.New("ps: missing process state")
+	}
+	return state, nil
 }
 
 // waitState waits until the state of pid starts with one of the letters in
 // want ("" in want means the process is gone or a zombie).
 func waitState(t *testing.T, what string, pid int, want ...string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	var state string
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	for {
-		state = processState(t, pid)
+		state, err := processState(ctx, pid)
+		if err != nil {
+			t.Fatalf("%s (pid %d): probe failed: %v", what, pid, err)
+		}
 		for _, w := range want {
 			if (w == "" && (state == "" || strings.HasPrefix(state, "Z"))) || (w != "" && strings.HasPrefix(state, w)) {
 				return
 			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s (pid %d): state %q; want one of %q", what, pid, state, want)
+		select {
+		case <-ctx.Done():
+			t.Fatalf("%s (pid %d): %v, last state %q; want one of %q", what, pid, ctx.Err(), state, want)
+		case <-time.After(20 * time.Millisecond):
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func TestProcessState(t *testing.T) {
+	pid := os.Getpid()
+	tests := []struct {
+		name       string
+		script     string
+		wantState  string
+		wantPrefix string
+		wantError  string
+	}{
+		{name: "absent", script: "exit 1"},
+		{name: "zombie", script: "printf ' Z+\\n'", wantState: "Z+"},
+		{name: "running", script: "printf ' R\\n'", wantState: "R", wantPrefix: "R"},
+		{name: "stopped", script: "printf ' T+\\n'", wantState: "T+", wantPrefix: "T"},
+		{name: "diagnostic", script: "printf 'cannot read process state\\n' >&2; exit 1", wantError: "cannot read process state"},
+		{name: "exit 2", script: "exit 2", wantError: "exit status 2"},
+		{name: "exit 1 with state", script: "printf 'T\\n'; exit 1", wantError: `stdout "T"`},
+		{name: "blank success", script: "printf ' \\n'", wantError: "missing process state"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			installPSFixture(t, tt.script)
+			ctx, cancel := context.WithTimeout(t.Context(), psTimeout)
+			defer cancel()
+			state, err := processState(ctx, pid)
+			if tt.wantError != "" {
+				if state != "" || err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("processState = %q, %v; want an empty state and an error containing %q", state, err, tt.wantError)
+				}
+				return
+			}
+			if state != tt.wantState || err != nil {
+				t.Fatalf("processState = %q, %v; want %q and no error", state, err, tt.wantState)
+			}
+			waitState(t, tt.name, pid, tt.wantPrefix)
+		})
+	}
+	t.Run("missing executable", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if state, err := processState(t.Context(), pid); state != "" || !errors.Is(err, exec.ErrNotFound) {
+			t.Fatalf("processState = %q, %v; want an empty state and exec.ErrNotFound", state, err)
+		}
+	})
+	t.Run("canceled context", func(t *testing.T) {
+		installPSFixture(t, "exit 1")
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if state, err := processState(ctx, pid); state != "" || !errors.Is(err, context.Canceled) {
+			t.Fatalf("processState = %q, %v; want an empty state and context.Canceled", state, err)
+		}
+	})
+	t.Run("deadline during probe", func(t *testing.T) {
+		installPSFixture(t, "exec /bin/sleep 5")
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+		defer cancel()
+		if state, err := processState(ctx, pid); state != "" || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("processState = %q, %v; want an empty state and context.DeadlineExceeded", state, err)
+		}
+		if elapsed := time.Since(start); elapsed >= 3*time.Second {
+			t.Fatalf("processState took %v after a 250ms deadline", elapsed)
+		}
+	})
 }
 
 // startWorker runs `sh -c "sleep 300 & echo $! $$; wait"` as an exec in the
@@ -709,13 +794,13 @@ func TestHelperStoppedObservesRealHelper(t *testing.T) {
 // stopped for the first falseCalls calls and then delegates to the real
 // observation, and a function that returns the number of calls. onFalse runs
 // before each call that reports not stopped.
-func countingObserver(falseCalls int, onFalse func(call int)) (func(context.Context, int) (bool, error), func() int) {
+func countingObserver(falseCalls int, onFalse func(ctx context.Context, call int)) (func(context.Context, int) (bool, error), func() int) {
 	var calls atomic.Int32
 	observe := func(ctx context.Context, pid int) (bool, error) {
 		n := int(calls.Add(1))
 		if n <= falseCalls {
 			if onFalse != nil {
-				onFalse(n)
+				onFalse(ctx, n)
 			}
 			return false, nil
 		}
@@ -736,9 +821,12 @@ func TestPauseEnumeratesOnlyAfterHelperIsObservedStopped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observe, calls := countingObserver(3, func(call int) {
+	observe, calls := countingObserver(3, func(ctx context.Context, call int) {
 		for _, pid := range []int{shell, sleeper} {
-			if state := processState(t, pid); strings.HasPrefix(state, "T") {
+			state, err := processState(ctx, pid)
+			if err != nil {
+				t.Errorf("worker %d before the helper was observed stopped (call %d): probe failed: %v", pid, call, err)
+			} else if strings.HasPrefix(state, "T") {
 				t.Errorf("worker %d stopped (state %q) before the helper was observed stopped (call %d)", pid, state, call)
 			}
 		}
