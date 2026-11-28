@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -11,10 +12,50 @@ import (
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
+
+type handoverRenewalGate struct {
+	mu      sync.RWMutex
+	closed  bool
+	blocked chan struct{}
+}
+
+var errHandoverRenewalBlocked = errors.New("fixture blocks renewal by the former lease holder")
+
+func (g *handoverRenewalGate) renew(ctx context.Context, tryAcquire lease.RenewFunc) (bool, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if !g.closed {
+		return tryAcquire(ctx)
+	}
+	select {
+	case g.blocked <- struct{}{}:
+	default:
+	}
+	return false, errHandoverRenewalBlocked
+}
+
+// close prevents new attempts and drains any database call already in progress
+// so the original worker cannot reclaim the row after Release.
+func (g *handoverRenewalGate) close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closed = true
+}
+
+func newOfflineHandoverEnv(t *testing.T, ticks <-chan time.Time) (*testenv.Env, *handoverRenewalGate) {
+	t.Helper()
+	gate := &handoverRenewalGate{blocked: make(chan struct{}, 1)}
+	env := testenv.New(t, func(o *app.Options) {
+		o.LeaseRenew = gate.renew
+		o.LeaseRenewTicks = ticks
+	})
+	return env, gate
+}
 
 func runHandoverLease(t *testing.T, env *testenv.Env) (stop func()) {
 	t.Helper()
@@ -72,7 +113,8 @@ func waitForOfflineLeaseSkip(t *testing.T, env *testenv.Env, deviceID string) {
 // new holder has acknowledged the same device's full state report.
 func TestOfflineWriteAfterLeaseHandover(t *testing.T) {
 	t.Parallel()
-	env := testenv.New(t)
+	ticks := make(chan time.Time)
+	env, renewal := newOfflineHandoverEnv(t, ticks)
 	org := env.NewOrg("alice")
 	dev, _ := setupAgent(t, env, org, nil)
 	created, err := org.OwnerClient.Sandbox.CreateSandbox(context.Background(), connect.NewRequest(createReq(org.ID)))
@@ -84,12 +126,34 @@ func TestOfflineWriteAfterLeaseHandover(t *testing.T) {
 
 	entered, resume := pauseOfflineCleanup(t, env, dev.ID)
 	defer resume()
+	renewal.close()
 	env.App.Lease.Release()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("old channel did not reach the close listener")
 	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	select {
+	case ticks <- time.Now():
+	case <-ctx.Done():
+		t.Fatal("the original lease worker did not receive the renewal tick")
+	}
+	select {
+	case <-renewal.blocked:
+	case <-ctx.Done():
+		t.Fatal("the original lease worker did not hit the renewal gate")
+	}
+	var leaseExists bool
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM instance_leases WHERE lease_name = $1)", lease.Name).Scan(&leaseExists); err != nil {
+		t.Fatalf("check for a reclaimed lease: %v", err)
+	}
+	if leaseExists {
+		t.Fatal("the original lease worker reclaimed the row before the successor started")
+	}
+	t.Log("the original worker attempted renewal after release and the lease row stayed absent")
 
 	successor := env.StartPeer()
 	runHandoverLease(t, successor)
@@ -119,10 +183,11 @@ func TestOfflineWriteDuringLeaseLossWhileDeviceRowHeld(t *testing.T) {
 			name = "reacquisition"
 		}
 		t.Run(name, func(t *testing.T) {
-			env := testenv.New(t)
+			env, renewal := newOfflineHandoverEnv(t, nil)
 			org := env.NewOrg("alice")
 			dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 			env.WaitForLease()
+			renewal.close()
 			env.App.Lease.Release()
 			holder := env.StartPeer()
 			stop := runHandoverLease(t, holder)
@@ -161,10 +226,11 @@ func TestOfflineWriteDuringLeaseLossWhileDeviceRowHeld(t *testing.T) {
 
 func TestOfflineWriteFromEarlierLeasePeriodAfterReacquisition(t *testing.T) {
 	t.Parallel()
-	env := testenv.New(t)
+	env, renewal := newOfflineHandoverEnv(t, nil)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 	env.WaitForLease()
+	renewal.close()
 	env.App.Lease.Release()
 	holder := env.StartPeer()
 	stop := runHandoverLease(t, holder)
