@@ -158,7 +158,7 @@ func (c *Client) download(ctx context.Context, p DownloadParams, extractor archi
 		st, err := extractor.extractArchive(ctx, af, staged)
 		af.Close()
 		if err != nil {
-			var collision *archiveCaseCollision
+			var collision *archiveNameCollision
 			if errors.As(err, &collision) {
 				return nil, localError(connect.CodeFailedPrecondition, err)
 			}
