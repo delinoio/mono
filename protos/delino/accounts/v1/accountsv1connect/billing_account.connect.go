@@ -84,8 +84,9 @@ type BillingAccountServiceClient interface {
 	CreateBillingAccount(context.Context, *connect.Request[v1.CreateBillingAccountRequest]) (*connect.Response[v1.CreateBillingAccountResponse], error)
 	// Read one billing account. Every member may call it.
 	GetBillingAccount(context.Context, *connect.Request[v1.GetBillingAccountRequest]) (*connect.Response[v1.GetBillingAccountResponse], error)
-	// List the billing accounts in which the caller has a membership, ordered
-	// by billing_account_id (creation order).
+	// List the caller's live billing accounts. New traversals order by stored
+	// create_time, then billing_account_id, both ascending. An ID-only page
+	// token continues in ascending billing_account_id order.
 	ListBillingAccounts(context.Context, *connect.Request[v1.ListBillingAccountsRequest]) (*connect.Response[v1.ListBillingAccountsResponse], error)
 	// Rename a billing account. Owner and admin only.
 	UpdateBillingAccount(context.Context, *connect.Request[v1.UpdateBillingAccountRequest]) (*connect.Response[v1.UpdateBillingAccountResponse], error)
@@ -318,8 +319,9 @@ type BillingAccountServiceHandler interface {
 	CreateBillingAccount(context.Context, *connect.Request[v1.CreateBillingAccountRequest]) (*connect.Response[v1.CreateBillingAccountResponse], error)
 	// Read one billing account. Every member may call it.
 	GetBillingAccount(context.Context, *connect.Request[v1.GetBillingAccountRequest]) (*connect.Response[v1.GetBillingAccountResponse], error)
-	// List the billing accounts in which the caller has a membership, ordered
-	// by billing_account_id (creation order).
+	// List the caller's live billing accounts. New traversals order by stored
+	// create_time, then billing_account_id, both ascending. An ID-only page
+	// token continues in ascending billing_account_id order.
 	ListBillingAccounts(context.Context, *connect.Request[v1.ListBillingAccountsRequest]) (*connect.Response[v1.ListBillingAccountsResponse], error)
 	// Rename a billing account. Owner and admin only.
 	UpdateBillingAccount(context.Context, *connect.Request[v1.UpdateBillingAccountRequest]) (*connect.Response[v1.UpdateBillingAccountResponse], error)

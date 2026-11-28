@@ -163,8 +163,8 @@ func (h *BillingAccountHandler) GetBillingAccount(ctx context.Context, req *conn
 	return connect.NewResponse(&accountsv1.GetBillingAccountResponse{BillingAccount: account.proto()}), nil
 }
 
-// ListBillingAccounts lists the caller's billing accounts by ID (creation
-// order).
+// ListBillingAccounts lists the caller's live billing accounts by creation
+// time and then ID, both ascending.
 func (h *BillingAccountHandler) ListBillingAccounts(ctx context.Context, req *connect.Request[accountsv1.ListBillingAccountsRequest]) (*connect.Response[accountsv1.ListBillingAccountsResponse], error) {
 	const rpc = "ListBillingAccounts"
 	userID, err := callerUserID(ctx)
@@ -179,18 +179,30 @@ func (h *BillingAccountHandler) ListBillingAccounts(ctx context.Context, req *co
 	if err != nil {
 		return nil, err
 	}
-	after := "00000000-0000-0000-0000-000000000000"
 	if tok.After != "" {
-		if after, err = normalizeID("page_token", tok.After); err != nil {
+		if tok.After, err = normalizeID("page_token", tok.After); err != nil {
 			return nil, invalidArgument("page_token is not valid for this request")
 		}
 	}
-	rows, err := h.db.Pool.Query(ctx, `SELECT a.billing_account_id::text, a.name, a.create_time, a.balance_usd_micros, m.role
+	const liveAccounts = `SELECT a.billing_account_id::text, a.name, a.create_time, a.balance_usd_micros, m.role
 		FROM billing_account_members m
 		JOIN billing_accounts a ON a.billing_account_id = m.billing_account_id
-		WHERE m.user_id = $1 AND a.delete_time IS NULL AND a.billing_account_id > $2
-		ORDER BY a.billing_account_id
-		LIMIT $3`, userID, after, size+1)
+		WHERE m.user_id = $1 AND a.delete_time IS NULL`
+	const timeOrder = ` ORDER BY a.create_time, a.billing_account_id LIMIT $2`
+	legacy := tok.After != "" && tok.AfterTime == 0
+	var rows pgx.Rows
+	switch {
+	case tok.After == "":
+		rows, err = h.db.Pool.Query(ctx, liveAccounts+timeOrder, userID, size+1)
+	case legacy:
+		// An ID-only token resumes the order used by the previous release.
+		rows, err = h.db.Pool.Query(ctx, liveAccounts+`
+			AND a.billing_account_id > $3 ORDER BY a.billing_account_id LIMIT $2`, userID, size+1, tok.After)
+	default:
+		rows, err = h.db.Pool.Query(ctx, liveAccounts+`
+			AND (a.create_time, a.billing_account_id) > ($3, $4::uuid)`+timeOrder,
+			userID, size+1, time.UnixMicro(tok.AfterTime).UTC(), tok.After)
+	}
 	if err != nil {
 		return nil, h.internal(ctx, "list_billing_accounts", err)
 	}
@@ -207,7 +219,12 @@ func (h *BillingAccountHandler) ListBillingAccounts(ctx context.Context, req *co
 	resp := &accountsv1.ListBillingAccountsResponse{}
 	if len(accounts) > size {
 		accounts = accounts[:size]
-		resp.NextPageToken = encodePageToken(pageToken{RPC: rpc, Scope: userID, After: accounts[size-1].ID})
+		last := accounts[size-1]
+		next := pageToken{RPC: rpc, Scope: userID, After: last.ID}
+		if !legacy {
+			next.AfterTime = last.CreateTime.UnixMicro()
+		}
+		resp.NextPageToken = encodePageToken(next)
 	}
 	for _, a := range accounts {
 		resp.BillingAccounts = append(resp.BillingAccounts, a.proto())

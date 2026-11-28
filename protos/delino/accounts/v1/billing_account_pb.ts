@@ -840,8 +840,9 @@ export const BillingAccountService: GenService<{
     output: typeof GetBillingAccountResponseSchema;
   },
   /**
-   * List the billing accounts in which the caller has a membership, ordered
-   * by billing_account_id (creation order).
+   * List the caller's live billing accounts. New traversals order by stored
+   * create_time, then billing_account_id, both ascending. An ID-only page
+   * token continues in ascending billing_account_id order.
    *
    * @generated from rpc delino.accounts.v1.BillingAccountService.ListBillingAccounts
    */

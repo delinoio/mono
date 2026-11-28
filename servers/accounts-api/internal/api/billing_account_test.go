@@ -4,6 +4,8 @@ package api_test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -225,6 +227,107 @@ func TestRoleMatrix(t *testing.T) {
 				wantCode(t, err, nf)
 			}
 		})
+	}
+}
+
+func TestListBillingAccountsCreationTimePagination(t *testing.T) {
+	t.Parallel()
+	env := testenv.New(t)
+	alice := newPerson(env, "alice")
+	bob := newPerson(env, "bob")
+
+	const (
+		rpc     = "ListBillingAccounts"
+		a       = "01900000-0000-7000-8000-000000000001"
+		b       = "01900000-0001-7000-8000-000000000001"
+		c       = "01900000-0002-7000-8000-000000000001"
+		deleted = "01900000-0003-7000-8000-000000000001"
+		other   = "01900000-0004-7000-8000-000000000001"
+	)
+	earlier := time.Date(2026, time.January, 1, 0, 0, 0, 2000, time.UTC)
+	later := earlier.Add(time.Microsecond)
+	seed := func(id, userID string, created time.Time, deleteTime *time.Time) {
+		t.Helper()
+		if _, err := env.DB.Pool.Exec(ctx(), `WITH account AS (
+			INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time, delete_time)
+			VALUES ($1, 'Account', $2, $2, $3)
+			RETURNING billing_account_id
+		)
+		INSERT INTO billing_account_members (billing_account_id, user_id, role, create_time)
+		SELECT billing_account_id, $4, 'owner', $2 FROM account`, id, created, deleteTime, userID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(a, alice.ID, later, nil)
+	seed(b, alice.ID, earlier, nil)
+	seed(c, alice.ID, earlier, nil)
+	seed(deleted, alice.ID, earlier, &later)
+	seed(other, bob.ID, earlier, nil)
+
+	type cursor struct {
+		RPC   string `json:"r"`
+		Scope string `json:"s"`
+		ID    string `json:"a"`
+		Time  int64  `json:"t,omitempty"`
+	}
+	encode := func(c cursor) string {
+		body, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(body)
+	}
+	list := func(p person, token string) (*connect.Response[accountsv1.ListBillingAccountsResponse], error) {
+		return p.Client.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{
+			PageSize: 1, PageToken: token,
+		}))
+	}
+
+	for _, tc := range []struct {
+		name     string
+		start    string
+		want     []string
+		wantTime int64
+	}{
+		{"fresh", "", []string{b, c, a}, earlier.UnixMicro()},
+		{"legacy", encode(cursor{RPC: rpc, Scope: alice.ID, ID: a}), []string{b, c}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := tc.start
+			if token != "" {
+				_, err := list(bob, token)
+				wantCode(t, err, connect.CodeInvalidArgument)
+			}
+			for i, id := range tc.want {
+				page, err := list(alice, token)
+				if err != nil {
+					t.Fatalf("page %d: %v", i+1, err)
+				}
+				rows := page.Msg.GetBillingAccounts()
+				if len(rows) != 1 || rows[0].GetBillingAccountId() != id {
+					t.Fatalf("page %d: accounts = %v, want only %s", i+1, rows, id)
+				}
+				wantToken := ""
+				if i+1 < len(tc.want) {
+					wantToken = encode(cursor{RPC: rpc, Scope: alice.ID, ID: id, Time: tc.wantTime})
+				}
+				if token = page.Msg.GetNextPageToken(); token != wantToken {
+					t.Fatalf("page %d: token = %q, want %q", i+1, token, wantToken)
+				}
+				if token != "" {
+					_, err := list(bob, token)
+					wantCode(t, err, connect.CodeInvalidArgument)
+				}
+			}
+		})
+	}
+
+	for _, token := range []cursor{
+		{RPC: "ListInvitations", Scope: alice.ID, ID: a, Time: later.UnixMicro()},
+		{RPC: rpc, Scope: alice.ID, ID: "not-a-uuid", Time: later.UnixMicro()},
+	} {
+		_, err := list(alice, encode(token))
+		wantCode(t, err, connect.CodeInvalidArgument)
 	}
 }
 
