@@ -307,6 +307,7 @@
   "requests.empty.description": "GitHub가 SandRun 라벨이 붙은 작업을 대기열에 추가하거나, 공급업체가 에이전트 세션을 요청하거나, 멤버가 개발 세션을 만들면 요청이 표시됩니다.",
   "requests.column.source": "출처",
   "requests.column.queueWait": "대기 시간",
+  "requests.cancellationRejected": "요청이 더 이상 대기열에 있지 않습니다.",
   "requests.cancelDialog.title": "이 요청을 취소하시겠습니까?",
   "requests.cancelDialog.description": "요청은 ‘취소됨’ 상태로 종료되며 러너가 할당되지 않습니다. GitHub 작업은 GitHub가 취소할 때까지 GitHub 대기열에 남아 있습니다.",
   "requests.cancelDialog.confirm": "요청 취소",

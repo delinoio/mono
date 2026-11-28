@@ -307,6 +307,7 @@
   "requests.empty.description": "Las solicitudes aparecen cuando GitHub pone en cola un trabajo con una etiqueta de SandRun, un proveedor solicita una sesión de agente o un miembro crea una sesión de desarrollo.",
   "requests.column.source": "Origen",
   "requests.column.queueWait": "Tiempo en cola",
+  "requests.cancellationRejected": "La solicitud ya no está en la cola.",
   "requests.cancelDialog.title": "¿Cancelar esta solicitud?",
   "requests.cancelDialog.description": "La solicitud queda en estado Cancelada y no se le asigna ningún ejecutor. Si se trata de un trabajo de GitHub, este permanece en la cola de GitHub hasta que GitHub lo cancela.",
   "requests.cancelDialog.confirm": "Cancelar solicitud",

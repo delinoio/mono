@@ -103,6 +103,7 @@ import {
 } from "../e2e/integration-permission-fixture.ts";
 import { organizationCreationFixture } from "../e2e/organization-creation-fixture.ts";
 import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
+import { requestCancellationFixture } from "../e2e/request-cancellation-fixture.ts";
 import { runnerGroupFixture } from "../e2e/runner-group-transport.ts";
 import {
   linkedSetupTransport,
@@ -5208,6 +5209,136 @@ describe("work", () => {
       expect(within(row).getByRole("button", { name: "Cancel" })).toBeTruthy();
     }
     expect(calls).toHaveLength(1);
+  });
+
+  describe("stale request cancellation", () => {
+    const requestPage = `/orgs/${MOCK_IDS.acme}/requests`;
+    const queuedJob = /acme-robotics\/firmware · test \(ubuntu\)/;
+    const rejection = "The request is no longer queued.";
+    const dialog = () =>
+      screen.queryByRole("alertdialog", { name: "Cancel this request?" });
+    const jobRow = () => screen.getByRole("row", { name: queuedJob });
+    const cancelJob = () =>
+      within(jobRow()).queryByRole("button", { name: "Cancel" });
+
+    async function openCancellation(rowName: RegExp) {
+      const row = await screen.findByRole("row", { name: rowName });
+      await click(within(row).getByRole("button", { name: "Cancel" }));
+      return within(
+        await screen.findByRole("alertdialog", {
+          name: "Cancel this request?",
+        }),
+      );
+    }
+
+    async function submitCancellation() {
+      const confirmation = await openCancellation(queuedJob);
+      await click(confirmation.getByRole("button", { name: "Cancel request" }));
+      return confirmation;
+    }
+
+    test.each(["running", "ended", "requeued"] as const)(
+      "retires the rejected queue attempt while refreshing a %s request",
+      async (outcome) => {
+        const fixture = requestCancellationFixture(createMockTransport());
+        renderConsole(requestPage, { transport: fixture.transport });
+
+        await submitCancellation();
+        await act(async () => fixture.completeCancellation(outcome));
+        const message = await screen.findByText(rejection);
+        expect(message.closest('[role="alert"]')).not.toBeNull();
+        await waitFor(() => expect(dialog()).toBeNull());
+        expect(jobRow().textContent).toContain("Queued");
+        expect(cancelJob()).toBeNull();
+        expect(fixture.state.cancellations).toEqual([MOCK_IDS.queuedJob]);
+        await waitFor(() => expect(fixture.state.refreshCalls).toBe(1));
+
+        await act(async () => fixture.completeRefresh());
+        if (outcome === "running") {
+          await waitFor(() =>
+            expect(jobRow().textContent).toContain("Running"),
+          );
+          expect(cancelJob()).toBeNull();
+        } else if (outcome === "ended") {
+          await waitFor(() => {
+            expect(screen.queryByRole("row", { name: queuedJob })).toBeNull();
+          });
+        } else {
+          await waitFor(() => expect(cancelJob()).not.toBeNull());
+        }
+      },
+    );
+
+    test("keeps the stale action hidden when refresh fails, including after returning to Requests", async () => {
+      const fixture = requestCancellationFixture(createMockTransport());
+      renderConsole(requestPage, { transport: fixture.transport });
+      await submitCancellation();
+      await act(async () => {
+        fixture.completeCancellation("running");
+        fixture.completeRefresh(true);
+      });
+
+      const retry = await screen.findByRole("button", { name: "Try again" });
+      expect(retry.hasAttribute("disabled")).toBe(false);
+      expect(cancelJob()).toBeNull();
+      await click(screen.getByRole("link", { name: "Runners" }));
+      await click(screen.getByRole("link", { name: "Requests" }));
+      expect(jobRow().textContent).toContain("Queued");
+      expect(cancelJob()).toBeNull();
+
+      fixture.completeRefresh();
+      await click(await screen.findByRole("button", { name: "Try again" }));
+      await waitFor(() => expect(jobRow().textContent).toContain("Running"));
+      expect(fixture.state.cancellations).toEqual([MOCK_IDS.queuedJob]);
+    });
+
+    test("refreshes after a late rejection and preserves the next confirmation", async () => {
+      const fixture = requestCancellationFixture(createMockTransport());
+      renderConsole(requestPage, { transport: fixture.transport });
+      const first = await submitCancellation();
+      await click(first.getByRole("button", { name: "Cancel" }));
+      const next = await openCancellation(/sess_codex_4711/);
+
+      await act(async () => {
+        fixture.completeCancellation("running");
+        fixture.completeRefresh();
+      });
+      await waitFor(() => expect(jobRow().textContent).toContain("Running"));
+      expect(dialog()).not.toBeNull();
+      expect(screen.queryByText(rejection)).toBeNull();
+
+      await click(next.getByRole("button", { name: "Cancel request" }));
+      expect(fixture.state.cancellations).toEqual([
+        MOCK_IDS.queuedJob,
+        MOCK_IDS.queuedAgent,
+      ]);
+    });
+
+    test("allows a retry after Unavailable and refreshes after success", async () => {
+      const fixture = requestCancellationFixture(createMockTransport());
+      renderConsole(requestPage, { transport: fixture.transport });
+      const confirmation = await submitCancellation();
+      await act(async () => fixture.completeCancellation("unavailable"));
+
+      const retry = confirmation.getByRole("button", {
+        name: "Cancel request",
+      });
+      expect((await confirmation.findByRole("alert")).textContent).toContain(
+        "SandRun is not available right now.",
+      );
+      expect(retry.hasAttribute("disabled")).toBe(false);
+      expect(fixture.state.refreshCalls).toBe(0);
+      await click(retry);
+
+      await waitFor(() => {
+        expect(dialog()).toBeNull();
+        expect(screen.queryByRole("row", { name: queuedJob })).toBeNull();
+      });
+      expect(fixture.state.cancellations).toEqual([
+        MOCK_IDS.queuedJob,
+        MOCK_IDS.queuedJob,
+      ]);
+    });
   });
 
   describe("request pagination", () => {

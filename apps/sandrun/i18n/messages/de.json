@@ -307,6 +307,7 @@
   "requests.empty.description": "Anfragen erscheinen, wenn GitHub einen Job mit einem SandRun-Label in die Warteschlange stellt, ein Anbieter eine Agenten-Sitzung anfordert oder ein Mitglied eine Dev-Sitzung erstellt.",
   "requests.column.source": "Quelle",
   "requests.column.queueWait": "Wartezeit",
+  "requests.cancellationRejected": "Die Anfrage befindet sich nicht mehr in der Warteschlange.",
   "requests.cancelDialog.title": "Diese Anfrage abbrechen?",
   "requests.cancelDialog.description": "Die Anfrage endet mit dem Status „Abgebrochen“ und erhält keinen Runner. Ein GitHub-Job bleibt in der Warteschlange von GitHub, bis GitHub ihn abbricht.",
   "requests.cancelDialog.confirm": "Anfrage abbrechen",

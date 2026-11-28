@@ -307,6 +307,7 @@
   "requests.empty.description": "当 GitHub 将带有 SandRun 标签的作业加入队列、供应商请求启动代理会话或成员创建开发会话时，此处会显示相应的请求。",
   "requests.column.source": "来源",
   "requests.column.queueWait": "排队时长",
+  "requests.cancellationRejected": "该请求已不在队列中。",
   "requests.cancelDialog.title": "取消此请求？",
   "requests.cancelDialog.description": "请求将以「已取消」状态结束，不会分配运行器。GitHub 作业会继续在 GitHub 中排队，直到 GitHub 将其取消。",
   "requests.cancelDialog.confirm": "取消请求",
