@@ -40,6 +40,16 @@ func (s *Service) SetAfterConfigLimitsReadForTest(fn func(deviceID string)) {
 	s.afterConfigLimitsRead.Store(&fn)
 }
 
+// SetAfterInitialReportCommitForTest sets a hook before the first state
+// report acknowledgement. Passing nil clears the hook.
+func (s *Service) SetAfterInitialReportCommitForTest(fn func(*hub.Conn)) {
+	if fn == nil {
+		s.afterInitialReportCommit.Store(nil)
+		return
+	}
+	s.afterInitialReportCommit.Store(&fn)
+}
+
 // SendConfigurationForTest runs the configuration send that the channel
 // handler runs when the channel opens.
 func (s *Service) SendConfigurationForTest(ctx context.Context, conn *hub.Conn) error {

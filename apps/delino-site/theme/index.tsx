@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Keep the brand stylesheet first, as before the `Link` override, so the
+// Keep the site stylesheets first, as before the `Link` override, so the
 // order of the theme and Rspress styles does not change.
 import "./index.css";
+import "./nav-focus.css";
 import { forwardRef, type ComponentProps } from "react";
 import { useLang } from "@rspress/core/runtime";
 import { Link as BaseLink } from "@rspress/core/theme-original";

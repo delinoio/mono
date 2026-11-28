@@ -73,6 +73,14 @@
 - [Command-line interface foundation](cmds-sandrun-cli-foundation.md)
 - [TypeScript and Go SDK foundation](packages-sandrun-sdk-foundation.md)
 
+### sandcrew
+
+- [Project index](project-sandcrew.md)
+- [Control plane foundation](servers-sandcrew-api-foundation.md)
+- [Web console foundation](apps-sandcrew-console-foundation.md)
+- [Guest bridge foundation](cmds-sandcrew-bridge-foundation.md)
+- [Connect RPC API and bridge event contract](protos-sandcrew-api-contract.md)
+
 Before implementing a new project, add `project-<id>.md`, at least one `<domain>-<project-or-component>-<contract>.md`, and their links here. Use lowercase kebab-case IDs and domain prefixes `apps`, `cmds`, `servers`, `crates`, `protos`, or `packages`.
 
 ## Instruction update policy

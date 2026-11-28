@@ -45,21 +45,25 @@ fi
 
 retry_delay="${CHECK_RETRY_DELAY:-5}"
 api_output=""
+api_error=""
 
 # Runs `gh api` with retries. Returns 0 on success, 4 on HTTP 404 and 1 on
-# any other failure after three attempts. The output or error is left in
-# `api_output`.
+# any other failure after three attempts. Stores stdout in `api_output`
+# and stderr in `api_error` for the last attempt.
 api() {
-  local attempt
+  local attempt status
   for attempt in 1 2 3; do
-    if api_output="$(gh api "$@" 2>&1)"; then
+    status=0
+    api_output="$(gh api "$@" 2>"$api_stderr_file")" || status=$?
+    api_error="$(<"$api_stderr_file")"
+    if (( status == 0 )); then
       return 0
     fi
-    if [[ "$api_output" == *"(HTTP 404)"* ]]; then
+    if [[ "$api_error" == *"(HTTP 404)"* ]]; then
       return 4
     fi
     if (( attempt < 3 )); then
-      echo "::warning::gh api $1 failed (attempt $attempt of 3): $api_output"
+      echo "::warning::gh api $1 failed (attempt $attempt of 3): $api_error"
       sleep "$retry_delay"
     fi
   done
@@ -85,6 +89,10 @@ if [[ ! "${GITHUB_RUN_NUMBER:-}" =~ ^[0-9]+$ ]]; then
   echo "::error::GITHUB_RUN_NUMBER is not a number: ${GITHUB_RUN_NUMBER:-}"
   exit 1
 fi
+
+api_stderr_file="$(mktemp -t deploy-guard-gh.XXXXXXXX)"
+trap 'rm -f -- "$api_stderr_file"' EXIT
+
 # Collect the started runs on `main` that are newer than this run. The API
 # lists runs newest first, so read pages until a page reaches this run or
 # runs out; a page of queue-cancelled runs must not hide a newer started run.
@@ -104,7 +112,7 @@ for (( page = 1; ; page++ )); do
     --jq ".workflow_runs[] | [.id, .run_number, ($kind_filter)] | @tsv" \
     || status=$?
   if (( status != 0 )); then
-    echo "::error::Could not list the runs of $WORKFLOW: $api_output"
+    echo "::error::Could not list the runs of $WORKFLOW: $api_error"
     exit 1
   fi
   [[ -n "$api_output" ]] || break
@@ -132,7 +140,7 @@ while IFS=$'\t' read -r run_id run_number kind; do
       api "repos/$REPOSITORY/actions/runs/$run_id/jobs?filter=all&per_page=100&page=$job_page" \
         --jq '"\([.jobs[] | select(.started_at != null)] | length) \(.jobs | length)"' || status=$?
       if (( status != 0 )); then
-        echo "::error::Could not list the jobs of run #$run_number: $api_output"
+        echo "::error::Could not list the jobs of run #$run_number: $api_error"
         exit 1
       fi
       read -r page_started page_jobs <<< "$api_output"
@@ -170,7 +178,7 @@ case "$status" in
   0) ;;
   4) stale "the planned revision $SHA is not in the repository any more." ;;
   *)
-    echo "::error::Could not compare the planned revision with main: $api_output"
+    echo "::error::Could not compare the planned revision with main: $api_error"
     exit 1
     ;;
 esac
@@ -199,7 +207,7 @@ case "$status" in
   0) current="$api_output" ;;
   4) current='{}' ;;
   *)
-    echo "::error::Could not list .changeset on main: $api_output"
+    echo "::error::Could not list .changeset on main: $api_error"
     exit 1
     ;;
 esac
@@ -221,7 +229,7 @@ for id in "${ids[@]}"; do
       0) actual="$api_output" ;;
       4) ;;
       *)
-        echo "::error::Could not read .changeset/$id.md on main: $api_output"
+        echo "::error::Could not read .changeset/$id.md on main: $api_error"
         exit 1
         ;;
     esac

@@ -83,7 +83,8 @@ function scratch(t) {
 
 // A `gh` stub that answers `gh api <path> [--jq <filter>]` from a JSON map of
 // path prefix to a list of responses. Each response is used once, and the
-// last one repeats. A response is {body} for success or {error} for failure.
+// last one repeats. A response is {body, stderr?} for success or {error}
+// for failure.
 function stubGh(dir, responses) {
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -113,6 +114,7 @@ fs.writeFileSync(dir + "/calls.json", JSON.stringify(calls));
 const list = responses[key];
 const response = list[Math.min(count, list.length - 1)];
 if (response.error) { process.stderr.write(response.error + "\\n"); process.exit(1); }
+if (response.stderr) process.stderr.write(response.stderr + "\\n");
 process.stdout.write(execFileSync("jq", ["-r", jq], { input: JSON.stringify(response.body) }));
 `,
   );
@@ -229,6 +231,51 @@ test("guard passes a current plan", { skip }, (t) => {
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /The plan is current/);
 });
+
+test(
+  "guard parses successful API responses that also have diagnostics",
+  { skip },
+  (t) => {
+    const stderr = "GitHub CLI notice on stderr";
+    const result = runGuard(
+      t,
+      {
+        "repos/owner/repo/actions/workflows/deploy.yml/runs": [
+          { ...runPage([[8, "completed", "cancelled"]]), stderr },
+          { ...runPage([[7, "in_progress"]]), stderr },
+        ],
+        "repos/owner/repo/actions/runs/1008/jobs": [
+          { body: { jobs: [{ started_at: null }] }, stderr },
+          { body: { jobs: [] }, stderr },
+        ],
+        [`repos/owner/repo/compare/${plannedSha}...main`]: [
+          { body: { status: "ahead" }, stderr },
+        ],
+        "repos/owner/repo/contents/.changeset/a.md": [
+          { body: { sha: blobA }, stderr },
+        ],
+        "repos/owner/repo/contents/.changeset": [
+          {
+            body: Array.from({ length: 1000 }, (_, i) => ({
+              name: `other-${i}.md`,
+              sha: blobNew,
+            })),
+            stderr,
+          },
+        ],
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.args, /branch=main&per_page=100&page=2/);
+    assert.match(result.args, /filter=all&per_page=100&page=2/);
+    assert.match(
+      result.stdout,
+      /Ignoring run #8: no job of any attempt started/,
+    );
+    assert.match(result.stdout, /The plan is current/);
+  },
+);
 
 test("guard ignores a newer run that waits in the queue", { skip }, (t) => {
   const result = runGuard(

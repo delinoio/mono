@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,9 +13,82 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/delinoio/mono/servers/internal/telemetry"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/config"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/secrets"
 )
+
+func TestCanceledStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		enableMetrics bool
+		cancelAfter   int
+	}{
+		{name: "before first bind", enableMetrics: true, cancelAfter: 0},
+		{name: "after public bind without metrics", cancelAfter: 1},
+		{name: "after public bind with metrics configured", enableMetrics: true, cancelAfter: 1},
+		{name: "after metrics bind", enableMetrics: true, cancelAfter: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			tel, err := telemetry.New(t.Context(), telemetry.Options{
+				ServiceName: "sandrun-api",
+				Stdout:      &logs,
+				LookupEnv:   func(string) (string, bool) { return "", false },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tel.Shutdown(context.Background())
+
+			cfg := config.Config{Addr: "127.0.0.1:0", SecretKeys: &secrets.Keyring{}}
+			if tc.enableMetrics {
+				cfg.MetricsAddr = "127.0.0.1:0"
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.cancelAfter == 0 {
+				cancel()
+			}
+			var listeners []*startupListener
+			listen := func(_, _ string) (net.Listener, error) {
+				listener := bindStartupListener(t)
+				listeners = append(listeners, listener)
+				if len(listeners) == tc.cancelAfter {
+					cancel()
+				}
+				return listener, nil
+			}
+			var workerCalls atomic.Int32
+			stopCalls := 0
+			err = startAndServe(ctx, func() { stopCalls++ }, cfg, tel, http.NotFoundHandler(),
+				listen, func(context.Context) { workerCalls.Add(1) })
+			if err != nil {
+				t.Errorf("canceled startup returned %v, want nil", err)
+			}
+			if stopCalls != 1 {
+				t.Errorf("stop calls = %d, want 1", stopCalls)
+			}
+			if calls := workerCalls.Load(); calls != 0 {
+				t.Errorf("lease worker calls = %d, want 0", calls)
+			}
+			if len(listeners) != tc.cancelAfter {
+				t.Errorf("listener binds = %d, want %d", len(listeners), tc.cancelAfter)
+			}
+			if logOutput := logs.String(); strings.Contains(logOutput, "server_started") ||
+				strings.Contains(logOutput, "server_shutdown_started") {
+				t.Errorf("logged serving or HTTP drain during canceled startup: %s", logOutput)
+			}
+			for _, listener := range listeners {
+				listener.checkClosedWithoutServing(t)
+			}
+		})
+	}
+}
 
 // TestServeH2CAndShutdown checks that the server speaks HTTP/2 without TLS
 // (prior knowledge), which gRPC clients of the server streams need behind Caddy, and

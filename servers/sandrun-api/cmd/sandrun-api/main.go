@@ -114,6 +114,10 @@ func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) e
 			return err
 		}
 	}
+	if ctx.Err() != nil {
+		stop()
+		return nil
+	}
 
 	var gh github.Options
 	if g := cfg.GitHub; g != nil {
@@ -149,25 +153,49 @@ func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) e
 		return err
 	}
 
-	listener, err := net.Listen("tcp", cfg.Addr)
+	return startAndServe(ctx, stop, cfg, tel, a.Handler(), net.Listen, a.Run)
+}
+
+func startAndServe(ctx context.Context, stop func(), cfg config.Config, tel *telemetry.Telemetry, handler http.Handler,
+	listen func(network, address string) (net.Listener, error), runWorkers func(context.Context)) error {
+	logger := tel.Logger
+	if ctx.Err() != nil {
+		stop()
+		return nil
+	}
+	listener, err := listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil {
+		_ = listener.Close()
+		stop()
+		return nil
+	}
 	var metricsListener net.Listener
 	if cfg.MetricsAddr != "" {
-		if metricsListener, err = net.Listen("tcp", cfg.MetricsAddr); err != nil {
+		metricsListener, err = listen("tcp", cfg.MetricsAddr)
+		if ctx.Err() != nil {
+			if metricsListener != nil {
+				_ = metricsListener.Close()
+			}
+			_ = listener.Close()
+			stop()
+			return nil
+		}
+		if err != nil {
 			_ = listener.Close()
 			return err
 		}
 	}
-	srv := newServer(a.Handler(), logger)
+	srv := newServer(handler, logger)
 
 	workersCtx, stopWorkers := context.WithCancel(context.Background())
 	var workers sync.WaitGroup
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		a.Run(workersCtx)
+		runWorkers(workersCtx)
 	}()
 	// stopAndWait releases the lease, which stops the lease components; it
 	// runs before the HTTP drain and again on return.
@@ -196,6 +224,16 @@ func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) e
 // shutdown, so an overlapping metrics failure is returned to main.
 func runServers(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger,
 	timeout time.Duration, beforeDrain func(), metricsSrv *http.Server, metricsListener net.Listener) error {
+	if ctx.Err() != nil {
+		stop()
+		beforeDrain()
+		// Serve has not registered either listener with its server yet.
+		_ = listener.Close()
+		if metricsListener != nil {
+			_ = metricsListener.Close()
+		}
+		return nil
+	}
 	if metricsSrv == nil {
 		return serve(ctx, stop, srv, listener, logger, timeout, beforeDrain)
 	}
@@ -260,6 +298,12 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // timeout. beforeDrain runs first, so the instance releases the lease and
 // stops the lease components before the drain.
 func serve(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration, beforeDrain func()) error {
+	if ctx.Err() != nil {
+		stop()
+		beforeDrain()
+		_ = listener.Close()
+		return nil
+	}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- srv.Serve(listener) }()
 	var serveErr error
