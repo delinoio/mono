@@ -29,8 +29,10 @@ import type { GetDeviceResponse } from "@delino/ownsand-protos/v1/device_pb";
 import type { CreateOrganizationResponse } from "@delino/ownsand-protos/v1/organization_pb";
 import {
   CreateSandboxRequestSchema,
+  SandboxSourceSchema,
   type CreateSandboxRequest,
   type CreateSandboxResponse,
+  type GetSandboxResponse,
   type ListSandboxesResponse,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type {
@@ -132,6 +134,34 @@ function holdTemplateRequest(request: "first-page" | "create") {
 }
 
 export function createMockTransport(): Transport {
+  const templateSourceKey = "ownsand-e2e-sandbox-template-lookup";
+  if (sessionStorage.getItem(templateSourceKey) !== null) {
+    const base = createBaseMock();
+    return {
+      ...base,
+      async unary(method, ...args) {
+        if (
+          method.name === "ListTemplates" &&
+          sessionStorage.getItem(templateSourceKey) === "fail"
+        ) {
+          throw new ConnectError(
+            "Synthetic template lookup failure",
+            Code.Unavailable,
+          );
+        }
+        const response = await base.unary(method, ...args);
+        if (method.name === "GetSandbox") {
+          const { sandbox } = response.message as unknown as GetSandboxResponse;
+          if (sandbox?.sandboxId === MOCK_IDS.runningSandbox) {
+            sandbox.source = create(SandboxSourceSchema, {
+              source: { case: "templateId", value: MOCK_IDS.template },
+            });
+          }
+        }
+        return response;
+      },
+    };
+  }
   const billingSeed = sessionStorage.getItem("ownsand-e2e-billing-status-seed");
   const billingRefresh = createRouterTransport((router) => {
     router.rpc(BillingService.method.getBillingStatus, () => {

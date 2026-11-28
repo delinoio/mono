@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, describe, expect, test } from "@rstest/core";
-import { cleanup, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, screen, waitFor, within } from "@testing-library/react";
 import { ConnectError, Code, type Transport } from "@connectrpc/connect";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
+import { QueryClient } from "@tanstack/react-query";
 import { SandboxSourceSchema } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { create } from "@bufbuild/protobuf";
 import { BaseImage } from "@delino/ownsand-protos/v1/common_pb";
+import { invalidateServices } from "./api.ts";
 import { shortIdText } from "./components/ui.tsx";
 import { createMockTransport, MOCK_IDS } from "./mock/mock-api.ts";
 import { renderConsole, settle } from "./test-support.tsx";
@@ -25,13 +29,17 @@ function sourceTransport(
   options: { failTemplates?: boolean; holdTemplates?: boolean } = {},
 ) {
   const mock = createMockTransport();
-  const state = { listTemplates: 0, release: () => {} };
+  const state = {
+    listTemplates: 0,
+    failTemplates: options.failTemplates ?? false,
+    release: () => {},
+  };
   const transport: Transport = {
     ...mock,
     async unary(method, ...rest) {
       if (method.name === "ListTemplates") {
         state.listTemplates += 1;
-        if (options.failTemplates === true) {
+        if (state.failTemplates) {
           throw new ConnectError("templates unavailable", Code.Unavailable);
         }
         if (options.holdTemplates === true) {
@@ -138,6 +146,54 @@ describe("sandbox source row", () => {
     expect(screen.queryByText(/templates unavailable/)).toBeNull();
     expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
     expect(state.listTemplates).toBe(1);
+  });
+
+  test("shows the short ID after a failed refetch and restores the name after recovery", async () => {
+    const { transport, state } = sourceTransport({
+      case: "templateId",
+      value: MOCK_IDS.template,
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    renderConsole(sandboxPath(), { transport, queryClient });
+    const row = await sourceRow();
+    await waitFor(() =>
+      expect(row.textContent).toBe("Template node-24-toolchain"),
+    );
+    const query = queryClient.getQueryCache().find({
+      queryKey: createConnectQueryKey({
+        schema: SnapshotService.method.listTemplates,
+        cardinality: "finite",
+      }),
+      exact: false,
+    });
+    const cachedList = query?.state.data;
+    expect(cachedList).toBeDefined();
+
+    state.failTemplates = true;
+    await act(() => invalidateServices(queryClient, SnapshotService));
+    expect(query?.state.status).toBe("error");
+    expect(query?.state.data).toBe(cachedList);
+    await waitFor(() =>
+      expect(row.textContent).toBe(
+        `Template ${shortIdText(MOCK_IDS.template)}`,
+      ),
+    );
+    expect(screen.getByTitle(MOCK_IDS.template).textContent).toBe(
+      shortIdText(MOCK_IDS.template),
+    );
+    expect(screen.getByRole("heading", { name: "Sandbox" })).toBeTruthy();
+    expect(screen.queryByText(/Loading|templates unavailable/)).toBeNull();
+    expect(within(screen.getByRole("main")).queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+
+    state.failTemplates = false;
+    await act(() => invalidateServices(queryClient, SnapshotService));
+    await waitFor(() =>
+      expect(row.textContent).toBe("Template node-24-toolchain"),
+    );
+    expect(screen.getByText("node-24-toolchain").title).toBe(MOCK_IDS.template);
   });
 
   test("keeps the base image text and requests no templates", async () => {
