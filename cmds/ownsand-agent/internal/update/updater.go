@@ -67,10 +67,9 @@ type ExecutableInstaller struct {
 }
 
 // Install copies the artifact next to the executable and renames it into
-// place. On Windows the running executable is renamed away first, because
-// Windows cannot replace a running executable. When the rename of the new
-// executable onto Path then fails, Install renames the previous executable
-// back to Path, so the next start still finds it.
+// place. On Windows, Install first moves the running executable aside
+// unless an earlier failed rollback already left it at Path.old. If
+// publication fails, Install tries to restore the previous executable.
 func (i ExecutableInstaller) Install(artifactPath string) error {
 	data, err := os.ReadFile(artifactPath)
 	if err != nil {
@@ -92,9 +91,21 @@ func (i ExecutableInstaller) Install(artifactPath string) error {
 		return rename(next, i.Path)
 	}
 	old := i.Path + ".old"
-	os.Remove(old)
-	if err := rename(i.Path, old); err != nil {
-		return err
+	_, err = os.Lstat(i.Path)
+	switch {
+	case err == nil:
+		os.Remove(old)
+		if err := rename(i.Path, old); err != nil {
+			return err
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		// A failed publication and rollback can leave Path.old as the
+		// only previous executable. Keep it and publish the new stage directly.
+		if _, err := os.Lstat(old); err != nil {
+			return fmt.Errorf("update: inspect previous executable: %w", err)
+		}
+	default:
+		return fmt.Errorf("update: inspect working executable: %w", err)
 	}
 	if err := rename(next, i.Path); err != nil {
 		// Path is missing now and the previous bytes are at old. Put them back.

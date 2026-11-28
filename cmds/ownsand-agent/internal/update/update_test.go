@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -462,6 +463,95 @@ func TestExecutableInstallerWindowsRenames(t *testing.T) {
 
 // TestExecutableInstallerNonWindowsSingleRename checks that other hosts keep
 // one rename of Path.new onto Path and never create Path.old.
+func TestExecutableInstallerWindowsRetryAfterFailedRestore(t *testing.T) {
+	publishErr := errors.New("publication denied")
+	restoreErr := errors.New("restoration denied")
+	for _, tc := range []struct {
+		name        string
+		failPublish bool
+		failRestore bool
+	}{
+		{name: "publishes fresh bytes"},
+		{name: "restores the previous executable", failPublish: true},
+		{name: "keeps the backup", failPublish: true, failRestore: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exe, art := installFixture(t)
+			next, old := exe+".new", exe+".old"
+			failPublish, failRestore := true, true
+			var calls []renameCall
+			installer := ExecutableInstaller{
+				Path: exe,
+				goos: "windows",
+				rename: func(from, to string) error {
+					calls = append(calls, renameCall{from, to})
+					switch {
+					case from == next && failPublish:
+						return publishErr
+					case from == old && failRestore:
+						return restoreErr
+					default:
+						return os.Rename(from, to)
+					}
+				},
+			}
+			if err := installer.Install(art); !errors.Is(err, publishErr) || !strings.Contains(err.Error(), restoreErr.Error()) {
+				t.Fatalf("first install error = %v, want both rename failures", err)
+			}
+			if _, err := os.Lstat(exe); !os.IsNotExist(err) {
+				t.Fatalf("working executable check after double failure = %v, want not exist", err)
+			}
+			if got := readString(t, old); got != "old" {
+				t.Fatalf("backup after double failure = %q, want old", got)
+			}
+
+			retry := filepath.Join(filepath.Dir(art), "retry-artifact")
+			if err := os.WriteFile(retry, []byte("retry"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			calls = nil
+			failPublish, failRestore = tc.failPublish, tc.failRestore
+			err := installer.Install(retry)
+			wantCalls := []renameCall{{next, exe}}
+			if tc.failPublish {
+				wantCalls = append(wantCalls, renameCall{old, exe})
+			}
+			if !slices.Equal(calls, wantCalls) {
+				t.Errorf("retry rename calls = %v, want %v", calls, wantCalls)
+			}
+			switch {
+			case tc.failRestore:
+				if !errors.Is(err, publishErr) || !strings.Contains(err.Error(), restoreErr.Error()) {
+					t.Fatalf("retry error = %v, want both rename failures", err)
+				}
+				if _, err := os.Lstat(exe); !os.IsNotExist(err) {
+					t.Fatalf("working executable check after retry = %v, want not exist", err)
+				}
+				if got := readString(t, old); got != "old" {
+					t.Fatalf("backup after retry = %q, want old", got)
+				}
+			case tc.failPublish:
+				if !errors.Is(err, publishErr) {
+					t.Fatalf("retry error = %v, want %v", err, publishErr)
+				}
+				if got := readString(t, exe); got != "old" {
+					t.Fatalf("restored executable = %q, want old", got)
+				}
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := readString(t, exe); got != "retry" {
+					t.Fatalf("published executable = %q, want retry", got)
+				}
+				if got := readString(t, old); got != "old" {
+					t.Fatalf("backup after publication = %q, want old", got)
+				}
+			}
+		})
+	}
+}
+
 func TestExecutableInstallerNonWindowsSingleRename(t *testing.T) {
 	exe, art := installFixture(t)
 	var calls []renameCall
@@ -527,6 +617,87 @@ func TestFailedWindowsRenameRestoresExecutableAndSkipsRestart(t *testing.T) {
 	}
 	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED {
 		t.Fatalf("state %v", s)
+	}
+}
+
+func TestVerifiedWindowsUpdateRetriesAfterFailedRestore(t *testing.T) {
+	const retryArtifact = "verified retry binary"
+	retryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(retryArtifact))
+	}))
+	t.Cleanup(retryServer.Close)
+	r := newRelease(t, func(m *Manifest, _ *[]byte) {
+		hash := sha256.Sum256([]byte(retryArtifact))
+		m.Releases = append(m.Releases, Release{Version: "1.2.0", Artifacts: []Artifact{{
+			Platform: "linux-amd64", URL: retryServer.URL, SHA256: hex.EncodeToString(hash[:]),
+		}}})
+	})
+	busy := &atomic.Bool{}
+	u, _, restarts := newUpdater(t, r, "1.0.0", busy)
+	exe, _ := installFixture(t)
+	denied := errors.New("rename denied")
+	blocked := true
+	u.opts.Installer = ExecutableInstaller{
+		Path: exe,
+		goos: "windows",
+		rename: func(from, to string) error {
+			if blocked && to == exe {
+				return denied
+			}
+			return os.Rename(from, to)
+		},
+	}
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := u.TryInstall(); ok || !errors.Is(err, denied) {
+		t.Fatalf("first update install = %v, %v, want failure", ok, err)
+	}
+	if got := restarts.Load(); got != 0 {
+		t.Fatalf("restarts after failed update = %d, want 0", got)
+	}
+	if state, _ := u.State(); state != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED {
+		t.Fatalf("state after failed update = %v, want failed", state)
+	}
+
+	blocked = false
+	busy.Store(true)
+	if err := update(u, "1.2.0", false); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := u.TryInstall(); ok || err != nil {
+		t.Fatalf("update install while busy = %v, %v", ok, err)
+	}
+	busy.Store(false)
+	if ok, err := u.TryInstall(); !ok || err != nil {
+		t.Fatalf("retry update install = %v, %v, want success", ok, err)
+	}
+	if got := restarts.Load(); got != 1 {
+		t.Fatalf("restarts after retry = %d, want 1", got)
+	}
+	if got := readString(t, exe); got != retryArtifact {
+		t.Fatalf("published executable = %q, want %q", got, retryArtifact)
+	}
+	saved, err := u.opts.Store.LoadAgent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.PendingUpdate == nil || saved.PendingUpdate.TargetVersion != "1.2.0" {
+		t.Fatalf("pending update = %+v, want target 1.2.0", saved.PendingUpdate)
+	}
+	restarted, err := New(Options{Store: u.opts.Store, Running: "1.2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := restarted.State(); state != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE {
+		t.Fatalf("state after restart = %v, want up to date", state)
+	}
+	saved, err = u.opts.Store.LoadAgent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.PendingUpdate != nil {
+		t.Fatalf("pending update after restart = %+v, want cleared", saved.PendingUpdate)
 	}
 }
 
