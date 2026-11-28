@@ -183,13 +183,15 @@ func TestUpdateAutoTopUpSettingsResponsesMatchOwnWrites(t *testing.T) {
 	owner := env.Credit(f.Owner.ID)
 
 	const writers = 12
+	submittedCaps := make(map[int64]struct{}, writers)
 	var wg sync.WaitGroup
 	errs := make(chan error, writers)
 	for i := 0; i < writers; i++ {
+		want := int64(100+i) * usd
+		submittedCaps[want] = struct{}{}
 		wg.Add(1)
-		go func(i int) {
+		go func(i int, want int64) {
 			defer wg.Done()
-			want := int64(100+i) * usd
 			res, err := owner.UpdateAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.UpdateAutoTopUpSettingsRequest{
 				BillingAccountId: f.AccountID,
 				Settings: &accountsv1.AutoTopUpSettings{Enabled: true, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 25 * usd,
@@ -202,7 +204,7 @@ func TestUpdateAutoTopUpSettingsResponsesMatchOwnWrites(t *testing.T) {
 			if got := res.Msg.GetSettings().GetMonthlyCapUsdMicros(); got != want {
 				errs <- fmt.Errorf("writer %d: response cap = %d, want its own write %d", i, got, want)
 			}
-		}(i)
+		}(i, want)
 	}
 	wg.Wait()
 	close(errs)
@@ -210,12 +212,19 @@ func TestUpdateAutoTopUpSettingsResponsesMatchOwnWrites(t *testing.T) {
 		t.Error(err)
 	}
 
-	// The last committed write is what the read RPC returns.
+	// Any submitted cap can be the last committed write.
+	_, _, _, capMicros, found := storedAutoTopUp(t, env, f.AccountID)
+	if !found {
+		t.Fatal("auto-top-up settings row is missing after concurrent updates")
+	}
+	if _, submitted := submittedCaps[capMicros]; !submitted {
+		t.Fatalf("stored auto-top-up cap = %d, want a submitted cap", capMicros)
+	}
+
 	got, err := owner.GetAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.GetAutoTopUpSettingsRequest{BillingAccountId: f.AccountID}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, capMicros, _ := storedAutoTopUp(t, env, f.AccountID)
 	if got.Msg.GetSettings().GetMonthlyCapUsdMicros() != capMicros {
 		t.Fatalf("GetAutoTopUpSettings cap = %d, stored %d", got.Msg.GetSettings().GetMonthlyCapUsdMicros(), capMicros)
 	}

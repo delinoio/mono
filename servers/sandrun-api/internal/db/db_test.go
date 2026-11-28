@@ -33,6 +33,43 @@ func TestOpenInvalidDatabaseURL(t *testing.T) {
 	}
 }
 
+func TestOpenDatabaseURLSessionAffinity(t *testing.T) {
+	const prefix = "postgres://sandrun:fixture-password@"
+	const suffix = "/sandrun?sslmode=disable"
+	const pooledError = "DATABASE_URL requires a session-preserving PostgreSQL endpoint (use the PlanetScale direct primary endpoint on port 5432)"
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		pooled   bool
+	}{
+		{name: "pooled primary", endpoint: "example.horizon.psdb.cloud:6432", pooled: true},
+		{name: "pooled fallback", endpoint: "127.0.0.1:5432,example.horizon.psdb.cloud:6432", pooled: true},
+		{name: "uppercase absolute hostname", endpoint: "EXAMPLE.HORIZON.PSDB.CLOUD.:6432", pooled: true},
+		{name: "direct PlanetScale", endpoint: "example.horizon.psdb.cloud:5432"},
+		{name: "direct loopback", endpoint: "127.0.0.1:5432"},
+		{name: "different DNS label", endpoint: "example.otherpsdb.cloud:6432"},
+		{name: "different DNS suffix", endpoint: "example.psdb.cloud.invalid:6432"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A canceled context keeps accepted endpoints from reaching the network.
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			database, err := db.Open(ctx, prefix+tc.endpoint+suffix)
+			if database != nil {
+				database.Close()
+				t.Fatal("Open returned a database with a canceled context")
+			}
+			if tc.pooled {
+				if err == nil || err.Error() != pooledError {
+					t.Fatalf("Open error = %v, want %q", err, pooledError)
+				}
+			} else if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Open error = %v, want context canceled", err)
+			}
+		})
+	}
+}
+
 // TestMigrationNames checks the naming convention of the embedded files.
 func TestMigrationNames(t *testing.T) {
 	names, err := fs.Glob(db.Migrations(), "*.sql")

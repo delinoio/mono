@@ -28,6 +28,15 @@ func req(auth_ string, p string, op string) Request {
 
 const accepted = ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED
 
+func requireGrantDone(t *testing.T, g *Grant, transition string) {
+	t.Helper()
+	select {
+	case <-g.Done():
+	default:
+		t.Fatalf("%s did not close the grant notification channel", transition)
+	}
+}
+
 func TestIdempotencyAndAdmission(t *testing.T) {
 	c := &clock{t: time.Unix(1000, 0)}
 	r := New(c.now)
@@ -53,7 +62,7 @@ func TestIdempotencyAndAdmission(t *testing.T) {
 		t.Fatalf("added predecessor: %v", err)
 	}
 	r.Ack(g.ID, accepted, "")
-	<-g.Done()
+	requireGrantDone(t, g, "accepted acknowledgement")
 	if r.Admittable(g.ID) == nil {
 		t.Fatal("installed grant not admittable")
 	}
@@ -168,7 +177,7 @@ func TestLimitsReleaseAndRejection(t *testing.T) {
 	r2 := New(c.now)
 	g, _, _ := r2.Reserve(req("r", "u", "op"), newID)
 	r2.Ack(g.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT, "")
-	<-g.Done()
+	requireGrantDone(t, g, "grant limit rejection")
 	if g.Outcome() != OutcomeRejectedLimit || r2.Len() != 0 {
 		t.Fatal("rejected grant kept")
 	}
@@ -177,31 +186,31 @@ func TestLimitsReleaseAndRejection(t *testing.T) {
 	r3 := New(c.now)
 	lost, _, _ := r3.Reserve(req("lost", "u", "op"), newID)
 	r3.RemoveChannel(lost.DeviceID, lost.ChannelGen)
-	<-lost.Done()
+	requireGrantDone(t, lost, "channel loss")
 	if lost.Outcome() != OutcomeRemoved || r3.Len() != 0 {
 		t.Fatalf("channel loss outcome = %v", lost.Outcome())
 	}
 	released, _, _ := r3.Reserve(req("released", "u", "op2"), newID)
 	r3.Release(released.ID, released.DeviceID)
-	<-released.Done()
+	requireGrantDone(t, released, "release")
 	if released.Outcome() != OutcomeRemoved {
 		t.Fatalf("release outcome = %v", released.Outcome())
 	}
 	revoked, _, _ := r3.Reserve(req("revoked", "u", "op3"), newID)
 	r3.RemoveMatching(func(x *Grant) bool { return x.ID == revoked.ID })
-	<-revoked.Done()
+	requireGrantDone(t, revoked, "matching revocation")
 	if revoked.Outcome() != OutcomeRemoved {
 		t.Fatalf("revocation outcome = %v", revoked.Outcome())
 	}
 	odd, _, _ := r3.Reserve(req("odd", "u", "op4"), newID)
 	r3.Ack(odd.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_UNSPECIFIED, "")
-	<-odd.Done()
+	requireGrantDone(t, odd, "unspecified acknowledgement")
 	if odd.Outcome() != OutcomeRemoved {
 		t.Fatalf("unspecified result outcome = %v", odd.Outcome())
 	}
 	accepted, _, _ := r3.Reserve(req("accepted", "u", "op5"), newID)
 	r3.Ack(accepted.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED, "")
-	<-accepted.Done()
+	requireGrantDone(t, accepted, "accepted acknowledgement")
 	if accepted.Outcome() != OutcomeAccepted {
 		t.Fatalf("accepted outcome = %v", accepted.Outcome())
 	}
@@ -275,12 +284,23 @@ func TestRemoveUndelivered(t *testing.T) {
 	r := New(c.now)
 	g, _, _ := r.Reserve(req("a", "u", "op"), newID)
 	woken := make(chan Outcome, 1)
-	go func() { <-g.Done(); woken <- g.Outcome() }()
+	go func() {
+		select {
+		case <-g.Done():
+			woken <- g.Outcome()
+		case <-t.Context().Done():
+		}
+	}()
 	if !r.RemoveUndelivered(g.ID) {
 		t.Fatal("pending grant not removed")
 	}
-	if got := <-woken; got != OutcomeDeliveryFailed {
-		t.Fatalf("waiter outcome = %v", got)
+	select {
+	case got := <-woken:
+		if got != OutcomeDeliveryFailed {
+			t.Fatalf("waiter outcome = %v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RemoveUndelivered did not wake the waiter within one second")
 	}
 	if r.Len() != 0 || r.Get(g.ID) != nil {
 		t.Fatal("removed grant is still registered")
@@ -387,7 +407,7 @@ func TestAckNamingPredecessorRemovesIt(t *testing.T) {
 	r := New(c.now)
 	pred, succ := installedWithReplacement(t, r)
 	r.Ack(succ.ID, accepted, pred.ID)
-	<-succ.Done()
+	requireGrantDone(t, succ, "accepted acknowledgement naming the predecessor")
 	if r.Get(pred.ID) != nil || r.Admittable(succ.ID) == nil || succ.Replaces != "" {
 		t.Fatal("swap not applied")
 	}
