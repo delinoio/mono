@@ -78,6 +78,8 @@ func TestLogtoValidatorEarlyCompletionIsReportedBeforeJWKSStart(t *testing.T) {
 	}
 	srv := httptest.NewServer(o)
 	t.Cleanup(srv.Close)
+	// Cleanups run in reverse order, so release the handler before closing the server.
+	t.Cleanup(func() { close(o.block) })
 	now := time.Now()
 	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://ownsand.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
 	token := o.f.sign(t, "JWT", outageClaims(o.f, now))
