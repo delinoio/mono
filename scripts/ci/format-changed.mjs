@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isUtf8 } from "node:buffer";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { constants } from "node:os";
@@ -330,22 +330,70 @@ const ExclusionProbe = "\n\n\n";
 // is given, so ask it through `--stdin-filepath`, which applies the same
 // matching to a path that does not exist on disk. A probe that cannot run
 // reports "not excluded", which keeps the path failure in force.
-function excludedByRstack(cwd, name) {
+const exclusionProbeArgs = (name) => [
+  rstackEntry(),
+  "fmt",
+  "--stdin-filepath",
+  `./${lossyPath(name)}`,
+];
+
+function excludedByRstackSync(cwd, name) {
   try {
-    const output = execFileSync(
-      process.execPath,
-      [rstackEntry(), "fmt", "--stdin-filepath", `./${lossyPath(name)}`],
-      {
-        cwd,
-        input: ExclusionProbe,
-        encoding: "utf8",
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
+    const output = execFileSync(process.execPath, exclusionProbeArgs(name), {
+      cwd,
+      input: ExclusionProbe,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     return output === ExclusionProbe;
   } catch {
     return false;
   }
+}
+
+async function excludedByRstack(cwd, name, rstack) {
+  let excluded = false;
+  let inputFailed = false;
+  try {
+    await rstack.run(() => {
+      const child = execFile(
+        process.execPath,
+        exclusionProbeArgs(name),
+        { cwd, encoding: "utf8" },
+        (error, output) => {
+          excluded = !error && output === ExclusionProbe;
+        },
+      );
+      child.stdin.on("error", () => {
+        inputFailed = true;
+      });
+      child.stdin.end(ExclusionProbe);
+      return child;
+    });
+  } catch {
+    return false;
+  }
+  return excluded && !inputFailed;
+}
+
+// Selectors yield only paths that need a probe and resume with Rstack's
+// verdict. The CLI stops before resuming if it received a signal.
+function selectSynchronously(cwd, selection) {
+  let step = selection.next();
+  while (!step.done) {
+    step = selection.next(excludedByRstackSync(cwd, step.value));
+  }
+  return step.value;
+}
+
+async function selectWithRstack(cwd, selection, rstack) {
+  let step = selection.next();
+  while (!step.done) {
+    const excluded = await excludedByRstack(cwd, step.value, rstack);
+    if (rstack.signal) return [];
+    step = selection.next(excluded);
+  }
+  return step.value;
 }
 
 // Human-readable kind of a non-regular lstat result for diagnostics.
@@ -373,9 +421,9 @@ function entryKind(stats) {
 // exclusion probe, which still matches because directory prefixes are valid
 // UTF-8, such a path fails with the accurate non-UTF-8 error instead of the
 // false missing-path diagnosis.
-function stagedRegularFile(cwd, name) {
+function* stagedRegularFile(cwd, name) {
   if (hasInvalidBytes(name)) {
-    if (excludedByRstack(cwd, name)) return false;
+    if (yield name) return false;
     throw new NonUtf8PathError(displayPath(name));
   }
   let stats;
@@ -383,7 +431,7 @@ function stagedRegularFile(cwd, name) {
     stats = worktreeEntry(cwd, name);
   } catch (error) {
     if (!goneCodes.has(error.code)) throw error;
-    if (excludedByRstack(cwd, name)) return false;
+    if (yield name) return false;
     if (error.code === GoneCode.OutsideRepository) {
       throw new Error(
         `Staged path ${name} cannot be formatted because a parent directory resolves outside the repository through a symbolic link. Restore the parent directory, or unstage the path with "git restore --staged -- <path>" (or "git rm --cached -- <path>" to commit its deletion), then commit again.`,
@@ -396,16 +444,15 @@ function stagedRegularFile(cwd, name) {
     );
   }
   if (stats.isFile()) return true;
-  if (excludedByRstack(cwd, name)) return false;
+  if (yield name) return false;
   throw new Error(
     `Staged path exists in the working tree as a ${entryKind(stats)}, not a regular file, and cannot be formatted: ${name}. Restore the regular file, or unstage it with "git restore --staged -- <path>" (or "git rm --cached -- <path>" to commit its deletion), then commit again.`,
   );
 }
 
-export function stagedFormatFiles(start) {
-  const cwd = repositoryRoot(start);
+function* stagedFormatSelection(cwd) {
   const exempt = recordedNonFormattablePaths(cwd);
-  return gitPaths(cwd, [
+  const names = gitPaths(cwd, [
     "diff",
     "--cached",
     "--name-only",
@@ -413,18 +460,24 @@ export function stagedFormatFiles(start) {
     "--diff-filter=ACMRT",
     "-z",
     "--",
-  ])
-    .filter((name) => {
-      // Every exemption runs before the worktree is consulted, so none of them
-      // can hit the missing-file or non-regular-file failure: an unsupported
-      // extension, a path the index records as a symlink or gitlink, and,
-      // inside stagedRegularFile, a path excluded by the shared Rstack
-      // configuration. A name that is not valid UTF-8 reaches the same probe
-      // before its own failure.
-      if (!isFormattableExtension(name) || exempt.has(name)) return false;
-      return stagedRegularFile(cwd, name);
-    })
-    .sort();
+  ]);
+  const selected = [];
+  for (const name of names) {
+    // Every exemption runs before the worktree is consulted, so none of them
+    // can hit the missing-file or non-regular-file failure: an unsupported
+    // extension, a path the index records as a symlink or gitlink, and,
+    // inside stagedRegularFile, a path excluded by the shared Rstack
+    // configuration. A name that is not valid UTF-8 reaches the same probe
+    // before its own failure.
+    if (!isFormattableExtension(name) || exempt.has(name)) continue;
+    if (yield* stagedRegularFile(cwd, name)) selected.push(name);
+  }
+  return selected.sort();
+}
+
+export function stagedFormatFiles(start) {
+  const cwd = repositoryRoot(start);
+  return selectSynchronously(cwd, stagedFormatSelection(cwd));
 }
 
 // What an explicit comparison does with a present formattable path whose name
@@ -450,7 +503,7 @@ export const UnavailablePathPolicy = Object.freeze({
   Defer: "defer",
 });
 
-function explicitRegularFile(cwd, name, unavailable) {
+function* explicitRegularFile(cwd, name, unavailable) {
   let stats;
   let lookupError;
   try {
@@ -461,22 +514,21 @@ function explicitRegularFile(cwd, name, unavailable) {
     lookupError = error;
   }
   if (unavailable === UnavailablePathPolicy.Defer) return true;
-  if (excludedByRstack(cwd, name)) return false;
+  if (yield name) return false;
   if (lookupError) throw lookupError;
   throw new Error(
     `Explicit comparison path ${name} cannot be formatted because its working-tree entry is a ${entryKind(stats)}`,
   );
 }
 
-export function changedFormatFiles(
-  start,
+function* changedFormatSelection(
+  cwd,
   base,
   head,
   local = false,
   nonUtf8 = NonUtf8Policy.Fail,
   unavailable = UnavailablePathPolicy.Fail,
 ) {
-  const cwd = repositoryRoot(start);
   revision(cwd, base);
   revision(cwd, head);
   const names = gitPaths(cwd, [
@@ -522,30 +574,45 @@ export function changedFormatFiles(
   // `head`. Both have no blob to format, so they are exempted before the
   // non-UTF-8 check below, as `stagedFormatFiles` does.
   const exempt = recordedNonFormattablePaths(cwd);
-  return [...new Set(names)]
-    .filter((name) => {
-      if (!name || !isFormattableExtension(name) || !present.has(name))
-        return false;
-      if (exempt.has(name)) return false;
-      // The explicit comparison decides what CI validates, so a present path
-      // whose name is not valid UTF-8 fails accurately after the exclusion
-      // probe. Local selection keeps the silent skip. Names compare by their
-      // bytes, so a path deleted in the range is not in the explicit `present`
-      // and was skipped above, even when a valid name with the same lossy form
-      // exists.
-      // The `Defer` policy selects the name before any probe (see
-      // `NonUtf8Policy`).
-      if (hasInvalidBytes(name)) {
-        if (local) return false;
-        if (nonUtf8 === NonUtf8Policy.Defer) return true;
-        if (excludedByRstack(cwd, name)) return false;
-        throw new NonUtf8PathError(displayPath(name));
-      }
-      return local
-        ? isRegularFile(cwd, name, true)
-        : explicitRegularFile(cwd, name, unavailable);
-    })
-    .sort();
+  const selected = [];
+  for (const name of new Set(names)) {
+    if (!name || !isFormattableExtension(name) || !present.has(name)) continue;
+    if (exempt.has(name)) continue;
+    // The explicit comparison decides what CI validates, so a present path
+    // whose name is not valid UTF-8 fails accurately after the exclusion
+    // probe. Local selection keeps the silent skip. Names compare by their
+    // bytes, so a path deleted in the range is not in the explicit `present`
+    // and was skipped above, even when a valid name with the same lossy form
+    // exists.
+    // The `Defer` policy selects the name before any probe (see
+    // `NonUtf8Policy`).
+    if (hasInvalidBytes(name)) {
+      if (local) continue;
+      if (nonUtf8 === NonUtf8Policy.Defer) selected.push(name);
+      else if (!(yield name)) throw new NonUtf8PathError(displayPath(name));
+      continue;
+    }
+    const regular = local
+      ? isRegularFile(cwd, name, true)
+      : yield* explicitRegularFile(cwd, name, unavailable);
+    if (regular) selected.push(name);
+  }
+  return selected.sort();
+}
+
+export function changedFormatFiles(
+  start,
+  base,
+  head,
+  local,
+  nonUtf8,
+  unavailable,
+) {
+  const cwd = repositoryRoot(start);
+  return selectSynchronously(
+    cwd,
+    changedFormatSelection(cwd, base, head, local, nonUtf8, unavailable),
+  );
 }
 
 // Signals that stop the formatter. They are forwarded to the Rstack child so an
@@ -561,39 +628,45 @@ const ForwardedSignal = Object.freeze({
 });
 const signalExitCode = (signal) => 128 + constants.signals[signal];
 
-// Runs one Rstack batch. Resolves after the child has exited with its status
-// and the first forwarded signal received meanwhile (null when none). The
-// handlers are removed on every exit path so batches never stack listeners.
-function runBatch(cwd, args, env) {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, args, {
-      cwd,
-      env,
-      stdio: "inherit",
-      shell: false,
-    });
-    let received = null;
-    const handlers = Object.values(ForwardedSignal).map((signal) => {
-      const handler = () => {
-        received ??= signal;
-        console.error(JSON.stringify({ event: "ci_format_signal", signal }));
-        child.kill(signal);
-      };
-      process.on(signal, handler);
-      return [signal, handler];
-    });
-    const cleanup = () => {
-      for (const [signal, handler] of handlers) process.off(signal, handler);
+// Use one set of handlers for the whole run, from selection through the last
+// batch. A child remains active until its exit and stdio close.
+async function withRstack(format) {
+  let activeChild;
+  let received = null;
+  const handlers = Object.values(ForwardedSignal).map((signal) => {
+    const handler = () => {
+      if (received) return;
+      received = signal;
+      console.error(JSON.stringify({ event: "ci_format_signal", signal }));
+      activeChild?.kill(signal);
     };
-    child.once("error", (error) => {
-      cleanup();
-      reject(error);
-    });
-    child.once("close", (code) => {
-      cleanup();
-      resolvePromise({ status: code ?? 2, signal: received });
-    });
+    process.on(signal, handler);
+    return [signal, handler];
   });
+  try {
+    return await format({
+      get signal() {
+        return received;
+      },
+      run(start) {
+        return new Promise((resolvePromise, reject) => {
+          const child = start();
+          activeChild = child;
+          let childError;
+          child.once("error", (error) => {
+            childError = error;
+          });
+          child.once("close", (code) => {
+            activeChild = undefined;
+            if (childError && !received) reject(childError);
+            else resolvePromise(code ?? 2);
+          });
+        });
+      },
+    });
+  } finally {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+  }
 }
 
 // Most paths one Rstack process receives. Bounds the argument count on every
@@ -691,20 +764,17 @@ export function splitBatches(
   return batches;
 }
 
-// Runs every Rstack batch and returns `{ status, signal }`. `signal` is the
-// first forwarded signal (null when none); a stopped run reports the shell
-// convention `128 + signal` as `status` and starts no further batch. Callers
-// that must tell a stopped run from a failed check read `signal`, because a
-// signal exit code is indistinguishable from a check status by value alone.
+// Returns the highest Rstack batch exit status. A signal stops the run before
+// the next batch and returns the shell convention `128 + signal`.
 // `options.env` supplies the environment for Git root lookup and Rstack.
 // When omitted, those child processes inherit the caller's environment.
 // `options.commandLineLimit` and `options.onBatch` are test seams: the first
 // replaces the platform command-line limit, the second observes each batch's
 // paths before its process starts.
-async function runFormatterBatches(start, paths, mode, options = {}) {
+async function runFormatterBatches(start, paths, mode, rstack, options = {}) {
   if (!Object.values(Mode).includes(mode))
     throw new Error("Unknown formatting mode");
-  if (!paths.length) return { status: 0, signal: null };
+  if (!paths.length) return 0;
   // Selected paths are repository-root-relative, so Rstack must run there too.
   const { env } = options;
   const cwd = repositoryRoot(start, env);
@@ -731,17 +801,24 @@ async function runFormatterBatches(start, paths, mode, options = {}) {
   let status = 0;
   for (const batch of batches) {
     options.onBatch?.(batch);
-    const { status: batchStatus, signal } = await runBatch(
-      cwd,
-      [...fixedArgs, ...batch.map((name) => `./${name}`)],
-      env,
+    const batchStatus = await rstack.run(() =>
+      spawn(
+        process.execPath,
+        [...fixedArgs, ...batch.map((name) => `./${name}`)],
+        {
+          cwd,
+          env,
+          stdio: "inherit",
+          shell: false,
+        },
+      ),
     );
     // A stopped run must not start another batch; report the shell convention
     // for the received signal instead of the child's own status.
-    if (signal) return { status: signalExitCode(signal), signal };
+    if (rstack.signal) return signalExitCode(rstack.signal);
     status = Math.max(status, batchStatus);
   }
-  return { status, signal: null };
+  return status;
 }
 
 export async function runFormatter(
@@ -750,7 +827,9 @@ export async function runFormatter(
   mode = Mode.Check,
   options = {},
 ) {
-  return (await runFormatterBatches(start, paths, mode, options)).status;
+  return withRstack((rstack) =>
+    runFormatterBatches(start, paths, mode, rstack, options),
+  );
 }
 
 // CI is enabled when the variable is set to anything except an empty value or
@@ -821,49 +900,56 @@ export async function main(env = process.env) {
     throw new Error(
       "All-file formatting requires local execution without a comparison",
     );
-  const paths = values.staged
-    ? stagedFormatFiles(cwd)
-    : values.all
-      ? allFormatFiles(cwd)
-      : changedFormatFiles(cwd, base, head, !explicit);
-  const pathspecCommit = Boolean(values.staged) && isThrowawayIndex(env);
-  const mode = values.write && !pathspecCommit ? Mode.Write : Mode.Check;
-  console.log(
-    JSON.stringify({
-      event: "ci_format",
-      base,
-      head,
-      validationRevision: values.staged
-        ? null
-        : git(cwd, ["rev-parse", "HEAD"]).trim(),
-      staged: values.staged ?? false,
-      mode,
-      candidates: paths.length,
-      local: !explicit,
-    }),
-  );
-  const { status, signal } = await runFormatterBatches(cwd, paths, mode);
-  console.log(
-    JSON.stringify({
-      event: "ci_format_result",
-      status,
-      candidates: paths.length,
-    }),
-  );
-  // A run stopped by a signal exits 128+signal and was not a formatting verdict,
-  // so only a non-signal failure gets the pathspec-commit guidance. The signal
-  // is checked directly: `status > 128` would also match a child's own status.
-  if (pathspecCommit && !signal && status !== 0)
-    // Check mode exits 1 when a file needs formatting and 2 when a file cannot
-    // be parsed; the highest batch status wins. Both fail the commit with the
-    // same guidance because the hook cannot fix either in a pathspec commit.
-    throw new Error(
-      "git commit <path> cannot be formatted through the pre-commit hook: " +
-        "formatting is required or a staged file cannot be parsed. " +
-        "Nothing was changed. Fix the reported files, run `git add` on them " +
-        "and run a plain `git commit` without a path.",
+  return withRstack(async (rstack) => {
+    const paths = values.staged
+      ? await selectWithRstack(cwd, stagedFormatSelection(cwd), rstack)
+      : values.all
+        ? allFormatFiles(cwd)
+        : await selectWithRstack(
+            cwd,
+            changedFormatSelection(cwd, base, head, !explicit),
+            rstack,
+          );
+    if (rstack.signal) return signalExitCode(rstack.signal);
+    const pathspecCommit = Boolean(values.staged) && isThrowawayIndex(env);
+    const mode = values.write && !pathspecCommit ? Mode.Write : Mode.Check;
+    console.log(
+      JSON.stringify({
+        event: "ci_format",
+        base,
+        head,
+        validationRevision: values.staged
+          ? null
+          : git(cwd, ["rev-parse", "HEAD"]).trim(),
+        staged: values.staged ?? false,
+        mode,
+        candidates: paths.length,
+        local: !explicit,
+      }),
     );
-  return status;
+    const status = await runFormatterBatches(cwd, paths, mode, rstack);
+    console.log(
+      JSON.stringify({
+        event: "ci_format_result",
+        status,
+        candidates: paths.length,
+      }),
+    );
+    // A run stopped by a signal exits 128+signal and was not a formatting verdict,
+    // so only a non-signal failure gets the pathspec-commit guidance. The signal
+    // is checked directly: `status > 128` would also match a child's own status.
+    if (pathspecCommit && !rstack.signal && status !== 0)
+      // Check mode exits 1 when a file needs formatting and 2 when a file cannot
+      // be parsed; the highest batch status wins. Both fail the commit with the
+      // same guidance because the hook cannot fix either in a pathspec commit.
+      throw new Error(
+        "git commit <path> cannot be formatted through the pre-commit hook: " +
+          "formatting is required or a staged file cannot be parsed. " +
+          "Nothing was changed. Fix the reported files, run `git add` on them " +
+          "and run a plain `git commit` without a path.",
+      );
+    return status;
+  });
 }
 
 if (isWorkspaceCli(import.meta)) {
