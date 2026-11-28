@@ -3009,9 +3009,11 @@ Use `useTransition` instead of manual `useState` for loading states. This provid
 **Incorrect: manual loading state**
 
 ```tsx
+type Result = Awaited<ReturnType<typeof fetchResults>>[number]
+
 function SearchResults() {
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
+  const [results, setResults] = useState<Result[]>([])
   const [isLoading, setIsLoading] = useState(false)
 
   const handleSearch = async (value: string) => {
@@ -3037,9 +3039,11 @@ function SearchResults() {
 ```tsx
 import { useTransition, useState, useRef } from 'react'
 
+type Result = Awaited<ReturnType<typeof fetchResults>>[number]
+
 function SearchResults() {
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
+  const [results, setResults] = useState<Result[]>([])
   const [isPending, startTransition] = useTransition()
   const latestRequest = useRef(0)
 
