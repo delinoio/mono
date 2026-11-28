@@ -43,8 +43,8 @@ type tokenServer struct {
 	// When body is set, a response writes it instead of the default valid
 	// token response or OAuth error body.
 	body string
-	// When block is set, a request announces itself on entered and then
-	// waits until block is closed.
+	// When block is set, a request notifies entered if there is room and
+	// then waits until block is closed. calls counts every request.
 	block       chan struct{}
 	entered     chan struct{}
 	releaseOnce sync.Once
@@ -68,7 +68,10 @@ func (s *tokenServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.t.Errorf("token request: %s %v %q %q %v", r.Method, ok, id, secret, r.PostForm)
 	}
 	if s.block != nil {
-		s.entered <- struct{}{}
+		select {
+		case s.entered <- struct{}{}:
+		default:
+		}
 		<-s.block
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -94,6 +97,89 @@ func newSource(t *testing.T, ts *tokenServer, c *clock) *TokenSource {
 	// Runs before srv.Close, so a failed test never hangs on a held request.
 	t.Cleanup(ts.release)
 	return NewTokenSource(TokenConfig{Endpoint: srv.URL + "/oidc/token", ClientID: "client/id", ClientSecret: "s&cret", HTTPClient: srv.Client(), Now: c.Now})
+}
+
+func TestTokenServerReleasesRequestsWithFullArrivalChannel(t *testing.T) {
+	const notificationCapacity = 4
+	ts := &tokenServer{
+		t:       t,
+		expires: 3600,
+		block:   make(chan struct{}),
+		entered: make(chan struct{}, notificationCapacity),
+	}
+	srv := httptest.NewServer(ts)
+	t.Cleanup(func() {
+		ts.release()
+		if t.Failed() {
+			// Free a slot for the fifth handler if it is stuck sending.
+			select {
+			case <-ts.entered:
+			default:
+			}
+		}
+		closed := make(chan struct{})
+		go func() {
+			srv.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(entryTimeout):
+			t.Error("token server did not close after releasing its requests")
+		}
+	})
+
+	src := NewTokenSource(TokenConfig{
+		Endpoint:     srv.URL + "/oidc/token",
+		ClientID:     "client/id",
+		ClientSecret: "s&cret",
+		HTTPClient:   srv.Client(),
+	})
+	startRequest := func() <-chan tokenResult {
+		result := make(chan tokenResult, 1)
+		go func() {
+			// Call fetch directly so every request reaches the endpoint.
+			token, _, err := src.fetch(t.Context())
+			result <- tokenResult{token, err}
+		}()
+		return result
+	}
+
+	var queued [notificationCapacity]<-chan tokenResult
+	for i := range queued {
+		queued[i] = startRequest()
+	}
+	deadline := time.Now().Add(entryTimeout)
+	for len(ts.entered) < notificationCapacity {
+		if time.Now().After(deadline) {
+			t.Fatalf("arrival channel did not fill: %d of %d notifications", len(ts.entered), notificationCapacity)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	excess := startRequest()
+	deadline = time.Now().Add(entryTimeout)
+	for ts.calls.Load() < notificationCapacity+1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("token requests = %d, want %d", ts.calls.Load(), notificationCapacity+1)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ts.release()
+	if r := receive(t, excess, "the fifth request"); r.err != nil || r.token != "token-5" {
+		t.Fatalf("fifth request = %+v", r)
+	}
+	for _, result := range queued {
+		if r := receive(t, result, "a queued request"); r.err != nil || r.token == "" {
+			t.Fatalf("queued request = %+v", r)
+		}
+	}
+	if got := len(ts.entered); got != notificationCapacity {
+		t.Fatalf("queued notifications = %d, want %d", got, notificationCapacity)
+	}
+	if got := ts.calls.Load(); got != notificationCapacity+1 {
+		t.Fatalf("token requests = %d, want %d", got, notificationCapacity+1)
+	}
 }
 
 func TestTokenSourceCachesUntilShortlyBeforeExpiry(t *testing.T) {
