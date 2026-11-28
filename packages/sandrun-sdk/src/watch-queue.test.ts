@@ -401,6 +401,7 @@ describe("watchQueue", () => {
   function recordingCaller(
     first: WatchQueueResponse,
     second: () => WatchQueueResponse | Promise<WatchQueueResponse>,
+    onClose?: () => void,
   ) {
     const counts = { reads: 0, closes: 0, streams: 0 };
     const caller: WatchQueueCaller = {
@@ -423,6 +424,7 @@ describe("watchQueue", () => {
               },
               async return() {
                 counts.closes++;
+                onClose?.();
                 return { done: true, value: undefined };
               },
             };
@@ -458,6 +460,90 @@ describe("watchQueue", () => {
       expect(clock.sleeps).toEqual([]);
     },
   );
+
+  test.each(
+    [
+      { response: firstRequest, kind: WatchQueueEventKind.Request },
+      { response: firstRunner, kind: WatchQueueEventKind.Runner },
+      { response: firstSnapshot, kind: WatchQueueEventKind.SnapshotComplete },
+    ].flatMap((event) => [
+      { ...event, error: new Error("consumer failed"), errorType: "Error" },
+      {
+        ...event,
+        error: new ConnectError("consumer failed", Code.Unavailable),
+        errorType: "ConnectError",
+      },
+    ]),
+  )(
+    "propagates a consumer $errorType at $kind without reconnecting",
+    async ({ response, kind, error }) => {
+      const clock = new RecordingClock();
+      const { caller, counts } = recordingCaller(
+        response,
+        () => bufferedRequest,
+      );
+      const events = watchQueue(caller, { organizationId: ORG, clock });
+
+      expect((await events.next()).value).toMatchObject({ kind });
+      await expect(events.throw(error)).rejects.toBe(error);
+      expect(await events.next()).toEqual({ done: true, value: undefined });
+      expect(counts).toEqual({ reads: 1, closes: 1, streams: 1 });
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test("rejects with an injected undefined when abort and close failure also occur", async () => {
+    const clock = new RecordingClock();
+    const abort = new AbortController();
+    const { caller, counts } = recordingCaller(
+      firstRequest,
+      () => bufferedRequest,
+      () => {
+        abort.abort();
+        throw new Error("close failed");
+      },
+    );
+    const events = watchQueue(caller, {
+      organizationId: ORG,
+      signal: abort.signal,
+      clock,
+    });
+
+    expect((await events.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Request,
+    });
+    await expect(events.throw(undefined)).rejects.toBe(undefined);
+    expect(await events.next()).toEqual({ done: true, value: undefined });
+    expect(counts).toEqual({ reads: 1, closes: 1, streams: 1 });
+    expect(clock.sleeps).toEqual([]);
+  });
+
+  test("reconnects and reports the upstream error when a read fails", async () => {
+    const clock = new RecordingClock();
+    const error = new ConnectError("upstream unavailable", Code.Unavailable);
+    const { caller, counts } = recordingCaller(firstRequest, () => {
+      throw error;
+    });
+    const events = watchQueue(caller, { organizationId: ORG, clock });
+
+    expect((await events.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Request,
+    });
+    const gap = (await events.next()).value;
+    expect(gap).toMatchObject({
+      kind: WatchQueueEventKind.Gap,
+      failures: 1,
+      delayMs: 1000,
+    });
+    expect(gap?.kind === WatchQueueEventKind.Gap && gap.cause).toBe(error);
+    expect(clock.sleeps).toEqual([1000]);
+    expect(counts.streams).toBe(1);
+    expect((await events.next()).value).toMatchObject({
+      kind: WatchQueueEventKind.Request,
+    });
+    expect(counts.streams).toBe(2);
+    await events.return();
+  });
 
   test("reads both responses in order when the signal stays active", async () => {
     const { caller } = recordingCaller(firstRequest, () => bufferedRequest);

@@ -76,6 +76,8 @@ export interface WatchQueueOptions {
  * - Keepalive messages are not yielded.
  * - A status that is the server's answer (for example `permission_denied`
  *   or `not_found`) ends the iteration with that `ConnectError`.
+ * - Calling `throw(value)` at a yielded event ends the iterator and rejects
+ *   with that value, even if closing the stream fails.
  * - Aborting the signal closes the stream and ends the iteration without
  *   an error. The helper discards any buffered responses after abort.
  */
@@ -85,9 +87,11 @@ export async function* watchQueue(
 ): AsyncGenerator<WatchQueueEvent, void, undefined> {
   const clock = options.clock ?? systemClock;
   const signal = options.signal;
+  const consumerThrow = Symbol("consumer throw");
   let failures = 0;
   while (!abortedBy(signal)) {
     let cause: unknown;
+    let consumerError: unknown;
     let snapshotComplete = false;
     try {
       const stream = work.watchQueue(
@@ -99,21 +103,34 @@ export async function* watchQueue(
           return;
         }
         const event = message.event;
+        let output: WatchQueueEvent | undefined;
         switch (event.case) {
           case "request":
-            yield { kind: WatchQueueEventKind.Request, request: event.value };
+            output = {
+              kind: WatchQueueEventKind.Request,
+              request: event.value,
+            };
             break;
           case "runner":
-            yield { kind: WatchQueueEventKind.Runner, runner: event.value };
+            output = { kind: WatchQueueEventKind.Runner, runner: event.value };
             break;
           case "snapshotComplete":
             snapshotComplete = true;
             failures = 0;
-            yield { kind: WatchQueueEventKind.SnapshotComplete };
+            output = { kind: WatchQueueEventKind.SnapshotComplete };
             break;
           default:
             // Keepalives and events of a newer schema carry no state.
             break;
+        }
+        if (output !== undefined) {
+          try {
+            yield output;
+          } catch (error) {
+            // Unwind the upstream iterator before propagating the caller's value.
+            consumerError = error;
+            throw consumerThrow;
+          }
         }
         // The caller can abort while the generator is paused at a yield.
         if (abortedBy(signal)) {
@@ -121,6 +138,9 @@ export async function* watchQueue(
         }
       }
     } catch (error) {
+      if (error === consumerThrow) {
+        throw consumerError;
+      }
       if (abortedBy(signal)) {
         return;
       }
