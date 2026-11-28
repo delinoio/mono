@@ -2157,6 +2157,51 @@ describe("integrations", () => {
     ).toContainText("Environment key: Set at");
   });
 
+  test("clears Cursor settings, credentials, and errors through a vendor without settings", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+    await screen.getByRole("button", "Create agent integration").tap();
+    const dialog = screen.getByRole("dialog", "Create an agent integration");
+    const name = dialog.getByLabel("Name", { exact: true });
+    const vendor = dialog.getByRole("combobox", "Vendor");
+    const pool = dialog.getByLabel("Cursor self-hosted pool name");
+    const key = dialog.getByLabel("Service account API key");
+    const submit = dialog.getByRole("button", "Create integration");
+
+    await name.tap();
+    await browser.keyboard.type("vendor-switch-fixture");
+    await vendor.tap();
+    await screen.getByRole("option", "Cursor").tap();
+    await pool.tap();
+    await browser.keyboard.type("fixture-pool");
+    await key.tap();
+    await browser.keyboard.type("synthetic-cursor-key");
+    await vendor.tap();
+    await screen.getByRole("option", "OpenAI Codex").tap();
+    await expect(pool).toBeHidden();
+    await submit.tap();
+    const codexError = dialog.getByText("Enter the webhook secret.");
+    await expect(codexError).toBeVisible();
+
+    await vendor.tap();
+    await screen.getByRole("option", "Cursor").tap();
+    await expect(codexError).toBeHidden();
+    await expect(name).toHaveValue("vendor-switch-fixture");
+    await expect(pool).toHaveValue("");
+    await submit.tap();
+    await expect(
+      dialog.getByText("Enter the Cursor self-hosted pool name."),
+    ).toBeVisible();
+    await expect(
+      dialog.getByText("Enter the service account API key."),
+    ).toBeVisible();
+  });
+
   test("creates and updates a Cursor integration with a full Unicode name, pool, and credential", async ({
     app,
     screen,

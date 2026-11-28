@@ -2240,6 +2240,88 @@ describe("integrations", () => {
     expect(document.body.textContent).not.toContain("env_key_value");
   });
 
+  test.each([
+    {
+      fromVendor: "Cursor",
+      fromLabel: "Cursor self-hosted pool name",
+      toVendor: "Devin",
+      toLabel: "Devin outpost name",
+      vendor: AgentVendor.DEVIN,
+      setting: "fixture-outpost",
+      settings: { case: "devin", value: { outpostName: "fixture-outpost" } },
+      credentialLabels: ["API token", "Outpost token"],
+    },
+    {
+      fromVendor: "Devin",
+      fromLabel: "Devin outpost name",
+      toVendor: "Cursor",
+      toLabel: "Cursor self-hosted pool name",
+      vendor: AgentVendor.CURSOR,
+      setting: "fixture-pool",
+      settings: { case: "cursor", value: { poolName: "fixture-pool" } },
+      credentialLabels: ["Service account API key"],
+    },
+  ])(
+    "requires a new setting after switching from $fromVendor to $toVendor",
+    async ({
+      fromVendor,
+      fromLabel,
+      toVendor,
+      toLabel,
+      vendor,
+      setting,
+      settings,
+      credentialLabels,
+    }) => {
+      const { transport, calls } = gatedTransport("CreateAgentIntegration");
+      renderConsole(`/orgs/${MOCK_IDS.acme}/integrations`, { transport });
+      await click(
+        await screen.findByRole("button", { name: "Create agent integration" }),
+      );
+      const form = within(
+        await screen.findByRole("dialog", {
+          name: "Create an agent integration",
+        }),
+      );
+      const name = form.getByRole<HTMLInputElement>("textbox", {
+        name: "Name",
+      });
+      const select = form.getByRole("combobox", { name: "Vendor" });
+      const submit = form.getByRole("button", { name: "Create integration" });
+      await type(name, "fixture-integration");
+      await click(select);
+      await click(await screen.findByRole("option", { name: fromVendor }));
+      await type(form.getByLabelText(fromLabel), "fixture-previous-setting");
+      await click(select);
+      await click(await screen.findByRole("option", { name: toVendor }));
+
+      const settingInput = form.getByLabelText<HTMLInputElement>(toLabel);
+      expect(settingInput.value).toBe("");
+      expect(name.value).toBe("fixture-integration");
+      for (const label of credentialLabels) {
+        await type(form.getByLabelText(label), "synthetic-credential");
+      }
+      await click(submit);
+      expect(form.getByText(`Enter the ${toLabel}.`)).toBeTruthy();
+      expect(calls).toHaveLength(0);
+
+      await type(settingInput, setting);
+      await click(submit);
+      expect(calls.map(({ input }) => input)).toEqual([
+        expect.objectContaining({
+          organizationId: MOCK_IDS.acme,
+          name: "fixture-integration",
+          vendor,
+          settings,
+        }),
+      ]);
+      await act(async () => calls[0].settle());
+      expect(
+        await screen.findByText(`fixture-integration · ${toVendor}`),
+      ).toBeTruthy();
+    },
+  );
+
   test("creates a Devin integration with two masked credentials", async () => {
     const { transport, calls } = gatedTransport("CreateAgentIntegration");
     const name = "devin-fixture";
