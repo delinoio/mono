@@ -29,9 +29,11 @@ export const releaseOnlyPackageDirs = [
 ];
 
 // Task single workspace packages: Go command packages under `cmds/` whose
-// manifests declare package tasks that wrap the Go toolchain (for example the
-// cross-compilation of the SandCrew guest bridge). Every path inside them is
-// a workspace input, like a package under a workspace root.
+// manifests declare package tasks (for example the tests of the SandCrew guest
+// bridge build script). The Go source is checked by the Go jobs, not by
+// package tasks; plan.test.mjs checks that they declare no `build` or `lint`
+// script. Every path inside them is a workspace input, like a package under a
+// workspace root.
 export const taskPackageDirs = ["cmds/sandcrew-bridge"];
 
 // Single workspace packages outside the workspace roots. plan.test.mjs checks

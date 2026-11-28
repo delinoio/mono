@@ -213,6 +213,7 @@ func (h *Handler) ListDevSessionProfiles(ctx context.Context, req *connect.Reque
 	if err != nil {
 		return nil, err
 	}
+	s.RecordAuthorizedAPIKeyUse(ctx, c)
 	limit, after, err := api.PageArgs(req.Msg.GetPageSize(), req.Msg.GetPageToken())
 	if err != nil {
 		return nil, err
@@ -259,13 +260,12 @@ func validateLabel(label string) error {
 func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[sandrunv1.CreateDevSessionRequest]) (*connect.Response[sandrunv1.CreateDevSessionResponse], error) {
 	s := h.svc
 	var out *session
-	var orgID string
+	var authorized api.Caller
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		c, err := s.Authorize(ctx, tx, req.Msg.GetOrganizationId(), authz.ActionUseDevSessions)
 		if err != nil {
 			return err
 		}
-		orgID = c.OrganizationID
 		profileID, err := api.NormalizeID("runner_profile_id", req.Msg.GetRunnerProfileId())
 		if err != nil {
 			return err
@@ -293,6 +293,7 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[san
 			}
 			return err
 		}
+		authorized = c
 		var limit *int32
 		if err := tx.QueryRow(ctx, "SELECT max_dev_sessions_per_user FROM organizations WHERE organization_id = $1", c.OrganizationID).Scan(&limit); err != nil {
 			return err
@@ -320,10 +321,11 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[san
 		out = &session{req: r, profileName: p.Name, guestOS: p.GuestOS, workspace: p.WorkspacePath}
 		return nil
 	})
+	s.RecordAuthorizedAPIKeyUse(ctx, authorized)
 	if err != nil {
 		return nil, s.Internal(ctx, "create dev session", err)
 	}
-	s.WorkChanged(orgID)
+	s.WorkChanged(authorized.OrganizationID)
 	return connect.NewResponse(&sandrunv1.CreateDevSessionResponse{DevSession: out.proto()}), nil
 }
 
@@ -337,6 +339,7 @@ func (h *Handler) GetDevSession(ctx context.Context, req *connect.Request[sandru
 	if err != nil {
 		return nil, s.Internal(ctx, "get dev session", err)
 	}
+	s.RecordAuthorizedAPIKeyUse(ctx, c)
 	return connect.NewResponse(&sandrunv1.GetDevSessionResponse{DevSession: sess.proto()}), nil
 }
 
@@ -347,6 +350,7 @@ func (h *Handler) ListDevSessions(ctx context.Context, req *connect.Request[sand
 	if err != nil {
 		return nil, err
 	}
+	s.RecordAuthorizedAPIKeyUse(ctx, c)
 	limit, after, err := api.PageArgs(m.GetPageSize(), m.GetPageToken())
 	if err != nil {
 		return nil, err
@@ -426,7 +430,8 @@ const deleteAttempts = 3
 func (h *Handler) DeleteDevSession(ctx context.Context, req *connect.Request[sandrunv1.DeleteDevSessionRequest]) (*connect.Response[sandrunv1.DeleteDevSessionResponse], error) {
 	s := h.svc
 	var d *work.Deletion
-	var orgID, sessionID string
+	var authorized api.Caller
+	var sessionID string
 	var err error
 	for attempt := 1; ; attempt++ {
 		d = nil
@@ -435,7 +440,6 @@ func (h *Handler) DeleteDevSession(ctx context.Context, req *connect.Request[san
 			if err != nil {
 				return err
 			}
-			orgID = c.OrganizationID
 			if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 				return err
 			}
@@ -448,8 +452,12 @@ func (h *Handler) DeleteDevSession(ctx context.Context, req *connect.Request[san
 				return api.ErrPermission("a member can delete only their own dev sessions")
 			}
 			cur, runnerLocked, err := h.lockSessionForEnd(ctx, tx, c.OrganizationID, sessionID)
-			if err != nil || work.RequestTerminal(cur.State) {
+			if err != nil {
 				return err
+			}
+			authorized = c
+			if work.RequestTerminal(cur.State) {
+				return nil
 			}
 			if runnerLocked {
 				d, err = h.e.DeleteRunnerTx(ctx, tx, c.OrganizationID, cur.RunnerID, sandrunv1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER, work.DeleteByUser)
@@ -477,12 +485,13 @@ func (h *Handler) DeleteDevSession(ctx context.Context, req *connect.Request[san
 			break
 		}
 	}
+	s.RecordAuthorizedAPIKeyUse(ctx, authorized)
 	if err != nil {
 		return nil, s.Internal(ctx, "delete dev session", err)
 	}
 	h.e.FinishDeletion(ctx, d)
-	h.e.Kick(orgID)
-	sess, err := h.load(ctx, s.DB.Pool, orgID, sessionID)
+	h.e.Kick(authorized.OrganizationID)
+	sess, err := h.load(ctx, s.DB.Pool, authorized.OrganizationID, sessionID)
 	if err != nil {
 		return nil, s.Internal(ctx, "delete dev session", err)
 	}
@@ -620,24 +629,26 @@ func isWindowsPathSeparator(c byte) bool { return c == '\\' || c == '/' }
 func isLetter(c byte) bool { return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' }
 
 // operable loads a dev session for an exec or a file transfer: the caller
-// must be its owner and it must be RUNNING.
-func (h *Handler) operable(ctx context.Context, orgIDRaw, sessionIDRaw string) (*session, api.Caller, error) {
+// must be its owner and it must be RUNNING. Record key use once when
+// the data path operation is admitted.
+func (h *Handler) operable(ctx context.Context, orgIDRaw, sessionIDRaw string) (*session, error) {
 	s := h.svc
 	c, err := s.Authorize(ctx, s.DB.Pool, orgIDRaw, authz.ActionOperateDevSession)
 	if err != nil {
-		return nil, c, err
+		return nil, err
 	}
 	sess, err := h.load(ctx, s.DB.Pool, c.OrganizationID, sessionIDRaw)
 	if err != nil {
-		return nil, c, s.Internal(ctx, "load dev session", err)
+		return nil, s.Internal(ctx, "load dev session", err)
 	}
 	if !authz.CanOperateDevSession(c.UserID, sess.req.OwnerUserID) {
-		return nil, c, api.ErrPermission("only the session owner can run commands and transfer files")
+		return nil, api.ErrPermission("only the session owner can run commands and transfer files")
 	}
 	if sess.req.State != sandrunv1.RequestState_REQUEST_STATE_RUNNING || sess.runner == nil || sess.runner.SandboxID == "" {
-		return nil, c, api.ErrPrecondition("the dev session is not RUNNING")
+		return nil, api.ErrPrecondition("the dev session is not RUNNING")
 	}
-	return sess, c, nil
+	s.RecordAuthorizedAPIKeyUse(ctx, c)
+	return sess, nil
 }
 
 // ownsandError maps an OwnSand error of a data path operation to the SandRun

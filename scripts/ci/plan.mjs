@@ -259,7 +259,12 @@ export function isGoInput(path) {
     path === relayDigestVectors ||
     path === ownsandApiLauncher ||
     goTestInputs.has(path) ||
-    goTestdata.test(path)
+    goTestdata.test(path) ||
+    // The Go tests of a task package read its embedded data files (for
+    // example the pinned agent components and npm lockfiles of the SandCrew
+    // guest bridge), and its package tasks do not run Go, so every path
+    // inside it selects the Go checks.
+    taskPackageDirs.some((dir) => path.startsWith(`${dir}/`))
   );
 }
 

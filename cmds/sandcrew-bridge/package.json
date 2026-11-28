@@ -4,8 +4,7 @@
   "private": true,
   "license": "Apache-2.0",
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "lint": "go vet ./...",
-    "test": "go test ./... && node --test \"scripts/*.test.mjs\""
+    "build:binaries": "node scripts/build.mjs",
+    "test": "node --test \"scripts/*.test.mjs\""
   }
 }

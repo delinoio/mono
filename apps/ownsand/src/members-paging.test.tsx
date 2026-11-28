@@ -7,6 +7,7 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
 import {
   ListMembersResponseSchema,
   MemberService,
@@ -208,7 +209,11 @@ describe("ownership transfer picker", () => {
         [ADMIN],
         [MEMBER],
       ]);
-      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+      const refresh = fullListRefresh(
+        MemberService.method.listMembers,
+        transport,
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, refresh);
       await openOwnerPicker();
       await screen.findByRole("option", { name: MEMBER }, WAIT);
       expect(screen.getByRole("option", { name: "Jun Park" })).toBeTruthy();
@@ -224,8 +229,157 @@ describe("ownership transfer picker", () => {
       });
       const dialog = await screen.findByRole("alertdialog", {}, WAIT);
       expect(dialog.textContent).toContain(`Make ${MEMBER} the owner?`);
+
+      await refresh.refetch();
+      expect(state.tokens).toEqual([
+        "",
+        "page-2",
+        "page-3",
+        "",
+        "page-2",
+        "page-3",
+      ]);
+      expect(
+        screen.getByRole("alertdialog", { name: `Make ${MEMBER} the owner?` }),
+      ).toBe(dialog);
     },
     3 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "requires a new selection and confirmation after a successful refresh removes the target",
+    async () => {
+      const pages = [[OWNER, ADMIN, MEMBER]];
+      const { transport } = await pagedMembers(pages);
+      const held = holdingTransport(
+        ["TransferOwnership"],
+        () => true,
+        transport,
+      );
+      const refresh = fullListRefresh(
+        MemberService.method.listMembers,
+        held.transport,
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, refresh);
+
+      await openOwnerPicker();
+      await act(async () =>
+        fireEvent.click(
+          await screen.findByRole("option", { name: "Jun Park" }, WAIT),
+        ),
+      );
+      const picker = screen.getByRole("combobox", { name: "New owner" });
+      const transfer = screen.getByRole("button", { name: "Transfer" });
+      await act(async () => fireEvent.click(transfer));
+      await screen.findByRole(
+        "alertdialog",
+        { name: "Make Jun Park the owner?" },
+        WAIT,
+      );
+
+      pages[0] = [OWNER, MEMBER];
+      await refresh.refetch();
+      await waitFor(
+        () => expect(screen.queryByRole("alertdialog")).toBeNull(),
+        WAIT,
+      );
+      expect(picker.textContent).toContain("Choose a member");
+      expect(transfer.hasAttribute("disabled")).toBe(true);
+      expect(held.seen.TransferOwnership).toBeUndefined();
+
+      pages[0] = [OWNER, ADMIN, MEMBER];
+      await refresh.refetch();
+      expect(picker.textContent).toContain("Choose a member");
+      expect(transfer.hasAttribute("disabled")).toBe(true);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+
+      await openOwnerPicker();
+      expect(
+        await screen.findByRole("option", { name: "Jun Park" }, WAIT),
+      ).toBeTruthy();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("option", { name: MEMBER })),
+      );
+      await act(async () => fireEvent.click(transfer));
+      const dialog = await screen.findByRole(
+        "alertdialog",
+        {
+          name: `Make ${MEMBER} the owner?`,
+        },
+        WAIT,
+      );
+      await act(async () =>
+        fireEvent.click(
+          within(dialog).getByRole("button", { name: "Transfer ownership" }),
+        ),
+      );
+      expect(held.seen.TransferOwnership).toBe(1);
+      expect(held.calls.TransferOwnership?.[0]?.input).toMatchObject({
+        organizationId: MOCK_IDS.acme,
+        userId: MEMBER,
+      });
+      await act(async () => held.calls.TransferOwnership![0]!.settle());
+    },
+    7 * WAIT.timeout + TEST_SETUP_MS,
+  );
+
+  test(
+    "keeps the pending choice while an incomplete refresh looks for the target on a later page",
+    async () => {
+      const pages = [[OWNER, ADMIN, MEMBER]];
+      const { transport } = await pagedMembers(pages);
+      const held = holdingTransport(
+        ["ListMembers"],
+        () => pages.length > 1,
+        transport,
+      );
+      const refresh = fullListRefresh(
+        MemberService.method.listMembers,
+        held.transport,
+      );
+      renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, refresh);
+      await openOwnerPicker();
+      await act(async () =>
+        fireEvent.click(
+          await screen.findByRole("option", { name: "Jun Park" }, WAIT),
+        ),
+      );
+      const transfer = screen.getByRole("button", { name: "Transfer" });
+      await act(async () => fireEvent.click(transfer));
+      await screen.findByRole(
+        "alertdialog",
+        { name: "Make Jun Park the owner?" },
+        WAIT,
+      );
+
+      pages.splice(0, 1, [OWNER, MEMBER], [ADMIN]);
+      const refetch = refresh.queryClient.refetchQueries({
+        queryKey: createConnectQueryKey({
+          schema: MemberService.method.listMembers,
+          cardinality: "infinite",
+        }),
+      });
+      await waitFor(() => expect(held.calls.ListMembers).toHaveLength(1), WAIT);
+      expect(
+        screen.getByRole("alertdialog", { name: "Make Jun Park the owner?" }),
+      ).toBeTruthy();
+      await act(async () => {
+        held.calls.ListMembers![0]!.settle();
+        await refetch;
+      });
+      await waitFor(() => expect(held.calls.ListMembers).toHaveLength(2), WAIT);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(transfer.hasAttribute("disabled")).toBe(true);
+      expect(held.seen.TransferOwnership).toBeUndefined();
+
+      await act(async () => held.calls.ListMembers![1]!.settle());
+      await screen.findByRole(
+        "alertdialog",
+        { name: "Make Jun Park the owner?" },
+        WAIT,
+      );
+    },
+    7 * WAIT.timeout + TEST_SETUP_MS,
   );
 
   test(

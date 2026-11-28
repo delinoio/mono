@@ -48,40 +48,50 @@ func TestPersonalAPIKeyLifecycle(t *testing.T) {
 	}))
 	wantCode(t, "malformed expiry", err, connect.CodeInvalidArgument)
 
-	// The key works on DevSessionService and nowhere else.
-	keyClient := env.Bearer(secret)
-	if err := listProfiles(keyClient, org.ID); err != nil {
-		t.Fatalf("dev session RPC with key: %v", err)
+	lastUsed := func() *time.Time {
+		var used *time.Time
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT last_used_time FROM api_keys WHERE api_key_id = $1", key.GetApiKeyId()).Scan(&used); err != nil {
+			t.Fatal(err)
+		}
+		return used
 	}
+
+	keyClient := env.Bearer(secret)
 	_, err = keyClient.Organization.GetOrganization(ctx, connect.NewRequest(&sandrunv1.GetOrganizationRequest{OrganizationId: org.ID}))
 	wantCode(t, "GetOrganization with key", err, connect.CodePermissionDenied)
 	_, err = keyClient.APIKey.ListApiKeys(ctx, connect.NewRequest(&sandrunv1.ListApiKeysRequest{OrganizationId: org.ID}))
 	wantCode(t, "ListApiKeys with key", err, connect.CodePermissionDenied)
-	// Another organization's ID: not_found.
 	other := env.NewOrg("bob")
 	wantCode(t, "key with another organization", listProfiles(keyClient, other.ID), connect.CodeNotFound)
+	if got := lastUsed(); got != nil {
+		t.Fatalf("last use after denied calls = %v, want nil", got)
+	}
 
-	// Last use: written once, not again within a minute.
-	lastUsed := func() *time.Time {
-		var t2 *time.Time
-		if err := env.DB.Pool.QueryRow(ctx, "SELECT last_used_time FROM api_keys WHERE api_key_id = $1", key.GetApiKeyId()).Scan(&t2); err != nil {
-			t.Fatal(err)
-		}
-		return t2
+	// The denied calls did not consume the write interval.
+	if err := listProfiles(keyClient, org.ID); err != nil {
+		t.Fatalf("dev session RPC with key: %v", err)
 	}
 	first := lastUsed()
 	if first == nil || !first.Equal(env.Clock.Now()) {
-		t.Fatalf("last use %v, want %v", first, env.Clock.Now())
+		t.Fatalf("last use = %v, want %v", first, env.Clock.Now())
 	}
 	env.Clock.Advance(30 * time.Second)
-	_ = listProfiles(keyClient, org.ID)
-	if got := lastUsed(); !got.Equal(*first) {
-		t.Fatalf("last use moved within a minute: %v", got)
+	if err := listProfiles(keyClient, org.ID); err != nil {
+		t.Fatal(err)
 	}
-	env.Clock.Advance(31 * time.Second)
-	_ = listProfiles(keyClient, org.ID)
-	if got := lastUsed(); !got.After(*first) {
-		t.Fatalf("last use not updated after a minute: %v", got)
+	if got := lastUsed(); got == nil || !got.Equal(*first) {
+		t.Fatalf("last use within a minute = %v, want %v", got, first)
+	}
+	env.Clock.Advance(30 * time.Second)
+	wantCode(t, "key with another organization after a minute", listProfiles(keyClient, other.ID), connect.CodeNotFound)
+	if got := lastUsed(); got == nil || !got.Equal(*first) {
+		t.Fatalf("last use after denied call = %v, want %v", got, first)
+	}
+	if err := listProfiles(keyClient, org.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastUsed(); got == nil || !got.Equal(env.Clock.Now()) {
+		t.Fatalf("last use after a minute = %v, want %v", got, env.Clock.Now())
 	}
 
 	// Each user lists and revokes only their own keys.

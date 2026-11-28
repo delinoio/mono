@@ -287,6 +287,7 @@ export function fakeWebRtc(
       if (options.openBeforeAnswer && this.channel) {
         const channel = this.channel;
         queueMicrotask(() => {
+          if (channel.readyState !== "connecting") return;
           channel.readyState = "open";
           channel.emit("open");
         });

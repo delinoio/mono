@@ -26,9 +26,18 @@ import (
 // and returns when its context ends.
 func TestRunRefreshesWhileAttached(t *testing.T) {
 	m, _ := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
 	var n atomic.Int32
+	var routeChanged atomic.Bool
+	prefix := netip.MustParsePrefix("198.51.100.0/24")
 	m.interval = time.Millisecond
-	m.refresh = func() error { n.Add(1); return nil }
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
+		n.Add(1)
+		if routeChanged.Load() {
+			return nil, []netip.Prefix{prefix}, nil
+		}
+		return nil, nil, nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()
@@ -47,9 +56,9 @@ func TestRunRefreshesWhileAttached(t *testing.T) {
 		t.Fatalf("%d refreshes without an attached sandbox", got)
 	}
 	mustAttach(t, m, "sandbox-a")
-	n.Store(0)
+	routeChanged.Store(true)
 	deadline := time.Now().Add(5 * time.Second)
-	for n.Load() < 2 {
+	for len(applied()) < 2 {
 		if time.Now().After(deadline) {
 			t.Fatal("no periodic refresh while a sandbox is attached")
 		}
@@ -60,6 +69,10 @@ func TestRunRefreshesWhileAttached(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
+	}
+	scripts := applied()
+	if strings.Contains(scripts[0], prefix.String()) || !strings.Contains(scripts[1], prefix.String()) {
+		t.Fatalf("expected the periodic refresh to add %s to the ruleset", prefix)
 	}
 }
 
@@ -108,7 +121,7 @@ func newFakeManager(t *testing.T) (*Manager, *fakeHost) {
 	h.logger = slog.New(slog.NewJSONHandler(&lockedWriter{h: h}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	m := NewManager(h.logger)
 	m.resolvConf = filepath.Join(t.TempDir(), "resolv.conf")
-	m.refresh = func() error { return nil }
+	m.refresh = func(refreshMode) error { return nil }
 	m.setForwarding = func() error { return nil }
 	m.run = h.run
 	m.tableState = func() (nftTableState, error) { return nftTablePresent, nil }
@@ -567,7 +580,7 @@ func useRealRefresh(m *Manager) (applied func() []string, setApplyErr func(error
 		scripts = append(scripts, rules)
 		return nil
 	}
-	m.refresh = m.Refresh
+	m.refresh = m.refreshPolicy
 	return func() []string {
 			mu.Lock()
 			defer mu.Unlock()
@@ -986,7 +999,7 @@ func TestFailedAttachRemovesDNSRulesAppliedByIndependentRefresh(t *testing.T) {
 		}
 	}
 	refresh := m.refresh
-	m.refresh = func() error {
+	m.refresh = func(mode refreshMode) error {
 		select {
 		case <-attachReady:
 		default:
@@ -994,7 +1007,7 @@ func TestFailedAttachRemovesDNSRulesAppliedByIndependentRefresh(t *testing.T) {
 			// which waits for the independent refresh.
 			close(attachReady)
 		}
-		return refresh()
+		return refresh(mode)
 	}
 
 	waitIndependent := startGatedWorker(t, openRelease, "independent refresh", m.Refresh)
@@ -1104,7 +1117,7 @@ func TestRefreshKeepsRulesWhenRouteDumpFails(t *testing.T) {
 	}
 	// The periodic refresh logs the failure.
 	m.interval = time.Millisecond
-	m.refresh = m.Refresh
+	m.refresh = m.refreshPolicy
 	m.mu.Lock()
 	m.attached["s"] = &attachment{}
 	m.mu.Unlock()
@@ -1200,6 +1213,59 @@ func TestManagerCleanupHost(t *testing.T) {
 	}
 }
 
+func TestManagerDelayedPollAfterCleanupHost(t *testing.T) {
+	m, h := newFakeManager(t)
+	var reads int
+	var tablePresent bool
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
+		reads++
+		return nil, nil, nil
+	}
+	m.applyRules = func(string) error {
+		tablePresent = true
+		return nil
+	}
+	m.run = func(name string, args ...string) error {
+		if name == "nft" && slices.Equal(args, []string{"delete", "table", "inet", TableName}) {
+			tablePresent = false
+		}
+		return h.run(name, args...)
+	}
+
+	selected := make(chan struct{})
+	release := make(chan struct{})
+	openRelease := onceFunc(release)
+	m.refresh = func(mode refreshMode) error {
+		if mode == refreshPeriodic {
+			close(selected)
+			<-release
+		}
+		return m.refreshPolicy(mode)
+	}
+	mustAttach(t, m, "sandbox-a")
+	if !tablePresent {
+		t.Fatal("the initial attach did not install the table")
+	}
+	waitPoll := startGatedWorker(t, openRelease, "poll after CleanupHost", func() error {
+		m.poll()
+		return nil
+	})
+	waitFor(t, selected, "the tick before entering the serialized refresh")
+
+	m.Detach("sandbox-a")
+	if err := m.CleanupHost(); err != nil {
+		t.Fatalf("CleanupHost: %v", err)
+	}
+	before := reads
+	openRelease()
+	if err := waitPoll(); err != nil {
+		t.Fatal(err)
+	}
+	if reads != before || tablePresent || m.rules != "" {
+		t.Fatalf("after the delayed tick: route reads = %d, table present = %t, rules cached = %t; want no reads, no table and no cache", reads-before, tablePresent, m.rules != "")
+	}
+}
+
 // A periodic refresh that reads the host routes while the device removal
 // runs CleanupHost applies nothing, so the table that the clean-up deleted
 // stays deleted.
@@ -1207,7 +1273,14 @@ func TestManagerRefreshInFlightDuringCleanupHost(t *testing.T) {
 	m, _ := newFakeManager(t)
 	applied, _ := useRealRefresh(m)
 	mustAttach(t, m, "sandbox-a")
-	m.Detach("sandbox-a")
+	// Bypass the serialized refresh during detach so teardown can finish
+	// while the periodic route read is paused.
+	m.refresh = func(mode refreshMode) error {
+		if mode == refreshDirect {
+			return nil
+		}
+		return m.refreshPolicy(mode)
+	}
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	openRelease := onceFunc(release)
@@ -1216,8 +1289,12 @@ func TestManagerRefreshInFlightDuringCleanupHost(t *testing.T) {
 		<-release
 		return nil, nil, nil
 	}
-	waitRefresh := startGatedWorker(t, openRelease, "Refresh during CleanupHost", m.Refresh)
+	waitRefresh := startGatedWorker(t, openRelease, "poll during CleanupHost", func() error {
+		m.poll()
+		return nil
+	})
 	waitFor(t, entered, "the route read before CleanupHost")
+	m.Detach("sandbox-a")
 	waitCleanup := startGatedWorker(t, openRelease, "CleanupHost while Refresh is paused", m.CleanupHost)
 	if err := waitCleanup(); err != nil {
 		t.Fatalf("CleanupHost: %v", err)
