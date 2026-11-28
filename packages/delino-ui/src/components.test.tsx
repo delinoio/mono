@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, rs, test } from "@rstest/core";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -11,6 +12,10 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import {
+  findUiSdkStylesheetImports,
+  importsUiSdkStylesheet,
+} from "./__tests__/stylesheet-imports.ts";
 import {
   AlertDialog,
   AlertDialogActions,
@@ -2144,17 +2149,14 @@ describe("ToastRegion", () => {
       const exportsField = JSON.stringify(
         (JSON.parse(manifest) as { exports?: unknown }).exports ?? {},
       );
-      expect(exportsField).not.toContain("@ui-sdk");
-      expect(css).not.toMatch(/@import[^;]*ui-sdk/);
-      const sourceFiles = readdirSync(new URL("./", import.meta.url)).filter(
-        (name) => /\.(css|ts|tsx)$/.test(name) && !name.endsWith(".test.tsx"),
+      expect(exportsField, "package.json").not.toContain("@ui-sdk");
+      expect(
+        importsUiSdkStylesheet("src/styles.css", css),
+        "src/styles.css",
+      ).toBe(false);
+      expect(findUiSdkStylesheetImports(fileURLToPath(packageRoot))).toEqual(
+        [],
       );
-      for (const name of sourceFiles) {
-        const text = readFileSync(new URL(name, import.meta.url), "utf8");
-        expect(text, name).not.toMatch(
-          /(?:@import|import|export)[^;\n]*@ui-sdk\/[^"';\n]*\.css/,
-        );
-      }
     });
   });
 
