@@ -3291,9 +3291,21 @@ describe("peer-to-peer data path", () => {
       await h.clock.advance(1_000);
       expect(rtc.held("createOffer")).toBe(1);
       controller.abort(reason);
+      const second = sandbox.run({ command: ["b"] }).catch((e: unknown) => e);
+
+      await h.clock.advance(1_000);
       expect(await h.clock.run(first)).toBe(reason);
-      // The sole waiter left: the setup was cancelled and its peer closed.
       expect(rtc.closedConnections).toBe(1);
+      expect(rtc.connections).toHaveLength(2);
+      expect(rtc.held("createOffer")).toBe(2);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+
+      rtc.release("createOffer");
+      expect(await h.clock.run(second)).toMatchObject({
+        result: { kind: ExecResultKind.Exited },
+      });
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.channels[0]!.readyState).toBe("closed");
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
       expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
     });
