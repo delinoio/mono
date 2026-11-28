@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code } from "@connectrpc/connect";
 import { describe, test, type Browser } from "@e2e-dev/web";
-import { expect, type Screen } from "e2e";
+import { expect, type Locator, type Screen } from "e2e";
 
 // The suite runs the development server with PUBLIC_OWNSAND_MOCK_API=true
 // (see e2e.config.ts): an in-browser fake control plane and a fake signed-in
@@ -1428,9 +1428,11 @@ interface LayoutMetrics {
   offscreen: string[];
 }
 
-async function measureLayout(browser: {
+type LayoutBrowser = {
   evaluate<T extends import("e2e").JsonValue>(fn: () => T): Promise<T>;
-}): Promise<LayoutMetrics> {
+};
+
+async function measureLayout(browser: LayoutBrowser): Promise<LayoutMetrics> {
   return browser.evaluate(() => {
     const doc = document.documentElement;
     const nav = document.querySelector(".sidenav");
@@ -1480,19 +1482,50 @@ async function measureLayout(browser: {
   });
 }
 
-// Widths of the narrow layout (`max-width: 760px`) and the pages that the
-// console shows to each role. A page counts as loaded when its heading or button is visible.
+// Widths of the narrow layout (`max-width: 760px`).
 const NARROW_WIDTHS = [320, 360, 390, 430, 600, 760];
 interface PageUnderTest {
   path: string;
   // Heading of a section page, or button of a detail page.
   heading?: string;
   button?: string;
+  // Expected content inside the list boundaries for this role.
+  listContent?: (screen: Screen) => Locator[];
 }
+
+const ownerSnapshot = (screen: Screen) =>
+  screen
+    .getByRole("list", "Snapshots", { exact: true })
+    .getByRole("button", "Export snapshot 0193a000…00b1", { exact: true });
+const ownerTemplate = (screen: Screen) =>
+  screen
+    .getByRole("list", "Templates", { exact: true })
+    .getByText("node-24-toolchain", { exact: true });
+const OWNER_SNAPSHOTS_PAGE: PageUnderTest = {
+  path: "snapshots",
+  heading: "Snapshots",
+  listContent: (screen) => [ownerSnapshot(screen), ownerTemplate(screen)],
+};
 const OWNER_PAGES: PageUnderTest[] = [
-  { path: "sandboxes", heading: "Sandboxes" },
-  { path: "snapshots", heading: "Snapshots" },
-  { path: "devices", heading: "Devices" },
+  {
+    path: "sandboxes",
+    heading: "Sandboxes",
+    listContent: (screen) => [
+      screen
+        .getByRole("region", "Sandbox list")
+        .getByRole("link", "0193a000…00a1", { exact: true }),
+    ],
+  },
+  OWNER_SNAPSHOTS_PAGE,
+  {
+    path: "devices",
+    heading: "Devices",
+    listContent: (screen) => [
+      screen
+        .getByRole("region", "Device list")
+        .getByRole("link", "build-box-1", { exact: true }),
+    ],
+  },
   { path: "members", heading: "Members" },
   { path: "enrollment-tokens", heading: "Enrollment tokens" },
   { path: "api-keys", heading: "API keys" },
@@ -1502,9 +1535,30 @@ const OWNER_PAGES: PageUnderTest[] = [
   { path: `devices/${BUILD_BOX}`, button: "Remove device" },
 ];
 const MEMBER_PAGES: PageUnderTest[] = [
-  { path: "sandboxes", heading: "Sandboxes" },
-  { path: "snapshots", heading: "Snapshots" },
-  { path: "devices", heading: "Devices" },
+  {
+    path: "sandboxes",
+    heading: "Sandboxes",
+    listContent: (screen) => [
+      screen.getByText("No sandboxes match", { exact: true }),
+    ],
+  },
+  {
+    path: "snapshots",
+    heading: "Snapshots",
+    listContent: (screen) => [
+      screen.getByText("No snapshots", { exact: true }),
+      screen
+        .getByRole("region", "Templates")
+        .getByText("No templates", { exact: true }),
+    ],
+  },
+  {
+    path: "devices",
+    heading: "Devices",
+    listContent: (screen) => [
+      screen.getByText("No devices yet", { exact: true }),
+    ],
+  },
   { path: "members", heading: "Members" },
   { path: "settings", heading: "Settings" },
 ];
@@ -1520,6 +1574,28 @@ async function expectLoaded(
   } else if (page.button !== undefined) {
     await expect(screen.getByRole("button", page.button)).toBeVisible();
   }
+  for (const content of page.listContent?.(screen) ?? []) {
+    await expect(content).toBeVisible();
+  }
+}
+
+async function expectNarrowLayout(
+  browser: LayoutBrowser,
+  screen: Screen,
+  page: PageUnderTest,
+  width: number,
+): Promise<void> {
+  await expectLoaded(screen, page);
+  const m = await measureLayout(browser);
+  const where = `${width}px ${page.path}`;
+  expect(
+    m.scrollWidth,
+    `${where}: document scrolls sideways`,
+  ).toBeLessThanOrEqual(m.clientWidth);
+  expect(m.offscreen, `${where}: controls outside the viewport`).toEqual([]);
+  expect(m.navListPresent, `${where}: section list exists`).toBe(true);
+  expect(m.navListLinkCount, `${where}: section link count`).toBeGreaterThan(0);
+  expect(m.navListLinksReachable, `${where}: section links`).toBe(true);
 }
 
 describe("narrow screens", () => {
@@ -1535,22 +1611,7 @@ describe("narrow screens", () => {
       await browser.setViewport({ width, height: 844 });
       for (const page of OWNER_PAGES) {
         await app.open(`/orgs/${ACME}/${page.path}`);
-        await expectLoaded(screen, page);
-        const m = await measureLayout(browser);
-        const where = `${width}px ${page.path}`;
-        expect(
-          m.scrollWidth,
-          `${where}: document scrolls sideways`,
-        ).toBeLessThanOrEqual(m.clientWidth);
-        expect(m.offscreen, `${where}: controls outside the viewport`).toEqual(
-          [],
-        );
-        expect(m.navListPresent, `${where}: section list exists`).toBe(true);
-        expect(
-          m.navListLinkCount,
-          `${where}: section link count`,
-        ).toBeGreaterThan(0);
-        expect(m.navListLinksReachable, `${where}: section links`).toBe(true);
+        await expectNarrowLayout(browser, screen, page, width);
       }
     }
   });
@@ -1567,7 +1628,6 @@ describe("narrow screens", () => {
       await browser.setViewport({ width, height: 844 });
       for (const page of MEMBER_PAGES) {
         await app.open(`/orgs/${NORTHWIND}/${page.path}`);
-        await expectLoaded(screen, page);
         if (page.path === "members") {
           const roster = screen.getByRole("list", "Members");
           await expect(roster.getByText("Seo-yeon Lee")).toBeVisible();
@@ -1581,24 +1641,74 @@ describe("narrow screens", () => {
           await expect(updateMode).toBeVisible();
           await expect(updateMode).toBeDisabled();
         }
-        const m = await measureLayout(browser);
-        const where = `${width}px ${page.path}`;
-        expect(
-          m.scrollWidth,
-          `${where}: document scrolls sideways`,
-        ).toBeLessThanOrEqual(m.clientWidth);
-        expect(m.offscreen, `${where}: controls outside the viewport`).toEqual(
-          [],
-        );
-        expect(m.navListPresent, `${where}: section list exists`).toBe(true);
-        expect(
-          m.navListLinkCount,
-          `${where}: section link count`,
-        ).toBeGreaterThan(0);
-        expect(m.navListLinksReachable, `${where}: section links`).toBe(true);
+        await expectNarrowLayout(browser, screen, page, width);
       }
     }
   });
+
+  for (const { method, loading, sibling } of [
+    {
+      method: "ListSnapshots",
+      loading: "Loading snapshots",
+      sibling: ownerTemplate,
+    },
+    {
+      method: "ListTemplates",
+      loading: "Loading templates",
+      sibling: ownerSnapshot,
+    },
+  ]) {
+    test(`waits for initial ${method} before measuring Snapshots at 320 px`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await browser.setViewport({ width: 320, height: 844 });
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      const key = `ownsand-e2e-hold-initial-${method}`;
+      await browser.evaluate((key) => {
+        sessionStorage.setItem(key, "hold");
+        return null;
+      }, key);
+      await app.open(`/orgs/${ACME}/snapshots`);
+
+      let releasing = false;
+      const measurement: LayoutBrowser = {
+        evaluate(fn) {
+          expect(releasing, `layout measured while ${method} was held`).toBe(
+            true,
+          );
+          return browser.evaluate(fn);
+        },
+      };
+      await Promise.all([
+        expectNarrowLayout(measurement, screen, OWNER_SNAPSHOTS_PAGE, 320),
+        (async () => {
+          try {
+            await expect(
+              screen.getByRole("heading", "Snapshots", { level: 1 }),
+            ).toBeVisible();
+            await expect(sibling(screen)).toBeVisible();
+            await expect(screen.getByRole("status", loading)).toBeVisible();
+            await expect
+              .poll(() =>
+                browser.evaluate((key) => sessionStorage.getItem(key), key),
+              )
+              .toBe("held");
+            await app.screenshot(`narrow-${method}-held`);
+          } finally {
+            releasing = true;
+            await browser.evaluate((key) => {
+              window.dispatchEvent(new Event(`${key}-release`));
+              return null;
+            }, key);
+          }
+        })(),
+      ]);
+      await app.screenshot(`narrow-${method}-released`);
+    });
+  }
 
   test("scrolls the section list inside itself at 390 px", async ({
     app,
