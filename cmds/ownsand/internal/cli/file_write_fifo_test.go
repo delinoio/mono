@@ -31,6 +31,26 @@ func openTestFIFOWriter(t *testing.T, fifo string) *os.File {
 	}
 }
 
+func TestFileWriteInvalidGuestPathBeforeOpeningFIFO(t *testing.T) {
+	r := newRunner(t)
+	fifo := makeFIFO(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	res := r.runCtx(ctx, "--no-color", "file", "write", r.f.sb, "relative.txt", "--from", fifo)
+	if ctx.Err() != nil && res.code == ExitError {
+		// Release the blocked open if the regression returns.
+		writer := openTestFIFOWriter(t, fifo)
+		_ = writer.Close()
+	}
+	if ctx.Err() != nil || res != (result{code: ExitUsage, stderr: invalidGuestPathStderr}) {
+		t.Errorf("want usage error before the deadline, got %+v (context error: %v)", res, ctx.Err())
+	}
+	if calls := r.f.callNames(); len(calls) != 0 {
+		t.Errorf("API received calls for an invalid guest path: %v", calls)
+	}
+}
+
 func TestFileWriteFIFOWithoutWriterEndsOnCancel(t *testing.T) {
 	r := newRunner(t)
 	fifo := makeFIFO(t)

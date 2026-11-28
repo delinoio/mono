@@ -619,6 +619,9 @@ func (a *app) fileRead(ctx context.Context, name string, args []string) error {
 		return err
 	}
 	defer s.Close()
+	if err := validate.GuestPath(rest[1]); err != nil {
+		return usageErr("%v", err)
+	}
 	var w io.Writer = a.env.Stdout
 	var dst *downloadTarget
 	if *to != "" {
@@ -874,6 +877,9 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 		return err
 	}
 	defer s.Close()
+	if err := validate.GuestPath(rest[1]); err != nil {
+		return usageErr("%v", err)
+	}
 	// Standard input can block without data, for example on a terminal, and a
 	// blocked read cannot observe ctx: read it through a reader that returns
 	// when an interrupt cancels ctx.
