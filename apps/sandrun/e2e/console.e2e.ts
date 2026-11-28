@@ -965,6 +965,35 @@ describe("organization member pagination", () => {
 });
 
 describe("overview", () => {
+  test("shows no devices after linking an unseeded OwnSand organization", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const ownsandOrganizationId = "0193a000-0000-7000-8000-00000000f036";
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+
+    await screen.getByRole("button", "Remove link").tap();
+    const confirm = screen.getByRole("alertdialog", "Remove the OwnSand link?");
+    await confirm.getByRole("button", "Remove link").tap();
+    await screen.getByRole("button", "Link OwnSand").tap();
+    const link = screen.getByRole("dialog", "Link OwnSand");
+    await expect(link.getByLabel("OwnSand organization ID")).toBeFocused();
+    await browser.keyboard.type(ownsandOrganizationId);
+    await link.getByLabel("OwnSand API key").tap();
+    await browser.keyboard.type("osk_fixture");
+    await link.getByRole("button", "Link", { exact: true }).tap();
+    await expect(screen.getByText(ownsandOrganizationId)).toBeVisible();
+
+    // Open Overview for the first capacity request in this browser session.
+    await screen.getByRole("link", "Overview", { exact: true }).tap();
+    const pool = screen.getByRole("region", "Device pool");
+    await expect(pool.getByText("No devices", { exact: true })).toBeVisible();
+    await expect(pool.getByRole("table", "Devices")).toBeHidden();
+  });
+
   test("guides an unlinked organization to integrations from the device pool", async ({
     app,
     screen,

@@ -210,7 +210,6 @@ interface OrgState {
   profiles: RunnerProfile[];
   requests: Request[];
   runners: Runner[];
-  devices: DeviceCapacity[];
   devSessions: DevSession[];
   apiKeys: (ApiKey & { userId: string })[];
   audit: AuditEvent[];
@@ -257,7 +256,6 @@ function emptyOrg(organizationId: string, name: string): OrgState {
     profiles: [],
     requests: [],
     runners: [],
-    devices: [],
     devSessions: [],
     apiKeys: [],
     audit: [],
@@ -312,8 +310,9 @@ function seed(
   userId: string,
   runnerProfileCount: number,
   agentIntegrationPageSize: number | undefined,
-): Map<string, OrgState> {
+) {
   const orgs = new Map<string, OrgState>();
+  const devicePools = new Map<string, DeviceCapacity[]>();
 
   const acme = emptyOrg(MOCK_IDS.acme, "Acme Robotics");
   acme.organization.settings = {
@@ -607,7 +606,7 @@ function seed(
       guestOs: GuestOs.LINUX,
     }),
   );
-  acme.devices.push(
+  devicePools.set(MOCK_IDS.ownsandAcme, [
     create(DeviceCapacitySchema, {
       ownsandDeviceId: MOCK_IDS.linuxDevice,
       name: "build-box",
@@ -653,7 +652,7 @@ function seed(
       effectiveVcpuLimit: 8n,
       allocation: { vcpuCount: 0n, memoryMib: 0n, diskGib: 0n },
     }),
-  );
+  ]);
   acme.devSessions.push(
     create(DevSessionSchema, {
       devSessionId: MOCK_IDS.queuedDev,
@@ -814,7 +813,7 @@ function seed(
     member(MOCK_IDS.globex, userId, Role.ADMIN, "Mina Kim"),
   );
   orgs.set(MOCK_IDS.globex, globex);
-  return orgs;
+  return { orgs, devicePools };
 }
 
 /** Serves one page of a list with numeric offsets as page tokens. */
@@ -894,7 +893,7 @@ export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
-  const orgs = seed(
+  const { orgs, devicePools } = seed(
     userId,
     options.runnerProfileCount ?? 3,
     options.agentIntegrationPageSize,
@@ -2098,8 +2097,9 @@ export function createMockTransport(
           counts.set(state, (counts.get(state) ?? 0) + 1);
           countsByDevice.set(ownsandDeviceId, counts);
         }
+        const devices = devicePools.get(org.link.ownsandOrganizationId) ?? [];
         return {
-          devices: org.devices.map((device) => ({
+          devices: devices.map((device) => ({
             ...device,
             runners: Array.from(
               countsByDevice.get(device.ownsandDeviceId) ?? [],
