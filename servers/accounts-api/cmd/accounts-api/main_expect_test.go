@@ -253,17 +253,29 @@ func TestNewServerKeepAliveSequenceEndingInRejectionLogsEveryRequestOnce(t *test
 		check(t, logs)
 	})
 
-	t.Run("request split across writes", func(t *testing.T) {
-		addr, logs := startRequestLogServer(t)
-		conn := dialRaw(t, addr)
-		stream := get + get + reject
-		for i := 0; i < len(stream); i += 7 {
-			if _, err := io.WriteString(conn, stream[i:min(i+7, len(stream))]); err != nil {
-				t.Fatalf("write: %v", err)
+	t.Run("request split across server reads", func(t *testing.T) {
+		// TCP can combine client writes. Limit each server read below the
+		// first request's length so a single write still tests a split request.
+		listener := &readLimitedListener{Listener: newTestListener(t), maxReadSize: 7}
+		addr, logs, _ := startRequestLogServerOnListener(t, listener)
+		response := exchange(t, addr, get+get+reject)
+
+		readSizes := listener.readSizes()
+		bytesRead := 0
+		for _, size := range readSizes {
+			bytesRead += size
+			if bytesRead >= len(get) {
+				break
 			}
-			time.Sleep(time.Millisecond)
 		}
-		response := readUntilClosed(t, conn)
+		if len(readSizes) == 0 || readSizes[0] >= len(get) || bytesRead < len(get) {
+			t.Fatalf("server read sizes = %v, want a read ending inside the first %d-byte request and later reads completing it", readSizes, len(get))
+		}
+		t.Logf("first request length = %d bytes, cumulative bytes at completion = %d, server read sizes = %v", len(get), bytesRead, readSizes)
+
+		if got := strings.Count(response, "HTTP/1.1 200 OK"); got != 2 {
+			t.Errorf("got %d 200 responses, want 2: %q", got, response)
+		}
 		if !strings.HasSuffix(maskDate(response), wantExpectationFailed) {
 			t.Errorf("response %q does not end with the 417", response)
 		}
