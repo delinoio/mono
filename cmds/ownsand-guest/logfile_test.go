@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -262,9 +261,9 @@ func TestRunReportsFailedLogRotationInTheActiveLog(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	code := make(chan int, 1)
+	logs := &serviceLogs{openLog: func(dir string) (logOutput, error) { return openLogFile(dir, smallLogLimit) }}
 	go func() {
-		code <- run(ctx, []string{"--listen", "unix://" + sock, "--state-dir", stateDir, "--clock", "ignore"},
-			func(dir string) (logOutput, error) { return openLogFile(dir, smallLogLimit) }, processor)
+		code <- run(ctx, []string{"--listen", "unix://" + sock, "--state-dir", stateDir, "--clock", "ignore"}, logs, processor)
 	}()
 	t.Cleanup(cancel)
 	waitServing(t, sock)
@@ -324,16 +323,24 @@ func TestRunReportsFailedLogRotationInTheActiveLog(t *testing.T) {
 // open blocks the removal of the file on Windows.
 func TestRunClosesTheLogWhenItReturns(t *testing.T) {
 	var closed int
+	var output bytes.Buffer
+	logs := &serviceLogs{openLog: func(string) (logOutput, error) {
+		return logOutput{W: &output, Close: func() error { closed++; return nil }}, nil
+	}}
 	// An invalid clock mode ends run after the logger exists and before the
 	// helper listens.
-	code := run(context.Background(), []string{"--state-dir", t.TempDir(), "--clock", "bogus"},
-		func(string) (logOutput, error) {
-			return logOutput{W: io.Discard, Close: func() error { closed++; return nil }}, nil
-		})
+	code := run(context.Background(), []string{
+		"--state-dir", t.TempDir(), "--clock", "bogus", "--log-level", "error", "--listen", "invalid://",
+	}, logs)
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2", code)
 	}
 	if closed != 1 {
 		t.Fatalf("the log was closed %d times, want once", closed)
+	}
+	records := logRecords(t, output.String())
+	if len(records) != 1 || records[0]["level"] != "ERROR" ||
+		records[0]["msg"] != "Invalid clock mode. Set --clock or OWNSAND_GUEST_CLOCK to set or ignore." {
+		t.Fatalf("unexpected service log: %s", &output)
 	}
 }

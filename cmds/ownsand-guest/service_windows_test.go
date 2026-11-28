@@ -16,6 +16,57 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
+func TestServiceRejectsInvalidLogLevel(t *testing.T) {
+	t.Setenv(envLogLevel, "private-log-level")
+	state := filepath.Join(t.TempDir(), "private-state")
+	var events []string
+	h := &serviceHandler{
+		args: []string{"--state-dir", state, "--listen", "invalid://", "--clock", "ignore"},
+		reportStartupError: func(message string) error {
+			events = append(events, message)
+			return errors.New("event log unavailable")
+		},
+	}
+	specific, code := h.Execute(nil, nil, make(chan svc.Status, 2))
+	if !specific || code != 2 || h.code != 2 {
+		t.Fatalf("service-specific = %t, code = %d, process exit = %d; want true, 2, 2", specific, code, h.code)
+	}
+	const want = "Invalid log level. Set --log-level or OWNSAND_GUEST_LOG_LEVEL to debug, info, warn or error."
+	if len(events) != 1 || events[0] != want {
+		t.Fatalf("got events %q, want one event %q", events, want)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid log level reached log setup: stat state directory returned %v", err)
+	}
+}
+
+func TestServiceRejectsInvalidClockMode(t *testing.T) {
+	t.Setenv(envClock, "private-clock-mode")
+	state := filepath.Join(t.TempDir(), "private-state")
+	h := &serviceHandler{
+		args: []string{"--state-dir", state, "--listen", "invalid://", "--log-level", "error"},
+		reportStartupError: func(message string) error {
+			t.Errorf("unexpected startup event: %s", message)
+			return nil
+		},
+	}
+	specific, code := h.Execute(nil, nil, make(chan svc.Status, 2))
+	if !specific || code != 2 || h.code != 2 {
+		t.Fatalf("service-specific = %t, code = %d, process exit = %d; want true, 2, 2", specific, code, h.code)
+	}
+	data := readFile(t, filepath.Join(state, logFile))
+	records := logRecords(t, data)
+	if len(records) != 1 || records[0]["level"] != "ERROR" || records[0]["component"] != "ownsand-guest" ||
+		records[0]["msg"] != "Invalid clock mode. Set --clock or OWNSAND_GUEST_CLOCK to set or ignore." {
+		t.Fatalf("unexpected service log: %v", records)
+	}
+	for _, value := range []string{"private-clock-mode", "private-state"} {
+		if strings.Contains(data, value) {
+			t.Fatalf("service log contains %q: %s", value, data)
+		}
+	}
+}
+
 func TestServiceLogSetupFailurePreservesExitCode(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

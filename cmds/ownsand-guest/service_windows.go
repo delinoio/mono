@@ -65,7 +65,8 @@ func (h *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan int, 1)
-	go func() { done <- run(ctx, h.args, h.openServiceLog) }()
+	logs := &serviceLogs{openLog: h.openServiceLog, reportStartupError: h.reportStartupError}
+	go func() { done <- run(ctx, h.args, logs) }()
 	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	for {
 		select {

@@ -64,6 +64,14 @@ func TestRunRejectsInvalidLogLevel(t *testing.T) {
 	}
 }
 
+func TestRunRejectsInvalidClockMode(t *testing.T) {
+	t.Setenv(envClock, "bogus")
+	code, stderr := runCapturingStderr(t, []string{"--log-level", "error", "--listen", "invalid://"})
+	if code != 2 || stderr != "ownsand-guest: invalid clock mode \"bogus\"\n" {
+		t.Fatalf("exit code = %d, stderr = %q; want code 2 and the existing clock diagnostic", code, stderr)
+	}
+}
+
 func TestRunAcceptsASCIICaseFoldedLogLevel(t *testing.T) {
 	// An invalid clock mode makes run return 2 right after the level check,
 	// so the test reaches the step after level parsing without starting a
@@ -171,7 +179,7 @@ func startHelper(t *testing.T, sock, stateDir string) *helperProcess {
 	go func() {
 		defer close(h.finished)
 		h.code <- run(ctx, []string{"--listen", "unix://" + sock, "--state-dir", stateDir, "--clock", "ignore"},
-			func(string) (logOutput, error) { return logOutput{W: h.log}, nil })
+			&serviceLogs{openLog: func(string) (logOutput, error) { return logOutput{W: h.log}, nil }})
 	}()
 	t.Cleanup(func() {
 		cancel()
