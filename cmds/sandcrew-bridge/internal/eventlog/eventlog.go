@@ -102,8 +102,9 @@ func Open(path string, opts Options) (*Log, error) {
 	}
 	l.file = file
 	if !terminated {
-		// A crash left a partial last line. Terminate it, so the next event
-		// starts on its own line; the partial line stays as it is.
+		// A crash left a last line without a newline: a partial event, or
+		// a complete one whose newline is missing. Terminate it, so the next
+		// event starts on its own line; the line stays as it is.
 		opts.Logger.Warn("event log ends with a partial line", "log_end_offset", l.offset)
 		if _, err := file.Write([]byte("\n")); err != nil {
 			file.Close()
@@ -130,7 +131,11 @@ func (l *Log) recover(path string) (bool, error) {
 	for {
 		line, err := reader.ReadBytes('\n')
 		l.offset += uint64(len(line))
-		if len(line) > 0 && line[len(line)-1] == '\n' {
+		// The last line can lack its newline. When it still holds a
+		// complete event, that event counts: Open adds the newline, so the
+		// event stays in the log, and the next event must not reuse its
+		// sequence or apply its input again.
+		if len(bytes.TrimSpace(line)) > 0 {
 			var event sandcrewv1.BridgeEvent
 			if uerr := unmarshal.Unmarshal(bytes.TrimSpace(line), &event); uerr != nil {
 				l.opts.Logger.Warn("event log line does not parse", "log_end_offset", l.offset, "error", uerr)

@@ -98,6 +98,46 @@ func TestPartialLastLineIsTerminated(t *testing.T) {
 	}
 }
 
+func TestCompleteLastEventWithoutNewlineCounts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	log, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append(accepted("a")); err != nil {
+		t.Fatal(err)
+	}
+	log.Close()
+	// An interrupted append wrote the whole event but not its newline.
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(`{"sequence":"2","inputAccepted":{"inputId":"b"}}`)
+	f.Close()
+
+	log, err = Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := log.LastSequence(); got != 2 {
+		t.Fatalf("LastSequence() = %d, want 2", got)
+	}
+	if !log.HasInput("b") {
+		t.Fatal("the input of the complete last event is not remembered")
+	}
+	if err := log.Append(accepted("c")); err != nil {
+		t.Fatal(err)
+	}
+	log.Close()
+	data, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("log lines %q", lines)
+	}
+	last, err := Decode([]byte(lines[2]))
+	if err != nil || last.GetSequence() != 3 || last.GetLogEndOffset() != uint64(len(data)) {
+		t.Fatalf("last event %v %v, log size %d", last, err, len(data))
+	}
+}
+
 // flakyFile writes at most limit bytes per call and fails the first
 // failures calls.
 type flakyFile struct {
