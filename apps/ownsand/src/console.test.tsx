@@ -2622,17 +2622,25 @@ describe("sandbox create form resources", () => {
     });
     await settle();
     expect(memory.value).toBe("1,257");
-    // The plus button of the Memory field adds one more whole number.
     const plus = memory
       .closest('[data-slot="number-input-group"]')!
       .querySelector('[data-slot="number-input-increment"]')!;
+    const primaryMouse = {
+      button: 0,
+      isPrimary: true,
+      pointerId: 1,
+      pointerType: "mouse",
+    };
     await act(async () => {
-      fireEvent.pointerDown(plus, { button: 0 });
-      fireEvent.pointerUp(plus, { button: 0 });
-      fireEvent.click(plus);
+      fireEvent.pointerDown(plus, { ...primaryMouse, buttons: 1 });
+      fireEvent.pointerUp(plus, { ...primaryMouse, buttons: 0 });
+    });
+    // Let React apply the controlled value before the click handler reads it.
+    await act(async () => {
+      fireEvent.click(plus, { detail: 1 });
     });
     await settle();
-    expect(memory.value).toMatch(/^1,25[89]$/);
+    expect(memory.value).toBe("1,258");
   });
 });
 
