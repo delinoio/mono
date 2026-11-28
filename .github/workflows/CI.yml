@@ -173,6 +173,31 @@ jobs:
           # cannot restore without saving, so its cache would save an entry
           # from every pull request under a key of its own.
           cache: false
+      - name: Resolve Go cache paths and key
+        id: go-cache-key
+        shell: bash
+        env:
+          CACHE_INPUTS_HASH: ${{ hashFiles('go.sum') }}
+        run: |
+          set -euo pipefail
+          # The go-test job's key: this job only restores that cache.
+          prefix="go-test-$RUNNER_OS-$RUNNER_ARCH-${ImageOS:-unknown}-$(go env GOVERSION)-"
+          {
+            echo "prefix=$prefix"
+            echo "key=$prefix$CACHE_INPUTS_HASH"
+            echo 'paths<<EOF'
+            go env GOCACHE GOMODCACHE
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore the go-test module and build caches
+        # Restore only: the go-test job saves this cache on main. The build
+        # cache skips most compilation; without it this job compiles every
+        # package from scratch.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
+          restore-keys: ${{ steps.go-cache-key.outputs.prefix }}
       - name: Vet Go module
         run: go vet ./...
       - name: Record validation result
@@ -936,6 +961,31 @@ jobs:
           # saving, so its cache would save an entry from every pull request
           # under a key of its own.
           cache: false
+      - name: Resolve Go cache paths and key
+        id: go-cache-key
+        shell: bash
+        env:
+          CACHE_INPUTS_HASH: ${{ hashFiles('go.sum') }}
+        run: |
+          set -euo pipefail
+          # The go-test job's key: this job only restores that cache.
+          prefix="go-test-$RUNNER_OS-$RUNNER_ARCH-${ImageOS:-unknown}-$(go env GOVERSION)-"
+          {
+            echo "prefix=$prefix"
+            echo "key=$prefix$CACHE_INPUTS_HASH"
+            echo 'paths<<EOF'
+            go env GOCACHE GOMODCACHE
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore the go-test module and build caches
+        # Restore only: the go-test job saves this cache on main. The build
+        # cache skips most compilation; without it this job compiles every
+        # package from scratch.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
+          restore-keys: ${{ steps.go-cache-key.outputs.prefix }}
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
