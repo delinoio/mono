@@ -233,7 +233,11 @@ func (l *Layer) poolInstallation(ctx context.Context, q db.Querier, orgID, poolK
 // the deleted runners for RunnerChanged after the commit.
 func (l *Layer) deactivateTx(ctx context.Context, tx pgx.Tx, inst *Installation, skip map[string]bool) ([]string, error) {
 	pool := inst.PoolKey()
-	rows, err := tx.Query(ctx, "SELECT request_id::text, state FROM requests WHERE organization_id = $1 AND kind = $2 AND pool_key = $3 AND state = ANY($4)",
+	// Match profile deletion's lock order and decide how to end each
+	// request from its locked state.
+	rows, err := tx.Query(ctx, `SELECT request_id::text, state FROM requests
+		WHERE organization_id = $1 AND kind = $2 AND pool_key = $3 AND state = ANY($4)
+		ORDER BY requests.request_id FOR UPDATE`,
 		inst.OrganizationID, int16(sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB), pool, work.OpenRequestStates())
 	if err != nil {
 		return nil, err
@@ -295,9 +299,12 @@ var idleRunnerStates = []int16{
 
 // idleRunners returns the GITHUB_JOB runners of a pool that wait for a job
 // (CREATING, PREPARING, WARM or WAITING_FOR_WORK without a request).
+// The scan is unlocked so unlink can commit each registered runner's
+// retirement separately. ID order lets deactivateTx match profile deletion
+// when it locks the remaining runners.
 func (l *Layer) idleRunners(ctx context.Context, q db.Querier, orgID, pool string) ([]*work.Runner, error) {
 	rows, err := q.Query(ctx, "SELECT "+work.RunnerColumns+` FROM runners WHERE organization_id = $1 AND kind = $2 AND pool_key = $3 AND request_id IS NULL
-		AND state = ANY($4) ORDER BY create_time DESC, runner_id DESC`, orgID, int16(sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB), pool, idleRunnerStates)
+		AND state = ANY($4) ORDER BY runners.runner_id`, orgID, int16(sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB), pool, idleRunnerStates)
 	if err != nil {
 		return nil, err
 	}
