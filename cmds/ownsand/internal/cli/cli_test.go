@@ -541,6 +541,7 @@ type fakeLogto struct {
 	polls                   int
 	refreshes               []string
 	deviceAuthorizationBody string
+	resourceTokenBody       string
 }
 
 func (l *fakeLogto) handler(t *testing.T) http.Handler {
@@ -572,12 +573,55 @@ func (l *fakeLogto) handler(t *testing.T) http.Handler {
 			if r.Form.Get("resource") != DefaultLogtoResource {
 				t.Errorf("refresh without the resource: %v", r.Form)
 			}
+			if l.resourceTokenBody != "" {
+				fmt.Fprint(w, l.resourceTokenBody)
+				return
+			}
 			n := len(l.refreshes)
 			fmt.Fprintf(w, `{"access_token":"jwt-%d","refresh_token":"refresh-%d","expires_in":1}`, n, n+1)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	})
+}
+
+func TestLoginRejectsInvalidTokenLifetime(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing credentials=%t", existing), func(t *testing.T) {
+			r := newRunner(t)
+			delete(r.env, ownsand.EnvAPIKey)
+			lg := &fakeLogto{resourceTokenBody: `{"access_token":"bad-access","refresh_token":"bad-rotation","expires_in":9223372037}`}
+			ls := httptest.NewServer(lg.handler(t))
+			t.Cleanup(ls.Close)
+			r.env[EnvLogtoEndpoint] = ls.URL
+			r.env[EnvLogtoAppID] = "app"
+			store := credstore.Store{Dir: r.env[EnvConfigDir]}
+			if existing {
+				if err := store.Save(&credstore.Credentials{RefreshToken: "existing"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(store.Path())
+			if existing && err != nil {
+				t.Fatal(err)
+			}
+
+			res := r.run("login", "--no-color")
+			const want = "Open https://login.example/device in a browser and enter the code ABCD-EFGH to sign in.\n" +
+				"error: logto: invalid token response: expires_in must be an integer in the supported duration range\n"
+			if res != (result{code: ExitError, stderr: want}) {
+				t.Errorf("login = %+v, want exit %d and stderr %q", res, ExitError, want)
+			}
+			after, err := os.ReadFile(store.Path())
+			if existing {
+				if err != nil || !bytes.Equal(after, before) {
+					t.Errorf("login changed the existing credential file: %v", err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("credential file after rejected login: %v, want no file", err)
+			}
+		})
+	}
 }
 
 func TestLoginStoresUserOnlyCredentialsAndLogout(t *testing.T) {
