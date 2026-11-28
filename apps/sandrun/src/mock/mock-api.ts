@@ -1808,6 +1808,11 @@ export function createMockTransport(
         const p = findProfile(org, req.runnerProfileId);
         const input = req.profile;
         const paths = req.updateMask?.paths ?? [];
+        if (paths.length === 0)
+          throw new ConnectError(
+            "invalid update_mask: must name at least one path",
+            Code.InvalidArgument,
+          );
         if (input === undefined)
           throw new ConnectError("profile is required", Code.InvalidArgument);
         if (
