@@ -318,10 +318,10 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	blocked := make(chan struct{})
 	unblock := make(chan struct{})
 	third := make(chan struct{})
-	a.renew = func(ctx context.Context) (bool, error) {
+	a.Renew = func(ctx context.Context, tryAcquire RenewFunc) (bool, error) {
 		switch calls.Add(1) {
 		case 1:
-			held, err := a.TryAcquire(ctx)
+			held, err := tryAcquire(ctx)
 			firstAcquisition <- acquisitionResult{held: held, err: err}
 			return held, err
 		case 2:
@@ -535,9 +535,9 @@ func TestLeaseRenewalExtendsOwnership(t *testing.T) {
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), OnLose: func() { lost.Add(1) },
 		renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
 	var calls atomic.Int32
-	a.renew = func(ctx context.Context) (bool, error) {
+	a.Renew = func(ctx context.Context, tryAcquire RenewFunc) (bool, error) {
 		calls.Add(1)
-		return a.TryAcquire(ctx)
+		return tryAcquire(ctx)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -706,8 +706,8 @@ func TestLeaseReleaseAfterUncertainAcquisition(t *testing.T) {
 	b := &Lease{DB: database, InstanceID: "b", DeadlineNow: clock.Now, Logger: logger}
 	// The renewal commits the row and then reports an error, as a call does
 	// when the connection breaks after the commit.
-	a.renew = func(ctx context.Context) (bool, error) {
-		if _, err := a.TryAcquire(context.Background()); err != nil {
+	a.Renew = func(_ context.Context, tryAcquire RenewFunc) (bool, error) {
+		if _, err := tryAcquire(context.Background()); err != nil {
 			return false, err
 		}
 		return false, errors.New("connection reset after commit")
@@ -762,7 +762,7 @@ func newRenewTestLease(next func() (bool, error)) (*Lease, *testClock, *atomic.I
 	var logs bytes.Buffer
 	l.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 	l.DeadlineNow = clock.Now
-	l.renew = func(context.Context) (bool, error) { return next() }
+	l.Renew = func(context.Context, RenewFunc) (bool, error) { return next() }
 	l.init()
 	return l, clock, lost, &logs
 }

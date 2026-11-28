@@ -39,6 +39,12 @@ const (
 	reasonReleased  = "released"
 )
 
+// RenewFunc is a single database attempt to take or renew the lease.
+type RenewFunc func(context.Context) (bool, error)
+
+// RenewHook lets tests wrap the worker's database attempt.
+type RenewHook func(ctx context.Context, tryAcquire RenewFunc) (bool, error)
+
 // Lease is one instance's view of the lease.
 type Lease struct {
 	DB         *db.DB
@@ -58,9 +64,13 @@ type Lease struct {
 	OnAcquire func(ctx context.Context)
 	OnLose    func()
 
-	// Test seams of this package: the renewal call, the renewal interval and
-	// the watcher poll interval. Zero values select the production behavior.
-	renew      func(ctx context.Context) (bool, error)
+	// Renew overrides the worker's call to TryAcquire in tests.
+	Renew RenewHook
+	// RenewTicks replaces the renewal ticker in tests. The first attempt
+	// still runs immediately. Keep the channel open until Run returns.
+	RenewTicks <-chan time.Time
+
+	// Test intervals. Zero values select the production behavior.
 	renewEvery time.Duration
 	poll       time.Duration
 
@@ -420,9 +430,11 @@ func (l *Lease) renewOnce(ctx context.Context) {
 	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	renew := l.renew
-	if renew == nil {
-		renew = l.TryAcquire
+	renew := l.TryAcquire
+	if l.Renew != nil {
+		renew = func(ctx context.Context) (bool, error) {
+			return l.Renew(ctx, l.TryAcquire)
+		}
 	}
 	ok, err := renew(callCtx)
 	if ctx.Err() != nil {
@@ -443,12 +455,16 @@ func (l *Lease) renewOnce(ctx context.Context) {
 // Run keeps the lease until ctx ends and then releases it.
 func (l *Lease) Run(ctx context.Context) {
 	l.init()
-	interval := l.renewEvery
-	if interval <= 0 {
-		interval = RenewInterval
+	ticks := l.RenewTicks
+	if ticks == nil {
+		interval := l.renewEvery
+		if interval <= 0 {
+			interval = RenewInterval
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		ticks = ticker.C
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	var watcher sync.WaitGroup
 	watcher.Add(1)
 	go func() { defer watcher.Done(); l.watch(ctx) }()
@@ -459,7 +475,7 @@ func (l *Lease) Run(ctx context.Context) {
 		case <-ctx.Done():
 			l.Release()
 			return
-		case <-ticker.C:
+		case <-ticks:
 		}
 	}
 }

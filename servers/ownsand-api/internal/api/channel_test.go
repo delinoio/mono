@@ -1826,13 +1826,55 @@ func TestGateLeaseRelease(t *testing.T) {
 	}
 }
 
+// singleAcquisitionLease lets the real worker acquire once. It rejects
+// further attempts before they reach the database so the same worker
+// cannot start another ownership period during the admission checks.
+func singleAcquisitionLease() (testenv.Option, func(*testing.T)) {
+	ticks := make(chan time.Time)
+	blocked := make(chan struct{}, 1)
+	blockedErr := errors.New("fixture blocks lease renewal after acquisition")
+	var acquired bool // Only the lease worker calls the hook.
+	configure := func(o *app.Options) {
+		o.LeaseRenewTicks = ticks
+		o.LeaseRenew = func(ctx context.Context, tryAcquire lease.RenewFunc) (bool, error) {
+			if acquired {
+				select {
+				case blocked <- struct{}{}:
+				default:
+				}
+				return false, blockedErr
+			}
+			held, err := tryAcquire(ctx)
+			acquired = held && err == nil
+			return held, err
+		}
+	}
+	attemptRenewal := func(t *testing.T) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		select {
+		case ticks <- time.Now():
+		case <-ctx.Done():
+			t.Fatal("the lease worker did not receive the renewal tick")
+		}
+		select {
+		case <-blocked:
+		case <-ctx.Done():
+			t.Fatal("the lease worker did not hit the renewal gate")
+		}
+	}
+	return configure, attemptRenewal
+}
+
 // TestChannelRegisteredBeforeLeaseLossCloses checks that a channel that is
 // registered when the real lease is lost closes during the loss transition,
 // and that the device then connects to the successor and gets its
 // configuration and heartbeat acknowledgements.
 func TestChannelRegisteredBeforeLeaseLossCloses(t *testing.T) {
 	t.Parallel()
-	env := testenv.New(t)
+	configureLease, attemptRenewal := singleAcquisitionLease()
+	env := testenv.New(t, configureLease)
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 	env.WaitForLease()
@@ -1845,6 +1887,7 @@ func TestChannelRegisteredBeforeLeaseLossCloses(t *testing.T) {
 
 	// The holder releases the lease, for example when it starts to drain.
 	env.App.Lease.Release()
+	attemptRenewal(t)
 	select {
 	case <-conn.Done():
 	case <-time.After(5 * time.Second):
@@ -1867,6 +1910,8 @@ func TestChannelRegisteredBeforeLeaseLossCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stream := successor.channel(ctx, env.SessionCredential(dev))
+	// End the successor's request stream before its test server shuts down.
+	defer func() { _ = stream.CloseRequest() }()
 	// The client request starts with its first message.
 	if err := stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}}); err != nil {
 		t.Fatal(err)
@@ -2079,12 +2124,13 @@ func (c *offsetClock) Advance(d time.Duration) { c.offset.Add(int64(d)) }
 // TestChannelClosesAtLeaseExpiry checks that a holder that cannot confirm a
 // renewal stops serving at the confirmed expiry: the connected agent channel
 // closes, the instance no longer holds the lease and a new admission is
-// refused. The test moves the local lease deadline clock past the TTL; the
-// next scheduled renewal is 10 seconds away, so nothing renews in between.
+// refused. The test moves the local lease deadline clock past the TTL and
+// waits for the watcher to close the channel before it triggers a renewal.
 func TestChannelClosesAtLeaseExpiry(t *testing.T) {
 	t.Parallel()
 	clock := &offsetClock{}
-	env := testenv.New(t, func(o *app.Options) { o.LeaseDeadlineNow = clock.Now })
+	configureLease, attemptRenewal := singleAcquisitionLease()
+	env := testenv.New(t, configureLease, func(o *app.Options) { o.LeaseDeadlineNow = clock.Now })
 	org := env.NewOrg("alice")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 	agent := env.NewFakeAgent(dev)
@@ -2108,6 +2154,7 @@ func TestChannelClosesAtLeaseExpiry(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the agent did not see the channel close")
 	}
+	attemptRenewal(t)
 	late := env.Clients(env.SessionCredential(dev)).Agent.Channel(context.Background())
 	_ = late.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
 	if _, err := late.Receive(); testenv.Code(err) != connect.CodeUnavailable {
