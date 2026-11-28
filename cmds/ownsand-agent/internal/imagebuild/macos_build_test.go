@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -16,6 +17,114 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
+
+func TestMacOSImageFirstBootAfterDiskCleanup(t *testing.T) {
+	const guestOS = ownsandv1.GuestOs_GUEST_OS_MACOS
+	unmountErr := errors.New("unmount failed")
+	for _, tc := range []struct {
+		name       string
+		interrupt  string
+		previous   bool
+		unmountErr error
+		wantErr    error
+	}{
+		{name: "cancel during unmount", interrupt: "unmount", previous: true, wantErr: context.Canceled},
+		{name: "cancel during detach", interrupt: "detach", wantErr: context.Canceled},
+		{name: "deadline during detach", interrupt: "detach", previous: true, wantErr: context.DeadlineExceeded},
+		{name: "unmount error takes precedence", interrupt: "unmount", unmountErr: unmountErr, wantErr: unmountErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), images.MacOSDir)
+				metadataPath := filepath.Join(dir, images.MetadataFile)
+				var previousMetadata []byte
+				if tc.previous {
+					writeMacOSFixture(t, dir, "previous")
+					if err := images.WriteMetadata(dir, images.Metadata{GuestOS: guestOS, GuestVersion: "previous"}); err != nil {
+						t.Fatal(err)
+					}
+					var err error
+					previousMetadata, err = os.ReadFile(metadataPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				var calls []string
+				run := func(toolCtx context.Context, name string, args ...string) ([]byte, error) {
+					step := args[0]
+					calls = append(calls, step)
+					if err := toolCtx.Err(); err != nil {
+						t.Fatalf("%s started with an ended context: %v", step, err)
+					}
+					var wantTimeout time.Duration
+					switch step {
+					case "attach":
+						return []byte(attachPlist), nil
+					case "info":
+						return []byte(emptyDiskInventory), nil
+					case "mount":
+						return nil, nil
+					case "unmount":
+						wantTimeout = unmountTimeout
+					case "detach":
+						wantTimeout = detachTimeout
+					default:
+						t.Fatalf("unexpected host command: %s %v", name, args)
+					}
+					if deadline, ok := toolCtx.Deadline(); !ok || time.Until(deadline) != wantTimeout {
+						t.Fatalf("%s deadline = %v, want a fresh %v deadline", step, deadline, wantTimeout)
+					}
+					if step == tc.interrupt {
+						if tc.wantErr == context.DeadlineExceeded {
+							<-ctx.Done()
+						} else {
+							cancel()
+						}
+					}
+					if err := toolCtx.Err(); err != nil {
+						t.Fatalf("%s cleanup context ended with the build context: %v", step, err)
+					}
+					if step == "unmount" {
+						return nil, tc.unmountErr
+					}
+					return nil, nil
+				}
+				logger := discardLogger()
+				err := withMacOSBuildDir(ctx, dir, logger, run, func() ([]string, error) { return nil, nil }, func(build string) error {
+					writeMacOSFixture(t, build, "staged")
+					if err := withAttachedDisk(ctx, run, filepath.Join(build, images.MacOSDisk), logger, func(string) error {
+						return withMountedDataVolume(ctx, run, "disk5s1", filepath.Join(build, "mnt"), func() error { return nil })
+					}); err != nil {
+						return err
+					}
+					return finishMacOSImage(ctx, dir, images.Metadata{GuestOS: guestOS}, "", func() (string, error) {
+						t.Error("first boot ran after canceled disk cleanup")
+						return "staged-helper", nil
+					})
+				})
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("build error = %v, want %v", err, tc.wantErr)
+				}
+				if want := []string{"attach", "mount", "unmount", "detach", "info"}; !slices.Equal(calls, want) {
+					t.Errorf("host commands = %v, want %v", calls, want)
+				}
+				if _, err := os.Stat(images.BuildDir(dir)); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("staging after build = %v, want os.ErrNotExist", err)
+				}
+				if tc.previous {
+					assertMacOSFixture(t, dir, "previous", "previous")
+					if got, err := os.ReadFile(metadataPath); err != nil || !bytes.Equal(got, previousMetadata) {
+						t.Errorf("installed metadata changed: got %q, %v", got, err)
+					}
+				} else if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("first install after cancellation = %v, want os.ErrNotExist", err)
+				}
+			})
+		})
+	}
+}
 
 func TestMacOSImagePublication(t *testing.T) {
 	for _, tt := range []struct {
