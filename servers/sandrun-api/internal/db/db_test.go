@@ -14,6 +14,7 @@ import (
 
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db/dbtest"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestOpenInvalidDatabaseURL(t *testing.T) {
@@ -62,6 +63,21 @@ func TestMigrateTwice(t *testing.T) {
 	}
 }
 
+func TestMigrateRefusesBeforeAnyUpgradeDDL(t *testing.T) {
+	ctx := t.Context()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if err := d.Migrate(ctx, logger); !errors.Is(err, db.ErrQuiescedV9UpgradeRequired) {
+		t.Fatalf("normal migration error = %v, want maintenance refusal", err)
+	}
+	assertWatchTransactionMigrationPending(t, d, 7)
+}
+
 // TestWatchQueueTransactionMigration runs the production migration over rows
 // created with the old trigger and then writes through the old SQL shape.
 func TestWatchQueueTransactionMigration(t *testing.T) {
@@ -86,9 +102,39 @@ func TestWatchQueueTransactionMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.Migrate(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil))); err != nil {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	// Make the last statement of v9 fail after both ALTER TABLEs, the
+	// trigger function change and the first index have run.
+	if _, err := d.Pool.Exec(ctx, "CREATE INDEX runners_watch_xact_idx ON organizations (organization_id)"); err != nil {
 		t.Fatal(err)
 	}
+	var pgErr *pgconn.PgError
+	if err := d.MigrateQuiescedV9(ctx, logger); !errors.As(err, &pgErr) || pgErr.Code != "42P07" {
+		t.Fatalf("quiesced migration error = %v, want duplicate relation", err)
+	}
+	assertWatchTransactionMigrationPending(t, d, 8)
+	if _, err := d.Pool.Exec(ctx, "DROP INDEX runners_watch_xact_idx"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.MigrateQuiescedV9(ctx, logger); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, logger); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id = 9 AND is_applied").Scan(&applied); err != nil || applied != 1 {
+		t.Fatalf("applied v9 records = %d, error = %v, want one record", applied, err)
+	}
+	var indexed int
+	if err := d.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema()
+		AND (tablename, indexname) IN (('requests', 'requests_watch_xact_idx'), ('runners', 'runners_watch_xact_idx'))
+	`).Scan(&indexed); err != nil || indexed != 2 {
+		t.Fatalf("v9 watch indexes = %d, error = %v, want two indexes", indexed, err)
+	}
+
 	tx, err := d.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +164,21 @@ func TestWatchQueueTransactionMigration(t *testing.T) {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func assertWatchTransactionMigrationPending(t *testing.T, d *db.DB, wantVersion int64) {
+	t.Helper()
+	var version int64
+	var columns, records int
+	if err := d.Pool.QueryRow(t.Context(), `
+		SELECT max(version_id), count(*) FILTER (WHERE version_id = 9),
+			(SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema()
+			 AND table_name IN ('requests', 'runners') AND column_name = 'watch_xact_id')
+		FROM goose_db_version
+	`).Scan(&version, &records, &columns); err != nil || version != wantVersion || records != 0 || columns != 0 {
+		t.Fatalf("schema version = %d, v9 records = %d, columns = %d, error = %v, want version %d with v9 pending",
+			version, records, columns, err, wantVersion)
 	}
 }
 

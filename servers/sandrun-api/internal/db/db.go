@@ -27,6 +27,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
@@ -38,6 +39,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
 	"github.com/pressly/goose/v3/lock"
 )
 
@@ -54,6 +56,11 @@ const migrationLockID int64 = 0x746964652d617069 // "sandrun-api"
 // zone, from now() in the session time zone. UTC keeps those times
 // comparable if a later migration reads them.
 const migrationTimeZone = "UTC"
+
+const watchTransactionVersion int64 = 9
+
+// ErrQuiescedV9UpgradeRequired means that the database has pre-v9 history.
+var ErrQuiescedV9UpgradeRequired = errors.New("migration v9 requires maintenance: stop all SandRun processes using this database, confirm their transactions have ended, then run sandrun-api migrate-quiesced-v9")
 
 // DB is the Postgres pool of the control plane.
 type DB struct {
@@ -126,11 +133,21 @@ func (d *DB) Migrate(ctx context.Context, logger *slog.Logger) error {
 	return d.MigrateUpTo(ctx, logger, 0)
 }
 
+// MigrateQuiescedV9 applies pending migrations after the operator confirms that
+// all predecessor processes and their transactions have drained.
+func (d *DB) MigrateQuiescedV9(ctx context.Context, logger *slog.Logger) error {
+	return d.migrate(ctx, logger, 0, true)
+}
+
 // MigrateUpTo applies the embedded migrations that the database has not
 // applied yet, up to and including maxVersion; 0 means all of them. Upgrade
 // tests use it to build a database at an older schema version and then
 // apply the later migrations through the normal runner.
 func (d *DB) MigrateUpTo(ctx context.Context, logger *slog.Logger, maxVersion int64) error {
+	return d.migrate(ctx, logger, maxVersion, false)
+}
+
+func (d *DB) migrate(ctx context.Context, logger *slog.Logger, maxVersion int64, quiesced bool) error {
 	// The migration connections are separate from the pool, so the session
 	// time zone does not change the sessions that serve requests.
 	connConfig := d.Pool.Config().ConnConfig.Copy()
@@ -141,6 +158,15 @@ func (d *DB) MigrateUpTo(ctx context.Context, logger *slog.Logger, maxVersion in
 	locker, err := lock.NewPostgresSessionLocker(lock.WithLockID(migrationLockID))
 	if err != nil {
 		return fmt.Errorf("migration lock: %w", err)
+	}
+	checkV9 := maxVersion == 0 || maxVersion >= watchTransactionVersion
+	var store database.Store
+	if checkV9 {
+		store, err = database.NewStore(goose.DialectPostgres, goose.DefaultTablename)
+		if err != nil {
+			return fmt.Errorf("load migration history store: %w", err)
+		}
+		locker = watchTransactionLocker{SessionLocker: locker, store: store, logger: logger, quiesced: quiesced}
 	}
 	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, Migrations(),
 		goose.WithSessionLocker(locker),
@@ -167,7 +193,79 @@ func (d *DB) MigrateUpTo(ctx context.Context, logger *slog.Logger, maxVersion in
 	if err != nil {
 		return fmt.Errorf("apply migrations: %w", err)
 	}
+	if checkV9 {
+		// Forward-only history keeps an applied v9 record after Goose releases
+		// the lock. Check the exact record, including when Up had no work.
+		applied, err := watchTransactionApplied(ctx, store, sqlDB)
+		if err != nil {
+			return fmt.Errorf("verify migration v9: %w", err)
+		}
+		if !applied {
+			return errors.New("migration v9 has no applied record")
+		}
+		if quiesced {
+			logger.Info("db_quiesced_v9_upgrade_verified", slog.Int64("version", watchTransactionVersion))
+		}
+	}
 	return nil
+}
+
+type watchTransactionLocker struct {
+	lock.SessionLocker
+	store    database.Store
+	logger   *slog.Logger
+	quiesced bool
+}
+
+func (l watchTransactionLocker) SessionLock(ctx context.Context, conn *sql.Conn) error {
+	if err := l.SessionLocker.SessionLock(ctx, conn); err != nil {
+		return err
+	}
+	// Up and UpTo initialize the history during their unlocked pending check.
+	// Check it here on the session that will apply the migrations, while it
+	// holds the same advisory lock as every other SandRun migrator.
+	if err := l.checkHistory(ctx, conn); err != nil {
+		return errors.Join(err, l.SessionUnlock(context.WithoutCancel(ctx), conn))
+	}
+	return nil
+}
+
+func (l watchTransactionLocker) checkHistory(ctx context.Context, conn *sql.Conn) error {
+	applied, err := watchTransactionApplied(ctx, l.store, conn)
+	if err != nil {
+		return fmt.Errorf("read migration v9 history: %w", err)
+	}
+	if applied {
+		return nil
+	}
+	current, err := l.store.GetLatestVersion(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("read database schema version: %w", err)
+	}
+	if current == 0 {
+		return nil
+	}
+	if current >= watchTransactionVersion {
+		return fmt.Errorf("database schema version %d has no applied record for migration v9", current)
+	}
+	if !l.quiesced {
+		return fmt.Errorf("database schema version %d: %w", current, ErrQuiescedV9UpgradeRequired)
+	}
+	// The advisory lock excludes other migrators. Only the operator can
+	// confirm that old application transactions cannot overlap the DDL.
+	l.logger.Info("db_quiesced_v9_upgrade_confirmed", slog.Int64("current_version", current))
+	return nil
+}
+
+func watchTransactionApplied(ctx context.Context, store database.Store, conn database.DBTxConn) (bool, error) {
+	record, err := store.GetMigration(ctx, conn, watchTransactionVersion)
+	if errors.Is(err, database.ErrVersionNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return record.IsApplied, nil
 }
 
 // IsUniqueViolation reports whether err is a unique constraint violation.

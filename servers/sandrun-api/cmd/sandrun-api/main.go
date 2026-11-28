@@ -41,6 +41,8 @@ import (
 // exec, WatchQueue) end with the drain. Clients resume them.
 const shutdownTimeout = 10 * time.Second
 
+const migrateQuiescedV9Command = "migrate-quiesced-v9"
+
 // HTTP server timeouts. Server streams run for up to 14 minutes, so the
 // server sets no ReadTimeout or WriteTimeout: each RPC bounds its own
 // lifetime. readHeaderTimeout bounds the request head, idleTimeout an idle
@@ -60,9 +62,14 @@ func main() {
 		os.Exit(runOwnSandRollback(os.Args[2:]))
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	quiescedV9Upgrade := len(os.Args) > 1 && os.Args[1] == migrateQuiescedV9Command
+	if quiescedV9Upgrade && len(os.Args) != 2 {
+		slog.Error("invalid_arguments", slog.String("usage", "sandrun-api "+migrateQuiescedV9Command))
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, stop); err != nil {
+	if err := run(ctx, stop, quiescedV9Upgrade); err != nil {
 		slog.Error("server_exited", slog.Any("error", err))
 		os.Exit(1)
 	}
@@ -73,7 +80,7 @@ func hookMode(args []string) bool {
 	return len(args) > 0 && (filepath.Base(args[0]) == claude.HookName || len(args) > 1 && args[1] == claude.HookName)
 }
 
-func run(ctx context.Context, stop context.CancelFunc) error {
+func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) error {
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
 		return err
@@ -99,6 +106,9 @@ func run(ctx context.Context, stop context.CancelFunc) error {
 		return err
 	}
 	defer database.Close()
+	if quiescedV9Upgrade {
+		return database.MigrateQuiescedV9(ctx, logger)
+	}
 	if cfg.RunMigrations {
 		if err := database.Migrate(ctx, logger); err != nil {
 			return err

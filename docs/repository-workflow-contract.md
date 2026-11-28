@@ -290,6 +290,10 @@ The deployment script gives outgoing containers 30 seconds between Docker's stop
 
 Roll a service back with the image in `/srv/delino/state/<service>.previous`: run `ssh deploy@<droplet> bash -s -- <service> <image> <port> <hostname> <upstream-protocol> <udp-ports> < scripts/ci/droplet-deploy.sh` from a checkout of `main`, with the values of the `deploy` field of the server's `package.json` (`http1` and `none` when the field does not set them). The rollback takes the same per-service lock as the workflow deployment and waits for a deployment that is running. It uses the same health check and route switch and leaves versions and tags intact. Follow the [OwnSand removal rollback procedure](servers-sandrun-api-foundation.md#ownsand-removal-rollback) before selecting a SandRun API image. Delete old images from the registry with the DigitalOcean registry garbage collection when the registry storage limit requires it, and keep the images in the `.current` and `.previous` state files of every service.
 
+#### SandRun API v9 maintenance upgrade
+
+SandRun refuses normal startup with migrations enabled on a database with pre-v9 application history. The deployer retains the previous container and route when a replacement fails this check. Use the [SandRun v9 maintenance procedure](servers-sandrun-api-foundation.md#v9-maintenance-upgrade) to drain all predecessors, migrate once, and verify the schema before the normal replacement.
+
 #### OwnSand API pending unlink compatibility
 
 The OwnSand API can write pending billing unlinks with a NULL account after migration `0012`. A failed replacement can apply the migration and write these rows before its route becomes active. The deployer therefore checks the target and every running OwnSand fallback under the service lock before creating a replacement or stopping a container. The same check applies to a digest passed for manual rollback, including one from `ownsand-api.previous`.
