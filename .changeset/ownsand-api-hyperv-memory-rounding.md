@@ -2,4 +2,4 @@
 "ownsand-api": patch
 ---
 
-Account for Hyper-V memory rounding during placement: a Windows device reserves an odd memory request rounded up to an even number of MiB, so the reservation cannot exceed the device memory limit.
+For Hyper-V placement on Windows devices, the control plane adds 1 MiB to odd memory requests below 9223372036854775807 MiB. A request of 9223372036854775807 MiB reserves exactly that amount. Placement checks the resulting reservation against the device memory limit.
