@@ -1,0 +1,12 @@
+{
+  "app.language": "Language",
+  "appInfo.loading": "Loading app details…",
+  "appInfo.browser": "Running in a browser. Start the app with Tauri to see the runtime.",
+  "appInfo.failed": "Could not load app details: {message}",
+  "appInfo.version": "Version",
+  "appInfo.runtime": "Webview runtime",
+  "appInfo.platform": "Platform",
+  "appInfo.platformValue": "{platform} ({os})",
+  "runtime.cef": "Chromium Embedded Framework",
+  "runtime.wry": "System webview"
+}

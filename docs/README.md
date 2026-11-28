@@ -13,6 +13,7 @@
 - [Authentication](repository-auth-contract.md)
 - [Billing currency, precision and shared billing accounts](repository-billing-contract.md)
 - [End-to-end testing](repository-e2e-contract.md)
+- [Localization](repository-localization-contract.md)
 
 ## Templates
 
@@ -42,6 +43,11 @@
 
 - [Project index](project-delino-ui.md)
 - [Shared UI component package foundation](packages-delino-ui-foundation.md)
+
+### delino-i18n
+
+- [Project index](project-delino-i18n.md)
+- [Localization package foundation](packages-delino-i18n-foundation.md)
 
 ### delidev
 

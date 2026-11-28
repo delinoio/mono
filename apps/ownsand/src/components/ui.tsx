@@ -36,7 +36,9 @@ import {
 } from "./focus.ts";
 import { ACCOUNTS_URL } from "../config.ts";
 import { errorMessage, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import type { FollowedPages } from "../pagination.ts";
+import { enumText, type MessageKey, sourceText, type Text } from "../text.ts";
 
 export function PageHeader({
   title,
@@ -65,19 +67,25 @@ export function PageHeader({
 /**
  * Shows a failed action in a toast. A billing error also gets a link
  * action to the billing site, because toast text cannot hold a link.
+ * Components pass `useI18n()` as `text`.
  */
-export function toastError(error: unknown): void {
+export function toastError(
+  error: unknown,
+  text: Pick<Text, "t"> = sourceText,
+): void {
   if (billingReasonOf(error) !== undefined) {
-    toast.error(errorMessage(error), {
-      action: { label: "Open billing", href: ACCOUNTS_URL },
+    toast.error(errorMessage(error, text), {
+      action: { label: text.t("common.openBilling"), href: ACCOUNTS_URL },
     });
     return;
   }
-  toast.error(errorMessage(error));
+  toast.error(errorMessage(error, text));
 }
 
 /** A loading placeholder for a list. */
-export function Loading({ label = "Loading" }: { label?: string }) {
+export function Loading({ label }: { label?: string }) {
+  const { t } = useI18n();
+  label ??= t("common.loading");
   return (
     <div className="loading" role="status" aria-label={label}>
       <Skeleton height="56px" />
@@ -117,6 +125,7 @@ export function TextWithAccountsLink({ text }: { text: string }) {
  */
 function SignInButton({ onSignIn }: { onSignIn?: () => void | Promise<void> }) {
   const auth = useAuth();
+  const { t } = useI18n();
   return (
     <>
       <Button
@@ -125,7 +134,7 @@ function SignInButton({ onSignIn }: { onSignIn?: () => void | Promise<void> }) {
           void (onSignIn ?? auth.signIn)();
         }}
       >
-        Sign in with Delino
+        {t("common.signInWithDelino")}
       </Button>
       <SignInFailureNotice />
     </>
@@ -140,11 +149,8 @@ function SignInButton({ onSignIn }: { onSignIn?: () => void | Promise<void> }) {
  */
 export function SignInFailureNotice() {
   const auth = useAuth();
-  return auth.signInFailed ? (
-    <p role="alert">
-      Sign-in did not start. Check your connection and try again.
-    </p>
-  ) : null;
+  const { t } = useI18n();
+  return auth.signInFailed ? <p role="alert">{t("signIn.failed")}</p> : null;
 }
 
 /**
@@ -170,6 +176,7 @@ export function ErrorNotice({
   onSignIn?: () => void | Promise<void>;
   children?: ReactNode;
 }) {
+  const i18n = useI18n();
   const billing = billingReasonOf(error) !== undefined;
   const retryFutile =
     error instanceof ConnectError &&
@@ -179,13 +186,13 @@ export function ErrorNotice({
   return (
     <div className="notice notice-error" role="alert">
       <p>
-        <TextWithAccountsLink text={errorMessage(error)} />
+        <TextWithAccountsLink text={errorMessage(error, i18n)} />
       </p>
       {unauthenticated ? (
         <SignInButton onSignIn={onSignIn} />
       ) : onRetry && !billing && !retryFutile ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
-          Try again
+          {i18n.t("common.tryAgain")}
         </Button>
       ) : null}
       {children}
@@ -240,12 +247,16 @@ export function RefreshFailedNotice({
 }: {
   query: BoundaryQuery<unknown>;
 }) {
+  const i18n = useI18n();
   const billing = billingReasonOf(query.error) !== undefined;
   return (
     <div className="notice notice-error" role="alert">
       <p>
-        The last refresh failed, so this page may be out of date.{" "}
-        <TextWithAccountsLink text={errorMessage(query.error)} />
+        {i18n.rich("errors.refreshFailed", {
+          error: (
+            <TextWithAccountsLink text={errorMessage(query.error, i18n)} />
+          ),
+        })}
       </p>
       {billing ? null : (
         <Button
@@ -253,7 +264,7 @@ export function RefreshFailedNotice({
           disabled={query.isFetching}
           onClick={() => void query.refetch()}
         >
-          Try again
+          {i18n.t("common.tryAgain")}
         </Button>
       )}
     </div>
@@ -293,27 +304,80 @@ export function QueryBoundary<T>({
   );
 }
 
+/** The objects of a list that `MorePagesNotice` names. */
+export enum ListNoun {
+  Organizations = "organizations",
+  Devices = "devices",
+  Members = "members",
+  PendingInvitations = "pendingInvitations",
+  EnrollmentTokens = "enrollmentTokens",
+  ApiKeys = "apiKeys",
+  Snapshots = "snapshots",
+  Templates = "templates",
+}
+
+/** The texts of `MorePagesNotice`, one whole sentence per list. */
+const MORE_PAGES_TEXT = {
+  [ListNoun.Organizations]: {
+    notShown: "morePages.organizations.notShown",
+    loading: "morePages.organizations.loading",
+  },
+  [ListNoun.Devices]: {
+    notShown: "morePages.devices.notShown",
+    loading: "morePages.devices.loading",
+  },
+  [ListNoun.Members]: {
+    notShown: "morePages.members.notShown",
+    loading: "morePages.members.loading",
+  },
+  [ListNoun.PendingInvitations]: {
+    notShown: "morePages.pendingInvitations.notShown",
+    loading: "morePages.pendingInvitations.loading",
+  },
+  [ListNoun.EnrollmentTokens]: {
+    notShown: "morePages.enrollmentTokens.notShown",
+    loading: "morePages.enrollmentTokens.loading",
+  },
+  [ListNoun.ApiKeys]: {
+    notShown: "morePages.apiKeys.notShown",
+    loading: "morePages.apiKeys.loading",
+  },
+  [ListNoun.Snapshots]: {
+    notShown: "morePages.snapshots.notShown",
+    loading: "morePages.snapshots.loading",
+  },
+  [ListNoun.Templates]: {
+    notShown: "morePages.templates.notShown",
+    loading: "morePages.templates.loading",
+  },
+} as const satisfies Record<
+  ListNoun,
+  { notShown: MessageKey; loading: MessageKey }
+>;
+
 /**
  * The state of the pages that a list has not loaded yet: a status while the
  * console follows the continuation token, and the error with a retry when a
  * later page failed. It renders nothing when the list is complete.
  *
- * `noun` is the plural of the listed object, for example "API keys".
+ * `noun` names the listed objects.
  */
 export function MorePagesNotice({
   noun,
   pages,
 }: {
-  noun: string;
+  noun: ListNoun;
   pages: Pick<
     FollowedPages,
     "isIncomplete" | "loadMoreError" | "retryLoadMore"
   >;
 }) {
+  const { t } = useI18n();
+  const text = MORE_PAGES_TEXT[noun];
   if (pages.loadMoreError) {
     return (
       <>
-        <p className="muted">Some {noun} are not shown yet.</p>
+        <p className="muted">{t(text.notShown)}</p>
         <ErrorNotice
           error={pages.loadMoreError}
           onRetry={pages.retryLoadMore}
@@ -324,7 +388,7 @@ export function MorePagesNotice({
   if (pages.isIncomplete) {
     return (
       <p className="muted" role="status">
-        Loading more {noun}
+        {t(text.loading)}
       </p>
     );
   }
@@ -378,27 +442,32 @@ export function SandboxStateBadge({
   state: SandboxState;
   lastKnownState?: SandboxState | undefined;
 }) {
-  const lastKnownLabel =
+  const i18n = useI18n();
+  // A last-known state that this client does not know shows no state.
+  const lastKnownKey: MessageKey | undefined =
     lastKnownState === undefined
       ? undefined
-      : labels.sandboxState[lastKnownState];
+      : labels.sandboxStateLastKnown[lastKnownState];
   const text =
-    state === SandboxState.UNREACHABLE && typeof lastKnownLabel === "string"
-      ? `${labels.sandboxState[state]} (last ${lastKnownLabel.toLowerCase()})`
-      : labels.sandboxState[state];
+    state === SandboxState.UNREACHABLE && lastKnownKey !== undefined
+      ? i18n.t(lastKnownKey)
+      : enumText(i18n, labels.sandboxState, state);
   return (
     <Badge variant={SANDBOX_BADGE[state] ?? BadgeVariant.Neutral}>{text}</Badge>
   );
 }
 
 export function DeviceStateBadge({ state }: { state: DeviceState }) {
+  const i18n = useI18n();
   const variant =
     state === DeviceState.ONLINE
       ? BadgeVariant.Accent
       : state === DeviceState.REMOVED
         ? BadgeVariant.Danger
         : BadgeVariant.Neutral;
-  return <Badge variant={variant}>{labels.deviceState[state]}</Badge>;
+  return (
+    <Badge variant={variant}>{enumText(i18n, labels.deviceState, state)}</Badge>
+  );
 }
 
 /**
@@ -418,13 +487,14 @@ export function SecretDialog({
   hint?: ReactNode;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const copy = async () => {
     if (secret === undefined) return;
     try {
       await navigator.clipboard.writeText(secret);
-      toast.success("Copied");
+      toast.success(t("secret.copied"));
     } catch {
-      toast.error("Copy failed. Select the text and copy it.");
+      toast.error(t("secret.copyFailed"));
     }
   };
   return (
@@ -437,10 +507,7 @@ export function SecretDialog({
     >
       <DialogContent>
         <DialogTitle>{title}</DialogTitle>
-        <DialogDescription>
-          It appears only once. Copy it now and keep it somewhere safe; OwnSand
-          cannot show it again.
-        </DialogDescription>
+        <DialogDescription>{t("secret.description")}</DialogDescription>
         <div className="secret">
           <span className="secret-label">{label}</span>
           <code className="secret-value" aria-label={label}>
@@ -449,11 +516,11 @@ export function SecretDialog({
         </div>
         {hint ? <p className="muted">{hint}</p> : null}
         <DialogActions>
-          <DialogClose>Done</DialogClose>
+          <DialogClose>{t("common.done")}</DialogClose>
           {/* `data-autofocus` makes the SDK focus Copy on open; Done stays
               first in the DOM and visual order. */}
           <Button onClick={copy} data-autofocus="">
-            Copy
+            {t("secret.copy")}
           </Button>
         </DialogActions>
       </DialogContent>
@@ -527,6 +594,7 @@ export function ConfirmDialog({
   onConfirm: (opening: DialogOpening) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useI18n();
   const [error, setError] = useState<unknown>();
   const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
@@ -573,7 +641,7 @@ export function ConfirmDialog({
         <AlertDialogDescription>{description}</AlertDialogDescription>
         {error !== undefined ? <ErrorNotice error={error} /> : null}
         <AlertDialogActions>
-          <AlertDialogClose>Cancel</AlertDialogClose>
+          <AlertDialogClose>{t("common.cancel")}</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
             disabled={pending}
@@ -620,6 +688,7 @@ export function FormDialog({
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
+  const { t } = useI18n();
   const [error, setError] = useState<unknown>();
   const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
@@ -671,7 +740,7 @@ export function FormDialog({
           {children}
           {error !== undefined ? <ErrorNotice error={error} /> : null}
           <DialogActions>
-            <DialogClose>Cancel</DialogClose>
+            <DialogClose>{t("common.cancel")}</DialogClose>
             <Button type="submit" disabled={pending || submitDisabled}>
               {submitLabel}
             </Button>

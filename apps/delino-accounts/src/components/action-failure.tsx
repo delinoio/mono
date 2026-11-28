@@ -3,6 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { toast } from "delino-ui/toast";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
 import { errorMessage } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { ErrorNotice } from "./ui.tsx";
 
 /**
@@ -35,13 +36,20 @@ export interface ActionFailure {
  */
 export function useActionFailure(): ActionFailure {
   const [signInError, setSignInError] = useState<ConnectError>();
-  const report = useCallback((error: unknown) => {
-    if (error instanceof ConnectError && error.code === Code.Unauthenticated) {
-      setSignInError(error);
-      return;
-    }
-    toast.error(errorMessage(error));
-  }, []);
+  const i18n = useI18n();
+  const report = useCallback(
+    (error: unknown) => {
+      if (
+        error instanceof ConnectError &&
+        error.code === Code.Unauthenticated
+      ) {
+        setSignInError(error);
+        return;
+      }
+      toast.error(errorMessage(error, i18n));
+    },
+    [i18n],
+  );
   const clear = useCallback(() => setSignInError(undefined), []);
   return useMemo(
     () => ({

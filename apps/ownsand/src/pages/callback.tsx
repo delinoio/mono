@@ -3,6 +3,7 @@ import { useHandleSignInCallback } from "@logto/react";
 import { useEffect, useRef, useState } from "react";
 import { logtoSignInSessionState, SignInSessionState } from "../auth.tsx";
 import { ErrorNotice, Loading } from "../components/ui.tsx";
+import { useI18n } from "../i18n.ts";
 import { pendingInvitation } from "../invitation.ts";
 import { RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -51,6 +52,7 @@ function UnreadableSessionNotice() {
 
 function CompleteSignIn({ pending }: { pending: boolean }) {
   const { navigate } = useRouter();
+  const { t } = useI18n();
   const { isLoading, error } = useHandleSignInCallback(() => {
     navigate(afterSignInPath(), { replace: true });
   });
@@ -65,14 +67,15 @@ function CompleteSignIn({ pending }: { pending: boolean }) {
     if (error) pendingInvitation.clear();
   }, [error]);
   if (error) return <ErrorNotice error={error} />;
-  return isLoading ? <Loading label="Signing in" /> : null;
+  return isLoading ? <Loading label={t("callback.signingIn")} /> : null;
 }
 
 /** Route `callback` with the mock API. */
 export function MockCallbackPage() {
   const { navigate } = useRouter();
+  const { t } = useI18n();
   useEffect(() => {
     navigate(afterSignInPath(), { replace: true });
   }, [navigate]);
-  return <Loading label="Signing in" />;
+  return <Loading label={t("callback.signingIn")} />;
 }

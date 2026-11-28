@@ -11,14 +11,17 @@ import { TopBar } from "../components/shell.tsx";
 import {
   Empty,
   FormDialog,
+  ListNoun,
   MorePagesNotice,
   PageHeader,
   QueryBoundary,
 } from "../components/ui.tsx";
 import { labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
 import { refreshOrganizations, useOrganizations } from "../organizations.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import { enumText } from "../text.ts";
 
 const organizationIdPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -26,6 +29,8 @@ const organizationIdPattern =
 /** Route `organizations`: the organization list, creation and invitations. */
 export function OrganizationsPage() {
   const { navigate } = useRouter();
+  const i18n = useI18n();
+  const { t } = i18n;
   const queryClient = useQueryClient();
   const orgs = useOrganizations();
   const create = useMutation(OrganizationService.method.createOrganization);
@@ -38,7 +43,7 @@ export function OrganizationsPage() {
     event.preventDefault();
     const secret = secretFromInput(link);
     if (secret === undefined) {
-      setLinkError("Paste the whole invitation link.");
+      setLinkError(t("organizations.join.invalidLink"));
       return;
     }
     setLink("");
@@ -52,23 +57,23 @@ export function OrganizationsPage() {
       <TopBar />
       <main className="content content-narrow">
         <PageHeader
-          title="Organizations"
-          description="Choose an organization to manage its devices and sandboxes."
+          title={t("organizations.title")}
+          description={t("organizations.description")}
           action={
             <Button onClick={() => setCreating(true)}>
-              Create organization
+              {t("organizations.create")}
             </Button>
           }
         />
-        <QueryBoundary query={orgs} loading="Loading organizations">
+        <QueryBoundary query={orgs} loading={t("organizations.loading")}>
           {(organizations) =>
             organizations.length === 0 && !orgs.isIncomplete ? (
-              <Empty title="You are not in an organization yet">
-                Create one, or open an invitation link from an admin.
+              <Empty title={t("organizations.empty.title")}>
+                {t("organizations.empty.description")}
               </Empty>
             ) : (
               <>
-                <ul className="list" aria-label="Your organizations">
+                <ul className="list" aria-label={t("organizations.list")}>
                   {organizations.map((org) => (
                     <li key={org.organizationId} className="list-row">
                       <Link
@@ -79,21 +84,23 @@ export function OrganizationsPage() {
                         })}
                       >
                         <span className="list-title">{org.name}</span>
-                        <Badge>{labels.role[org.callerRole]}</Badge>
+                        <Badge>
+                          {enumText(i18n, labels.role, org.callerRole)}
+                        </Badge>
                       </Link>
                     </li>
                   ))}
                 </ul>
-                <MorePagesNotice noun="organizations" pages={orgs} />
+                <MorePagesNotice noun={ListNoun.Organizations} pages={orgs} />
               </>
             )
           }
         </QueryBoundary>
         <section className="section" aria-labelledby="join-title">
-          <h2 id="join-title">Join with an invitation</h2>
+          <h2 id="join-title">{t("organizations.join.title")}</h2>
           <form className="inline-form" onSubmit={join}>
             <TextField
-              label="Invitation link"
+              label={t("organizations.join.link")}
               value={link}
               onValueChange={(value) => {
                 setLink(value);
@@ -103,16 +110,16 @@ export function OrganizationsPage() {
               autoComplete="off"
             />
             <Button type="submit" variant={ButtonVariant.Secondary}>
-              Continue
+              {t("organizations.join.continue")}
             </Button>
           </form>
         </section>
       </main>
       <FormDialog
         open={creating}
-        title="Create an organization"
-        description="You become its owner. You can invite members after you create it."
-        submitLabel="Create"
+        title={t("organizations.createDialog.title")}
+        description={t("organizations.createDialog.description")}
+        submitLabel={t("common.create")}
         onOpenChange={(open) => {
           setCreating(open);
           if (!open) setName("");
@@ -129,7 +136,7 @@ export function OrganizationsPage() {
           const organizationId = res.organization?.organizationId;
           if (!organizationId || !organizationIdPattern.test(organizationId)) {
             throw new ConnectError(
-              "The organization may have been created. Close this dialog and check the organization list before trying again.",
+              t("organizations.createDialog.unconfirmed"),
               Code.FailedPrecondition,
             );
           }
@@ -144,7 +151,7 @@ export function OrganizationsPage() {
         }}
       >
         <TextField
-          label="Organization name"
+          label={t("organizations.createDialog.name")}
           value={name}
           onValueChange={setName}
           required

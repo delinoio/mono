@@ -28,7 +28,13 @@ import {
   ShortId,
   StateBadge,
 } from "../components/ui.tsx";
-import { formatTime, labels, TERMINAL_RUNNER_STATES } from "../format.ts";
+import {
+  formatTime,
+  guestOsName,
+  labels,
+  TERMINAL_RUNNER_STATES,
+} from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { can, Permission } from "../roles.ts";
 
 const ALL = "all";
@@ -52,6 +58,7 @@ function runnerTone(state: RunnerState): BadgeVariant {
 
 /** Route `runners`: runners with profile, device, state and end reason. */
 export function RunnersPage() {
+  const { lang, t } = useI18n();
   const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const [state, setState] = useState<string>(ALL);
@@ -94,19 +101,21 @@ export function RunnersPage() {
   return (
     <>
       <PageHeader
-        title="Runners"
-        description="Each runner is one OwnSand sandbox that serves at most one request. SandRun deletes it when the work ends."
+        title={t("runners.title")}
+        description={t("runners.description")}
       />
       <div className="filters">
         <Select
-          label="State"
+          label={t("common.column.state")}
           value={state}
           onValueChange={(v) => setState(v ?? ALL)}
         >
-          <SelectOption value={ALL}>All states</SelectOption>
+          <SelectOption value={ALL}>
+            {t("common.filter.allStates")}
+          </SelectOption>
           {STATES.map((s) => (
             <SelectOption key={s} value={String(s)}>
-              {labels.runnerState[s]}
+              {t(labels.runnerState[s])}
             </SelectOption>
           ))}
         </Select>
@@ -116,36 +125,37 @@ export function RunnersPage() {
           onValueChange={setProfileId}
         />
         <Checkbox
-          label="Show ended runners"
+          label={t("runners.filter.showEnded")}
           checked={includeEnded}
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
       <RunnerProfileNotice query={profiles} />
-      <QueryBoundary query={list} loading="Loading runners">
+      <QueryBoundary query={list} loading={t("runners.loading")}>
         {(data) => {
           const runners = data.pages.flatMap((p) => p.runners);
           return runners.length === 0 ? (
             <SetupEmpty
               organizationId={organizationId}
-              title="No runners match"
+              title={t("runners.empty.title")}
             >
-              Runners start for waiting requests and for the warm count of each
-              runner profile.
+              {t("runners.empty.description")}
             </SetupEmpty>
           ) : (
             <div className="table-wrap">
-              <table className="table" aria-label="Runners">
+              <table className="table" aria-label={t("runners.title")}>
                 <thead>
                   <tr>
-                    <th scope="col">Runner</th>
-                    <th scope="col">Profile</th>
-                    <th scope="col">Kind</th>
-                    <th scope="col">Device</th>
-                    <th scope="col">State</th>
-                    <th scope="col">End reason</th>
-                    <th scope="col">Created</th>
-                    {admin ? <th scope="col">Actions</th> : null}
+                    <th scope="col">{t("runners.column.runner")}</th>
+                    <th scope="col">{t("common.column.profile")}</th>
+                    <th scope="col">{t("common.column.kind")}</th>
+                    <th scope="col">{t("common.column.device")}</th>
+                    <th scope="col">{t("common.column.state")}</th>
+                    <th scope="col">{t("common.column.endReason")}</th>
+                    <th scope="col">{t("common.column.created")}</th>
+                    {admin ? (
+                      <th scope="col">{t("common.column.actions")}</th>
+                    ) : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -162,8 +172,8 @@ export function RunnersPage() {
                           )}
                         </td>
                         <td>
-                          {labels.workloadKind[r.kind]} ·{" "}
-                          {labels.guestOs[r.guestOs]}
+                          {t(labels.workloadKind[r.kind])} ·{" "}
+                          {guestOsName(r.guestOs, t)}
                         </td>
                         <td>
                           {r.ownsandDeviceId === ""
@@ -174,16 +184,23 @@ export function RunnersPage() {
                         </td>
                         <td>
                           <StateBadge
-                            text={labels.runnerState[r.state]}
+                            text={t(labels.runnerState[r.state])}
                             tone={runnerTone(r.state)}
                           />
                         </td>
                         <td className="wrap">
-                          {ended
-                            ? `${labels.runnerEndReason[r.endReason]}${r.ownsandEndReason ? ` (${r.ownsandEndReason})` : ""}`
-                            : "—"}
+                          {!ended
+                            ? "—"
+                            : r.ownsandEndReason
+                              ? t("runners.endReasonWithDetail", {
+                                  reason: t(
+                                    labels.runnerEndReason[r.endReason],
+                                  ),
+                                  detail: r.ownsandEndReason,
+                                })
+                              : t(labels.runnerEndReason[r.endReason])}
                         </td>
-                        <td>{formatTime(r.createdAt)}</td>
+                        <td>{formatTime(r.createdAt, lang)}</td>
                         {admin ? (
                           <td>
                             {!ended && r.state !== RunnerState.DELETING ? (
@@ -192,7 +209,7 @@ export function RunnersPage() {
                                 size={ButtonSize.Small}
                                 onClick={() => setDeleting(r)}
                               >
-                                Delete
+                                {t("common.delete")}
                               </Button>
                             ) : null}
                           </td>
@@ -210,9 +227,9 @@ export function RunnersPage() {
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
-        title="Delete this runner?"
-        description="SandRun deletes the runner and its OwnSand sandbox. Work that runs in it stops at once. This cannot be undone."
-        confirmLabel="Delete runner"
+        title={t("runners.deleteDialog.title")}
+        description={t("runners.deleteDialog.description")}
+        confirmLabel={t("runners.deleteDialog.confirm")}
         onConfirm={() =>
           remove.mutateAsync({ organizationId, runnerId: deleting!.runnerId })
         }
