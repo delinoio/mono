@@ -646,26 +646,69 @@ func TestNotificationConcurrentWorkersSkipLeased(t *testing.T) {
 	}
 }
 
-// A worker that died after the claim releases the notification when the lease
-// ends, and the retry skips the recipients that are recorded.
+// When a worker stops after recording one delivery, the next worker waits for
+// the lease to expire and sends only to the unfinished recipient.
 func TestNotificationLeaseExpiryRetries(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
-	id, _ := f.queueNotice(acct)
-	if _, ok, err := f.s.claimNotification(ctx()); err != nil || !ok {
-		t.Fatalf("claim: %v %v", ok, err)
+	id, key := f.queueNotice(acct)
+	recorded := fmt.Sprintf("admin-%d", f.lastAccountSeq)
+	unfinished := fmt.Sprintf("owner-%d", f.lastAccountSeq)
+
+	claimed, ok, err := f.s.claimNotification(t.Context())
+	if err != nil || !ok || claimed.ID != id {
+		t.Fatalf("claim: ID %q, want %q, found %t, error %v", claimed.ID, id, ok, err)
 	}
-	if err := f.s.DeliverNotifications(ctx()); err != nil || len(f.email.Messages()) != 0 {
-		t.Fatalf("delivered a leased notification: %v", err)
-	}
-	f.clock.Advance(notificationLease)
-	if err := f.s.DeliverNotifications(ctx()); err != nil {
+
+	sentAt := f.clock.Now()
+	leaseExpiry := sentAt.Add(notificationLease)
+	if _, err := f.db.Pool.Exec(t.Context(), `INSERT INTO billing_notification_deliveries (notification_id, user_id, send_time)
+		VALUES ($1, $2, $3)`, id, recorded, sentAt); err != nil {
 		t.Fatal(err)
 	}
-	if st := f.noticeState(id); !st.Sent || len(f.email.Messages()) != 2 {
-		t.Fatalf("state after the lease: %+v, emails %d", st, len(f.email.Messages()))
+	checkRecordedSendTime := func() {
+		t.Helper()
+		var got time.Time
+		if err := f.db.Pool.QueryRow(t.Context(), `SELECT send_time FROM billing_notification_deliveries
+			WHERE notification_id = $1 AND user_id = $2`, id, recorded).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if !got.Equal(sentAt) {
+			t.Fatalf("recorded delivery time: %v, want %v", got, sentAt)
+		}
 	}
+
+	f.clock.Set(leaseExpiry.Add(-time.Microsecond))
+	if err := f.s.DeliverNotifications(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.email.Messages()); got != 0 {
+		t.Fatalf("emails before lease expiry: %d, want 0", got)
+	}
+	if st := f.noticeState(id); st.Sent || st.Abandoned || st.Attempts != 0 ||
+		!st.Next.Equal(leaseExpiry) || !slices.Equal(st.Recipients, []string{recorded}) {
+		t.Fatalf("state before lease expiry: %+v, want pending with zero attempts, lease %v and recipient %q", st, leaseExpiry, recorded)
+	}
+	checkRecordedSendTime()
+
+	f.clock.Set(leaseExpiry)
+	if err := f.s.DeliverNotifications(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	msgs := f.email.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("emails at lease expiry: %d, want 1", len(msgs))
+	}
+	wantTo, wantKey := unfinished+"@example.com", key+"/"+unfinished
+	if got := msgs[0]; got.To != wantTo || got.IdempotencyKey != wantKey {
+		t.Fatalf("resumed email: destination %q and key %q, want %q and %q", got.To, got.IdempotencyKey, wantTo, wantKey)
+	}
+	if st := f.noticeState(id); !st.Sent || st.Abandoned || st.Attempts != 1 ||
+		!slices.Equal(st.Recipients, []string{recorded, unfinished}) {
+		t.Fatalf("state after lease expiry: %+v, want sent with one attempt and recipients %q and %q", st, recorded, unfinished)
+	}
+	checkRecordedSendTime()
 }
 
 // An ordinary failure of the first recipient keeps the retry backoff and
