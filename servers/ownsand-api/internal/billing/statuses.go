@@ -370,12 +370,9 @@ func (s *Statuses) Advance(ctx context.Context) error {
 // that the new owner made after it. A link attempt whose call can still be
 // running is left alone.
 //
-// The due check reads the row after the lock and compares it with a clock
-// reading that it takes after the lock, because the wait for the lock can be
-// long. A caller that selected the row as due before the lock sends nothing
-// when a transaction that held the lock moved the deadline into the future
-// or removed the row, and it sends the call when the deadline passed while
-// it waited.
+// The cleanup path then locks the pending unlink row, which also serializes
+// retries after the organization is deleted. It reads the clock after the
+// pending row lock so it checks the latest retry time and unlink guards.
 func (s *Statuses) UnlinkPending(ctx context.Context, orgID string) error {
 	if s.client == nil {
 		return ErrReportingDisabled
@@ -385,24 +382,27 @@ func (s *Statuses) UnlinkPending(ctx context.Context, orgID string) error {
 		if _, err := tx.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR NO KEY UPDATE", orgID); err != nil {
 			return err
 		}
-		now := s.now()
 		op, err := loadOwnerUnlink(ctx, tx, orgID)
 		if err != nil {
 			return err
 		}
 		if op.id != "" {
-			if op.nextAttempt.After(now) {
+			if op.nextAttempt.After(s.now()) {
 				return nil
 			}
 			_, change, err = s.resolveOwnerUnlink(ctx, tx, orgID, op, "")
 		} else {
-			var due bool
-			err = tx.QueryRow(ctx, "SELECT next_attempt_time <= $2 FROM billing_pending_unlinks WHERE organization_id = $1", orgID, now).Scan(&due)
-			if errors.Is(err, pgx.ErrNoRows) || (err == nil && !due) {
+			var nextAttempt time.Time
+			err = tx.QueryRow(ctx, "SELECT next_attempt_time FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&nextAttempt)
+			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
 			if err != nil {
 				return err
+			}
+			now := s.now()
+			if nextAttempt.After(now) {
+				return nil
 			}
 			err = s.UnlinkPendingTx(ctx, tx, orgID, now)
 		}

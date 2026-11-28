@@ -945,7 +945,7 @@ func (f *statusFixture) waitForLockWaiter(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatal("no session waits for the organization lock")
+	t.Fatal("no session is waiting for a database lock")
 }
 
 const statusWorkerTimeout = 10 * time.Second
@@ -1104,6 +1104,72 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 		}
 	})
 
+	testConcurrentPendingUnlinks(t, t0, func(t *testing.T) *statusFixture {
+		f := newStatusFixture(t, t0)
+		f.addOrg(t, org1)
+		f.link(t, org1, accountA)
+		f.addPendingUnlink(t, org1)
+		return f
+	})
+}
+
+func TestPendingUnlinkDeletedOrganizationLockWait(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	newDeletedFixture := func(t *testing.T) *statusFixture {
+		t.Helper()
+		f := newStatusFixture(t, t0)
+		f.addOrg(t, org1)
+		f.link(t, org1, accountA)
+		f.addPendingUnlink(t, org1)
+		if _, err := f.db.Pool.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", org1); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	testConcurrentPendingUnlinks(t, t0, newDeletedFixture)
+
+	t.Run("due and guard expires while waiting", func(t *testing.T) {
+		f := newDeletedFixture(t)
+		due := t0.Add(10 * time.Second)
+		if _, err := f.db.Pool.Exec(ctx, "UPDATE billing_pending_unlinks SET next_attempt_time = $2, unlink_not_before = $2 WHERE organization_id = $1", org1, due); err != nil {
+			t.Fatal(err)
+		}
+		holder, err := f.db.Pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = holder.Rollback(ctx) }()
+		if _, err := holder.Exec(ctx, "SELECT 1 FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", org1); err != nil {
+			t.Fatal(err)
+		}
+		worker := startStatusWorker(t, "UnlinkPending", nil, func(ctx context.Context) error {
+			return f.statuses.UnlinkPending(ctx, org1)
+		})
+		f.waitForLockWaiter(t)
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 0 {
+			t.Fatalf("UnlinkOrganization calls before releasing the lock = %d, want 0", got)
+		}
+		f.clock.Set(due)
+		if err := holder.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := worker.waitForResult(t); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.fake.Calls(accountstest.MethodUnlinkOrganization); got != 1 {
+			t.Fatalf("UnlinkOrganization calls = %d, want 1", got)
+		}
+		if _, _, ok := f.pendingUnlink(t, org1); ok {
+			t.Fatal("the pending unlink stayed after a success")
+		}
+	})
+}
+
+func testConcurrentPendingUnlinks(t *testing.T, t0 time.Time, newFixture func(*testing.T) *statusFixture) {
+	t.Helper()
+	ctx := context.Background()
 	// The immediate attempt after a commit holds the lock during its call. A
 	// worker that selected the same row waits for it.
 	immediate := func(t *testing.T, f *statusFixture) (*accountstest.Gate, <-chan error, <-chan error) {
@@ -1119,10 +1185,7 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 	}
 
 	t.Run("immediate attempt failed", func(t *testing.T) {
-		f := newStatusFixture(t, t0)
-		f.addOrg(t, org1)
-		f.link(t, org1, accountA)
-		f.addPendingUnlink(t, org1)
+		f := newFixture(t)
 		f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
 		gate, attemptDone, workerDone := immediate(t, f)
 		gate.Release()
@@ -1154,10 +1217,7 @@ func TestPendingUnlinkLockWait(t *testing.T) {
 	})
 
 	t.Run("immediate attempt succeeded", func(t *testing.T) {
-		f := newStatusFixture(t, t0)
-		f.addOrg(t, org1)
-		f.link(t, org1, accountA)
-		f.addPendingUnlink(t, org1)
+		f := newFixture(t)
 		gate, attemptDone, workerDone := immediate(t, f)
 		gate.Release()
 		if err := gate.WaitForResult(t, attemptDone); err != nil {
