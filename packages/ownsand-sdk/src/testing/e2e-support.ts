@@ -307,7 +307,13 @@ export async function withCleanup<T>(
   }
   const errors = await runCleanup(steps, options);
   if (failed) {
-    for (const error of errors) options.onCleanupError?.(error);
+    for (const error of errors) {
+      try {
+        options.onCleanupError?.(error);
+      } catch {
+        // Preserve the body failure and report the remaining cleanup errors.
+      }
+    }
     throw failure;
   }
   if (errors.length === 1) throw errors[0];

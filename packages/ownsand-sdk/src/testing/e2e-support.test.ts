@@ -578,6 +578,43 @@ describe("withCleanup", () => {
     expect(reported).toHaveLength(2);
   });
 
+  test("preserves the body failure and reports later cleanup errors when reporting throws", async () => {
+    const clock = new VirtualClock();
+    const ran: string[] = [];
+    const reported: unknown[] = [];
+    const bodyError = new Error("body failed");
+    const snapshotError = new Error("snapshot delete failed");
+    const sandboxError = new Error("sandbox delete failed");
+    const wait = withCleanup(
+      async () => {
+        throw bodyError;
+      },
+      [
+        () => {
+          ran.push("deleteSnapshot");
+          throw snapshotError;
+        },
+        () => {
+          ran.push("deleteSandbox");
+          throw sandboxError;
+        },
+        () => void ran.push("close"),
+      ],
+      {
+        stepTimeoutMs: 1_000,
+        clock,
+        onCleanupError(error) {
+          reported.push(error);
+          if (error === snapshotError) throw new Error("report failed");
+        },
+      },
+    );
+
+    await expect(clock.run(wait)).rejects.toBe(bodyError);
+    expect(ran).toEqual(["deleteSnapshot", "deleteSandbox", "close"]);
+    expect(reported).toEqual([snapshotError, sandboxError]);
+  });
+
   test("throws the cleanup error when the body passes", async () => {
     const clock = new VirtualClock();
     const ran: string[] = [];
