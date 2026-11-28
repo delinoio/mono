@@ -134,13 +134,14 @@
 ## Issue Tracker Contract
 
 - Use the Linear team `DELI` (Mono) at https://linear.app/delinoio/team/DELI/ as the primary issue tracker for all development work, including bugs, features, tasks, chores, investigations and review, QA or analysis follow-ups.
+- When an automated process creates an issue, create it in the Linear team `AI` at https://linear.app/delinoio/team/AI/, not in `DELI`. Automated processes include scheduled tasks, automations, CI jobs, bots and agent workflows that create issues without a human directing each issue.
 - Use GitHub Issues in this repository for customer support only. Do not create GitHub issues for development work.
-- In pull request descriptions, add a standalone `Closes DELI-<number>` line for each fully resolved Linear issue and a standalone `Refs DELI-<number>` line for each partially addressed or related Linear issue. Do not use both for the same issue.
+- In pull request descriptions, add a standalone `Closes <identifier>` line (for example `Closes DELI-<number>` or `Closes AI-<number>`) for each fully resolved Linear issue and a standalone `Refs <identifier>` line for each partially addressed or related Linear issue. Do not use both for the same issue.
 - Follow `docs/repository-issue-tracker-contract.md`.
 
 ## Linear Issue Style Contract
 
-- Apply this contract to all open/new Linear issues in the `DELI` team.
+- Apply this contract to all open/new Linear issues in the `DELI` and `AI` teams.
 - Use issue titles in the format `<domain>: <description>`.
 - `<domain>` must use stable lowercase identifiers from project/domain contracts (for example: `tooling`, `docs`).
 - `<description>` should be concise, specific, and start with a lowercase verb phrase when possible.

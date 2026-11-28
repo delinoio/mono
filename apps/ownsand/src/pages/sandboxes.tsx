@@ -512,11 +512,15 @@ function CreateSandboxDialog({
             next,
             resourceErrors(
               {
-                vcpu: vcpuDraft.current?.hasFraction() ? Number.NaN : vcpu,
+                vcpu: vcpuDraft.current?.hasFraction()
+                  ? Number.NaN
+                  : (vcpuDraft.current?.valueBelowMin() ?? vcpu),
                 memory: memoryDraft.current?.hasFraction()
                   ? Number.NaN
                   : memory,
-                disk: diskDraft.current?.hasFraction() ? Number.NaN : disk,
+                disk: diskDraft.current?.hasFraction()
+                  ? Number.NaN
+                  : (diskDraft.current?.valueBelowMin() ?? disk),
               },
               i18n,
             ),
@@ -663,6 +667,7 @@ function CreateSandboxDialog({
           onValueChange={setVcpu}
           draftRef={vcpuDraft}
           min={1}
+          preserveBelowMin
           error={errors.vcpu}
         />
         <NumberInput
@@ -690,6 +695,7 @@ function CreateSandboxDialog({
           onValueChange={setDisk}
           draftRef={diskDraft}
           min={1}
+          preserveBelowMin
           error={errors.disk}
         />
       </div>

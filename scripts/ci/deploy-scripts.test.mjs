@@ -2563,7 +2563,8 @@ function setupDroplet(
   shellStub(
     bin,
     "docker",
-    `if [[ -n "\${STUB_BLOCK_ON:-}" && "$*" == \$STUB_BLOCK_ON ]]; then
+    `if [[ -n "\${STUB_BLOCK_ON:-}" && "$*" == \$STUB_BLOCK_ON ]] &&
+  [[ "\${STUB_BLOCK_AFTER_PROXY_WAIT:-0}" != 1 || -e "$STUB_DIR/lock-contended" ]]; then
   if [[ "\${STUB_BLOCK_IGNORES_TERM:-}" == 1 ]]; then
     trap '' TERM
     sleep 4
@@ -2785,7 +2786,10 @@ test(
       "docker run",
       "docker inspect",
       "docker inspect",
-      "curl --silent",
+      "curl --disable",
+      "docker inspect",
+      "docker inspect",
+      "curl --disable",
       "docker exec",
       "docker exec",
       "docker exec",
@@ -3685,7 +3689,10 @@ test(
       "docker start",
       "docker inspect",
       "docker inspect",
-      "curl --silent",
+      "curl --disable",
+      "docker inspect",
+      "docker inspect",
+      "curl --disable",
       "docker exec",
       "docker exec",
       "docker exec",
@@ -5198,7 +5205,7 @@ async function waitFor(condition, what) {
 }
 
 // The contender must encounter the held lock before the test releases it.
-async function startContendingDroplet(t, setup, args, lockName) {
+async function startContendingDroplet(t, setup, args, lockName, env = {}) {
   const bin = join(setup.dir, "lock-probe-bin");
   const marker = join(setup.dir, "lock-contended");
   mkdirSync(bin);
@@ -5224,6 +5231,7 @@ exec "$STUB_REAL_FLOCK" "$@"`,
     STUB_EXPECTED_LOCK: join(setup.deployRoot, "state", lockName),
     STUB_REAL_FLOCK: realFlock,
     STUB_LOCK_MARKER: marker,
+    ...env,
   });
   let outcome;
   void run.done.then(
@@ -7246,6 +7254,154 @@ test(
     assert.equal(setup.read("caddy/sites/api.caddy"), route);
     assert.equal(setup.read("state/api.current"), state);
     assert.equal(setup.read("state/api.previous"), previous);
+  },
+);
+
+test(
+  "droplet deploy checks replacement health again after acquiring the proxy lock",
+  { skip: skipDroplet },
+  async (t) => {
+    for (const { name, udp = "none", code, blockStatus, signal } of [
+      { name: "HTTP replacement becomes unhealthy", code: "503" },
+      { name: "UDP replacement becomes unhealthy", udp: "3478", code: "503" },
+      { name: "replacement stays healthy", code: "204" },
+      { name: "the current status inspection times out", blockStatus: true },
+      { name: "signal during the fresh probe", signal: "SIGTERM" },
+    ]) {
+      await t.test(name, async (t) => {
+        const route = "api.example.com {\n\treverse_proxy before:8080\n}\n";
+        const state = `${olderImage}\n`;
+        const previous = `${oldestImage}\n`;
+        const args = [...httpArgs.slice(0, -1), udp];
+        const setup = setupDroplet(t, args, {
+          old: ["old1"],
+          route,
+          state,
+          previous,
+          stubs: {
+            curl: `response="$STUB_DIR/health-response"
+if [[ -e "$STUB_DIR/hold-probe" ]]; then
+  : > "$STUB_DIR/probe-blocked"
+  while [[ -e "$STUB_DIR/hold-probe" ]]; do sleep 0.05; done
+fi
+cat "$response"`,
+          },
+        });
+        const response = join(setup.dir, "health-response");
+        writeFileSync(response, "200");
+        const ready = join(setup.dir, "proxy-locked");
+        const lock = spawnProcessGroup(t, "bash", [
+          "-c",
+          'exec 9>"$1"; flock 9 && touch "$2" && read -r _',
+          "bash",
+          join(setup.deployRoot, "state/.proxy.lock"),
+          ready,
+        ]);
+        await waitFor(() => existsSync(ready), "the proxy lock to be held");
+        const run = await startContendingDroplet(
+          t,
+          setup,
+          args,
+          ".proxy.lock",
+          blockStatus
+            ? {
+                DROPLET_HEALTH_TIMEOUT: "1",
+                STUB_BLOCK_ON: "inspect*State.Status*",
+                STUB_BLOCK_AFTER_PROXY_WAIT: "1",
+                STUB_BLOCK_IGNORES_TERM: "1",
+              }
+            : code === "204"
+              ? {}
+              : { STUB_BLOCK_ON: "logs --tail *" },
+        );
+        assert.equal(
+          setup.calls().filter((call) => call.startsWith("curl ")).length,
+          1,
+        );
+        if (code) writeFileSync(response, code);
+        const holdProbe = join(setup.dir, "hold-probe");
+        if (signal) writeFileSync(holdProbe, "");
+        const releasedAt = performance.now();
+        lock.child.stdin.end("release\n");
+        assert.equal((await lock.done).status, 0);
+        if (signal) {
+          await waitFor(
+            () => existsSync(join(setup.dir, "probe-blocked")),
+            "the fresh probe to block",
+          );
+          run.child.kill(signal);
+          rmSync(holdProbe);
+        }
+        if (!blockStatus && code !== "204") {
+          await waitFor(
+            () => setup.calls().some((call) => call.startsWith("docker logs ")),
+            "replacement cleanup to start",
+          );
+          const tryLock = (name) =>
+            spawnSync(realFlock, [
+              "--nonblock",
+              "--conflict-exit-code",
+              "99",
+              join(setup.deployRoot, "state", name),
+              "true",
+            ]).status;
+          assert.equal(tryLock(".proxy.lock"), 0);
+          assert.equal(tryLock("api.lock"), 99);
+          writeFileSync(join(setup.dir, "release-docker"), "");
+        }
+        const result = await run.done;
+        const calls = setup.calls();
+        const statuses = calls.filter((call) => call.includes(".State.Status"));
+        const addresses = calls.filter((call) => call.includes(".IPAddress"));
+        const probes = calls.filter((call) => call.startsWith("curl "));
+        assert.equal(statuses.length, 2);
+        assert.equal(addresses.length, blockStatus ? 1 : 2);
+        assert.equal(probes.length, blockStatus ? 1 : 2);
+        const routePath = "caddy/sites/api.caddy";
+        if (code === "204") {
+          assert.equal(result.status, 0, result.stderr);
+          assert.ok(
+            calls.findIndex((call) => call.startsWith("docker exec ")) >
+              calls.lastIndexOf(probes[1]),
+          );
+          assert.notEqual(setup.read(routePath), route);
+          assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+          assert.equal(setup.read("state/api.previous"), state);
+          assert.ok(calls.includes("docker rm old1"));
+          return;
+        }
+
+        assert.equal(result.status, signal ? 143 : 1, result.stderr);
+        if (blockStatus) {
+          assert.match(
+            result.stderr,
+            /did not pass the health check within 1 seconds/,
+          );
+          assert.ok(performance.now() - releasedAt < 2500);
+        }
+        if (signal)
+          assert.match(result.stderr, /received SIGTERM before the route/);
+        assert.equal(setup.read(routePath), route);
+        assert.equal(setup.read("state/api.current"), state);
+        assert.equal(setup.read("state/api.previous"), previous);
+        assert.deepEqual(readdirSync(join(setup.deployRoot, "caddy/sites")), [
+          "api.caddy",
+        ]);
+        const cleanup = calls.filter((call) =>
+          /^docker (exec|start|stop|rm) /.test(call),
+        );
+        if (udp === "none") {
+          assert.equal(cleanup.length, 1, cleanup.join("\n"));
+          assert.match(cleanup[0], /^docker rm --force api-/);
+        } else {
+          assert.equal(cleanup.length, 4, cleanup.join("\n"));
+          assert.equal(cleanup[0], "docker stop --time 30 old1");
+          assert.match(cleanup[1], /^docker start api-/);
+          assert.equal(cleanup[2], cleanup[1].replace("start", "rm --force"));
+          assert.equal(cleanup[3], "docker start old1");
+        }
+      });
+    }
   },
 );
 
