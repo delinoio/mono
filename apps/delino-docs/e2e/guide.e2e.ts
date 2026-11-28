@@ -356,100 +356,130 @@ describe("brand colors", () => {
       };
     };
 
-  const readHeroButtonContrast = () =>
-    function () {
-      const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
-      const button = document.querySelector(
-        ".rp-home-hero__action.rp-button--brand",
-      );
-      if (!button) {
-        throw new Error("The hero button is missing");
-      }
-      const buttonStyle = getComputedStyle(button);
-      const label = kit.parse(buttonStyle.color);
-      return {
-        label: [label.r, label.g, label.b, label.a].join(","),
-        buttonOpacity: Number(buttonStyle.opacity),
-        buttonTransition: buttonStyle.transitionProperty,
-        buttonShadow: buttonStyle.boxShadow,
-        buttonHovered: button.matches(":hover"),
-        buttonAnimating: button.getAnimations().length > 0,
-        buttonLabelLowest: Math.min(
-          ...kit
-            .stops(buttonStyle.backgroundImage)
-            .map((stop) => kit.ratio(label, stop)),
-        ),
-      };
-    };
-
+  const heroButtonSelector = ".rp-home-hero__action.rp-button--brand";
   const wordmarkSelector = ".rp-home-hero__title-brand";
 
-  const readWordmarkContrast = async (
+  const readHeroButtonContrast = async (fixtures: WebFixtures) => {
+    const { stops, label, buttonLabelLowest, ...state } =
+      await fixtures.browser.evaluate((selector) => {
+        const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
+        const button = document.querySelector(selector);
+        if (!button) {
+          throw new Error("The hero button is missing");
+        }
+
+        const style = getComputedStyle(button);
+        const label = kit.parse(style.color);
+        const stops = kit.stops(style.backgroundImage);
+        const backing = stops.some((stop) => stop.a < 1)
+          ? kit.parse(style.backgroundColor)
+          : null;
+
+        return {
+          label,
+          stops,
+          buttonOpacity: Number(style.opacity),
+          buttonTransition: style.transitionProperty,
+          buttonShadow: style.boxShadow,
+          buttonHovered: button.matches(":hover"),
+          buttonAnimating: button.getAnimations().length > 0,
+          buttonLabelLowest:
+            backing && backing.a !== 1
+              ? null
+              : Math.min(
+                  ...stops.map((stop) =>
+                    kit.ratio(label, backing ? kit.over(stop, backing) : stop),
+                  ),
+                ),
+        };
+      }, heroButtonSelector);
+
+    return {
+      ...state,
+      label: [label.r, label.g, label.b, label.a].join(","),
+      buttonLabelLowest:
+        buttonLabelLowest ??
+        (await readHeroBackdrop(
+          fixtures,
+          "hero-button-backing",
+          heroButtonSelector,
+          {
+            "background-image": "none",
+            color: "transparent",
+            "-webkit-text-fill-color": "transparent",
+            "text-shadow": "none",
+          },
+          stops,
+          label,
+        )),
+    };
+  };
+
+  const readHeroBackdrop = async (
     { app, browser }: WebFixtures,
     screenshotLabel: string,
+    selector: string,
+    hiddenStyles: Record<string, string>,
+    stops: Rgba[],
+    label?: Rgba,
   ) => {
-    const { visibility, priority, wordmarkBackgroundLowest, ...sample } =
-      await browser.evaluate(async (selector) => {
+    const { originalStyles, ...sample } = await browser.evaluate(
+      async ({ selector, hiddenStyles }) => {
         await document.fonts.ready;
         const element = document.querySelector<HTMLElement>(selector);
         if (!element) {
-          throw new Error("The hero wordmark is missing");
+          throw new Error(`Cannot find the hero backdrop target ${selector}`);
         }
-        const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
-        const stops = kit.stops(getComputedStyle(element).backgroundImage);
-        const background = kit.resolve("--rp-c-bg");
+
         const text = document.createRange();
         text.selectNodeContents(element);
-        // Rspress gives the title a wider box than the wordmark text.
+        // The element can be wider than the text it paints.
         const rects = Array.from(
           text.getClientRects(),
-          ({ left, top, right, bottom }) => ({
-            left,
-            top,
-            right,
-            bottom,
-          }),
+          ({ left, top, right, bottom }) => ({ left, top, right, bottom }),
         );
-        const visibility = element.style.getPropertyValue("visibility");
-        const priority = element.style.getPropertyPriority("visibility");
-        element.style.setProperty("visibility", "hidden", "important");
+        const originalStyles = Object.entries(hiddenStyles).map(
+          ([property, value]) => {
+            const original = element.style.getPropertyValue(property);
+            const priority = element.style.getPropertyPriority(property);
+            element.style.setProperty(property, value, "important");
+            return { property, original, priority };
+          },
+        );
         return {
-          stops,
           rects,
           width: window.innerWidth,
           height: window.innerHeight,
-          visibility,
-          priority,
-          wordmarkBackgroundLowest: Math.min(
-            ...stops.map((stop) => kit.ratio(stop, background)),
-          ),
+          originalStyles,
         };
-      }, wordmarkSelector);
+      },
+      { selector, hiddenStyles },
+    );
 
     let screenshot: string;
     try {
       screenshot = await app.screenshot(screenshotLabel);
     } finally {
       await browser.evaluate(
-        ({ selector, visibility, priority }) => {
+        ({ selector, originalStyles }) => {
           const element = document.querySelector<HTMLElement>(selector);
           if (!element) {
-            throw new Error("The hero wordmark is missing");
+            throw new Error(
+              `Cannot restore the hero backdrop target ${selector}`,
+            );
           }
-          element.style.setProperty("visibility", visibility, priority);
+          for (const { property, original, priority } of originalStyles) {
+            element.style.setProperty(property, original, priority);
+          }
           return true;
         },
-        {
-          selector: wordmarkSelector,
-          visibility,
-          priority,
-        },
+        { selector, originalStyles },
       );
     }
 
     const png = await readFile(screenshot, "base64");
-    const wordmarkGlowLowest = await browser.evaluate(
-      async ({ png, rects, stops, width, height }) => {
+    return browser.evaluate(
+      async ({ png, rects, stops, width, height, selector, label }) => {
         const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
         const image = new Image();
         image.src = `data:image/png;base64,${png}`;
@@ -459,7 +489,9 @@ describe("brand colors", () => {
         canvas.height = image.naturalHeight;
         const context = canvas.getContext("2d");
         if (!context) {
-          throw new Error("Could not create a canvas for the hero backdrop");
+          throw new Error(
+            `Cannot sample the hero backdrop for ${selector}: canvas is unavailable`,
+          );
         }
         context.drawImage(image, 0, 0);
 
@@ -486,6 +518,11 @@ describe("brand colors", () => {
             bottom - top,
           );
           for (let i = 0; i < data.length; i += 4) {
+            if (data[i + 3] !== 255) {
+              throw new Error(
+                `Cannot sample the hero backdrop for ${selector}: a text backing pixel is translucent`,
+              );
+            }
             const backdrop = {
               r: data[i]!,
               g: data[i + 1]!,
@@ -493,24 +530,62 @@ describe("brand colors", () => {
               a: 1,
             };
             for (const stop of stops) {
-              lowest = Math.min(lowest, kit.ratio(stop, backdrop));
+              lowest = Math.min(
+                lowest,
+                kit.ratio(kit.over(stop, backdrop), label ?? backdrop),
+              );
             }
           }
         }
         if (!Number.isFinite(lowest)) {
           throw new Error(
-            "The screenshot has no visible wordmark pixels to sample",
+            `Cannot sample the hero backdrop for ${selector}: the screenshot has no visible text pixels`,
           );
         }
         return lowest;
       },
-      { png, ...sample },
+      { png, ...sample, stops, selector, label: label ?? null },
+    );
+  };
+
+  const readWordmarkContrast = async (
+    fixtures: WebFixtures,
+    screenshotLabel: string,
+  ) => {
+    const { stops, wordmarkBackgroundLowest } = await fixtures.browser.evaluate(
+      (selector) => {
+        const element = document.querySelector(selector);
+        if (!element) {
+          throw new Error("The hero wordmark is missing");
+        }
+        const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
+        const stops = kit.stops(getComputedStyle(element).backgroundImage);
+        const background = kit.resolve("--rp-c-bg");
+        if (background.a !== 1) {
+          throw new Error("The hero wordmark needs an opaque --rp-c-bg");
+        }
+        return {
+          stops,
+          wordmarkBackgroundLowest: Math.min(
+            ...stops.map((stop) =>
+              kit.ratio(kit.over(stop, background), background),
+            ),
+          ),
+        };
+      },
+      wordmarkSelector,
     );
 
     return {
-      stops: sample.stops,
+      stops,
       wordmarkBackgroundLowest,
-      wordmarkGlowLowest,
+      wordmarkGlowLowest: await readHeroBackdrop(
+        fixtures,
+        screenshotLabel,
+        wordmarkSelector,
+        { visibility: "hidden" },
+        stops,
+      ),
     };
   };
 
@@ -665,9 +740,7 @@ describe("brand colors", () => {
       browser,
     }) => {
       await app.open("/");
-      await expect(
-        browser.locator(".rp-home-hero__action.rp-button--brand"),
-      ).toBeVisible();
+      await expect(browser.locator(heroButtonSelector)).toBeVisible();
       await expect(browser.locator(".rp-home-hero__title-brand")).toBeVisible();
       await browser.evaluate(installColorKit());
       if (mode === "dark") {
@@ -677,7 +750,7 @@ describe("brand colors", () => {
         });
       }
 
-      const hero = await browser.evaluate(readHeroButtonContrast());
+      const hero = await readHeroButtonContrast({ app, browser });
 
       expect(hero.label).toBe("255,255,255,1");
       expect(hero.buttonLabelLowest).toBeGreaterThanOrEqual(4.5);
@@ -694,7 +767,7 @@ describe("brand colors", () => {
         document.documentElement.classList.toggle("rp-dark", dark);
         return true;
       }, mode === "dark");
-      const readHero = () => browser.evaluate(readHeroButtonContrast());
+      const readHero = () => readHeroButtonContrast({ app, browser });
       const action = screen.getByRole("link", "Get started");
       await expect(action).toBeVisible();
       const rest = await readHero();
@@ -786,6 +859,98 @@ describe("brand colors", () => {
         );
       }
       await expect(browser.locator(wordmarkSelector)).toBeVisible();
+    });
+
+    test(`accounts for translucent hero gradient stops in ${mode} mode`, async ({
+      app,
+      browser,
+    }) => {
+      await app.open("/");
+      await expect(browser.locator(heroButtonSelector)).toBeVisible();
+      await expect(browser.locator(wordmarkSelector)).toBeVisible();
+      await browser.evaluate(installColorKit());
+      const fixtureId = "hero-contrast-fixture";
+      await browser.evaluate(
+        ({ fixtureId, dark }) => {
+          document.documentElement.classList.toggle("rp-dark", dark);
+          const style = document.createElement("style");
+          style.id = fixtureId;
+          document.head.append(style);
+          return true;
+        },
+        { fixtureId, dark: mode === "dark" },
+      );
+
+      const setGradient = (alpha: number, buttonBacking: string) =>
+        browser.evaluate(
+          ({
+            fixtureId,
+            alpha,
+            buttonBacking,
+            heroButtonSelector,
+            wordmarkSelector,
+          }) => {
+            document.getElementById(fixtureId)!.textContent = `
+              :root { --rp-c-bg: white !important; }
+              .rp-home-hero__container { background-color: rgb(231, 232, 255); }
+              ${heroButtonSelector}, ${wordmarkSelector} {
+                background-image: linear-gradient(rgb(44, 71, 216), rgba(91, 104, 230, ${alpha})) !important;
+              }
+              ${heroButtonSelector} {
+                background-color: ${buttonBacking} !important;
+                opacity: 1 !important;
+              }
+            `;
+            return true;
+          },
+          {
+            fixtureId,
+            alpha,
+            buttonBacking,
+            heroButtonSelector,
+            wordmarkSelector,
+          },
+        );
+
+      try {
+        await setGradient(1, "rgb(231, 232, 255)");
+        const opaqueButton = await readHeroButtonContrast({ app, browser });
+        const opaqueWordmark = await readWordmarkContrast(
+          { app, browser },
+          `wordmark-${mode}-opaque-control`,
+        );
+        expect(opaqueButton.buttonLabelLowest).toBeGreaterThanOrEqual(4.5);
+        expect(opaqueWordmark.wordmarkBackgroundLowest).toBeGreaterThanOrEqual(
+          3,
+        );
+        expect(opaqueWordmark.wordmarkGlowLowest).toBeGreaterThanOrEqual(3);
+
+        await setGradient(0.01, "rgb(231, 232, 255)");
+        const translucentButton = await readHeroButtonContrast({
+          app,
+          browser,
+        });
+        const translucentWordmark = await readWordmarkContrast(
+          { app, browser },
+          `wordmark-${mode}-translucent-control`,
+        );
+        expect(translucentButton.buttonOpacity).toBe(1);
+        expect(translucentButton.buttonLabelLowest).toBeLessThan(4.5);
+        expect(translucentWordmark.wordmarkBackgroundLowest).toBeLessThan(3);
+        expect(translucentWordmark.wordmarkGlowLowest).toBeLessThan(3);
+
+        await setGradient(0.01, "transparent");
+        const sampledButton = await readHeroButtonContrast({ app, browser });
+        expect(sampledButton.buttonOpacity).toBe(1);
+        expect(sampledButton.buttonLabelLowest).toBe(
+          translucentButton.buttonLabelLowest,
+        );
+      } finally {
+        await browser.evaluate((id) => {
+          document.getElementById(id)?.remove();
+          return true;
+        }, fixtureId);
+      }
     });
   }
 });
