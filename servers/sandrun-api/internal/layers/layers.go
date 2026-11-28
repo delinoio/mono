@@ -38,6 +38,8 @@ type Options struct {
 	WorkTiming       *work.Timing
 	WatchQueueTiming work.WatchQueueTiming
 	DevSessionTiming devsession.Timing
+	// ReconcileDriverObserver observes driver decisions in integration fixtures.
+	ReconcileDriverObserver func(runnerID string, registered bool)
 	// GitHub configures the GitHub App layer; a nil Client leaves it off.
 	GitHub github.Options
 	// AgentTiming overrides the agent session watcher and claim poller
@@ -99,6 +101,7 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 				timing = *opts.WorkTiming
 			}
 			out.Engine = work.Register(r, out.Links, out.Profiles, m, timing, opts.WatchQueueTiming)
+			out.Engine.SetReconcileDriverObserver(opts.ReconcileDriverObserver)
 			out.DevSessions = devsession.Register(r, out.Engine, opts.DevSessionTiming)
 			out.GitHub = github.Register(r, out.Engine, m, opts.GitHub)
 			out.Agents = agent.Register(r, out.Engine, out.Integrations, opts.AgentTiming)
