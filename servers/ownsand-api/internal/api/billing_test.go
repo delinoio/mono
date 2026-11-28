@@ -879,8 +879,12 @@ func TestBillingRPCs(t *testing.T) {
 		t.Fatalf("repeated link: %v", err)
 	}
 
-	// Usage of the current month, one entry per meter in order.
-	window := billing.WindowStart(env.Clock.Now())
+	// Stay in the current month and let the usage window enter the reporting allowance.
+	now := env.Clock.Now()
+	window := billing.WindowStart(now)
+	if untilReportable := window.Add(billing.WindowLength - time.Minute).Sub(now); untilReportable > 0 {
+		env.Clock.Advance(untilReportable)
+	}
 	if _, err := fake.Client().ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: []*accountsv1.UsageReport{
 		{Service: billing.ServiceID, OrganizationId: org.ID, Meter: accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, WindowStart: timestamppb.New(window), Quantity: 10, AmountUsdMicros: 45},
 	}})); err != nil {
