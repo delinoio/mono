@@ -59,6 +59,39 @@ func TestExtendedPath(t *testing.T) {
 		if got := extendedPath(c.in); got != c.want {
 			t.Errorf("%s: extendedPath(%q) = %q, want %q", c.name, c.in, got, c.want)
 		}
+		if got := extendedReadPath(c.in); got != c.want {
+			t.Errorf("%s: extendedReadPath(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+func TestExtendedPathReadSuffixes(t *testing.T) {
+	t.Parallel()
+	longDrive := longDrivePath(`C:\ownsand`) + `\file.txt`
+	longUNC := `\\server\share` + strings.Repeat(`\`+strings.Repeat("u", 40), 6) + `\file.txt`
+	for _, suffix := range []string{".", " "} {
+		cases := []struct {
+			path string
+			want string
+		}{
+			{longDrive + suffix, `\\?\` + longDrive},
+			{longUNC + suffix, `\\?\UNC\` + longUNC[2:]},
+			{`\\?\` + longDrive + suffix, `\\?\` + longDrive + suffix},
+			{`\\?\UNC\` + longUNC[2:] + suffix, `\\?\UNC\` + longUNC[2:] + suffix},
+			{`C:\ownsand\file.txt` + suffix, `C:\ownsand\file.txt` + suffix},
+		}
+		for _, c := range cases {
+			if got := extendedReadPath(c.path); got != c.want {
+				t.Errorf("extendedReadPath(%q) = %q, want %q", c.path, got, c.want)
+			}
+		}
+		if got, want := extendedPath(longDrive+suffix), `\\?\`+longDrive+suffix; got != want {
+			t.Errorf("extendedPath(%q) = %q, want %q", longDrive+suffix, got, want)
+		}
+	}
+	invalid := longDrive + "\x00"
+	if got := extendedReadPath(invalid); got != invalid {
+		t.Errorf("extendedReadPath(%q) = %q, want original spelling", invalid, got)
 	}
 }
 
@@ -79,9 +112,13 @@ func TestExtendedPathRelative(t *testing.T) {
 // prefixed form that CreateFile received.
 func TestStatSourceErrorKeepsOriginalPath(t *testing.T) {
 	t.Parallel()
+	path := makeLongFile(t, "hello")
 	for _, path := range []string{
 		longDrivePath(filepath.Join(t.TempDir(), "missing")),
 		filepath.Join(t.TempDir(), "missing"),
+		filepath.Dir(path) + `\missing.txt.`,
+		`\\?\` + path + ".",
+		`\\?\` + path + " ",
 	} {
 		_, err := statSource(path)
 		var pe *fs.PathError
@@ -123,10 +160,12 @@ func TestStatSourceLongPath(t *testing.T) {
 	t.Parallel()
 	path := makeLongFile(t, "hello")
 	for name, p := range map[string]string{
-		"ordinary":     path,
-		"slashes":      strings.ReplaceAll(path, `\`, `/`),
-		"extended":     `\\?\` + path,
-		"dot segments": filepath.Dir(path) + `\.\sub\..\file.txt`,
+		"ordinary":       path,
+		"slashes":        strings.ReplaceAll(path, `\`, `/`),
+		"extended":       `\\?\` + path,
+		"dot segments":   filepath.Dir(path) + `\.\sub\..\file.txt`,
+		"trailing dot":   path + ".",
+		"trailing space": path + " ",
 	} {
 		info, err := statSource(p)
 		if err != nil {
@@ -139,10 +178,14 @@ func TestStatSourceLongPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: os.Open(%q): %v", name, p, err)
 		}
-		inInfo, err := in.Stat()
+		inInfo, statErr := in.Stat()
+		data, readErr := io.ReadAll(in)
 		in.Close()
-		if err != nil {
-			t.Fatal(err)
+		if statErr != nil {
+			t.Fatalf("%s: stat open file: %v", name, statErr)
+		}
+		if readErr != nil || string(data) != "hello" {
+			t.Fatalf("%s: read open file: content %q, error %v", name, data, readErr)
 		}
 		if !os.SameFile(info, inInfo) {
 			t.Fatalf("%s: statSource and os.Open name different files", name)
@@ -159,11 +202,13 @@ func TestMakeSnapshotLongPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := makeLongFile(t, "hello")
-	dst := filepath.Join(m.dir, "snap")
-	if _, n, created, err := m.makeSnapshot(path, dst); err != nil || !created || n != 5 {
-		t.Fatalf("makeSnapshot of a long path: size %d, created %v, error %v", n, created, err)
-	}
-	if got, err := os.ReadFile(dst); err != nil || string(got) != "hello" {
-		t.Fatalf("snapshot content %q, error %v", got, err)
+	for name, suffix := range map[string]string{"ordinary": "", "trailing-dot": ".", "trailing-space": " "} {
+		dst := filepath.Join(m.dir, name)
+		if _, n, created, err := m.makeSnapshot(path+suffix, dst); err != nil || !created || n != 5 {
+			t.Fatalf("%s: makeSnapshot size %d, created %v, error %v", name, n, created, err)
+		}
+		if got, err := os.ReadFile(dst); err != nil || string(got) != "hello" {
+			t.Fatalf("%s: snapshot content %q, error %v", name, got, err)
+		}
 	}
 }
