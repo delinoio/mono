@@ -619,6 +619,9 @@ type guest struct {
 	snapshots map[string]readSnapshot
 	reads     []*sandrunv1.ReadDevSessionFileRequest
 	wg        sync.WaitGroup
+
+	// afterExecAdmitted is a test hook called without locks before command setup.
+	afterExecAdmitted func()
 }
 
 func newGuest(s *Server) *guest {
@@ -715,6 +718,9 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 	p, execs, err := g.admitExec(ds, req)
 	if err != nil {
 		return nil, err
+	}
+	if g.afterExecAdmitted != nil {
+		g.afterExecAdmitted()
 	}
 	done := func() {
 		execs.wg.Done()

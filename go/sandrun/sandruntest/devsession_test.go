@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
@@ -368,70 +368,76 @@ func TestListDevSessionsFilters(t *testing.T) {
 const streamTestExecID = "018f0000-0000-7000-8000-00000000000a"
 
 func TestCloseDuringExecStart(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the fake guest runs POSIX sleep")
-	}
 	workspace := t.TempDir()
-	for round := range 300 {
-		testCloseDuringExecStart(t, workspace, round)
-	}
-}
+	synctest.Test(t, func(t *testing.T) {
+		ds := &sandrunv1.DevSession{
+			OrganizationId: "org",
+			DevSessionId:   "session",
+			State:          sandrunv1.RequestState_REQUEST_STATE_RUNNING,
+			WorkspacePath:  workspace,
+		}
+		s := &Server{
+			sessions:     []*sandrunv1.DevSession{ds},
+			sessionExecs: make(map[string]*sessionExecs),
+		}
+		g := newGuest(s)
+		defer g.cancel()
 
-func testCloseDuringExecStart(t *testing.T, workspace string, round int) {
-	t.Helper()
-	const execs = 8
-	s := New()
-	defer s.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	var calls sync.WaitGroup
-	defer func() {
-		cancel()
-		calls.Wait()
-	}()
-	ready := make(chan struct{}, execs)
-	start := make(chan struct{})
-	s.BeforeExec = func(*sandrunv1.ExecDevSessionRequest) {
-		ready <- struct{}{}
-		select {
-		case <-start:
-		case <-ctx.Done():
+		admitted, resume := make(chan struct{}), make(chan struct{})
+		release := sync.OnceFunc(func() { close(resume) })
+		defer release()
+		g.afterExecAdmitted = func() {
+			close(admitted)
+			<-resume
 		}
-	}
-	client, ds := createExecTestSession(t, ctx, s, workspace)
-	for range execs {
-		calls.Go(func() {
-			stream, err := client.ExecDevSession(ctx, listTestRequest(&sandrunv1.ExecDevSessionRequest{
-				OrganizationId: ds.GetOrganizationId(), DevSessionId: ds.GetDevSessionId(),
-				ExecId: s.newID(), Command: []string{"sleep", "30"},
-			}))
-			if err == nil {
-				defer stream.Close()
-				for stream.Receive() {
-				}
-			}
-		})
-	}
-	for range execs {
-		select {
-		case <-ready:
-		case <-ctx.Done():
-			t.Fatalf("round %d: execs did not reach the start gate: %v", round, ctx.Err())
-		}
-	}
-	close(start)
-	time.Sleep(time.Duration(rand.IntN(500)) * time.Microsecond)
-	s.Close()
 
-	s.guest.mu.Lock()
-	defer s.guest.mu.Unlock()
-	for id, p := range s.guest.execs {
-		p.mu.Lock()
-		finished := p.final != nil
-		p.mu.Unlock()
-		if !finished {
-			t.Errorf("round %d: Close returned before exec %s finished", round, id)
+		started := make(chan error, 1)
+		go func() {
+			_, err := g.start(ds, &sandrunv1.ExecDevSessionRequest{
+				ExecId:           streamTestExecID,
+				Command:          []string{"unused"},
+				WorkingDirectory: "missing",
+			})
+			started <- err
+		}()
+		select {
+		case <-admitted:
+		case err := <-started:
+			t.Fatalf("start returned before the admission hook: %v", err)
 		}
-	}
+		p := g.execs[streamTestExecID]
+		if p == nil {
+			t.Fatalf("exec %s was not registered", streamTestExecID)
+		}
+		if p.final != nil {
+			t.Fatalf("paused exec already has a terminal event: %v", p.final)
+		}
+
+		closed := make(chan *sandrunv1.DevSessionExecEvent, 1)
+		go func() {
+			g.close()
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			closed <- p.final
+		}()
+		<-g.ctx.Done()
+		synctest.Wait()
+		select {
+		case <-closed:
+			t.Fatal("guest close returned while exec startup was paused")
+		default:
+		}
+
+		release()
+		final := <-closed
+		want := sandrunv1.ExecFailureReason_EXEC_FAILURE_REASON_WORKING_DIRECTORY_INVALID
+		if final.GetFailed().GetReason() != want {
+			t.Fatalf("terminal event when guest close returned = %v, want failure %v", final, want)
+		}
+		if err := <-started; err != nil {
+			t.Fatalf("start returned an error: %v", err)
+		}
+	})
 }
 
 func TestCloseReapsRunningExec(t *testing.T) {
