@@ -1,0 +1,12 @@
+{
+  "app.language": "语言",
+  "appInfo.loading": "正在加载应用详情…",
+  "appInfo.browser": "当前在浏览器中运行。请使用 Tauri 启动应用以查看运行时。",
+  "appInfo.failed": "无法加载应用详情：{message}",
+  "appInfo.version": "版本",
+  "appInfo.runtime": "WebView 运行时",
+  "appInfo.platform": "平台",
+  "appInfo.platformValue": "{platform} ({os})",
+  "runtime.cef": "Chromium 嵌入式框架",
+  "runtime.wry": "系统 WebView"
+}

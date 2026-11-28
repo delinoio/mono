@@ -9,8 +9,10 @@
     "dev": "rsbuild dev",
     "preview": "rsbuild preview",
     "tauri": "node tauri.mjs",
-    "test": "node --test tauri.test.mjs",
-    "typecheck": "tsc --noEmit"
+    "test": "delino-i18n check && node --test tauri.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "i18n:check": "delino-i18n check",
+    "i18n:translate": "delino-i18n translate"
   },
   "dependencies": {
     "@tauri-apps/api": "3.0.0-alpha.3",
@@ -24,6 +26,7 @@
     "@types/node": "24.19.2",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
+    "delino-i18n": "workspace:*",
     "typescript": "6.0.3"
   }
 }

@@ -54,6 +54,9 @@ importers:
       '@types/react-dom':
         specifier: 19.3.0
         version: 19.3.0(@types/react@19.3.0)
+      delino-i18n:
+        specifier: workspace:*
+        version: link:../../packages/delino-i18n
       typescript:
         specifier: 6.0.3
         version: 6.0.3

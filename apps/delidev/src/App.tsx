@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from "react";
 import { type AppInfo, loadAppInfo, WebviewRuntime } from "./app-info.ts";
+import { useI18n } from "./i18n.ts";
 
 enum LoadState {
   Loading = "loading",
@@ -15,10 +16,10 @@ type State =
   | { kind: LoadState.Browser }
   | { kind: LoadState.Failed; message: string };
 
-const runtimeLabels: Record<WebviewRuntime, string> = {
-  [WebviewRuntime.Cef]: "Chromium Embedded Framework",
-  [WebviewRuntime.Wry]: "System webview",
-};
+const runtimeLabels = {
+  [WebviewRuntime.Cef]: "runtime.cef",
+  [WebviewRuntime.Wry]: "runtime.wry",
+} as const satisfies Record<WebviewRuntime, string>;
 
 export function App() {
   const [state, setState] = useState<State>({ kind: LoadState.Loading });
@@ -45,34 +46,62 @@ export function App() {
 
   return (
     <main className="shell">
-      <h1>DeliDev</h1>
+      <header className="header">
+        <h1>DeliDev</h1>
+        <LanguageSelect />
+      </header>
       <AppInfoPanel state={state} />
     </main>
   );
 }
 
+function LanguageSelect() {
+  const { lang, locales, setLanguage, t } = useI18n();
+  return (
+    <label className="language">
+      <span>{t("app.language")}</span>
+      <select
+        value={lang}
+        onChange={(event) => {
+          setLanguage(event.target.value).catch((error: unknown) => {
+            console.error("language selection failed", error);
+          });
+        }}
+      >
+        {locales.map((locale) => (
+          <option key={locale.lang} value={locale.lang} lang={locale.lang}>
+            {locale.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function AppInfoPanel({ state }: { state: State }) {
+  const { t } = useI18n();
   switch (state.kind) {
     case LoadState.Loading:
-      return <p aria-busy="true">Loading app details…</p>;
+      return <p aria-busy="true">{t("appInfo.loading")}</p>;
     case LoadState.Browser:
-      return (
-        <p>
-          Running in a browser. Start the app with Tauri to see the runtime.
-        </p>
-      );
+      return <p>{t("appInfo.browser")}</p>;
     case LoadState.Failed:
-      return <p role="alert">Could not load app details: {state.message}</p>;
+      return (
+        <p role="alert">{t("appInfo.failed", { message: state.message })}</p>
+      );
     case LoadState.Ready:
       return (
         <dl className="details">
-          <dt>Version</dt>
+          <dt>{t("appInfo.version")}</dt>
           <dd>{state.info.version}</dd>
-          <dt>Webview runtime</dt>
-          <dd>{runtimeLabels[state.info.runtime]}</dd>
-          <dt>Platform</dt>
+          <dt>{t("appInfo.runtime")}</dt>
+          <dd>{t(runtimeLabels[state.info.runtime])}</dd>
+          <dt>{t("appInfo.platform")}</dt>
           <dd>
-            {state.info.platform} ({state.info.os})
+            {t("appInfo.platformValue", {
+              platform: state.info.platform,
+              os: state.info.os,
+            })}
           </dd>
         </dl>
       );
