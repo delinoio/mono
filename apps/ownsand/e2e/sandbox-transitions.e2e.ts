@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code } from "@connectrpc/connect";
+import { SandboxState } from "@delino/ownsand-protos/v1/common_pb";
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { MOCK_IDS } from "../src/mock/mock-api.ts";
@@ -29,6 +31,28 @@ const sandboxPage = test.extend<{
 });
 
 describe("sandbox transitions", () => {
+  for (const method of ["pauseSandbox", "resumeSandbox"] as const) {
+    test(`${method} reports an offline device and preserves the record`, async ({
+      app,
+      browser,
+    }) => {
+      await app.open("/sandbox-offline.html");
+
+      const result = await browser.evaluate(
+        (action) => window.tryOfflineSandboxTransition(action),
+        method,
+      );
+
+      expect(result).toEqual({
+        code: Code.Unavailable,
+        message: "the sandbox's device is offline",
+        state: SandboxState.UNREACHABLE,
+        lastKnownState: SandboxState.RUNNING,
+        recordUnchanged: true,
+      });
+    });
+  }
+
   for (const {
     action,
     nextAction,

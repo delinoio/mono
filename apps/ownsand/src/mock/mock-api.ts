@@ -1814,6 +1814,12 @@ export function createMockTransport(
       pauseSandbox(req) {
         const { org } = membership(req.organizationId);
         const s = findSandbox(org, req.sandboxId);
+        if (s.state === SandboxState.UNREACHABLE) {
+          throw new ConnectError(
+            "the sandbox's device is offline",
+            Code.Unavailable,
+          );
+        }
         if (
           s.state !== SandboxState.RUNNING &&
           s.state !== SandboxState.PAUSED
@@ -1830,6 +1836,12 @@ export function createMockTransport(
         const { org } = membership(req.organizationId);
         requireBillingAllowed(org);
         const s = findSandbox(org, req.sandboxId);
+        if (s.state === SandboxState.UNREACHABLE) {
+          throw new ConnectError(
+            "the sandbox's device is offline",
+            Code.Unavailable,
+          );
+        }
         if (
           s.state !== SandboxState.RUNNING &&
           s.state !== SandboxState.PAUSED
