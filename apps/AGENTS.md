@@ -18,6 +18,8 @@
 
 - Write all source and comments in English.
 
+- Keep user-visible text in the app's source catalog `i18n/messages/en.json` (Rspress apps: also the pages in `docs/en/`), not in components. After changing source text, run `pnpm i18n:translate` and commit the reviewed translations with the change; the app `test` script fails on missing or stale translations. Follow [the localization contract](../docs/repository-localization-contract.md).
+
 ## Owning contracts
 
 - [Repository defaults](../docs/repository-defaults.md)
@@ -25,6 +27,7 @@
 - [Authentication](../docs/repository-auth-contract.md)
 - [Billing currency and precision](../docs/repository-billing-contract.md)
 - [End-to-end testing](../docs/repository-e2e-contract.md)
+- [Localization](../docs/repository-localization-contract.md)
 - `apps/delino-site/`: [project index](../docs/project-delino-site.md) and [foundation contract](../docs/apps-delino-site-foundation.md)
 - `apps/delino-docs/`: [project index](../docs/project-delino-docs.md) and [foundation contract](../docs/apps-delino-docs-foundation.md)
 - `apps/delino-accounts/`: [project index](../docs/project-delino-accounts.md) and [web app foundation contract](../docs/apps-delino-accounts-foundation.md)

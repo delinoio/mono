@@ -12,6 +12,7 @@
 
 - [Repository defaults](../docs/repository-defaults.md)
 - [Repository workflow](../docs/repository-workflow-contract.md)
+- `packages/delino-i18n/`: [project index](../docs/project-delino-i18n.md) and [foundation contract](../docs/packages-delino-i18n-foundation.md)
 - `packages/delino-ui/`: [project index](../docs/project-delino-ui.md) and [foundation contract](../docs/packages-delino-ui-foundation.md)
 - `packages/ownsand-sdk/`: [project index](../docs/project-ownsand.md) and [SDK foundation contract](../docs/packages-ownsand-sdk-foundation.md)
 - `packages/sandrun-sdk/`: [project index](../docs/project-sandrun.md) and [SDK foundation contract](../docs/packages-sandrun-sdk-foundation.md)
