@@ -58,7 +58,8 @@ func newHarness(t *testing.T, mutate func(*Config)) *harness {
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	srv, err := New(cfg)
+	// A caller may pass the state directory of an earlier server.
+	srv, err := newAfterRelease(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

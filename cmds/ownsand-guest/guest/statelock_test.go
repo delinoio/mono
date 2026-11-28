@@ -7,8 +7,43 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
+
+// forkReleaseWait bounds how long newAfterRelease retries a start that finds
+// the state directory lock still held.
+const forkReleaseWait = 5 * time.Second
+
+// newAfterRelease starts a server on a state directory that an earlier server
+// may just have released.
+//
+// Workaround: the tests of this package run in parallel, and some of them run
+// commands, which forks the test process. Until the child calls exec, it holds
+// a copy of every open file descriptor of the process, including the state
+// directory lock of a server that another test closes at that moment. The
+// flock then stays held after Close, and a replacement on the same directory
+// fails with ErrStateDirInUse. On Linux, os/exec forks with vfork while it
+// holds syscall.ForkLock for writing, so taking the read lock waits until
+// every pending child has called exec. Other systems release ForkLock before
+// the child calls exec, so a start that still finds the lock held is retried
+// for up to forkReleaseWait. Scope: test starts on a state directory that an
+// earlier server released; a test that expects ErrStateDirInUse calls New
+// directly. Remove it when the tests that run commands no longer run in
+// parallel with the tests that restart a server.
+func newAfterRelease(cfg Config) (*Server, error) {
+	syscall.ForkLock.RLock()
+	syscall.ForkLock.RUnlock()
+	deadline := time.Now().Add(forkReleaseWait)
+	for {
+		srv, err := New(cfg)
+		if !errors.Is(err, ErrStateDirInUse) || time.Now().After(deadline) {
+			return srv, err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
 
 func TestNewRejectsSecondServerOnStateDir(t *testing.T) {
 	t.Parallel()
@@ -42,7 +77,7 @@ func TestNewRejectsSecondServerOnStateDir(t *testing.T) {
 	// and clears the snapshots of the earlier helper.
 	first.Close()
 	first.Close() // Close is idempotent.
-	replacement, err := New(Config{StateDir: dir})
+	replacement, err := newAfterRelease(Config{StateDir: dir})
 	if err != nil {
 		t.Fatalf("replacement after Close: %v", err)
 	}
@@ -70,7 +105,7 @@ func TestNewReleasesStateDirAfterFailedStart(t *testing.T) {
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Config{StateDir: dir})
+	srv, err := newAfterRelease(Config{StateDir: dir})
 	if err != nil {
 		t.Fatalf("start after a failed start: %v", err)
 	}
