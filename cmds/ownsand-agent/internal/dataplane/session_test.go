@@ -6,8 +6,11 @@ package dataplane
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -132,7 +135,11 @@ func (w *world) session(t *testing.T, dp *DataPlane, ch *fakeChannel, expiresIn 
 }
 
 func newPlane(w *world, timing Timing) *DataPlane {
-	dp := New(Options{Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), Timing: timing, IncludeLoopback: true, InterfaceFilter: loopbackOnly})
+	return newPlaneWithLogger(w, timing, logger())
+}
+
+func newPlaneWithLogger(w *world, timing Timing, logger *slog.Logger) *DataPlane {
+	dp := New(Options{Dispatcher: w.d, Sandboxes: w.m, Logger: logger, Timing: timing, IncludeLoopback: true, InterfaceFilter: loopbackOnly})
 	w.t.Cleanup(dp.Close)
 	return dp
 }
@@ -215,24 +222,63 @@ func TestSessionEndRules(t *testing.T) {
 }
 
 func TestSessionIdleAndLabel(t *testing.T) {
-	w := newWorld(t)
-	dp := newPlane(w, Timing{SessionIdle: time.Second})
-	ch := newChannel(1)
-	dp.ChannelOpened(ch)
-	c, _ := w.session(t, dp, ch, time.Hour)
-	c.waitClosed()
+	t.Run("quiet session", func(t *testing.T) {
+		w := newWorld(t)
+		dp := newPlane(w, Timing{SessionIdle: time.Second})
+		ch := newChannel(1)
+		dp.ChannelOpened(ch)
+		c, _ := w.session(t, dp, ch, time.Hour)
+		c.waitClosed()
+	})
 
-	other, sdp := newCaller(t, "something-else")
-	answer := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: w.sandbox, ExpiresIn: durationpb.New(time.Hour), Sdp: sdp})
-	if err := other.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.GetSdp()}); err != nil {
-		t.Fatal(err)
-	}
-	other.waitClosed()
+	t.Run("unexpected label", func(t *testing.T) {
+		const lifetime = time.Hour
+		w := newWorld(t)
+		logs := &logBuffer{}
+		dp := newPlaneWithLogger(w, Timing{SessionIdle: lifetime}, slog.New(slog.NewJSONHandler(logs, nil)))
+		ch := newChannel(1)
+		dp.ChannelOpened(ch)
+		c, sdp := newCaller(t, "something-else")
+		id := newID(t)
+		answer := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: id, SandboxId: w.sandbox, ExpiresIn: durationpb.New(lifetime), Sdp: sdp})
+		if err := answer.GetError(); err != nil {
+			t.Fatalf("offer failed: %v", err)
+		}
+		if err := c.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.GetSdp()}); err != nil {
+			t.Fatal(err)
+		}
+		c.waitClosed()
 
-	// Offers for a sandbox that is not running are rejected.
-	if a := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: newID(t), ExpiresIn: durationpb.New(time.Hour), Sdp: sdp}); a.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
-		t.Fatalf("unknown sandbox %v", a)
-	}
+		// The agent writes the warning before it closes the data channel.
+		output := logs.String()
+		for line := range strings.Lines(output) {
+			var event struct {
+				Message   string `json:"msg"`
+				SessionID string `json:"session_id"`
+				LabelOK   *bool  `json:"label_ok"`
+				Reliable  bool   `json:"reliable"`
+			}
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				t.Fatalf("decode data plane log: %v", err)
+			}
+			if event.Message == "rejecting a data channel" && event.SessionID == id && event.LabelOK != nil && !*event.LabelOK && event.Reliable {
+				return
+			}
+		}
+		t.Fatalf("data channel closed without a rejection for session %s (label_ok=false, reliable=true):\n%s", id, output)
+	})
+
+	t.Run("unknown sandbox", func(t *testing.T) {
+		w := newWorld(t)
+		dp := newPlane(w, Timing{})
+		ch := newChannel(1)
+		dp.ChannelOpened(ch)
+		_, sdp := newCaller(t, DataChannelLabel)
+		answer := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: newID(t), ExpiresIn: durationpb.New(time.Hour), Sdp: sdp})
+		if answer.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+			t.Fatalf("unknown sandbox %v", answer)
+		}
+	})
 }
 
 // idleSession opens a session with a long idle time, so the watcher never
