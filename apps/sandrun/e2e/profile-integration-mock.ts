@@ -35,6 +35,10 @@ import {
 import { observeDisplayNameWrites } from "./display-name-fixture.ts";
 import { createMockTransport as createSettingsMock } from "./settings-mock.ts";
 import {
+  caseInsensitiveAcmeTransport,
+  ORGANIZATION_SWITCHER_FIXTURE,
+} from "./organization-switcher-fixture.ts";
+import {
   pagedProfileIntegrations,
   PROFILE_INTEGRATION_FIXTURE,
 } from "./profile-integration-fixture.ts";
@@ -161,6 +165,9 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
     return transport;
   }
 
+  if (sessionStorage.getItem(ORGANIZATION_SWITCHER_FIXTURE) === "true") {
+    return caseInsensitiveAcmeTransport(createSettingsMock(options));
+  }
   const setup = sessionStorage.getItem(SETUP_GUIDANCE_FIXTURE);
   if (setup === "with-work-source") {
     return linkedSetupTransport(createSettingsMock(options), [

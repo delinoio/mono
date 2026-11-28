@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, test, type WebFixtures } from "@e2e-dev/web";
+import { beforeEach, describe, test, type WebFixtures } from "@e2e-dev/web";
 import { expect, type TestFixtures } from "e2e";
 import { Role } from "@delino/sandrun-protos/v1/common_pb";
 import {
@@ -20,6 +20,10 @@ import { ORGANIZATION_CREATION_FIXTURE } from "./organization-creation-fixture.t
 import { MOCK_IDS } from "../src/mock/mock-api.ts";
 import { REQUEST_CANCELLATION_FIXTURE } from "./request-cancellation-fixture.ts";
 import { DISPLAY_NAME_FIXTURE } from "./display-name-fixture.ts";
+import {
+  ACME_UUID_SPELLINGS,
+  ORGANIZATION_SWITCHER_FIXTURE,
+} from "./organization-switcher-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 import {
@@ -1006,6 +1010,61 @@ describe("organization settings", () => {
     ).toBeVisible();
     await expect(input).toHaveValue("4");
     await expect(save).toBeDisabled();
+  });
+});
+
+describe("organization switcher UUIDs", () => {
+  beforeEach(async ({ app, browser, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "true");
+      return null;
+    }, ORGANIZATION_SWITCHER_FIXTURE);
+  });
+
+  for (const [spelling, organizationId] of Object.entries(
+    ACME_UUID_SPELLINGS,
+  )) {
+    test(`selects Acme by name from the ${spelling} Members URL`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      const path = `/orgs/${organizationId}/members`;
+      await app.open(path);
+
+      const members = screen.getByRole("heading", "Members", { level: 1 });
+      await expect(members).toBeVisible();
+      const switcher = screen.getByRole("combobox", "Organization");
+      await expect(switcher).toContainText("Acme Robotics");
+      await switcher.tap();
+      await expect(screen.getByRole("option", "Acme Robotics")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      await expect(browser).toHaveURL(path);
+      await app.screenshot(`organization-switcher-${spelling}-uuid`);
+    });
+  }
+
+  test("keeps Members active when switching from a mixed-case URL", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open(`/orgs/${ACME_UUID_SPELLINGS.mixed}/members`);
+    const members = screen.getByRole("heading", "Members", { level: 1 });
+    await expect(members).toBeVisible();
+    const switcher = screen.getByRole("combobox", "Organization");
+    await switcher.tap();
+    await screen.getByRole("option", "Northwind Labs").tap();
+
+    await expect(browser).toHaveURL(`/orgs/${NORTHWIND}/members`);
+    await expect(switcher).toContainText("Northwind Labs");
+    await expect(members).toBeVisible();
+    await app.screenshot("organization-switcher-after-switch");
   });
 });
 
