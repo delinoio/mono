@@ -3646,18 +3646,23 @@ func TestMacOSSnapshotHardwareModels(t *testing.T) {
 	b := add(ownsandv1.GuestOs_GUEST_OS_MACOS, "model-b")
 	// A Linux snapshot never reports a macOS hardware model.
 	add(ownsandv1.GuestOs_GUEST_OS_LINUX, "model-c")
-	models := map[string]bool{}
-	for _, m := range e.m.MacOSHardwareModels() {
-		models[string(m)] = true
+	assertModels := func(stage string) {
+		t.Helper()
+		models := e.m.MacOSHardwareModels()
+		got := make([]string, 0, len(models))
+		for _, model := range models {
+			got = append(got, string(model))
+		}
+		slices.Sort(got)
+		want := []string{"model-a", "model-b"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("models %s = %q, want %q", stage, got, want)
+		}
 	}
-	if len(models) != 2 || !models["model-a"] || !models["model-b"] {
-		t.Fatalf("models %v", models)
-	}
+	assertModels("before restart")
 	// The record keeps the model across an agent restart.
 	e.restart()
-	if len(e.m.MacOSHardwareModels()) != 2 {
-		t.Fatalf("models after restart %q", e.m.MacOSHardwareModels())
-	}
+	assertModels("after restart")
 	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: b}); err != nil {
 		t.Fatal(err)
 	}
