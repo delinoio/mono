@@ -34,6 +34,7 @@ import (
 // personal API key) and an admin delete sessions, a member cannot delete
 // another member's session.
 func TestDevSessionQueueAndDeletion(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.MaxSandboxes = 1 })
@@ -153,6 +154,7 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 }
 
 func TestDevSessionPerUserLimit(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
@@ -190,6 +192,7 @@ func TestDevSessionPerUserLimit(t *testing.T) {
 
 // TestDevSessionEnds covers the end reasons of the runner lifecycle.
 func TestDevSessionEnds(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
 	member := w.env.User(w.org.Member)
@@ -287,6 +290,7 @@ func collectExec(t *testing.T, stream interface {
 }
 
 func TestDevSessionExecResumeOffsets(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	s, _ := w.runningSession(t)
 	ctx := t.Context()
@@ -392,6 +396,7 @@ func TestDevSessionExecResumeOffsets(t *testing.T) {
 }
 
 func TestDevSessionExecGuestTimestamps(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	s, _ := w.runningSession(t)
 	start := time.Date(2024, time.January, 1, 0, 0, 0, 123456789, time.UTC)
@@ -475,6 +480,7 @@ func TestDevSessionExecGuestTimestamps(t *testing.T) {
 }
 
 func TestDevSessionExec(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{StreamLimit: 600 * time.Millisecond, KeepaliveInterval: 150 * time.Millisecond})
 	ctx := context.Background()
 	s, _ := w.runningSession(t)
@@ -598,6 +604,7 @@ func TestDevSessionExec(t *testing.T) {
 }
 
 func TestDevSessionFiles(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	s, sandboxID := w.runningSession(t)
@@ -686,6 +693,7 @@ func TestDevSessionFiles(t *testing.T) {
 }
 
 func TestDevSessionFilesWriteRanges(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	session, sandboxID := w.runningSession(t)
 	owner := w.env.User(w.org.Member)
@@ -820,6 +828,7 @@ func TestDevSessionFilesWriteRanges(t *testing.T) {
 }
 
 func TestDevSessionFilesReadPathBinding(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	session, sandboxID := w.runningSession(t)
 	owner := w.env.User(w.org.Member)
@@ -873,6 +882,7 @@ func TestDevSessionFilesReadPathBinding(t *testing.T) {
 }
 
 func TestDevSessionFileReadSnapshotEOF(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	session, sandboxID := w.runningSession(t)
 	owner := w.env.User(w.org.Member)
@@ -934,6 +944,7 @@ func TestDevSessionFileReadSnapshotEOF(t *testing.T) {
 }
 
 func TestDevSessionWindowsUNCPaths(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	const workspace = `C:\work`
 	profile := devProfileProto("windows-dev", 0, 0)
@@ -1039,6 +1050,7 @@ func TestDevSessionWindowsUNCPaths(t *testing.T) {
 }
 
 func TestDevSessionExecOwnSandValidation(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	s, _ := w.runningSession(t)
 	sdk, err := (ownsandclient.SDKFactory{BaseURL: "http://127.0.0.1:1"}).New(w.osOrg, ownsandKey('a'))
@@ -1067,6 +1079,7 @@ func TestDevSessionExecOwnSandValidation(t *testing.T) {
 }
 
 func TestDevSessionFilesOwnSandErrors(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	s, sandboxID := w.runningSession(t)
@@ -1222,6 +1235,7 @@ func (w *workWorld) waitState(t *testing.T, id string, state sandrunv1.RequestSt
 // profile deletion that holds the profile row and then fails with
 // not_found, so no session of a deleted profile stays queued.
 func TestCreateDevSessionDuringProfileDeletion(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

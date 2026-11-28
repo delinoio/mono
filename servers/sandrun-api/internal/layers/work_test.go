@@ -39,6 +39,7 @@ import (
 // deletes the running session's sandbox (ENDED, MEMBER_REMOVED) and cancels
 // the queued one (CANCELED, MEMBER_REMOVED).
 func TestMembershipEndWithSessionsAndKeys(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.MaxSandboxes = 1 })
@@ -78,6 +79,7 @@ func TestMembershipEndWithSessionsAndKeys(t *testing.T) {
 // sandbox and is replaced; when OwnSand has no capacity, the dispatcher
 // deletes the warm runner of the lowest priority profile.
 func TestWarmRunnersAndReclaim(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.MaxSandboxes = 2 })
 	warmID := w.createProfile(t, devProfileProto("warm", 1, sandrunv1.Priority_PRIORITY_LOW))
@@ -117,6 +119,7 @@ func TestWarmRunnersAndReclaim(t *testing.T) {
 }
 
 func TestDispatchDemandAfterOwnSandLinkReplacement(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		kind   sandrunv1.WorkloadKind
@@ -233,6 +236,7 @@ func (f *dispatchLinkFactory) New(orgID, key string) (ownsandclient.Client, erro
 }
 
 func TestWarmReservationDuringProfileDeletion(t *testing.T) {
+	t.Parallel()
 	t.Run("stale dispatch cannot reserve", func(t *testing.T) {
 		w := newWorkWorld(t, devsession.Timing{})
 		ctx := context.Background()
@@ -425,6 +429,7 @@ func TestWarmCreateRejectionDoesNotSpin(t *testing.T) {
 }
 
 func TestWarmPreparationFailureBacksOffAndReadyRunnerClearsRetry(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	w.fake.SetExec(func(_ context.Context, _ string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
 		exitCode := int64(1)
@@ -448,6 +453,7 @@ func TestWarmPreparationFailureBacksOffAndReadyRunnerClearsRetry(t *testing.T) {
 }
 
 func TestWarmInFlightRejectionDoesNotBackOffNewProfileRevision(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	started, release, duplicate := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
 	var first sync.Once
@@ -511,6 +517,7 @@ func profileRunnerCount(t *testing.T, w *workWorld, profileID string, state sand
 }
 
 func TestGetCapacityAllocatedVCPU(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	work := w.env.User(w.org.Member).Work
 	for _, tc := range []struct {
@@ -549,6 +556,7 @@ func TestGetCapacityAllocatedVCPU(t *testing.T) {
 }
 
 func TestWorkService(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	w.fake.SetDevices(w.osOrg, &ownsandv1.Device{DeviceId: "device-0", Name: "linux-box", State: ownsandv1.DeviceState_DEVICE_STATE_ONLINE,
@@ -671,6 +679,7 @@ func TestWorkService(t *testing.T) {
 }
 
 func TestDeleteRunnerUsesLockedState(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -750,6 +759,7 @@ func TestDeleteRunnerUsesLockedState(t *testing.T) {
 // the OwnSand link deletes the runners and ends the sessions; deleting the
 // organization deletes the remaining sandboxes.
 func TestCleanUps(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin)
@@ -820,6 +830,7 @@ func isEnded(s sandrunv1.RequestState) bool {
 // sandbox, DeleteOrganization fails, the organization stays and its
 // dispatcher still starts new work.
 func TestOrganizationDeletionFailureKeepsDispatch(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
@@ -843,6 +854,7 @@ func TestOrganizationDeletionFailureKeepsDispatch(t *testing.T) {
 // TestConcurrentCancelRequest: parallel cancellations of one queued request
 // cancel it once; the others get failed_precondition.
 func TestConcurrentCancelRequest(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
@@ -881,6 +893,7 @@ func TestConcurrentCancelRequest(t *testing.T) {
 // lost and an admin then changes the profile, the retry sends the original
 // parameters with the key and recovers the created sandbox.
 func TestCreateRetryAfterProfileChange(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
@@ -907,6 +920,7 @@ func TestCreateRetryAfterProfileChange(t *testing.T) {
 // created sandbox. The runner keeps its key and recovers that sandbox; no
 // second sandbox is created.
 func TestLostCreateResponseAsUnavailable(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
@@ -927,6 +941,7 @@ func TestLostCreateResponseAsUnavailable(t *testing.T) {
 // was lost stays DELETING until SandRun found its sandbox with the stored key,
 // and the sandbox is deleted.
 func TestDeleteAfterLostCreateResponse(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx := context.Background()
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
@@ -956,6 +971,7 @@ func TestDeleteAfterLostCreateResponse(t *testing.T) {
 }
 
 func TestDeleteSandboxNow(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		revokeKey   bool
@@ -1007,6 +1023,7 @@ func TestDeleteSandboxNow(t *testing.T) {
 }
 
 func TestDeleteSandboxAttemptTimeout(t *testing.T) {
+	t.Parallel()
 	timing := testenv.FastWorkTiming()
 	timing.DeleteTimeout = 150 * time.Millisecond
 	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
@@ -1262,6 +1279,7 @@ func TestTeardownSandboxDeleteAttemptTimeout(t *testing.T) {
 }
 
 func TestDeleteSandboxRetry(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		revokeKey   bool
@@ -1311,6 +1329,7 @@ func TestDeleteSandboxRetry(t *testing.T) {
 }
 
 func TestStartFailureAfterSandboxStatusDeadline(t *testing.T) {
+	t.Parallel()
 	timing := testenv.FastWorkTiming()
 	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
 	unavailable := connect.NewWireError(connect.CodeUnavailable, errors.New("OwnSand temporarily unavailable"))
@@ -1386,6 +1405,7 @@ func TestStartFailureAfterSandboxStatusDeadline(t *testing.T) {
 }
 
 func TestStartFailureSandboxStatusBeforeDeadline(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		recovered bool
@@ -1433,6 +1453,7 @@ func TestStartFailureSandboxStatusBeforeDeadline(t *testing.T) {
 // TestStartFailureCleanupRetry: when the sandbox deletion after a start
 // failure fails, SandRun retries it until OwnSand deletes the sandbox.
 func TestStartFailureCleanupRetry(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
 	w.fake.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
@@ -1458,6 +1479,7 @@ func TestStartFailureCleanupRetry(t *testing.T) {
 }
 
 func TestStartFailureCleanupRetryAfterCancellationAndTimeout(t *testing.T) {
+	t.Parallel()
 	timing := testenv.FastWorkTiming()
 	timing.TerminalCleanupTimeout = 2 * time.Second
 	w := newWorkWorldWithTiming(t, devsession.Timing{}, &timing)
@@ -1555,6 +1577,7 @@ func TestStartFailureCleanupRetryAfterCancellationAndTimeout(t *testing.T) {
 }
 
 func TestTerminalSandboxCleanupBeforeTeardown(t *testing.T) {
+	t.Parallel()
 	for _, teardown := range []struct {
 		name   string
 		delete bool
@@ -1673,6 +1696,7 @@ func TestTerminalSandboxCleanupBeforeTeardown(t *testing.T) {
 // answers ends at CreateTimeout, so the dispatcher goes on; the runner keeps
 // its key and its driver creates the sandbox.
 func TestStalledCreateSandbox(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
 	var stalled sync.Once
@@ -1696,6 +1720,7 @@ func TestStalledCreateSandbox(t *testing.T) {
 }
 
 func TestWatchQueueSnapshotReplay(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name      string
 		openFirst bool
@@ -1743,6 +1768,7 @@ func TestWatchQueueSnapshotReplay(t *testing.T) {
 }
 
 func TestWatchQueueSnapshotReplayChanges(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	q := w.env.DB.Pool
 	seedWatchRequests(t, q, w.org.ID, "open", sandrunv1.RequestState_REQUEST_STATE_RUNNING, 2)
@@ -1765,6 +1791,7 @@ func TestWatchQueueSnapshotReplayChanges(t *testing.T) {
 }
 
 func TestWatchQueueLateCommit(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name           string
 		beforeSnapshot bool
@@ -1876,6 +1903,7 @@ func assertQueueWatchIdle(t *testing.T, watch *connect.ServerStreamForClient[san
 // after OwnSand had no capacity is sent once more as DELETED, so a watch
 // does not keep it.
 func TestWatchQueueRemovedRunner(t *testing.T) {
+	t.Parallel()
 	w := newWorkWorld(t, devsession.Timing{})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -2018,6 +2046,7 @@ func TestWatchQueueCommitOrder(t *testing.T) {
 }
 
 func TestWatchQueueSnapshotAcrossTables(t *testing.T) {
+	t.Parallel()
 	// Keep the work components from waiting on the same runners lock as the watch.
 	seed := testenv.New(t)
 	eventually(t, "core instance holds lease", seed.App.Lease.Held)

@@ -76,6 +76,7 @@ func requireDirectAdmissionRows(t *testing.T, w *agentWorld, requests, workOrder
 }
 
 func TestClaudeDirectAdmission(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"commit", "rollback"} {
 		t.Run(name, func(t *testing.T) {
 			w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, 0)
@@ -148,6 +149,7 @@ func TestClaudeDirectAdmission(t *testing.T) {
 }
 
 func TestCodexDirectAdmission(t *testing.T) {
+	t.Parallel()
 	w := newCodexWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))

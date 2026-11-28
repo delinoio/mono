@@ -21,6 +21,7 @@ import (
 )
 
 func TestRunnerExecIDSaveRetry(t *testing.T) {
+	t.Parallel()
 	const (
 		preparing = sandrunv1.RunnerState_RUNNER_STATE_PREPARING
 		waiting   = sandrunv1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
@@ -84,6 +85,7 @@ func TestRunnerExecIDSaveRetry(t *testing.T) {
 }
 
 func TestRunnerExecIDSaveGuards(t *testing.T) {
+	t.Parallel()
 	t.Run("deleted runner", func(t *testing.T) {
 		s := newExecSaveScenario(t)
 		s.progress(t)

@@ -17,6 +17,7 @@ import (
 )
 
 func TestOwnSandRemovalRollbackFence(t *testing.T) {
+	t.Parallel()
 	w := newRemovalLeaseWorld(t, time.Minute, false)
 	var replicaLayers layers.Layers
 	replica := w.replica(t, &replicaLayers, false)

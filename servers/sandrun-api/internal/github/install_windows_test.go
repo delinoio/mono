@@ -14,6 +14,7 @@ import (
 // TestInstallAndStartCommandsWindowsACL uses Windows PowerShell with simulated
 // ACL operations and, when elevated, with a disposable NTFS runner directory.
 func TestInstallAndStartCommandsWindowsACL(t *testing.T) {
+	t.Parallel()
 	const policy = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
 	const extraGrant = policy + "(A;OICI;FA;;;WD)"
 	for _, tc := range []struct {

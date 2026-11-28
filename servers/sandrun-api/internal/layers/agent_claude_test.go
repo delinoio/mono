@@ -108,6 +108,7 @@ func (w *claudeWorld) storedWorkOrder(t *testing.T, requestID string) []byte {
 // exit ends the request. The environment key never reaches the guest, and
 // no secret reaches the log.
 func TestClaudeSessionLifecycle(t *testing.T) {
+	t.Parallel()
 	w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, 0)
 	p := w.proc(t)
 	if p.Spec.Path != "claude" || !slices.Equal(p.Spec.Args[:2], []string{"self-hosted-runner", "orchestrator"}) ||
@@ -215,6 +216,7 @@ func TestClaudeSessionLifecycle(t *testing.T) {
 }
 
 func TestClaudeRunnerStoredTTL(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		profileTTL time.Duration
@@ -294,6 +296,7 @@ func TestClaudeRunnerStoredTTL(t *testing.T) {
 // a spawn request that SandRun can never serve, and 1 (retry) for failures
 // that a retry can fix.
 func TestClaudeHookExitCodes(t *testing.T) {
+	t.Parallel()
 	w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_MACOS, 0)
 	p := w.proc(t)
 	for name, tc := range map[string]struct {
@@ -341,6 +344,7 @@ func TestClaudeHookExitCodes(t *testing.T) {
 // its work order expires (the expected spawn time), even when the
 // profile's maximum queue wait is longer.
 func TestClaudeWorkOrderExpiry(t *testing.T) {
+	t.Parallel()
 	w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, 2*time.Minute)
 	w.full()
 	p := w.proc(t)
@@ -359,6 +363,7 @@ func TestClaudeWorkOrderExpiry(t *testing.T) {
 }
 
 func TestClaudeWorkOrderExpiryBeforeLaunch(t *testing.T) {
+	t.Parallel()
 	const expectedSpawn = 2 * time.Minute
 	const runnerCommand = "'claude' 'self-hosted-runner'"
 	for _, scenario := range []string{"during credential write", "during order consumption", "already consumed", "on time"} {
@@ -502,6 +507,7 @@ func TestClaudeWorkOrderExpiryBeforeLaunch(t *testing.T) {
 // received the work order (here the installation) returns the request to
 // the queue with its stored work order, and the next runner uses it.
 func TestClaudeStartFailureKeepsWorkOrder(t *testing.T) {
+	t.Parallel()
 	w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, 0)
 	retry := make(chan struct{})
 	allowRetry := sync.OnceFunc(func() { close(retry) })
@@ -550,6 +556,7 @@ func TestClaudeStartFailureKeepsWorkOrder(t *testing.T) {
 // restarts it with the new key; deleting the last profile stops it with
 // SIGTERM.
 func TestClaudeOrchestratorRestart(t *testing.T) {
+	t.Parallel()
 	w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, 0)
 	first := w.proc(t)
 	w.orch.FailStarts(1)
@@ -593,6 +600,7 @@ func TestClaudeOrchestratorRestart(t *testing.T) {
 // TestClaudeOrganizationDeletion: deleting the organization stops the
 // orchestrator and ends the queued request.
 func TestClaudeOrganizationDeletion(t *testing.T) {
+	t.Parallel()
 	w := newClaudeWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, 0)
 	w.full()
 	p := w.proc(t)
@@ -610,6 +618,7 @@ func TestClaudeOrganizationDeletion(t *testing.T) {
 }
 
 func TestClaudeOrganizationDeletionWaitsForDrainingWatcher(t *testing.T) {
+	t.Parallel()
 	script := filepath.Join(t.TempDir(), "claude")
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
 trap '
@@ -772,6 +781,7 @@ while :; do sleep 0.02; done
 // variables. The hooks store requests over the socket and exit 0 during
 // the normal run and after the orchestrator receives SIGTERM.
 func TestClaudeRealProcesses(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("builds the sandrun-api binary")
 	}
@@ -853,6 +863,7 @@ while :; do sleep 0.05; done
 }
 
 func TestClaudeInheritedOutput(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("requires Unix processes and signals")
 	}

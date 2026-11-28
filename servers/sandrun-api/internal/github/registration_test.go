@@ -20,6 +20,7 @@ import (
 )
 
 func TestJITRegistrationRollback(t *testing.T) {
+	t.Parallel()
 	const writeError = "injected runner registration write failure"
 	for _, tc := range []struct {
 		name            string
@@ -164,6 +165,7 @@ func TestJITRegistrationRollback(t *testing.T) {
 }
 
 func TestJITRegistrationCleanupAfterStartFailure(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusNoContent, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			w := newGHWorld(t, worldOpts{})

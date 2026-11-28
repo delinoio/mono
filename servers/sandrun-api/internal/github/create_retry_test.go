@@ -25,6 +25,7 @@ import (
 )
 
 func TestJobSandboxCreateRejectedAfterRestart(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"queued", "expired", "canceled", "started", "warm_fill", "legacy", "removed_sponsor", "capacity"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := t.Context()

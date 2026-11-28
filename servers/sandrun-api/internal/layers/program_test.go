@@ -67,6 +67,7 @@ type runnerProgramCase struct {
 }
 
 func TestRunnerProgramLifecycle(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []runnerProgramCase{
 		{
 			name: "successful exit", runnerReason: sandrunv1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE,

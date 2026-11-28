@@ -23,6 +23,7 @@ import (
 )
 
 func TestCreateAndUpdateAgentIntegrationValidateCursorPoolName(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	admin := w.env.User(w.org.Admin).Integration
 	const invalidPool = `team"a`
@@ -71,6 +72,7 @@ func TestCreateAndUpdateAgentIntegrationValidateCursorPoolName(t *testing.T) {
 }
 
 func TestAgentIntegrations(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	admin := w.env.User(w.org.Admin)
@@ -270,6 +272,7 @@ func equalIntegration(a, b *sandrunv1.AgentIntegration) bool {
 }
 
 func TestAgentIntegrationReadSnapshot(t *testing.T) {
+	t.Parallel()
 	for _, mutation := range []string{"update", "delete"} {
 		t.Run(mutation, func(t *testing.T) {
 			w := newWorld(t)
@@ -399,6 +402,7 @@ func keyOf(t *testing.T, w *world) []secrets.Key {
 // has the old primary key keeps the key ID, so the job must not write the
 // value that it read before.
 func TestReencryptKeepsConcurrentReplacement(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	resp, err := w.env.User(w.org.Admin).Integration.CreateAgentIntegration(ctx, connect.NewRequest(&sandrunv1.CreateAgentIntegrationRequest{

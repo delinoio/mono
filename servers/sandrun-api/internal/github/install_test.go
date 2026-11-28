@@ -12,6 +12,7 @@ import (
 // TestRunnerChecksums fails when Renovate (or a person) changes the pinned
 // runner version without the checksums of the new release archives.
 func TestRunnerChecksums(t *testing.T) {
+	t.Parallel()
 	if RunnerVersion != runnerChecksumsVersion {
 		t.Fatalf("RunnerVersion %s has no checksums (runnerSHA256 is for %s): copy the sha256 values of the six archives from the release notes of v%s",
 			RunnerVersion, runnerChecksumsVersion, RunnerVersion)
@@ -24,6 +25,7 @@ func TestRunnerChecksums(t *testing.T) {
 }
 
 func TestInstallAndStartCommands(t *testing.T) {
+	t.Parallel()
 	releaseURL := "https://github.com/actions/runner/releases/download/v" + RunnerVersion + "/"
 	for _, tc := range []struct {
 		guest       sandrunv1.GuestOs
