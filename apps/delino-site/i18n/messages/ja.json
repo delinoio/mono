@@ -34,5 +34,6 @@
   "theme.promptCopyText": "プロンプトをコピー",
   "theme.promptCopiedText": "コピーしました",
   "theme.promptExpandText": "展開",
-  "theme.promptCollapseText": "折りたたむ"
+  "theme.promptCollapseText": "折りたたむ",
+  "nav.darkMode": "ダークモード"
 }

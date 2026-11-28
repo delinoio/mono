@@ -9,6 +9,8 @@ import { Link as BaseLink } from "@rspress/core/theme-original";
 import { localizeCrossSiteHref } from "./cross-site-link";
 
 export * from "@rspress/core/theme-original";
+export { NavHamburger } from "./nav-hamburger";
+export { SwitchAppearance } from "./switch-appearance";
 
 // Workaround: the marketing site has no documentation search (docs.delino.io
 // owns it), but the Rspress 2.1.3 default theme `Nav` mounts `<Search />`
