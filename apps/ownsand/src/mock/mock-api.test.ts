@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { clone } from "@bufbuild/protobuf";
 import { type Timestamp, timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { afterEach, describe, expect, rs, test } from "@rstest/core";
@@ -29,6 +30,7 @@ import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import {
+  SandboxSchema,
   type SandboxSource,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
@@ -364,6 +366,63 @@ describe("mock device list", () => {
     expect(sandbox?.endReason).toBe(SandboxEndReason.DELETED_BY_CALLER);
     expect(sandbox?.endTime).toEqual(timestampFromMs(removalTime - 1000));
     expect(await sandboxes.getSandbox(other)).toEqual(unaffected);
+  });
+});
+
+describe("mock sandbox pause and resume", () => {
+  const organizationId = MOCK_IDS.acme;
+  const methods = ["pauseSandbox", "resumeSandbox"] as const;
+
+  test.each(methods)("%s rejects an unreachable sandbox", async (method) => {
+    const client = createClient(SandboxService, createMockTransport());
+    const request = { organizationId, sandboxId: MOCK_IDS.unreachableSandbox };
+    const { sandbox } = await client.getSandbox(request);
+    if (!sandbox) throw new Error("GetSandbox returned no sandbox");
+    const before = clone(SandboxSchema, sandbox);
+    expect(before.state).toBe(SandboxState.UNREACHABLE);
+    expect(before.lastKnownState).toBe(SandboxState.RUNNING);
+
+    await expect(client[method](request)).rejects.toMatchObject({
+      code: Code.Unavailable,
+      rawMessage: "the sandbox's device is offline",
+    });
+
+    expect((await client.getSandbox(request)).sandbox).toEqual(before);
+  });
+
+  test.each([
+    { method: "pauseSandbox", message: "the sandbox is not running" },
+    { method: "resumeSandbox", message: "the sandbox is not paused" },
+  ] as const)(
+    "$method rejects a deleted sandbox",
+    async ({ method, message }) => {
+      const client = createClient(SandboxService, createMockTransport());
+
+      await expect(
+        client[method]({ organizationId, sandboxId: MOCK_IDS.deletedSandbox }),
+      ).rejects.toMatchObject({
+        code: Code.FailedPrecondition,
+        rawMessage: message,
+      });
+    },
+  );
+
+  test("pauses and resumes a sandbox idempotently", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const request = { organizationId, sandboxId: MOCK_IDS.runningSandbox };
+
+    expect((await client.pauseSandbox(request)).sandbox?.state).toBe(
+      SandboxState.PAUSED,
+    );
+    expect((await client.pauseSandbox(request)).sandbox?.state).toBe(
+      SandboxState.PAUSED,
+    );
+    expect((await client.resumeSandbox(request)).sandbox?.state).toBe(
+      SandboxState.RUNNING,
+    );
+    expect((await client.resumeSandbox(request)).sandbox?.state).toBe(
+      SandboxState.RUNNING,
+    );
   });
 });
 
@@ -1501,12 +1560,12 @@ describe("mock billing", () => {
     expect(res.billing?.reason).toBe(BillingReason.ACCOUNT_REQUIRED);
   });
 
-  test("rejects resource creation of a blocked organization with a billing reason", async () => {
+  test("checks billing before resuming an unreachable sandbox", async () => {
     const transport = createMockTransport({
       billing: { [organizationId]: MockBillingState.BlockedLinked },
     });
     const error = (await createClient(SandboxService, transport)
-      .resumeSandbox({ organizationId, sandboxId: MOCK_IDS.pausedSandbox })
+      .resumeSandbox({ organizationId, sandboxId: MOCK_IDS.unreachableSandbox })
       .catch((e: unknown) => e)) as ConnectError;
     expect(error.code).toBe(Code.ResourceExhausted);
     expect(error.rawMessage).toContain("https://accounts.delino.io");

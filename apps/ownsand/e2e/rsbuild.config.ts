@@ -14,6 +14,7 @@ export default mergeRsbuildConfig(consoleConfig, {
       "enrollment-token": "./e2e/enrollment-token-fixture.ts",
       "member-row-identity": "./e2e/member-row-identity-fixture.tsx",
       "sandbox-idempotency": "./e2e/sandbox-idempotency-fixture.ts",
+      "sandbox-offline": "./e2e/sandbox-offline-fixture.ts",
     },
   },
   resolve: {
