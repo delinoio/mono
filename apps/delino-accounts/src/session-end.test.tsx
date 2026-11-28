@@ -12,6 +12,7 @@ import {
 import { LogtoAuthProvider } from "./auth.tsx";
 import { Accounts } from "./App.tsx";
 import { API_RESOURCE } from "./config.ts";
+import { seedLogtoIdToken } from "./testing/logto-session.ts";
 import { TEST_CONFIG } from "./testing/render.tsx";
 
 /**
@@ -21,13 +22,6 @@ import { TEST_CONFIG } from "./testing/render.tsx";
  * signed-out screen.
  */
 const SETTINGS = { endpoint: "https://logto.test", appId: "app", scopes: [] };
-
-function base64Url(value: object): string {
-  return btoa(JSON.stringify(value))
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
-}
 
 /**
  * Upper bound for every wait on real Logto SDK work (discovery, the rejected
@@ -49,12 +43,7 @@ beforeEach(() => {
   window.localStorage.clear();
   requested = [];
   const key = (item: string) => `logto:${SETTINGS.appId}:${item}`;
-  const idToken = [
-    base64Url({ alg: "ES384", typ: "JWT" }),
-    base64Url({ sub: "user-owner", iss: "https://logto.test/oidc" }),
-    "signature",
-  ].join(".");
-  window.localStorage.setItem(key("idToken"), idToken);
+  seedLogtoIdToken(SETTINGS);
   window.localStorage.setItem(key("refreshToken"), "expired-refresh-token");
   window.localStorage.setItem(
     key("accessToken"),
