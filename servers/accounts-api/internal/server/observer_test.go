@@ -2001,10 +2001,16 @@ func TestStallWithFewerThanFourHeadBytesIsNotAHeaderReadTimeout(t *testing.T) {
 // does not skip.
 func TestLeadingCRLFDuringTheHandlerKeepsTheRejectedRequestStart(t *testing.T) {
 	const post = "POST /slow HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+	const syncTimeout = 2 * time.Second
+	handlerEntered := make(chan *connObserver, 1)
+	handlerRelease := make(chan struct{})
+	releaseHandler := sync.OnceFunc(func() { close(handlerRelease) })
 	addr, logs := serveObserved(t, func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(300 * time.Millisecond)
+		handlerEntered <- observerFrom(r.Context())
+		<-handlerRelease
 		_, _ = io.WriteString(w, "ok")
 	})
+	t.Cleanup(releaseHandler)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -2018,10 +2024,32 @@ func TestLeadingCRLFDuringTheHandlerKeepsTheRejectedRequestStart(t *testing.T) {
 		}
 	}
 	write(post)
-	time.Sleep(50 * time.Millisecond)
+	var obs *connObserver
+	select {
+	case obs = <-handlerEntered:
+		if obs == nil {
+			t.Fatal("request context has no connection observer")
+		}
+	case <-time.After(syncTimeout):
+		t.Fatal("timed out waiting for the POST handler to start")
+	}
 	// One byte per write: net/http reads a single byte in the background while
 	// the handler runs.
 	write("\r")
+	ackDeadline := time.Now().Add(syncTimeout)
+	for {
+		obs.mu.Lock()
+		skipped := obs.leadingSkipped
+		obs.mu.Unlock()
+		if skipped == 1 {
+			break
+		}
+		if !time.Now().Before(ackDeadline) {
+			t.Fatalf("timed out waiting for the observer to skip the leading CR: leadingSkipped = %d", skipped)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	releaseHandler()
 	// Wait for the response, so the handler has ended when the next bytes go.
 	var response []byte
 	buf := make([]byte, 512)
@@ -2063,9 +2091,9 @@ func TestLeadingCRLFDuringTheHandlerKeepsTheRejectedRequestStart(t *testing.T) {
 	if record.Reason != string(RejectionMalformedRequest) || record.Status != http.StatusBadRequest {
 		t.Errorf("record = %+v, want a malformed_request 400", record)
 	}
-	// The handler ended about 300 ms after the POST and the rejection came about
-	// 700 ms after that. Without the fix the start is the "\n" byte that arrived
-	// 300 ms after the handler ended, so the logged duration is about 400 ms.
+	// The rejection comes about 700 ms after the handler ends. If the observer
+	// starts at the "\n" byte sent 300 ms after the response, the logged
+	// duration is about 400 ms.
 	if record.DurationMS < 600 {
 		t.Errorf("duration_ms = %v, want at least 600 from the end of the handler: %s", record.DurationMS, logs.String())
 	}
