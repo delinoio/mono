@@ -1939,18 +1939,21 @@ function holdingTransport(hold: (method: string, call: number) => boolean) {
 
 describe("device limits", () => {
   test("saves an explicit zero with the strict RPC", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
     const disk = await screen.findByLabelText("Disk limit (GiB)");
     await settle();
-    await act(async () => {
-      fireEvent.input(disk, { target: { value: "0" } });
-      fireEvent.blur(disk);
-    });
-    await settle();
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
-    });
-    await settle(60);
+    expect((disk as HTMLInputElement).value).toBe("500");
+    await commit(disk, "0");
+    await save();
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0]?.diskGib).toBe(0n);
     expect(
       (await screen.findAllByText("The device limits are saved.")).length,
     ).toBeGreaterThan(0);
