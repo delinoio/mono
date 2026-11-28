@@ -50,17 +50,25 @@ func (q linkDispatchTrace) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data 
 
 type linkDispatchClient struct {
 	accountsv1connect.UsageServiceClient
-	recorder *linkDispatchRecorder
+	recorder     *linkDispatchRecorder
+	observations chan linkDispatchObservation
 }
 
+var errLinkDispatchMissingDeadline = errors.New("Accounts LinkOrganization dispatch context has no deadline")
+
 type linkDispatchObservation struct {
+	hasDeadline bool
+	budget      time.Duration
+}
+
+type linkDispatchRecord struct {
 	calls       int
 	firstBudget time.Duration
 }
 
 type linkDispatchRecorder struct {
 	mu          sync.Mutex
-	observation linkDispatchObservation
+	observation linkDispatchRecord
 }
 
 func (r *linkDispatchRecorder) record(budget time.Duration) {
@@ -72,16 +80,51 @@ func (r *linkDispatchRecorder) record(budget time.Duration) {
 	r.observation.calls++
 }
 
-func (r *linkDispatchRecorder) snapshot() linkDispatchObservation {
+func (r *linkDispatchRecorder) snapshot() linkDispatchRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.observation
 }
 
 func (c linkDispatchClient) LinkOrganization(ctx context.Context, req *connect.Request[accountsv1.LinkOrganizationRequest]) (*connect.Response[accountsv1.LinkOrganizationResponse], error) {
-	deadline, _ := ctx.Deadline()
-	c.recorder.record(time.Until(deadline))
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		c.recorder.record(0)
+		if c.observations != nil {
+			c.observations <- linkDispatchObservation{hasDeadline: false}
+		}
+		return nil, errLinkDispatchMissingDeadline
+	}
+	budget := time.Until(deadline)
+	c.recorder.record(budget)
+	if c.observations != nil {
+		c.observations <- linkDispatchObservation{hasDeadline: true, budget: budget}
+	}
 	return c.UsageServiceClient.LinkOrganization(ctx, req)
+}
+
+func TestLinkDispatchClientRejectsMissingDeadline(t *testing.T) {
+	t.Parallel()
+	fake := accountstest.New(t, nil)
+	observations := make(chan linkDispatchObservation, 1)
+	var recorder linkDispatchRecorder
+	client := linkDispatchClient{UsageServiceClient: fake.Client(), recorder: &recorder, observations: observations}
+
+	_, err := client.LinkOrganization(context.Background(), connect.NewRequest(&accountsv1.LinkOrganizationRequest{}))
+	if !errors.Is(err, errLinkDispatchMissingDeadline) {
+		t.Errorf("LinkOrganization error = %v, want %v", err, errLinkDispatchMissingDeadline)
+	}
+	select {
+	case observation := <-observations:
+		if observation.hasDeadline {
+			t.Error("LinkOrganization observation reports a deadline, want no deadline")
+		}
+	default:
+		t.Error("no LinkOrganization dispatch observation")
+	}
+	if calls := fake.Calls(accountstest.MethodLinkOrganization); calls != 0 {
+		t.Errorf("Accounts link calls = %d, want 0", calls)
+	}
 }
 
 type linkDispatchStub struct {
@@ -210,10 +253,11 @@ func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
 				},
 			}
 			var recorder linkDispatchRecorder
+			observations := make(chan linkDispatchObservation, 1)
 			f = newLinkAttemptFixture(t, "dispatch-owner", func(o *app.Options) {
 				testDB = o.DB
 				o.DB = linkDispatchDB(t, testDB, trace)
-				o.UsageClient = linkDispatchClient{UsageServiceClient: o.UsageClient, recorder: &recorder}
+				o.UsageClient = linkDispatchClient{UsageServiceClient: o.UsageClient, recorder: &recorder, observations: observations}
 			})
 
 			wantCalls := 0
@@ -223,12 +267,25 @@ func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
 				t.Cleanup(gate.Release)
 			}
 			err := f.link(f.org.OwnerClient, billingAccountA)
-			observation := recorder.snapshot()
-			if observation.calls != wantCalls {
-				t.Errorf("recorded Accounts link calls = %d, want %d", observation.calls, wantCalls)
+			record := recorder.snapshot()
+			var dispatchObservation linkDispatchObservation
+			dispatched := false
+			select {
+			case dispatchObservation = <-observations:
+				dispatched = true
+				if !dispatchObservation.hasDeadline {
+					t.Fatal(errLinkDispatchMissingDeadline)
+				}
+			default:
+			}
+			if record.calls != wantCalls {
+				t.Errorf("recorded Accounts link calls = %d, want %d", record.calls, wantCalls)
 			}
 			if calls := f.fake.Calls(accountstest.MethodLinkOrganization); calls != wantCalls {
 				t.Errorf("fake Accounts link calls = %d, want %d", calls, wantCalls)
+			}
+			if dispatched != (wantCalls == 1) {
+				t.Errorf("Accounts link dispatch observed = %t, want %t", dispatched, wantCalls == 1)
 			}
 			if testenv.Code(err) != tc.wantCode {
 				t.Fatalf("link = %v, want %v", err, tc.wantCode)
@@ -236,9 +293,12 @@ func TestBillingLinkDispatchAfterOwnershipLookup(t *testing.T) {
 			if logged := strings.Contains(f.env.Logs.String(), "billing_link_attempt_expired_before_dispatch"); logged != tc.wantExpiry {
 				t.Errorf("expiration logged = %t, want %t", logged, tc.wantExpiry)
 			}
-			if observation.calls == 1 && wantCalls == 1 {
-				if budget := observation.firstBudget; budget <= 0 || budget > tc.wantRemainingBudget {
+			if record.calls == 1 && wantCalls == 1 {
+				if budget := record.firstBudget; budget <= 0 || budget > tc.wantRemainingBudget {
 					t.Errorf("Accounts call budget = %v, want (0, %v]", budget, tc.wantRemainingBudget)
+				}
+				if budget := dispatchObservation.budget; budget <= 0 || budget > tc.wantRemainingBudget {
+					t.Errorf("Accounts observed call budget = %v, want (0, %v]", budget, tc.wantRemainingBudget)
 				}
 			}
 			if wantCalls == 1 {
