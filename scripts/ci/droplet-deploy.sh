@@ -1039,7 +1039,7 @@ write_route() {
     rm -f "$pending"
     return 1
   fi
-  if ! mv -f "$pending" "$site"; then
+  if ! mv -fT -- "$pending" "$site"; then
     echo "::error::could not install the new route as $site." >&2
     rm -f "$pending"
     return 1

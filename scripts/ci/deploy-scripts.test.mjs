@@ -5102,6 +5102,49 @@ test(
 );
 
 test(
+  "droplet deploy fails and keeps the route directory when it blocks a UDP deployment",
+  { skip: skipDroplet },
+  (t) => {
+    const current = `${olderImage}\n`;
+    const previous = `${oldestImage}\n`;
+    const sentinel = "keep this file\n";
+    const sites = "caddy/sites";
+    const route = `${sites}/api.caddy`;
+    const result = runDroplet(t, udpArgs, {
+      old: ["old1"],
+      state: current,
+      previous,
+      prepare(root) {
+        mkdirSync(join(root, route));
+        writeFileSync(join(root, route, "sentinel"), sentinel);
+      },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(
+      result.stderr.includes(
+        `::error::could not install the new route as ${join(result.deployRoot, route)}.`,
+      ),
+      result.stderr,
+    );
+    assert.match(
+      result.stderr,
+      /route of api was not switched; the previous containers were started again/,
+    );
+    assert.deepEqual(readdirSync(join(result.deployRoot, sites)), [
+      "api.caddy",
+    ]);
+    assert.deepEqual(readdirSync(join(result.deployRoot, route)), ["sentinel"]);
+    assert.equal(result.read(`${route}/sentinel`), sentinel);
+    assert.equal(result.read("state/api.current"), current);
+    assert.equal(result.read("state/api.previous"), previous);
+    assert.ok(!result.calls.some((call) => call.startsWith("docker exec ")));
+    assert.ok(result.calls.includes("docker stop --time 30 old1"));
+    assert.match(result.calls.at(-2), /^docker rm --force api-/);
+    assert.equal(result.calls.at(-1), "docker start old1");
+  },
+);
+
+test(
   "droplet deploy prints the replacement logs before it removes it when the route fails",
   { skip: skipDroplet },
   (t) => {
