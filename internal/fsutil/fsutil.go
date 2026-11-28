@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -455,17 +454,30 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 	if err := checkLinksConfined(root, links); err != nil {
 		return err
 	}
-	// A tar can list a directory after its children. Apply the deepest
-	// modes first so that every parent stays searchable until its children
-	// have their final modes.
-	keys := slices.SortedFunc(maps.Keys(dirs), func(a, b string) int {
-		return tarDirectoryDepth(b) - tarDirectoryDepth(a)
-	})
-	for _, key := range keys {
+	// Resolve every deferred path before applying final modes. A symbolic
+	// link can make a child path look shallower than the directory that
+	// contains it, so archive-name depth is not sufficient for ordering.
+	resolvedDirs := make([]dirMode, 0, len(dirs))
+	for _, dir := range dirs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		dir := dirs[key]
+		path, err := resolveTarDirectory(root, dir.path)
+		if err != nil {
+			return err
+		}
+		resolvedDirs = append(resolvedDirs, dirMode{path: path, perm: dir.perm})
+	}
+	// A tar can list a directory after its children. Apply the deepest
+	// modes first so that every parent stays searchable until its children
+	// have their final modes.
+	slices.SortFunc(resolvedDirs, func(a, b dirMode) int {
+		return tarDirectoryDepth(b.path) - tarDirectoryDepth(a.path)
+	})
+	for _, dir := range resolvedDirs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := setTarDirectoryMode(root, dir.path, dir.perm); err != nil {
 			return err
 		}
@@ -540,6 +552,58 @@ func tarDirectoryDepth(name string) int {
 		return 0
 	}
 	return 1 + strings.Count(name, string(filepath.Separator))
+}
+
+// resolveTarDirectory follows symbolic links within root and returns the
+// resolved root-relative path. It runs before final directory modes are
+// applied, while every extracted path remains searchable.
+func resolveTarDirectory(root *os.Root, name string) (string, error) {
+	pending := strings.Split(name, string(filepath.Separator))
+	resolved := make([]string, 0, len(pending))
+	linksLeft := 255
+	for len(pending) > 0 {
+		part := pending[0]
+		pending = pending[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) == 0 {
+				return "", fmt.Errorf("fsutil: tar directory %q resolves outside the target directory", name)
+			}
+			resolved = resolved[:len(resolved)-1]
+			continue
+		}
+
+		candidate := filepath.Join(append(resolved, part)...)
+		info, err := root.Lstat(candidate)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			if len(pending) > 0 && !info.IsDir() {
+				return "", &fs.PathError{Op: "resolve", Path: candidate, Err: syscall.ENOTDIR}
+			}
+			resolved = append(resolved, part)
+			continue
+		}
+		if linksLeft == 0 {
+			return "", &fs.PathError{Op: "resolve", Path: name, Err: syscall.ELOOP}
+		}
+		linksLeft--
+		target, err := root.Readlink(candidate)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
+			return "", fmt.Errorf("fsutil: tar directory %q resolves outside the target directory", name)
+		}
+		pending = append(strings.Split(target, string(filepath.Separator)), pending...)
+	}
+	if len(resolved) == 0 {
+		return ".", nil
+	}
+	return filepath.Join(resolved...), nil
 }
 
 func setTarDirectoryMode(root *os.Root, name string, mode fs.FileMode) error {
