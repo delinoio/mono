@@ -4,7 +4,9 @@ package api_test
 
 import (
 	"context"
+	"slices"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -68,11 +70,17 @@ func TestOpenSessionRevokedKeyBeforeRegistration(t *testing.T) {
 	if testenv.Code(err) != connect.CodeUnauthenticated {
 		t.Fatalf("open session with a revoked key: %v", err)
 	}
-	if n := offersReceived(agent); n != offers {
-		t.Fatalf("the agent received %d offers, want %d", n, offers)
-	}
 	if n := plane.SessionCount(); n != 0 {
 		t.Fatalf("%d sessions after the rejected call", n)
+	}
+	// The agent records earlier envelopes on this stream before answering the owner's offer.
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	if _, err := org.OwnerClient.DataPath.OpenSession(ctx, openSessionRequest(org.ID, sandboxID)); err != nil {
+		t.Fatalf("open session as the owner: %v", err)
+	}
+	if n, want := offersReceived(agent), offers+1; n != want {
+		t.Fatalf("the agent received %d offers, want %d", n, want)
 	}
 }
 
@@ -118,14 +126,17 @@ func TestAuthorizeRelayRevokedKeyBeforeRegistration(t *testing.T) {
 	if plane.Grants.Len() != 1 {
 		t.Fatalf("%d grants after the rejected call, want 1", plane.Grants.Len())
 	}
-	if ids := grantsReceived(agent); len(ids) != 1 || ids[0] != grantID {
-		t.Fatalf("grants sent = %v, want only %s", ids, grantID)
-	}
-	// A user is not affected.
-	userCtx := auth.WithPrincipal(context.Background(), auth.Principal{Kind: ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER, ID: org.Owner})
+	// The agent records earlier envelopes on this stream before acknowledging the user's grant.
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	userCtx := auth.WithPrincipal(ctx, auth.Principal{Kind: ownsandv1.PrincipalKind_PRINCIPAL_KIND_USER, ID: org.Owner})
 	userAuth, _ := uuidv7.NewString()
-	if _, err := handler.AuthorizeRelay(userCtx, newReq(other, userAuth)); err != nil {
+	userGrant, err := handler.AuthorizeRelay(userCtx, newReq(other, userAuth))
+	if err != nil {
 		t.Fatalf("authorize relay as a user: %v", err)
+	}
+	if ids, want := grantsReceived(agent), []string{grantID, userGrant.Msg.GetGrantId()}; !slices.Equal(ids, want) {
+		t.Fatalf("grant history = %v, want %v", ids, want)
 	}
 }
 
