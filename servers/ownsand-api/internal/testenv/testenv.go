@@ -266,6 +266,9 @@ func (e *Env) StartPeer() *Env {
 	o := e.opts
 	o.DB = d
 	o.InstanceID = ""
+	// Renewal controls for the original worker must not affect a peer.
+	o.LeaseRenew = nil
+	o.LeaseRenewTicks = nil
 	a, err := app.New(o)
 	if err != nil {
 		d.Close()
