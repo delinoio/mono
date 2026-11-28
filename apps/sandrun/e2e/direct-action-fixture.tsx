@@ -23,6 +23,7 @@ const appId = "direct-action-fixture";
 const params = new URLSearchParams(window.location.search);
 const action = params.get("action");
 const failure = params.get("failure");
+const delay = params.get("delay") === "true";
 
 async function start() {
   const mock = createMockTransport({ failFirstAcmeMemberContinuation: false });
@@ -39,7 +40,8 @@ async function start() {
     async unary(method, ...args) {
       if (method.name !== action) return mock.unary(method, ...args);
       document.body.dataset.actionRequests = String(++actionRequests);
-      if (failure === "delayed") {
+      if (delay) {
+        if (actionRequests > 1) return mock.unary(method, ...args);
         await new Promise<void>((resolve) => {
           window.addEventListener("release-direct-action", () => resolve(), {
             once: true,

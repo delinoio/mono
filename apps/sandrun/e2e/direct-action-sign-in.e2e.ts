@@ -8,6 +8,16 @@ const SESSION_ENDED = "Your session ended. Sign in again.";
 const SIGN_IN = "Sign in with Delino";
 const SIGN_IN_FAILURE =
   "Sign-in did not start. Check your connection and try again.";
+const PERMISSION_ERROR = "You do not have permission to do this.";
+
+async function releaseDirectAction() {
+  window.dispatchEvent(new Event("release-direct-action"));
+  // Let the rejected mutation and its React update settle.
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  });
+  return true;
+}
 
 describe("sign-in recovery from direct actions", () => {
   for (const [action, page, list] of [
@@ -70,7 +80,7 @@ describe("sign-in recovery from direct actions", () => {
           await expect(
             screen
               .getByRole("region", "Notifications")
-              .getByText("You do not have permission to do this."),
+              .getByText(PERMISSION_ERROR),
           ).toBeVisible();
           await expect(signIn).toHaveCount(0);
           expect(signIns).toBe(0);
@@ -88,34 +98,80 @@ describe("sign-in recovery from direct actions", () => {
     }
   }
 
-  test("ignores a delayed GitHub failure after switching organizations", async ({
+  for (const failure of ["session", "permission"] as const) {
+    test(`ignores a delayed GitHub ${failure} error after switching organizations`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await browser.setViewport({ width: 1280, height: 900 });
+      await app.open(
+        `/direct-action-fixture.html?action=CreateGitHubInstallUrl&failure=${failure}&delay=true`,
+      );
+      await screen.getByRole("button", "Connect GitHub").tap();
+      const body = browser.locator("body");
+      await expect(body).toHaveAttribute("data-action-requests", "1");
+      await screen.getByRole("combobox", "Organization").tap();
+      await screen.getByRole("option", "Globex").tap();
+      await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
+
+      await browser.evaluate(releaseDirectAction);
+
+      await expect(body).toHaveAttribute("data-action-rejected", "true");
+      await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
+      await expect(screen.getByText(SESSION_ENDED)).toHaveCount(0);
+      await expect(screen.getByRole("button", SIGN_IN)).toHaveCount(0);
+      await expect(
+        screen.getByRole("region", "Notifications").getByText(PERMISSION_ERROR),
+      ).toHaveCount(0);
+      await expect(
+        screen.getByText("No GitHub organization is connected"),
+      ).toBeVisible();
+      if (failure === "permission") {
+        await app.screenshot("github-stale-permission-error");
+      }
+    });
+  }
+
+  test("shows a delayed GitHub permission error and can retry on the same visit", async ({
     app,
     browser,
     screen,
   }) => {
-    await app.open(
-      "/direct-action-fixture.html?action=CreateGitHubInstallUrl&failure=delayed",
-    );
-    await screen.getByRole("button", "Connect GitHub").tap();
-    const body = browser.locator("body");
-    await expect(body).toHaveAttribute("data-action-requests", "1");
-    await screen.getByRole("combobox", "Organization").tap();
-    await screen.getByRole("option", "Globex").tap();
-    await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
-    await browser.evaluate(async () => {
-      window.dispatchEvent(new Event("release-direct-action"));
-      // Let the rejected mutation and its React update settle.
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    await browser.setViewport({ width: 1280, height: 900 });
+    const installUrl =
+      /^https:\/\/github\.com\/apps\/sandrun\/installations\/new\?state=.+$/;
+    let redirects = 0;
+    await browser.route(installUrl, async (route) => {
+      redirects++;
+      await route.fulfill({
+        contentType: "text/plain",
+        body: "Mock GitHub installation",
       });
-      return true;
     });
+    await app.open(
+      "/direct-action-fixture.html?action=CreateGitHubInstallUrl&failure=permission&delay=true",
+    );
+    const connect = screen.getByRole("button", "Connect GitHub");
+    await connect.tap();
+    await expect(browser.locator("body")).toHaveAttribute(
+      "data-action-requests",
+      "1",
+    );
+    await expect(connect).toBeDisabled();
+    await browser.evaluate(releaseDirectAction);
 
-    await expect(body).toHaveAttribute("data-action-rejected", "true");
-    await expect(screen.getByText(SESSION_ENDED)).toHaveCount(0);
-    await expect(screen.getByRole("button", SIGN_IN)).toHaveCount(0);
-    await expect(
-      screen.getByText("No GitHub organization is connected"),
-    ).toBeVisible();
+    const toast = screen
+      .getByRole("region", "Notifications")
+      .getByText(PERMISSION_ERROR);
+    await expect(toast).toBeVisible();
+    await expect(toast).toHaveCount(1);
+    await expect(connect).toBeEnabled();
+    await expect(browser).toHaveURL(`/orgs/${ACME}/integrations`);
+    await app.screenshot("github-active-permission-error");
+
+    await connect.tap();
+    await expect(browser).toHaveURL(installUrl);
+    expect(redirects).toBe(1);
   });
 });

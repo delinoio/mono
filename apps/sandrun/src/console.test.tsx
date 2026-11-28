@@ -1886,20 +1886,29 @@ describe("integrations", () => {
     }
   });
 
-  test.each([
-    ["leaving Integrations", `/orgs/${MOCK_IDS.acme}/members`],
-    ["switching organizations", `/orgs/${MOCK_IDS.globex}/integrations`],
-    ["leaving and returning", `/orgs/${MOCK_IDS.acme}/integrations`],
+  test.each(
     [
-      "leaving and returning in one render",
-      `/orgs/${MOCK_IDS.acme}/integrations`,
-    ],
-    ["a location change before popstate", `/orgs/${MOCK_IDS.acme}/members`],
-  ])(
-    "Connect GitHub discards the installation URL after %s",
-    async (scenario, path) => {
+      ["leaving Integrations", `/orgs/${MOCK_IDS.acme}/members`],
+      ["switching organizations", `/orgs/${MOCK_IDS.globex}/integrations`],
+      ["leaving and returning", `/orgs/${MOCK_IDS.acme}/integrations`],
+      [
+        "leaving and returning in one render",
+        `/orgs/${MOCK_IDS.acme}/integrations`,
+      ],
+      ["a location change before popstate", `/orgs/${MOCK_IDS.acme}/members`],
+    ].flatMap(([scenario, path]) =>
+      (["success", "error"] as const).map((status) => ({
+        scenario,
+        path,
+        status,
+      })),
+    ),
+  )(
+    "Connect GitHub discards a $status response after $scenario",
+    async ({ scenario, path, status }) => {
       const assigned: string[] = [];
       const original = externalNavigation.assign;
+      const notify = rs.spyOn(toast, "error").mockReturnValue("fixture-toast");
       externalNavigation.assign = (url) => assigned.push(url);
       try {
         const { transport, calls } = gatedTransport("CreateGitHubInstallUrl");
@@ -1942,15 +1951,21 @@ describe("integrations", () => {
         }
         expect(window.location.pathname).toBe(path);
 
-        await act(async () => calls[0].settle());
+        const error =
+          status === "error"
+            ? new ConnectError("Request failed", Code.PermissionDenied)
+            : undefined;
+        await act(async () => calls[0].settle(error));
 
         expect(queryClient.getMutationCache().getAll()[0]?.state.status).toBe(
-          "success",
+          status,
         );
+        expect(notify).not.toHaveBeenCalled();
         expect(assigned).toHaveLength(0);
         expect(window.location.pathname).toBe(path);
       } finally {
         externalNavigation.assign = original;
+        notify.mockRestore();
       }
     },
   );
