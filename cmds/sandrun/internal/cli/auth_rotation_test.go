@@ -340,16 +340,23 @@ func TestTokenSourceLimitsRefreshAttempts(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRotationFixture(t, func(f *rotationFixture, _ string, attempt int) string {
+				if attempt > 3 {
+					t.Errorf("unexpected issuer refresh request %d (limit is 3)", attempt)
+					// A response with no access token ends the refresh loop.
+					return `{}`
+				}
 				if err := f.save("session", fmt.Sprintf("rt-%d", attempt), "expired", -time.Hour); err != nil {
 					t.Error(err)
 				}
 				return tc.body
 			})
-			if _, err := f.source(io.Discard)(t.Context()); err == nil {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			if _, err := f.source(io.Discard)(ctx); err == nil {
 				t.Fatal("refresh succeeded despite every result being superseded")
 			}
-			f.assertCalls("rt-0", "rt-1", "rt-2")
 			f.assertStored("rt-3", "expired")
+			f.assertCalls("rt-0", "rt-1", "rt-2")
 		})
 	}
 }
