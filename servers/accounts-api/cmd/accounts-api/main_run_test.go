@@ -3,28 +3,19 @@
 package main
 
 import (
-	"bytes"
 	"errors"
-	"io"
+	"log"
 	"log/slog"
 	"net"
-	"os"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/config"
 )
 
 // setRunEnv sets the configuration that lets run start without external
 // services. The database pool opens lazily and RUN_MIGRATIONS=false skips the
-// migrations, so the unreachable database (port 1 refuses connections) is
-// contacted only by billing work, which these tests must never reach.
-//
-// LOG_LEVEL is set explicitly because run builds its logger from it and the
-// billing_worker_started event is logged at INFO. Without it the test would
-// inherit the parent's LOG_LEVEL, and a warn or error level would drop that
-// event and let the "worker did not start" assertion pass vacuously.
+// migrations. The fake dispatcher keeps billing work from contacting the
+// database.
 func setRunEnv(t *testing.T, metricsAddr string) {
 	t.Helper()
 	env := map[string]string{
@@ -32,7 +23,7 @@ func setRunEnv(t *testing.T, metricsAddr string) {
 		"RUN_MIGRATIONS":               "false",
 		"ADDR":                         "127.0.0.1:0",
 		"METRICS_ADDR":                 metricsAddr,
-		config.EnvLogLevel:             "info",
+		config.EnvLogLevel:             "error",
 		"LOGTO_ISSUER":                 "http://127.0.0.1:1/oidc",
 		"LOGTO_MANAGEMENT_ENDPOINT":    "http://127.0.0.1:1",
 		"LOGTO_M2M_CLIENT_ID":          "run-test",
@@ -50,40 +41,6 @@ func setRunEnv(t *testing.T, metricsAddr string) {
 	}
 }
 
-// captureRunOutput redirects os.Stdout, where run writes its logs, and
-// restores it and the default logger when the test ends. The returned function
-// stops the capture and returns the output.
-func captureRunOutput(t *testing.T) func() string {
-	t.Helper()
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
-	}
-	original := os.Stdout
-	originalLogger := slog.Default()
-	os.Stdout = writer
-	var buf bytes.Buffer
-	copied := make(chan struct{})
-	go func() {
-		defer close(copied)
-		_, _ = io.Copy(&buf, reader)
-	}()
-	stopped := false
-	stop := func() string {
-		if !stopped {
-			stopped = true
-			os.Stdout = original
-			slog.SetDefault(originalLogger)
-			_ = writer.Close()
-			<-copied
-			_ = reader.Close()
-		}
-		return buf.String()
-	}
-	t.Cleanup(func() { stop() })
-	return stop
-}
-
 // TestRunFailsOnMetricsBindErrorBeforeStartingWorker verifies that a metrics
 // listener that cannot be bound fails run before the billing worker starts, so
 // no Paddle call can begin after run has returned.
@@ -99,9 +56,23 @@ func TestRunFailsOnMetricsBindErrorBeforeStartingWorker(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setRunEnv(t, tt.metricsAddr)
-			stopCapture := captureRunOutput(t)
+			originalLogger := slog.Default()
+			originalLogWriter, originalLogFlags := log.Writer(), log.Flags()
+			t.Cleanup(func() {
+				slog.SetDefault(originalLogger)
+				log.SetOutput(originalLogWriter)
+				log.SetFlags(originalLogFlags)
+			})
 
-			err := run()
+			dispatches := 0
+			dispatchWorker := func(func() error) <-chan error {
+				dispatches++
+				result := make(chan error, 1)
+				result <- nil
+				return result
+			}
+
+			err := run(dispatchWorker)
 			if err == nil {
 				t.Fatal("run succeeded; want the metrics listen error")
 			}
@@ -109,11 +80,8 @@ func TestRunFailsOnMetricsBindErrorBeforeStartingWorker(t *testing.T) {
 			if !errors.As(err, &opErr) || opErr.Op != "listen" {
 				t.Fatalf("run error = %v; want a listen error", err)
 			}
-			// A worker that was started before the bind logs asynchronously
-			// right after it starts, so give it time to do so.
-			time.Sleep(300 * time.Millisecond)
-			if output := stopCapture(); strings.Contains(output, "billing_worker_started") {
-				t.Fatalf("billing worker started although run failed to bind METRICS_ADDR; output: %s", output)
+			if dispatches != 0 {
+				t.Errorf("billing worker dispatches = %d; want 0 after a metrics listen error", dispatches)
 			}
 		})
 	}
