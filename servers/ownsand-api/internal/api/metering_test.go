@@ -309,8 +309,13 @@ func TestRelayEgressMetering(t *testing.T) {
 	// The frame leaves the Droplet in one Connect message: its encoding plus
 	// the 5-byte envelope prefix, less when the agent accepts compression.
 	upper := int64(proto.Size(&ownsandv1.ConnectResponse{Frame: frame})) + 5 + 64
-	egress := usageOf(t, env, org.ID)[meterRelay] - received
-	if egress <= 0 || egress > upper {
+	// The agent can respond before the relay writer records the request bytes.
+	var egress int64
+	testenv.Eventually(t, "WriteFile egress counted", func() bool {
+		egress = usageOf(t, env, org.ID)[meterRelay] - received
+		return egress > 0
+	})
+	if egress > upper {
 		t.Fatalf("WriteFile egress = %d, want 1..%d", egress, upper)
 	}
 }
