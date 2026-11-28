@@ -333,6 +333,23 @@ describe("session list", () => {
     expect(watches).toBe(3);
   }, 10_000);
 
+  test("shows a stopped change stream with the sign-in action", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    const transport: Transport = {
+      ...base,
+      async stream(method, ...rest) {
+        if (method.name !== "WatchSessions")
+          return base.stream(method, ...rest);
+        throw new ConnectError("expired", Code.Unauthenticated);
+      },
+    };
+    renderConsole(`/orgs/${ACME}/sessions`, { transport });
+    await screen.findByRole("list", { name: "Sessions" });
+    expect(
+      await screen.findByRole("button", { name: "Sign in with Delino" }),
+    ).toBeTruthy();
+  });
+
   test("keeps a failed first load recoverable", async () => {
     renderConsole(`/orgs/${ACME}/sessions`, {
       mock: { failFirstSessionList: true },

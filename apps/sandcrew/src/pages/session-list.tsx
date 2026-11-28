@@ -26,6 +26,7 @@ import {
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
+  ErrorNotice,
   ListPagination,
   PageHeader,
   QueryBoundary,
@@ -209,6 +210,14 @@ export function SessionListPage() {
           </span>
         ) : null}
       </div>
+      {watch.status === StreamStatus.Failed ? (
+        // The cached list stays visible, but it no longer changes.
+        <ErrorNotice
+          title={t("chat.liveUpdatesStopped")}
+          error={watch.error}
+          onRetry={watch.retry}
+        />
+      ) : null}
       <QueryBoundary query={list} loading={t("sessions.loading")}>
         {(data) => {
           const sessions = data.pages.flatMap((p) => p.sessions);
