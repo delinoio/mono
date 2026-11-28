@@ -30,6 +30,7 @@ import {
   DataFrameKind,
   DataFrameSchema,
   ExecRequestSchema,
+  type ReadFileRequest,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
@@ -2434,12 +2435,15 @@ describe("peer-to-peer data path", () => {
     });
 
     describe("a channel failure that an old session reports late", () => {
+      const chunkSize = 1 << 10;
+      const relayOffset = 3 * chunkSize;
+      const snapshot = source(4 << 10);
+
       /**
        * Three chunks of a read, no end frame, and an exec that starts and
        * exits at once; `execStarted` leaves an exec running instead.
        */
       function stallingAgent(execStarted = false): FakeAgent {
-        const file = source(3 << 10);
         return (frame, peer) => {
           if (frame.payload.case === "execRequest") {
             execEvent(peer, frame.streamId, ev.started());
@@ -2449,7 +2453,7 @@ describe("peer-to-peer data path", () => {
             return;
           }
           if (frame.payload.case !== "fileReadRequest") return;
-          for (let at = 0; at < file.length; at += 1 << 10) {
+          for (let at = 0; at < relayOffset; at += chunkSize) {
             peer.send({
               streamId: frame.streamId,
               sandboxId: SANDBOX,
@@ -2461,7 +2465,7 @@ describe("peer-to-peer data path", () => {
                     case: "chunk",
                     value: {
                       offset: BigInt(at),
-                      data: file.subarray(at, at + (1 << 10)),
+                      data: snapshot.subarray(at, at + chunkSize),
                     },
                   },
                 },
@@ -2479,19 +2483,21 @@ describe("peer-to-peer data path", () => {
       async function pausedReadThatLosesItsChannel(p: FakeWebRtcHarness) {
         const sandbox = p.h.client.sandbox(SANDBOX);
         const wait = gate();
-        let chunks = 0;
+        const chunks: Uint8Array[] = [];
         const done = (async () => {
-          for await (const _ of sandbox.readFile("/big")) {
-            if (++chunks === 1) await wait.promise;
+          for await (const chunk of sandbox.readFile("/big")) {
+            chunks.push(chunk);
+            if (chunks.length === 1) await wait.promise;
           }
           return "completed";
         })().catch((e: unknown) => e);
         await p.h.clock.advance(1000);
-        expect(chunks).toBe(1);
+        expect(chunks).toHaveLength(1);
+        expect(chunks[0]).toHaveLength(chunkSize);
         expect(p.rtc.channels).toHaveLength(1);
         p.rtc.peers[0]!.fail();
         await p.h.clock.settle();
-        return { sandbox, wait, done };
+        return { sandbox, wait, done, chunks };
       }
 
       test("a forced peer-to-peer handle returns the error and keeps the healthy replacement", async () => {
@@ -2544,28 +2550,51 @@ describe("peer-to-peer data path", () => {
       test("a paused peer read resumes on relay after another read detects the failure", async () => {
         const p = p2pSetup(stallingAgent());
         const { h, rtc } = p;
-        h.api.stream(RelayService, "ReadFile", function* (request) {
-          const offset = Number(
-            (request as unknown as { offset: bigint }).offset,
-          );
-          yield file.accepted();
-          yield file.chunk(offset, "relay");
-          yield file.end(offset + 5);
-        });
-        const { sandbox, wait, done } = await pausedReadThatLosesItsChannel(p);
+        h.api.stream(
+          RelayService,
+          "ReadFile",
+          function* ({ path }: ReadFileRequest) {
+            yield file.accepted();
+            if (path === "/other") {
+              yield file.chunk(0, "relay");
+              yield file.end(5);
+              return;
+            }
+            yield file.chunk(relayOffset, snapshot.subarray(relayOffset));
+            yield file.end(snapshot.length);
+          },
+        );
+        const { sandbox, wait, done, chunks } =
+          await pausedReadThatLosesItsChannel(p);
         expect(text(await h.clock.run(sandbox.readFileBytes("/other")))).toBe(
           "relay",
         );
+        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
         wait.open();
         expect(await h.clock.run(done)).toBe("completed");
+        expect(Buffer.compare(concat(chunks), snapshot)).toBe(0);
 
-        const reads = h.api.callsOf("ReadFile");
-        expect(reads.map(({ request }) => request)).toMatchObject([
+        const peerReads = rtc.frames.flatMap(({ payload }) =>
+          payload.case === "fileReadRequest" ? [payload.value] : [],
+        );
+        expect(peerReads).toMatchObject([{ path: "/big", offset: 0n }]);
+        const peerReadId = peerReads[0]!.readId;
+
+        const reads = h.api
+          .callsOf("ReadFile")
+          .map(({ request }) => request as ReadFileRequest);
+        expect(reads).toMatchObject([
           { path: "/other", offset: 0n },
-          { path: "/big", offset: 3072n },
+          { path: "/big", offset: 3072n, readId: peerReadId },
         ]);
-        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
-        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+        const triggerReadId = reads[0]!.readId;
+        expect(triggerReadId).not.toBe(peerReadId);
+        expect(
+          h.api.callsOf("AuthorizeRelay").map(({ request }) => request),
+        ).toMatchObject([
+          { operationId: triggerReadId },
+          { operationId: peerReadId },
+        ]);
         expect(rtc.channels).toHaveLength(1);
       });
 
