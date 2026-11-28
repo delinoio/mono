@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   BillingAccountRole,
   CreateBillingAccountResponseSchema,
+  GetBillingAccountRequestSchema,
   GetBillingAccountResponseSchema,
   ListBillingAccountsResponseSchema,
 } from "@delino/accounts-protos/v1/billing_account_pb";
@@ -82,14 +83,31 @@ async function deferBillingCreate(browser: Browser, holdListRefresh: boolean) {
           }),
         );
         break;
-      case "GetBillingAccount":
+      case "GetBillingAccount": {
+        const { billingAccountId } = fromBinary(
+          GetBillingAccountRequestSchema,
+          Buffer.from(route.request.postData ?? ""),
+        );
+        const accounts = created
+          ? [existingAccount, newAccount]
+          : [existingAccount];
+        const account = accounts.find(
+          (account) => account.billingAccountId === billingAccountId,
+        );
+        if (!account) {
+          await route.fulfill({
+            status: 404,
+            headers,
+            json: { code: "not_found", message: "billing account not found" },
+          });
+          return;
+        }
         body = toBinary(
           GetBillingAccountResponseSchema,
-          create(GetBillingAccountResponseSchema, {
-            billingAccount: newAccount,
-          }),
+          create(GetBillingAccountResponseSchema, { billingAccount: account }),
         );
         break;
+      }
     }
     await route.fulfill({ contentType: "application/proto", headers, body });
   });
@@ -162,6 +180,9 @@ describe("billing account creation", () => {
             await app.screenshot("billing-list-after-late-create");
           } else {
             await billing.listRefreshStarted;
+            await expect(browser).toHaveURL(
+              `${app.baseUrl}/billing/${newAccount.billingAccountId}`,
+            );
             await expect(
               screen.getByRole("heading", newAccount.name, { level: 1 }),
             ).toBeVisible();
