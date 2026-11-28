@@ -228,8 +228,9 @@ func TestAttachReadWrite(t *testing.T) {
 }
 
 func TestLabels(t *testing.T) {
+	const acceptedLabelCount = 32
 	labels := map[string]string{}
-	for i := 0; i < MaxLabels; i++ {
+	for i := 0; i < acceptedLabelCount; i++ {
 		labels[strings.Repeat("k", 1+i)] = strings.Repeat("v", MaxLabelValueSize)
 	}
 	labels[strings.Repeat("k", MaxLabelKeySize)] = ""
