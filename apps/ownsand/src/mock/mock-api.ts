@@ -57,6 +57,7 @@ import {
   SandboxEndReason,
   SandboxRestorePath,
   SandboxState,
+  SandboxStateSchema,
   SnapshotExportState,
   SnapshotState,
 } from "@delino/ownsand-protos/v1/common_pb";
@@ -1781,13 +1782,22 @@ export function createMockTransport(
       },
       listSandboxes(req) {
         const { org } = membership(req.organizationId);
+        const { state } = req;
+        if (
+          state !== undefined &&
+          (state === SandboxState.UNSPECIFIED ||
+            !SandboxStateSchema.values.some((value) => value.number === state))
+        ) {
+          throw new ConnectError(
+            "invalid state: must be a sandbox state",
+            Code.InvalidArgument,
+          );
+        }
         const ended = (s: Sandbox) =>
           s.state === SandboxState.DELETED || s.state === SandboxState.FAILED;
         const filtered = org.sandboxes
-          .filter(
-            (s) => req.includeEnded || req.state !== undefined || !ended(s),
-          )
-          .filter((s) => req.state === undefined || s.state === req.state)
+          .filter((s) => req.includeEnded || state !== undefined || !ended(s))
+          .filter((s) => state === undefined || s.state === state)
           .filter(
             (s) => req.deviceId === undefined || s.deviceId === req.deviceId,
           );

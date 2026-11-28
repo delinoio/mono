@@ -2,7 +2,10 @@
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { type Code, ConnectError, createClient } from "@connectrpc/connect";
 import { BaseImage } from "@delino/ownsand-protos/v1/common_pb";
-import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import {
+  type ListSandboxesRequest,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
 import { createMockTransport, MOCK_IDS } from "../src/mock/mock-api.ts";
 
 const client = createClient(SandboxService, createMockTransport());
@@ -93,17 +96,46 @@ async function listSandboxIds() {
   return sandboxes.map((sandbox) => sandbox.sandboxId);
 }
 
+async function listSandboxesForFilterTest(
+  filter: Partial<
+    Pick<
+      ListSandboxesRequest,
+      "state" | "includeEnded" | "deviceId" | "pageSize" | "pageToken"
+    >
+  >,
+): Promise<
+  { ids: string[]; nextPageToken: string } | { code: Code; rawMessage: string }
+> {
+  try {
+    const { sandboxes, nextPageToken } = await client.listSandboxes({
+      organizationId,
+      ...filter,
+    });
+    return {
+      ids: sandboxes.map((sandbox) => sandbox.sandboxId),
+      nextPageToken,
+    };
+  } catch (error) {
+    if (error instanceof ConnectError) {
+      return { code: error.code, rawMessage: error.rawMessage };
+    }
+    throw error;
+  }
+}
+
 declare global {
   interface Window {
     createSandboxForIdempotencyTest: typeof createSandbox;
     createSandboxWithTtls: typeof createSandboxWithTtls;
     listSandboxIds: typeof listSandboxIds;
+    listSandboxesForFilterTest: typeof listSandboxesForFilterTest;
   }
 }
 
 window.createSandboxForIdempotencyTest = createSandbox;
 window.createSandboxWithTtls = createSandboxWithTtls;
 window.listSandboxIds = listSandboxIds;
+window.listSandboxesForFilterTest = listSandboxesForFilterTest;
 
 const ready = document.createElement("p");
 ready.textContent = "Sandbox RPC fixture ready";
