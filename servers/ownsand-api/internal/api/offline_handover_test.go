@@ -195,14 +195,7 @@ func TestOfflineWriteChecksExpiryAfterLeaseRowWait(t *testing.T) {
 	dev, agent := setupAgent(t, env, org, nil)
 
 	ctx := context.Background()
-	tx, err := env.DB.Pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, "SELECT 1 FROM instance_leases WHERE lease_name = $1 FOR UPDATE", lease.Name); err != nil {
-		t.Fatal(err)
-	}
+	tx := holdFixtureLock(t, env.DB.Pool, "SELECT 1 FROM instance_leases WHERE lease_name = $1 FOR UPDATE", lease.Name)
 	agent.Close()
 	waitForLockWaiter(t, env, "FROM instance_leases", "FOR SHARE")
 	// Expire the shared row after the cleanup transaction started, while
@@ -210,9 +203,7 @@ func TestOfflineWriteChecksExpiryAfterLeaseRowWait(t *testing.T) {
 	if _, err := tx.Exec(ctx, "UPDATE instance_leases SET expire_time = clock_timestamp() WHERE lease_name = $1", lease.Name); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	finishFixtureLock(t, "commit", tx.Commit)
 	waitForOfflineLeaseSkip(t, env, dev.ID)
 	if got := deviceState(t, org, dev.ID); got != ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
 		t.Fatalf("device state after database lease expiry = %s, want ONLINE", got)

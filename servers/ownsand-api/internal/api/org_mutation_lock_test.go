@@ -82,24 +82,13 @@ func orgRecordCounts(t *testing.T, env *testenv.Env, orgID, table string) [3]int
 // function commits the deletion.
 func holdOrganizationDeletion(t *testing.T, env *testenv.Env, orgID string) func() {
 	t.Helper()
-	ctx := context.Background()
-	holder, err := env.DB.Pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = holder.Rollback(ctx) })
-	if _, err := holder.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", orgID); err != nil {
-		t.Fatal(err)
-	}
+	holder := holdFixtureLock(t, env.DB.Pool, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", orgID)
+	ctx, cancel := context.WithTimeout(t.Context(), fixtureLockTimeout)
+	defer cancel()
 	if _, err := holder.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", orgID); err != nil {
 		t.Fatal(err)
 	}
-	return func() {
-		t.Helper()
-		if err := holder.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
+	return func() { finishFixtureLock(t, "commit", holder.Commit) }
 }
 
 // TestCreateRPCAfterInFlightOrganizationDeletionCommits holds a deletion of
@@ -138,7 +127,7 @@ func TestCreateRPCAfterInFlightOrganizationDeletionCommits(t *testing.T) {
 			go func() { rpcDone <- rpc.call(org) }()
 			// The RPC waits for the deletion: for the organization row in its
 			// lock, or, in an unlocked order, in its insert.
-			waitLockWaiters(t, env, 1)
+			waitForDatabaseLockWaiters(t, env, 1)
 			commit()
 			err := <-rpcDone
 			if testenv.Code(err) != connect.CodeNotFound {
