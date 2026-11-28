@@ -7,6 +7,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
@@ -56,6 +57,7 @@ func TestWarmDispatchContinuesAfterRejection(t *testing.T) {
 
 func TestWarmDispatchStopsAfterDeadlineOrCancellation(t *testing.T) {
 	t.Parallel()
+	const watchdogTimeout = 5 * time.Second
 	for _, pooled := range []bool{false, true} {
 		t.Run(warmProfileKind(pooled), func(t *testing.T) {
 			for _, scenario := range []string{"deadline", "cancellation"} {
@@ -64,18 +66,38 @@ func TestWarmDispatchStopsAfterDeadlineOrCancellation(t *testing.T) {
 					ctx, cancel := context.WithCancel(t.Context())
 					defer cancel()
 					var attempts []*ownsandv1.CreateSandboxRequest
+					var callErr, parentErr error
+					var watchdogFired bool
 					w.os.SetCreateRequestHook(func(callCtx context.Context, req *ownsandv1.CreateSandboxRequest) error {
 						attempts = append(attempts, req)
 						if scenario == "cancellation" {
 							cancel()
+							<-callCtx.Done()
+							return callCtx.Err()
 						}
-						<-callCtx.Done()
-						return callCtx.Err()
+
+						watchdog := time.NewTimer(watchdogTimeout)
+						defer watchdog.Stop()
+						select {
+						case <-callCtx.Done():
+							callErr, parentErr = callCtx.Err(), ctx.Err()
+							return callErr
+						case <-watchdog.C:
+							watchdogFired = true
+							cancel()
+							return ctx.Err()
+						}
 					})
 
 					w.l.Engine.Pass(ctx, w.org.ID)
+					if watchdogFired {
+						t.Fatalf("CreateSandbox watchdog fired after %v while waiting for the RPC deadline", watchdogTimeout)
+					}
 					if len(attempts) != 1 || attempts[0].GetLabels()[ownsandclient.LabelRunnerProfileID] != first {
 						t.Fatalf("expected one create attempt for the first profile, got %v", attempts)
+					}
+					if scenario == "deadline" && (!errors.Is(callErr, context.DeadlineExceeded) || parentErr != nil) {
+						t.Fatalf("CreateSandbox context error = %v, dispatcher parent error = %v, want %v and nil", callErr, parentErr, context.DeadlineExceeded)
 					}
 					runners := w.runners(t)
 					if len(runners) != 1 || runners[0].GetState() != sandrunv1.RunnerState_RUNNER_STATE_CREATING || runners[0].GetOwnsandSandboxId() != "" {

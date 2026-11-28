@@ -94,28 +94,58 @@ func TestWhileHeldRunsOnlyWhileHeld(t *testing.T) {
 // a running fn and runs OnLose only after it, so OnLose sees the effects of
 // fn, and that a call after the transition does not run fn.
 func TestWhileHeldSerializesWithLoss(t *testing.T) {
+	const waitTimeout = 5 * time.Second
+
 	l, lost := newTestLease()
 	acquireFor(t, l, time.Now().Add(time.Hour))
 
 	inFn := make(chan struct{})
 	releaseFn := make(chan struct{})
-	whileHeldDone := make(chan bool, 1)
+	release := sync.OnceFunc(func() { close(releaseFn) })
+	whileHeldDone := make(chan struct{})
+	var lossDone chan struct{}
+	joinWorker := func(done <-chan struct{}, name string) bool {
+		t.Helper()
+		select {
+		case <-done:
+			return true
+		case <-time.After(waitTimeout):
+			t.Errorf("timed out waiting for the %s worker to exit", name)
+			return false
+		}
+	}
+	t.Cleanup(func() {
+		release()
+		joinWorker(whileHeldDone, "WhileHeld")
+		if lossDone != nil {
+			joinWorker(lossDone, "loss transition")
+		}
+	})
+
+	var whileHeldRan bool
 	go func() {
-		whileHeldDone <- l.WhileHeld(func() {
+		defer close(whileHeldDone)
+		whileHeldRan = l.WhileHeld(func() {
 			close(inFn)
 			<-releaseFn
 		})
 	}()
-	<-inFn
+	select {
+	case <-inFn:
+	case <-whileHeldDone:
+		t.Fatal("WhileHeld returned before the callback started")
+	case <-time.After(waitTimeout):
+		t.Fatal("timed out waiting for the WhileHeld callback to start")
+	}
 
-	setDone := make(chan struct{})
+	lossDone = make(chan struct{})
 	go func() {
-		defer close(setDone)
+		defer close(lossDone)
 		l.lose(reasonReleased)
 	}()
 	// The loss transition is blocked on the ownership lock held by fn.
 	select {
-	case <-setDone:
+	case <-lossDone:
 		t.Fatal("the loss transition did not wait for the running fn")
 	case <-time.After(100 * time.Millisecond):
 	}
@@ -123,14 +153,15 @@ func TestWhileHeldSerializesWithLoss(t *testing.T) {
 		t.Fatalf("OnLose ran %d times before fn returned", got)
 	}
 
-	close(releaseFn)
-	if !<-whileHeldDone {
+	release()
+	if !joinWorker(whileHeldDone, "WhileHeld") {
+		return
+	}
+	if !whileHeldRan {
 		t.Fatal("WhileHeld reported that fn did not run")
 	}
-	select {
-	case <-setDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the loss transition stayed blocked")
+	if !joinWorker(lossDone, "loss transition") {
+		return
 	}
 	if got := lost.Load(); got != 1 {
 		t.Fatalf("OnLose ran %d times, want 1", got)

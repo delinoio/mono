@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
+	"github.com/delinoio/mono/servers/accounts-api/internal/api"
 	"github.com/delinoio/mono/servers/accounts-api/internal/testenv"
 )
 
@@ -205,9 +206,22 @@ func TestMutationAfterUnrelatedLockWaitSucceeds(t *testing.T) {
 	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
+	wantRole := func(userID string, want api.Role) {
+		t.Helper()
+		var got string
+		if err := env.DB.Pool.QueryRow(ctx(), `SELECT role FROM billing_account_members
+			WHERE billing_account_id = $1 AND user_id = $2`, f.AccountID, userID).Scan(&got); err != nil {
+			t.Fatalf("read role for %q: %v", userID, err)
+		}
+		if api.Role(got) != want {
+			t.Fatalf("role for %q = %q, want %q", userID, got, want)
+		}
+	}
+	wantRole(f.Viewer2.ID, api.RoleViewer)
+	wantRole(f.Admin.ID, api.RoleAdmin)
 	before := readBusinessState(t, env, f.AccountID)
 	err := raceMembershipChange(t, env, f.AccountID, func(tx pgx.Tx) {
-		execTx(t, tx, `UPDATE billing_account_members SET role = 'viewer' WHERE billing_account_id = $1 AND user_id = $2`, f.AccountID, f.Viewer2.ID)
+		execTx(t, tx, `UPDATE billing_account_members SET role = $3 WHERE billing_account_id = $1 AND user_id = $2`, f.AccountID, f.Viewer2.ID, api.RoleAdmin)
 	}, func() error {
 		_, err := f.Admin.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
 			BillingAccountId: f.AccountID, Email: fmt.Sprintf("control-%d@example.com", userSeq.Add(1)), Role: roleViewer,
@@ -215,6 +229,8 @@ func TestMutationAfterUnrelatedLockWaitSucceeds(t *testing.T) {
 		return err
 	})
 	wantCode(t, err, 0)
+	wantRole(f.Viewer2.ID, api.RoleAdmin)
+	wantRole(f.Admin.ID, api.RoleAdmin)
 	after := readBusinessState(t, env, f.AccountID)
 	if after.Invitations != before.Invitations+1 || after.AuditEvents != before.AuditEvents+1 {
 		t.Fatalf("the invitation was not recorded: before=%+v after=%+v", before, after)
