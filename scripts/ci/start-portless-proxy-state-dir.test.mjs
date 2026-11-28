@@ -19,7 +19,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { createPsFixture } from "./fixture-portless-ps.mjs";
 import { spawnProcessGroup } from "./fixture-process.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -29,9 +30,11 @@ const appNames = ["web", "web-sibling"];
 
 const pinnedVersion = "0.18.1";
 const outdatedVersion = "0.15.8";
+const stubProxyPid = 12345;
 
 // The version check reads the proxy command with `ps`, which Windows lacks.
-const psSkip = process.platform === "win32" ? "needs ps" : false;
+const psSkip =
+  process.platform === "win32" ? "needs POSIX proxy lookup" : false;
 
 // A fake portless CLI that records its arguments, cwd and state override.
 const fakeCli = `
@@ -76,9 +79,6 @@ process.stdin.on("end", () => { process.exitCode = 42; });
 process.stdin.resume();
 console.log("ready");
 `;
-
-// A fake proxy process that runs until the test kills it.
-const fakeProxyCli = `setInterval(() => {}, 1000);`;
 
 // Keep launcher fixtures independent of the developer's listener on port 443.
 const fakeProbe = `
@@ -191,9 +191,13 @@ function addFakeApp(dir, name) {
   return appDir;
 }
 
-// Starts a fake proxy of an older portless and records its PID in
-// `<stateDir>/proxy.pid`.
-function startOutdatedProxy(t, dir, stateDir) {
+function writeProxyPid(stateDir, pid) {
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(stateDir, "proxy.pid"), String(pid), { mode: 0o600 });
+}
+
+// Install the package that the command from ps points to.
+function recordOutdatedProxy(dir, stateDir, pid = stubProxyPid) {
   const cli = proxyCliPath(dir);
   const dist = dirname(cli);
   mkdirSync(dist, { recursive: true });
@@ -201,17 +205,19 @@ function startOutdatedProxy(t, dir, stateDir) {
     join(dist, "..", "package.json"),
     JSON.stringify({ name: "portless", version: outdatedVersion }),
   );
-  writeFileSync(cli, fakeProxyCli);
-  const proxy = spawn(
-    process.execPath,
-    [cli, "proxy", "start", "--foreground"],
-    { stdio: "ignore" },
-  );
-  t.after(() => proxy.kill());
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  writeFileSync(join(stateDir, "proxy.pid"), String(proxy.pid), {
-    mode: 0o600,
+  writeFileSync(cli, "");
+  writeProxyPid(stateDir, pid);
+  return { pid, command: `node ${cli} proxy start --foreground` };
+}
+
+// Linux reads /proc for process identity. The unsafe-state cases also check
+// that the recorded process stays alive.
+function startLiveProcess(t) {
+  const proxy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
   });
+  t.after(() => proxy.kill());
+  assert.ok(proxy.pid);
   return proxy.pid;
 }
 
@@ -226,9 +232,11 @@ function run(
     proxyStatus = 0,
     probe = "refused",
     mode,
+    psOptions,
   },
 ) {
   const record = join(dir, "record.jsonl");
+  const ps = createPsFixture(dir, psOptions);
   const {
     PORTLESS: _shellPortless,
     PORTLESS_HTTPS: _shellHttps,
@@ -245,12 +253,17 @@ function run(
     FAKE_PORTLESS_STATUS: String(proxyStatus),
     FAKE_PORTLESS_PROBE: probe,
     ...mode,
+    ...ps.env,
   };
   if (portless !== undefined) env.PORTLESS = portless;
   if (stateDir !== undefined) env.PORTLESS_STATE_DIR = stateDir;
   const result = spawnSync(
     process.execPath,
-    ["--import", join(dir, "probe.mjs"), join(dir, "scripts", "dev", script)],
+    [
+      "--import",
+      pathToFileURL(join(dir, "probe.mjs")).href,
+      join(dir, "scripts", "dev", script),
+    ],
     { encoding: "utf8", env, cwd: dir },
   );
   const calls = existsSync(record)
@@ -259,7 +272,7 @@ function run(
         .split("\n")
         .map((line) => JSON.parse(line))
     : [];
-  return { ...result, calls };
+  return { ...result, calls, psCalls: ps.readCalls() };
 }
 
 function stopThenStart(appDir, stateDir = null) {
@@ -281,8 +294,8 @@ test(
     if (repo === null) return;
     const { dir, appDir } = repo;
     const stateDir = join(appDir, ".portless-probe");
-    startOutdatedProxy(t, dir, stateDir);
-    const result = run(dir, { stateDir: ".portless-probe", home: dir });
+    const psOptions = recordOutdatedProxy(dir, stateDir);
+    const result = run(dir, { stateDir: ".portless-probe", psOptions });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.calls, stopThenStart(appDir, stateDir));
     assert.match(result.stderr, /portless_proxy_outdated/);
@@ -297,14 +310,15 @@ test(
     if (repo === null) return;
     const { dir, appDir } = repo;
     // portless would not read this directory: it runs from the app directory.
-    startOutdatedProxy(t, dir, join(dir, ".portless-probe"));
-    const result = run(dir, { stateDir: ".portless-probe", home: dir });
+    const psOptions = recordOutdatedProxy(dir, join(dir, ".portless-probe"));
+    const result = run(dir, { stateDir: ".portless-probe", psOptions });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(
       result.calls,
       startOnly(appDir, join(appDir, ".portless-probe")),
     );
     assert.doesNotMatch(result.stderr, /portless_proxy_outdated/);
+    assert.deepEqual(result.psCalls, []);
   },
 );
 
@@ -313,8 +327,8 @@ test("uses an absolute state directory as written", { skip: psSkip }, (t) => {
   if (repo === null) return;
   const { dir, appDir } = repo;
   const stateDir = join(dir, "absolute-state");
-  startOutdatedProxy(t, dir, stateDir);
-  const result = run(dir, { stateDir, home: dir });
+  const psOptions = recordOutdatedProxy(dir, stateDir);
+  const result = run(dir, { stateDir, psOptions });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, stopThenStart(appDir, stateDir));
 });
@@ -327,8 +341,8 @@ test(
     if (repo === null) return;
     const { dir, appDir } = repo;
     const home = join(dir, "home");
-    startOutdatedProxy(t, dir, join(home, ".portless"));
-    const result = run(dir, { home });
+    const psOptions = recordOutdatedProxy(dir, join(home, ".portless"));
+    const result = run(dir, { home, psOptions });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.calls, stopThenStart(appDir));
   },
@@ -341,10 +355,20 @@ function appCalls(appDir, siblingDir, stateDir) {
 test("root dev shares the preflight app's relative state directory", (t) => {
   const { dir, appDir, siblingDir } = fixture(t);
   const stateDir = join(appDir, ".portless-probe");
-  if (!psSkip) startOutdatedProxy(t, dir, stateDir);
+  const psOptions = psSkip ? undefined : recordOutdatedProxy(dir, stateDir);
   const detectsOutdatedProxy = !psSkip && !proxyCliPathHasWhitespace(dir);
-  const result = run(dir, { script: launcher, stateDir: ".portless-probe" });
+  const result = run(dir, {
+    script: launcher,
+    stateDir: ".portless-probe",
+    psOptions,
+  });
   assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(
+    result.psCalls,
+    psSkip
+      ? []
+      : [{ args: ["-o", "command=", "-p", String(stubProxyPid)], status: 0 }],
+  );
   assert.deepEqual(result.calls, [
     ...(detectsOutdatedProxy
       ? stopThenStart(appDir, stateDir)
@@ -438,7 +462,8 @@ test(
         const stateDir = join(dir, ".portless");
         const legacyDir =
           location === "directory" ? stateDir : join(dir, "legacy");
-        const pid = startOutdatedProxy(t, dir, legacyDir);
+        const pid = startLiveProcess(t);
+        const psOptions = recordOutdatedProxy(dir, legacyDir, pid);
         chmodSync(legacyDir, 0o1777);
         const legacyPid = join(legacyDir, "proxy.pid");
         const legacyRoutes = join(legacyDir, "routes.json");
@@ -449,13 +474,18 @@ test(
           symlinkSync(legacyPid, join(stateDir, "proxy.pid"));
         }
 
-        const result = run(dir, { script: launcher, probe: "portless" });
+        const result = run(dir, {
+          script: launcher,
+          probe: "portless",
+          psOptions,
+        });
         assert.equal(result.status, 1, result.stderr);
         assert.equal(
           JSON.parse(result.stderr).event,
           "portless_proxy_state_mismatch",
         );
         assert.deepEqual(result.calls, []);
+        assert.deepEqual(result.psCalls, []);
         assert.equal(readFileSync(legacyPid, "utf8"), String(pid));
         assert.equal(
           readFileSync(legacyRoutes, "utf8"),
@@ -477,18 +507,14 @@ test(
         if (repo === null) return;
         const { dir, appDir, siblingDir } = repo;
         const stateDir = join(dir, ".portless");
-        const pid = startOutdatedProxy(t, dir, stateDir);
-        const start =
-          process.platform === "linux"
-            ? /^\d+ \(.*\) (?:\S+ ){19}(\d+)/.exec(
-                readFileSync(`/proc/${pid}/stat`, "utf8"),
-              )[1]
-            : spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-                encoding: "utf8",
-                env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
-              })
-                .stdout.trim()
-                .replace(/\s+/g, " ");
+        const linux = process.platform === "linux";
+        const pid = linux ? startLiveProcess(t) : stubProxyPid;
+        const psOptions = recordOutdatedProxy(dir, stateDir, pid);
+        const start = linux
+          ? /^\d+ \(.*\) (?:\S+ ){19}(\d+)/.exec(
+              readFileSync(`/proc/${pid}/stat`, "utf8"),
+            )[1]
+          : "Sat Nov 28 10:00:00 2026";
         writeFileSync(
           join(stateDir, "proxy.port"),
           record === "wrong port" ? "80" : "443",
@@ -500,7 +526,25 @@ test(
           { mode: 0o600 },
         );
 
-        const result = run(dir, { script: launcher, probe: "portless" });
+        const result = run(dir, {
+          script: launcher,
+          probe: "portless",
+          psOptions: { ...psOptions, startTime: start },
+        });
+        const expectedPsCalls = [];
+        if (!linux && record !== "wrong port") {
+          expectedPsCalls.push({
+            args: ["-o", "stat=", "-o", "lstart=", "-p", String(pid)],
+            status: 0,
+          });
+        }
+        if (record === "matching") {
+          expectedPsCalls.push({
+            args: ["-o", "command=", "-p", String(pid)],
+            status: 0,
+          });
+        }
+        assert.deepEqual(result.psCalls, expectedPsCalls);
         if (record === "matching") {
           assert.equal(result.status, 0, result.stderr);
           assert.deepEqual(result.calls, [
@@ -564,7 +608,10 @@ for (const { signal, group } of [
         t,
         process.execPath,
         [join(dir, "scripts", "dev", launcher), "--filter=web"],
-        { cwd: dir, env: { ...process.env, PORTLESS: "0" } },
+        {
+          cwd: dir,
+          env: { ...process.env, PORTLESS: "0", ...createPsFixture(dir).env },
+        },
       );
       const lines = createInterface({ input: child.stdout });
       const options = { signal: t.signal };
