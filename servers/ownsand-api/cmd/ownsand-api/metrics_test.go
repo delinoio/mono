@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -40,7 +41,7 @@ func TestMetricsServer(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ownsand_test_gauge 3") {
+	if resp.StatusCode != http.StatusOK || !slices.Contains(strings.Split(string(body), "\n"), "ownsand_test_gauge 3") {
 		t.Fatalf("metrics: %d %s", resp.StatusCode, body)
 	}
 	for _, path := range []string{"/", "/healthz", "/delino.ownsand.v1.OrganizationService/ListOrganizations"} {
