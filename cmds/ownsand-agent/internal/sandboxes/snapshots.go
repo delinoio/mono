@@ -525,6 +525,14 @@ func (m *Manager) SetSnapshotPublishHookForTest(hook func(id string)) {
 	m.beforeSnapshotPublish = hook
 }
 
+// SetSnapshotImportWaiterHookForTest installs a hook that runs after an
+// import registers on a held lock, before it waits to acquire the lock.
+func (m *Manager) SetSnapshotImportWaiterHookForTest(hook func(id string)) {
+	m.hookMu.Lock()
+	defer m.hookMu.Unlock()
+	m.importWaiterHook = hook
+}
+
 // removeSnapshot deletes the stored record and content of a snapshot.
 func (m *Manager) removeSnapshot(id string) error {
 	m.hookMu.Lock()
@@ -702,7 +710,16 @@ func (m *Manager) LockSnapshotImport(ctx context.Context, id string) (func(), er
 		m.importLocks[id] = l
 	}
 	l.refs++
+	held := len(l.held) != 0
 	m.mu.Unlock()
+	if held {
+		m.hookMu.Lock()
+		hook := m.importWaiterHook
+		m.hookMu.Unlock()
+		if hook != nil {
+			hook(id)
+		}
+	}
 	drop := func() {
 		m.mu.Lock()
 		l.refs--
