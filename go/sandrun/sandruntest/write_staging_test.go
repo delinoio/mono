@@ -3,6 +3,7 @@
 package sandruntest
 
 import (
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
@@ -57,6 +59,8 @@ func TestWriteDevSessionFileFinalization(t *testing.T) {
 		wantMode    os.FileMode
 		blockRename bool
 	}{
+		{name: "sticky mode", mode: 0o1640, wantMode: fs.ModeSticky | 0o640},
+		{name: "sticky-only mode", mode: 0o1000, wantMode: fs.ModeSticky},
 		{name: "explicit mode", mode: 0o640, wantMode: 0o640},
 		{name: "default mode", wantMode: 0o644},
 		{name: "retry after rename failure", wantMode: 0o644, blockRename: true},
@@ -66,6 +70,9 @@ func TestWriteDevSessionFileFinalization(t *testing.T) {
 			parent := filepath.Join(workspace, "nested")
 			if err := os.Mkdir(parent, 0o700); err != nil {
 				t.Fatal(err)
+			}
+			if test.wantMode&fs.ModeSticky != 0 {
+				requireStickyModeSupport(t, parent, test.wantMode)
 			}
 			profile := s.AddDevSessionProfile(org, "write", sandrunv1.GuestOs_GUEST_OS_LINUX, workspace)
 			session, err := client.CreateDevSession(t.Context(), listTestRequest(&sandrunv1.CreateDevSessionRequest{
@@ -134,7 +141,20 @@ func TestWriteDevSessionFileFinalization(t *testing.T) {
 			if err != nil || !res.Msg.GetFinished() || res.Msg.GetSizeBytes() != int64(len(first+last)) {
 				t.Fatalf("final chunk returned %v, %v, want a finished write of %d bytes", res, err, len(first+last))
 			}
-			requireFixtureFile(t, destination, first+last, test.wantMode)
+			replay, err := write(int64(len(first)), last, true)
+			if err != nil || !proto.Equal(replay.Msg, res.Msg) {
+				t.Fatalf("final retry returned %v, %v, want %v", replay, err, res.Msg)
+			}
+			readableMode := test.wantMode
+			if readableMode == fs.ModeSticky {
+				requireFixtureMode(t, destination, readableMode)
+				// Grant owner read permission only after checking the published mode.
+				readableMode |= 0o400
+				if err := os.Chmod(destination, readableMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			requireFixtureFile(t, destination, first+last, readableMode)
 			requireFixtureFile(t, sibling, "keep sibling", 0o600)
 			requireNoStage()
 		})
@@ -155,12 +175,39 @@ func requireFixtureFile(t *testing.T, path, contents string, mode os.FileMode) {
 		t.Fatalf("read %q returned %q, %v, want %q", path, data, err, contents)
 	}
 	if runtime.GOOS != "windows" {
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.Mode().Perm() != mode {
-			t.Errorf("%q has mode %04o, want %04o", path, info.Mode().Perm(), mode)
-		}
+		requireFixtureMode(t, path, mode)
+	}
+}
+
+func requireFixtureMode(t *testing.T, path string, want fs.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode() & (fs.ModePerm | fs.ModeSticky); mode != want {
+		t.Fatalf("%q has mode %v, want %v", path, mode, want)
+	}
+}
+
+func requireStickyModeSupport(t *testing.T, parent string, mode fs.FileMode) {
+	t.Helper()
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("the fixture applies the sticky bit on Linux and macOS")
+	}
+	control := filepath.Join(parent, "control")
+	writeFixtureFile(t, control, "")
+	if err := os.Chmod(control, mode); err != nil {
+		t.Skipf("control chmod: %v", err)
+	}
+	info, err := os.Stat(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&(fs.ModePerm|fs.ModeSticky) != mode {
+		t.Skipf("filesystem does not retain mode %v on a regular file", mode)
+	}
+	if err := os.Remove(control); err != nil {
+		t.Fatal(err)
 	}
 }

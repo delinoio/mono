@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"sync"
@@ -486,8 +487,13 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		default:
 			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("written ranges do not cover exactly the final file"))
 		}
-		mode := fs.FileMode(m.GetMode()).Perm()
-		if mode == 0 {
+		wireMode := m.GetMode()
+		mode := fs.FileMode(wireMode).Perm()
+		preserveStickyBit := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+		if preserveStickyBit && wireMode&0o1000 != 0 {
+			mode |= fs.ModeSticky
+		}
+		if wireMode == 0 || (!preserveStickyBit && mode == 0) {
 			mode = 0o644
 		}
 		tmp, err := stageWrite(w.path, data, mode)
@@ -501,7 +507,7 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		res.Finished = true
 		res.SizeBytes = end
 		w.completed = &completedWrite{
-			mode:     m.GetMode(),
+			mode:     wireMode,
 			digest:   sha256.Sum256(m.GetData()),
 			response: proto.CloneOf(res),
 		}
