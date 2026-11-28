@@ -91,8 +91,9 @@ func newHarness(t *testing.T, options ...harnessOption) *harness {
 			h.launches = append(h.launches, launch)
 			return agent.NewACPAgent(h.agent, agent.ACPOptions{Handler: launch.Handler, ClientInfo: launch.ClientInfo, AuthMethodID: launch.AuthMethodID}), nil
 		},
-		PollInterval:       5 * time.Millisecond,
-		CredentialInterval: 5 * time.Millisecond,
+		PollInterval:         5 * time.Millisecond,
+		FallbackPollInterval: 5 * time.Millisecond,
+		CredentialInterval:   5 * time.Millisecond,
 	}
 	h.agent = newFakeAgent(t)
 	for _, option := range options {
@@ -807,6 +808,23 @@ func TestInputsAreHandledInInputIDOrder(t *testing.T) {
 	if !slices.Equal(accepted, ids) {
 		t.Fatalf("accepted order %v, want %v", accepted, ids)
 	}
+}
+
+func TestInboxNotificationsDeliverInputs(t *testing.T) {
+	h := newHarness(t)
+	// Without notifications the bridge would not read the inbox again
+	// after its first read.
+	h.cfg.PollInterval = time.Hour
+	h.cfg.FallbackPollInterval = time.Hour
+	h.run()
+	idle := h.waitIdle()
+	id := h.write(prompt("notified"))
+	accepted := h.waitAccepted(idle, id)
+	answer := h.waitFor(accepted, "answer", func(e *sandcrewv1.BridgeEvent) bool {
+		return e.GetAgentMessageChunk().GetContent().GetText() == "echo: notified"
+	})
+	h.waitState(h.waitKind(answer, "turn_ended"), sandcrewv1.AgentActivity_AGENT_ACTIVITY_IDLE)
+	h.checkLog()
 }
 
 func TestRestartContinuesTheLog(t *testing.T) {

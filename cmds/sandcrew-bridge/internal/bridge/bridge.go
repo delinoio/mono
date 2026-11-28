@@ -110,9 +110,12 @@ type Config struct {
 	// StartAgent starts the agent process. Defaults to a child process
 	// with the ACP implementation.
 	StartAgent func(ctx context.Context, launch Launch) (agent.Agent, error)
-	// PollInterval is the inbox poll interval. Defaults to
-	// inbox.PollInterval.
+	// PollInterval is the inbox poll interval when file system
+	// notifications are not available. Defaults to inbox.PollInterval.
 	PollInterval time.Duration
+	// FallbackPollInterval is the inbox poll interval while file system
+	// notifications work. Defaults to inbox.FallbackPollInterval.
+	FallbackPollInterval time.Duration
 	// CredentialInterval is the credential file check interval. Defaults
 	// to credwatch.Interval.
 	CredentialInterval time.Duration
@@ -166,6 +169,9 @@ func (c *Config) defaults() error {
 	}
 	if c.PollInterval == 0 {
 		c.PollInterval = inbox.PollInterval
+	}
+	if c.FallbackPollInterval == 0 {
+		c.FallbackPollInterval = inbox.FallbackPollInterval
 	}
 	if c.CredentialInterval == 0 {
 		c.CredentialInterval = credwatch.Interval
@@ -431,7 +437,18 @@ func (b *Bridge) readStart() (*sandcrewv1.BridgeStartConfig, error) {
 }
 
 func (b *Bridge) loop(ctx context.Context) ExitCode {
-	ticker := time.NewTicker(b.cfg.PollInterval)
+	// Notifications start before the first read of the inbox, so a file
+	// that arrives between them is not missed.
+	interval := b.cfg.PollInterval
+	var notified <-chan struct{}
+	if notifier, err := b.inbox.Notify(); err != nil {
+		b.logger.Warn("inbox notifications are not available; polling only", "error", err, "poll_interval", interval.String())
+	} else {
+		defer notifier.Close()
+		notified = notifier.C()
+		interval = b.cfg.FallbackPollInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	b.processInbox()
 	for {
@@ -452,6 +469,8 @@ func (b *Bridge) loop(ctx context.Context) ExitCode {
 			return b.agentExited()
 		case result := <-b.turnDone:
 			b.finishTurn(result)
+		case <-notified:
+			b.processInbox()
 		case <-ticker.C:
 			b.processInbox()
 		}
@@ -919,15 +938,21 @@ func (b *Bridge) watchCredential(ctx context.Context, path string) {
 		watchFailed(err)
 		return
 	}
-	go watcher.Run(ctx, func(revision uint64) {
-		b.logger.Info("credential file changed", "revision", revision)
-		if err := b.log.WriteStdoutOnly(&sandcrewv1.BridgeEvent{Event: &sandcrewv1.BridgeEvent_CredentialUpdate{CredentialUpdate: &sandcrewv1.CredentialUpdate{
-			Kind:     sandcrewv1.VendorCredentialKind_VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON,
-			Revision: revision,
-		}}}); err != nil {
-			b.logger.Warn("credential update write failed", "error", err)
-		}
-	}, watchFailed)
+	go watcher.Run(ctx, credwatch.Handlers{
+		Change: func(revision uint64) {
+			b.logger.Info("credential file changed", "revision", revision)
+			if err := b.log.WriteStdoutOnly(&sandcrewv1.BridgeEvent{Event: &sandcrewv1.BridgeEvent_CredentialUpdate{CredentialUpdate: &sandcrewv1.CredentialUpdate{
+				Kind:     sandcrewv1.VendorCredentialKind_VENDOR_CREDENTIAL_KIND_CODEX_AUTH_JSON,
+				Revision: revision,
+			}}}); err != nil {
+				b.logger.Warn("credential update write failed", "error", err)
+			}
+		},
+		Error: watchFailed,
+		PollingOnly: func(err error) {
+			b.logger.Warn("credential file notifications are not available; polling only", "error", err, "check_interval", b.cfg.CredentialInterval.String())
+		},
+	})
 }
 
 // SessionUpdate implements agent.Handler.

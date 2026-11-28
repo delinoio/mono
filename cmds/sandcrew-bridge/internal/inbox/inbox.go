@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/delinoio/mono/go/uuidv7"
@@ -24,8 +25,14 @@ import (
 // MaxFileSize limits one inbox file.
 const MaxFileSize = 1 << 20
 
-// PollInterval is the interval at which the bridge looks for new files.
+// PollInterval is the interval at which the bridge looks for new files
+// when file system notifications are not available.
 const PollInterval = 250 * time.Millisecond
+
+// FallbackPollInterval is the interval at which the bridge looks for new
+// files while file system notifications work. It finds a file whose
+// notification was lost, for example after a full notification queue.
+const FallbackPollInterval = 2 * time.Second
 
 const fileSuffix = ".json"
 
@@ -56,6 +63,73 @@ func New(dir string) (*Inbox, error) {
 
 // Dir returns the inbox directory.
 func (i *Inbox) Dir() string { return i.dir }
+
+// Notifier reports possible new files in the inbox directory.
+type Notifier struct {
+	watcher *fsnotify.Watcher
+	c       chan struct{}
+	done    chan struct{}
+}
+
+// Notify starts file system notifications for the inbox directory. The
+// caller closes the notifier. An error means that the platform or the file
+// system gives no notifications; the caller then polls with PollInterval.
+func (i *Inbox) Notify() (*Notifier, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, fmt.Errorf("inbox: notifications: %w", err)
+	}
+	if err := watcher.Add(i.dir); err != nil {
+		watcher.Close()
+		return nil, fmt.Errorf("inbox: notifications: %w", err)
+	}
+	n := &Notifier{watcher: watcher, c: make(chan struct{}, 1), done: make(chan struct{})}
+	go n.run()
+	return n, nil
+}
+
+// C receives a value after a file was created or written in the inbox.
+// Values are merged: one value can stand for several files.
+func (n *Notifier) C() <-chan struct{} { return n.c }
+
+// Close stops the notifications.
+func (n *Notifier) Close() error {
+	err := n.watcher.Close()
+	<-n.done
+	return err
+}
+
+func (n *Notifier) run() {
+	defer close(n.done)
+	for {
+		select {
+		case event, ok := <-n.watcher.Events:
+			if !ok {
+				return
+			}
+			// WriteDevSessionFile renames the finished file into the
+			// inbox, which is a create event. Removals are the bridge's
+			// own deletions.
+			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) {
+				n.signal()
+			}
+		case _, ok := <-n.watcher.Errors:
+			if !ok {
+				return
+			}
+			// An error (for example a full queue) can hide a new file, so
+			// the bridge reads the directory again.
+			n.signal()
+		}
+	}
+}
+
+func (n *Notifier) signal() {
+	select {
+	case n.c <- struct{}{}:
+	default:
+	}
+}
 
 // List returns the inbox files in input_id order (UUID v7 time order).
 // Files whose names are not `<uuid v7>.json` and directories are ignored.
