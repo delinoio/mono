@@ -497,22 +497,30 @@ func TestWatchQueueReconnects(t *testing.T) {
 }
 
 func TestBackoffBounds(t *testing.T) {
-	b := backoff{min: time.Second, max: 30 * time.Second}
-	prev := time.Duration(0)
+	const initial = time.Second
+	const capped = 30 * time.Second
+	b := backoff{min: initial, max: capped}
+	nominalDelays := []time.Duration{
+		initial,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		capped,
+	}
+	checkDelay := func(call string, got, nominal time.Duration) {
+		t.Helper()
+		lower := nominal - nominal/5
+		if got < lower || got > nominal {
+			t.Fatalf("%s: delay = %v, want [%v, %v]", call, got, lower, nominal)
+		}
+	}
 	for i := range 10 {
-		d := b.next()
-		if d > 30*time.Second || d < 800*time.Millisecond {
-			t.Fatalf("delay %d = %v out of bounds", i, d)
-		}
-		if i < 4 && d < prev {
-			t.Fatalf("delay %d = %v below %v", i, d, prev)
-		}
-		prev = d
+		nominal := nominalDelays[min(i, len(nominalDelays)-1)]
+		checkDelay(fmt.Sprintf("call %d", i+1), b.next(), nominal)
 	}
 	b.reset()
-	if d := b.next(); d > time.Second {
-		t.Fatalf("after reset %v", d)
-	}
+	checkDelay("after reset", b.next(), initial)
 }
 
 func TestWaitDevSession(t *testing.T) {
