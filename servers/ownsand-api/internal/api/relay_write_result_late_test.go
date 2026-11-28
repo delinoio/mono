@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,9 +22,9 @@ func holdWriteResponse(t *testing.T, c *writeResultCall) <-chan struct{} {
 	t.Helper()
 	reached := make(chan struct{})
 	plane := c.env.App.Plane
-	plane.SetAfterWriteResponseDequeuedForTest(func(cctx context.Context) {
+	plane.SetAfterWriteResponseDequeuedForTest(func(_, call context.Context) {
 		close(reached)
-		<-cctx.Done()
+		<-call.Done()
 	})
 	t.Cleanup(func() { plane.SetAfterWriteResponseDequeuedForTest(nil) })
 	return reached
@@ -75,17 +76,58 @@ func TestRelayWriteFileLateResultIsRejected(t *testing.T) {
 // expired call deadline.
 func TestRelayWriteFileLateResultCallerCancelWins(t *testing.T) {
 	t.Parallel()
-	c := startWriteResultCall(t, 30*time.Second)
+	c := startWriteResultCall(t, 4*time.Second)
 	waiting := fillOutboundQueue(t, c).WatchWindowUpdateWaitForTest(c.stream)
-	reached := holdWriteResponse(t, c)
+
+	type serverContexts struct {
+		caller, call context.Context
+	}
+	dequeued := make(chan serverContexts, 1)
+	resumeHandler := make(chan struct{})
+	resume := sync.OnceFunc(func() { close(resumeHandler) })
+	plane := c.env.App.Plane
+	plane.SetAfterWriteResponseDequeuedForTest(func(caller, call context.Context) {
+		dequeued <- serverContexts{caller: caller, call: call}
+		<-resumeHandler
+	})
+	t.Cleanup(func() {
+		resume()
+		plane.SetAfterWriteResponseDequeuedForTest(nil)
+	})
+
 	c.releaseWriteResult()
+	var ctxs serverContexts
 	select {
-	case <-reached:
+	case ctxs = <-dequeued:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the handler never took the write result off the queue")
 	}
-	// Cancel while the handler holds the result before accounting for it.
+	select {
+	case <-ctxs.call.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server call context did not expire")
+	}
+	if err := ctxs.call.Err(); err != context.DeadlineExceeded {
+		t.Fatalf("server call context error = %v, want deadline exceeded", err)
+	}
+	if err := ctxs.caller.Err(); err != nil {
+		t.Fatalf("server caller context error at the call deadline = %v, want nil", err)
+	}
+
 	c.cancel()
+	select {
+	case <-ctxs.caller.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server caller context did not end after client cancellation")
+	}
+	if err := ctxs.caller.Err(); err != context.Canceled {
+		t.Fatalf("server caller context error = %v, want canceled", err)
+	}
+	if err := ctxs.call.Err(); err != context.DeadlineExceeded {
+		t.Fatalf("server call context error after client cancellation = %v, want deadline exceeded", err)
+	}
+	resume()
+
 	if err := c.waitDone(t, 10*time.Second); testenv.Code(err) != connect.CodeCanceled {
 		t.Fatalf("WriteFile = %v, want canceled", err)
 	}

@@ -797,7 +797,7 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 		agentErr, ended := endFromAgent(f)
 		result := f.GetFileWriteResult()
 		if hook := h.afterWriteResponseDequeued.Load(); hook != nil && (ended || result != nil) {
-			(*hook)(cctx)
+			(*hook)(ctx, cctx)
 		}
 		// Next can return a queued frame after the call context ends.
 		// Check the budget before accepting any agent response.

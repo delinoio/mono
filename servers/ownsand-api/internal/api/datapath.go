@@ -123,9 +123,9 @@ type DataPlane struct {
 	// nothing. Tests use it to know that a concurrent call is waiting.
 	grantWaitObserver func(grantID string)
 	// afterWriteResponseDequeued is a test hook that WriteFile calls with the
-	// call context after dequeuing an agent result or terminal frame and
-	// before checking the deadline. It is nil in production.
-	afterWriteResponseDequeued atomic.Pointer[func(cctx context.Context)]
+	// caller and call contexts after dequeuing an agent result or terminal
+	// frame and before checking cancellation. It is nil in production.
+	afterWriteResponseDequeued atomic.Pointer[func(caller, call context.Context)]
 }
 
 // SetGrantWaitObserver sets a callback that AuthorizeRelay calls just before
