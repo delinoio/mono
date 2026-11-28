@@ -42,11 +42,12 @@ pg_verifybackup /path/to/plain-backup
 Requires base backup + continuous WAL archiving. Restores to any timestamp, transaction, or named restore point. Without PITR: restore only to backup time (potentially lose hours). With PITR: RPO = minutes. `archive_command` must return 0 ONLY when file is safely stored—premature 0 = data loss risk. `wal_level` must be `replica` or `logical` (not `minimal`).
 
 ## WAL Archiving
-`archive_mode=on` plus an `archive_command` (or `archive_library`) that honors this contract. Prefer a dedicated archiver (pgBackRest, WAL-G or Barman) over a hand-written one-liner. **Do not use `test ! -f /archive/%f && cp %p /archive/%f`**: `cp` returning does not mean the data is durable, and the existence check treats every retry as a failure, even when an earlier attempt copied identical bytes, so archiving can stall on a file that is already stored. A custom archive script must:
-- **First archive** (destination absent): copy to a temporary name in the archive directory, fsync the file, rename it to the final name, fsync the directory, and only then exit 0.
-- **Retry** (destination already exists): compare the bytes with `%p` (for example `cmp`) and make sure the existing file is durable (fsync it and the directory) before exiting 0.
-- **Conflict** (same name, different bytes): exit nonzero and leave the existing file untouched.
-- **Any failure to write or to establish durability**: exit nonzero.
+`archive_mode=on` plus an `archive_command` (or `archive_library`) that honors this contract. Prefer a dedicated archiver (pgBackRest, WAL-G or Barman) over a hand-written one-liner. **Do not use `test ! -f /archive/%f && cp %p /archive/%f`**: `cp` returning does not mean the data is durable, and the existence check treats every retry as a failure, even when an earlier attempt copied identical bytes, so archiving can stall on a file that is already stored. A custom archive script must follow these steps.
+
+- **Prepare the file.** Copy `%p` to a unique temporary file in the archive directory and fsync the temporary file.
+- **Publish the file.** Use an atomic operation that fails if the final name exists, such as Linux `renameat2` with `RENAME_NOREPLACE`. Use it even if an earlier check found the final name absent. If publication succeeds, fsync the archive directory before exiting 0.
+- **Handle an existing file.** If the final name already exists, including when publication returns `EEXIST`, compare the published bytes with `%p` (for example, with `cmp`). If the bytes differ, exit nonzero and leave the published file untouched. If they match, fsync the published file and the archive directory before exiting 0.
+- **Handle other errors.** Exit nonzero on any other publication error or on a copy, comparison, or fsync error. If the filesystem does not support atomic publication without replacement, exit nonzero. Clean up only this attempt's unused temporary file and leave the published file in place.
 
 **Test the archive command as the postgres OS user** (not root) since permission issues are common. Monitor `pg_stat_archiver` for `failed_count`, `last_archived_time`. Archive failures prevent WAL recycling → disk fills.
 
