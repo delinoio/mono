@@ -181,6 +181,7 @@ describe("sandbox transitions", () => {
           }, phase);
         }
 
+        await expect(button).toBeFocused();
         await browser.keyboard.press("Enter");
         await release("mutation");
         await expect
@@ -192,6 +193,7 @@ describe("sandbox transitions", () => {
           .toBe("refresh");
         await expect(button).toHaveAttribute("aria-busy", "true");
         await expect(screen.getByText(requested)).toBeHidden();
+        await expect(button).toBeFocused();
         await browser.keyboard.press("Space");
         await app.screenshot(`sandbox-${evidence}-refreshing`);
 
