@@ -4,10 +4,13 @@ package billing_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +146,41 @@ func (f *statusFixture) load(t *testing.T, org string) billing.Status {
 	return st
 }
 
+func (f *statusFixture) pollCursor(t *testing.T) int64 {
+	t.Helper()
+	var cursor int64
+	if err := f.db.Pool.QueryRow(t.Context(), "SELECT after_sequence FROM billing_status_cursor WHERE singleton").Scan(&cursor); err != nil {
+		t.Fatal(err)
+	}
+	return cursor
+}
+
+func (f *statusFixture) assertPollLog(t *testing.T, logsBefore string, wantCursor int64, wantStatuses int) {
+	t.Helper()
+	logs := strings.TrimPrefix(f.logText(), logsBefore)
+	count := 0
+	for line := range strings.Lines(logs) {
+		var event struct {
+			Message       string `json:"msg"`
+			AfterSequence *int64 `json:"after_sequence"`
+			Statuses      *int   `json:"statuses"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode poll log %q: %v", line, err)
+		}
+		if event.Message != "billing_status_polled" {
+			continue
+		}
+		count++
+		if event.AfterSequence == nil || *event.AfterSequence != wantCursor || event.Statuses == nil || *event.Statuses != wantStatuses {
+			t.Fatalf("billing_status_polled = %s, want after_sequence=%d and statuses=%d", line, wantCursor, wantStatuses)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("got %d billing_status_polled events, want 1: %s", count, logs)
+	}
+}
+
 // TestStatusPollAndLinks follows one organization through the status
 // sources: a new organization is blocked, a link to an account in good
 // standing allows it, polled changes block and suspend it, and an unlink
@@ -169,6 +207,7 @@ func TestStatusPollAndLinks(t *testing.T) {
 	// The account runs out of credit; the poll applies the change.
 	blockStart := f.clock.Now()
 	f.fake.SetAccountStatus(accountA, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, blockStart)
+	logsBefore := f.logText()
 	if err := f.statuses.Poll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -176,20 +215,27 @@ func TestStatusPollAndLinks(t *testing.T) {
 	if st.Phase != billing.PhaseBlocked || !st.BlockedSince.Equal(blockStart) || st.Sequence != f.fake.Status(org1).GetSequence() {
 		t.Fatalf("after poll = %+v", st)
 	}
-	var cursor int64
-	if err := f.db.Pool.QueryRow(ctx, "SELECT after_sequence FROM billing_status_cursor").Scan(&cursor); err != nil || cursor != st.Sequence {
-		t.Fatalf("cursor = %d, %v", cursor, err)
+	cursor := f.pollCursor(t)
+	if cursor != st.Sequence {
+		t.Fatalf("cursor = %d, want %d", cursor, st.Sequence)
 	}
+	f.assertPollLog(t, logsBefore, cursor, 1)
 
 	// A poll without changes still refreshes the sync time, so the status
 	// does not become stale.
 	f.clock.Advance(50 * time.Minute)
+	emptyPollTime := f.clock.Now()
+	logsBefore = f.logText()
 	if err := f.statuses.Poll(ctx); err != nil {
 		t.Fatal(err)
 	}
+	f.assertPollLog(t, logsBefore, cursor, 0)
+	if got := f.pollCursor(t); got != cursor {
+		t.Fatalf("cursor after empty poll = %d, want %d", got, cursor)
+	}
 	f.clock.Advance(50 * time.Minute)
-	if st = f.load(t, org1); st.Stale(f.clock.Now()) {
-		t.Fatalf("stale after an empty poll: %+v", st)
+	if st = f.load(t, org1); st.SyncTime == nil || !st.SyncTime.Equal(emptyPollTime) || st.Stale(f.clock.Now()) {
+		t.Fatalf("status after empty poll = %+v, want a fresh status synced at %v", st, emptyPollTime)
 	}
 	// Without a poll for more than an hour, it is stale.
 	f.clock.Advance(11 * time.Minute)
@@ -237,6 +283,69 @@ func TestStatusPollAndLinks(t *testing.T) {
 		Status: accountsv1.BillingStatus_BILLING_STATUS_ALLOWED, Sequence: st.Sequence + 100}})
 	if got := f.load(t, org1); got.Linked() || got.Phase != billing.PhaseSuspended {
 		t.Fatalf("late status applied: %+v", got)
+	}
+}
+
+func TestStatusPollPagination(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		replayPage bool
+	}{
+		{name: "advancing short final page"},
+		{name: "non-advancing full page", replayPage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStatusFixture(t, time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC))
+			f.addOrg(t, org1)
+			linked := f.link(t, org1, accountA)
+			statuses := make([]*accountsv1.OrganizationBillingStatus, billing.StatusPageSize+1)
+			for i := range statuses {
+				statuses[i] = &accountsv1.OrganizationBillingStatus{
+					Service: billing.ServiceID, OrganizationId: org1, BillingAccountId: accountA,
+					Status: accountsv1.BillingStatus_BILLING_STATUS_ALLOWED, Sequence: linked.Sequence + int64(i) + 1,
+				}
+			}
+			fullPage := statuses[:billing.StatusPageSize]
+			finalPage := statuses[billing.StatusPageSize:]
+			if tc.replayPage {
+				finalPage = fullPage
+			}
+			pages := [][]*accountsv1.OrganizationBillingStatus{fullPage, finalPage}
+			requestCursors := []int64{f.pollCursor(t), fullPage[len(fullPage)-1].GetSequence()}
+			var calls atomic.Int32
+			handler := connect.NewUnaryHandler(accountsv1connect.UsageServiceListBillingStatusChangesProcedure,
+				func(_ context.Context, req *connect.Request[accountsv1.ListBillingStatusChangesRequest]) (*connect.Response[accountsv1.ListBillingStatusChangesResponse], error) {
+					i := int(calls.Add(1)) - 1
+					if i >= len(pages) {
+						return nil, fmt.Errorf("unexpected poll request %d with cursor %d", i+1, req.Msg.GetAfterSequence())
+					}
+					if got, want := req.Msg.GetAfterSequence(), requestCursors[i]; got != want {
+						return nil, fmt.Errorf("poll request %d cursor = %d, want %d", i+1, got, want)
+					}
+					page := pages[i]
+					return connect.NewResponse(&accountsv1.ListBillingStatusChangesResponse{
+						Statuses: page, NextSequence: page[len(page)-1].GetSequence(),
+					}), nil
+				})
+			server := httptest.NewServer(handler)
+			t.Cleanup(server.Close)
+			client := accountsv1connect.NewUsageServiceClient(server.Client(), server.URL)
+			poller := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client})
+
+			logsBefore := f.logText()
+			if err := poller.Poll(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if got := int(calls.Load()); got != len(pages) {
+				t.Fatalf("poll requests = %d, want %d", got, len(pages))
+			}
+			wantCursor := finalPage[len(finalPage)-1].GetSequence()
+			cursor := f.pollCursor(t)
+			if cursor != wantCursor {
+				t.Fatalf("cursor = %d, want %d", cursor, wantCursor)
+			}
+			f.assertPollLog(t, logsBefore, cursor, len(fullPage)+len(finalPage))
+		})
 	}
 }
 
