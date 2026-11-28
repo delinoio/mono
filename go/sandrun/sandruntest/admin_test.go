@@ -195,6 +195,117 @@ func TestListRunnersFilters(t *testing.T) {
 	}
 }
 
+func TestCreateApiKeyExpiry(t *testing.T) {
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("test").GetOrganizationId()
+	client := sandrunv1connect.NewApiKeyServiceClient(http.DefaultClient, s.URL)
+	create := func(t *testing.T, expiresAt *timestamppb.Timestamp) (*connect.Response[sandrunv1.CreateApiKeyResponse], error) {
+		t.Helper()
+		return client.CreateApiKey(t.Context(), listTestRequest(&sandrunv1.CreateApiKeyRequest{
+			OrganizationId: org, Name: "test key", ExpiresAt: expiresAt,
+		}))
+	}
+	list := func(t *testing.T) *sandrunv1.ListApiKeysResponse {
+		t.Helper()
+		res, err := client.ListApiKeys(t.Context(), listTestRequest(&sandrunv1.ListApiKeysRequest{OrganizationId: org}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Msg
+	}
+
+	future := timestamppb.New(time.Now().Add(time.Hour))
+	for _, expiresAt := range []*timestamppb.Timestamp{nil, future} {
+		res, err := create(t, expiresAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.Msg.GetApiKey().GetExpiresAt(); !proto.Equal(got, expiresAt) {
+			t.Errorf("created key expiry = %v, want %v", got, expiresAt)
+		}
+	}
+	before := list(t)
+	if got := len(before.GetApiKeys()); got != 2 {
+		t.Fatalf("listed %d keys after successful creation, want 2", got)
+	}
+	for _, tt := range []struct {
+		name      string
+		expiresAt *timestamppb.Timestamp
+	}{
+		{"past", timestamppb.New(time.Now().Add(-time.Hour))},
+		{"now", timestamppb.Now()},
+		{"invalid nanoseconds", &timestamppb.Timestamp{Seconds: future.GetSeconds(), Nanos: 1_000_000_000}},
+		{"out-of-range seconds", timestamppb.New(time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC))},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := create(t, tt.expiresAt)
+			if connect.CodeOf(err) != connect.CodeInvalidArgument {
+				t.Errorf("create key: %v, want invalid_argument", err)
+			}
+			if after := list(t); !proto.Equal(after, before) {
+				t.Errorf("keys after rejected creation = %v, want %v", after, before)
+			}
+		})
+	}
+}
+
+func TestCreateApiKeyExpiryAtIssuance(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const org = "org-1"
+		s := &Server{orgs: []*sandrunv1.Organization{{OrganizationId: org}}}
+		service := &apiKeyService{s: s}
+		now := time.Now()
+		req := connect.NewRequest(&sandrunv1.CreateApiKeyRequest{
+			OrganizationId: org, Name: "test key", ExpiresAt: timestamppb.New(now),
+		})
+		_, err := service.CreateApiKey(t.Context(), req)
+		if connect.CodeOf(err) != connect.CodeInvalidArgument || len(s.apiKeys) != 0 {
+			t.Fatalf("create with expiry equal to issuance time: got %v and %d keys, want invalid_argument and no keys", err, len(s.apiKeys))
+		}
+
+		req.Msg.ExpiresAt = timestamppb.New(now.Add(time.Nanosecond))
+		res, err := service.CreateApiKey(t.Context(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.Msg.GetApiKey().GetCreatedAt(); !proto.Equal(got, timestamppb.New(now)) {
+			t.Errorf("created_at = %v, want %v", got, now)
+		}
+	})
+}
+
+func TestExpiredApiKeyAuthentication(t *testing.T) {
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("test").GetOrganizationId()
+	admin := sandrunv1connect.NewApiKeyServiceClient(http.DefaultClient, s.URL)
+	key, err := admin.CreateApiKey(t.Context(), listTestRequest(&sandrunv1.CreateApiKeyRequest{
+		OrganizationId: org, Name: "test key", ExpiresAt: timestamppb.New(time.Now().Add(time.Hour)),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, s.URL)
+	list := func() error {
+		req := connect.NewRequest(&sandrunv1.ListDevSessionsRequest{OrganizationId: org})
+		req.Header().Set("Authorization", "Bearer "+key.Msg.GetSecret())
+		_, err := client.ListDevSessions(t.Context(), req)
+		return err
+	}
+	if err := list(); err != nil {
+		t.Fatalf("list with unexpired key: %v", err)
+	}
+
+	s.mu.Lock()
+	s.apiKeys[0].ExpiresAt = timestamppb.New(time.Now().Add(-time.Hour))
+	s.mu.Unlock()
+
+	if err := list(); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("list with expired key: %v, want unauthenticated", err)
+	}
+}
+
 func TestListApiKeysExpiryBoundary(t *testing.T) {
 	const (
 		active  = sandrunv1.ApiKeyState_API_KEY_STATE_ACTIVE

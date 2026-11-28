@@ -719,10 +719,20 @@ func (a *apiKeyService) CreateApiKey(_ context.Context, req *connect.Request[san
 	if n := len(req.Msg.GetName()); n == 0 || n > 64 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("name must have 1 to 64 characters"))
 	}
+	now := time.Now()
+	expiresAt := req.Msg.GetExpiresAt()
+	if expiresAt != nil {
+		if err := expiresAt.CheckValid(); err != nil {
+			return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("invalid expires_at: %w", err))
+		}
+		if !expiresAt.AsTime().After(now) {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid expires_at: must be in the future"))
+		}
+	}
 	k := &sandrunv1.ApiKey{
 		ApiKeyId: a.s.newID(), OrganizationId: req.Msg.GetOrganizationId(), Name: req.Msg.GetName(),
 		DisplayPrefix: "sandrun_abcd", State: sandrunv1.ApiKeyState_API_KEY_STATE_ACTIVE,
-		CreatedAt: timestamppb.Now(), ExpiresAt: req.Msg.GetExpiresAt(),
+		CreatedAt: timestamppb.New(now), ExpiresAt: expiresAt,
 	}
 	a.s.apiKeys = append(a.s.apiKeys, k)
 	return connect.NewResponse(&sandrunv1.CreateApiKeyResponse{ApiKey: proto.CloneOf(k), Secret: issuedAPIKeyPrefix + k.GetApiKeyId()}), nil
