@@ -141,12 +141,18 @@ func TestLogtoValidatorJWKSFile(t *testing.T) {
 	}
 }
 
-// jwksOutage serves a key set that tests switch between healthy, failing
-// with 503 and malformed.
+const (
+	jwksHealthy = iota
+	jwksUnavailable
+	jwksMalformed
+	jwksEmpty
+)
+
+// jwksOutage serves healthy, unavailable, malformed or empty JWKS responses.
 type jwksOutage struct {
 	f       tokenFactory
 	fetches atomic.Int32
-	mode    atomic.Int32 // 0 valid, 1 status 503, 2 malformed JSON
+	mode    atomic.Int32
 	extra   atomic.Pointer[tokenFactory]
 	// block, when non-nil, holds every healthy response until it is closed.
 	block   chan struct{}
@@ -156,10 +162,12 @@ type jwksOutage struct {
 func (o *jwksOutage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	o.fetches.Add(1)
 	switch o.mode.Load() {
-	case 1:
+	case jwksUnavailable:
 		w.WriteHeader(http.StatusServiceUnavailable)
-	case 2:
+	case jwksMalformed:
 		_, _ = w.Write([]byte("{not json"))
+	case jwksEmpty:
+		_, _ = w.Write([]byte(`{"keys":[]}`))
 	default:
 		if o.block != nil {
 			select {
@@ -205,7 +213,7 @@ func TestLogtoValidatorBacksOffFailedRefresh(t *testing.T) {
 	// The cache goes stale and the endpoint fails: exactly one extra fetch
 	// serves known keys, an unknown key and repeats within the cooldown.
 	now = now.Add(11 * time.Minute)
-	o.mode.Store(1)
+	o.mode.Store(jwksUnavailable)
 	for i := 0; i < 2; i++ {
 		if sub, err := v.Validate(ctx, known()); err != nil || sub != "user-1" {
 			t.Fatalf("known key during outage: %q %v", sub, err)
@@ -227,7 +235,7 @@ func TestLogtoValidatorBacksOffFailedRefresh(t *testing.T) {
 	// endpoint healthy a token with a new key validates.
 	now = now.Add(jwksMinRefresh)
 	o.extra.Store(&other)
-	o.mode.Store(0)
+	o.mode.Store(jwksHealthy)
 	if sub, err := v.Validate(ctx, unknown()); err != nil || sub != "user-1" {
 		t.Fatalf("new key after cooldown: %q %v", sub, err)
 	}
@@ -237,27 +245,52 @@ func TestLogtoValidatorBacksOffFailedRefresh(t *testing.T) {
 }
 
 func TestLogtoValidatorBacksOffEmptyKeySet(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	testLogtoValidatorBacksOffKeySet(t, jwksEmpty, true)
+}
+
+func TestLogtoValidatorBacksOffMalformedKeySet(t *testing.T) {
+	testLogtoValidatorBacksOffKeySet(t, jwksMalformed, false)
+}
+
+func testLogtoValidatorBacksOffKeySet(t *testing.T, mode int32, wantLoad bool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	o := &jwksOutage{f: tokenFactory{key: key, kid: "k1", issuer: "https://tenant.logto.app/oidc"}}
-	o.mode.Store(2)
+	o.mode.Store(mode)
 	srv := httptest.NewServer(o)
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 	now := time.Now()
 	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://sandrun.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
 	ctx := context.Background()
-	token := func() string { return o.f.sign(t, "at+jwt", outageClaims(o.f, now)) }
-	for i := 0; i < 3; i++ {
-		if _, err := v.Validate(ctx, token()); err != ErrInvalidToken {
-			t.Fatalf("validation %d with no key set: %v", i, err)
+	token := o.f.sign(t, "at+jwt", outageClaims(o.f, now))
+	if _, err := v.Validate(ctx, token); err != ErrInvalidToken {
+		t.Fatalf("initial validation error = %v, want %v", err, ErrInvalidToken)
+	}
+	v.mu.Lock()
+	fetchedAt := v.fetchedAt
+	v.mu.Unlock()
+	wantFetchedAt := time.Time{}
+	if wantLoad {
+		wantFetchedAt = now
+	}
+	if !fetchedAt.Equal(wantFetchedAt) {
+		t.Fatalf("fetchedAt after first validation = %v, want %v", fetchedAt, wantFetchedAt)
+	}
+	for attempt := 2; attempt <= 3; attempt++ {
+		if _, err := v.Validate(ctx, token); err != ErrInvalidToken {
+			t.Fatalf("validation %d during cooldown: error = %v, want %v", attempt, err, ErrInvalidToken)
 		}
 	}
 	if got := o.fetches.Load(); got != 1 {
 		t.Fatalf("fetches within cooldown = %d, want 1", got)
 	}
 	now = now.Add(jwksMinRefresh)
-	o.mode.Store(0)
-	if _, err := v.Validate(ctx, token()); err != nil {
-		t.Fatalf("recovered key set: %v", err)
+	o.mode.Store(jwksHealthy)
+	if sub, err := v.Validate(ctx, token); err != nil || sub != "user-1" {
+		t.Fatalf("validation after cooldown: subject = %q, error = %v, want user-1 and no error", sub, err)
 	}
 	if got := o.fetches.Load(); got != 2 {
 		t.Fatalf("fetches after cooldown = %d, want 2", got)
