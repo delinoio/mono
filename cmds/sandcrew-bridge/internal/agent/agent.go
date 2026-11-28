@@ -65,8 +65,9 @@ type Agent interface {
 	Start(ctx context.Context, cwd string) (Info, error)
 	// Prompt runs one turn and returns the ACP stop reason.
 	Prompt(ctx context.Context, text string) (string, error)
-	// Cancel asks the agent to end the current turn.
-	Cancel() error
+	// Cancel asks the agent to end the current turn. It returns the
+	// context error when ctx ends before the request is sent.
+	Cancel(ctx context.Context) error
 	// SetMode switches the agent mode.
 	SetMode(ctx context.Context, modeID string) error
 	// SetConfigOption sets a configuration option and returns the new
@@ -282,8 +283,8 @@ func (a *ACPAgent) Prompt(ctx context.Context, text string) (string, error) {
 }
 
 // Cancel implements Agent.
-func (a *ACPAgent) Cancel() error {
-	return a.conn.Notify(acp.MethodSessionCancel, acp.CancelNotification{SessionID: a.session()})
+func (a *ACPAgent) Cancel(ctx context.Context) error {
+	return a.conn.Notify(ctx, acp.MethodSessionCancel, acp.CancelNotification{SessionID: a.session()})
 }
 
 // SetMode implements Agent.

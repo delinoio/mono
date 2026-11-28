@@ -740,7 +740,9 @@ func (b *Bridge) cancelTurn(id string) {
 	b.queue = nil
 	b.cancelPendingLocked()
 	b.mu.Unlock()
-	if err := b.agent.Cancel(); err != nil {
+	ctx, cancel := context.WithTimeout(b.ctx, callTimeout)
+	defer cancel()
+	if err := b.agent.Cancel(ctx); err != nil {
 		b.logger.Warn("session/cancel failed", "error", err)
 	}
 }

@@ -131,3 +131,39 @@ func jsonText(v any) string {
 	data, _ := json.Marshal(v)
 	return string(data)
 }
+
+func TestBlockedWritesEndWithTheContext(t *testing.T) {
+	agentOut, connIn := io.Pipe()
+	defer connIn.Close()
+	// Nobody reads the agent stdin, so every write blocks.
+	connOut, agentIn := io.Pipe()
+	conn := NewConn(agentOut, agentIn, &recordingHandler{})
+	defer conn.Close()
+
+	call := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		return conn.Call(ctx, "session/set_mode", map[string]any{}, nil)
+	}
+	// The first call blocks in the write; the second waits for the
+	// writer. Both end with their deadline.
+	for range 2 {
+		done := make(chan error, 1)
+		go func() { done <- call() }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Call() = %v, want the deadline error", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Call blocked after its deadline")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := conn.Notify(ctx, "session/cancel", map[string]any{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Notify() = %v, want the deadline error", err)
+	}
+	// Closing the pipe ends the blocked write.
+	connOut.Close()
+}

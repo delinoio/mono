@@ -72,12 +72,21 @@ type response struct {
 	err    error
 }
 
+// outgoing is one message for the writer goroutine.
+type outgoing struct {
+	data   []byte
+	result chan error
+}
+
 // Conn is one JSON-RPC connection.
 type Conn struct {
 	w       io.Writer
 	handler Handler
 
-	writeMu sync.Mutex
+	// out passes messages to the writer goroutine. A write to an agent
+	// that stops reading blocks in the pipe; only the writer goroutine
+	// waits there, and senders give up when their context ends.
+	out chan outgoing
 
 	mu      sync.Mutex
 	nextID  int64
@@ -97,12 +106,14 @@ func NewConn(r io.Reader, w io.Writer, handler Handler) *Conn {
 	c := &Conn{
 		w:       w,
 		handler: handler,
+		out:     make(chan outgoing),
 		pending: make(map[string]chan response),
 		done:    make(chan struct{}),
 		ctx:     ctx,
 		cancel:  cancel,
 	}
 	go c.read(r)
+	go c.write()
 	return c
 }
 
@@ -117,7 +128,8 @@ func (c *Conn) Err() error {
 }
 
 // Call sends a request and waits for its response. When ctx ends first,
-// Call returns the context error and drops the late response.
+// also while the request waits to be written, Call returns the context
+// error and drops the late response.
 func (c *Conn) Call(ctx context.Context, method string, params any, result any) error {
 	c.mu.Lock()
 	if c.closed {
@@ -135,7 +147,7 @@ func (c *Conn) Call(ctx context.Context, method string, params any, result any) 
 		c.forget(id)
 		return err
 	}
-	if err := c.send(message{JSONRPC: "2.0", ID: json.RawMessage(id), Method: method, Params: raw}); err != nil {
+	if err := c.send(ctx, message{JSONRPC: "2.0", ID: json.RawMessage(id), Method: method, Params: raw}); err != nil {
 		c.forget(id)
 		return err
 	}
@@ -157,17 +169,19 @@ func (c *Conn) Call(ctx context.Context, method string, params any, result any) 
 	}
 }
 
-// Notify sends a notification.
-func (c *Conn) Notify(method string, params any) error {
+// Notify sends a notification. It returns the context error when ctx ends
+// before the notification is written.
+func (c *Conn) Notify(ctx context.Context, method string, params any) error {
 	raw, err := json.Marshal(params)
 	if err != nil {
 		return err
 	}
-	return c.send(message{JSONRPC: "2.0", Method: method, Params: raw})
+	return c.send(ctx, message{JSONRPC: "2.0", Method: method, Params: raw})
 }
 
-// Close stops request handlers and fails pending calls. It does not close
-// the reader or the writer; the owner of the process does.
+// Close stops request handlers, the writer goroutine and pending calls.
+// It does not close the reader or the writer; the owner of the process
+// does. A write that is blocked in w ends when the owner closes w.
 func (c *Conn) Close() {
 	c.cancel()
 	c.failPending(ErrClosed)
@@ -179,16 +193,41 @@ func (c *Conn) forget(id string) {
 	c.mu.Unlock()
 }
 
-func (c *Conn) send(m message) error {
+// send hands m to the writer goroutine and waits for the write. It returns
+// when ctx ends or the connection closes first; a message that the writer
+// already took is still written whole, so the stream stays valid.
+func (c *Conn) send(ctx context.Context, m message) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_, err = c.w.Write(data)
-	return err
+	req := outgoing{data: append(data, '\n'), result: make(chan error, 1)}
+	select {
+	case c.out <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return ErrClosed
+	}
+	select {
+	case err := <-req.result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// write writes the messages of send in order until the connection closes.
+func (c *Conn) write() {
+	for {
+		select {
+		case req := <-c.out:
+			_, err := c.w.Write(req.data)
+			req.result <- err
+		case <-c.ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *Conn) failPending(err error) {
@@ -288,5 +327,5 @@ func (c *Conn) serve(m message) {
 	}
 	// A failed write means that the agent is gone; its exit ends the
 	// session.
-	_ = c.send(reply)
+	_ = c.send(c.ctx, reply)
 }
