@@ -822,6 +822,47 @@ describe("chat view", () => {
     );
   });
 
+  test("stays on another page when a restart finishes after the user left", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { transport, calls } = recording({
+      ...base,
+      async unary(method, ...rest) {
+        if (method.name === "RestartSessionFromTranscript") await held;
+        return base.unary(method, ...rest);
+      },
+    });
+    renderConsole(`/orgs/${ACME}/sessions/${MOCK_IDS.endedSession}`, {
+      transport,
+    });
+    const ended = await screen.findByRole("region", { name: "Session ended" });
+    await type(
+      within(ended).getByRole("textbox", {
+        name: "First message of the new session",
+      }),
+      "Continue",
+    );
+    await click(
+      within(ended).getByRole("button", {
+        name: "Start new session from transcript",
+      }),
+    );
+    await click(screen.getByRole("link", { name: "Settings" }));
+    const settingsPath = window.location.pathname;
+    expect(settingsPath).toBe(`/orgs/${ACME}/settings`);
+    await act(async () => release());
+    await waitFor(() =>
+      expect(
+        calls.some((c) => c.method === "RestartSessionFromTranscript"),
+      ).toBe(true),
+    );
+    await settle();
+    expect(window.location.pathname).toBe(settingsPath);
+  });
+
   test("explains an agent installation failure", async () => {
     renderConsole(`/orgs/${ACME}/sessions/${MOCK_IDS.installFailedSession}`);
     expect(

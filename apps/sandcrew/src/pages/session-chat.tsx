@@ -566,7 +566,7 @@ function EndedPanel({
   transcript: Transcript;
 }) {
   const { organizationId } = useOrg();
-  const { navigate } = useRouter();
+  const { navigate, isCurrentVisit } = useRouter();
   const { t } = useI18n();
   const queryClient = useQueryClient();
   const [text, setText] = useState("");
@@ -589,13 +589,18 @@ function EndedPanel({
       setError("chat.ended.error");
       return;
     }
+    // The user can leave the chat while the new session starts; the redirect
+    // then must not pull them away from the page they went to.
+    const stillHere = isCurrentVisit;
     try {
       const res = await restart.mutateAsync({
         organizationId,
         sessionId: session.sessionId,
         firstMessage: message,
       });
-      navigate(sessionPath(organizationId, res.session!.sessionId));
+      if (stillHere()) {
+        navigate(sessionPath(organizationId, res.session!.sessionId));
+      }
     } catch {
       // The form shows the mutation error.
     }
