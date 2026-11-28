@@ -144,7 +144,12 @@ export function RunnersPage() {
               {t("runners.empty.description")}
             </SetupEmpty>
           ) : (
-            <div className="table-wrap">
+            <div
+              className="table-wrap"
+              role="region"
+              aria-label={t("runners.tableRegion")}
+              tabIndex={0}
+            >
               <table className="table" aria-label={t("runners.title")}>
                 <thead>
                   <tr>

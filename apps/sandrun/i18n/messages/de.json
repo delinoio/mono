@@ -582,5 +582,8 @@
   "integrations.agent.dialog.nameInvalid": "Geben Sie einen Namen mit 1 bis {max} Zeichen ein.",
   "integrations.agent.dialog.vendor": "Anbieter",
   "integrations.agent.dialog.vendorValue": "Anbieter: {vendor}",
-  "integrations.agent.dialog.replaceHint": "{state}. Geben Sie einen neuen Wert ein, um den bisherigen zu ersetzen."
+  "integrations.agent.dialog.replaceHint": "{state}. Geben Sie einen neuen Wert ein, um den bisherigen zu ersetzen.",
+  "devSessions.tableRegion": "Tabelle der Dev-Sitzungen",
+  "runners.tableRegion": "Tabelle der Runner",
+  "requests.tableRegion": "Tabelle der Anfragen"
 }

@@ -127,7 +127,12 @@ export function DevSessionsPage() {
               })}
             </SetupEmpty>
           ) : (
-            <div className="table-wrap">
+            <div
+              className="table-wrap"
+              role="region"
+              aria-label={t("devSessions.tableRegion")}
+              tabIndex={0}
+            >
               <table className="table" aria-label={t("devSessions.title")}>
                 <thead>
                   <tr>

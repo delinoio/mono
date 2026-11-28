@@ -582,5 +582,8 @@
   "integrations.agent.dialog.nameInvalid": "1～{max}文字の名前を入力してください。",
   "integrations.agent.dialog.vendor": "ベンダー",
   "integrations.agent.dialog.vendorValue": "ベンダー：{vendor}",
-  "integrations.agent.dialog.replaceHint": "{state}。置き換えるには新しい値を入力してください。"
+  "integrations.agent.dialog.replaceHint": "{state}。置き換えるには新しい値を入力してください。",
+  "devSessions.tableRegion": "開発セッション一覧",
+  "runners.tableRegion": "ランナー一覧",
+  "requests.tableRegion": "リクエスト一覧"
 }

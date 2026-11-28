@@ -6948,6 +6948,40 @@ describe("failed query refreshes", () => {
     });
   });
 
+  test.each([
+    ["requests", "ListRequests", "Requests", "Loading requests"],
+    ["runners", "ListRunners", "Runners", "Loading runners"],
+    ["dev-sessions", "ListDevSessions", "Dev sessions", "Loading dev sessions"],
+  ])(
+    "omits the %s table region while loading and after an initial error",
+    async (route, methodName, name, loading) => {
+      const fixture = queryFixture(methodName);
+      fixture.fail(new ConnectError("offline", Code.Internal));
+      let releaseFirstPage!: () => void;
+      const firstPage = new Promise<void>((resolve) => {
+        releaseFirstPage = resolve;
+      });
+      const transport: Transport = {
+        ...fixture.transport,
+        async unary(method, ...args) {
+          if (method.name === methodName) await firstPage;
+          return fixture.transport.unary(method, ...args);
+        },
+      };
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${route}`, { transport });
+      const region = { name: `${name} table` };
+
+      await screen.findByRole("status", { name: loading });
+      expect(screen.queryByRole("region", region)).toBeNull();
+      expect(document.querySelector('.table-wrap[tabindex="0"]')).toBeNull();
+
+      await act(async () => releaseFirstPage());
+      await screen.findByText("Something went wrong. Try again.");
+      expect(screen.queryByRole("region", region)).toBeNull();
+      expect(document.querySelector('.table-wrap[tabindex="0"]')).toBeNull();
+    },
+  );
+
   const infiniteLists = [
     ["api-keys", "ListApiKeys", "list", "Personal API keys"],
     ["audit", "ListAuditEvents", "table", "Audit events"],

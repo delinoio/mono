@@ -583,7 +583,10 @@
     "messages/integrations.agent.dialog.nameInvalid": "7887e2a01ca0eee726075fc07e48b0f8eaa58a011bea98281371a538714e82d0",
     "messages/integrations.agent.dialog.vendor": "f8aa82b42d07d108ed357335c9ac0d1a88cafb7292d61b30e0bdb224f20fd480",
     "messages/integrations.agent.dialog.vendorValue": "0f6f6b264d58b0c3efd08128371b63c66cc293cc6ac84b64290682266085f267",
-    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8"
+    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8",
+    "messages/devSessions.tableRegion": "68f3ff89972a236988f7ede236ef9c5b84fe3c263d68c0c6be2dcaf840ac6840",
+    "messages/runners.tableRegion": "9e6aafb4e03e19a95694155cb238db5a08d12bbfadbfc9c4591d3485ef8674d5",
+    "messages/requests.tableRegion": "5b44a2585a06e6ebef5c52601d445b4a908b72c64f73f05db76e6fe2f4eaef8c"
   },
   "ja": {
     "messages/common.language": "a4fe65264ef7dbb38d104b1e81eb3350f3142f3d16f32bdec39b1d9b42c1b8d1",
@@ -1169,7 +1172,10 @@
     "messages/integrations.agent.dialog.nameInvalid": "7887e2a01ca0eee726075fc07e48b0f8eaa58a011bea98281371a538714e82d0",
     "messages/integrations.agent.dialog.vendor": "f8aa82b42d07d108ed357335c9ac0d1a88cafb7292d61b30e0bdb224f20fd480",
     "messages/integrations.agent.dialog.vendorValue": "0f6f6b264d58b0c3efd08128371b63c66cc293cc6ac84b64290682266085f267",
-    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8"
+    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8",
+    "messages/devSessions.tableRegion": "68f3ff89972a236988f7ede236ef9c5b84fe3c263d68c0c6be2dcaf840ac6840",
+    "messages/runners.tableRegion": "9e6aafb4e03e19a95694155cb238db5a08d12bbfadbfc9c4591d3485ef8674d5",
+    "messages/requests.tableRegion": "5b44a2585a06e6ebef5c52601d445b4a908b72c64f73f05db76e6fe2f4eaef8c"
   },
   "zh-Hans": {
     "messages/common.language": "a4fe65264ef7dbb38d104b1e81eb3350f3142f3d16f32bdec39b1d9b42c1b8d1",
@@ -1755,7 +1761,10 @@
     "messages/integrations.agent.dialog.nameInvalid": "7887e2a01ca0eee726075fc07e48b0f8eaa58a011bea98281371a538714e82d0",
     "messages/integrations.agent.dialog.vendor": "f8aa82b42d07d108ed357335c9ac0d1a88cafb7292d61b30e0bdb224f20fd480",
     "messages/integrations.agent.dialog.vendorValue": "0f6f6b264d58b0c3efd08128371b63c66cc293cc6ac84b64290682266085f267",
-    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8"
+    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8",
+    "messages/devSessions.tableRegion": "68f3ff89972a236988f7ede236ef9c5b84fe3c263d68c0c6be2dcaf840ac6840",
+    "messages/runners.tableRegion": "9e6aafb4e03e19a95694155cb238db5a08d12bbfadbfc9c4591d3485ef8674d5",
+    "messages/requests.tableRegion": "5b44a2585a06e6ebef5c52601d445b4a908b72c64f73f05db76e6fe2f4eaef8c"
   },
   "es": {
     "messages/common.language": "a4fe65264ef7dbb38d104b1e81eb3350f3142f3d16f32bdec39b1d9b42c1b8d1",
@@ -2341,7 +2350,10 @@
     "messages/integrations.agent.dialog.nameInvalid": "7887e2a01ca0eee726075fc07e48b0f8eaa58a011bea98281371a538714e82d0",
     "messages/integrations.agent.dialog.vendor": "f8aa82b42d07d108ed357335c9ac0d1a88cafb7292d61b30e0bdb224f20fd480",
     "messages/integrations.agent.dialog.vendorValue": "0f6f6b264d58b0c3efd08128371b63c66cc293cc6ac84b64290682266085f267",
-    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8"
+    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8",
+    "messages/devSessions.tableRegion": "68f3ff89972a236988f7ede236ef9c5b84fe3c263d68c0c6be2dcaf840ac6840",
+    "messages/runners.tableRegion": "9e6aafb4e03e19a95694155cb238db5a08d12bbfadbfc9c4591d3485ef8674d5",
+    "messages/requests.tableRegion": "5b44a2585a06e6ebef5c52601d445b4a908b72c64f73f05db76e6fe2f4eaef8c"
   },
   "fr": {
     "messages/common.language": "a4fe65264ef7dbb38d104b1e81eb3350f3142f3d16f32bdec39b1d9b42c1b8d1",
@@ -2927,7 +2939,10 @@
     "messages/integrations.agent.dialog.nameInvalid": "7887e2a01ca0eee726075fc07e48b0f8eaa58a011bea98281371a538714e82d0",
     "messages/integrations.agent.dialog.vendor": "f8aa82b42d07d108ed357335c9ac0d1a88cafb7292d61b30e0bdb224f20fd480",
     "messages/integrations.agent.dialog.vendorValue": "0f6f6b264d58b0c3efd08128371b63c66cc293cc6ac84b64290682266085f267",
-    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8"
+    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8",
+    "messages/devSessions.tableRegion": "68f3ff89972a236988f7ede236ef9c5b84fe3c263d68c0c6be2dcaf840ac6840",
+    "messages/runners.tableRegion": "9e6aafb4e03e19a95694155cb238db5a08d12bbfadbfc9c4591d3485ef8674d5",
+    "messages/requests.tableRegion": "5b44a2585a06e6ebef5c52601d445b4a908b72c64f73f05db76e6fe2f4eaef8c"
   },
   "de": {
     "messages/common.language": "a4fe65264ef7dbb38d104b1e81eb3350f3142f3d16f32bdec39b1d9b42c1b8d1",
@@ -3513,7 +3528,10 @@
     "messages/integrations.agent.dialog.nameInvalid": "7887e2a01ca0eee726075fc07e48b0f8eaa58a011bea98281371a538714e82d0",
     "messages/integrations.agent.dialog.vendor": "f8aa82b42d07d108ed357335c9ac0d1a88cafb7292d61b30e0bdb224f20fd480",
     "messages/integrations.agent.dialog.vendorValue": "0f6f6b264d58b0c3efd08128371b63c66cc293cc6ac84b64290682266085f267",
-    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8"
+    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8",
+    "messages/devSessions.tableRegion": "68f3ff89972a236988f7ede236ef9c5b84fe3c263d68c0c6be2dcaf840ac6840",
+    "messages/runners.tableRegion": "9e6aafb4e03e19a95694155cb238db5a08d12bbfadbfc9c4591d3485ef8674d5",
+    "messages/requests.tableRegion": "5b44a2585a06e6ebef5c52601d445b4a908b72c64f73f05db76e6fe2f4eaef8c"
   },
   "pt-BR": {
     "messages/common.language": "a4fe65264ef7dbb38d104b1e81eb3350f3142f3d16f32bdec39b1d9b42c1b8d1",
@@ -4099,6 +4117,9 @@
     "messages/integrations.agent.dialog.nameInvalid": "7887e2a01ca0eee726075fc07e48b0f8eaa58a011bea98281371a538714e82d0",
     "messages/integrations.agent.dialog.vendor": "f8aa82b42d07d108ed357335c9ac0d1a88cafb7292d61b30e0bdb224f20fd480",
     "messages/integrations.agent.dialog.vendorValue": "0f6f6b264d58b0c3efd08128371b63c66cc293cc6ac84b64290682266085f267",
-    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8"
+    "messages/integrations.agent.dialog.replaceHint": "f874e004e3895012af8249c7f662388ccaed9b5bc4c045a51686148508b55eb8",
+    "messages/devSessions.tableRegion": "68f3ff89972a236988f7ede236ef9c5b84fe3c263d68c0c6be2dcaf840ac6840",
+    "messages/runners.tableRegion": "9e6aafb4e03e19a95694155cb238db5a08d12bbfadbfc9c4591d3485ef8674d5",
+    "messages/requests.tableRegion": "5b44a2585a06e6ebef5c52601d445b4a908b72c64f73f05db76e6fe2f4eaef8c"
   }
 }
