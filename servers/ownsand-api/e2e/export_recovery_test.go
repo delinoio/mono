@@ -5,10 +5,14 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	ownsand "github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -37,7 +41,7 @@ func waitExportState(ctx context.Context, t *testing.T, c *ownsand.Client, id st
 // exportRecoveryFixture starts a stack with two devices, creates a snapshot
 // of 12 MiB of data on the first and starts its export with the object
 // store holding the part uploads, so the export is stuck mid-transfer.
-func exportRecoveryFixture(t *testing.T) (s *stack, c *ownsand.Client, ctx context.Context, snapID string, data []byte) {
+func exportRecoveryFixture(t *testing.T) (s *stack, c *ownsand.Client, ctx context.Context, snapID, abandonedID string, data []byte) {
 	t.Helper()
 	s = newStack(t, stackOptions{agents: 2, objects: true})
 	ctx = s.ctx(5 * time.Minute)
@@ -67,45 +71,90 @@ func exportRecoveryFixture(t *testing.T) (s *stack, c *ownsand.Client, ctx conte
 	if _, err := c.Snapshots().Export(ctx, &ownsandv1.ExportSnapshotRequest{SnapshotId: snapID}); err != nil {
 		t.Fatalf("ExportSnapshot: %v", err)
 	}
-	s.objects.waitPutHeld(t)
+	key := s.objects.waitPutHeld(t)
+	rest, belongsToSnapshot := strings.CutPrefix(key, s.exportAttemptsPrefix(snapID))
+	abandonedID, part, hasPart := strings.Cut(rest, "/")
+	partNumber, err := strconv.Atoi(part)
+	if !belongsToSnapshot || abandonedID == "" || !hasPart || err != nil || partNumber < 1 {
+		t.Fatalf("held PUT key %q is not an export part of snapshot %s", key, snapID)
+	}
 	waitExportState(ctx, t, c, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING)
-	return s, c, ctx, snapID, data
+	return s, c, ctx, snapID, abandonedID, data
 }
 
 // retryExport retries the export once and checks that it reaches EXPORTED
-// with all parts under one attempt prefix.
-func retryExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client, snapID string) {
+// with a fresh attempt ID and a complete part set. It returns the part keys.
+func retryExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client, snapID, abandonedID string) []string {
 	t.Helper()
 	s.objects.releasePuts()
 	if _, err := c.Snapshots().Export(ctx, &ownsandv1.ExportSnapshotRequest{SnapshotId: snapID}); err != nil {
 		t.Fatalf("retry ExportSnapshot: %v", err)
 	}
 	waitExported(ctx, t, c, snapID)
-	// A stale upload of the abandoned attempt may have stored objects under
-	// its own prefix; the exported manifest points at exactly one attempt.
-	attempts := s.exportAttempts(snapID)
-	complete := 0
-	var errs []error
-	for id, parts := range attempts {
-		if err := checkExportParts(parts, e2ePartSize, s.wantExportParts()); err != nil {
-			errs = append(errs, fmt.Errorf("attempt %s: %w", id, err))
-			continue
+
+	cfg, err := pgxpool.ParseConfig(s.databaseURL())
+	if err != nil {
+		t.Fatal("parse database configuration for export retry")
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
+	if err != nil {
+		t.Fatalf("connect to the database: %v", err)
+	}
+	defer conn.Close(ctx)
+	var retryID string
+	err = conn.QueryRow(ctx, "SELECT COALESCE(export_command_id::text, '') FROM snapshots WHERE snapshot_id = $1", snapID).Scan(&retryID)
+	if err != nil {
+		t.Fatalf("read export command ID for snapshot %s: %v", snapID, err)
+	}
+
+	if err := checkRetryExportParts(s.exportAttempts(snapID), abandonedID, retryID, s.wantExportParts()); err != nil {
+		t.Fatal(err)
+	}
+	return s.objects.keys(s.exportAttemptsPrefix(snapID) + retryID + "/")
+}
+
+func checkRetryExportParts(attempts map[string]map[int]int, abandonedID, retryID string, wantParts int) error {
+	if retryID == "" {
+		return fmt.Errorf("exported snapshot has no export command ID")
+	}
+	if retryID == abandonedID {
+		return fmt.Errorf("export retry reused abandoned attempt %s", abandonedID)
+	}
+	// The abandoned attempt can still have objects under its own prefix.
+	if err := checkExportParts(attempts[retryID], e2ePartSize, wantParts); err != nil {
+		return fmt.Errorf("export retry attempt %s: %w", retryID, err)
+	}
+	return nil
+}
+
+func checkImportPartGets(got, want []string) error {
+	seen := make(map[string]bool, len(want))
+	for _, key := range want {
+		seen[key] = false
+	}
+	for _, key := range got {
+		if _, ok := seen[key]; !ok {
+			return fmt.Errorf("import requested unexpected object %q", key)
 		}
-		complete++
+		seen[key] = true
 	}
-	if complete < 1 {
-		t.Fatalf("no complete export attempt: %v", errors.Join(errs...))
+	for _, key := range want {
+		if !seen[key] {
+			return fmt.Errorf("import did not request retry part %q", key)
+		}
 	}
+	return nil
 }
 
 // importExport restores the snapshot on the second device and checks the
-// restored bytes against the original data.
-func importExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client, snapID string, data []byte) {
+// requests for the retry's parts and the restored bytes.
+func importExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client, snapID string, partKeys []string, data []byte) {
 	t.Helper()
 	p := createParams()
 	p.BaseImage = ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED
 	p.SnapshotID = snapID
 	p.DeviceID = s.agents[1].deviceID
+	position := s.objects.getPosition()
 	restored, err := c.CreateSandbox(ctx, p)
 	if err != nil {
 		t.Fatalf("CreateSandbox on the second device: %v", err)
@@ -120,6 +169,9 @@ func importExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client
 	if info.GetDeviceId() != s.agents[1].deviceID {
 		t.Fatalf("restored sandbox device = %q, want the second device %q", info.GetDeviceId(), s.agents[1].deviceID)
 	}
+	if err := checkImportPartGets(s.objects.getsSince(position), partKeys); err != nil {
+		t.Fatal(err)
+	}
 	got, err := restored.ReadFileBytes(ctx, workDir(ctx, t, restored)+"/data.bin")
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("restored ReadFile = (%d bytes, %v)", len(got), err)
@@ -132,7 +184,7 @@ func importExport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Client
 // and an import on a second device restores the data.
 func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 	t.Parallel()
-	s, c, ctx, snapID, data := exportRecoveryFixture(t)
+	s, c, ctx, snapID, abandonedID, data := exportRecoveryFixture(t)
 	sourceID := s.agents[0].deviceID
 	position := s.logs.position()
 	s.killAgent(t, 0)
@@ -142,8 +194,8 @@ func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 	s.restartAgent(t, 0)
 	waitExportState(ctx, t, c, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
 	s.waitForAgentChannelEvent(ctx, sourceID, agentStateReport, position)
-	retryExport(ctx, t, s, c, snapID)
-	importExport(ctx, t, s, c, snapID, data)
+	partKeys := retryExport(ctx, t, s, c, snapID, abandonedID)
+	importExport(ctx, t, s, c, snapID, partKeys, data)
 }
 
 // TestSnapshotExportRecoversAfterControlPlaneRestart kills the control plane
@@ -152,13 +204,56 @@ func TestSnapshotExportRecoversAfterAgentRestart(t *testing.T) {
 // explicit retry exports it.
 func TestSnapshotExportRecoversAfterControlPlaneRestart(t *testing.T) {
 	t.Parallel()
-	s, c, ctx, snapID, data := exportRecoveryFixture(t)
+	s, c, ctx, snapID, abandonedID, data := exportRecoveryFixture(t)
 	s.killAPI(t)
 	position := s.logs.position()
 	s.restartAPI(t)
 	waitExportState(ctx, t, c, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
 	s.waitForAgentChannelEvent(ctx, s.agents[0].deviceID, agentStateReport, position)
-	retryExport(ctx, t, s, c, snapID)
+	partKeys := retryExport(ctx, t, s, c, snapID, abandonedID)
 	s.waitForAgentChannelEvent(ctx, s.agents[1].deviceID, agentStateReport, position)
-	importExport(ctx, t, s, c, snapID, data)
+	importExport(ctx, t, s, c, snapID, partKeys, data)
+}
+
+func TestCheckRetryExportParts(t *testing.T) {
+	t.Parallel()
+	complete := map[int]int{1: e2ePartSize, 2: e2ePartSize, 3: 1}
+	for _, tc := range []struct {
+		name     string
+		retryID  string
+		attempts map[string]map[int]int
+		wantErr  string
+	}{
+		{
+			name:     "complete abandoned attempt alone",
+			retryID:  "retry",
+			attempts: map[string]map[int]int{"abandoned": complete},
+			wantErr:  "export retry attempt retry: 0 parts, want 3",
+		},
+		{
+			name:     "reused attempt ID",
+			retryID:  "abandoned",
+			attempts: map[string]map[int]int{"abandoned": complete},
+			wantErr:  "export retry reused abandoned attempt abandoned",
+		},
+		{
+			name:     "missing attempt ID",
+			attempts: map[string]map[int]int{"abandoned": complete},
+			wantErr:  "exported snapshot has no export command ID",
+		},
+		{
+			name:     "complete retry beside abandoned attempt",
+			retryID:  "retry",
+			attempts: map[string]map[int]int{"abandoned": complete, "retry": complete},
+		},
+	} {
+		err := checkRetryExportParts(tc.attempts, "abandoned", tc.retryID, 3)
+		if tc.wantErr == "" {
+			if err != nil {
+				t.Errorf("%s: %v", tc.name, err)
+			}
+		} else if err == nil || err.Error() != tc.wantErr {
+			t.Errorf("%s: error = %v, want %q", tc.name, err, tc.wantErr)
+		}
+	}
 }
