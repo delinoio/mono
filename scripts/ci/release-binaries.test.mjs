@@ -363,6 +363,8 @@ function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
   writeFileSync(githubEnv, "");
   const runnerTemp = join(dir, "runner");
   mkdirSync(runnerTemp);
+  const childTmp = join(dir, "child tmp");
+  mkdirSync(childTmp);
   const run = (
     args,
     env = {},
@@ -387,6 +389,7 @@ function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
         STUB_GOHOST: "freebsd-amd64",
         BINARIES: JSON.stringify(binaries),
         RUNNER_TEMP: runnerTemp,
+        TMPDIR: childTmp,
         GITHUB_STEP_SUMMARY: summary,
         GITHUB_ENV: githubEnv,
         RELEASE_MANIFEST_TOOL: join(bin, "release-manifest"),
@@ -396,6 +399,9 @@ function fixture(t, { parent = tmpdir(), bash = "bash" } = {}) {
         ...env,
       },
     });
+    if (args[0] === "github-releases") {
+      assert.deepEqual(readdirSync(childTmp), [], "release scratch remains");
+    }
     return {
       ...result,
       log: readFileSync(log, "utf8"),
@@ -1570,6 +1576,7 @@ test(
         [agent],
       );
       assert.equal(result.status, 0, result.stderr);
+      assert.equal(loggedArgs(result, "gh", "release", "download").length, 1);
       assert.doesNotMatch(result.log, releaseWrites);
       assert.doesNotMatch(result.log, /--clobber/);
       assert.match(result.stdout, /keeping its existing assets/);
@@ -1658,7 +1665,7 @@ test(
         {},
         plan,
       );
-      assert.notEqual(result.status, 0);
+      assert.equal(result.status, 1, result.stderr);
       assert.match(
         result.stderr,
         /The staged ownsand-agent-linux-amd64 of ownsand-agent@0\.1\.0 differs from the SHA-256 that the signed manifest records/,
@@ -1680,11 +1687,12 @@ test(
         {},
         plan,
       );
-      assert.notEqual(result.status, 0);
+      assert.equal(result.status, 1, result.stderr);
       assert.match(
         result.stderr,
         /The existing ownsand-agent-linux-amd64 of ownsand-agent@0\.1\.0 does not match the SHA-256 that the signed manifest records/,
       );
+      assert.equal(loggedArgs(result, "gh", "release", "download").length, 1);
       assert.doesNotMatch(result.log, releaseWrites);
       assert.equal(
         readFileSync(
@@ -1696,6 +1704,30 @@ test(
         ),
         "tampered\n",
       );
+    });
+    await t.test("an existing asset cannot be downloaded", (t) => {
+      const f = fixture(t);
+      const tag = "ownsand-agent@0.1.0";
+      const asset = "ownsand-agent-linux-amd64";
+      tagApi(f, tag);
+      tagApi(f, "ownsand-cli@0.0.1");
+      remoteRelease(f, tag, { assets: { [asset]: "a\n" } });
+      rmSync(join(f.dir, "release-assets", tag, asset));
+      const manifests = prepared(f, [
+        { version: "0.1.0", artifacts: { [asset]: "a\n" } },
+      ]);
+      const result = f.run(
+        ["github-releases", assembled(f), manifests],
+        { LC_ALL: "C" },
+        plan,
+      );
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /^cp: .*No such file or directory/m);
+      assert.equal(
+        loggedArgs(result, "gh", "release", "download", tag).length,
+        1,
+      );
+      assert.doesNotMatch(result.log, releaseWrites);
     });
     await t.test("the manifest lists an asset that was not staged", (t) => {
       const f = fixture(t);
@@ -1712,7 +1744,7 @@ test(
         {},
         plan,
       );
-      assert.notEqual(result.status, 0);
+      assert.equal(result.status, 1, result.stderr);
       assert.match(
         result.stderr,
         /lists ownsand-agent-darwin-arm64 for ownsand-agent@0\.1\.0, but this run staged no such asset/,
@@ -1728,7 +1760,7 @@ test(
         {},
         plan,
       );
-      assert.notEqual(result.status, 0);
+      assert.equal(result.status, 1, result.stderr);
       assert.match(
         result.stderr,
         /manifest\.json is missing; run fetch-manifests and prepare-manifests first/,
@@ -1763,9 +1795,9 @@ test(
           {},
           [agent],
         );
-        assert.notEqual(result.status, 0);
+        assert.equal(result.status, 1, result.stderr);
         assert.match(result.stderr, message);
-        assert.doesNotMatch(result.log, /gh release (create|upload)/);
+        assert.doesNotMatch(result.log, releaseWrites);
       });
     }
   },
