@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/webrtc/v4"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -70,11 +71,20 @@ func TestRevokeWhileCheckingSandboxState(t *testing.T) {
 			return ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, true
 		})})
 	t.Cleanup(dp.Close)
+	newPeerConnection := dp.newPeerConnection
+	constructorCalls := 0
+	dp.newPeerConnection = func(stun []string) (*webrtc.PeerConnection, error) {
+		constructorCalls++
+		return newPeerConnection(stun)
+	}
 	ch = newChannel(1)
 	dp.ChannelOpened(ch)
 	_, sdp := newCaller(t, DataChannelLabel)
 	offer := &ownsandv1.SignalingOffer{SessionId: id, SandboxId: w.sandbox, ExpiresIn: durationpb.New(time.Hour), Sdp: sdp}
 	requireRefusedOffer(t, dp.Offer(context.Background(), ch, offer))
+	if constructorCalls != 0 {
+		t.Errorf("peer constructor ran %d times, want 0", constructorCalls)
+	}
 	requireNoSession(t, dp)
 	dp.mu.Lock()
 	n := dp.revoked.len()
