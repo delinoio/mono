@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.sandcrew.v1;
+
+import "delino/sandcrew/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/sandcrew/v1;sandcrewv1";
+
+// One event that the bridge writes as a protobuf JSON line to the stdout of
+// its exec and to its guest event log.
+message BridgeEvent {
+  // Starts at 1 and increases by 1 for each event of the session that the
+  // guest event log holds. A credential_update event repeats the sequence of
+  // the last logged event.
+  uint64 sequence = 1;
+  // The byte offset in the guest event log after the line of this event.
+  uint64 log_end_offset = 2;
+  google.protobuf.Timestamp time = 3;
+  oneof event {
+    // Always the first event of a bridge process.
+    BridgeHello hello = 10;
+    InputAccepted input_accepted = 11;
+    InputRejected input_rejected = 12;
+    ContentChunk user_message_chunk = 13;
+    ContentChunk agent_message_chunk = 14;
+    ContentChunk agent_thought_chunk = 15;
+    ToolCall tool_call = 16;
+    ToolCallUpdate tool_call_update = 17;
+    Plan plan = 18;
+    PermissionRequest permission_request = 19;
+    PermissionResponse permission_response = 20;
+    TurnEnded turn_ended = 21;
+    ModeChanged mode_changed = 22;
+    ConfigOptions config_options = 23;
+    AgentSessionState session_state = 24;
+    BridgeError bridge_error = 25;
+    // The last event of a bridge process when the agent ends.
+    AgentExited agent_exited = 26;
+    // Written only to stdout, never to the guest event log, never stored and
+    // never logged.
+    CredentialUpdate credential_update = 27;
+    UnknownUpdate unknown_update = 28;
+  }
+}
+
+// A version of the bridge event and input schema.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// The ACP capabilities of the agent.
+message AgentCapabilities {
+  bool load_session = 1;
+  bool resume_session = 2;
+}
+
+message BridgeHello {
+  string bridge_version = 1;
+  ProtocolVersion protocol_version = 2;
+  AgentVendor vendor = 3;
+  string agent_version = 4;
+  string adapter_version = 5;
+  GuestOs guest_os = 6;
+  AgentCapabilities agent_capabilities = 7;
+  // True when the bridge wraps a headless CLI mode instead of ACP.
+  bool wrapped_headless = 8;
+}
+
+// The bridge read an inbox message and applied or queued it.
+message InputAccepted {
+  string input_id = 1;
+}
+
+// The bridge read an inbox message and rejected it.
+message InputRejected {
+  string input_id = 1;
+  InputRejectionReason reason = 2;
+}
+
+// A link to a resource that the agent can read.
+message ResourceLink {
+  string uri = 1;
+  string name = 2;
+  string title = 3;
+  string mime_type = 4;
+  optional int64 size_bytes = 5;
+}
+
+// An ACP content block that the schema has no case for.
+message UnsupportedContent {
+  // The original ACP JSON.
+  string raw_json = 1;
+}
+
+// An ACP content block.
+message ContentBlock {
+  oneof block {
+    // Markdown text.
+    string text = 1;
+    ResourceLink resource_link = 2;
+    UnsupportedContent unsupported = 3;
+  }
+}
+
+// A part of a user message, an agent message or an agent thought.
+message ContentChunk {
+  ContentBlock content = 1;
+}
+
+// A file change of a tool call.
+message Diff {
+  string path = 1;
+  // Unset for a new file.
+  optional string old_text = 2;
+  string new_text = 3;
+}
+
+// A terminal of a tool call.
+message Terminal {
+  string terminal_id = 1;
+}
+
+// One content item of a tool call.
+message ToolCallContent {
+  oneof content {
+    ContentBlock block = 1;
+    Diff diff = 2;
+    Terminal terminal = 3;
+  }
+}
+
+// A file location that a tool call works on.
+message ToolCallLocation {
+  string path = 1;
+  optional uint32 line = 2;
+}
+
+message ToolCall {
+  string tool_call_id = 1;
+  string title = 2;
+  ToolKind kind = 3;
+  ToolCallStatus status = 4;
+  repeated ToolCallContent content = 5;
+  repeated ToolCallLocation locations = 6;
+  // JSON text. Agent data: only the session owner reads it.
+  string raw_input = 7;
+}
+
+// The complete content of a tool call update, which replaces the content.
+message ToolCallContentList {
+  repeated ToolCallContent items = 1;
+}
+
+// The complete locations of a tool call update, which replace the locations.
+message ToolCallLocationList {
+  repeated ToolCallLocation items = 1;
+}
+
+// The changed fields of a tool call. Unset fields keep their value.
+message ToolCallUpdate {
+  string tool_call_id = 1;
+  optional string title = 2;
+  optional ToolKind kind = 3;
+  optional ToolCallStatus status = 4;
+  ToolCallContentList content = 5;
+  ToolCallLocationList locations = 6;
+  // JSON text. Agent data: only the session owner reads it.
+  optional string raw_input = 7;
+  // JSON text. Agent data: only the session owner reads it.
+  optional string raw_output = 8;
+}
+
+message PlanEntry {
+  string content = 1;
+  PlanEntryPriority priority = 2;
+  PlanEntryStatus status = 3;
+}
+
+// The plan of the agent. It replaces the previous plan.
+message Plan {
+  repeated PlanEntry entries = 1;
+}
+
+message PermissionOption {
+  string option_id = 1;
+  string name = 2;
+  PermissionOptionKind kind = 3;
+}
+
+// The agent asks for permission to run a tool call.
+message PermissionRequest {
+  string permission_request_id = 1;
+  string tool_call_id = 2;
+  repeated PermissionOption options = 3;
+}
+
+// The answer to a permission request.
+message PermissionResponse {
+  string permission_request_id = 1;
+  PermissionOutcome outcome = 2;
+  // Set when the outcome is SELECTED.
+  string option_id = 3;
+  // True when the bridge answered in AUTO_APPROVE.
+  bool auto_approved = 4;
+}
+
+message TurnEnded {
+  StopReason stop_reason = 1;
+}
+
+// A mode that the agent advertises.
+message SessionMode {
+  string mode_id = 1;
+  string name = 2;
+  string description = 3;
+}
+
+message ModeChanged {
+  string current_mode_id = 1;
+  repeated SessionMode available_modes = 2;
+  PermissionMode permission_mode = 3;
+}
+
+// One value of a configuration option.
+message ConfigOptionValue {
+  string value_id = 1;
+  string name = 2;
+  string description = 3;
+}
+
+// A session configuration option that the agent advertises, for example the
+// model.
+message ConfigOption {
+  string config_option_id = 1;
+  string name = 2;
+  ConfigOptionCategory category = 3;
+  string current_value_id = 4;
+  repeated ConfigOptionValue values = 5;
+}
+
+message ConfigOptions {
+  repeated ConfigOption options = 1;
+}
+
+message AgentSessionState {
+  AgentActivity state = 1;
+}
+
+message BridgeError {
+  BridgeErrorKind kind = 1;
+  // Never contains secrets, prompts or agent output.
+  string message = 2;
+}
+
+message AgentExited {
+  oneof status {
+    int32 exit_code = 1;
+    string signal = 2;
+  }
+}
+
+// The agent changed its credential file. It carries no credential content.
+message CredentialUpdate {
+  VendorCredentialKind kind = 1;
+  uint64 revision = 2;
+}
+
+// An ACP session update without a case in BridgeEvent.
+message UnknownUpdate {
+  // The ACP `sessionUpdate` value.
+  string session_update = 1;
+  // The original ACP update. Agent data: only the session owner reads it.
+  string raw_json = 2;
+}
+
+// One input that the control plane writes as a file into the guest inbox.
+message BridgeInput {
+  // UUID v7.
+  string input_id = 1;
+  google.protobuf.Timestamp create_time = 2;
+  oneof input {
+    PromptInput prompt = 10;
+    PermissionAnswerInput permission_answer = 11;
+    CancelTurnInput cancel_turn = 12;
+    SetModeInput set_mode = 13;
+    SetConfigOptionInput set_config_option = 14;
+  }
+}
+
+message PromptInput {
+  string text = 1;
+  // A guest path, for the previous transcript file.
+  optional string attachment_path = 2;
+}
+
+message PermissionAnswerInput {
+  string permission_request_id = 1;
+  string option_id = 2;
+}
+
+message CancelTurnInput {}
+
+message SetModeInput {
+  oneof mode {
+    string mode_id = 1;
+    PermissionMode permission_mode = 2;
+  }
+}
+
+message SetConfigOptionInput {
+  string config_option_id = 1;
+  string value_id = 2;
+}
