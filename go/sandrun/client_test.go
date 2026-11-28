@@ -198,9 +198,11 @@ func TestIssuedPersonalAPIKey(t *testing.T) {
 	if err := list(unexpired, org); err != nil {
 		t.Fatalf("list with unexpired key: %v", err)
 	}
-	expired, _ := issue(timestamppb.New(now.Add(-time.Hour)))
-	if err := list(expired, org); connect.CodeOf(err) != connect.CodeUnauthenticated {
-		t.Fatalf("list with expired key: %v, want unauthenticated", err)
+	_, err = admin.APIKeys().CreateApiKey(ctx, connect.NewRequest(&sandrunv1.CreateApiKeyRequest{
+		OrganizationId: org, Name: "dev session", ExpiresAt: timestamppb.New(now.Add(-time.Hour)),
+	}))
+	if connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("create key with past expiry: %v, want invalid_argument", err)
 	}
 
 	unknown, err := New(Options{BaseURL: srv.URL, APIKey: "sandrun_secret-unknown"})
