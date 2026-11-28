@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -35,6 +42,8 @@ const UNAVAILABLE =
   "Delino Accounts is not available right now. Try again in a moment.";
 const SIGN_IN = "Sign in with Delino";
 const TRY_AGAIN = "Try again";
+const USAGE_MONTH = { year: 2026, month: 12 };
+const UTC_ROLLOVER = Date.parse("2027-01-01T00:00:00Z");
 
 beforeEach(() => {
   window.sessionStorage.clear();
@@ -43,6 +52,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  rs.useRealTimers();
 });
 
 async function click(element: Element) {
@@ -172,12 +182,44 @@ const lists = [
 async function openList(
   entry: (typeof lists)[number],
   failure: ConnectError | undefined,
+  { rolloverUsageMonth = false } = {},
 ) {
-  const api = createFakeApi();
+  const usageMonth =
+    entry.method === "ListUsageSummary" ? USAGE_MONTH : undefined;
+  if (usageMonth !== undefined) {
+    rs.useFakeTimers({ now: UTC_ROLLOVER - 1_000, toFake: ["Date"] });
+  }
+  const api = createFakeApi({ usageMonth });
   api.userId = OWNER;
   const expectedRows = entry.seed(accountOf(api));
+  let releaseUsageResponse!: () => void;
+  if (rolloverUsageMonth) {
+    api.gates.set(
+      entry.method,
+      new Promise<void>((resolve) => {
+        releaseUsageResponse = resolve;
+      }),
+    );
+  }
   const { signIns } = renderApp(ACCOUNT_PATH, { api });
-  await click(await screen.findByRole("tab", { name: entry.tab }));
+  try {
+    await click(await screen.findByRole("tab", { name: entry.tab }));
+    if (rolloverUsageMonth) {
+      await waitFor(() => {
+        const request = api.calls.find(
+          ({ method }) => method === entry.method,
+        )?.request;
+        expect(request).toMatchObject({ ...USAGE_MONTH, pageToken: "" });
+      });
+      // Cross midnight after the page sends the request and before the fake serves it.
+      rs.setSystemTime(UTC_ROLLOVER);
+    }
+  } finally {
+    if (rolloverUsageMonth) {
+      api.gates.delete(entry.method);
+      releaseUsageResponse();
+    }
+  }
   await screen.findByText(entry.more, { selector: "button" });
   await waitFor(() => expect(rowCount(entry.list)).toBe(entry.firstPage));
   if (failure !== undefined) api.failContinuation.set(entry.method, failure);
@@ -187,13 +229,14 @@ async function openList(
 for (const entry of lists) {
   describe(`${entry.name}: a failed next page`, () => {
     test("keeps the rows, shows the notice and retries the failed cursor once", async () => {
+      const isUsageSummary = entry.method === "ListUsageSummary";
       const { api, expectedRows } = await openList(
         entry,
         new ConnectError("the page service is down", Code.Unavailable),
+        { rolloverUsageMonth: isUsageSummary },
       );
       const firstPageRows = expectedRows.slice(0, entry.firstPage);
       expect(entry.readRowIdentities()).toEqual(firstPageRows);
-      const isUsageSummary = entry.method === "ListUsageSummary";
       const usageTotal = () => screen.getByLabelText("Usage total").textContent;
       if (isUsageSummary) {
         expect(usageTotal()).toBe("$201.00");
