@@ -1778,14 +1778,29 @@ describe("exec over the relay", () => {
     expect(h.api.callsOf("Exec")).toHaveLength(2);
   });
 
-  test("a stream that ends without its end-of-stream message is an interruption", async () => {
+  test.each([
+    [
+      "a missing end-of-stream message",
+      true,
+      { delayMs: 500, authorizationCount: 2, grantId: "grant-2" },
+    ],
+    [
+      "a clean end-of-stream message",
+      false,
+      { delayMs: 0, authorizationCount: 1, grantId: "grant-1" },
+    ],
+  ])("continues an Exec stream after %s", async (_name, truncate, expected) => {
     const h = setup();
+    let execEndedAt = Number.NaN;
+    let attachStartedAt = Number.NaN;
     h.api.stream(RelayService, "Exec", async function* () {
       yield execMsg(ev.accepted());
       yield execMsg(ev.started());
-      yield new Eof();
+      execEndedAt = h.clock.now();
+      if (truncate) yield new Eof();
     });
     h.api.stream(RelayService, "AttachExec", async function* () {
+      attachStartedAt = h.clock.now();
       yield attachMsg(ev.accepted());
       yield attachMsg(ev.exited(0));
     });
@@ -1795,7 +1810,22 @@ describe("exec over the relay", () => {
         .exec({ command: ["x"] })
         .wait(),
     );
-    expect(result.kind).toBe(ExecResultKind.Exited);
+
+    expect(result).toMatchObject({ kind: ExecResultKind.Exited, exitCode: 0n });
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    const attaches = h.api.callsOf("AttachExec");
+    expect(attaches).toHaveLength(1);
+    const authorizations = h.api.callsOf("AuthorizeRelay");
+    expect({
+      delayMs: attachStartedAt - execEndedAt,
+      authorizationCount: authorizations.length,
+      grantId: attaches[0]?.headers.get("ownsand-relay-grant-id"),
+    }).toEqual(expected);
+    if (truncate) {
+      expect(authorizations[1]?.request).toMatchObject({
+        replacesGrantId: "grant-1",
+      });
+    }
   });
 
   test("attaches to an exec it did not start with an ATTACH_EXEC grant without a digest", async () => {
