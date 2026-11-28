@@ -196,6 +196,10 @@ function startLauncher(t, { port, env = {}, pathPrefix } = {}) {
   childEnv.METRICS_ADDR = "";
   delete childEnv.CORS_ORIGINS;
   delete childEnv.WEB_ORIGIN;
+  // Keep the fixture independent of the host's telemetry configuration.
+  for (const name of Object.keys(childEnv)) {
+    if (name.startsWith("OTEL_")) delete childEnv[name];
+  }
   Object.assign(childEnv, env);
   for (const [name, value] of Object.entries(childEnv)) {
     if (value === undefined) delete childEnv[name];
@@ -377,6 +381,75 @@ const envRecord = (output) =>
   JSON.parse(output.split("\n").find((line) => line.includes('"event":"env"')));
 
 test(
+  "the build and server receive only explicit OpenTelemetry settings",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const inherited = {
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:1",
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://127.0.0.1:1/v1/metrics",
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://127.0.0.1:1/v1/logs",
+      OTEL_EXPORTER_OTLP_HEADERS: "test=generic",
+      OTEL_EXPORTER_OTLP_METRICS_HEADERS: "test=metrics",
+      OTEL_EXPORTER_OTLP_LOGS_HEADERS: "test=logs",
+      OTEL_RESOURCE_ATTRIBUTES: "invalid_fixture_attribute",
+      OTEL_METRIC_EXPORT_INTERVAL: "100",
+      OTEL_SDK_DISABLED: "true",
+    };
+    const names = Object.keys(inherited);
+    for (const [name, value] of Object.entries(inherited)) {
+      const previous = process.env[name];
+      t.after(() => {
+        if (previous === undefined) delete process.env[name];
+        else process.env[name] = previous;
+      });
+      process.env[name] = value;
+    }
+
+    const probe = `#!${process.execPath}
+const names = ${JSON.stringify(names)};
+const present = Object.fromEntries(names.map((name) => [name, Object.hasOwn(process.env, name)]));
+console.log(JSON.stringify({ present, metricsDisabled: process.env.METRICS_ADDR === "" }));
+`;
+    const pathPrefix = fakeGo(
+      t,
+      [
+        'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done',
+        `cat > "$out" <<'PROGRAM'\n${probe}PROGRAM`,
+        'chmod 755 "$out"',
+        '"$out"',
+      ].join("\n"),
+    );
+    const endpoint = "OTEL_EXPORTER_OTLP_ENDPOINT";
+    for (const env of [
+      {},
+      {
+        [endpoint]: "http://127.0.0.1:2",
+        OTEL_EXPORTER_OTLP_LOGS_HEADERS: undefined,
+      },
+    ]) {
+      const run = startLauncher(t, { port: await freePort(), env, pathPrefix });
+      assert.equal((await run.exited).code, 0, run.stderr);
+      const expected = {
+        present: Object.fromEntries(
+          names.map((name) => [name, env[name] !== undefined]),
+        ),
+        metricsDisabled: true,
+      };
+      // The fake build runs the probe once and the launcher runs it again.
+      const records = run.stdout
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(records, [expected, expected]);
+    }
+
+    for (const [name, value] of Object.entries(inherited)) {
+      assert.ok(process.env[name] === value, `parent ${name} changed`);
+    }
+  },
+);
+
+test(
   "development origins are the defaults and explicit values win",
   { skip, timeout: Timeout },
   async (t) => {
@@ -503,6 +576,11 @@ test(
     const port = await freePort();
     const run = startLauncher(t, { port });
     await waitReady(run);
+    const started = JSON.parse(
+      run.stdout.split("\n").find((line) => line.includes('"server_started"')),
+    );
+    assert.equal(started.otlp_metrics_export, false);
+    assert.equal(started.otlp_logs_export, false);
     const health = await fetch(`http://127.0.0.1:${port}/healthz`);
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), { status: "ok" });
@@ -516,6 +594,22 @@ test(
     assert.match(run.stdout, /"server_shutdown_completed"/);
     await assertNoListener(port);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
+  },
+);
+
+test(
+  "an explicitly set malformed OpenTelemetry resource fails startup",
+  { skip, timeout: Timeout * 2 },
+  async (t) => {
+    const port = await freePort();
+    const run = startLauncher(t, {
+      port,
+      env: { OTEL_RESOURCE_ATTRIBUTES: "invalid_fixture_attribute" },
+    });
+    assert.equal((await run.exited).code, 1, run.stderr);
+    assert.match(serverExitError(run.stdout), /missing value/);
+    assert.doesNotMatch(run.stdout, /"server_started"/);
+    await assertNoListener(port);
   },
 );
 
