@@ -4,10 +4,13 @@ package api_test
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
@@ -60,18 +63,97 @@ func auditActions(t *testing.T, env *testenv.Env, orgID string) []sandrunv1.Audi
 	t.Helper()
 	rows, err := env.DB.Pool.Query(context.Background(), "SELECT action FROM audit_events WHERE organization_id = $1 ORDER BY audit_event_id DESC", orgID)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read audit actions: %v", err)
 	}
 	defer rows.Close()
+
+	actions, err := collectAuditActions(rows)
+	if err != nil {
+		t.Fatalf("read audit actions: %v", err)
+	}
+	return actions
+}
+
+func collectAuditActions(rows pgx.Rows) ([]sandrunv1.AuditAction, error) {
 	var out []sandrunv1.AuditAction
 	for rows.Next() {
 		var a int16
 		if err := rows.Scan(&a); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 		out = append(out, sandrunv1.AuditAction(a))
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type auditActionRow struct {
+	action sandrunv1.AuditAction
+	err    error
+}
+
+type auditActionRows struct {
+	pgx.Rows
+	rows         []auditActionRow
+	next         int
+	exhausted    bool
+	iterationErr error
+}
+
+func (r *auditActionRows) Next() bool {
+	if r.next == len(r.rows) {
+		r.exhausted = true
+		return false
+	}
+	r.next++
+	return true
+}
+
+func (r *auditActionRows) Scan(dest ...any) error {
+	row := r.rows[r.next-1]
+	if row.err != nil {
+		return row.err
+	}
+	*dest[0].(*int16) = int16(row.action)
+	return nil
+}
+
+func (r *auditActionRows) Err() error {
+	if r.exhausted {
+		return r.iterationErr
+	}
+	return nil
+}
+
+func TestCollectAuditActions(t *testing.T) {
+	t.Parallel()
+	iterationErr := errors.New("audit row iteration failed")
+	scanErr := errors.New("audit row scan failed")
+	created := auditActionRow{action: sandrunv1.AuditAction_AUDIT_ACTION_ORGANIZATION_CREATED}
+	joined := auditActionRow{action: sandrunv1.AuditAction_AUDIT_ACTION_MEMBER_JOINED}
+
+	for _, tc := range []struct {
+		name         string
+		rows         []auditActionRow
+		iterationErr error
+		want         []sandrunv1.AuditAction
+		wantErr      error
+	}{
+		{name: "empty"},
+		{name: "preserve query order", rows: []auditActionRow{joined, created}, want: []sandrunv1.AuditAction{joined.action, created.action}},
+		{name: "iteration fails before any row", iterationErr: iterationErr, wantErr: iterationErr},
+		{name: "iteration fails after a row", rows: []auditActionRow{created}, iterationErr: iterationErr, wantErr: iterationErr},
+		{name: "scan fails after a row", rows: []auditActionRow{created, {err: scanErr}}, wantErr: scanErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := collectAuditActions(&auditActionRows{rows: tc.rows, iterationErr: tc.iterationErr})
+			if err != tc.wantErr || !slices.Equal(got, tc.want) {
+				t.Fatalf("collectAuditActions = %v, %v, want %v, %v", got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
 }
 
 func countAction(actions []sandrunv1.AuditAction, a sandrunv1.AuditAction) int {
