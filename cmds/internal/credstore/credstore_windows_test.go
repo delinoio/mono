@@ -274,17 +274,35 @@ func TestWindowsLoadContextSingleAttempt(t *testing.T) {
 	}
 	defer func() { _ = windows.CloseHandle(handle) }()
 
-	ctx, cancel := context.WithTimeout(t.Context(), replaceRetryTimeout)
-	defer cancel()
-	start := time.Now()
-	_, err = s.LoadContext(ctx, time.Time{})
-	if elapsed := time.Since(start); elapsed >= replaceRetryTimeout/2 {
-		t.Fatalf("single attempt took %v", elapsed)
+	// The hosted Windows runner allowed a credential read with this handle
+	// open. Probe with the same open as os.ReadFile so the assertion runs
+	// only when the fixture creates a sharing violation. Remove this guard
+	// when all supported Windows test environments enforce the fixture.
+	probe, err := os.Open(s.Path())
+	switch {
+	case err == nil:
+		if err := probe.Close(); err != nil {
+			t.Fatalf("close the credential file probe: %v", err)
+		}
+		t.Skip("share mode 0 did not block os.Open on the Windows test volume")
+	case !errors.Is(err, windows.ERROR_SHARING_VIOLATION):
+		t.Fatalf("probe the credential file under the exclusive handle: %v", err)
 	}
-	var readErr *os.PathError
-	if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) || !errors.As(err, &readErr) {
-		t.Fatalf("want a wrapped sharing violation, got %v", err)
-	}
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), replaceRetryTimeout)
+		defer cancel()
+		start := time.Now()
+		_, err := s.LoadContext(ctx, time.Time{})
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Fatalf("single attempt waited %v", elapsed)
+		}
+		var readErr *os.PathError
+		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) || !errors.As(err, &readErr) ||
+			err == readErr || readErr.Path != s.Path() {
+			t.Fatalf("want a wrapped sharing violation for the credential file, got %v", err)
+		}
+	})
 }
 
 func TestWindowsLoadContextBoundsLockWait(t *testing.T) {
@@ -294,6 +312,18 @@ func TestWindowsLoadContextBoundsLockWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
+
+	t.Run("zero deadline", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			start := time.Now()
+			_, err := s.LoadContext(ctx, time.Time{})
+			if elapsed := time.Since(start); !errors.Is(err, ErrLockTimeout) || elapsed != 0 {
+				t.Fatalf("want an immediate lock timeout, got %v after %v", err, elapsed)
+			}
+		})
+	})
 
 	_, err = s.LoadContext(t.Context(), time.Now().Add(2*lockPollInterval))
 	if !errors.Is(err, ErrLockTimeout) {
