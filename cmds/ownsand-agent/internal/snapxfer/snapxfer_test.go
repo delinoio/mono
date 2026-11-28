@@ -119,6 +119,58 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestImportPublishesConfinedImplicitParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix resolves parent components after following the confined link")
+	}
+	probe := t.TempDir()
+	if err := os.Symlink("target", filepath.Join(probe, "probe")); err != nil {
+		t.Skipf("symbolic links are not available: %v", err)
+	}
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	for _, e := range []struct {
+		hdr  tar.Header
+		data string
+	}{
+		{hdr: tar.Header{Name: "real/deep/", Typeflag: tar.TypeDir, Mode: 0o700}},
+		{hdr: tar.Header{Name: "alias", Typeflag: tar.TypeSymlink, Linkname: "real/deep"}},
+		{hdr: tar.Header{Name: "alias/../child/file", Typeflag: tar.TypeReg, Mode: 0o640}, data: "contents"},
+	} {
+		e.hdr.Size = int64(len(e.data))
+		if err := tw.WriteHeader(&e.hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(tw, e.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := newBucket(t)
+	b.objects["/snap/1"] = archive.Bytes()
+	sum := sha256.Sum256(archive.Bytes())
+	parts := []*ownsandv1.SnapshotPart{{PartNumber: 1, SizeBytes: int64(archive.Len()), Sha256: sum[:]}}
+	tr := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: quietLogger(), TempDir: t.TempDir()}
+	base := t.TempDir()
+	content := filepath.Join(base, "content")
+	if err := tr.Import(context.Background(), "snap", parts, content); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(content, "real", "child", "file")); err != nil || string(got) != "contents" {
+		t.Fatalf("imported file = %q, %v", got, err)
+	}
+	requireMode(t, filepath.Join(content, "real", "child"), 0o700)
+	if _, err := os.Lstat(filepath.Join(content, "child")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lexically cleaned parent exists: %v", err)
+	}
+	if _, err := os.Lstat(content + ".importing"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging directory remains after publication: %v", err)
+	}
+}
+
 func makeProcessSnapshot(t *testing.T, root, data string) {
 	t.Helper()
 	t.Cleanup(func() { removeTestTree(t, root) })

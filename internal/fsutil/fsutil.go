@@ -410,7 +410,11 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 				dirs[tarDirectoryModeKey(name)] = dirMode{path: name, perm: mode}
 			}
 		case tar.TypeReg:
-			if err := mkdirTarDirs(root, filepath.Dir(name), 0); err != nil {
+			parent := "."
+			if sep := strings.LastIndexByte(name, filepath.Separator); sep >= 0 {
+				parent = name[:sep]
+			}
+			if err := mkdirTarDirs(root, parent, 0); err != nil {
 				return err
 			}
 			f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
