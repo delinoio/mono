@@ -170,7 +170,7 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 	var res UsageResult
 	var queued bool
 	var dup *storedReport
-	err = s.db.InTx(ctx, func(tx pgx.Tx) error {
+	err = s.InObservedTx(ctx, func(tx pgx.Tx, observations *TxObservations) error {
 		res, queued, dup = UsageResult{}, false, nil
 		now := s.timestamp()
 		if attributed {
@@ -242,7 +242,7 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 			res = UsageResult{Unattributed: true}
 			return nil
 		}
-		d, err := s.Deduct(ctx, tx, Deduction{
+		d, err := s.Deduct(ctx, tx, observations, Deduction{
 			BillingAccountID: link.AccountID, AmountUSDMicros: r.Amount, Service: r.Service,
 			OrganizationID: r.OrganizationID, Meter: r.Meter, WindowStart: r.WindowStart, Quantity: r.Quantity,
 		})

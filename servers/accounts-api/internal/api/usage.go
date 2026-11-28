@@ -270,7 +270,7 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 	var status billing.OrganizationStatus
 	var created bool
 	audit := &auditLog{}
-	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.billing.InObservedTx(ctx, func(tx pgx.Tx, observations *billing.TxObservations) error {
 		account, err = loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
 			return err
@@ -284,7 +284,7 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 		}
 		// The status of a new link, or a suspension of an existing link
 		// that became due, is recorded before the response reads it.
-		if err := h.billing.SyncStatuses(ctx, tx, accountID); err != nil {
+		if err := h.billing.SyncStatuses(ctx, tx, observations, accountID); err != nil {
 			return err
 		}
 		st, ok, err := billing.CurrentStatus(ctx, tx, service, orgID)

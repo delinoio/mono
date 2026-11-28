@@ -393,7 +393,7 @@ func (s *Service) StartSubscription(ctx context.Context, tx pgx.Tx, accountID st
 
 // changeSubscription stores the confirmed result of a Paddle schedule change
 // for the current subscription. tx holds the billing account and subscription locks.
-func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, accountID, operation string, sub Subscription, call func(id string) (paddle.Subscription, error)) (Subscription, error) {
+func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, observations *TxObservations, accountID, operation string, sub Subscription, call func(id string) (paddle.Subscription, error)) (Subscription, error) {
 	now := s.timestamp()
 	acct, err := lockAccount(ctx, tx, accountID)
 	if err != nil {
@@ -425,7 +425,7 @@ func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, accountID, 
 	if !applied {
 		return Subscription{}, unavailable("the payment provider did not confirm the subscription change; try again later")
 	}
-	if err := s.syncStatuses(ctx, tx, accountID, now); err != nil {
+	if err := s.syncStatuses(ctx, tx, observations, accountID, now); err != nil {
 		return Subscription{}, err
 	}
 	return LoadSubscription(ctx, tx, accountID, false)
@@ -434,7 +434,7 @@ func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, accountID, 
 // CancelSubscription schedules the cancellation at the end of the paid
 // period. tx holds the billing account lock. A scheduled cancellation is
 // kept unchanged.
-func (s *Service) CancelSubscription(ctx context.Context, tx pgx.Tx, accountID string) (Subscription, bool, error) {
+func (s *Service) CancelSubscription(ctx context.Context, tx pgx.Tx, observations *TxObservations, accountID string) (Subscription, bool, error) {
 	sub, err := LoadSubscription(ctx, tx, accountID, true)
 	if err != nil {
 		return Subscription{}, false, err
@@ -445,7 +445,7 @@ func (s *Service) CancelSubscription(ctx context.Context, tx pgx.Tx, accountID s
 	if sub.CancelAtPeriodEnd {
 		return sub, false, nil
 	}
-	sub, err = s.changeSubscription(ctx, tx, accountID, "cancel_subscription", sub, func(id string) (paddle.Subscription, error) {
+	sub, err = s.changeSubscription(ctx, tx, observations, accountID, "cancel_subscription", sub, func(id string) (paddle.Subscription, error) {
 		return s.paddle.CancelSubscription(ctx, id, paddle.EffectiveNextBillingPeriod)
 	})
 	return sub, err == nil, err
@@ -453,7 +453,7 @@ func (s *Service) CancelSubscription(ctx context.Context, tx pgx.Tx, accountID s
 
 // ResumeSubscription removes a scheduled cancellation. tx holds the billing
 // account lock. Without a scheduled cancellation nothing changes.
-func (s *Service) ResumeSubscription(ctx context.Context, tx pgx.Tx, accountID string) (Subscription, bool, error) {
+func (s *Service) ResumeSubscription(ctx context.Context, tx pgx.Tx, observations *TxObservations, accountID string) (Subscription, bool, error) {
 	sub, err := LoadSubscription(ctx, tx, accountID, true)
 	if err != nil {
 		return Subscription{}, false, err
@@ -464,7 +464,7 @@ func (s *Service) ResumeSubscription(ctx context.Context, tx pgx.Tx, accountID s
 	if !sub.CancelAtPeriodEnd {
 		return sub, false, nil
 	}
-	sub, err = s.changeSubscription(ctx, tx, accountID, "resume_subscription", sub, func(id string) (paddle.Subscription, error) {
+	sub, err = s.changeSubscription(ctx, tx, observations, accountID, "resume_subscription", sub, func(id string) (paddle.Subscription, error) {
 		return s.paddle.RemoveScheduledChange(ctx, id)
 	})
 	return sub, err == nil, err

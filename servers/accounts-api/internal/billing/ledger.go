@@ -364,8 +364,9 @@ type DeductionResult struct {
 // entry, queues an automatic top-up when the balance falls below its
 // threshold, queues the low-balance email when automatic top-up is off and
 // recomputes the billing statuses of the linked organizations. The caller
-// owns tx; Deduct locks the billing account row in it.
-func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, d Deduction) (DeductionResult, error) {
+// owns tx and flushes observations after commit. Deduct locks the billing
+// account row in tx.
+func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, observations *TxObservations, d Deduction) (DeductionResult, error) {
 	if d.AmountUSDMicros < 0 {
 		return DeductionResult{}, fmt.Errorf("usage amount %d is negative", d.AmountUSDMicros)
 	}
@@ -394,7 +395,7 @@ func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, d Deduction) (Deduction
 	if err != nil {
 		return DeductionResult{}, err
 	}
-	if err := s.syncStatuses(ctx, tx, acct.ID, now); err != nil {
+	if err := s.syncStatuses(ctx, tx, observations, acct.ID, now); err != nil {
 		return DeductionResult{}, err
 	}
 	return DeductionResult{LedgerEntryID: id, BalanceAfterUSDMicros: acct.Balance, AutoTopUpQueued: queued}, nil

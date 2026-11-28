@@ -167,16 +167,25 @@ func (f *fixture) grant(accountID string, kind LedgerKind, amount int64) string 
 
 func (f *fixture) deduct(accountID string, amount int64) DeductionResult {
 	f.t.Helper()
+	res, err := f.deductWithError(accountID, amount)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return res
+}
+
+func (f *fixture) deductWithError(accountID string, amount int64) (DeductionResult, error) {
+	f.t.Helper()
 	var res DeductionResult
-	f.tx(func(tx pgx.Tx) error {
+	err := f.s.InObservedTx(ctx(), func(tx pgx.Tx, observations *TxObservations) error {
 		var err error
-		res, err = f.s.Deduct(ctx(), tx, Deduction{
+		res, err = f.s.Deduct(ctx(), tx, observations, Deduction{
 			BillingAccountID: accountID, AmountUSDMicros: amount, Service: "ownsand", OrganizationID: "org",
 			Meter: "ownsand.relay_egress", WindowStart: f.clock.Now().Truncate(5 * time.Minute), Quantity: 1,
 		})
 		return err
 	})
-	return res
+	return res, err
 }
 
 func (f *fixture) balance(accountID string) int64 {
@@ -340,8 +349,8 @@ func TestLedgerConcurrentDeductions(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- f.db.InTx(ctx(), func(tx pgx.Tx) error {
-				_, err := f.s.Deduct(ctx(), tx, Deduction{BillingAccountID: acct, AmountUSDMicros: usd})
+			errs <- f.s.InObservedTx(ctx(), func(tx pgx.Tx, observations *TxObservations) error {
+				_, err := f.s.Deduct(ctx(), tx, observations, Deduction{BillingAccountID: acct, AmountUSDMicros: usd})
 				return err
 			})
 		}()
