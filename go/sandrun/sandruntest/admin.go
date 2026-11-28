@@ -103,6 +103,13 @@ func (s *Server) AddDevice(d *sandrunv1.DeviceCapacity) {
 
 const queueBufferSize = 64
 
+// scopedQueue is protected by Server.mu. A closed ready channel signals that
+// events are available for watches to compete for under that lock.
+type scopedQueue struct {
+	events []*sandrunv1.WatchQueueResponse
+	ready  chan struct{}
+}
+
 // SendQueueEvent queues a request or runner update for one WatchQueue stream
 // of the event's organization. Updates with no organization ID are ignored.
 // Other event types can go to any one WatchQueue stream.
@@ -121,20 +128,55 @@ func (s *Server) SendQueueEvent(ev *sandrunv1.WatchQueueResponse) {
 		s.unscopedQueue <- ev
 		return
 	}
-	if orgID != "" {
-		s.queueForOrganization(orgID) <- proto.CloneOf(ev)
+	if orgID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.queueByOrg == nil {
+		return // The server has shut down.
+	}
+	queue := s.scopedQueueLocked(orgID)
+	queue.events = append(queue.events, proto.CloneOf(ev))
+	if len(queue.events) == 1 {
+		close(queue.ready)
 	}
 }
 
-func (s *Server) queueForOrganization(orgID string) chan *sandrunv1.WatchQueueResponse {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Server) scopedQueueLocked(orgID string) *scopedQueue {
 	queue := s.queueByOrg[orgID]
 	if queue == nil {
-		queue = make(chan *sandrunv1.WatchQueueResponse, queueBufferSize)
+		queue = &scopedQueue{ready: make(chan struct{})}
 		s.queueByOrg[orgID] = queue
 	}
 	return queue
+}
+
+func (s *Server) scopedQueueReady(orgID string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.queueByOrg == nil {
+		return nil
+	}
+	return s.scopedQueueLocked(orgID).ready
+}
+
+func (s *Server) dequeueScopedEvent(ctx context.Context, orgID string) *sandrunv1.WatchQueueResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queue := s.queueByOrg[orgID]
+	if ctx.Err() != nil || queue == nil || len(queue.events) == 0 {
+		return nil
+	}
+	event := queue.events[0]
+	queue.events[0] = nil
+	queue.events = queue.events[1:]
+	if len(queue.events) == 0 {
+		queue.events = nil
+		queue.ready = make(chan struct{})
+	}
+	return event
 }
 
 // OwnSandLink returns the stored link of an organization and the API key
@@ -747,13 +789,22 @@ func (w *workService) WatchQueue(ctx context.Context, req *connect.Request[sandr
 			return err
 		}
 	}
-	queue := w.s.queueForOrganization(orgID)
 	for {
+		ready := w.s.scopedQueueReady(orgID)
+		if ready == nil {
+			return nil
+		}
 		var m *sandrunv1.WatchQueueResponse
 		select {
 		case <-ctx.Done():
 			return nil
-		case m = <-queue:
+		case <-w.s.watchDone:
+			return nil
+		case <-ready:
+			m = w.s.dequeueScopedEvent(ctx, orgID)
+			if m == nil {
+				continue
+			}
 		case m = <-w.s.unscopedQueue:
 		}
 		if done, err := send(m); done || err != nil {
