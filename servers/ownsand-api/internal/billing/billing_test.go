@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -130,6 +131,16 @@ func TestCeilMulDiv(t *testing.T) {
 
 func TestMeterMappings(t *testing.T) {
 	t.Parallel()
+	wantMeters := []ownsandv1.BillingMeter{
+		ownsandv1.BillingMeter_BILLING_METER_RELAY_EGRESS,
+		ownsandv1.BillingMeter_BILLING_METER_R2_STORAGE,
+		ownsandv1.BillingMeter_BILLING_METER_CLASS_A_RPC,
+		ownsandv1.BillingMeter_BILLING_METER_CLASS_B_RPC,
+	}
+	if !slices.Equal(Meters, wantMeters) {
+		t.Fatalf("Meters = %v, want %v", Meters, wantMeters)
+	}
+
 	want := map[ownsandv1.BillingMeter]struct {
 		accounts accountsv1.Meter
 		id       string
@@ -139,10 +150,7 @@ func TestMeterMappings(t *testing.T) {
 		classA: {accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, "ownsand.class_a_rpc"},
 		classB: {accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC, "ownsand.class_b_rpc"},
 	}
-	if len(Meters) != len(want) {
-		t.Fatalf("Meters = %v", Meters)
-	}
-	for _, m := range Meters {
+	for _, m := range wantMeters {
 		if AccountsMeter(m) != want[m].accounts || MeterID(m) != want[m].id {
 			t.Errorf("meter %v maps to %v %q", m, AccountsMeter(m), MeterID(m))
 		}
