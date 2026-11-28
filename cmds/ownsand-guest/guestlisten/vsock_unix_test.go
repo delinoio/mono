@@ -6,6 +6,7 @@ package guestlisten
 
 import (
 	"errors"
+	"os"
 	"syscall"
 	"testing"
 
@@ -34,6 +35,93 @@ func openDevNull(t *testing.T) int {
 func fdOpen(fd int) bool {
 	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
 	return err == nil
+}
+
+type fakeVsockRawConn struct {
+	syscall.RawConn
+	callbacks int
+	waits     int
+	waitErr   error
+}
+
+func (r *fakeVsockRawConn) Read(callback func(uintptr) bool) error {
+	for {
+		r.callbacks++
+		if callback(12) {
+			return nil
+		}
+		r.waits++
+		if r.waitErr != nil {
+			return r.waitErr
+		}
+	}
+}
+
+func TestVsockAccept(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		results   []error
+		waitErr   error
+		wantErr   error
+		wantWaits int
+		wantCalls int
+	}{
+		{name: "retry in the same callback", results: []error{unix.EINTR, unix.ECONNABORTED, nil}, wantCalls: 1},
+		{name: "wait for readiness", results: []error{unix.ECONNABORTED, unix.EWOULDBLOCK, nil}, wantWaits: 1, wantCalls: 2},
+		{name: "invalid listener", results: []error{unix.EINVAL}, wantErr: unix.EINVAL, wantCalls: 1},
+		{name: "descriptor limit", results: []error{unix.EMFILE}, wantErr: unix.EMFILE, wantCalls: 1},
+		{name: "closed during wait", results: []error{unix.EAGAIN}, waitErr: os.ErrClosed, wantErr: os.ErrClosed, wantWaits: 1, wantCalls: 1},
+		{name: "setup interrupted", results: []error{acceptSetupError{unix.EINTR}}, wantErr: unix.EINTR, wantCalls: 1},
+		{name: "setup aborted", results: []error{acceptSetupError{unix.ECONNABORTED}}, wantErr: unix.ECONNABORTED, wantCalls: 1},
+		{name: "setup would block", results: []error{acceptSetupError{unix.EAGAIN}}, wantErr: unix.EAGAIN, wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			originalAccept := acceptNonblock
+			t.Cleanup(func() { acceptNonblock = originalAccept })
+			attempts := 0
+			acceptNonblock = func(fd int) (int, unix.Sockaddr, error) {
+				if fd != 12 || attempts >= len(tc.results) {
+					t.Fatalf("unexpected accept attempt %d on descriptor %d", attempts+1, fd)
+				}
+				err := tc.results[attempts]
+				attempts++
+				if err != nil {
+					return -1, nil, err
+				}
+				return openDevNull(t), &unix.SockaddrVM{CID: 2, Port: 5000}, nil
+			}
+			raw := &fakeVsockRawConn{waitErr: tc.waitErr}
+			local := &VsockAddr{CID: unix.VMADDR_CID_ANY, Port: 1024}
+			listener := &vsockListener{raw: raw, addr: local}
+			conn, err := listener.Accept()
+			if conn != nil {
+				defer conn.Close()
+			}
+			if err != tc.wantErr {
+				t.Fatalf("Accept() error = %v, want %v", err, tc.wantErr)
+			}
+			if attempts != len(tc.results) || raw.callbacks != tc.wantCalls || raw.waits != tc.wantWaits {
+				t.Fatalf("attempts = %d, callbacks = %d, waits = %d; want %d, %d, %d",
+					attempts, raw.callbacks, raw.waits, len(tc.results), tc.wantCalls, tc.wantWaits)
+			}
+			if tc.wantErr != nil {
+				if conn != nil {
+					t.Fatal("Accept() returned a connection with an error")
+				}
+				return
+			}
+			if conn == nil {
+				t.Fatal("Accept() returned no connection")
+			}
+			remote, ok := conn.RemoteAddr().(*VsockAddr)
+			if !ok || *remote != (VsockAddr{CID: 2, Port: 5000}) {
+				t.Errorf("remote address = %v, want vsock address 2:5000", conn.RemoteAddr())
+			}
+			if conn.LocalAddr() != local {
+				t.Errorf("local address = %v, want %v", conn.LocalAddr(), local)
+			}
+		})
+	}
 }
 
 func TestCreateCloexecHoldsForkLockAroundCreateAndMark(t *testing.T) {

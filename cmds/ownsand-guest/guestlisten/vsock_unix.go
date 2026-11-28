@@ -5,7 +5,6 @@
 package guestlisten
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -34,6 +33,11 @@ type vsockListener struct {
 	addr *VsockAddr
 	once sync.Once
 }
+
+var acceptNonblock = acceptVsockNonblock
+
+// acceptSetupError keeps descriptor setup failures out of the accept retry loop.
+type acceptSetupError struct{ error }
 
 // setCloseOnExec marks fd close-on-exec. It is a variable so that tests can
 // inject a failure.
@@ -105,11 +109,23 @@ func (l *vsockListener) Accept() (net.Conn, error) {
 		acceptErr error
 	)
 	err := l.raw.Read(func(fd uintptr) bool {
-		nfd, peer, acceptErr = acceptNonblock(int(fd))
-		return !errors.Is(acceptErr, unix.EAGAIN)
+		for {
+			nfd, peer, acceptErr = acceptNonblock(int(fd))
+			switch acceptErr {
+			case unix.EINTR, unix.ECONNABORTED:
+				continue
+			case unix.EAGAIN: // Also EWOULDBLOCK on Linux and Darwin.
+				return false
+			default:
+				return true
+			}
+		}
 	})
 	if err != nil {
 		return nil, err
+	}
+	if setupErr, ok := acceptErr.(acceptSetupError); ok {
+		return nil, setupErr.error
 	}
 	if acceptErr != nil {
 		return nil, acceptErr

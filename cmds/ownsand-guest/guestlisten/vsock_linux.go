@@ -10,6 +10,6 @@ func socketCloexec() (int, error) {
 	return unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 }
 
-func acceptNonblock(fd int) (int, unix.Sockaddr, error) {
+func acceptVsockNonblock(fd int) (int, unix.Sockaddr, error) {
 	return unix.Accept4(fd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 }
