@@ -36,6 +36,28 @@ const angleCopyLists = [
 const angleFiles =
   '      // ANGLE support\n      "libEGL.so",\n      "libGLESv2.so",\n';
 
+// The pinned CLI groups CEF with custom runtimes, but CEF uses GTK 4.
+// Remove this patch when the published CLI pin declares GTK 4 for CEF.
+const cefDependencyPatch = {
+  path: "src/runtime/mod.rs",
+  before: `      // CEF is shipped with the app
+      Self::Cef | Self::Other => &[GTK],`,
+  after: `      Self::Cef => &[LinuxDependency {
+        deb_package: "libgtk-4-1",
+        library: "libgtk-4.so.1",
+      }],
+      Self::Other => &[GTK],`,
+};
+
+export function patchCefLinuxDependencies(source) {
+  const { before, after } = cefDependencyPatch;
+  const index = source.indexOf(before);
+  if (index === -1 || index !== source.lastIndexOf(before)) {
+    throw new Error("Could not locate the pinned CEF Linux dependency mapping");
+  }
+  return source.replace(before, after);
+}
+
 async function unpackCrate(workDir, { name, version, sha256 }) {
   const packageName = `${name}-${version}`;
   const url = `https://static.crates.io/crates/${name}/${packageName}.crate`;
@@ -77,7 +99,7 @@ export async function linuxCefCli() {
   const cacheVersion = createHash("sha256")
     .update(cli.sha256)
     .update(bundler.sha256)
-    .update(JSON.stringify([angleCopyLists, angleFiles]))
+    .update(JSON.stringify([angleCopyLists, angleFiles, cefDependencyPatch]))
     .digest("hex");
   const cacheDir = join(
     cache,
@@ -97,6 +119,11 @@ export async function linuxCefCli() {
     );
     const cliDir = await unpackCrate(workDir, cli);
     const bundlerDir = await unpackCrate(workDir, bundler);
+    const runtimePath = join(cliDir, cefDependencyPatch.path);
+    writeFileSync(
+      runtimePath,
+      patchCefLinuxDependencies(readFileSync(runtimePath, "utf8")),
+    );
     for (const copyList of angleCopyLists) {
       const sourcePath = join(bundlerDir, copyList);
       const source = readFileSync(sourcePath, "utf8");

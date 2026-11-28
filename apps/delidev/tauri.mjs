@@ -165,7 +165,7 @@ function resolveConfig(platformName) {
   }
 }
 
-function embeddedBundleConfig() {
+function resolveBundleConfig() {
   if (
     (command !== "build" && command !== "bundle") ||
     tauriOptions.some(
@@ -208,7 +208,6 @@ function embeddedBundleConfig() {
 
   const resolved = resolveConfig(platformName);
   const bundle = resolved.config?.bundle;
-  if (bundle?.cef?.embed === false) return;
   if (!explicitFormats && command === "build" && bundle?.active !== true) {
     return;
   }
@@ -222,8 +221,14 @@ function embeddedBundleConfig() {
           .filter((target) => typeof target === "string")
           .map((target) => target.toLowerCase()));
   if (!includesFormat(selectedFormats, supportedFormats)) return;
-  const stageNotices = includesFormat(selectedFormats, noticeFormats);
-  return { ...resolved, platformName, stageNotices };
+  const embedsCef = bundle?.cef?.embed !== false;
+  const stageNotices =
+    embedsCef && includesFormat(selectedFormats, noticeFormats);
+  // On Linux, DeliDev links CEF for both shared and embedded bundles.
+  const usePatchedCli =
+    platformName === "linux" &&
+    (embedsCef || includesFormat(selectedFormats, ["deb", "rpm"]));
+  return { ...resolved, platformName, stageNotices, usePatchedCli };
 }
 
 function shellQuote(value) {
@@ -349,9 +354,8 @@ async function runNoticeBuild(
 }
 
 try {
-  const resolved = embeddedBundleConfig();
-  const cli =
-    resolved?.platformName === "linux" ? await linuxCefCli() : undefined;
+  const resolved = resolveBundleConfig();
+  const cli = resolved?.usePatchedCli ? await linuxCefCli() : undefined;
   if (resolved?.stageNotices) {
     await runNoticeBuild(resolved, cli);
   } else if (cli) {
