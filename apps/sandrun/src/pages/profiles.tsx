@@ -18,7 +18,7 @@ import {
 } from "@delino/sandrun-protos/v1/runner_profile_pb";
 import { useMemo, useState } from "react";
 import { useAgentIntegrations } from "../api.ts";
-import { SetupEmpty } from "../components/setup.tsx";
+import { SetupEmpty, SetupStep } from "../components/setup.tsx";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -144,6 +144,7 @@ export function ProfilesPage() {
             <SetupEmpty
               organizationId={organizationId}
               title={t("profiles.empty.title")}
+              hiddenStep={admin ? undefined : SetupStep.CreateRunnerProfile}
             >
               {admin ? t("profiles.empty.admin") : t("profiles.empty.member")}
             </SetupEmpty>

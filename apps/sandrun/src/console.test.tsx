@@ -92,6 +92,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { StrictMode } from "react";
 import { pagedProfileIntegrations } from "../e2e/profile-integration-fixture.ts";
+import { linkedSetupTransport } from "../e2e/setup-guidance-fixture.ts";
 import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -4069,6 +4070,7 @@ describe("overview", () => {
 describe("setup guidance", () => {
   const globexPath = `/orgs/${MOCK_IDS.globex}`;
   const acmePath = `/orgs/${MOCK_IDS.acme}`;
+  const northwindPath = `/orgs/${MOCK_IDS.northwind}`;
 
   async function linkOwnSandAction(route: string) {
     if (route === "") {
@@ -4140,39 +4142,31 @@ describe("setup guidance", () => {
     },
   );
 
-  function linkedSetupTransport(
-    empty: (
-      "ListGitHubInstallations" | "ListAgentIntegrations" | "ListRunnerProfiles"
-    )[],
-    linkState = OwnSandLinkState.ACTIVE,
-  ): Transport {
-    const mock = createMockTransport();
-    const fixture = createRouterTransport((router) => {
-      router.service(OwnSandLinkService, {
-        getOwnSandLink: ({ organizationId }) => ({
-          link: { organizationId, state: linkState },
-        }),
-      });
-      router.service(GitHubService, { listGitHubInstallations: () => ({}) });
-      router.service(AgentIntegrationService, {
-        listAgentIntegrations: () => ({}),
-      });
-      router.service(RunnerProfileService, { listRunnerProfiles: () => ({}) });
-      router.service(WorkService, { listRunners: () => ({}) });
-    });
-    const fixtureMethods = new Set<string>([
-      ...empty,
-      "GetOwnSandLink",
-      "ListRunners",
+  test("asks members to contact an admin when profile creation is next", async () => {
+    const transport = linkedSetupTransport(createMockTransport(), [
+      "ListRunnerProfiles",
     ]);
-    return {
-      ...mock,
-      unary(method, ...args) {
-        const transport = fixtureMethods.has(method.name) ? fixture : mock;
-        return transport.unary(method, ...args);
-      },
-    };
-  }
+    renderConsole(northwindPath, { transport });
+    const checklist = await screen.findByRole("region", {
+      name: "Set up SandRun",
+    });
+    const action = await within(checklist).findByRole("link", {
+      name: "Create a runner profile",
+    });
+
+    await click(action);
+
+    expect(
+      await screen.findByText("Ask an admin to create a runner profile."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Next step: create a runner profile/)).toBeNull();
+    expect(
+      screen.queryByRole("link", { name: "Create a runner profile" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Create runner profile" }),
+    ).toBeNull();
+  });
 
   test.each([
     [
@@ -4192,12 +4186,16 @@ describe("setup guidance", () => {
   ] as const)(
     "shows the next action with link state %s and GitHub connected: %s",
     async (linkState, hasGitHub, actionName, destination) => {
-      const emptyLists: Parameters<typeof linkedSetupTransport>[0] = [
+      const emptyLists: Parameters<typeof linkedSetupTransport>[1] = [
         "ListAgentIntegrations",
         "ListRunnerProfiles",
       ];
       if (!hasGitHub) emptyLists.push("ListGitHubInstallations");
-      const transport = linkedSetupTransport(emptyLists, linkState);
+      const transport = linkedSetupTransport(
+        createMockTransport(),
+        emptyLists,
+        linkState,
+      );
       const client = renderConsole(acmePath, { transport });
       const setupMethods: DescMethodUnary[] = [
         GitHubService.method.listGitHubInstallations,
@@ -4240,7 +4238,7 @@ describe("setup guidance", () => {
   );
 
   test("offers a work source when both lists are empty and profiles fail", async () => {
-    const mock = linkedSetupTransport([
+    const mock = linkedSetupTransport(createMockTransport(), [
       "ListGitHubInstallations",
       "ListAgentIntegrations",
     ]);
@@ -4258,7 +4256,9 @@ describe("setup guidance", () => {
   });
 
   test("offers a runner profile when GitHub is connected and agent integrations fail", async () => {
-    const mock = linkedSetupTransport(["ListRunnerProfiles"]);
+    const mock = linkedSetupTransport(createMockTransport(), [
+      "ListRunnerProfiles",
+    ]);
     renderConsole(acmePath, {
       transport: failingTransport(
         "ListAgentIntegrations",
