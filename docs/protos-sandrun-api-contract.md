@@ -127,14 +127,18 @@ When the OwnSand link is `ACTIVE`, `CreateRunnerProfile` checks template sources
 
 Each `GetAgentIntegration` response and each `ListAgentIntegrations` page use one committed view of the integration settings and credential state. Each page has its own view.
 
-`AgentIntegration` has `agent_integration_id`, `vendor`, `name`, a vendor settings `oneof` and the credential state: one `AgentCredentialState` (`AgentCredential`, `credential_set` and `credential_set_at`) for each credential of the vendor. Create and update requests carry the credentials in a vendor credentials `oneof`; `UpdateAgentIntegration` uses a field mask with the paths `name`, `settings` and `credentials`, and replaces only the non-empty credential fields. The settings and credentials per vendor:
+`AgentIntegration` has `agent_integration_id`, `vendor`, `name`, a vendor settings `oneof` and one `AgentCredentialState` per credential of the vendor. The state contains the `AgentCredential` kind, `credential_set` and `credential_set_at`. Create and update requests carry the credential values in a vendor credentials `oneof`.
 
-| Vendor         | Settings       | Credentials                                    |
-| -------------- | -------------- | ---------------------------------------------- |
-| `CLAUDE_CODE`  | none           | `environment_key`                              |
-| `CURSOR`       | `pool_name`    | `service_account_api_key`                      |
-| `OPENAI_CODEX` | none           | `environment_key`, `webhook_secret`, `api_key` |
-| `DEVIN`        | `outpost_name` | `api_token`, `outpost_token`                   |
+`UpdateAgentIntegration` accepts `name` and the top-level member paths in the table below. Each concrete path must name the active request member for the stored vendor, even if the mask also includes a legacy alias. The legacy paths `settings` and `credentials` select the active member of their respective `oneof`. Repeated paths and combinations of aliases and concrete paths apply each group once.
+
+| Vendor         | Settings path  | Settings fields | Credentials path           | Credential fields                              |
+| -------------- | -------------- | --------------- | -------------------------- | ---------------------------------------------- |
+| `CLAUDE_CODE`  | `claude_code`  | none            | `claude_code_credentials`  | `environment_key`                              |
+| `CURSOR`       | `cursor`       | `pool_name`     | `cursor_credentials`       | `service_account_api_key`                      |
+| `OPENAI_CODEX` | `openai_codex` | none            | `openai_codex_credentials` | `environment_key`, `webhook_secret`, `api_key` |
+| `DEVIN`        | `devin`        | `outpost_name`  | `devin_credentials`        | `api_token`, `outpost_token`                   |
+
+An empty mask, an unsupported path such as a nested field, or a missing or mismatched selected member returns `invalid_argument`. A credential update requires at least one non-empty credential field and replaces only non-empty fields. Omitted credentials retain their values and timestamps. Responses expose only credential state.
 
 - A Cursor `pool_name` must be free of double quotes (`"`). When a name contains a double quote, create and update return `invalid_argument` with `invalid settings.cursor.pool_name: must not contain a double quote`.
 - `OPENAI_CODEX` `api_key` (`AgentCredential` `API_KEY`, field 3 of `OpenAiCodexCredentials`) is an OpenAI API key of the project with the `api.agents.read` permission. The OpenAI `agent.session.action_required` webhook carries only the session ID and the action type, so `sandrun-api` reads the session's environment ID and remote URL with this key; the key stays in SandRun. The field and the enum value are additive changes of `v1`.
