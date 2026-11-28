@@ -32,37 +32,49 @@ func TestTombstoneExpiresAfterSessionLifetime(t *testing.T) {
 	ts.add("a", now)
 	ts.add("b", now.Add(30*time.Minute))
 	ts.add("a", now.Add(45*time.Minute)) // A repeated revocation keeps the first expiry.
-	if !ts.has("a", now.Add(tombstoneTTL-time.Nanosecond)) {
+	if !ts.has("a", now.Add(time.Hour-time.Nanosecond)) {
 		t.Fatal("tombstone expired before the session lifetime")
 	}
-	if ts.has("a", now.Add(tombstoneTTL)) {
+	if ts.has("a", now.Add(time.Hour)) {
 		t.Fatal("tombstone outlived the session lifetime")
 	}
-	if !ts.has("b", now.Add(tombstoneTTL)) {
+	if !ts.has("b", now.Add(time.Hour)) {
 		t.Fatal("a later tombstone expired with an earlier one")
 	}
-	if ts.has("b", now.Add(30*time.Minute+tombstoneTTL)) || ts.len() != 0 {
+	if ts.has("b", now.Add(time.Hour+30*time.Minute)) || ts.len() != 0 {
 		t.Fatal("tombstone b did not expire")
 	}
 }
 
 func TestTombstoneCapDropsOldest(t *testing.T) {
 	t.Parallel()
+	const capacity = 1024
 	var ts tombstones
 	now := time.Unix(1000, 0)
-	for i := 0; i < maxTombstones+3; i++ {
+	for i := 0; i < capacity; i++ {
 		ts.add(fmt.Sprintf("s%d", i), now)
 	}
-	if ts.len() != maxTombstones {
-		t.Fatalf("len = %d, want %d", ts.len(), maxTombstones)
+	if got := ts.len(); got != capacity {
+		t.Fatalf("len at capacity = %d, want %d", got, capacity)
+	}
+	for i := 0; i < capacity; i++ {
+		if !ts.has(fmt.Sprintf("s%d", i), now) {
+			t.Fatalf("tombstone s%d was dropped at capacity", i)
+		}
 	}
 	for i := 0; i < 3; i++ {
+		ts.add(fmt.Sprintf("s%d", capacity+i), now)
+		if got := ts.len(); got != capacity {
+			t.Fatalf("len after %d extra inserts = %d, want %d", i+1, got, capacity)
+		}
 		if ts.has(fmt.Sprintf("s%d", i), now) {
 			t.Fatalf("oldest tombstone s%d survived the cap", i)
 		}
 	}
-	if !ts.has("s3", now) || !ts.has(fmt.Sprintf("s%d", maxTombstones+2), now) {
-		t.Fatal("a newer tombstone was dropped")
+	for i := 3; i < capacity+3; i++ {
+		if !ts.has(fmt.Sprintf("s%d", i), now) {
+			t.Fatalf("newer tombstone s%d was dropped", i)
+		}
 	}
 }
 
@@ -102,10 +114,13 @@ func TestTombstoneReaddAfterTake(t *testing.T) {
 		t.Fatal("take did not find a")
 	}
 	ts.add("a", now.Add(time.Minute))
-	if !ts.has("a", now.Add(tombstoneTTL)) || ts.len() != 1 {
+	if !ts.has("a", now.Add(time.Hour)) || ts.len() != 1 {
 		t.Fatalf("re-added tombstone did not survive the original expiry, len = %d", ts.len())
 	}
-	if ts.has("a", now.Add(tombstoneTTL+time.Minute)) {
+	if !ts.has("a", now.Add(time.Hour+time.Minute-time.Nanosecond)) {
+		t.Fatal("re-added tombstone expired before its own expiry")
+	}
+	if ts.has("a", now.Add(time.Hour+time.Minute)) {
 		t.Fatal("re-added tombstone outlived its own expiry")
 	}
 }
