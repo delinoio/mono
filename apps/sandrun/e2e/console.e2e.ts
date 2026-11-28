@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
+import { Role } from "@delino/sandrun-protos/v1/common_pb";
+import {
+  DEV_SESSION_REFRESH_CASES,
+  DEV_SESSION_REFRESH_FIXTURE,
+  type DevSessionRefreshMode,
+} from "./dev-session-refresh-fixture.ts";
+import {
+  INTEGRATION_PERMISSION_FIXTURE,
+  integrationOpenings,
+} from "./integration-permission-fixture.ts";
+import { ORGANIZATION_CREATION_FIXTURE } from "./organization-creation-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
@@ -116,6 +127,267 @@ describe("sign-in", () => {
       "href",
       "https://ownsand.delino.io",
     );
+  });
+});
+
+describe("leave organization with delayed caller identity", () => {
+  const fixture = "/leave-organization-fixture.html";
+  const membersPath = `/orgs/${NORTHWIND}/members`;
+  const action = "Leave organization";
+
+  test("requires a fresh confirmation after the caller ID disappears", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open(fixture);
+
+    const roster = screen.getByRole("list", "Members");
+    const leave = screen.getByRole("button", action);
+    const dialog = screen.getByRole("alertdialog", "Leave this organization?");
+    const confirm = dialog.getByRole("button", action);
+    const body = browser.locator("body");
+    await expect(roster).toContainText("Mina Kim");
+    await expect(leave).toHaveCount(0);
+    await expect(body).toHaveAttribute("data-leave-requests", "0");
+    await app.screenshot("members-without-caller-id");
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "resolved" }),
+      );
+    });
+    await leave.tap();
+    await expect(dialog).toBeVisible();
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "missing" }),
+      );
+    });
+    await confirm.tap();
+
+    await expect(dialog).toBeHidden();
+    await expect(browser).toHaveURL(membersPath);
+    await expect(roster).toContainText("Mina Kim");
+    await expect(leave).toHaveCount(0);
+    await expect(body).toHaveAttribute("data-leave-requests", "0");
+    await expect(body).toHaveAttribute("data-roster-reads", "1");
+    await expect(body).toHaveAttribute("data-organization-reads", "1");
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "resolved" }),
+      );
+    });
+    await expect(leave).toBeVisible();
+    await expect(dialog).toBeHidden();
+    await leave.tap();
+    await confirm.tap();
+    await expect(body).toHaveAttribute("data-leave-requests", "1");
+    await expect(body).toHaveAttribute("data-leave-organization-id", NORTHWIND);
+    await expect(body).toHaveAttribute("data-leave-user-id", "mock-user-owner");
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-leave-result", { detail: "unavailable" }),
+      );
+    });
+    await expect(
+      dialog.getByText(
+        "SandRun is not available right now. Try again in a moment.",
+      ),
+    ).toBeVisible();
+    await expect(confirm).toBeEnabled();
+    await app.screenshot("leave-retry-after-failure");
+
+    await confirm.tap();
+    await expect(body).toHaveAttribute("data-leave-requests", "2");
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-leave-result", { detail: "success" }),
+      );
+    });
+
+    await expect(browser).toHaveURL("/");
+    await expect(body).toHaveAttribute("data-organization-reads", "2");
+    await expect(body).toHaveAttribute("data-path-at-organization-read", "/");
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await expect(screen.getByRole("link", "Northwind Labs Member")).toHaveCount(
+      0,
+    );
+  });
+
+  test("refreshes after a dismissed Leave without changing the current route", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open(fixture);
+    await expect(screen.getByRole("list", "Members")).toBeVisible();
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "resolved" }),
+      );
+    });
+    const leave = screen.getByRole("button", action);
+    const dialog = screen.getByRole("alertdialog", "Leave this organization?");
+    const body = browser.locator("body");
+    await leave.tap();
+    await dialog.getByRole("button", action).tap();
+    await expect(body).toHaveAttribute("data-leave-requests", "1");
+    const historyLength = await browser.evaluate(() => window.history.length);
+
+    await dialog.getByRole("button", "Cancel").tap();
+    await expect(dialog).toBeHidden();
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-leave-result", { detail: "success" }),
+      );
+    });
+
+    await expect(body).toHaveAttribute("data-organization-reads", "2");
+    await expect(body).toHaveAttribute(
+      "data-path-at-organization-read",
+      membersPath,
+    );
+    await expect(browser).toHaveURL(membersPath);
+    expect(await browser.evaluate(() => window.history.length)).toBe(
+      historyLength,
+    );
+  });
+});
+
+describe("organization creation", () => {
+  const name = "New testing org";
+
+  test("opens the returned organization while the list continuation is held", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "hold-list");
+      return null;
+    }, ORGANIZATION_CREATION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await screen.getByRole("button", "Create organization").tap();
+    const dialog = screen.getByRole("dialog", "Create an organization");
+    await dialog.getByLabel("Organization name").fill(name);
+    await dialog.getByRole("button", "Create").tap();
+
+    await expect
+      .poll(() =>
+        browser.evaluate(
+          () =>
+            window.sandrunOrganizationCreationFixture!.state
+              .continuationPending,
+        ),
+      )
+      .toBe(true);
+    const id = await browser.evaluate(
+      () => window.sandrunOrganizationCreationFixture!.state.createdId,
+    );
+    expect(id).toMatch(/^[0-9a-f-]+$/);
+    await expect(browser).toHaveURL(`/orgs/${id}`);
+    await expect(dialog).toHaveCount(0);
+    await expect(screen.getByText("Set up SandRun")).toBeVisible();
+
+    const switcher = screen.getByRole("combobox", "Organization");
+    await switcher.tap();
+    const option = screen.getByRole("option", name);
+    await expect(option).toHaveCount(0);
+    await app.screenshot("organization-overview-while-list-is-held");
+    await browser.evaluate(() => {
+      window.sandrunOrganizationCreationFixture!.releaseContinuation();
+      return null;
+    });
+    await expect(option).toBeVisible();
+    await app.screenshot("organization-switcher-after-list-refresh");
+  });
+
+  test("keeps the current route and newer dialog after a late create succeeds", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "hold-create");
+      return null;
+    }, ORGANIZATION_CREATION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    const open = screen.getByRole("button", "Create organization");
+    const dialog = screen.getByRole("dialog", "Create an organization");
+    const input = dialog.getByLabel("Organization name");
+    const submit = dialog.getByRole("button", "Create");
+    await open.tap();
+    await input.fill(name);
+    await submit.tap();
+    await expect
+      .poll(() =>
+        browser.evaluate(
+          () => window.sandrunOrganizationCreationFixture!.state.createPending,
+        ),
+      )
+      .toBe(true);
+
+    await browser.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await open.tap();
+    await input.fill("Newer draft");
+    await browser.evaluate(() => {
+      window.sandrunOrganizationCreationFixture!.releaseCreate();
+      return null;
+    });
+    await expect(
+      browser.locator('ul[aria-label="Your organizations"]'),
+    ).toContainText(name);
+    await expect(browser).toHaveURL("/");
+    await expect(dialog).toBeVisible();
+    await expect(input).toHaveValue("Newer draft");
+    await expect(submit).toBeEnabled();
+    await app.screenshot("newer-dialog-after-late-organization-create");
+  });
+
+  test("shows a create error and allows retry in the same dialog", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "fail-create");
+      return null;
+    }, ORGANIZATION_CREATION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await screen.getByRole("button", "Create organization").tap();
+    const dialog = screen.getByRole("dialog", "Create an organization");
+    const input = dialog.getByLabel("Organization name");
+    const submit = dialog.getByRole("button", "Create");
+    await input.fill(name);
+    await submit.tap();
+
+    await expect(
+      dialog.getByText("Something went wrong. Try again."),
+    ).toBeVisible();
+    await expect(input).toHaveValue(name);
+    await expect(submit).toBeEnabled();
+    await expect(browser).toHaveURL("/");
+    await app.screenshot("organization-create-error-before-retry");
+
+    await submit.tap();
+    await expect(screen.getByText("Set up SandRun")).toBeVisible();
+    const id = await browser.evaluate(
+      () => window.sandrunOrganizationCreationFixture!.state.createdId,
+    );
+    await expect(browser).toHaveURL(`/orgs/${id}`);
+    await expect(dialog).toHaveCount(0);
+    await app.screenshot("organization-overview-after-retry");
   });
 });
 
@@ -698,6 +970,35 @@ describe("organization member pagination", () => {
 });
 
 describe("overview", () => {
+  test("shows no devices after linking an unseeded OwnSand organization", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const ownsandOrganizationId = "0193a000-0000-7000-8000-00000000f036";
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/integrations`);
+
+    await screen.getByRole("button", "Remove link").tap();
+    const confirm = screen.getByRole("alertdialog", "Remove the OwnSand link?");
+    await confirm.getByRole("button", "Remove link").tap();
+    await screen.getByRole("button", "Link OwnSand").tap();
+    const link = screen.getByRole("dialog", "Link OwnSand");
+    await expect(link.getByLabel("OwnSand organization ID")).toBeFocused();
+    await browser.keyboard.type(ownsandOrganizationId);
+    await link.getByLabel("OwnSand API key").tap();
+    await browser.keyboard.type("osk_fixture");
+    await link.getByRole("button", "Link", { exact: true }).tap();
+    await expect(screen.getByText(ownsandOrganizationId)).toBeVisible();
+
+    // Open Overview for the first capacity request in this browser session.
+    await screen.getByRole("link", "Overview", { exact: true }).tap();
+    const pool = screen.getByRole("region", "Device pool");
+    await expect(pool.getByText("No devices", { exact: true })).toBeVisible();
+    await expect(pool.getByRole("table", "Devices")).toBeHidden();
+  });
+
   test("guides an unlinked organization to integrations from the device pool", async ({
     app,
     screen,
@@ -991,6 +1292,95 @@ describe("audit", () => {
   });
 });
 
+describe("Dev session refresh from work", () => {
+  for (const scenario of DEV_SESSION_REFRESH_CASES) {
+    for (const mode of ["success", scenario.failureMode] as const) {
+      test(`refreshes Dev Sessions after ${scenario.page} (${mode})`, async ({
+        app,
+        browser,
+        screen,
+      }) => {
+        await app.open("/");
+        await browser.evaluate(
+          ([key, mode]: [string, DevSessionRefreshMode]) => {
+            sessionStorage.setItem(key, mode);
+            return null;
+          },
+          [DEV_SESSION_REFRESH_FIXTURE, mode],
+        );
+        await screen.getByRole("button", "Sign in with Delino").tap();
+        await screen.getByRole("link", "Acme Robotics Owner").tap();
+        const devSessions = screen.getByRole("link", "Dev sessions");
+        const showEnded = screen.getByRole(
+          "checkbox",
+          "Show ended dev sessions",
+        );
+        const table = screen.getByRole("table", "Dev sessions");
+        const row = table
+          .getByRole("row")
+          .filter({ hasText: scenario.session });
+        const reads = () =>
+          browser.evaluate(() => window.sandrunDevSessionReads ?? []);
+
+        await devSessions.tap();
+        await expect(row.getByRole("cell", scenario.activeState)).toBeVisible();
+        await expect(row.getByRole("button", "Delete")).toBeVisible();
+        const loadedAt = await browser.evaluate(() => performance.now());
+        await showEnded.tap();
+        await expect(table).toContainText("compiler check");
+        const primedReads = await reads();
+        expect(primedReads).toContain(false);
+        expect(primedReads).toContain(true);
+
+        await screen.getByRole("link", scenario.page).tap();
+        const workRow = screen
+          .getByRole("table", scenario.page)
+          .getByRole("row")
+          .filter({ hasText: scenario.workRow });
+        await workRow.getByRole("button", scenario.action).tap();
+        const dialog = screen.getByRole("alertdialog", scenario.dialog);
+        await dialog.getByRole("button", scenario.confirm).tap();
+
+        if (mode !== "success") {
+          await expect(dialog.getByText(scenario.error)).toBeVisible();
+          await expect(
+            dialog.getByRole("button", scenario.confirm),
+          ).toBeEnabled();
+          await app.screenshot(`${scenario.screenshot}-failure`);
+          await dialog.getByRole("button", "Cancel", { exact: true }).tap();
+          await expect(dialog).toBeHidden();
+          await expect(workRow).toBeVisible();
+          await devSessions.tap();
+          await expect(
+            row.getByRole("cell", scenario.activeState),
+          ).toBeVisible();
+          await expect(row.getByRole("button", "Delete")).toBeVisible();
+          expect(await reads()).toEqual(primedReads);
+          return;
+        }
+
+        await expect(dialog).toBeHidden();
+        await expect(workRow).toBeHidden();
+        await devSessions.tap();
+        expect(
+          (await browser.evaluate(() => performance.now())) - loadedAt,
+        ).toBeLessThan(10_000);
+        await expect(row).toHaveCount(0);
+        const defaultRefresh = await reads();
+        expect(defaultRefresh.slice(primedReads.length)).toContain(false);
+        await app.screenshot(`${scenario.screenshot}-default`);
+
+        await showEnded.tap();
+        await expect(row.getByRole("cell", scenario.endedState)).toBeVisible();
+        await expect(row.getByRole("cell", scenario.reason)).toBeVisible();
+        await expect(row.getByRole("button", "Delete")).toHaveCount(0);
+        expect((await reads()).slice(defaultRefresh.length)).toContain(true);
+        await app.screenshot(`${scenario.screenshot}-ended`);
+      });
+    }
+  }
+});
+
 describe("member names in Audit and Dev Sessions", () => {
   test("keeps fallback labels on a roster error and uses names from the recovered roster", async ({
     app,
@@ -1198,6 +1588,121 @@ describe("requests", () => {
 });
 
 describe("integrations", () => {
+  for (const opening of integrationOpenings) {
+    test(`closes ${opening.title} when the organization role becomes member`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await expect(
+        screen.getByRole("link", "Acme Robotics Owner"),
+      ).toBeVisible();
+      await browser.evaluate(
+        ({ key, mode }) => {
+          sessionStorage.setItem(key, mode);
+          return null;
+        },
+        {
+          key: INTEGRATION_PERMISSION_FIXTURE,
+          mode: opening.opener === "Link OwnSand" ? "unlinked" : "linked",
+        },
+      );
+      const path = `/orgs/${ACME}/integrations`;
+      await app.open(path);
+
+      const scope = opening.row
+        ? screen.getByRole("listitem").filter({ hasText: opening.row })
+        : screen;
+      const opener = scope.getByRole("button", opening.opener);
+      const dialog = screen.getByRole(opening.role, opening.title);
+      await opener.tap();
+      await expect(dialog).toBeVisible();
+      if (opening.draftField) {
+        await dialog
+          .getByLabel(opening.draftField, { exact: true })
+          .fill("unsent-draft");
+      }
+      if (opening.credential) {
+        await dialog
+          .getByLabel(opening.credential, { exact: true })
+          .fill("synthetic-unsent-key");
+      }
+      if (opening.opener === "Change runner group") {
+        await expect(
+          dialog.getByRole("combobox", "Runner group"),
+        ).toBeVisible();
+      }
+
+      const refreshRole = async (role: Role) => {
+        const readCount = await browser.evaluate((next) => {
+          const fixture = window.sandrunIntegrationPermissionFixture!;
+          const count = fixture.organizationReads.length;
+          fixture.setRole(next);
+          // Make the cached role stale and exercise React Query's tab-focus refresh.
+          const now = Date.now;
+          Date.now = () => now() + 10_001;
+          Object.defineProperty(document, "visibilityState", {
+            configurable: true,
+            value: "hidden",
+          });
+          window.dispatchEvent(new Event("visibilitychange"));
+          Reflect.deleteProperty(document, "visibilityState");
+          window.dispatchEvent(new Event("visibilitychange"));
+          return count;
+        }, role);
+        await expect
+          .poll(() =>
+            browser.evaluate(
+              (previous) =>
+                window.sandrunIntegrationPermissionFixture!.organizationReads.slice(
+                  previous,
+                ),
+              readCount,
+            ),
+          )
+          .toEqual([role]);
+      };
+
+      if (opening.opener === "Replace API key") {
+        await refreshRole(Role.ADMIN);
+        await expect(dialog).toBeVisible();
+        await app.screenshot("integration-admin-refresh-retains-draft");
+      }
+
+      await refreshRole(Role.MEMBER);
+      await expect(dialog).toBeHidden();
+      await expect(opener).toBeHidden();
+      await expect(browser).toHaveURL(path);
+      await expect(
+        screen.getByRole("heading", "Integrations", { level: 1 }),
+      ).toBeVisible();
+      await expect(screen.getByText("acme-robotics · Active")).toBeVisible();
+      await expect(screen.getByText("claude-team · Claude Code")).toBeVisible();
+      await app.screenshot(`integration-member-${opening.mutation}`);
+
+      await refreshRole(Role.ADMIN);
+      await expect(opener).toBeVisible();
+      await expect(dialog).toBeHidden();
+      await opener.tap();
+      await expect(dialog).toBeVisible();
+      if (opening.draftField) {
+        await expect(
+          dialog.getByLabel(opening.draftField, { exact: true }),
+        ).toHaveValue("");
+      }
+      if (opening.opener === "Replace API key") {
+        await app.screenshot("integration-admin-reopen-empty");
+      }
+      expect(
+        await browser.evaluate(
+          () => window.sandrunIntegrationPermissionFixture!.mutations,
+        ),
+      ).toEqual([]);
+    });
+  }
+
   test("offers a newly created integration in the runner profile form", async ({
     app,
     browser,
@@ -1496,6 +2001,69 @@ describe("integrations", () => {
     ).toBeVisible();
   });
 
+  test("the GitHub callback recovers from a wrong SandRun organization choice", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${GLOBEX}/integrations`);
+    await browser.evaluate(() => {
+      // Return to the same mock API instance that issues the callback state.
+      window.navigation.addEventListener(
+        "navigate",
+        (event) => {
+          const destination = new URL(event.destination.url);
+          if (destination.origin !== "https://github.com") return;
+          event.preventDefault();
+          const state = destination.searchParams.get("state");
+          if (!state) throw new Error("Expected issued state");
+          const query = new URLSearchParams({
+            installation_id: "51000001",
+            code: "fixture-code",
+            state,
+          });
+          setTimeout(() => {
+            window.history.pushState(null, "", `/github/setup?${query}`);
+            window.dispatchEvent(new PopStateEvent("popstate"));
+          }, 0);
+        },
+        { once: true },
+      );
+      return null;
+    });
+    await screen.getByRole("button", "Connect GitHub").tap();
+    await expect(browser).toHaveURL("/github/setup");
+    const historyLength = await browser.evaluate(() => window.history.length);
+    const picker = screen.getByRole("combobox", "SandRun organization");
+    const submit = screen.getByRole("button", "Link installation");
+    await picker.tap();
+    await screen.getByRole("option", "Acme Robotics (owner)").tap();
+    await submit.tap();
+
+    await expect(screen.getByRole("main").getByRole("alert")).toContainText(
+      "Choose the SandRun organization where you started the GitHub installation.",
+    );
+    await expect(browser).toHaveURL("/github/setup");
+    await expect(picker).toBeVisible();
+    await expect(submit).toBeDisabled();
+    await expect(picker).toBeFocused();
+    await app.screenshot("github-organization-mismatch-recovery");
+
+    await picker.tap();
+    await screen.getByRole("option", "Globex (admin)").tap();
+    await submit.tap();
+    await expect(browser).toHaveURL(`/orgs/${GLOBEX}/integrations`);
+    await expect(
+      screen.getByText("github-org-51000001", { exact: false }),
+    ).toBeVisible();
+    expect(await browser.evaluate(() => window.history.length)).toBe(
+      historyLength,
+    );
+    await app.screenshot("github-organization-recovery-success");
+  });
+
   test("the GitHub callback rejects an installation linked to another organization", async ({
     app,
     browser,
@@ -1611,6 +2179,100 @@ describe("integrations", () => {
     await expect(later).toBeHidden();
     await expect(list.getByText("acme-robotics · Active")).toBeVisible();
   });
+
+  for (const { result, name, nextGroup, nextId } of [
+    {
+      result: "default-only",
+      name: "requires a fresh runner group choice after removal",
+      nextGroup: "Default (default) · all",
+      nextId: "1",
+    },
+    {
+      result: "failure",
+      name: "retains the runner group after a transient refresh failure",
+      nextGroup: "sandrun-private · selected",
+      nextId: "7",
+    },
+  ] as const) {
+    test(name, async ({ app, browser, screen }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open("/runner-group-fixture.html");
+      const installation = screen
+        .getByRole("list", "GitHub installations")
+        .getByRole("listitem")
+        .filter({ hasText: "acme-robotics · Active" });
+      await installation.getByRole("button", "Change runner group").tap();
+
+      const dialog = screen.getByRole("dialog", "Change the runner group");
+      const group = dialog.getByRole("combobox", "Runner group");
+      const save = dialog.getByRole("button", "Save");
+      await group.tap();
+      await screen.getByRole("option", "sandrun-private · selected").tap();
+
+      await browser.evaluate(() => {
+        const fixture = window.sandrunRunnerGroupFixture;
+        fixture.releaseRefresh = fixture.holdRefresh();
+        return null;
+      });
+      await expect(group).toHaveText("sandrun-private · selected");
+      await browser.evaluate(async (result) => {
+        await window.sandrunRunnerGroupFixture.releaseRefresh!(result);
+        return null;
+      }, result);
+
+      if (result === "default-only") {
+        await expect(group).toHaveText("Choose a runner group");
+        await expect(save).toBeDisabled();
+        expect(
+          await browser.evaluate(() => {
+            const form = document.querySelector<HTMLFormElement>(
+              '[role="dialog"] form',
+            )!;
+            form.dispatchEvent(
+              new SubmitEvent("submit", { bubbles: true, cancelable: true }),
+            );
+            return window.sandrunRunnerGroupFixture.updates.length;
+          }),
+        ).toBe(0);
+        await app.screenshot("runner-group-removed");
+        await group.tap();
+        await expect(
+          screen.getByRole("option", "sandrun-private · selected"),
+        ).toBeHidden();
+        await screen.getByRole("option", nextGroup).tap();
+      } else {
+        await expect(dialog.getByRole("alert")).toContainText(
+          "The last refresh failed",
+        );
+        await expect(group).toHaveText(nextGroup);
+        await expect(save).toBeEnabled();
+        await app.screenshot("runner-group-refresh-failed");
+        await dialog.getByRole("button", "Try again").tap();
+        await expect(dialog.getByRole("alert")).toBeHidden();
+        await expect(group).toHaveText(nextGroup);
+      }
+
+      await expect(save).toBeEnabled();
+      await save.tap();
+      await expect(dialog).toBeHidden();
+      expect(
+        await browser.evaluate(() =>
+          window.sandrunRunnerGroupFixture.updates.map((update) => ({
+            organizationId: update.organizationId,
+            installationId: update.installationId,
+            groupId: String(update.githubRunnerGroupId),
+          })),
+        ),
+      ).toEqual([
+        {
+          organizationId: ACME,
+          installationId: "0193b000-0000-7000-8000-0000000000d1",
+          groupId: nextId,
+        },
+      ]);
+    });
+  }
 
   test("a member can read a later page and switch to another organization's list", async ({
     app,
@@ -1770,6 +2432,58 @@ function measureProfileWorkspace(profileName: string) {
 }
 
 describe("runner profiles", () => {
+  test("validates template IDs and saves a corrected Windows profile", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/profiles`);
+    await screen.getByRole("button", "Create runner profile").tap();
+    const create = screen.getByRole("dialog", "Create a runner profile");
+    await create.getByLabel("Name").tap();
+    await browser.keyboard.type("template-id-check");
+    await create.getByRole("combobox", "Source").tap();
+    await screen.getByRole("option", "OwnSand template", { exact: true }).tap();
+    const createTemplate = create.getByLabel("Template ID");
+    await createTemplate.tap();
+    await browser.keyboard.type("not-a-uuid");
+    await create.getByRole("button", "Create profile").tap();
+    const invalid = "Enter a valid UUID v7 for the template ID.";
+    await expect(create.getByText(invalid)).toBeVisible();
+    await expect(createTemplate).toHaveAttribute("aria-invalid", "true");
+    await browser.keyboard.press("Escape");
+    await expect(create).toBeHidden();
+    await expect(
+      screen.getByText("template-id-check · GitHub job · Linux"),
+    ).toBeHidden();
+
+    const windows = screen
+      .getByRole("listitem")
+      .filter({ hasText: "windows-dev ·" });
+    const openEdit = windows.getByRole("button", "Edit");
+    await openEdit.tap();
+    const edit = screen.getByRole("dialog", "Edit windows-dev");
+    const editTemplate = edit.getByLabel("Template ID");
+    const save = edit.getByRole("button", "Save changes");
+    await editTemplate.tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type("0193a000-0000-7000-4000-0000000000c9");
+    await save.tap();
+    await expect(edit.getByText(invalid)).toBeVisible();
+    await expect(editTemplate).toHaveAttribute("aria-invalid", "true");
+    await editTemplate.tap();
+    await browser.keyboard.press("ControlOrMeta+A");
+    await browser.keyboard.type(" 0193A000-0000-7000-8000-0000000000C9 ");
+    await save.tap();
+    await expect(edit).toBeHidden();
+    await openEdit.tap();
+    await expect(editTemplate).toHaveValue(
+      "0193a000-0000-7000-8000-0000000000c9",
+    );
+  });
+
   for (const { organizationId, mode, nextAction, scenario } of [
     {
       organizationId: NORTHWIND,
@@ -2642,6 +3356,11 @@ describe("invitations", () => {
     await screen.getByRole("button", "Done").tap();
     await expect(link).toBeHidden();
     await screen.getByRole("button", "Revoke").tap();
+    await expect(
+      screen
+        .getByRole("listitem")
+        .filter({ hasText: "The invitation is revoked." }),
+    ).toBeVisible();
     await expect(screen.getByText("No pending invitations")).toBeVisible();
 
     await app.open(`/orgs/${NORTHWIND}/members`);
@@ -2812,4 +3531,101 @@ describe("routing", () => {
       screen.getByRole("heading", "Page not found", { level: 1 }),
     ).toBeVisible();
   });
+});
+
+describe("stale invitation revoke", () => {
+  for (const failRefresh of [false, true]) {
+    test(
+      failRefresh
+        ? "retries the invitation read after a rejected revoke and failed refresh"
+        : "refreshes pending invitations from page one after a rejected revoke",
+      async ({ app, browser, screen }) => {
+        await app.open("/");
+        await browser.evaluate(() => {
+          sessionStorage.setItem("sandrun-e2e-invitation-revoke", "true");
+          return null;
+        });
+        await screen.getByRole("button", "Sign in with Delino").tap();
+        const globex = screen.getByRole("link", "Globex Admin");
+        await expect(globex).toBeVisible();
+        await app.open(`/orgs/${GLOBEX}`);
+        const members = screen.getByRole("link", "Members");
+        await expect(members).toBeVisible();
+        const staleId = await browser.evaluate(
+          (organizationId) =>
+            window.sandrunInvitationRevokeFixture!.seed(organizationId),
+          GLOBEX,
+        );
+        await members.tap();
+        const list = screen.getByRole("list", "Pending invitations");
+        const stale = list
+          .getByRole("listitem")
+          .filter({ hasText: "Member invitation" });
+        const pending = list
+          .getByRole("listitem")
+          .filter({ hasText: "Admin invitation" });
+        await expect(stale).toBeVisible();
+        await expect(pending).toBeVisible();
+
+        await browser.evaluate(
+          async ({ organizationId, invitationId, failRefresh }) => {
+            await window.sandrunInvitationRevokeFixture!.stale(
+              organizationId,
+              invitationId,
+              failRefresh,
+            );
+            return null;
+          },
+          { organizationId: GLOBEX, invitationId: staleId, failRefresh },
+        );
+        await stale.getByRole("button", "Revoke").tap();
+        await expect(
+          screen
+            .getByRole("listitem")
+            .filter({ hasText: "only a pending invitation can be revoked" }),
+        ).toBeVisible();
+        // Wait for the toast to slide into the viewport before capturing it.
+        await expect
+          .poll(() =>
+            browser.evaluate(() => {
+              const toast = document.querySelector(".dui-toast");
+              return (
+                toast != null &&
+                toast.getBoundingClientRect().bottom <= window.innerHeight
+              );
+            }),
+          )
+          .toBe(true);
+
+        if (failRefresh) {
+          const notice = screen.getByText(/The last refresh failed/);
+          await expect(notice).toBeVisible();
+          await expect(stale).toBeVisible();
+          await app.screenshot("stale-invitation-refresh-failed");
+          await screen.getByRole("button", "Try again").tap();
+          await expect(notice).toBeHidden();
+        }
+        await expect(stale).toBeHidden();
+        await expect(pending).toBeVisible();
+        expect(
+          await browser.evaluate(() => {
+            const { listRequests, revokeRequests } =
+              window.sandrunInvitationRevokeFixture!;
+            return { listRequests, revokeRequests };
+          }),
+        ).toEqual({
+          listRequests: Array.from({ length: failRefresh ? 2 : 1 }, () => ({
+            organizationId: GLOBEX,
+            pageToken: "",
+          })),
+          revokeRequests: [{ organizationId: GLOBEX, invitationId: staleId }],
+        });
+        await app.screenshot(
+          failRefresh
+            ? "stale-invitation-read-retried"
+            : "stale-invitation-removed",
+        );
+      },
+    );
+  }
 });

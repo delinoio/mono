@@ -20,7 +20,7 @@ import {
 } from "../relay/context.ts";
 import { GrantKeeper, RelayCallKind } from "../relay/grant.ts";
 import { RecoveryWindow } from "../relay/recovery.ts";
-import { relayCallWithDeadline } from "../relay/stream.ts";
+import { linkedController, relayCallWithDeadline } from "../relay/stream.ts";
 import { recoverOrThrow } from "./common.ts";
 
 /** Contents that `writeFile` accepts. */
@@ -215,11 +215,13 @@ async function* iterateSource(
       }
     }
   } else {
-    const iterable = source as Iterable<Uint8Array> | AsyncIterable<Uint8Array>;
-    const iterator: Iterator<Uint8Array> | AsyncIterator<Uint8Array> =
-      Symbol.asyncIterator in iterable
-        ? iterable[Symbol.asyncIterator]()
-        : (iterable as Iterable<Uint8Array>)[Symbol.iterator]();
+    const asyncIterator = (source as Partial<AsyncIterable<Uint8Array>>)[
+      Symbol.asyncIterator
+    ];
+    const iterator =
+      asyncIterator === undefined || asyncIterator === null
+        ? (source as Iterable<Uint8Array>)[Symbol.iterator]()
+        : Reflect.apply(asyncIterator, source, []);
     let finished = false;
     try {
       for (;;) {
@@ -263,66 +265,79 @@ export async function runWriteFile(
   mode: number,
   signal: AbortSignal | undefined,
 ): Promise<WriteFileResult> {
-  const salt = newBindingSalt();
-  // The agent admits an operation ID only while its UUID v7 timestamp is
-  // within 15 minutes, so the ID is allocated when the first chunk is ready
-  // to send and not before the source is read: a source that needs that long
-  // for its first chunk (or for the end of the stream after a full chunk)
-  // must not use up the admission window.
-  let writeId: string | undefined;
-  let grants: GrantKeeper | undefined;
-  let offset = 0n;
-  let first = true;
   throwIfAborted(signal);
-  for await (const chunk of chunkSource(source, MAX_FILE_CHUNK_SIZE, signal)) {
-    writeId ??= ctx.ids.next();
-    const request = create(WriteFileRequestSchema, {
-      organizationId: ctx.organizationId,
-      sandboxId: ctx.sandboxId,
-      writeId,
-      path: first ? path : "",
-      bindingSalt: first ? salt : new Uint8Array(0),
-      offset,
-      data: chunk.data,
-      finish: chunk.last
-        ? { sizeBytes: offset + BigInt(chunk.data.length), mode }
-        : undefined,
-    });
-    grants ??= new GrantKeeper(
-      ctx,
-      RelayOperationKind.WRITE_FILE,
-      writeId,
-      requestDigest(writeFileBinding(request)),
-    );
-    const response = await sendChunk(ctx, selector, grants, request, signal);
-    if (
-      response.offset !== request.offset ||
-      response.length !== BigInt(request.data.length)
-    ) {
-      throw new DataPathError("the agent acknowledged a different range", {
-        code: Code.Internal,
+  const { controller, dispose } = linkedController(signal);
+  const unwatch = selector.watchPeerClose((reason) => controller.abort(reason));
+  try {
+    throwIfAborted(controller.signal);
+    const salt = newBindingSalt();
+    // The agent admits an operation ID only while its UUID v7 timestamp is
+    // within 15 minutes, so the ID is allocated when the first chunk is ready
+    // to send and not before the source is read: a source that needs that long
+    // for its first chunk (or for the end of the stream after a full chunk)
+    // must not use up the admission window.
+    let writeId: string | undefined;
+    let grants: GrantKeeper | undefined;
+    let offset = 0n;
+    let first = true;
+    for await (const chunk of chunkSource(
+      source,
+      MAX_FILE_CHUNK_SIZE,
+      controller.signal,
+    )) {
+      throwIfAborted(controller.signal);
+      writeId ??= ctx.ids.next();
+      const request = create(WriteFileRequestSchema, {
+        organizationId: ctx.organizationId,
+        sandboxId: ctx.sandboxId,
+        writeId,
+        path: first ? path : "",
+        bindingSalt: first ? salt : new Uint8Array(0),
+        offset,
+        data: chunk.data,
+        finish: chunk.last
+          ? { sizeBytes: offset + BigInt(chunk.data.length), mode }
+          : undefined,
       });
-    }
-    offset += BigInt(chunk.data.length);
-    first = false;
-    if (request.finish !== undefined) {
-      if (!response.finished) {
-        throw new DataPathError("the agent did not finish the write", {
+      grants ??= new GrantKeeper(
+        ctx,
+        RelayOperationKind.WRITE_FILE,
+        writeId,
+        requestDigest(writeFileBinding(request)),
+      );
+      const response = await sendChunk(ctx, selector, grants, request, signal);
+      if (
+        response.offset !== request.offset ||
+        response.length !== BigInt(request.data.length)
+      ) {
+        throw new DataPathError("the agent acknowledged a different range", {
           code: Code.Internal,
         });
       }
-      if (response.sizeBytes !== request.finish.sizeBytes) {
-        throw new DataPathError(
-          "the agent reported a final size that differs from the requested size",
-          { code: Code.Internal },
-        );
+      offset += BigInt(chunk.data.length);
+      first = false;
+      if (request.finish !== undefined) {
+        if (!response.finished) {
+          throw new DataPathError("the agent did not finish the write", {
+            code: Code.Internal,
+          });
+        }
+        if (response.sizeBytes !== request.finish.sizeBytes) {
+          throw new DataPathError(
+            "the agent reported a final size that differs from the requested size",
+            { code: Code.Internal },
+          );
+        }
+        return { writeId, sizeBytes: response.sizeBytes };
       }
-      return { writeId, sizeBytes: response.sizeBytes };
     }
+    throw new DataPathError("the write source ended without a last chunk", {
+      code: Code.Internal,
+    });
+  } finally {
+    unwatch?.();
+    dispose();
   }
-  throw new DataPathError("the write source ended without a last chunk", {
-    code: Code.Internal,
-  });
 }
 
 /**

@@ -5,10 +5,18 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { ACCOUNT_ID, ADMIN, createFakeApi, OWNER } from "./testing/fake-api.ts";
+import { InvitationState } from "@delino/accounts-protos/v1/billing_account_pb";
+import {
+  ACCOUNT_ID,
+  addInvitations,
+  ADMIN,
+  createFakeApi,
+  OWNER,
+} from "./testing/fake-api.ts";
 import { renderApp, settle } from "./testing/render.tsx";
 
 /**
@@ -282,6 +290,14 @@ describe("members", () => {
 });
 
 describe("invitations", () => {
+  const firstPage = expect.objectContaining({
+    billingAccountId: ACCOUNT_ID,
+    pageToken: "",
+  });
+  const nonPending = "the invitation is not pending";
+  const revoked = "The invitation is revoked.";
+  const retainedEmail = "invitee-0001@example.com";
+
   async function revoke(failure: ConnectError | undefined) {
     const rendered = await renderAccount(OWNER, (api) => {
       if (failure !== undefined) api.failNext.set("RevokeInvitation", failure);
@@ -292,6 +308,73 @@ describe("invitations", () => {
     return rendered;
   }
 
+  async function revokeStaleInvitation(refreshFailure?: ConnectError) {
+    const { api } = await renderAccount(OWNER, (api) => {
+      addInvitations(api.accounts.get(ACCOUNT_ID)!, 1);
+    });
+    await openTab("Members");
+    const staleEmail = await screen.findByText("pending@example.com");
+    expect(screen.getByText(retainedEmail)).toBeTruthy();
+    expect(calls(api, "ListInvitations")).toEqual([firstPage]);
+
+    const invitations = api.accounts.get(ACCOUNT_ID)!.invitations;
+    const stale = invitations[0]!;
+    invitations[0] = { ...stale, state: InvitationState.REVOKED };
+    api.failNext.set(
+      "RevokeInvitation",
+      new ConnectError(nonPending, Code.FailedPrecondition),
+    );
+    if (refreshFailure !== undefined) {
+      api.failNext.set("ListInvitations", refreshFailure);
+    }
+    await click(
+      within(staleEmail.closest("li")!).getByRole("button", { name: "Revoke" }),
+    );
+
+    await expectToast(nonPending);
+    expect(screen.queryByText(revoked)).toBeNull();
+    const expectedRevoke = expect.objectContaining({
+      billingAccountId: ACCOUNT_ID,
+      invitationId: stale.invitationId,
+    });
+    expect(calls(api, "RevokeInvitation")).toEqual([expectedRevoke]);
+    expect(calls(api, "ListInvitations")).toEqual([firstPage, firstPage]);
+    return { api, expectedRevoke };
+  }
+
+  test("a non-pending revoke refreshes the list and removes only the stale invitation", async () => {
+    await revokeStaleInvitation();
+    await waitFor(() =>
+      expect(screen.queryByText("pending@example.com")).toBeNull(),
+    );
+    expect(screen.getByText(retainedEmail)).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(1);
+  });
+
+  test("a failed invitation refresh keeps the list and can be retried", async () => {
+    const { api, expectedRevoke } = await revokeStaleInvitation(
+      new ConnectError("down", Code.Unavailable),
+    );
+    const section = within(screen.getByRole("region", { name: "Invitations" }));
+    const notice = await section.findByRole("alert");
+    expect(notice.textContent).toContain("Delino Accounts is not available");
+    expect(screen.getByText("pending@example.com")).toBeTruthy();
+    expect(screen.getByText(retainedEmail)).toBeTruthy();
+
+    await click(within(notice).getByRole("button", { name: "Try again" }));
+    await waitFor(() =>
+      expect(screen.queryByText("pending@example.com")).toBeNull(),
+    );
+    expect(screen.getByText(retainedEmail)).toBeTruthy();
+    expect(section.queryByRole("alert")).toBeNull();
+    expect(calls(api, "ListInvitations")).toEqual([
+      firstPage,
+      firstPage,
+      firstPage,
+    ]);
+    expect(calls(api, "RevokeInvitation")).toEqual([expectedRevoke]);
+  });
+
   test("an ended session offers sign-in and keeps the invitation list", async () => {
     const { api, signIns } = await revoke(unauthenticated());
     expectSessionNotice();
@@ -301,22 +384,37 @@ describe("invitations", () => {
     expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy();
     expect(signIns).toHaveLength(0);
     expect(calls(api, "RevokeInvitation")).toHaveLength(1);
+    expect(calls(api, "ListInvitations")).toEqual([firstPage]);
     await click(screen.getByRole("button", SIGN_IN));
     expect(signIns).toHaveLength(1);
     expect(calls(api, "RevokeInvitation")).toHaveLength(1);
+    expect(calls(api, "ListInvitations")).toEqual([firstPage]);
   });
 
-  test("another failure keeps its toast and shows no sign-in", async () => {
-    await revoke(denied("revoke the invitation"));
-    await expectToast("Not allowed to revoke the invitation.");
-    expect(screen.queryByRole("button", SIGN_IN)).toBeNull();
-  });
+  for (const [failure, feedback] of [
+    [denied("revoke the invitation"), "Not allowed to revoke the invitation."],
+    [
+      new ConnectError("down", Code.Unavailable),
+      "Delino Accounts is not available right now. Try again in a moment.",
+    ],
+  ] as const) {
+    test(`a revoke rejected with ${Code[failure.code]} keeps its toast without refreshing`, async () => {
+      const { api } = await revoke(failure);
+      await expectToast(feedback);
+      expect(screen.queryByText(revoked)).toBeNull();
+      expect(screen.queryByRole("button", SIGN_IN)).toBeNull();
+      expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy();
+      expect(calls(api, "RevokeInvitation")).toHaveLength(1);
+      expect(calls(api, "ListInvitations")).toEqual([firstPage]);
+    });
+  }
 
   test("a successful revoke keeps its success and refresh behavior", async () => {
     const { api } = await revoke(undefined);
     expect(calls(api, "RevokeInvitation")).toHaveLength(1);
     expect(await screen.findByText("No pending invitations")).toBeTruthy();
-    expect(screen.getByText("The invitation is revoked.")).toBeTruthy();
+    await expectToast(revoked);
+    expect(calls(api, "ListInvitations")).toEqual([firstPage, firstPage]);
     expect(screen.queryByRole("button", SIGN_IN)).toBeNull();
   });
 });

@@ -91,6 +91,21 @@ func (c *Control) PollEventsForTest(ctx context.Context) {
 	c.processEvents(ctx)
 }
 
+// PassWithTargetsForTest reports the selected sandbox IDs for this pass
+// after both queries succeed and before any command dispatch.
+func (e *BillingEnforcer) PassWithTargetsForTest(ctx context.Context, observe func(pause, resume []string)) error {
+	sandboxIDs := func(targets []billingTarget) []string {
+		ids := make([]string, len(targets))
+		for i, target := range targets {
+			ids[i] = target.sandboxID
+		}
+		return ids
+	}
+	return e.pass(ctx, func(pause, resume []billingTarget) {
+		observe(sandboxIDs(pause), sandboxIDs(resume))
+	})
+}
+
 // SetAfterWriteResponseDequeuedForTest sets a hook that WriteFile runs with
 // the caller and call contexts after dequeuing a result or terminal frame
 // and before checking cancellation. A nil hook removes it.

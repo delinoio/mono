@@ -781,7 +781,9 @@ func TestIntegrationDeleteBlockedByProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	var creds int
-	_ = w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM agent_integration_credentials WHERE agent_integration_id = $1", cursor.GetAgentIntegrationId()).Scan(&creds)
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM agent_integration_credentials WHERE agent_integration_id = $1", cursor.GetAgentIntegrationId()).Scan(&creds); err != nil {
+		t.Fatalf("count credentials for deleted integration: %v", err)
+	}
 	if creds != 0 {
 		t.Fatal("credentials stay after the deletion")
 	}

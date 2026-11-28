@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"sync"
@@ -27,11 +28,17 @@ import (
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
 
+type devSessionRecord struct {
+	session  *sandrunv1.DevSession
+	priority sandrunv1.Priority
+}
+
 // SetSessionState changes the state of a dev session.
 func (s *Server) SetSessionState(id string, state sandrunv1.RequestState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, d := range s.sessions {
+	for _, record := range s.sessions {
+		d := record.session
 		if d.GetDevSessionId() == id {
 			d.State = state
 		}
@@ -44,7 +51,7 @@ func (s *Server) Sessions() []*sandrunv1.DevSession {
 	defer s.mu.Unlock()
 	out := make([]*sandrunv1.DevSession, 0, len(s.sessions))
 	for _, d := range s.sessions {
-		out = append(out, proto.CloneOf(d))
+		out = append(out, proto.CloneOf(d.session))
 	}
 	return out
 }
@@ -126,7 +133,8 @@ func (d *devSessionService) CreateDevSession(_ context.Context, req *connect.Req
 	}
 	if org.GetSettings().MaxDevSessionsPerUser != nil {
 		active := 0
-		for _, x := range s.sessions {
+		for _, record := range s.sessions {
+			x := record.session
 			if x.GetOrganizationId() == org.GetOrganizationId() && x.GetOwnerUserId() == s.UserID && !terminalRequest(x.GetState()) {
 				active++
 			}
@@ -148,18 +156,26 @@ func (d *devSessionService) CreateDevSession(_ context.Context, req *connect.Req
 		ds.StartedAt = timestamppb.Now()
 		ds.RunnerId = s.newID()
 	}
-	s.sessions = append(s.sessions, ds)
+	s.sessions = append(s.sessions, &devSessionRecord{session: ds, priority: prof.GetPriority()})
 	return connect.NewResponse(&sandrunv1.CreateDevSessionResponse{DevSession: proto.CloneOf(ds)}), nil
 }
 
-// session returns the dev session of the request. The caller holds s.mu.
-func (s *Server) session(org, id string) (*sandrunv1.DevSession, error) {
-	for _, x := range s.sessions {
+// findSessionLocked returns the dev session for this organization and ID.
+func (s *Server) findSessionLocked(org, id string) *devSessionRecord {
+	for _, record := range s.sessions {
+		x := record.session
 		if x.GetOrganizationId() == org && x.GetDevSessionId() == id {
-			return x, nil
+			return record
 		}
 	}
-	return nil, notFound("dev session")
+	return nil
+}
+
+// cancelQueuedSessionLocked ends a dev session that the caller verified is queued.
+func cancelQueuedSessionLocked(ds *sandrunv1.DevSession) {
+	ds.State = sandrunv1.RequestState_REQUEST_STATE_CANCELED
+	ds.EndReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER
+	ds.EndedAt = timestamppb.Now()
 }
 
 // runningSession returns a copy of a RUNNING dev session.
@@ -175,10 +191,11 @@ func (s *Server) runningSession(org, id string) (*sandrunv1.DevSession, error) {
 
 // runningSessionLocked checks the session state while the caller holds s.mu.
 func (s *Server) runningSessionLocked(org, id string) (*sandrunv1.DevSession, error) {
-	x, err := s.session(org, id)
-	if err != nil {
-		return nil, err
+	record := s.findSessionLocked(org, id)
+	if record == nil {
+		return nil, notFound("dev session")
 	}
+	x := record.session
 	if x.GetState() != sandrunv1.RequestState_REQUEST_STATE_RUNNING {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the dev session is not running"))
 	}
@@ -189,10 +206,11 @@ func (d *devSessionService) GetDevSession(_ context.Context, req *connect.Reques
 	s := d.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	x, err := s.session(req.Msg.GetOrganizationId(), req.Msg.GetDevSessionId())
-	if err != nil {
-		return nil, err
+	record := s.findSessionLocked(req.Msg.GetOrganizationId(), req.Msg.GetDevSessionId())
+	if record == nil {
+		return nil, notFound("dev session")
 	}
+	x := record.session
 	s.sessionGets[x.GetDevSessionId()]++
 	if s.PromoteAfterGets > 0 && s.sessionGets[x.GetDevSessionId()] >= s.PromoteAfterGets &&
 		(x.GetState() == sandrunv1.RequestState_REQUEST_STATE_QUEUED || x.GetState() == sandrunv1.RequestState_REQUEST_STATE_STARTING) {
@@ -227,7 +245,8 @@ func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Requ
 		return nil, err
 	}
 	var mine []*sandrunv1.DevSession
-	for _, x := range s.sessions {
+	for _, record := range s.sessions {
+		x := record.session
 		if x.GetOrganizationId() != m.GetOrganizationId() || (profileID != "" && x.GetRunnerProfileId() != profileID) {
 			continue
 		}
@@ -256,17 +275,16 @@ func (d *devSessionService) ListDevSessions(_ context.Context, req *connect.Requ
 func (d *devSessionService) DeleteDevSession(_ context.Context, req *connect.Request[sandrunv1.DeleteDevSessionRequest]) (*connect.Response[sandrunv1.DeleteDevSessionResponse], error) {
 	s := d.s
 	s.mu.Lock()
-	x, err := s.session(req.Msg.GetOrganizationId(), req.Msg.GetDevSessionId())
-	if err != nil {
+	record := s.findSessionLocked(req.Msg.GetOrganizationId(), req.Msg.GetDevSessionId())
+	if record == nil {
 		s.mu.Unlock()
-		return nil, err
+		return nil, notFound("dev session")
 	}
+	x := record.session
 	switch {
 	case terminalRequest(x.GetState()):
 	case x.GetState() == sandrunv1.RequestState_REQUEST_STATE_QUEUED:
-		x.State = sandrunv1.RequestState_REQUEST_STATE_CANCELED
-		x.EndReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER
-		x.EndedAt = timestamppb.Now()
+		cancelQueuedSessionLocked(x)
 	default:
 		x.State = sandrunv1.RequestState_REQUEST_STATE_ENDED
 		x.EndReason = sandrunv1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED
@@ -300,6 +318,9 @@ func (d *devSessionService) ExecDevSession(ctx context.Context, req *connect.Req
 	}
 	if len(req.Msg.GetCommand()) == 0 || req.Msg.GetExecId() == "" {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("exec_id and command are required"))
+	}
+	if timeout := req.Msg.GetTimeout(); timeout != nil && (timeout.CheckValid() != nil || timeout.AsDuration() <= 0) {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("invalid timeout: must be greater than zero"))
 	}
 	if d.s.BeforeExec != nil {
 		d.s.BeforeExec(proto.CloneOf(req.Msg))
@@ -357,6 +378,9 @@ func (d *devSessionService) ReadDevSessionFile(ctx context.Context, req *connect
 	off := req.Msg.GetOffset()
 	if off < 0 {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("the offset is outside the file"))
+	}
+	if req.Msg.GetPath() == "" {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("invalid path: is required"))
 	}
 	data, err := guest.readSnapshot(ds, req.Msg)
 	if err != nil {
@@ -486,8 +510,13 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		default:
 			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("written ranges do not cover exactly the final file"))
 		}
-		mode := fs.FileMode(m.GetMode()).Perm()
-		if mode == 0 {
+		wireMode := m.GetMode()
+		mode := fs.FileMode(wireMode).Perm()
+		preserveStickyBit := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+		if preserveStickyBit && wireMode&0o1000 != 0 {
+			mode |= fs.ModeSticky
+		}
+		if wireMode == 0 || (!preserveStickyBit && mode == 0) {
 			mode = 0o644
 		}
 		tmp, err := stageWrite(w.path, data, mode)
@@ -501,7 +530,7 @@ func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.
 		res.Finished = true
 		res.SizeBytes = end
 		w.completed = &completedWrite{
-			mode:     m.GetMode(),
+			mode:     wireMode,
 			digest:   sha256.Sum256(m.GetData()),
 			response: proto.CloneOf(res),
 		}
@@ -607,14 +636,15 @@ type sessionExecs struct {
 }
 
 type guest struct {
-	s        *Server
-	ctx      context.Context
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	closed   bool
-	execs    map[string]*proc
-	writes   map[writeKey]*pendingWrite
-	requests []*sandrunv1.ExecDevSessionRequest
+	s                *Server
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mu               sync.Mutex
+	closed           bool
+	execs            map[string]*proc
+	activeExecGroups map[*execGroup]struct{}
+	writes           map[writeKey]*pendingWrite
+	requests         []*sandrunv1.ExecDevSessionRequest
 	// snapshots holds the first snapshot bound to each read_id.
 	snapshots map[string]readSnapshot
 	reads     []*sandrunv1.ReadDevSessionFileRequest
@@ -626,14 +656,23 @@ type guest struct {
 
 func newGuest(s *Server) *guest {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[writeKey]*pendingWrite{}, snapshots: map[string]readSnapshot{}}
+	return &guest{
+		s: s, ctx: ctx, cancel: cancel,
+		execs:            map[string]*proc{},
+		activeExecGroups: map[*execGroup]struct{}{},
+		writes:           map[writeKey]*pendingWrite{},
+		snapshots:        map[string]readSnapshot{},
+	}
 }
 
 func (g *guest) close() {
 	g.mu.Lock()
 	g.closed = true
-	g.mu.Unlock()
+	for group := range g.activeExecGroups {
+		group.close()
+	}
 	g.cancel()
+	g.mu.Unlock()
 	g.wg.Wait()
 }
 
@@ -744,11 +783,13 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 		ctx, cancel = context.WithTimeout(ctx, t.AsDuration())
 	}
 	cmd := newExecCommand(ctx, req.GetCommand(), req.GetEnv())
+	group := new(execGroup)
 	var timedOut bool
-	cancelCommand := cmd.Cancel
 	cmd.Cancel = func() error {
+		g.mu.Lock()
+		defer g.mu.Unlock()
 		deadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
-		err := cancelCommand()
+		err := group.cancel(deadline)
 		timedOut = deadline && err == nil
 		return err
 	}
@@ -756,7 +797,15 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 	cmd.Stdout = writerFunc(func(b []byte) (int, error) { p.append(0, b); return len(b), nil })
 	cmd.Stderr = writerFunc(func(b []byte) (int, error) { p.append(1, b); return len(b), nil })
 	cmd.WaitDelay = time.Second
-	if err := cmd.Start(); err != nil {
+	// Close either sees the started group or cancels its context before Start.
+	g.mu.Lock()
+	err = group.start(ctx, cmd)
+	if err == nil {
+		g.activeExecGroups[group] = struct{}{}
+	}
+	g.mu.Unlock()
+	if err != nil {
+		group.release()
 		cancel()
 		switch {
 		case errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist):
@@ -769,8 +818,12 @@ func (g *guest) start(ds *sandrunv1.DevSession, req *sandrunv1.ExecDevSessionReq
 	go func() {
 		defer done()
 		defer cancel()
-		// Wait joins the cancellation callback before it drains the output.
+		// Wait joins Cmd.Cancel, but Close can still signal during output drain.
 		_ = cmd.Wait()
+		g.mu.Lock()
+		delete(g.activeExecGroups, group)
+		g.mu.Unlock()
+		group.release()
 		ex := &sandrunv1.DevSessionExecExited{TimedOut: timedOut, EndTime: timestamppb.Now()}
 		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 			ex.Status = &sandrunv1.DevSessionExecExited_Signal{Signal: int32(ws.Signal())}

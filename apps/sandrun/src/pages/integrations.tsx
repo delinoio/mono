@@ -152,13 +152,15 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
   const current = link.data?.link;
   if (
     removalTarget !== undefined &&
-    link.data !== undefined &&
-    !isSameOwnSandLink(removalTarget, current)
+    (!admin ||
+      (link.data !== undefined && !isSameOwnSandLink(removalTarget, current)))
   ) {
     setRemovalTarget(undefined);
   }
-  // Only a returned link result can invalidate this opening.
-  if (
+  if (!admin && dialog !== undefined) {
+    close();
+  } else if (
+    // Only a returned link result can invalidate a replacement target.
     dialog?.kind === "replace" &&
     link.data !== undefined &&
     current?.ownsandOrganizationId !== dialog.ownsandOrganizationId
@@ -254,7 +256,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
         }
       </QueryBoundary>
       <FormDialog
-        open={dialog !== undefined}
+        open={admin && dialog !== undefined}
         onOpenChange={(open) => !open && close()}
         title={
           replacing
@@ -269,7 +271,11 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
         }
         submitDisabled={replacementUnavailable}
         onSubmit={async (opening) => {
-          if (dialog === undefined || dialog.kind === "stale-replacement")
+          if (
+            !admin ||
+            dialog === undefined ||
+            dialog.kind === "stale-replacement"
+          )
             return;
           const org =
             dialog.kind === "replace"
@@ -326,7 +332,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
         />
       </FormDialog>
       <ConfirmDialog
-        open={removalTarget !== undefined}
+        open={admin && removalTarget !== undefined}
         onOpenChange={(open) => {
           if (!open) setRemovalTarget(undefined);
         }}
@@ -334,6 +340,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
         description={t("integrations.ownSand.removeDialog.description")}
         confirmLabel={t("integrations.ownSand.removeLink")}
         onConfirm={async () => {
+          if (!admin || removalTarget === undefined) return;
           // A refresh may update the cache before React displays the result.
           const { queryKey } = createQueryOptions(
             getLink,
@@ -381,6 +388,10 @@ function GitHubSection({ admin }: { admin: boolean }) {
   });
   const [unlinking, setUnlinking] = useState<GitHubInstallation>();
   const [grouping, setGrouping] = useState<GitHubInstallation>();
+  if (!admin && (unlinking !== undefined || grouping !== undefined)) {
+    setUnlinking(undefined);
+    setGrouping(undefined);
+  }
 
   const connect = async () => {
     try {
@@ -478,14 +489,14 @@ function GitHubSection({ admin }: { admin: boolean }) {
         }}
       </QueryBoundary>
       <ListPagination query={list} />
-      {grouping !== undefined ? (
+      {admin && grouping !== undefined ? (
         <RunnerGroupDialog
           installation={grouping}
           onClose={() => setGrouping(undefined)}
         />
       ) : null}
       <ConfirmDialog
-        open={unlinking !== undefined}
+        open={admin && unlinking !== undefined}
         onOpenChange={(open) => !open && setUnlinking(undefined)}
         title={
           unlinking === undefined
@@ -496,12 +507,13 @@ function GitHubSection({ admin }: { admin: boolean }) {
         }
         description={t("integrations.github.unlinkDialog.description")}
         confirmLabel={t("integrations.github.unlink")}
-        onConfirm={() =>
-          unlink.mutateAsync({
+        onConfirm={async () => {
+          if (!admin || unlinking === undefined) return;
+          await unlink.mutateAsync({
             organizationId,
-            installationId: unlinking!.installationId,
-          })
-        }
+            installationId: unlinking.installationId,
+          });
+        }}
       />
     </section>
   );
@@ -515,7 +527,7 @@ function RunnerGroupDialog({
   onClose: () => void;
 }) {
   const { t } = useI18n();
-  const { organizationId } = useOrg();
+  const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const groups = useQuery(GitHubService.method.listGitHubRunnerGroups, {
     organizationId,
@@ -524,7 +536,21 @@ function RunnerGroupDialog({
   const update = useMutation(GitHubService.method.updateGitHubInstallation, {
     onSuccess: () => invalidateServices(queryClient, GitHubService),
   });
-  const [group, setGroup] = useState(String(installation.githubRunnerGroupId));
+  const [groupId, setGroupId] = useState<string | null>(
+    String(installation.githubRunnerGroupId),
+  );
+  const selectedGroup = groups.data?.runnerGroups.find(
+    (group) => String(group.githubRunnerGroupId) === groupId,
+  );
+  const submitDisabled = selectedGroup === undefined || showsFullError(groups);
+  if (
+    groupId !== null &&
+    groups.data !== undefined &&
+    selectedGroup === undefined
+  ) {
+    setGroupId(null);
+  }
+
   return (
     <FormDialog
       open
@@ -532,12 +558,19 @@ function RunnerGroupDialog({
       title={t("integrations.github.groupDialog.title")}
       description={t("integrations.github.groupDialog.description")}
       submitLabel={t("common.save")}
-      submitDisabled={groups.data === undefined || showsFullError(groups)}
+      submitDisabled={submitDisabled}
       onSubmit={async (opening) => {
+        if (
+          !can(role, Permission.ManageIntegrations) ||
+          submitDisabled ||
+          selectedGroup === undefined
+        ) {
+          return;
+        }
         await update.mutateAsync({
           organizationId,
           installationId: installation.installationId,
-          githubRunnerGroupId: BigInt(group),
+          githubRunnerGroupId: selectedGroup.githubRunnerGroupId,
         });
         if (opening.isCurrent()) onClose();
       }}
@@ -549,8 +582,9 @@ function RunnerGroupDialog({
         {(data) => (
           <Select
             label={t("integrations.github.groupDialog.label")}
-            value={group}
-            onValueChange={(v) => v && setGroup(v)}
+            placeholder={t("integrations.github.groupDialog.placeholder")}
+            value={selectedGroup === undefined ? null : groupId}
+            onValueChange={setGroupId}
           >
             {data.runnerGroups.map((g) => (
               <SelectOption
@@ -761,6 +795,10 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
   );
   const [editing, setEditing] = useState<AgentIntegration | "new">();
   const [deleting, setDeleting] = useState<AgentIntegration>();
+  if (!admin && (editing !== undefined || deleting !== undefined)) {
+    setEditing(undefined);
+    setDeleting(undefined);
+  }
 
   return (
     <section className="section" aria-labelledby="agents-title">
@@ -863,14 +901,14 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
           </>
         )}
       </QueryBoundary>
-      {editing !== undefined ? (
+      {admin && editing !== undefined ? (
         <IntegrationDialog
           integration={editing === "new" ? undefined : editing}
           onClose={() => setEditing(undefined)}
         />
       ) : null}
       <ConfirmDialog
-        open={deleting !== undefined}
+        open={admin && deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
         title={
           deleting === undefined
@@ -881,12 +919,13 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
         }
         description={t("integrations.agent.deleteDialog.description")}
         confirmLabel={t("integrations.agent.deleteDialog.confirm")}
-        onConfirm={() =>
-          remove.mutateAsync({
+        onConfirm={async () => {
+          if (!admin || deleting === undefined) return;
+          await remove.mutateAsync({
             organizationId,
-            agentIntegrationId: deleting!.agentIntegrationId,
-          })
-        }
+            agentIntegrationId: deleting.agentIntegrationId,
+          });
+        }}
       />
     </section>
   );
@@ -901,7 +940,7 @@ function IntegrationDialog({
 }) {
   const i18n = useI18n();
   const { t } = i18n;
-  const { organizationId } = useOrg();
+  const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () =>
     invalidateServices(queryClient, AgentIntegrationService);
@@ -966,6 +1005,7 @@ function IntegrationDialog({
           : t("common.saveChanges")
       }
       onSubmit={async (opening) => {
+        if (!can(role, Permission.ManageIntegrations)) return;
         const found: Record<string, string> = {};
         const trimmedName = name.trim();
         if (!isNameLengthValid(trimmedName, AGENT_INTEGRATION_NAME_LIMIT)) {

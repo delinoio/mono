@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -14,9 +15,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/go/sandrun/sandruntest"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
@@ -319,6 +322,152 @@ func TestExecTruncationCallbackResume(t *testing.T) {
 				t.Fatalf("attach with nil callback result = %+v, error = %v", res, err)
 			}
 		})
+	}
+}
+
+func TestExecContextAtDispatch(t *testing.T) {
+	const execID = "exec"
+	rejected := errors.New("output rejected")
+	stdout := func(offset int64) *sandrunv1.DevSessionExecEvent {
+		return &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stdout{
+			Stdout: &sandrunv1.DevSessionExecOutput{Offset: offset, Data: []byte("a")},
+		}}
+	}
+	stderr := func(offset int64) *sandrunv1.DevSessionExecEvent {
+		return &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stderr{
+			Stderr: &sandrunv1.DevSessionExecOutput{Offset: offset, Data: []byte("bc")},
+		}}
+	}
+	for _, method := range []struct {
+		name, path     string
+		stdout, stderr int64
+	}{
+		{name: "Exec", path: sandrunv1connect.DevSessionServiceExecDevSessionProcedure},
+		{name: "AttachExec", path: sandrunv1connect.DevSessionServiceAttachDevSessionExecProcedure, stdout: 5, stderr: 9},
+	} {
+		initial := method.name == "Exec"
+		nextStdout, nextStderr := method.stdout+1, method.stderr+2
+		for _, tc := range []struct {
+			name     string
+			event    *sandrunv1.DevSessionExecEvent
+			readErr  error
+			callback bool
+			wantErr  error
+		}{
+			{name: "late start", event: retryStarted, readErr: context.Canceled, wantErr: context.Canceled},
+			{name: "late stdout", event: stdout(nextStdout), readErr: context.Canceled, wantErr: context.Canceled},
+			{name: "late stderr", event: stderr(nextStderr), readErr: context.Canceled, wantErr: context.Canceled},
+			{name: "late terminal", event: retryExited, readErr: context.Canceled, wantErr: context.Canceled},
+			{name: "deadline at terminal", event: retryExited, readErr: context.DeadlineExceeded, wantErr: context.DeadlineExceeded},
+			{name: "active", event: retryExited},
+			{name: "callback accepts during cancellation", event: stdout(nextStdout), callback: true, wantErr: context.Canceled},
+			{name: "callback rejects during cancellation", event: stdout(nextStdout), callback: true, wantErr: rejected},
+		} {
+			t.Run(method.name+"/"+tc.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					if tc.readErr == context.DeadlineExceeded {
+						deadlineCtx, cancelDeadline := context.WithTimeout(ctx, time.Second)
+						defer cancelDeadline()
+						ctx = deadlineCtx
+					}
+
+					wantStarted := tc.event != retryStarted
+					wantStdout, wantStderr := method.stdout, method.stderr
+					var events []*sandrunv1.DevSessionExecEvent
+					var wantKinds []ExecEventKind
+					if wantStarted {
+						events = append(events, retryStarted, stdout(method.stdout), stderr(method.stderr))
+						if initial {
+							wantKinds = append(wantKinds, ExecEventStarted)
+						}
+						wantKinds = append(wantKinds, ExecEventStdout, ExecEventStderr)
+						wantStdout, wantStderr = nextStdout, nextStderr
+					}
+					if tc.callback {
+						wantKinds = append(wantKinds, ExecEventStdout)
+						if tc.wantErr != rejected {
+							wantStdout++
+						}
+					}
+					var messages []proto.Message
+					for _, event := range append(events, tc.event) {
+						if initial {
+							messages = append(messages, &sandrunv1.ExecDevSessionResponse{Event: event})
+						} else {
+							messages = append(messages, &sandrunv1.AttachDevSessionExecResponse{Event: event})
+						}
+					}
+					body := newConnectTestBody(t, func() {
+						switch tc.readErr {
+						case context.Canceled:
+							cancel()
+						case context.DeadlineExceeded:
+							<-ctx.Done()
+						}
+					}, messages...)
+					requests := 0
+					client, err := New(Options{
+						BaseURL: "http://127.0.0.1:18400",
+						APIKey:  "test-token",
+						HTTPClient: &http.Client{Transport: connectTestTransport(func(req *http.Request) (*http.Response, error) {
+							requests++
+							_ = req.Body.Close()
+							if req.URL.Path != method.path {
+								t.Errorf("RPC path = %q, want %q", req.URL.Path, method.path)
+							}
+							return &http.Response{
+								StatusCode: http.StatusOK,
+								Header:     http.Header{"Content-Type": {"application/connect+proto"}},
+								Body:       body,
+							}, nil
+						})},
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					var kinds []ExecEventKind
+					onEvent := func(ev ExecEvent) error {
+						kinds = append(kinds, ev.Kind)
+						if tc.callback && ev.Kind == ExecEventStdout && ev.Offset == nextStdout {
+							cancel()
+							if tc.wantErr == rejected {
+								return rejected
+							}
+						}
+						return nil
+					}
+					var result *ExecResult
+					if initial {
+						result, err = client.Exec(ctx, ExecParams{ExecID: execID, Command: []string{"fixture"}, OnEvent: onEvent})
+					} else {
+						result, err = client.AttachExec(ctx, AttachParams{ExecID: execID, StdoutOffset: method.stdout, StderrOffset: method.stderr, OnEvent: onEvent})
+					}
+					if !slices.Equal(kinds, wantKinds) {
+						t.Errorf("events = %v, want %v", kinds, wantKinds)
+					}
+					if requests != 1 || !body.closed || body.payload.Len() != 0 {
+						t.Errorf("RPCs = %d, body closed = %t, unread payload = %d, want 1, true, 0", requests, body.closed, body.payload.Len())
+					}
+					if tc.wantErr == nil {
+						if err != nil || result == nil || result.Kind != ExecResultExited ||
+							result.StdoutOffset != wantStdout || result.StderrOffset != wantStderr {
+							t.Fatalf("active result = %+v, error = %v", result, err)
+						}
+						return
+					}
+					if result != nil {
+						t.Fatalf("result = %+v, want nil", result)
+					}
+					streamErr := requireExecRetryError(t, err, execID, wantStdout, wantStderr, wantStarted)
+					if streamErr.Unwrap() != tc.wantErr {
+						t.Fatalf("error cause = %v, want %v", streamErr.Unwrap(), tc.wantErr)
+					}
+				})
+			})
+		}
 	}
 }
 

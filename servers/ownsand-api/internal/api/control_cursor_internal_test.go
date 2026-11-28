@@ -114,8 +114,14 @@ func TestControlCursorHeldBatchAdvances(t *testing.T) {
 	h := newCursorHarness(t, 1200)
 	h.acquire(0, nil)
 	h.c.processEvents(context.Background())
-	if len(h.delivered) != 1200 || h.delivered[0] != 1 || h.delivered[1199] != 1200 {
-		t.Fatalf("delivered %d events, want 1..1200 across three pages", len(h.delivered))
+	if len(h.delivered) != 1200 {
+		t.Fatalf("delivered %d events, want 1200", len(h.delivered))
+	}
+	for i, got := range h.delivered {
+		want := int64(i + 1)
+		if got != want {
+			t.Fatalf("delivery at index %d: got ID %d, want %d", i, got, want)
+		}
 	}
 	if got := h.cursor(); got != 1200 {
 		t.Fatalf("cursor = %d, want 1200", got)

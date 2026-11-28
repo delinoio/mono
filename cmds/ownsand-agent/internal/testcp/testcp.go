@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,9 +73,10 @@ func (c *Channel) enqueue(env *ownsandv1.AgentEnvelope) bool {
 
 // Server is the fake control plane.
 type Server struct {
-	URL string
-	t   testing.TB
-	srv *httptest.Server
+	URL      string
+	t        testing.TB
+	srv      *httptest.Server
+	requests atomic.Int64
 
 	mu         sync.Mutex
 	devices    map[string]*device
@@ -239,7 +241,10 @@ func New(t testing.TB) *Server {
 	mux := http.NewServeMux()
 	mux.Handle(ownsandv1connect.NewAgentServiceHandler(s))
 	mux.Handle(ownsandv1connect.NewRelayAgentServiceHandler(relayHandler{s}))
-	s.srv = httptest.NewUnstartedServer(mux)
+	s.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.requests.Add(1)
+		mux.ServeHTTP(w, r)
+	}))
 	var p http.Protocols
 	p.SetHTTP1(true)
 	p.SetUnencryptedHTTP2(true)
@@ -249,6 +254,9 @@ func New(t testing.TB) *Server {
 	t.Cleanup(s.Close)
 	return s
 }
+
+// RequestCount returns the number of HTTP requests, including unmatched paths.
+func (s *Server) RequestCount() int64 { return s.requests.Load() }
 
 // Close stops the server.
 func (s *Server) Close() {

@@ -4,6 +4,7 @@ package telemetry
 
 import (
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -27,6 +28,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// clearResourceEnv isolates the SDK resource detector, which reads the process
+// environment directly.
+func clearResourceEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+}
+
 func noEnv(string) (string, bool) { return "", false }
 
 func scrape(t *testing.T, tel *Telemetry) string {
@@ -49,6 +58,7 @@ func scrape(t *testing.T, tel *Telemetry) string {
 // _total suffix on counters, a unit suffix, no scope labels, and the Go
 // runtime metrics.
 func TestPrometheusNames(t *testing.T) {
+	clearResourceEnv(t)
 	ctx := context.Background()
 	var out bytes.Buffer
 	tel, err := New(ctx, Options{ServiceName: "test-api", Stdout: &out, LookupEnv: noEnv})
@@ -95,6 +105,8 @@ func TestPrometheusNames(t *testing.T) {
 
 // otlpServer records the OTLP/HTTP requests it receives.
 type otlpServer struct {
+	metricsPath   string
+	logsPath      string
 	mu            sync.Mutex
 	paths         []string
 	headers       []http.Header
@@ -126,14 +138,14 @@ func (s *otlpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch r.URL.Path {
-	case "/v1/metrics":
+	case cmp.Or(s.metricsPath, "/v1/metrics"):
 		req := new(colmetricspb.ExportMetricsServiceRequest)
 		if err := proto.Unmarshal(data, req); err != nil {
 			s.rejectRequest(w, r.URL.Path, fmt.Errorf("decode metrics: %w", err))
 			return
 		}
 		s.metrics = append(s.metrics, req)
-	case "/v1/logs":
+	case cmp.Or(s.logsPath, "/v1/logs"):
 		var req collogspb.ExportLogsServiceRequest
 		if err := proto.Unmarshal(data, &req); err == nil {
 			for _, rl := range req.ResourceLogs {
@@ -186,6 +198,7 @@ func (s *otlpServer) assertTestCounter(t *testing.T) {
 // TestOTLPExport checks that OTEL_EXPORTER_OTLP_ENDPOINT turns on the export
 // of metrics and of the log records at or above the logger level.
 func TestOTLPExport(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	collector := &otlpServer{}
@@ -221,6 +234,159 @@ func TestOTLPExport(t *testing.T) {
 		t.Errorf("stdout = %s", out.String())
 	}
 	collector.assertTestCounter(t)
+}
+
+func TestOTLPLogEndpointWhitespace(t *testing.T) {
+	const padding = " \t\n\v\f\r"
+	for _, tc := range []struct {
+		name        string
+		genericEnv  string
+		logsEnv     string
+		genericLogs string
+		overrideLog string
+	}{
+		{
+			name:        "clean generic",
+			genericEnv:  "{generic}/ingest",
+			genericLogs: "/ingest/v1/logs",
+		},
+		{
+			name:        "padded generic",
+			genericEnv:  padding + "{generic}/discard/%2E%2E/ingest//" + padding,
+			genericLogs: "/ingest/v1/logs",
+		},
+		{
+			name:        "trailing padding",
+			genericEnv:  "{generic}/ingest ",
+			genericLogs: "/ingest/v1/logs",
+		},
+		{
+			name:        "clean override with padded generic",
+			genericEnv:  padding + "{generic}/ingest" + padding,
+			logsEnv:     "{logs}/exact%2Flogs//../",
+			overrideLog: "/exact/logs//../",
+		},
+		{
+			name:        "padded override",
+			genericEnv:  "{generic}/ingest",
+			logsEnv:     padding + "{logs}/exact%2Flogs//../" + padding,
+			overrideLog: "/exact/logs//../",
+		},
+		{
+			name:        "padded pathless override",
+			genericEnv:  "{generic}/ingest",
+			logsEnv:     padding + "{logs}" + padding,
+			overrideLog: "/",
+		},
+		{
+			name:        "blank override falls back to generic",
+			genericEnv:  "{generic}/ingest",
+			logsEnv:     padding,
+			genericLogs: "/ingest/v1/logs",
+		},
+		{
+			name:        "malformed override keeps SDK fallback",
+			genericEnv:  "{generic}/ingest",
+			logsEnv:     padding + "http://%" + padding,
+			genericLogs: "/ingest/v1/logs",
+		},
+		{name: "empty endpoints"},
+		{name: "blank endpoints", genericEnv: padding, logsEnv: padding},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearOTLPEnv(t)
+			t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+			t.Setenv("OTEL_SERVICE_NAME", "")
+			t.Setenv("OTEL_METRIC_EXPORT_INTERVAL", "3600000")
+			t.Setenv("OTEL_BLRP_SCHEDULE_DELAY", "3600000")
+			t.Setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "X-Test-Endpoint=logs")
+			t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "gzip")
+
+			const metricsPath = "/ingest/v1/metrics"
+			generic := &otlpServer{metricsPath: metricsPath, logsPath: tc.genericLogs}
+			override := &otlpServer{logsPath: tc.overrideLog}
+			genericSrv := httptest.NewServer(generic)
+			defer genericSrv.Close()
+			overrideSrv := httptest.NewServer(override)
+			defer overrideSrv.Close()
+			urls := strings.NewReplacer("{generic}", genericSrv.URL, "{logs}", overrideSrv.URL)
+			t.Setenv(EnvOTLPEndpoint, urls.Replace(tc.genericEnv))
+			t.Setenv(EnvOTLPLogsEndpoint, urls.Replace(tc.logsEnv))
+
+			ctx := context.Background()
+			var out bytes.Buffer
+			tel, err := New(ctx, Options{ServiceName: "test-api", Stdout: &out, Level: slog.LevelInfo})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantMetrics := strings.Contains(tc.genericEnv, "{generic}")
+			wantLogs := tc.genericLogs != "" || tc.overrideLog != ""
+			if tel.MetricsExport != wantMetrics || tel.LogsExport != wantLogs {
+				t.Errorf("export flags = metrics %v, logs %v, want metrics %v, logs %v",
+					tel.MetricsExport, tel.LogsExport, wantMetrics, wantLogs)
+			}
+			counter, _ := tel.MeterProvider.Meter("test").Int64Counter("test_events")
+			counter.Add(ctx, 1)
+			tel.Logger.Debug("hidden")
+			tel.Logger.Info("exported")
+			shutdownCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			if err := tel.Shutdown(shutdownCtx); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), `"level":"INFO","msg":"exported"`) || strings.Contains(out.String(), `"msg":"hidden"`) {
+				t.Errorf("stdout = %s", out.String())
+			}
+
+			generic.mu.Lock()
+			defer generic.mu.Unlock()
+			override.mu.Lock()
+			defer override.mu.Unlock()
+			var genericPaths []string
+			if wantMetrics {
+				genericPaths = append(genericPaths, metricsPath)
+				generic.assertTestCounter(t)
+			}
+			if tc.genericLogs != "" {
+				genericPaths = append(genericPaths, tc.genericLogs)
+			}
+			assertOTLPCollectorLogs(t, generic, genericPaths, tc.genericLogs)
+			var overridePaths []string
+			if tc.overrideLog != "" {
+				overridePaths = append(overridePaths, tc.overrideLog)
+			}
+			assertOTLPCollectorLogs(t, override, overridePaths, tc.overrideLog)
+		})
+	}
+}
+
+// assertOTLPCollectorLogs requires the caller to hold collector.mu.
+func assertOTLPCollectorLogs(t *testing.T, collector *otlpServer, paths []string, logPath string) {
+	t.Helper()
+	for _, err := range collector.requestErrors {
+		t.Errorf("OTLP collector: %v", err)
+	}
+	if got := len(collector.paths); got != len(paths) {
+		t.Errorf("OTLP paths = %v, want %v", collector.paths, paths)
+	}
+	for _, path := range paths {
+		if !slices.Contains(collector.paths, path) {
+			t.Errorf("OTLP paths = %v, missing %q", collector.paths, path)
+		}
+	}
+	var bodies []string
+	if logPath != "" {
+		bodies = []string{"exported"}
+		if i := slices.Index(collector.paths, logPath); i >= 0 {
+			headers := collector.headers[i]
+			if headers.Get("X-Test-Endpoint") != "logs" || headers.Get("Content-Encoding") != "gzip" {
+				t.Error("OTLP log request is missing its configured header or gzip encoding")
+			}
+		}
+	}
+	if !slices.Equal(collector.logs, bodies) {
+		t.Errorf("exported log bodies = %v, want %v", collector.logs, bodies)
+	}
 }
 
 // clearOTLPEnv removes every OTEL_EXPORTER_OTLP_* variable of the parent
@@ -261,6 +427,7 @@ func stalledCollector(t *testing.T) *httptest.Server {
 // collector that never answers does not use up the shutdown deadline before
 // the log export starts: both exports run in parallel under the one deadline.
 func TestShutdownFlushesLogsWhileMetricsExportStalls(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	stalled := stalledCollector(t)
@@ -302,6 +469,7 @@ func TestShutdownFlushesLogsWhileMetricsExportStalls(t *testing.T) {
 // TestShutdownReportsBothExportErrors checks that Shutdown joins the errors of
 // the metrics and the log export when both collectors stall.
 func TestShutdownReportsBothExportErrors(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	t.Setenv(EnvOTLPMetricsEndpoint, stalledCollector(t).URL)
@@ -332,6 +500,7 @@ func TestShutdownReportsBothExportErrors(t *testing.T) {
 // TestShutdownWithoutLogExport checks that Shutdown works when only metrics
 // are exported, so that there is no logger provider.
 func TestShutdownWithoutLogExport(t *testing.T) {
+	clearResourceEnv(t)
 	clearOTLPEnv(t)
 	ctx := context.Background()
 	collector := &otlpServer{}
@@ -365,6 +534,7 @@ func TestShutdownWithoutLogExport(t *testing.T) {
 // of the fixture tests. The requests reach only the fixture collector, with
 // no inherited headers or compression.
 func TestOTLPExportIgnoresInheritedSettings(t *testing.T) {
+	clearResourceEnv(t)
 	alternate := &otlpServer{}
 	altSrv := httptest.NewServer(alternate)
 	defer altSrv.Close()

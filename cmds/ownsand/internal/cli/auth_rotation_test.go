@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -30,7 +32,7 @@ type rotatingLogto struct {
 	valid     map[string]bool
 	calls     []string
 	seq       int
-	expiresIn int
+	expiresIn int64
 	hook      func(refreshToken string)
 }
 
@@ -281,6 +283,39 @@ func (f *rotationFixture) stored() *credstore.Credentials {
 		f.t.Fatal(err)
 	}
 	return c
+}
+
+func TestTokenSourceRejectsInvalidTokenLifetime(t *testing.T) {
+	f := newRotationFixture(t)
+	f.l.expiresIn = 9223372037
+	before, err := os.ReadFile(f.st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := f.source()
+	const want = "refresh the Logto token (run 'ownsand login' again if it was revoked): " +
+		"logto: invalid token response: expires_in must be an integer in the supported duration range"
+	if got, err := source(t.Context()); got != "" || err == nil || err.Error() != want {
+		t.Errorf("source() = %q, %v, want an empty token and %q", got, err, want)
+	}
+	after, err := os.ReadFile(f.st.Path())
+	if err != nil || !bytes.Equal(after, before) {
+		t.Errorf("refresh changed the existing credential file: %v", err)
+	}
+	if calls := f.l.refreshCalls(); !slices.Equal(calls, []string{"rt-0"}) {
+		t.Fatalf("refresh requests %v, want one with rt-0", calls)
+	}
+	f.l.setValid("rt-0")
+	f.l.expiresIn = 3600
+	if got, err := source(t.Context()); got != "jwt-2" || err != nil {
+		t.Errorf("source() after a valid response = %q, %v, want jwt-2 and no error", got, err)
+	}
+	if calls := f.l.refreshCalls(); !slices.Equal(calls, []string{"rt-0", "rt-0"}) {
+		t.Errorf("refresh requests %v, want two with rt-0", calls)
+	}
+	if got := f.stored(); got.AccessToken != "jwt-2" || got.RefreshToken != "rt-2" || got.SessionID != "s" {
+		t.Error("valid refresh did not store both tokens for the original session")
+	}
 }
 
 // A source that finds the access token another process refreshed uses it and

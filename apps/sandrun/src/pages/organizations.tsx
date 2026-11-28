@@ -122,7 +122,7 @@ export function OrganizationsPage() {
             return;
           }
           const res = await create.mutateAsync({ name: trimmed });
-          await refreshOrganizations(queryClient);
+          void refreshOrganizations(queryClient);
           if (!opening.isCurrent()) return;
           setCreating(false);
           setName("");

@@ -162,39 +162,60 @@ func TestServeH2CAndShutdown(t *testing.T) {
 
 var errPublicAccept = errors.New("permanent public accept failure")
 
-// After one real connection, the accept loop waits for a permanent error.
-type failingPublicListener struct {
+// After one real connection, the accept loop selects a permanent error.
+// The test can release it directly or wait until the server closes the listener.
+type acceptFailureListener struct {
 	net.Listener
-	accepted bool
-	fail     <-chan struct{}
-	closed   chan struct{}
+	accepted     bool
+	failure      error
+	failureReady chan struct{}
+	release      <-chan struct{}
+	closed       chan struct{}
+	closeOnce    sync.Once
 }
 
-func (l *failingPublicListener) Accept() (net.Conn, error) {
+func newAcceptFailureListener(t *testing.T, listener net.Listener, failure error, release <-chan struct{}) *acceptFailureListener {
+	t.Helper()
+	l := &acceptFailureListener{
+		Listener: listener, failure: failure, release: release,
+		failureReady: make(chan struct{}), closed: make(chan struct{}),
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	return l
+}
+
+func (l *acceptFailureListener) Accept() (net.Conn, error) {
 	if !l.accepted {
 		l.accepted = true
 		return l.Listener.Accept()
 	}
-	<-l.fail
-	return nil, errPublicAccept
+	close(l.failureReady)
+	select {
+	case <-l.release:
+	case <-l.closed:
+	}
+	return nil, l.failure
 }
 
-func (l *failingPublicListener) Close() error {
+func (l *acceptFailureListener) Close() error {
 	err := l.Listener.Close()
-	close(l.closed)
+	l.closeOnce.Do(func() { close(l.closed) })
 	return err
 }
 
 func TestServeDrainsAfterPublicListenerFailure(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		signalFirst bool
-		forceClose  bool
-		h2c         bool
+		name         string
+		signalFirst  bool
+		shutdownGate bool
+		forceClose   bool
+		h2c          bool
 	}{
 		{name: "active request completes"},
 		{name: "active request exceeds drain deadline", forceClose: true},
 		{name: "cancellation overlaps public listener failure", signalFirst: true},
+		{name: "shutdown closes listener before Accept returns", signalFirst: true, shutdownGate: true},
+		{name: "shutdown closes listener before Accept returns and forces drain", signalFirst: true, shutdownGate: true, forceClose: true},
 		{name: "active h2c request completes", h2c: true},
 		{name: "active h2c request exceeds drain deadline", forceClose: true, h2c: true},
 	} {
@@ -216,15 +237,19 @@ func TestServeDrainsAfterPublicListenerFailure(t *testing.T) {
 			t.Cleanup(func() { _ = tcp.Close() })
 			failAccept := make(chan struct{})
 			failListener := sync.OnceFunc(func() { close(failAccept) })
-			defer failListener()
-			listener := &failingPublicListener{Listener: tcp, fail: failAccept, closed: make(chan struct{})}
+			var releaseFailure <-chan struct{} = failAccept
+			if tc.shutdownGate {
+				releaseFailure = nil
+			}
+			listener := newAcceptFailureListener(t, tcp, errPublicAccept, releaseFailure)
 
 			requestStarted := make(chan struct{})
 			finishRequest := make(chan struct{})
 			releaseRequest := sync.OnceFunc(func() { close(finishRequest) })
 			defer releaseRequest()
 			requestCanceled := make(chan struct{})
-			logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
 			srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				close(requestStarted)
 				select {
@@ -278,19 +303,22 @@ func TestServeDrainsAfterPublicListenerFailure(t *testing.T) {
 				response <- err
 			}()
 			wait(requestStarted, "active HTTP request")
+			wait(listener.failureReady, "pending public Accept failure")
 			if tc.signalFirst {
 				signal()
 				wait(signalStopped, "signal handler removal")
 				wait(workersStopping, "lease worker shutdown after cancellation")
 			}
-			failListener()
-			wait(listener.closed, "Serve closing the failed listener")
-			select {
-			case <-workersStopping:
-			case err := <-done:
-				t.Fatalf("serve returned before stopping lease workers: %v", err)
-			case <-ctx.Done():
-				t.Fatal("serve did not stop lease workers")
+			if !tc.shutdownGate {
+				failListener()
+				wait(listener.closed, "Serve closing the failed listener")
+				select {
+				case <-workersStopping:
+				case err := <-done:
+					t.Fatalf("serve returned before stopping lease workers: %v", err)
+				case <-ctx.Done():
+					t.Fatal("serve did not stop lease workers")
+				}
 			}
 			select {
 			case <-shutdownStarted:
@@ -305,6 +333,7 @@ func TestServeDrainsAfterPublicListenerFailure(t *testing.T) {
 				}
 			}
 			releaseWorkers()
+			wait(listener.closed, "listener closure")
 			wait(shutdownStarted, "HTTP drain")
 			if !tc.forceClose {
 				select {
@@ -336,6 +365,9 @@ func TestServeDrainsAfterPublicListenerFailure(t *testing.T) {
 				}
 			case <-ctx.Done():
 				t.Fatal("serve did not return after draining")
+			}
+			if strings.Contains(logs.String(), "server_shutdown_completed") {
+				t.Fatalf("serve logged a successful shutdown after the listener failure: %s", &logs)
 			}
 		})
 	}

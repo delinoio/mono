@@ -24,6 +24,7 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/agent/cursor/cursorfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/app"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/db"
+	"github.com/delinoio/mono/servers/sandrun-api/internal/jobs"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/layers"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/sandrun-api/internal/testenv"
@@ -725,6 +726,143 @@ func TestCursorIntegrationDeletionKeepsHeldClaims(t *testing.T) {
 	if err := del(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestEndedRequestRetentionKeepsHeldCursorClaim(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour // Run claim polls explicitly.
+	passes := make(chan chan struct{})
+	fake := cursorfake.New(t, cursorKey, "sandrun-pool")
+	w := startCursorWorld(t, sandrunv1.GuestOs_GUEST_OS_LINUX, timing, fake, func(o *app.Options) {
+		o.DailyJobInterval = 50 * time.Millisecond
+	}, testenv.WithExtension(func(r *app.Registry) error {
+		// This job runs after both retention jobs. Pause here so the test can
+		// inspect each result before the next pass.
+		r.AddDailyJob(jobs.Job{Name: "retention_sentinel", Run: func(ctx context.Context, _ time.Time) (int64, error) {
+			resume := make(chan struct{})
+			select {
+			case passes <- resume:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			select {
+			case <-resume:
+				return 0, nil
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}})
+		return nil
+	}))
+	awaitPass := func() chan struct{} {
+		select {
+		case resume := <-passes:
+			return resume
+		case <-time.After(15 * time.Second):
+			t.Fatal("timed out waiting for the retention sentinel")
+			return nil
+		}
+	}
+	resume := awaitPass()
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
+	})
+	const vendorID = "bc-retention"
+	w.cursor.AddRequest(vendorID, true)
+	requestID := w.requestBySource(t, vendorID).GetRequestId()
+	w.cursor.FailClaimCalls(true)
+	if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&sandrunv1.DeleteRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: w.profileID,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	w.waitRequest(t, requestID, sandrunv1.RequestState_REQUEST_STATE_CANCELED)
+
+	pool := w.env.DB.Pool
+	jobTime := w.env.Clock.Now()
+	// Make the aged request and the controls visible to retention in the same transaction.
+	if _, err := pool.Exec(ctx, `WITH aged AS (
+		UPDATE requests SET end_time = $2::timestamptz - interval '31 days'
+		WHERE request_id = $1
+		RETURNING organization_id, runner_profile_id, kind, source, state, priority
+	), controls AS (
+		INSERT INTO requests (request_id, organization_id, runner_profile_id, kind, source, source_key,
+			state, priority, queue_time, queue_deadline, end_time, create_time, update_time)
+		SELECT gen_random_uuid(), organization_id, runner_profile_id, kind, source, control.source_key,
+			CASE WHEN age IS NULL THEN $4::smallint ELSE state END, priority, $2, $2, $2 - age, $2, $2
+		FROM aged CROSS JOIN (VALUES
+			('old-unclaimed', interval '31 days'),
+			('old-released', interval '31 days'),
+			('at-cutoff', interval '30 days'),
+			('inside-cutoff', interval '29 days'),
+			('open', NULL)
+		) AS control(source_key, age)
+		RETURNING request_id, organization_id, source_key
+	)
+	INSERT INTO agent_claims (request_id, organization_id, agent_integration_id, vendor,
+		vendor_request_id, worker_id, state, create_time, update_time)
+	SELECT request_id, organization_id, $3, $5, source_key, 'released-worker', $6, $2, $2
+	FROM controls WHERE source_key = 'old-released'`, requestID, jobTime, w.integrationID,
+		sandrunv1.RequestState_REQUEST_STATE_RUNNING, sandrunv1.AgentVendor_AGENT_VENDOR_CURSOR, agent.ClaimReleased); err != nil {
+		t.Fatal(err)
+	}
+	assertRequests := func(want ...string) {
+		t.Helper()
+		rows, err := pool.Query(ctx, "SELECT source_key FROM requests WHERE organization_id = $1 ORDER BY source_key", w.org.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil || !slices.Equal(keys, want) {
+			t.Fatalf("requests after retention = %v, %v, want %v", keys, err, want)
+		}
+	}
+	close(resume)
+	resume = awaitPass()
+	assertRequests("at-cutoff", vendorID, "inside-cutoff", "open")
+	var claimCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_claims WHERE organization_id = $1", w.org.ID).Scan(&claimCount); err != nil || claimCount != 1 {
+		t.Fatalf("claims after retention = %d, %v, want only the held claim", claimCount, err)
+	}
+	w.assertOrganizationRetainedClaim(t, requestID, vendorID)
+	t.Log("Retention removed the expired unclaimed and released requests and the released claim. It kept the held request and the cutoff controls.")
+
+	attempts := w.cursor.FailAttempts(vendorID)
+	w.l.Agents.Poll(ctx)
+	if got := w.cursor.FailAttempts(vendorID); got != attempts+1 {
+		t.Fatalf("Cursor fail attempts after polling = %d, want %d", got, attempts+1)
+	}
+	if _, err := w.env.User(w.org.Admin).Integration.DeleteAgentIntegration(ctx, connect.NewRequest(&sandrunv1.DeleteAgentIntegrationRequest{
+		OrganizationId: w.org.ID, AgentIntegrationId: w.integrationID,
+	})); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("DeleteAgentIntegration with retained claim = %v, want failed precondition", err)
+	}
+	if err := w.deleteOrganization(ctx); connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("DeleteOrganization while Cursor returns 503 = %v, want internal", err)
+	}
+	if got := w.cursor.FailAttempts(vendorID); got != attempts+2 {
+		t.Fatalf("Cursor fail attempts after organization deletion = %d, want %d", got, attempts+2)
+	}
+	w.assertOrganizationRetainedClaim(t, requestID, vendorID)
+	t.Log("The poller and organization deletion retried release. Integration deletion remained blocked, and the vendor credential survived.")
+
+	w.cursor.FailClaimCalls(false)
+	w.l.Agents.Poll(ctx)
+	if c, err := w.l.Agents.Claim(ctx, requestID); err != nil || c.State != agent.ClaimReleased {
+		t.Fatalf("claim after polling = %+v, %v, want released", c, err)
+	}
+	if _, held := w.cursor.Claim(vendorID); held {
+		t.Fatal("polling after recovery did not release the vendor claim")
+	}
+	close(resume)
+	awaitPass()
+	assertRequests("at-cutoff", "inside-cutoff", "open")
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_claims WHERE organization_id = $1", w.org.ID).Scan(&claimCount); err != nil || claimCount != 0 {
+		t.Fatalf("claims after release and retention = %d, %v, want none", claimCount, err)
+	}
+	t.Log("After Cursor recovered, the poller released the vendor claim and retention at the same cutoff deleted both rows.")
 }
 
 func TestCursorWatchPaginationRepeats(t *testing.T) {

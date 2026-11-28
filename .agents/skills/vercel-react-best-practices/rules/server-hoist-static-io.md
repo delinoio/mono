@@ -146,7 +146,20 @@ export async function processRequest(data: Data) {
 }
 ```
 
-The cached promise lives as long as the module instance. If a load fails (a missing file, malformed JSON, a failed fetch), the rejected promise stays cached and every later request rejects with the same error until the module is reloaded. To retry after a failure, clear the cache variable (for example `staticFiles = undefined`) in a `catch` around the awaited call.
+The cached promise lives as long as the module instance. If a load fails (a missing file, malformed JSON, a failed fetch), the rejected promise stays cached and every later request rejects with the same error until the module is reloaded.
+
+**Optional (retry on the next call after a failed load):**
+
+Replace `loadStaticFiles` with the version below. It attaches one rejection handler when it starts a load and caches the promise returned by `.catch()`. On failure, the handler clears the cache before rethrowing the original error. Callers continue to await `loadStaticFiles()`. All callers waiting on the failed attempt receive the same error, and the next call starts a retry that concurrent callers share. A successful promise stays cached for the lifetime of the module instance.
+
+```typescript
+function loadStaticFiles() {
+  return (staticFiles ??= readStaticFiles().catch(error => {
+    staticFiles = undefined
+    throw error
+  }))
+}
+```
 
 When to use this pattern:
 

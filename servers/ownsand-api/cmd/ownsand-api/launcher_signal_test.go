@@ -10,8 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 )
@@ -223,21 +224,11 @@ func (p *launcherProc) killTree() {
 	_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 }
 
-func freeLoopbackPort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a loopback port: %v", err)
-	}
-	defer func() { _ = l.Close() }()
-	return l.Addr().(*net.TCPAddr).Port
-}
-
 // startLauncher runs the real Node launcher in the package directory. The
 // environment carries the generated database URL as DATABASE_URL and never
 // the administration URL, so the launched server cannot reach the
 // administration database.
-func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
+func startLauncher(t *testing.T, databaseURL string) *launcherProc {
 	t.Helper()
 	packageDir, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
@@ -245,24 +236,24 @@ func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 	}
 	cmd := exec.Command("node", filepath.Join("scripts", "dev.mjs"))
 	cmd.Dir = packageDir
-	cmd.Env = launcherEnv(os.Environ(), databaseURL, port)
+	cmd.Env = launcherEnv(os.Environ(), databaseURL)
 	return newLauncherProc(t, cmd)
 }
 
-func launcherEnv(parent []string, databaseURL string, port int) []string {
+func launcherEnv(parent []string, databaseURL string) []string {
 	var env []string
 	for _, kv := range parent {
 		name, _, _ := strings.Cut(kv, "=")
 		// The metrics listener and OTLP exporters have separate settings.
 		// Keep the fixture's telemetry local even when the parent exports it.
-		if name == "DATABASE_URL" || name == dbtest.EnvTestDatabaseURL || name == "LOG_LEVEL" ||
+		if name == "ADDR" || name == "DATABASE_URL" || name == dbtest.EnvTestDatabaseURL || name == "LOG_LEVEL" ||
 			strings.HasPrefix(name, "OTEL_") {
 			continue
 		}
 		env = append(env, kv)
 	}
 	return append(env,
-		"ADDR="+net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+		"ADDR=127.0.0.1:0",
 		"DATABASE_URL="+databaseURL,
 		"LOGTO_ISSUER=http://127.0.0.1:9/oidc",
 		"STUN_ADDR=127.0.0.1:0",
@@ -281,6 +272,7 @@ func TestLauncherEnv(t *testing.T) {
 	parent := []string{
 		"PATH=/fixture/bin",
 		"FIXTURE_VALUE=OTEL_RESOURCE_ATTRIBUTES=unchanged",
+		"ADDR=127.0.0.1:8080",
 		"DATABASE_URL=postgres://localhost/parent",
 		dbtest.EnvTestDatabaseURL + "=postgres://localhost/admin",
 		"LOG_LEVEL=warn",
@@ -294,14 +286,14 @@ func TestLauncherEnv(t *testing.T) {
 	want := []string{
 		"PATH=/fixture/bin",
 		"FIXTURE_VALUE=OTEL_RESOURCE_ATTRIBUTES=unchanged",
-		"ADDR=127.0.0.1:8080",
+		"ADDR=127.0.0.1:0",
 		"DATABASE_URL=postgres://localhost/generated",
 		"LOGTO_ISSUER=http://127.0.0.1:9/oidc",
 		"STUN_ADDR=127.0.0.1:0",
 		"METRICS_ADDR=",
 		"LOG_LEVEL=info",
 	}
-	if got := launcherEnv(parent, "postgres://localhost/generated", 8080); !slices.Equal(got, want) {
+	if got := launcherEnv(parent, "postgres://localhost/generated"); !slices.Equal(got, want) {
 		t.Errorf("launcher environment = %q, want %q", got, want)
 	}
 	if !slices.Equal(parent, original) {
@@ -309,32 +301,121 @@ func TestLauncherEnv(t *testing.T) {
 	}
 }
 
-// waitHealthy polls /healthz until the server reports ok, the launcher exits
-// or the timeout passes.
-func (p *launcherProc) waitHealthy(t *testing.T, port int) {
-	t.Helper()
-	client := &http.Client{Timeout: 2 * time.Second}
-	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
-	deadline := time.Now().Add(launcherHealthTimeout)
-	for time.Now().Before(deadline) {
+// launcherStartedAddress reads complete log lines from the captured output.
+func launcherStartedAddress(output string) string {
+	lastNewline := strings.LastIndexByte(output, '\n')
+	if lastNewline < 0 {
+		return ""
+	}
+	for line := range strings.SplitSeq(output[:lastNewline], "\n") {
+		var record struct {
+			Message string `json:"msg"`
+			Address string `json:"addr"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil || record.Message != "server_started" {
+			continue
+		}
+		addr, err := netip.ParseAddrPort(record.Address)
+		if err == nil && addr.Addr().Is4() && addr.Addr().IsLoopback() && addr.Port() != 0 {
+			return addr.String()
+		}
+	}
+	return ""
+}
+
+// waitHealthy waits for the bound address and an ok response from /healthz
+// within one startup deadline.
+func (p *launcherProc) waitHealthy(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	var url string
+	for {
 		select {
 		case <-p.done:
-			t.Fatalf("the launcher exited before the server became healthy (status %d):\n%s", p.cmd.ProcessState.ExitCode(), p.output)
-		default:
+			return fmt.Errorf("the launcher exited before the server became healthy (status %d):\n%s", p.cmd.ProcessState.ExitCode(), p.output)
+		case <-ctx.Done():
+			return fmt.Errorf("the server did not become healthy within %s:\n%s", timeout, p.output)
+		case <-ticker.C:
 		}
-		if resp, err := client.Get(url); err == nil {
+		if url == "" {
+			addr := launcherStartedAddress(p.output.String())
+			if addr == "" {
+				continue
+			}
+			url = "http://" + addr + "/healthz"
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		if resp, err := client.Do(req); err == nil {
 			var body struct {
 				Status string `json:"status"`
 			}
 			decodeErr := json.NewDecoder(resp.Body).Decode(&body)
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK && decodeErr == nil && body.Status == "ok" {
-				return
+				return nil
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("the server did not become healthy within %s:\n%s", launcherHealthTimeout, p.output)
+}
+
+func TestLauncherStartedAddress(t *testing.T) {
+	var output lockedBuffer
+	_, _ = output.Write([]byte(`build noise
+{"msg":"go_build_completed","addr":"127.0.0.1:8080"}
+{"msg":"server_started","addr":"127.0.0.1:0"}
+{"msg":"server_started","addr":"127.0.0.1:65536"}
+{"msg":"server_started","addr":"192.0.2.1:8080"}
+{"msg":"server_started","addr":"localhost:8080"}
+{"msg":"server_started","addr":"[::1]:8080"}
+{"msg":"server_started","addr":"[::ffff:127.0.0.1]:8080"}
+{"msg":"server_started","addr":"127.0.0.1:8080"
+{"msg":"server_started","addr":"127.0.0.`))
+	if addr := launcherStartedAddress(output.String()); addr != "" {
+		t.Fatalf("address before the rest of the record = %q, want empty", addr)
+	}
+	_, _ = output.Write([]byte(`2:43210"}`))
+	if addr := launcherStartedAddress(output.String()); addr != "" {
+		t.Fatalf("address before the newline = %q, want empty", addr)
+	}
+	_, _ = output.Write([]byte("\n"))
+	if addr := launcherStartedAddress(output.String()); addr != "127.0.0.2:43210" {
+		t.Fatalf("address after the complete record = %q, want 127.0.0.2:43210", addr)
+	}
+}
+
+func TestLauncherWaitHealthyFailure(t *testing.T) {
+	t.Run("launcher exits", func(t *testing.T) {
+		p := newLauncherProc(t, exec.Command("sh", "-c", "echo 'build failed'; exit 17"))
+		t.Cleanup(p.stop)
+
+		err := p.waitHealthy(launcherHealthTimeout)
+		want := "the launcher exited before the server became healthy (status 17):\nbuild failed"
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("readiness error = %v, want %q", err, want)
+		}
+	})
+
+	t.Run("startup deadline", func(t *testing.T) {
+		p := &launcherProc{output: &lockedBuffer{}, done: make(chan struct{})}
+		_, _ = p.output.Write([]byte("still building\n"))
+
+		err := p.waitHealthy(20 * time.Millisecond)
+		want := "the server did not become healthy within 20ms:\nstill building"
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("readiness error = %v, want %q", err, want)
+		}
+	})
 }
 
 func assertLauncherTelemetryDisabled(t *testing.T, output string) {
@@ -372,7 +453,11 @@ func takeAdminSnapshot(t *testing.T, admin string) adminSnapshot {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, admin)
+	config, err := pgxpool.ParseConfig(admin)
+	if err != nil {
+		t.Fatalf("parse %s: invalid database configuration", dbtest.EnvTestDatabaseURL)
+	}
+	conn, err := pgx.ConnectConfig(ctx, config.ConnConfig)
 	if err != nil {
 		// pgx connect errors name the host and user but never the password
 		// or the URL.
@@ -432,11 +517,12 @@ func TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase(t *testing.T) {
 	// The fixture registers its database drop first, so the launcher cleanup
 	// below (registered later) runs before the drop.
 	databaseURL := dbtest.NewURL(t)
-	port := freeLoopbackPort(t)
-	launcher := startLauncher(t, databaseURL, port)
+	launcher := startLauncher(t, databaseURL)
 	t.Cleanup(launcher.stop)
 
-	launcher.waitHealthy(t, port)
+	if err := launcher.waitHealthy(launcherHealthTimeout); err != nil {
+		t.Fatal(err)
+	}
 	if err := launcher.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("send SIGTERM to the launcher: %v", err)
 	}

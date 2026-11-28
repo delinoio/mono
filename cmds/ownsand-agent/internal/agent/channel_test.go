@@ -12,11 +12,15 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
 
 func newTestConn(queueSize int, cancel context.CancelFunc) *conn {
@@ -78,64 +82,111 @@ func TestConnSendOnFullQueueCancelsStreamContext(t *testing.T) {
 	}
 }
 
-// TestChannelSendQueueOverflowEndsBlockedStream reproduces a control plane
-// that stops reading the channel: the HTTP/2 flow-control window fills up, the
-// writer blocks inside stream.Send, and the send queue fills behind it. One
-// more envelope must end the stream at once, not after the acknowledgement
-// timeout, and the next channel must report capabilities and full state.
+type blockedChannelSend struct {
+	first   atomic.Bool
+	marked  *ownsandv1.AgentEnvelope
+	entered chan struct{}
+	result  chan error
+}
+
+func (*blockedChannelSend) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc { return next }
+
+func (*blockedChannelSend) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return next
+}
+
+func (b *blockedChannelSend) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		stream := next(ctx, spec)
+		if spec.Procedure == ownsandv1connect.AgentServiceChannelProcedure && b.first.CompareAndSwap(false, true) {
+			return &blockedChannelSendConn{StreamingClientConn: stream, ctx: ctx, send: b}
+		}
+		return stream
+	}
+}
+
+type blockedChannelSendConn struct {
+	connect.StreamingClientConn
+	ctx  context.Context
+	send *blockedChannelSend
+}
+
+func (c *blockedChannelSendConn) Send(msg any) error {
+	if req, ok := msg.(*ownsandv1.ChannelRequest); ok && req.GetEnvelope() == c.send.marked {
+		close(c.send.entered)
+		<-c.ctx.Done()
+		err := c.ctx.Err()
+		c.send.result <- err
+		return err
+	}
+	return c.StreamingClientConn.Send(msg)
+}
+
+// TestChannelSendQueueOverflowEndsBlockedStream checks that an overflow cancels
+// a blocked send and prompts the next channel to report capabilities and full state.
 func TestChannelSendQueueOverflowEndsBlockedStream(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
-	cp.StallNextChannelReads()
+	blocked := &blockedChannelSend{
+		marked:  heartbeatEnvelope(),
+		entered: make(chan struct{}),
+		result:  make(chan error, 1),
+	}
 	h := startWith(t, cp, st, id, func(o *Options) {
-		// Only a send queue overflow may end the first channel in this test.
+		control := *o.Control
+		control.Agent = ownsandv1connect.NewAgentServiceClient(control.HTTP, control.APIURL, connect.WithInterceptors(blocked))
+		o.Control = &control
+		// Keep heartbeat traffic and acknowledgement timeouts out of this test.
 		o.HeartbeatInterval = time.Hour
 		o.AckTimeout = time.Hour
 	})
 
-	var first *conn
-	deadline := time.Now().Add(10 * time.Second)
-	for first == nil {
-		if time.Now().After(deadline) {
-			t.Fatal("the agent did not open a channel")
-		}
-		h.agent.mu.Lock()
-		first = h.agent.conn
-		h.agent.mu.Unlock()
-		time.Sleep(5 * time.Millisecond)
-	}
+	isCapabilityReport := func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil }
+	isStateReport := func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil }
+	_, firstCapability := h.wait(0, "capability report of the first channel", isCapabilityReport)
+	_, firstState := h.wait(firstCapability+1, "state report of the first channel", isStateReport)
 
-	big := &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{
-		CommandId: "stall",
-		Error:     &ownsandv1.ErrorDetail{Message: strings.Repeat("x", 64<<10)},
-	}}}
-	accepted := 0
-	for first.Send(big) {
-		accepted++
-		if accepted > 10*sendQueue {
-			t.Fatal("the send queue never filled up")
-		}
-		if accepted%64 == 0 {
-			// Give the writer time to block in the stalled stream.
-			time.Sleep(time.Millisecond)
+	h.agent.mu.Lock()
+	first := h.agent.conn
+	h.agent.mu.Unlock()
+	if first == nil || cp.Channels() != 1 {
+		t.Fatal("the first connection is no longer active")
+	}
+	if !first.Send(blocked.marked) {
+		t.Fatal("could not queue the marked envelope")
+	}
+	select {
+	case <-blocked.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the writer did not enter Send for the marked envelope")
+	}
+	pending := heartbeatEnvelope()
+	for i := range sendQueue {
+		if !first.Send(pending) {
+			t.Fatalf("Send rejected pending envelope %d of %d", i+1, sendQueue)
 		}
 	}
-	if accepted <= sendQueue {
-		t.Fatalf("accepted %d envelopes, want more than the queue size %d (the writer must have taken some before blocking)", accepted, sendQueue)
-	}
-	t.Logf("accepted %d envelopes before the overflow", accepted)
-
-	// The second channel reports capabilities and full state, long before
-	// the one-hour acknowledgement timeout.
-	h.wait(0, "capability report of the next channel", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
-	h.wait(0, "state report of the next channel", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
-	if n := cp.Channels(); n != 2 {
-		t.Fatalf("control plane saw %d channels, want 2", n)
+	if first.Send(pending) {
+		t.Fatal("Send on a full queue returned true")
 	}
 	select {
 	case <-first.Done():
 	default:
 		t.Fatal("the first connection is not closed")
+	}
+	select {
+	case err := <-blocked.result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocked Send returned %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the overflow did not cancel the blocked send")
+	}
+
+	_, nextCapability := h.wait(firstState+1, "capability report of the next channel", isCapabilityReport)
+	h.wait(nextCapability+1, "state report of the next channel", isStateReport)
+	if n := cp.Channels(); n != 2 {
+		t.Fatalf("control plane saw %d channels, want 2", n)
 	}
 	select {
 	case err := <-h.errc:

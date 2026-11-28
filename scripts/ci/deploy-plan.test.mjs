@@ -1913,6 +1913,26 @@ test("check accepts omitted entitlements with a regular license file", (t) => {
   check(dir);
 });
 
+test("check accepts a regular license under a directory symlink", (t) => {
+  const dir = releaseFixture(t, {
+    entitlements: null,
+    licenseFiles: ["license-alias/NOTICE"],
+  });
+  mkdirSync(join(dir, "licenses"));
+  writeFileSync(join(dir, "licenses/NOTICE"), "license\n");
+  try {
+    symlinkSync("licenses", join(dir, "license-alias"), "dir");
+  } catch (error) {
+    if (error?.code !== "EPERM") throw error;
+    t.skip("cannot create a symlink on this system");
+    return;
+  }
+  check(dir);
+
+  rmSync(join(dir, "licenses"), { recursive: true });
+  assert.throws(() => check(dir), /tool: license-alias\/NOTICE does not exist/);
+});
+
 test("check rejects a license symlink, even to a regular file", (t) => {
   const dir = releaseFixture(t, { entitlements: null });
   writeFileSync(join(dir, "real-license"), "license\n");

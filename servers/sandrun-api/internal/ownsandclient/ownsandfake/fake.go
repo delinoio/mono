@@ -599,6 +599,12 @@ func (w *fileWrite) send(offset int64, data []byte, finish *ownsandv1.WriteFileF
 			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("write already finished with other finish fields"))
 		}
 		return proto.CloneOf(completed.result), nil
+	} else if w.p.Path != fw.path {
+		return nil, &ownsand.DataPathError{
+			Operation:   "write-file",
+			OperationID: w.p.WriteID,
+			Err:         connect.NewWireError(connect.CodePermissionDenied, errors.New("request does not match the recorded operation")),
+		}
 	}
 	if err := fw.stage(offset, data); err != nil {
 		return nil, err

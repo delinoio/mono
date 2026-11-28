@@ -18,7 +18,9 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -38,9 +40,9 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
-// Environment variables that turn on OTLP export. The OTLP exporters read
-// these and the other standard OTEL_EXPORTER_OTLP_* variables (headers,
-// compression, timeout) themselves; see
+// Environment variables that turn on OTLP export. The OTLP exporters also
+// read the standard OTEL_EXPORTER_OTLP_* variables for headers, compression
+// and timeout. See
 // https://opentelemetry.io/docs/specs/otel/protocol/exporter/.
 const (
 	EnvOTLPEndpoint        = "OTEL_EXPORTER_OTLP_ENDPOINT"
@@ -147,7 +149,7 @@ func New(ctx context.Context, opts Options) (*Telemetry, error) {
 	}))
 	handler := slog.Handler(stdoutHandler)
 	if t.LogsExport {
-		exp, err := otlploghttp.New(ctx)
+		exp, err := otlploghttp.New(ctx, normalizedLogEndpointOptions()...)
 		if err != nil {
 			_ = t.meterProvider.Shutdown(ctx)
 			return nil, err
@@ -190,6 +192,44 @@ const ShutdownTimeout = 5 * time.Second
 func envSet(lookup func(string) (string, bool), name string) bool {
 	v, _ := lookup(name)
 	return strings.TrimSpace(v) != ""
+}
+
+// normalizedLogEndpointOptions works around the log exporter's use of raw
+// endpoint values. Use SDK defaults and environment parsing unless trimming
+// changes the selected URL or skips a blank logs override. Remove this
+// workaround when the SDK trims ASCII whitespace and skips blank overrides.
+func normalizedLogEndpointOptions() []otlploghttp.Option {
+	const asciiWhitespace = " \t\n\v\f\r"
+	rawLogs := os.Getenv(EnvOTLPLogsEndpoint)
+	endpoint := strings.Trim(rawLogs, asciiWhitespace)
+	signalSpecific := endpoint != ""
+	if signalSpecific {
+		if endpoint == rawLogs {
+			return nil
+		}
+	} else {
+		rawGeneric := os.Getenv(EnvOTLPEndpoint)
+		endpoint = strings.Trim(rawGeneric, asciiWhitespace)
+		if rawLogs == "" && endpoint == rawGeneric {
+			return nil
+		}
+	}
+
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil
+	}
+
+	// Match the SDK's environment resolver. The generic base path is joined
+	// with the signal suffix, and the signal-specific path is used as parsed.
+	exportPath := u.Path
+	if !signalSpecific {
+		exportPath = path.Join(exportPath, "/v1/logs")
+	} else if exportPath == "" {
+		exportPath = "/"
+	}
+	resolved := url.URL{Scheme: u.Scheme, Host: u.Host, Path: exportPath}
+	return []otlploghttp.Option{otlploghttp.WithEndpointURL(resolved.String())}
 }
 
 // levelHandler drops records below level. The OpenTelemetry log bridge is

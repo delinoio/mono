@@ -479,9 +479,8 @@ func guestRoot(s *sandrunv1.DevSession) string {
 	return ""
 }
 
-// runGuest runs one guest command through Exec and captures its output. A
-// command that cannot start, that a signal ends or whose sandbox ends is an
-// error.
+// runGuest runs one guest command through Exec and captures its output.
+// It returns a result only when the command reports an explicit exit code.
 func (c *Client) runGuest(ctx context.Context, s *sandrunv1.DevSession, op guestOp, env map[string]string) (*guestResult, error) {
 	cmd, err := guestCommand(s.GetGuestOs(), op)
 	if err != nil {
@@ -526,12 +525,17 @@ func (c *Client) runGuest(ctx context.Context, s *sandrunv1.DevSession, op guest
 	if res.Signal != nil {
 		return nil, localError(connect.CodeInternal, fmt.Errorf("sandrun: the guest %s command ended with signal %d", op, *res.Signal))
 	}
-	scan.end()
-	r := &guestResult{stdout: out.Bytes(), stderr: stderr, linkFailures: scan.paths, outputLost: scan.lost || res.Incomplete}
-	if res.ExitCode != nil {
-		r.exitCode = *res.ExitCode
+	if res.ExitCode == nil {
+		return nil, localError(connect.CodeInternal, fmt.Errorf("sandrun: the guest %s command exited without an exit status", op))
 	}
-	return r, nil
+	scan.end()
+	return &guestResult{
+		exitCode:     *res.ExitCode,
+		stdout:       out.Bytes(),
+		stderr:       stderr,
+		linkFailures: scan.paths,
+		outputLost:   scan.lost || res.Incomplete,
+	}, nil
 }
 
 func (c *Client) recoverGuestExec(ctx context.Context, s *sandrunv1.DevSession, streamErr *ExecStreamError) (*ExecResult, error) {

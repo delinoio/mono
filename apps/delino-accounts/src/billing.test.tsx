@@ -2886,10 +2886,13 @@ describe("paged lists", () => {
         name: "Pending invitations",
       });
       await settle(100);
-      const titles = rowTitles(list);
-      expect(titles).toHaveLength(201);
-      expect(titles[0]).toBe("pending@example.com");
-      expect(titles[200]).toBe(`invitee-${numbered(200)}@example.com`);
+      expect(rowTitles(list)).toEqual([
+        ...Array.from(
+          { length: 200 },
+          (_, index) => `invitee-${numbered(200 - index)}@example.com`,
+        ),
+        "pending@example.com",
+      ]);
       expect(
         within(list).getAllByRole("button", { name: "Revoke" }),
       ).toHaveLength(201);
@@ -2909,7 +2912,7 @@ describe("paged lists", () => {
       expect(calls(api, "RevokeInvitation")).toEqual([
         expect.objectContaining({
           billingAccountId: ACCOUNT_ID,
-          invitationId: `0193a1b2-0002-7000-8000-${"200".padStart(12, "0")}`,
+          invitationId: "0193a1b2-0000-7000-8000-0000000000a1",
         }),
       ]);
     });

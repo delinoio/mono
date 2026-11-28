@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { describe, expect, test } from "@rstest/core";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import {
@@ -8,6 +9,7 @@ import {
 } from "@delino/accounts-protos/v1/billing_account_pb";
 import {
   ACCOUNT_ID,
+  addInvitations,
   createFakeApi,
   INVITATION_TOKEN,
   OUTSIDER,
@@ -26,6 +28,78 @@ const rejection = async (promise: Promise<unknown>) => {
 const OTHER_OUTSIDER = "user-other-outsider";
 const OTHER_TOKEN = "bai_other-token";
 const accountRequest = { billingAccountId: ACCOUNT_ID };
+
+describe("fake ListInvitations", () => {
+  test("paginates pending invitations by descending creation time and ID", async () => {
+    const api = createFakeApi();
+    const client = createClient(BillingAccountService, api.transport);
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    const original = account.invitations[0];
+    addInvitations(account, 2);
+    account.invitations.push(
+      {
+        ...original,
+        invitationId: "0193a1b2-0000-7000-8000-000000000000",
+        email: "newest@example.com",
+        createTime: timestampFromDate(new Date("2026-11-02T00:00:00Z")),
+      },
+      {
+        ...original,
+        invitationId: "0193a1b2-0000-7000-8000-0000000000a2",
+        email: "revoked@example.com",
+        state: InvitationState.REVOKED,
+        createTime: timestampFromDate(new Date("2026-11-03T00:00:00Z")),
+      },
+    );
+    const storedOrder = account.invitations.map(
+      ({ invitationId }) => invitationId,
+    );
+    const expectedEmails = [
+      "newest@example.com",
+      "invitee-0002@example.com",
+      "invitee-0001@example.com",
+      "pending@example.com",
+    ];
+    let pageToken = "";
+    for (const [index, email] of expectedEmails.entries()) {
+      const page = await client.listInvitations({
+        ...accountRequest,
+        pageSize: 1,
+        pageToken,
+      });
+      expect(page.invitations.map((invitation) => invitation.email)).toEqual([
+        email,
+      ]);
+      pageToken = page.nextPageToken;
+      expect(pageToken).toBe(
+        index < expectedEmails.length - 1 ? `p${index + 1}` : "",
+      );
+    }
+    expect(account.invitations.map(({ invitationId }) => invitationId)).toEqual(
+      storedOrder,
+    );
+  });
+
+  test("orders timestamps within the same second before comparing invitation IDs", async () => {
+    const api = createFakeApi();
+    const client = createClient(BillingAccountService, api.transport);
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    const original = account.invitations[0];
+    account.invitations.push({
+      ...original,
+      invitationId: "0193a1b2-0000-7000-8000-000000000000",
+      email: "later@example.com",
+      createTime: { ...original.createTime!, nanos: 1 },
+    });
+
+    const page = await client.listInvitations(accountRequest);
+
+    expect(page.invitations.map((invitation) => invitation.email)).toEqual([
+      "later@example.com",
+      "pending@example.com",
+    ]);
+  });
+});
 
 describe("fake AcceptInvitation", () => {
   test("rejects a known token of a deleted account and keeps the token", async () => {

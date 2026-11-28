@@ -5,6 +5,7 @@ package sandruntest
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -55,6 +56,116 @@ func requireQueueEOF(t *testing.T, stream *connect.ServerStreamForClient[sandrun
 	t.Helper()
 	if stream.Receive() || stream.Err() != nil {
 		t.Fatalf("got %v (error: %v), want successful end of stream", stream.Msg(), stream.Err())
+	}
+}
+
+func TestWatchQueueQueuesBurstBeforeWatch(t *testing.T) {
+	t.Parallel()
+
+	const updates = 65
+	s := New()
+	t.Cleanup(s.Close)
+	s.WatchEventLimit = updates + 1 // snapshot marker and all queued updates
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	org := s.AddOrganization("burst").GetOrganizationId()
+
+	enqueued := make(chan struct{})
+	go func() {
+		defer close(enqueued)
+		update := queueRequest(org, "")
+		for i := range updates {
+			update.GetRequest().RequestId = strconv.Itoa(i)
+			s.SendQueueEvent(update)
+		}
+		update.GetRequest().RequestId = "after-enqueue"
+	}()
+	select {
+	case <-enqueued:
+	case <-ctx.Done():
+		t.Fatal("queuing 65 scoped updates blocked before the watch started")
+	}
+
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	watch := openQueueWatch(t, ctx, client, org)
+	for i := range updates {
+		requireQueueUpdate(t, watch, queueRequest(org, strconv.Itoa(i)))
+	}
+	requireQueueEOF(t, watch)
+}
+
+func TestWatchQueueExitsWhenCanceledWhileWaiting(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	t.Cleanup(cancelWatch)
+	org := s.AddOrganization("waiting").GetOrganizationId()
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	watch := openQueueWatch(t, watchCtx, client, org)
+
+	cancelWatch()
+	if watch.Receive() || connect.CodeOf(watch.Err()) != connect.CodeCanceled {
+		t.Fatalf("got %v (error: %v), want canceled stream", watch.Msg(), watch.Err())
+	}
+}
+
+func TestWatchQueueShutdownDiscardsScopedUpdates(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	pendingOrg := s.AddOrganization("pending").GetOrganizationId()
+	watchingOrg := s.AddOrganization("waiting").GetOrganizationId()
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	watch := openQueueWatch(t, ctx, client, watchingOrg)
+
+	update := queueRunner(pendingOrg, "pending")
+	s.SendQueueEvent(update)
+	closed, enqueued := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(enqueued)
+		for range 65 {
+			s.SendQueueEvent(update)
+		}
+	}()
+	go func() {
+		defer close(closed)
+		s.Close()
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("shutdown blocked with a waiting watch")
+	}
+	select {
+	case <-enqueued:
+	case <-ctx.Done():
+		t.Fatal("scoped sends blocked during shutdown")
+	}
+	if watch.Receive() || ctx.Err() != nil {
+		t.Fatalf("got %v (error: %v), want watch to end before its deadline", watch.Msg(), watch.Err())
+	}
+
+	late := make(chan struct{})
+	go func() {
+		defer close(late)
+		for range 65 {
+			s.SendQueueEvent(update)
+		}
+	}()
+	select {
+	case <-late:
+	case <-ctx.Done():
+		t.Fatal("scoped sends blocked after shutdown")
+	}
+	if len(s.queueByOrg) != 0 {
+		t.Fatal("scoped queues remained after shutdown")
 	}
 }
 
@@ -115,14 +226,18 @@ func TestWatchQueueSendsEachUpdateToOneWatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	t.Cleanup(cancel)
 	org := s.AddOrganization("shared").GetOrganizationId()
+	otherOrg := s.AddOrganization("other").GetOrganizationId()
 	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
 	firstWatch := openQueueWatch(t, ctx, client, org)
 	secondWatch := openQueueWatch(t, ctx, client, org)
+	otherWatch := openQueueWatch(t, ctx, client, otherOrg)
 
 	request := queueRequest(org, "request")
 	runner := queueRunner(org, "runner")
+	otherRequest := queueRequest(otherOrg, "other-request")
 	s.SendQueueEvent(request)
 	s.SendQueueEvent(runner)
+	s.SendQueueEvent(otherRequest)
 
 	if !firstWatch.Receive() {
 		t.Fatalf("first watch ended before the update: %v", firstWatch.Err())
@@ -137,4 +252,59 @@ func TestWatchQueueSendsEachUpdateToOneWatch(t *testing.T) {
 	}
 	requireQueueEOF(t, firstWatch)
 	requireQueueEOF(t, secondWatch)
+	requireQueueUpdate(t, otherWatch, otherRequest)
+	requireQueueEOF(t, otherWatch)
+}
+
+func TestWatchQueueSnapshotProjectsDevSessionRequests(t *testing.T) {
+	t.Parallel()
+	s := New()
+	t.Cleanup(s.Close)
+	s.NewSessionState = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	_, ds := createExecTestSession(t, ctx, s, t.TempDir())
+	_, other := createExecTestSession(t, ctx, s, t.TempDir())
+	org, id := ds.GetOrganizationId(), ds.GetDevSessionId()
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	seed := &sandrunv1.Request{OrganizationId: org, RequestId: "standalone", State: ds.GetState()}
+	s.AddRequest(seed)
+	s.AddRequest(&sandrunv1.Request{OrganizationId: org, RequestId: id, State: ds.GetState()})
+
+	watch, err := client.WatchQueue(ctx, listTestRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = watch.Close() })
+	seen := make(map[string]*sandrunv1.Request)
+	for watch.Receive() && watch.Msg().GetSnapshotComplete() == nil {
+		r := watch.Msg().GetRequest()
+		if r == nil || seen[r.GetRequestId()] != nil {
+			t.Fatalf("unexpected snapshot event %v", watch.Msg())
+		}
+		seen[r.GetRequestId()] = r
+	}
+	if watch.Msg().GetSnapshotComplete() == nil || len(seen) != 2 || seen[other.GetDevSessionId()] != nil ||
+		!proto.Equal(seen[seed.GetRequestId()], seed) {
+		t.Fatalf("unexpected snapshot %v, last event %v, error %v", seen, watch.Msg(), watch.Err())
+	}
+	requireDevSessionWorkRequest(t, seen[id], ds, sandrunv1.Priority_PRIORITY_NORMAL)
+
+	_, err = client.CancelRequest(ctx, listTestRequest(&sandrunv1.CancelRequestRequest{OrganizationId: org, RequestId: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := queueRunner(org, "live")
+	s.SendQueueEvent(update)
+	requireQueueUpdate(t, watch, update)
+
+	reopened, err := client.WatchQueue(ctx, listTestRequest(&sandrunv1.WatchQueueRequest{OrganizationId: org}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	requireQueueUpdate(t, reopened, &sandrunv1.WatchQueueResponse{Event: &sandrunv1.WatchQueueResponse_Request{Request: seed}})
+	if !reopened.Receive() || reopened.Msg().GetSnapshotComplete() == nil {
+		t.Fatalf("got %v (error: %v), want snapshot marker after only the standalone request", reopened.Msg(), reopened.Err())
+	}
 }

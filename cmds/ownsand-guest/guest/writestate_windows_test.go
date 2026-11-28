@@ -24,7 +24,7 @@ func TestWriteRecoveryRecordHandleBlocksPromotionAndCleanup(t *testing.T) {
 	target, req := startPartialWrite(t, h)
 	staging := tempPath(target, req.GetWriteId())
 	canonical, temp := demoteRecordToTemp(t, h, req)
-	path, err := windows.UTF16PtrFromString(temp)
+	path, err := windows.UTF16PtrFromString(extendedPath(temp))
 	if err != nil {
 		t.Fatal(err)
 	}

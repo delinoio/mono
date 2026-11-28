@@ -840,12 +840,32 @@ RSC→client serialization deduplicates by object reference, not value. Same ref
 **Correct: sends 3 strings**
 
 ```tsx
-// RSC: send once
-<ClientList usernames={usernames} />
+// UserList.tsx (Server Component)
+import { ClientList } from './ClientList'
 
-// Client: transform there
+export default function UserList() {
+  const usernames = ['zoe', 'amy', 'mika']
+  return <ClientList usernames={usernames} />
+}
+```
+
+```tsx
+// ClientList.tsx (Client Component)
 'use client'
-const sorted = useMemo(() => [...usernames].sort(), [usernames])
+
+import { useMemo } from 'react'
+
+export function ClientList({ usernames }: { usernames: string[] }) {
+  const sorted = useMemo(() => [...usernames].sort(), [usernames])
+
+  return (
+    <ol>
+      {sorted.map(username => (
+        <li key={username}>{username}</li>
+      ))}
+    </ol>
+  )
+}
 ```
 
 **Nested deduplication behavior:**
@@ -1115,7 +1135,20 @@ export async function processRequest(data: Data) {
 }
 ```
 
-The cached promise lives as long as the module instance. If a load fails (a missing file, malformed JSON, a failed fetch), the rejected promise stays cached and every later request rejects with the same error until the module is reloaded. To retry after a failure, clear the cache variable (for example `staticFiles = undefined`) in a `catch` around the awaited call.
+The cached promise lives as long as the module instance. If a load fails (a missing file, malformed JSON, a failed fetch), the rejected promise stays cached and every later request rejects with the same error until the module is reloaded.
+
+**Optional (retry on the next call after a failed load):**
+
+Replace `loadStaticFiles` with the version below. It attaches one rejection handler when it starts a load and caches the promise returned by `.catch()`. On failure, the handler clears the cache before rethrowing the original error. Callers continue to await `loadStaticFiles()`. All callers waiting on the failed attempt receive the same error, and the next call starts a retry that concurrent callers share. A successful promise stays cached for the lifetime of the module instance.
+
+```typescript
+function loadStaticFiles() {
+  return (staticFiles ??= readStaticFiles().catch(error => {
+    staticFiles = undefined
+    throw error
+  }))
+}
+```
 
 When to use this pattern:
 
@@ -1292,7 +1325,7 @@ Each item independently chains `getChat` → `getUser`, so a slow chat doesn't b
 
 Use `React.cache()` for server-side request deduplication. Authentication and database queries benefit most.
 
-**Usage:**
+Define each memoized wrapper once at module scope. Call it during a React Server Component render. Calls to the same wrapper with matching arguments share a result within that render request. At module scope, each call executes the underlying function.
 
 ```typescript
 import { cache } from 'react'
@@ -1304,44 +1337,43 @@ export const getCurrentUser = cache(async () => {
     where: { id: session.user.id }
   })
 })
+
+export async function CurrentUser() {
+  await Promise.all([getCurrentUser(), getCurrentUser()]) // One query if signed in
+  return null
+}
 ```
 
-Within a single request, multiple calls to `getCurrentUser()` execute the query only once.
+**Argument identity**
 
-**Avoid inline objects as arguments:**
-
-`React.cache()` uses shallow equality (`Object.is`) to determine cache hits. Inline objects create new references each call, preventing cache hits.
-
-**Incorrect: always cache miss**
+Primitive arguments match by value. Object arguments match by reference. Reuse the same object to share the result. Two object literals with the same fields create separate cache entries.
 
 ```typescript
-const getUser = cache(async (params: { uid: number }) => {
-  return await db.user.findUnique({ where: { id: params.uid } })
-})
+import { cache } from 'react'
 
-// Each call creates new object, never hits cache
-getUser({ uid: 1 })
-getUser({ uid: 1 })  // Cache miss, runs query again
-```
-
-**Correct: cache hit**
-
-```typescript
 const getUser = cache(async (uid: number) => {
   return await db.user.findUnique({ where: { id: uid } })
 })
 
-// Primitive args use value equality
-getUser(1)
-getUser(1)  // Cache hit, returns cached result
-```
+const getUserByParams = cache(async (params: { uid: number }) => {
+  return await db.user.findUnique({ where: { id: params.uid } })
+})
 
-If you must pass objects, pass the same reference:
+export async function PrimitiveArgument() {
+  await Promise.all([getUser(1), getUser(1)]) // One query
+  return null
+}
 
-```typescript
-const params = { uid: 1 }
-getUser(params)  // Query runs
-getUser(params)  // Cache hit (same reference)
+export async function SharedObjectArgument() {
+  const params = { uid: 1 }
+  await Promise.all([getUserByParams(params), getUserByParams(params)]) // One query
+  return null
+}
+
+export async function FreshObjectArguments() {
+  await Promise.all([getUserByParams({ uid: 1 }), getUserByParams({ uid: 1 })]) // Two queries
+  return null
+}
 ```
 
 **Next.js-Specific Note:**
@@ -2222,14 +2254,16 @@ function TodoList() {
 
 **Impact: MEDIUM (wasted computation on every render)**
 
-Pass a function to `useState` for expensive initial values. Without the function form, the initializer runs on every render even though the value is only used once.
+Pass a function to `useState` for expensive initial values. If you pass the result of a calculation instead, the calculation runs on every render. React keeps the value from initialization.
+
+Each `FilteredList` instance keeps an index of the `initialItems` array it receives when it mounts, even if the parent later supplies a different array.
 
 **Incorrect: runs on every render**
 
 ```tsx
-function FilteredList({ items }: { items: Item[] }) {
+function FilteredList({ initialItems }: { initialItems: Item[] }) {
   // buildSearchIndex() runs on EVERY render, even after initialization
-  const [searchIndex, setSearchIndex] = useState(buildSearchIndex(items))
+  const [searchIndex] = useState(buildSearchIndex(initialItems))
   const [query, setQuery] = useState('')
   
   // When query changes, buildSearchIndex runs again unnecessarily
@@ -2246,12 +2280,11 @@ function UserProfile() {
 }
 ```
 
-**Correct: runs only once**
+**Correct (lazy initialization)**
 
 ```tsx
-function FilteredList({ items }: { items: Item[] }) {
-  // buildSearchIndex() runs ONLY on initial render
-  const [searchIndex, setSearchIndex] = useState(() => buildSearchIndex(items))
+function FilteredList({ initialItems }: { initialItems: Item[] }) {
+  const [searchIndex] = useState(() => buildSearchIndex(initialItems))
   const [query, setQuery] = useState('')
   
   return <SearchResults index={searchIndex} query={query} />
@@ -2299,6 +2332,28 @@ When no `settings` key is stored, the defaults stay. The pure `buildSearchIndex`
 Use lazy initialization when computing initial values from localStorage/sessionStorage or the DOM (in browser-only components; see the server-rendered variant above), building data structures (indexes, maps), or performing heavy transformations.
 
 For simple primitives (`useState(0)`), direct references (`useState(props.value)`), or cheap literals (`useState({})`), the function form is unnecessary.
+
+**Index derived from current items**
+
+If the index must follow the current `items` prop, build it during render with `useMemo` and keep `query` in state. Replace the array when its contents change, for example with `setItems(previousItems => [...previousItems, newItem])`. On a render that changes only the query, React can reuse the index if `items` has the same array reference.
+
+```tsx
+function FilteredList({ items }: { items: Item[] }) {
+  const searchIndex = useMemo(() => buildSearchIndex(items), [items])
+  const [query, setQuery] = useState('')
+
+  return (
+    <>
+      <input
+        aria-label="Search items"
+        value={query}
+        onChange={event => setQuery(event.target.value)}
+      />
+      <SearchResults index={searchIndex} query={query} />
+    </>
+  )
+}
+```
 
 ### 5.13 Use Transitions for Non-Urgent Updates
 
@@ -2361,6 +2416,8 @@ function Search({ items }: { items: Item[] }) {
 **Correct: input stays snappy, results render when ready**
 
 ```tsx
+const MemoizedResultsList = memo(ResultsList)
+
 function Search({ items }: { items: Item[] }) {
   const [query, setQuery] = useState('')
   const deferredQuery = useDeferredValue(query)
@@ -2374,7 +2431,7 @@ function Search({ items }: { items: Item[] }) {
     <>
       <input value={query} onChange={e => setQuery(e.target.value)} />
       <div style={{ opacity: isStale ? 0.7 : 1 }}>
-        <ResultsList results={filtered} />
+        <MemoizedResultsList results={filtered} />
       </div>
     </>
   )
@@ -2389,7 +2446,7 @@ function Search({ items }: { items: Item[] }) {
 
 - Any derived state that causes noticeable render delays
 
-**Note:** Wrap the expensive computation in `useMemo` with the deferred value as a dependency, otherwise it still runs on every render.
+With React Compiler disabled, use `memo` at module scope so the list can skip rendering when its `results` prop stays the same. During the urgent update, React updates the input and dims the stale list. Since `items` and `deferredQuery` are unchanged, `useMemo` reuses the filtered array. When `deferredQuery` catches up, the filter produces a new array, the list renders the new results, and the wrapper returns to full opacity.
 
 Reference: [https://react.dev/reference/react/useDeferredValue](https://react.dev/reference/react/useDeferredValue)
 
@@ -2933,19 +2990,12 @@ function Navigation() {
 **When to use each:**
 
 | API | Use case |
-
 |-----|----------|
-
 | `prefetchDNS` | Third-party domains you'll connect to later |
-
 | `preconnect` | APIs or CDNs you'll fetch from immediately |
-
 | `preload` | Critical resources needed for current page |
-
 | `preloadModule` | JS modules for likely next navigation |
-
 | `preinit` | Stylesheets/scripts that must execute early |
-
 | `preinitModule` | ES modules that must execute early |
 
 Reference: [https://react.dev/reference/react-dom#resource-preloading-apis](https://react.dev/reference/react-dom#resource-preloading-apis)

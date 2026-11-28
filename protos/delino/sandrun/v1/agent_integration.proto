@@ -162,22 +162,26 @@ message UpdateAgentIntegrationRequest {
   string agent_integration_id = 2;
   // New name, for the mask path `name`.
   string name = 3;
-  // New settings of the integration's vendor, for the mask path `settings`.
+  // New settings of the integration's vendor. Mask the active member or use
+  // the legacy alias `settings`.
   oneof settings {
     ClaudeCodeSettings claude_code = 4;
     CursorSettings cursor = 5;
     OpenAiCodexSettings openai_codex = 6;
     DevinSettings devin = 7;
   }
-  // Replacement credentials, for the mask path `credentials`. Only the
-  // non-empty fields replace stored credentials.
+  // Replacement credentials of the integration's vendor. Mask the active member
+  // or use the legacy alias `credentials`. At least one field must be non-empty.
+  // Only non-empty fields replace stored credentials.
   oneof credentials {
     ClaudeCodeCredentials claude_code_credentials = 8;
     CursorCredentials cursor_credentials = 9;
     OpenAiCodexCredentials openai_codex_credentials = 10;
     DevinCredentials devin_credentials = 11;
   }
-  // `name`, `settings` and `credentials`.
+  // A non-empty mask of top-level paths. Use `name`, the active vendor-specific
+  // settings or credentials member names, or their legacy aliases. Each selected
+  // group is applied once, even if several paths select it.
   google.protobuf.FieldMask update_mask = 12;
 }
 

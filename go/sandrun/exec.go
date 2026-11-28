@@ -157,7 +157,7 @@ type ExecStreamError struct {
 	ExecID       string
 	StdoutOffset int64
 	StderrOffset int64
-	// Started is true when the SDK received the started event.
+	// Started is true when the SDK accepted the started event.
 	Started bool
 	// OutcomeUnknown is true when the server does not know the exec
 	// (AttachDevSessionExec returned not_found) and the SDK cannot tell
@@ -197,6 +197,10 @@ func (e *ExecStreamError) Unwrap() error { return e.Err }
 // A sink that saves a prefix before returning an error can receive that
 // prefix again. To avoid duplicate writes, use atomic chunk writes or track
 // durable bytes by stream and offset.
+//
+// After each successful receive, the SDK checks the caller context before
+// handling the event. If the context has ended, the SDK closes the stream
+// and returns an *ExecStreamError with the last accepted offsets.
 //
 // If the caller context ends while the callback accepts an inferred gap,
 // the stream stops before delivering the chunk that revealed the gap.
@@ -406,6 +410,10 @@ func (o *execOp) receive(ctx context.Context, retryDeadline time.Time) (a execAt
 	started, stdout, stderr := o.started, o.stdout, o.stderr
 	var idleSince time.Time
 	for stream.Receive() {
+		if err := ctx.Err(); err != nil {
+			a.eventErr = err
+			return a
+		}
 		a.received = true
 		ev := stream.event()
 		if !a.progressed && idleSince.IsZero() && (ev.GetKeepalive() != nil || (o.started && ev.GetStarted() != nil)) {

@@ -70,10 +70,6 @@ type TransferProgress struct {
 // with the same chunk request. progress receives the bytes confirmed by
 // valid write acknowledgements.
 func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, path string, mode uint32, r io.Reader, progress func(int64)) (int64, error) {
-	writeID, err := uuidv7.NewString()
-	if err != nil {
-		return 0, err
-	}
 	cur := make([]byte, ChunkSize)
 	nxt := make([]byte, ChunkSize)
 	n, err := io.ReadFull(r, cur)
@@ -81,6 +77,7 @@ func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, pa
 		return 0, err
 	}
 	cur = cur[:n]
+	var writeID string
 	var offset int64
 	for {
 		final := len(cur) < ChunkSize
@@ -91,6 +88,14 @@ func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, pa
 				return offset, err
 			}
 			final = m == 0
+		}
+		if writeID == "" {
+			// Start the OwnSand admission window after the first chunk and its
+			// lookahead are ready, so slow source reads cannot consume it.
+			writeID, err = uuidv7.NewString()
+			if err != nil {
+				return 0, err
+			}
 		}
 		req := &sandrunv1.WriteDevSessionFileRequest{
 			OrganizationId: s.GetOrganizationId(),
@@ -116,6 +121,14 @@ func (c *Client) writeGuestFile(ctx context.Context, s *sandrunv1.DevSession, pa
 		}
 		cur, nxt = nxt[:m], cur[:cap(cur)]
 	}
+}
+
+type readLimitError struct {
+	observed int64
+}
+
+func (e *readLimitError) Error() string {
+	return fmt.Sprintf("guest file read exceeds the size limit at %d bytes", e.observed)
 }
 
 // readGuestFile streams the guest file at path into w with
@@ -173,9 +186,10 @@ func (c *Client) readGuestFile(ctx context.Context, s *sandrunv1.DevSession, pat
 				if len(data) == 0 {
 					continue
 				}
-				if offset+int64(len(data)) > limit {
+				observed := offset + int64(len(data))
+				if observed > limit {
 					_ = stream.Close()
-					return offset, &LimitError{Operation: "download", FileLimit: limit, TotalLimit: limit, Paths: []PathSize{{Path: path, Size: offset + int64(len(data))}}}
+					return offset, &readLimitError{observed: observed}
 				}
 				n, err := w.Write(data)
 				if err != nil {

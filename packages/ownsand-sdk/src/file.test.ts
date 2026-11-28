@@ -718,6 +718,76 @@ describe("file write", () => {
     expect(write.finish?.sizeBytes).toBe(0n);
   });
 
+  describe("iterable write sources", () => {
+    async function expectUpload(source: WriteSource, byte: number) {
+      const h = setup();
+      h.api.unary(RelayService, "WriteFile", (req) => ({
+        writeId: req.writeId,
+        offset: req.offset,
+        length: BigInt(req.data.length),
+        finished: req.finish !== undefined,
+        sizeBytes: req.finish?.sizeBytes ?? 0n,
+      }));
+
+      const result = await h.clock.run(
+        h.client.sandbox(SANDBOX).writeFile("/work/file", source),
+      );
+
+      const writes = h.api.callsOf("WriteFile");
+      expect(writes).toHaveLength(1);
+      const write = writes[0]!.request as WriteFileRequest;
+      expect(write.data).toEqual(Uint8Array.of(byte));
+      expect(write.finish?.sizeBytes).toBe(1n);
+      expect(result.sizeBytes).toBe(1n);
+    }
+
+    test("reads a plain synchronous iterable", async () => {
+      await expectUpload([Uint8Array.of(7)], 7);
+    });
+
+    test.each([undefined, null])(
+      "uses the synchronous iterator when the async method is %s",
+      async (method) => {
+        const source = Object.assign([Uint8Array.of(7)], {
+          [Symbol.asyncIterator]: method,
+        });
+        await expectUpload(source, 7);
+      },
+    );
+
+    test("looks up the async iterator once and calls it on the source", async () => {
+      let lookups = 0;
+      const source = {
+        *[Symbol.iterator]() {
+          yield Uint8Array.of(7);
+        },
+        get [Symbol.asyncIterator]() {
+          lookups++;
+          return async function* (this: Iterable<Uint8Array>) {
+            expect(this).toBe(source);
+            yield Uint8Array.of(8);
+          };
+        },
+      };
+
+      await expectUpload(source, 8);
+      expect(lookups).toBe(1);
+    });
+
+    test("rejects a non-callable async iterator before sending requests", async () => {
+      const h = setup();
+      const source = Object.assign([Uint8Array.of(7)], {
+        [Symbol.asyncIterator]: 0,
+      });
+
+      await expect(
+        h.clock.run(h.client.sandbox(SANDBOX).writeFile("/work/file", source)),
+      ).rejects.toThrow(TypeError);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(h.api.callsOf("WriteFile")).toHaveLength(0);
+    });
+  });
+
   describe("binary sources from another realm", () => {
     // A `node:vm` context has its own Uint8Array and ArrayBuffer constructors,
     // so `instanceof` does not recognize its values.

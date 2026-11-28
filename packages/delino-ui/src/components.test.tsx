@@ -1549,6 +1549,117 @@ describe("Select", () => {
     expect(trigger.textContent).toContain("Editor");
   });
 
+  test.each([
+    { mode: "controlled", selection: { value: "org-1" } },
+    { mode: "uncontrolled", selection: { defaultValue: "org-1" } },
+  ])(
+    "refreshes the closed $mode trigger when the selected option text changes",
+    async ({ selection }) => {
+      const onValueChange = rs.fn();
+      function picker(name: string) {
+        return (
+          <Select
+            label="Organization"
+            {...selection}
+            onValueChange={onValueChange}
+          >
+            <>
+              <SelectOption value="org-1">{name}</SelectOption>
+              <SelectOption value="org-2">Second organization</SelectOption>
+            </>
+          </Select>
+        );
+      }
+
+      const { rerender } = render(picker("Old name"));
+      const trigger = screen.getByRole("combobox", { name: "Organization" });
+      expect(trigger.textContent).toBe("Old name");
+      expect(trigger.getAttribute("aria-expanded")).toBe("false");
+
+      rerender(picker("New name"));
+
+      expect(trigger.textContent).toBe("New name");
+      expect(trigger.getAttribute("aria-expanded")).toBe("false");
+      expect(onValueChange).not.toHaveBeenCalled();
+
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      const updatedOption = screen.getByRole("option", { name: "New name" });
+      expect(updatedOption.getAttribute("aria-selected")).toBe("true");
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("option", { name: "Second organization" }),
+        );
+      });
+      expect(onValueChange).toHaveBeenCalledTimes(1);
+      expect(onValueChange.mock.calls[0]?.[0]).toBe("org-2");
+    },
+  );
+
+  test("refreshes a changed explicit label while the list stays closed", () => {
+    const onValueChange = rs.fn();
+    function picker(label: string) {
+      return (
+        <Select
+          label="Organization"
+          defaultValue="org-1"
+          onValueChange={onValueChange}
+        >
+          <SelectOption value="org-1" label={label}>
+            Different child text
+          </SelectOption>
+        </Select>
+      );
+    }
+
+    const { rerender } = render(picker("Old label"));
+    const trigger = screen.getByRole("combobox", { name: "Organization" });
+    expect(trigger.textContent).toBe("Old label");
+
+    rerender(picker("New label"));
+
+    expect(trigger.textContent).toBe("New label");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(onValueChange).not.toHaveBeenCalled();
+  });
+
+  test("keeps the SDK label resolver, custom option label and unmatched value", async () => {
+    function CustomOption() {
+      return <SelectOption value="custom">Custom option</SelectOption>;
+    }
+
+    render(
+      <>
+        <Select
+          label="Resolver"
+          defaultValue="org-1"
+          itemToLabel={(value) => `Resolved ${value}`}
+        >
+          <SelectOption value="org-1">Declarative label</SelectOption>
+        </Select>
+        <Select label="Custom" defaultValue="custom">
+          <CustomOption />
+        </Select>
+        <Select label="Unmatched" defaultValue="unknown">
+          <SelectOption value="org-1">Declarative label</SelectOption>
+        </Select>
+      </>,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Resolver" }).textContent).toBe(
+      "Resolved org-1",
+    );
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "Custom" }).textContent).toBe(
+        "Custom option",
+      );
+    });
+    expect(
+      screen.getByRole("combobox", { name: "Unmatched" }).textContent,
+    ).toBe("unknown");
+  });
+
   describe("option text", () => {
     function renderInterpolated() {
       const os = "Linux";

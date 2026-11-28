@@ -61,10 +61,8 @@ export class NonUtf8PathError extends Error {
   }
 }
 
-// The checkout path itself is not valid UTF-8. Node decodes `process.cwd()` and
-// Git's output as UTF-8, so the path it holds has U+FFFD in place of each
-// invalid byte and names a directory that does not exist; passing it as a child
-// process `cwd` fails with the same `ENOENT` as a missing Git executable.
+// An invalid UTF-8 checkout path cannot be passed as a Node child process cwd.
+// A lossy decoding can point to a different directory whose name has U+FFFD.
 export class NonUtf8RootError extends Error {
   constructor(displayPath) {
     super(
@@ -154,23 +152,34 @@ function gitPaths(cwd, args) {
   return names;
 }
 
+function gitRootPath(cwd, env) {
+  const raw = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd,
+    env,
+    encoding: "buffer",
+    maxBuffer: GitMaxBuffer,
+  });
+  // Remove Git's final newline. The path itself can end in whitespace.
+  return decodePath(raw.at(-1) === 0x0a ? raw.subarray(0, -1) : raw);
+}
+
 // Top level of the working tree that contains `start`. `git diff` prints
 // repository-root-relative paths while `git ls-files` prints paths relative to
 // (and limited to) its working directory, so every selector, the Rstack probe
 // and the formatter run from this one root. The invoking directory then never
-// changes which files are selected or how a selected path resolves. Only the
-// single newline that terminates Git's output is removed: the path itself may
-// legitimately end in whitespace (a checkout directory named `checkout `), and
-// trimming it would point every selector at a directory that does not exist.
+// changes which files are selected or how a selected path resolves.
 export function repositoryRoot(start, env) {
+  let root;
   try {
-    return git(start, ["rev-parse", "--show-toplevel"], env).replace(
-      /\n$/u,
-      "",
-    );
+    root = gitRootPath(start, env);
   } catch (error) {
-    throw nonUtf8RootDiagnosis(start, error, env) ?? error;
+    if (start !== undefined) {
+      throw nonUtf8RootDiagnosis(start, error, env) ?? error;
+    }
+    throw error;
   }
+  if (hasInvalidBytes(root)) throw new NonUtf8RootError(displayPath(root));
+  return root;
 }
 
 // Workaround for a checkout whose own path is not valid UTF-8. Why: Node cannot
@@ -184,17 +193,12 @@ export function repositoryRoot(start, env) {
 // to avoid absolute paths) and this diagnosis is no longer needed.
 function nonUtf8RootDiagnosis(start, error, env) {
   if (error?.code !== "ENOENT" || existsSync(start)) return null;
-  let raw;
+  let root;
   try {
-    raw = execFileSync("git", ["rev-parse", "--show-toplevel"], {
-      env,
-      encoding: "buffer",
-      maxBuffer: GitMaxBuffer,
-    });
+    root = gitRootPath(undefined, env);
   } catch {
     return null;
   }
-  const root = decodePath(raw).replace(/\n$/u, "");
   return hasInvalidBytes(root) ? new NonUtf8RootError(displayPath(root)) : null;
 }
 
@@ -783,7 +787,8 @@ export async function main(env = process.env) {
       head: { type: "string" },
     },
   });
-  const cwd = repositoryRoot(process.cwd());
+  // Let Git inherit the OS working directory before Node decodes its path.
+  const cwd = repositoryRoot();
   const ci = ciEnabled(env);
   const explicit =
     values.base !== undefined ||
