@@ -17,6 +17,7 @@ import {
   CreditService,
   type Invoice,
 } from "@delino/accounts-protos/v1/credit_pb";
+import { useI18n } from "../../i18n.ts";
 import { formatUsd } from "../../money.ts";
 
 /**
@@ -74,6 +75,7 @@ export function InvoicesSection() {
   );
   const list = invoices.data?.pages.flatMap((page) => page.invoices) ?? [];
   const actionFailure = useActionFailure();
+  const { lang, t, rich } = useI18n();
   const viewSignal = useRef<AbortSignal | undefined>(undefined);
   useLayoutEffect(() => {
     const controller = new AbortController();
@@ -99,44 +101,48 @@ export function InvoicesSection() {
   };
   return (
     <section className="section" aria-labelledby="invoices-title">
-      <h2 id="invoices-title">Invoices</h2>
-      <p className="muted">
-        Paddle is the merchant of record and issues the invoices. Amounts
-        exclude tax.
-      </p>
+      <h2 id="invoices-title">{t("invoices.title")}</h2>
+      <p className="muted">{t("invoices.description")}</p>
       <InfiniteListNotice list={invoices} />
       {actionFailure.notice}
       {invoices.isPending ? (
-        <Loading label="Loading invoices" />
+        <Loading label={t("invoices.loading")} />
       ) : invoices.isLoadingError ? (
         <ErrorNotice
           error={invoices.error}
           onRetry={() => void invoices.refetch()}
         />
       ) : list.length === 0 ? (
-        <Empty title="No invoices yet" />
+        <Empty title={t("invoices.empty")} />
       ) : (
         <>
-          <ul className="list" aria-label="Invoices">
+          <ul className="list" aria-label={t("invoices.title")}>
             {list.map((invoice) => (
               <li key={invoice.paddleTransactionId} className="list-row">
                 <div className="list-main">
                   <span className="list-title">
-                    {labels.ledgerKind[invoice.kind]} ·{" "}
-                    {formatUsd(invoice.amountUsdMicros)}
+                    {t("invoices.summary", {
+                      kind: t(labels.ledgerKind[invoice.kind]),
+                      amount: formatUsd(invoice.amountUsdMicros, lang),
+                    })}
                   </span>
                   <span className="muted">
-                    {formatDate(invoice.createTime)} ·{" "}
-                    <code>{invoice.paddleTransactionId}</code>
+                    {rich("invoices.dateAndTransaction", {
+                      date: formatDate(invoice.createTime, lang),
+                      transaction: <code>{invoice.paddleTransactionId}</code>,
+                    })}
                   </span>
                 </div>
                 <Button
                   variant={ButtonVariant.Secondary}
                   size={ButtonSize.Small}
-                  aria-label={`Open the invoice of ${formatDate(invoice.createTime)} for ${formatUsd(invoice.amountUsdMicros)}`}
+                  aria-label={t("invoices.openLabel", {
+                    date: formatDate(invoice.createTime, lang),
+                    amount: formatUsd(invoice.amountUsdMicros, lang),
+                  })}
                   onClick={() => open(invoice)}
                 >
-                  Open invoice
+                  {t("invoices.open")}
                 </Button>
               </li>
             ))}
@@ -156,7 +162,7 @@ export function InvoicesSection() {
                 void invoices.fetchNextPage({ cancelRefetch: false })
               }
             >
-              Show older invoices
+              {t("invoices.showOlder")}
             </Button>
           ) : null}
         </>

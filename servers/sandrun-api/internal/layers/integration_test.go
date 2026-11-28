@@ -162,26 +162,35 @@ func TestAgentIntegrations(t *testing.T) {
 	wantCode(t, "outsider gets", err, connect.CodeNotFound)
 	_, err = outsider.ListAgentIntegrations(ctx, connect.NewRequest(&sandrunv1.ListAgentIntegrationsRequest{OrganizationId: w.org.ID}))
 	wantCode(t, "outsider lists", err, connect.CodeNotFound)
-	rows, _ := w.env.DB.Pool.Query(ctx, "SELECT ciphertext FROM agent_integration_credentials")
+	rows, err := w.env.DB.Pool.Query(ctx, "SELECT ciphertext FROM agent_integration_credentials")
+	if err != nil {
+		t.Fatalf("query stored credentials: %v", err)
+	}
+	defer rows.Close()
+
 	n := 0
 	for rows.Next() {
-		var c []byte
-		_ = rows.Scan(&c)
+		var ciphertext []byte
+		if err := rows.Scan(&ciphertext); err != nil {
+			t.Fatalf("scan stored credential: %v", err)
+		}
 		n++
 		for _, s := range secretsUsed {
-			if bytes.Contains(c, []byte(s)) {
-				t.Fatalf("credential %q stored in clear text", s)
+			if bytes.Contains(ciphertext, []byte(s)) {
+				t.Fatal("credential stored in clear text")
 			}
 		}
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate stored credentials: %v", err)
+	}
+	if n != 7 {
+		t.Fatalf("%d stored credentials", n)
+	}
 	for _, s := range secretsUsed {
 		if strings.Contains(list.Msg.String(), s) {
 			t.Fatalf("credential %q in a response", s)
 		}
-	}
-	if n != 7 {
-		t.Fatalf("%d stored credentials", n)
 	}
 	if v, err := w.l.Integrations.Credential(ctx, w.org.ID, devin.GetAgentIntegrationId(), sandrunv1.AgentCredential_AGENT_CREDENTIAL_OUTPOST_TOKEN); err != nil || v != "outpost-token" {
 		t.Fatalf("decrypt %q %v", v, err)

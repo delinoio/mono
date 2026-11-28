@@ -23,6 +23,7 @@ import {
   ConfirmDialog,
   Empty,
   FormDialog,
+  ListNoun,
   MorePagesNotice,
   PageHeader,
   QueryBoundary,
@@ -31,6 +32,7 @@ import {
   isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { invitationLink } from "../invitation.ts";
 import { membersBoundary, useMembers } from "../members.ts";
 import {
@@ -43,6 +45,7 @@ import {
 import { repeatedPrefixes } from "../revocation.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
+import { enumText } from "../text.ts";
 
 function displayName(m: Member): string {
   return m.displayName !== "" ? m.displayName : m.userId;
@@ -52,6 +55,8 @@ function displayName(m: Member): string {
 export function MembersPage() {
   const { organizationId, role } = useOrg();
   const { userId } = useAuth();
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const refresh = () =>
@@ -79,23 +84,26 @@ export function MembersPage() {
   return (
     <>
       <PageHeader
-        title="Members"
-        description="People who can use this organization. Profiles come from your Delino account."
+        title={t("members.title")}
+        description={t("members.description")}
         action={
           can(role, Permission.LeaveOrganization) ? (
             <Button
               variant={ButtonVariant.Secondary}
               onClick={() => setLeaving(true)}
             >
-              Leave organization
+              {t("members.leave")}
             </Button>
           ) : undefined
         }
       />
-      <QueryBoundary query={membersBoundary(members)} loading="Loading members">
+      <QueryBoundary
+        query={membersBoundary(members)}
+        loading={t("members.loading")}
+      >
         {(loaded) => (
           <>
-            <ul className="list" aria-label="Members">
+            <ul className="list" aria-label={t("members.list")}>
               {loaded.map((m) => {
                 const manageable = canManageMember(role, userId, m);
                 return (
@@ -104,17 +112,21 @@ export function MembersPage() {
                       <span className="list-title">
                         {displayName(m)}
                         {m.userId === userId ? (
-                          <span className="muted"> (you)</span>
+                          <span className="muted">
+                            {` ${t("members.you")}`}
+                          </span>
                         ) : null}
                       </span>
                       <span className="muted">
-                        Joined {formatTime(m.joinTime)}
+                        {t("members.joined", {
+                          time: formatTime(m.joinTime, lang),
+                        })}
                       </span>
                     </div>
                     {manageable ? (
                       <div className="list-actions">
                         <Select
-                          label={`Role of ${displayName(m)}`}
+                          label={t("members.roleOf", { name: displayName(m) })}
                           value={String(m.role)}
                           onValueChange={async (v) => {
                             if (v === null || Number(v) === m.role) return;
@@ -124,36 +136,40 @@ export function MembersPage() {
                                 userId: m.userId,
                                 role: Number(v) as Role,
                               });
-                              toast.success("The role is changed.");
+                              toast.success(t("members.roleChanged"));
                             } catch (error) {
-                              toastError(error);
+                              toastError(error, i18n);
                             }
                           }}
                         >
                           <SelectOption value={String(Role.ADMIN)}>
-                            Admin
+                            {enumText(i18n, labels.role, Role.ADMIN)}
                           </SelectOption>
                           <SelectOption value={String(Role.MEMBER)}>
-                            Member
+                            {enumText(i18n, labels.role, Role.MEMBER)}
                           </SelectOption>
                         </Select>
                         <Button
                           variant={ButtonVariant.Danger}
                           size={ButtonSize.Small}
-                          aria-label={`Remove ${displayName(m)}`}
+                          aria-label={t("members.removeNamed", {
+                            name: displayName(m),
+                          })}
                           onClick={() => setRemoving(m)}
                         >
-                          Remove
+                          {t("members.remove")}
                         </Button>
                       </div>
                     ) : (
-                      <span className="role">{labels.role[m.role]}</span>
+                      <span className="role">
+                        {enumText(i18n, labels.role, m.role)}
+                      </span>
                     )}
                   </li>
                 );
               })}
             </ul>
-            <MorePagesNotice noun="members" pages={members} />
+            <MorePagesNotice noun={ListNoun.Members} pages={members} />
           </>
         )}
       </QueryBoundary>
@@ -161,9 +177,11 @@ export function MembersPage() {
       <ConfirmDialog
         open={removing !== undefined}
         onOpenChange={(open) => !open && setRemoving(undefined)}
-        title={`Remove ${removing ? displayName(removing) : ""}?`}
-        description="They lose access to this organization. Its sandboxes keep running."
-        confirmLabel="Remove member"
+        title={t("members.removeDialog.title", {
+          name: removing ? displayName(removing) : "",
+        })}
+        description={t("members.removeDialog.description")}
+        confirmLabel={t("members.removeDialog.confirm")}
         onConfirm={async () => {
           if (!removing) return;
           await removeMember.mutateAsync({
@@ -175,9 +193,9 @@ export function MembersPage() {
       <ConfirmDialog
         open={leaving}
         onOpenChange={setLeaving}
-        title="Leave this organization?"
-        description="You lose access to its devices and sandboxes. An admin can invite you again."
-        confirmLabel="Leave organization"
+        title={t("members.leaveDialog.title")}
+        description={t("members.leaveDialog.description")}
+        confirmLabel={t("members.leave")}
         onConfirm={async (opening) => {
           await leave.mutateAsync({
             organizationId,
@@ -198,6 +216,8 @@ export function MembersPage() {
 
 function Invitations() {
   const { organizationId } = useOrg();
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const queryClient = useQueryClient();
   const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, MemberService);
@@ -259,57 +279,78 @@ function Invitations() {
   return (
     <section className="section" aria-labelledby="invitations-title">
       <div className="section-header">
-        <h2 id="invitations-title">Invitations</h2>
+        <h2 id="invitations-title">{t("invitations.title")}</h2>
         <Button
           variant={ButtonVariant.Secondary}
           onClick={() => setCreating(true)}
         >
-          Invite someone
+          {t("invitations.invite")}
         </Button>
       </div>
       <QueryBoundary
         query={boundaryOf(list, pages)}
-        loading="Loading invitations"
+        loading={t("invitations.loading")}
       >
         {() =>
           pending.length === 0 && !pages.isIncomplete ? (
-            <Empty title="No pending invitations" />
+            <Empty title={t("invitations.empty")} />
           ) : (
             <>
               {pending.length > 0 ? (
-                <ul className="list" aria-label="Pending invitations">
+                <ul className="list" aria-label={t("invitations.list")}>
                   {pending.map((i) => {
                     const showId = collisions.has(i.secretPrefix);
+                    const role = enumText(i18n, labels.role, i.role);
                     return (
                       <li key={i.invitationId} className="list-row">
                         <div className="list-main">
                           <span className="list-title">
-                            {labels.role[i.role]} invitation{" "}
-                            <code>{i.secretPrefix}…</code>
+                            {i18n.rich("invitations.rowTitle", {
+                              role,
+                              prefix: <code>{i.secretPrefix}…</code>,
+                            })}
                           </span>
                           <span className="muted">
-                            Expires {formatTime(i.expireTime)}
+                            {t("invitations.expires", {
+                              time: formatTime(i.expireTime, lang),
+                            })}
                           </span>
                           {showId ? (
                             <span className="muted list-record-id">
-                              ID <code>{i.invitationId}</code>
+                              {i18n.rich("invitations.recordId", {
+                                id: <code>{i.invitationId}</code>,
+                              })}
                             </span>
                           ) : null}
                         </div>
                         <Button
                           variant={ButtonVariant.Secondary}
                           size={ButtonSize.Small}
-                          aria-label={`Revoke ${labels.role[i.role]} invitation ${i.secretPrefix}${showId ? ` (${i.invitationId})` : ""}`}
+                          aria-label={
+                            showId
+                              ? t("invitations.revokeNamedWithId", {
+                                  role,
+                                  prefix: i.secretPrefix,
+                                  id: i.invitationId,
+                                })
+                              : t("invitations.revokeNamed", {
+                                  role,
+                                  prefix: i.secretPrefix,
+                                })
+                          }
                           onClick={() => setRevoking(i)}
                         >
-                          Revoke
+                          {t("invitations.revoke")}
                         </Button>
                       </li>
                     );
                   })}
                 </ul>
               ) : null}
-              <MorePagesNotice noun="pending invitations" pages={pages} />
+              <MorePagesNotice
+                noun={ListNoun.PendingInvitations}
+                pages={pages}
+              />
             </>
           )
         }
@@ -317,24 +358,26 @@ function Invitations() {
       <ConfirmDialog
         open={revoking !== undefined}
         onOpenChange={(open) => !open && setRevoking(undefined)}
-        title={`Revoke invitation ${revoking ? `${revoking.secretPrefix}…${revokingId}` : ""}?`}
-        description="The invitation link stops working at once. It cannot be restored; create a new link instead."
-        confirmLabel="Revoke invitation"
+        title={t("invitations.revokeDialog.title", {
+          invitation: revoking ? `${revoking.secretPrefix}…${revokingId}` : "",
+        })}
+        description={t("invitations.revokeDialog.description")}
+        confirmLabel={t("invitations.revokeDialog.confirm")}
         onConfirm={async () => {
           if (!revoking) return;
           await revoke.mutateAsync({
             organizationId,
             invitationId: revoking.invitationId,
           });
-          toast.success("The invitation is revoked.");
+          toast.success(t("invitations.revoked"));
         }}
       />
       <FormDialog
         open={creating}
         onOpenChange={setCreating}
-        title="Invite someone"
-        description="You get a one-time link that works for 7 days. Send it to the person you invite."
-        submitLabel="Create link"
+        title={t("invitations.invite")}
+        description={t("invitations.createDialog.description")}
+        submitLabel={t("invitations.createDialog.submit")}
         onSubmit={async (opening) => {
           const res = await create.mutateAsync({
             organizationId,
@@ -349,17 +392,21 @@ function Invitations() {
         }}
       >
         <Select
-          label="Role"
+          label={t("invitations.createDialog.role")}
           value={inviteRole}
           onValueChange={(v) => v && setInviteRole(v)}
         >
-          <SelectOption value={String(Role.MEMBER)}>Member</SelectOption>
-          <SelectOption value={String(Role.ADMIN)}>Admin</SelectOption>
+          <SelectOption value={String(Role.MEMBER)}>
+            {enumText(i18n, labels.role, Role.MEMBER)}
+          </SelectOption>
+          <SelectOption value={String(Role.ADMIN)}>
+            {enumText(i18n, labels.role, Role.ADMIN)}
+          </SelectOption>
         </Select>
       </FormDialog>
       <SecretDialog
-        title="Your invitation link"
-        label="Invitation link"
+        title={t("invitations.secret.title")}
+        label={t("invitations.secret.label")}
         secret={link}
         onClose={() => setLink(undefined)}
       />

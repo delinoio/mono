@@ -23,6 +23,7 @@ import {
 } from "../../components/ui.tsx";
 import { checkEmail } from "../../forms.ts";
 import { formatDate, labels } from "../../format.ts";
+import { useI18n } from "../../i18n.ts";
 import { useAllPages } from "../../paging.ts";
 import {
   type BillingAccountMember,
@@ -46,6 +47,7 @@ export function MembersSection() {
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const roleFailure = useActionFailure();
+  const { lang, t } = useI18n();
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
   const members = useAllPages(
     BillingAccountService.method.listMembers,
@@ -101,25 +103,25 @@ export function MembersSection() {
     <div className="stack">
       <section className="section" aria-labelledby="members-title">
         <div className="section-header">
-          <h2 id="members-title">Members</h2>
+          <h2 id="members-title">{t("members.title")}</h2>
           {canLeave ? (
             <Button
               variant={ButtonVariant.Secondary}
               onClick={() => setLeaving(true)}
             >
-              Leave billing account
+              {t("members.leave")}
             </Button>
           ) : null}
         </div>
         <RefetchNotice error={members.refreshError} onRetry={members.refetch} />
         {roleFailure.notice}
         {members.isPending ? (
-          <Loading label="Loading members" />
+          <Loading label={t("members.loading")} />
         ) : members.error ? (
           <ErrorNotice error={members.error} onRetry={members.refetch} />
         ) : (
           <>
-            <ul className="list" aria-label="Members">
+            <ul className="list" aria-label={t("members.title")}>
               {members.items.map((m) => {
                 const self = m.userId === userId;
                 return (
@@ -127,16 +129,22 @@ export function MembersSection() {
                     <div className="list-main">
                       <span className="list-title">
                         {displayName(m)}
-                        {self ? <span className="muted"> (you)</span> : null}
+                        {self ? (
+                          <span className="muted"> {t("members.you")}</span>
+                        ) : null}
                       </span>
                       <span className="muted">
-                        Joined {formatDate(m.createTime)}
+                        {t("members.joined", {
+                          date: formatDate(m.createTime, lang),
+                        })}
                       </span>
                     </div>
                     {manageable(m) ? (
                       <div className="list-actions">
                         <Select
-                          label={`Role of ${displayName(m)}`}
+                          label={t("members.roleOf", {
+                            name: displayName(m),
+                          })}
                           value={String(m.role)}
                           onValueChange={async (v) => {
                             if (v === null || Number(v) === m.role) return;
@@ -147,7 +155,7 @@ export function MembersSection() {
                                 role: Number(v) as BillingAccountRole,
                               });
                               roleFailure.clear();
-                              toast.success("The role is changed.");
+                              toast.success(t("members.roleChanged"));
                             } catch (error) {
                               roleFailure.report(error);
                             }
@@ -156,12 +164,12 @@ export function MembersSection() {
                           <SelectOption
                             value={String(BillingAccountRole.ADMIN)}
                           >
-                            Admin
+                            {t(labels.role[BillingAccountRole.ADMIN])}
                           </SelectOption>
                           <SelectOption
                             value={String(BillingAccountRole.VIEWER)}
                           >
-                            Viewer
+                            {t(labels.role[BillingAccountRole.VIEWER])}
                           </SelectOption>
                         </Select>
                         {canTransfer ? (
@@ -170,7 +178,7 @@ export function MembersSection() {
                             size={ButtonSize.Small}
                             onClick={() => setTransferringId(m.userId)}
                           >
-                            Make owner
+                            {t("members.makeOwner")}
                           </Button>
                         ) : null}
                         <Button
@@ -178,11 +186,11 @@ export function MembersSection() {
                           size={ButtonSize.Small}
                           onClick={() => setRemovingId(m.userId)}
                         >
-                          Remove
+                          {t("members.remove")}
                         </Button>
                       </div>
                     ) : (
-                      <span className="role">{labels.role[m.role]}</span>
+                      <span className="role">{t(labels.role[m.role])}</span>
                     )}
                   </li>
                 );
@@ -196,9 +204,11 @@ export function MembersSection() {
       <ConfirmDialog
         open={removing !== undefined}
         onOpenChange={(open) => !open && setRemovingId(undefined)}
-        title={`Remove ${removing ? displayName(removing) : ""}?`}
-        description="They lose access to this billing account. Linked organizations stay linked."
-        confirmLabel="Remove member"
+        title={t("members.removeDialog.title", {
+          name: removing ? displayName(removing) : "",
+        })}
+        description={t("members.removeDialog.description")}
+        confirmLabel={t("members.removeDialog.confirm")}
         onConfirm={async () => {
           if (removing === undefined) return;
           await removeMember.mutateAsync({
@@ -210,24 +220,26 @@ export function MembersSection() {
       <ConfirmDialog
         open={transferring !== undefined}
         onOpenChange={(open) => !open && setTransferringId(undefined)}
-        title={`Make ${transferring ? displayName(transferring) : ""} the owner?`}
-        description="There is only one owner. You become an admin and can no longer delete the billing account or transfer ownership."
-        confirmLabel="Transfer ownership"
+        title={t("members.transferDialog.title", {
+          name: transferring ? displayName(transferring) : "",
+        })}
+        description={t("members.transferDialog.description")}
+        confirmLabel={t("members.transferDialog.confirm")}
         onConfirm={async () => {
           if (transferring === undefined) return;
           await transfer.mutateAsync({
             billingAccountId,
             userId: transferring.userId,
           });
-          toast.success("Ownership is transferred.");
+          toast.success(t("members.transferred"));
         }}
       />
       <ConfirmDialog
         open={leaving && canLeave}
         onOpenChange={setLeaving}
-        title="Leave this billing account?"
-        description="You lose access to its balance, usage and settings. An owner or admin can invite you again."
-        confirmLabel="Leave billing account"
+        title={t("members.leaveDialog.title")}
+        description={t("members.leaveDialog.description")}
+        confirmLabel={t("members.leave")}
         onConfirm={async () => {
           if (!canLeave) return;
           await leave.mutateAsync({
@@ -254,6 +266,8 @@ function Invitations() {
   const { billingAccountId } = useBillingAccount();
   const queryClient = useQueryClient();
   const revokeFailure = useActionFailure();
+  const i18n = useI18n();
+  const { lang, t } = i18n;
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
   const list = useAllPages(
     BillingAccountService.method.listInvitations,
@@ -285,31 +299,34 @@ function Invitations() {
   return (
     <section className="section" aria-labelledby="invitations-title">
       <div className="section-header">
-        <h2 id="invitations-title">Invitations</h2>
+        <h2 id="invitations-title">{t("invitations.title")}</h2>
         <Button
           variant={ButtonVariant.Secondary}
           onClick={() => setCreating(true)}
         >
-          Invite by email
+          {t("invitations.invite")}
         </Button>
       </div>
       <RefetchNotice error={list.refreshError} onRetry={list.refetch} />
       {revokeFailure.notice}
       {list.isPending ? (
-        <Loading label="Loading invitations" />
+        <Loading label={t("invitations.loading")} />
       ) : list.error ? (
         <ErrorNotice error={list.error} onRetry={list.refetch} />
       ) : list.items.length === 0 ? (
-        <Empty title="No pending invitations" />
+        <Empty title={t("invitations.empty")} />
       ) : (
         <>
-          <ul className="list" aria-label="Pending invitations">
+          <ul className="list" aria-label={t("invitations.list")}>
             {list.items.map((i) => (
               <li key={i.invitationId} className="list-row">
                 <div className="list-main">
                   <span className="list-title">{i.email}</span>
                   <span className="muted">
-                    {labels.role[i.role]} · Expires {formatDate(i.expireTime)}
+                    {t("invitations.details", {
+                      role: t(labels.role[i.role]),
+                      date: formatDate(i.expireTime, lang),
+                    })}
                   </span>
                 </div>
                 <Button
@@ -322,13 +339,13 @@ function Invitations() {
                         invitationId: i.invitationId,
                       });
                       revokeFailure.clear();
-                      toast.success("The invitation is revoked.");
+                      toast.success(t("invitations.revoked"));
                     } catch (error) {
                       revokeFailure.report(error);
                     }
                   }}
                 >
-                  Revoke
+                  {t("invitations.revoke")}
                 </Button>
               </li>
             ))}
@@ -339,11 +356,11 @@ function Invitations() {
       <FormDialog
         open={creating}
         onOpenChange={openInvite}
-        title="Invite by email"
-        description="We email a link that works once for 7 days. The person accepts it after signing in with this email address."
-        submitLabel="Send invitation"
+        title={t("invitations.invite")}
+        description={t("invitations.dialog.description")}
+        submitLabel={t("invitations.dialog.submit")}
         onSubmit={async () => {
-          const checked = checkEmail(email);
+          const checked = checkEmail(email, i18n);
           if (!checked.ok) {
             setEmailError(checked.error);
             return formInvalid();
@@ -358,12 +375,12 @@ function Invitations() {
           // invitation; the close, reset and toast belong to this opening.
           return formSubmitted(() => {
             openInvite(false);
-            toast.success(`An invitation is sent to ${checked.value}.`);
+            toast.success(t("invitations.sent", { email: checked.value }));
           });
         }}
       >
         <TextField
-          label="Email"
+          label={t("invitations.dialog.email")}
           type="email"
           value={email}
           onChange={(event) => setEmail(event.target.value)}
@@ -372,15 +389,15 @@ function Invitations() {
           autoComplete="off"
         />
         <Select
-          label="Role"
+          label={t("invitations.dialog.role")}
           value={inviteRole}
           onValueChange={(v) => v && setInviteRole(v)}
         >
           <SelectOption value={String(BillingAccountRole.VIEWER)}>
-            Viewer: reads balance, usage and settings
+            {t("invitations.dialog.roleViewer")}
           </SelectOption>
           <SelectOption value={String(BillingAccountRole.ADMIN)}>
-            Admin: manages payments and members
+            {t("invitations.dialog.roleAdmin")}
           </SelectOption>
         </Select>
       </FormDialog>

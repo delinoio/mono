@@ -141,6 +141,18 @@ describe("createPaddleCheckout", () => {
     ]);
   });
 
+  test("opens the checkout in the selected app language", async () => {
+    const checkout = newCheckout();
+    const opening = checkout.open("txn_1", () => {}, undefined, "pt-BR");
+    const script = await insertedScript(0);
+    installPaddleGlobal();
+    script.dispatchEvent(new Event("load"));
+    await opening;
+    expect(paddle.opened).toEqual([
+      { transactionId: "txn_1", settings: { locale: "pt-BR" } },
+    ]);
+  });
+
   test("fails and retries the load when the script defines no Paddle global", async () => {
     const checkout = newCheckout();
     const failed = checkout.open("txn_1", () => {});

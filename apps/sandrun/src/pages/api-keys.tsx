@@ -28,6 +28,7 @@ import {
   SecretDialog,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { API_KEY_NAME_LIMIT, isNameLengthValid } from "../name.ts";
 
 /** Expiry choices of a new key, in days; 0 means no expiry. */
@@ -54,6 +55,7 @@ function apiKeyListOptions(
  * for dev sessions; the secret appears once.
  */
 export function ApiKeysPage() {
+  const { lang, t, plural } = useI18n();
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const transport = useTransport();
@@ -79,44 +81,53 @@ export function ApiKeysPage() {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [expiry, setExpiry] = useState(String(EXPIRY_DAYS[1]));
-  const [nameError, setNameError] = useState<string>();
+  const [nameError, setNameError] = useState<MessageKey>();
   const [secret, setSecret] = useState<string>();
   const [revoking, setRevoking] = useState<ApiKey>();
 
   return (
     <>
       <PageHeader
-        title="Personal API keys"
-        description="A personal API key lets a coding agent or another program use dev sessions as you, for example with sandrun mcp. It works only for dev sessions, and only you see your keys."
+        title={t("apiKeys.title")}
+        description={t("apiKeys.description", { command: "sandrun mcp" })}
         action={
-          <Button onClick={() => setCreating(true)}>Create API key</Button>
+          <Button onClick={() => setCreating(true)}>
+            {t("apiKeys.create")}
+          </Button>
         }
       />
-      <QueryBoundary query={list} loading="Loading API keys">
+      <QueryBoundary query={list} loading={t("apiKeys.loading")}>
         {(data) => {
           const keys = data.pages.flatMap((p) => p.apiKeys);
           return keys.length === 0 ? (
-            <Empty title="No personal API keys">
-              Create a key for a coding agent that uses dev sessions.
+            <Empty title={t("apiKeys.empty.title")}>
+              {t("apiKeys.empty.description")}
             </Empty>
           ) : (
-            <ul className="list" aria-label="Personal API keys">
+            <ul className="list" aria-label={t("apiKeys.title")}>
               {keys.map((k) => (
                 <li key={k.apiKeyId} className="list-row">
                   <div className="list-main">
                     <span className="list-title">
-                      {k.name} · {labels.apiKeyState[k.state]}
+                      {k.name} · {t(labels.apiKeyState[k.state])}
                     </span>
                     <span className="muted">
-                      <code>{k.displayPrefix}…</code> · created{" "}
-                      {formatTime(k.createdAt)} ·{" "}
-                      {k.expiresAt === undefined
-                        ? "does not expire"
-                        : `expires ${formatTime(k.expiresAt)}`}{" "}
-                      · last used{" "}
-                      {k.lastUsedAt === undefined
-                        ? "never"
-                        : formatTime(k.lastUsedAt)}
+                      <code>{k.displayPrefix}…</code> ·{" "}
+                      {[
+                        t("apiKeys.created", {
+                          time: formatTime(k.createdAt, lang),
+                        }),
+                        k.expiresAt === undefined
+                          ? t("apiKeys.noExpiry")
+                          : t("apiKeys.expires", {
+                              time: formatTime(k.expiresAt, lang),
+                            }),
+                        k.lastUsedAt === undefined
+                          ? t("apiKeys.neverUsed")
+                          : t("apiKeys.lastUsed", {
+                              time: formatTime(k.lastUsedAt, lang),
+                            }),
+                      ].join(" · ")}
                     </span>
                   </div>
                   {k.state === ApiKeyState.ACTIVE ? (
@@ -125,7 +136,7 @@ export function ApiKeysPage() {
                       size={ButtonSize.Small}
                       onClick={() => setRevoking(k)}
                     >
-                      Revoke
+                      {t("apiKeys.revoke")}
                     </Button>
                   ) : null}
                 </li>
@@ -144,15 +155,13 @@ export function ApiKeysPage() {
             setNameError(undefined);
           }
         }}
-        title="Create a personal API key"
-        description="The key authenticates as you, but only on dev session calls."
-        submitLabel="Create key"
+        title={t("apiKeys.createDialog.title")}
+        description={t("apiKeys.createDialog.description")}
+        submitLabel={t("apiKeys.createDialog.submit")}
         onSubmit={async (opening) => {
           const trimmed = name.trim();
           if (!isNameLengthValid(trimmed, API_KEY_NAME_LIMIT)) {
-            setNameError(
-              `Enter a name of 1 to ${API_KEY_NAME_LIMIT} characters, for example the agent that uses the key.`,
-            );
+            setNameError("apiKeys.createDialog.nameInvalid");
             return;
           }
           const days = Number(expiry);
@@ -171,42 +180,51 @@ export function ApiKeysPage() {
         }}
       >
         <TextField
-          label="Name"
-          description="Helps you recognize the key later."
+          label={t("apiKeys.createDialog.nameLabel")}
+          description={t("apiKeys.createDialog.nameDescription")}
           value={name}
           onValueChange={(v) => {
             setName(v);
             setNameError(undefined);
           }}
-          error={nameError}
+          error={nameError && t(nameError, { max: API_KEY_NAME_LIMIT })}
           autoFocus
           autoComplete="off"
         />
         <Select
-          label="Expires after"
+          label={t("apiKeys.createDialog.expiry")}
           value={expiry}
           onValueChange={(v) => v && setExpiry(v)}
         >
           {EXPIRY_DAYS.map((d) => (
             <SelectOption key={d} value={String(d)}>
-              {d === 0 ? "Never" : `${d} days`}
+              {d === 0
+                ? t("apiKeys.createDialog.expiryNever")
+                : plural("apiKeys.createDialog.expiryDays", d)}
             </SelectOption>
           ))}
         </Select>
       </FormDialog>
       <SecretDialog
-        title="Your new personal API key"
-        label="API key"
+        title={t("apiKeys.secretDialog.title")}
+        label={t("apiKeys.secretDialog.label")}
         secret={secret}
-        hint="It works only for dev sessions. Set it as SANDRUN_API_KEY for the SandRun CLI or sandrun mcp."
+        hint={t("apiKeys.secretDialog.hint", {
+          variable: "SANDRUN_API_KEY",
+          command: "sandrun mcp",
+        })}
         onClose={() => setSecret(undefined)}
       />
       <ConfirmDialog
         open={revoking !== undefined}
         onOpenChange={(open) => !open && setRevoking(undefined)}
-        title={`Revoke ${revoking?.name ?? "this key"}?`}
-        description="Programs that use the key stop working at once. This cannot be undone."
-        confirmLabel="Revoke key"
+        title={
+          revoking === undefined
+            ? t("apiKeys.revokeDialog.titleUnnamed")
+            : t("apiKeys.revokeDialog.title", { name: revoking.name })
+        }
+        description={t("apiKeys.revokeDialog.description")}
+        confirmLabel={t("apiKeys.revokeDialog.confirm")}
         onConfirm={() =>
           revoke.mutateAsync({ organizationId, apiKeyId: revoking!.apiKeyId })
         }

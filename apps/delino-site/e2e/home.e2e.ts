@@ -90,6 +90,50 @@ describe("home", () => {
   );
 });
 
+describe("languages", () => {
+  test("renders the Korean home page with a language menu", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    // Rspress 2.1.3 moves the language menu into the hamburger menu at 1280px
+    // and narrower, so use a wider viewport to reach the navbar menu.
+    await browser.setViewport({ width: 1440, height: 900 });
+    await app.open("/ko/");
+    // The hero image text is translated, so wait for the brand wordmark.
+    await expect(browser.locator(".rp-home-hero__title-brand")).toBeVisible();
+
+    const lang = await browser.evaluate(() => document.documentElement.lang);
+    expect(lang).toBe("ko");
+
+    // The menu shows the native label of the selected language and lists the
+    // other languages as links to the same page in that language.
+    const menu = browser.locator(
+      ".rp-nav__others > .rp-nav-menu__item > .rp-nav-menu__item__container",
+    );
+    await expect(menu).toHaveText("한국어");
+    await menu.hover();
+    await expect(screen.getByRole("link", "English")).toHaveAttribute(
+      "href",
+      "/",
+    );
+  });
+
+  test("keeps the selected language in links to the documentation site", async ({
+    app,
+    browser,
+  }) => {
+    await app.open("/ko/");
+
+    // The translated page keeps the English URL in its frontmatter; the theme
+    // `Link` adds the language prefix. The action label is translated, so the
+    // test selects the brand action by its Rspress class name.
+    await expect(
+      browser.locator(".rp-home-hero__action.rp-button--brand"),
+    ).toHaveAttribute("href", "https://docs.delino.io/ko/");
+  });
+});
+
 describe("compact navigation focus", () => {
   function readTriggerOutline(selector: string) {
     const trigger = document.querySelector<HTMLButtonElement>(selector);

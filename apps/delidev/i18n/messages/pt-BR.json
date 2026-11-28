@@ -1,0 +1,12 @@
+{
+  "app.language": "Idioma",
+  "appInfo.loading": "Carregando detalhes do app…",
+  "appInfo.browser": "O app está sendo executado em um navegador. Inicie-o com o Tauri para ver o ambiente de execução.",
+  "appInfo.failed": "Não foi possível carregar os detalhes do app: {message}",
+  "appInfo.version": "Versão",
+  "appInfo.runtime": "Ambiente de execução da WebView",
+  "appInfo.platform": "Plataforma",
+  "appInfo.platformValue": "{platform} ({os})",
+  "runtime.cef": "Chromium Embedded Framework",
+  "runtime.wry": "WebView do sistema"
+}

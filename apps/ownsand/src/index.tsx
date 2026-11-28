@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
 import { CONSOLE_CONFIG } from "./build-config.ts";
 import { AuthMode } from "./config.ts";
+import { I18nProvider, loadInitialLanguage } from "./i18n.ts";
 
 const root = document.getElementById("root");
 if (!root) {
@@ -13,6 +14,9 @@ if (!root) {
 }
 
 async function start() {
+  // Load the selected catalog before the first render, so the first render
+  // shows the selected language (docs/repository-localization-contract.md).
+  const initial = await loadInitialLanguage();
   // The mock API is a separate chunk that only a mock build loads. The
   // condition compares the inlined build-time value, so the minifier drops
   // the import from every other build; a production build also rejects the
@@ -24,7 +28,9 @@ async function start() {
       : undefined;
   createRoot(root!).render(
     <StrictMode>
-      <App config={CONSOLE_CONFIG} mockTransport={mockTransport} />
+      <I18nProvider initial={initial}>
+        <App config={CONSOLE_CONFIG} mockTransport={mockTransport} />
+      </I18nProvider>
     </StrictMode>,
   );
 }

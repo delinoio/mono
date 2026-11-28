@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ReactNode } from "react";
+import { useI18n } from "../i18n.ts";
 import type { useMembers } from "../members.ts";
 import { ErrorNotice, QueryBoundary } from "./ui.tsx";
 
@@ -10,16 +11,17 @@ export function MemberListStatus({
   roster: ReturnType<typeof useMembers>;
   children?: ReactNode;
 }) {
+  const { t } = useI18n();
   return (
-    <QueryBoundary query={query} loading="Loading members">
+    <QueryBoundary query={query} loading={t("members.loading")}>
       {() => (
         <>
           {query.hasNextPage ? (
             query.error && !query.isFetching ? (
-              <p className="muted">Some members are not shown yet.</p>
+              <p className="muted">{t("members.partial")}</p>
             ) : (
               <p className="muted" role="status">
-                Loading more members
+                {t("members.loadingMore")}
               </p>
             )
           ) : null}

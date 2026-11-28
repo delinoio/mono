@@ -63,6 +63,22 @@ func waitForEnrollArrival(hold *testcp.EnrollHold, result <-chan enrollResult) e
 	}
 }
 
+func observeEnrollmentLockBusy(ctx context.Context) (context.Context, <-chan struct{}) {
+	busy := make(chan struct{})
+	return store.WithEnrollmentLockBusyObserver(ctx, func() { close(busy) }), busy
+}
+
+func waitForEnrollmentLockBusy[T any](t *testing.T, busy <-chan struct{}, contender <-chan T) {
+	t.Helper()
+	select {
+	case <-busy:
+	case result := <-contender:
+		t.Fatalf("contender returned before observing a busy enrollment lock: %+v", result)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the contender to observe a busy enrollment lock")
+	}
+}
+
 func newEnrollFixture(t *testing.T) (*testcp.Server, *store.Store, *cpclient.Client) {
 	t.Helper()
 	cp := testcp.New(t)
@@ -117,20 +133,16 @@ func TestEnrollWithExpiredLockContextDoesNotPrepareIdentity(t *testing.T) {
 func TestEnrollWaitingAttemptKeepsCompletedIdentity(t *testing.T) {
 	cp, st, client := newEnrollFixture(t)
 	hold := cp.HoldNextEnroll()
-	first := enrollAsync(t, context.Background(), st, client)
+	first := enrollAsync(t, t.Context(), st, client)
 	if err := waitForEnrollArrival(hold, first); err != nil {
 		t.Fatal(err)
 	}
 	pubKey := requirePendingKey(t, st)
 
 	st2, client2 := openSecond(t, st, cp)
-	second := enrollAsync(t, context.Background(), st2, client2)
-	// The second command cannot have finished while the first holds the lock.
-	select {
-	case r := <-second:
-		t.Fatalf("second enrollment returned while the first runs: %+v", r)
-	case <-time.After(150 * time.Millisecond):
-	}
+	ctx, busy := observeEnrollmentLockBusy(t.Context())
+	second := enrollAsync(t, ctx, st2, client2)
+	waitForEnrollmentLockBusy(t, busy, second)
 	if got := requirePendingKey(t, st); !bytes.Equal(got, pubKey) {
 		t.Fatal("the pending key changed while the first enrollment runs")
 	}
@@ -164,14 +176,16 @@ func TestEnrollWaitingAttemptReusesPendingKey(t *testing.T) {
 	cp.ConsumeEnrollToken()
 	cp.DropNextEnrollResponse()
 	hold := cp.HoldNextEnroll()
-	first := enrollAsync(t, context.Background(), st, client)
+	first := enrollAsync(t, t.Context(), st, client)
 	if err := waitForEnrollArrival(hold, first); err != nil {
 		t.Fatal(err)
 	}
 	pubKey := requirePendingKey(t, st)
 
 	st2, client2 := openSecond(t, st, cp)
-	second := enrollAsync(t, context.Background(), st2, client2)
+	ctx, busy := observeEnrollmentLockBusy(t.Context())
+	second := enrollAsync(t, ctx, st2, client2)
+	waitForEnrollmentLockBusy(t, busy, second)
 	hold.Release()
 
 	// The first attempt commits and loses its reply.
@@ -297,23 +311,16 @@ func TestResetWaitsForEnrollment(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	hold := cp.HoldNextEnroll()
-	enrollment := enrollAsync(t, ctx, st, client)
-	select {
-	case <-hold.Arrived():
-	case r := <-enrollment:
-		t.Fatalf("enrollment ended before reaching the control plane: %v", r.err)
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
+	enrollment := enrollAsync(t, t.Context(), st, client)
+	if err := waitForEnrollArrival(hold, enrollment); err != nil {
+		t.Fatal(err)
 	}
 	key := requirePendingKey(t, st)
 
+	resetCtx, busy := observeEnrollmentLockBusy(ctx)
 	reset := make(chan error, 1)
-	go func() { reset <- store.ResetDir(st.Dir()) }()
-	select {
-	case err := <-reset:
-		t.Fatalf("reset returned while enrollment held the lock: %v", err)
-	case <-time.After(150 * time.Millisecond):
-	}
+	go func() { reset <- store.ResetDirContext(resetCtx, st.Dir()) }()
+	waitForEnrollmentLockBusy(t, busy, reset)
 	if got := requirePendingKey(t, st); !bytes.Equal(got, key) {
 		t.Fatal("reset changed the pending key")
 	}

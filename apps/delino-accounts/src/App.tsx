@@ -15,6 +15,7 @@ import {
 import { Page } from "./components/shell.tsx";
 import { PageHeader, SignInFailureNotice } from "./components/ui.tsx";
 import type { AccountsConfig } from "./config.ts";
+import { useI18n } from "./i18n.ts";
 import { pendingInvitation } from "./invitation.ts";
 import {
   type Checkout,
@@ -105,12 +106,18 @@ export function Accounts({
     <ApiProviders config={config} transport={transport} queryClient={client}>
       <CheckoutProvider checkout={checkout}>
         <RouterProvider onNavigate={clearInvitationOnLeave}>
-          <ToastRegion />
+          <Toasts />
           <Routes config={config} />
         </RouterProvider>
       </CheckoutProvider>
     </ApiProviders>
   );
+}
+
+/** The toast region, named in the selected language. */
+function Toasts() {
+  const { t } = useI18n();
+  return <ToastRegion aria-label={t("common.notifications")} />;
 }
 
 function ApiProviders({
@@ -144,6 +151,7 @@ function ApiProviders({
 function Routes({ config }: { config: AccountsConfig }) {
   const auth = useAuth();
   const { route } = useRouter();
+  const { t } = useI18n();
   const configured = config.logto !== undefined;
   if (route.id === RouteId.Callback) {
     // Without a Logto registration there is no provider for the Logto
@@ -165,8 +173,10 @@ function Routes({ config }: { config: AccountsConfig }) {
     case RouteId.NotFound:
       return (
         <Page narrow>
-          <PageHeader title="Page not found" />
-          <Link to={routePath({ id: RouteId.Home })}>Go to the home page</Link>
+          <PageHeader title={t("notFound.title")} />
+          <Link to={routePath({ id: RouteId.Home })}>
+            {t("notFound.goHome")}
+          </Link>
         </Page>
       );
     default:
@@ -190,19 +200,22 @@ function Routes({ config }: { config: AccountsConfig }) {
 
 function SignIn({ configured }: { configured: boolean }) {
   const auth = useAuth();
+  const { t } = useI18n();
   return (
     <Page narrow>
       <PageHeader
-        title="Sign in to manage billing"
-        description="Use your Delino account to manage billing accounts, credit and invoices."
+        title={t("signIn.title")}
+        description={t("signIn.description")}
       />
       {configured ? (
         <>
-          <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+          <Button onClick={() => auth.signIn()}>
+            {t("auth.signInWithDelino")}
+          </Button>
           <SignInFailureNotice />
         </>
       ) : (
-        <p role="alert">Sign-in is not configured for this build.</p>
+        <p role="alert">{t("auth.notConfigured")}</p>
       )}
     </Page>
   );

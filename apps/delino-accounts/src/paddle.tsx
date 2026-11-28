@@ -17,11 +17,16 @@ export interface Checkout {
    * still loads, the call resolves without installing the event callback or
    * opening the overlay. The shared Paddle.js load is not canceled, so a later
    * call reuses it.
+   *
+   * `locale` is the selected app language. Paddle accepts every registered
+   * language tag of the app as its checkout `locale`; without it, Paddle uses
+   * the browser language.
    */
   open(
     transactionId: string,
     onClosed: () => void,
     signal?: AbortSignal,
+    locale?: string,
   ): Promise<void>;
 }
 
@@ -91,7 +96,7 @@ export function createPaddleCheckout(settings: PaddleSettings): Checkout {
     return paddle;
   }
   return {
-    async open(transactionId, onClosed, signal) {
+    async open(transactionId, onClosed, signal, locale) {
       loading ??= load();
       const attempt = loading;
       let paddle: Paddle;
@@ -109,7 +114,11 @@ export function createPaddleCheckout(settings: PaddleSettings): Checkout {
           onClosed();
         }
       };
-      paddle.Checkout.open({ transactionId });
+      paddle.Checkout.open(
+        locale === undefined
+          ? { transactionId }
+          : { transactionId, settings: { locale } },
+      );
     },
   };
 }

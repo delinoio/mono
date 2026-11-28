@@ -60,7 +60,8 @@ import {
   useActionSignInNotice,
 } from "../components/ui.tsx";
 import { ownsandDevicesUrl } from "../config.ts";
-import { formatTime, labels } from "../format.ts";
+import { formatTime, labels, vendorName } from "../format.ts";
+import { type Localizer, type MessageKey, useI18n } from "../i18n.ts";
 import { AGENT_INTEGRATION_NAME_LIMIT, isNameLengthValid } from "../name.ts";
 import { externalNavigation } from "../navigation.ts";
 import { can, Permission } from "../roles.ts";
@@ -68,13 +69,14 @@ import { useRouter } from "../router.tsx";
 
 /** Route `integrations`: the OwnSand link, GitHub and agent integrations. */
 export function IntegrationsPage() {
+  const { t } = useI18n();
   const { role } = useOrg();
   const admin = can(role, Permission.ManageIntegrations);
   return (
     <>
       <PageHeader
-        title="Integrations"
-        description="SandRun runs work on the devices of the linked OwnSand organization. GitHub installations and agent integrations bring the work."
+        title={t("integrations.title")}
+        description={t("integrations.description")}
       />
       <OwnSandLinkSection admin={admin} />
       <GitHubSection admin={admin} />
@@ -84,8 +86,14 @@ export function IntegrationsPage() {
 }
 
 /** "Set at <time>" for a credential that SandRun stores and never shows. */
-function credentialText(set: boolean, at: Parameters<typeof formatTime>[0]) {
-  return set ? `Set at ${formatTime(at)}` : "Not set";
+function credentialText(
+  set: boolean,
+  at: Parameters<typeof formatTime>[0],
+  { lang, t }: Localizer,
+) {
+  return set
+    ? t("integrations.credential.setAt", { time: formatTime(at, lang) })
+    : t("integrations.credential.notSet");
 }
 
 type OwnSandLinkDialog =
@@ -112,6 +120,8 @@ function isSameOwnSandLink(
 }
 
 function OwnSandLinkSection({ admin }: { admin: boolean }) {
+  const i18n = useI18n();
+  const { t } = i18n;
   const { organizationId } = useOrg();
   const transport = useTransport();
   const queryClient = useQueryClient();
@@ -127,7 +137,10 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
   const [dialog, setDialog] = useState<OwnSandLinkDialog>();
   const [ownsandOrg, setOwnsandOrg] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [errors, setErrors] = useState<{ org?: string; key?: string }>({});
+  const [errors, setErrors] = useState<{
+    org?: MessageKey;
+    key?: MessageKey;
+  }>({});
   const [removalTarget, setRemovalTarget] = useState<OwnSandLinkIdentity>();
   const close = () => {
     setDialog(undefined);
@@ -160,34 +173,37 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
   return (
     <section className="section" aria-labelledby="ownsand-title">
       <div className="section-header">
-        <h2 id="ownsand-title">OwnSand link</h2>
+        <h2 id="ownsand-title">{t("integrations.ownSand.title")}</h2>
       </div>
-      <QueryBoundary query={link} loading="Loading the OwnSand link">
+      <QueryBoundary query={link} loading={t("integrations.ownSand.loading")}>
         {() =>
           current === undefined ? (
             <div className="empty">
-              <p className="empty-title">OwnSand is not linked</p>
+              <p className="empty-title">
+                {t("integrations.ownSand.empty.title")}
+              </p>
               <p className="muted">
-                First step: link the OwnSand organization whose devices run your
-                work, with an organization API key from the OwnSand console.
+                {t("integrations.ownSand.empty.description")}
               </p>
               {admin ? (
                 <Button onClick={() => setDialog({ kind: "link" })}>
-                  Link OwnSand
+                  {t("integrations.ownSand.link")}
                 </Button>
               ) : (
-                <p className="muted">Ask an admin to link OwnSand.</p>
+                <p className="muted">
+                  {t("integrations.ownSand.empty.member")}
+                </p>
               )}
             </div>
           ) : (
             <>
               <dl className="details details-flat">
-                <Detail term="OwnSand organization">
+                <Detail term={t("integrations.ownSand.organization")}>
                   <code>{current.ownsandOrganizationId}</code>
                 </Detail>
-                <Detail term="State">
+                <Detail term={t("common.column.state")}>
                   <StateBadge
-                    text={labels.ownSandLinkState[current.state]}
+                    text={t(labels.ownSandLinkState[current.state])}
                     tone={
                       current.state === OwnSandLinkState.INVALID
                         ? BadgeVariant.Danger
@@ -195,19 +211,20 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
                     }
                   />
                 </Detail>
-                <Detail term="API key">
+                <Detail term={t("integrations.ownSand.apiKey")}>
                   {credentialText(
                     current.credentialSet,
                     current.credentialSetAt,
+                    i18n,
                   )}
                 </Detail>
-                <Detail term="Devices">
+                <Detail term={t("integrations.ownSand.devices")}>
                   <a
                     href={ownsandDevicesUrl(current.ownsandOrganizationId)}
                     target="_blank"
                     rel="noreferrer"
                   >
-                    Manage devices in the OwnSand console
+                    {t("integrations.ownSand.manageDevices")}
                   </a>
                 </Detail>
               </dl>
@@ -222,13 +239,13 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
                       })
                     }
                   >
-                    Replace API key
+                    {t("integrations.ownSand.replaceKey")}
                   </Button>
                   <Button
                     variant={ButtonVariant.Danger}
                     onClick={() => setRemovalTarget(current)}
                   >
-                    Remove link
+                    {t("integrations.ownSand.removeLink")}
                   </Button>
                 </div>
               ) : null}
@@ -239,9 +256,17 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
       <FormDialog
         open={dialog !== undefined}
         onOpenChange={(open) => !open && close()}
-        title={replacing ? "Replace the API key" : "Link OwnSand"}
-        description="SandRun stores the key encrypted and never shows it again. Create an organization API key in the OwnSand console."
-        submitLabel={replacing ? "Replace key" : "Link"}
+        title={
+          replacing
+            ? t("integrations.ownSand.dialog.replaceTitle")
+            : t("integrations.ownSand.link")
+        }
+        description={t("integrations.ownSand.dialog.description")}
+        submitLabel={
+          replacing
+            ? t("integrations.ownSand.dialog.replaceSubmit")
+            : t("integrations.ownSand.dialog.linkSubmit")
+        }
         submitDisabled={replacementUnavailable}
         onSubmit={async (opening) => {
           if (dialog === undefined || dialog.kind === "stale-replacement")
@@ -251,8 +276,9 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
               ? dialog.ownsandOrganizationId
               : ownsandOrg.trim();
           const found: typeof errors = {};
-          if (org === "") found.org = "Enter the OwnSand organization ID.";
-          if (apiKey === "") found.key = "Enter the OwnSand API key.";
+          if (org === "") found.org = "integrations.ownSand.dialog.orgRequired";
+          if (apiKey === "")
+            found.key = "integrations.ownSand.dialog.keyRequired";
           if (found.org || found.key) {
             setErrors(found);
             return;
@@ -269,34 +295,31 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
       >
         {replacementUnavailable ? (
           <div className="notice notice-error" role="alert">
-            <p>
-              The OwnSand link changed. Close this dialog and start again from
-              Integrations.
-            </p>
+            <p>{t("integrations.ownSand.dialog.stale")}</p>
           </div>
         ) : null}
         {dialog?.kind === "link" ? (
           <TextField
-            label="OwnSand organization ID"
+            label={t("integrations.ownSand.dialog.orgLabel")}
             value={ownsandOrg}
             onValueChange={(v) => {
               setOwnsandOrg(v);
               setErrors((e) => ({ ...e, org: undefined }));
             }}
-            error={errors.org}
+            error={errors.org && t(errors.org)}
             autoFocus
             autoComplete="off"
           />
         ) : null}
         <PasswordInput
-          label="OwnSand API key"
-          toggleLabel="Show API key"
+          label={t("integrations.ownSand.dialog.keyLabel")}
+          toggleLabel={t("integrations.showApiKey")}
           value={apiKey}
           onValueChange={(v: string) => {
             setApiKey(v);
             setErrors((e) => ({ ...e, key: undefined }));
           }}
-          error={errors.key}
+          error={errors.key && t(errors.key)}
           disabled={replacementUnavailable}
           autoFocus={dialog?.kind === "replace"}
           autoComplete="off"
@@ -307,9 +330,9 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
         onOpenChange={(open) => {
           if (!open) setRemovalTarget(undefined);
         }}
-        title="Remove the OwnSand link?"
-        description="SandRun stops dispatch, ends every queued request with Canceled, deletes every runner of this organization and then deletes the stored API key."
-        confirmLabel="Remove link"
+        title={t("integrations.ownSand.removeDialog.title")}
+        description={t("integrations.ownSand.removeDialog.description")}
+        confirmLabel={t("integrations.ownSand.removeLink")}
         onConfirm={async () => {
           // A refresh may update the cache before React displays the result.
           const { queryKey } = createQueryOptions(
@@ -331,6 +354,7 @@ function OwnSandLinkSection({ admin }: { admin: boolean }) {
 }
 
 function GitHubSection({ admin }: { admin: boolean }) {
+  const { lang, t } = useI18n();
   const { organizationId } = useOrg();
   const { isCurrentVisit } = useRouter();
   const { signInError, reportActionError } = useActionSignInNotice();
@@ -379,17 +403,15 @@ function GitHubSection({ admin }: { admin: boolean }) {
             onClick={() => void connect()}
             disabled={installUrl.isPending}
           >
-            Connect GitHub
+            {t("integrations.github.connect")}
           </Button>
         ) : null}
       </div>
       <p className="muted">
-        SandRun registers organization-level runners for GitHub Actions jobs
-        whose runs-on label names a runner profile. Install the SandRun GitHub
-        App on a GitHub organization; GitHub then returns to this console.
+        {t("integrations.github.description", { label: "runs-on" })}
       </p>
       {signInError ? <ErrorNotice error={signInError} /> : null}
-      <QueryBoundary query={list} loading="Loading GitHub installations">
+      <QueryBoundary query={list} loading={t("integrations.github.loading")}>
         {(data) => {
           const installations = new Map<string, GitHubInstallation>();
           for (const page of data.pages) {
@@ -398,23 +420,33 @@ function GitHubSection({ admin }: { admin: boolean }) {
             }
           }
           return installations.size === 0 ? (
-            <Empty title="No GitHub organization is connected">
+            <Empty title={t("integrations.github.empty.title")}>
               {admin
-                ? "Connect GitHub to run GitHub Actions jobs, or create an agent integration below."
-                : "Ask an admin to connect GitHub."}
+                ? t("integrations.github.empty.admin")
+                : t("integrations.github.empty.member")}
             </Empty>
           ) : (
-            <ul className="list" aria-label="GitHub installations">
+            <ul
+              className="list"
+              aria-label={t("integrations.github.listLabel")}
+            >
               {Array.from(installations.values(), (i) => (
                 <li key={i.installationId} className="list-row">
                   <div className="list-main">
                     <span className="list-title">
                       {i.githubAccountLogin} ·{" "}
-                      {labels.gitHubInstallationState[i.state]}
+                      {t(labels.gitHubInstallationState[i.state])}
                     </span>
                     <span className="muted">
-                      Runner group: {i.runnerGroupName || "Default"} · linked{" "}
-                      {formatTime(i.createTime)}
+                      {t("integrations.github.runnerGroup", {
+                        name:
+                          i.runnerGroupName ||
+                          t("integrations.github.defaultGroup"),
+                      })}{" "}
+                      ·{" "}
+                      {t("integrations.github.linked", {
+                        time: formatTime(i.createTime, lang),
+                      })}
                     </span>
                   </div>
                   {admin ? (
@@ -425,7 +457,7 @@ function GitHubSection({ admin }: { admin: boolean }) {
                           size={ButtonSize.Small}
                           onClick={() => setGrouping(i)}
                         >
-                          Change runner group
+                          {t("integrations.github.changeGroup")}
                         </Button>
                       ) : null}
                       <Button
@@ -433,7 +465,7 @@ function GitHubSection({ admin }: { admin: boolean }) {
                         size={ButtonSize.Small}
                         onClick={() => setUnlinking(i)}
                       >
-                        Unlink
+                        {t("integrations.github.unlink")}
                       </Button>
                     </div>
                   ) : null}
@@ -453,9 +485,15 @@ function GitHubSection({ admin }: { admin: boolean }) {
       <ConfirmDialog
         open={unlinking !== undefined}
         onOpenChange={(open) => !open && setUnlinking(undefined)}
-        title={`Unlink ${unlinking?.githubAccountLogin ?? "this installation"}?`}
-        description="SandRun cancels the queued requests of this installation and deletes its waiting runners. The GitHub App stays installed in GitHub until you uninstall it there."
-        confirmLabel="Unlink"
+        title={
+          unlinking === undefined
+            ? t("integrations.github.unlinkDialog.titleUnnamed")
+            : t("integrations.github.unlinkDialog.title", {
+                name: unlinking.githubAccountLogin,
+              })
+        }
+        description={t("integrations.github.unlinkDialog.description")}
+        confirmLabel={t("integrations.github.unlink")}
         onConfirm={() =>
           unlink.mutateAsync({
             organizationId,
@@ -474,6 +512,7 @@ function RunnerGroupDialog({
   installation: GitHubInstallation;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const groups = useQuery(GitHubService.method.listGitHubRunnerGroups, {
@@ -488,9 +527,9 @@ function RunnerGroupDialog({
     <FormDialog
       open
       onOpenChange={(open) => !open && onClose()}
-      title="Change the runner group"
-      description="GitHub's runner group settings control which repositories can use the SandRun runners."
-      submitLabel="Save"
+      title={t("integrations.github.groupDialog.title")}
+      description={t("integrations.github.groupDialog.description")}
+      submitLabel={t("common.save")}
       submitDisabled={groups.data === undefined || showsFullError(groups)}
       onSubmit={async (opening) => {
         await update.mutateAsync({
@@ -501,10 +540,13 @@ function RunnerGroupDialog({
         if (opening.isCurrent()) onClose();
       }}
     >
-      <QueryBoundary query={groups} loading="Loading runner groups">
+      <QueryBoundary
+        query={groups}
+        loading={t("integrations.github.groupDialog.loading")}
+      >
         {(data) => (
           <Select
-            label="Runner group"
+            label={t("integrations.github.groupDialog.label")}
             value={group}
             onValueChange={(v) => v && setGroup(v)}
           >
@@ -513,7 +555,12 @@ function RunnerGroupDialog({
                 key={String(g.githubRunnerGroupId)}
                 value={String(g.githubRunnerGroupId)}
               >
-                {`${g.name}${g.isDefault ? " (default)" : ""} · ${g.visibility}`}
+                {t(
+                  g.isDefault
+                    ? "integrations.github.groupDialog.defaultOption"
+                    : "integrations.github.groupDialog.option",
+                  { name: g.name, visibility: g.visibility },
+                )}
               </SelectOption>
             ))}
           </Select>
@@ -533,50 +580,73 @@ const VENDORS = [
 /** The credential fields of each vendor, in the order of the protos contract. */
 export const VENDOR_CREDENTIALS: Record<
   AgentVendor,
-  readonly { key: CredentialKey; credential: AgentCredential; label: string }[]
+  readonly {
+    key: CredentialKey;
+    credential: AgentCredential;
+    /** The catalog key of the field label; `{scope}` names an API scope. */
+    label: MessageKey;
+    /** The catalog key of the accessible name of the show toggle. */
+    show: MessageKey;
+    /** The catalog key of the error of an empty field. */
+    required: MessageKey;
+  }[]
 > = {
   [AgentVendor.UNSPECIFIED]: [],
   [AgentVendor.CLAUDE_CODE]: [
     {
       key: "environmentKey",
       credential: AgentCredential.ENVIRONMENT_KEY,
-      label: "Environment key",
+      label: "integrations.agent.credential.environmentKey",
+      show: "integrations.agent.credential.environmentKeyShow",
+      required: "integrations.agent.credential.environmentKeyRequired",
     },
   ],
   [AgentVendor.CURSOR]: [
     {
       key: "serviceAccountApiKey",
       credential: AgentCredential.SERVICE_ACCOUNT_API_KEY,
-      label: "Service account API key",
+      label: "integrations.agent.credential.serviceAccountApiKey",
+      show: "integrations.agent.credential.serviceAccountApiKeyShow",
+      required: "integrations.agent.credential.serviceAccountApiKeyRequired",
     },
   ],
   [AgentVendor.OPENAI_CODEX]: [
     {
       key: "environmentKey",
       credential: AgentCredential.ENVIRONMENT_KEY,
-      label: "Environment key",
+      label: "integrations.agent.credential.environmentKey",
+      show: "integrations.agent.credential.environmentKeyShow",
+      required: "integrations.agent.credential.environmentKeyRequired",
     },
     {
       key: "webhookSecret",
       credential: AgentCredential.WEBHOOK_SECRET,
-      label: "Webhook secret",
+      label: "integrations.agent.credential.webhookSecret",
+      show: "integrations.agent.credential.webhookSecretShow",
+      required: "integrations.agent.credential.webhookSecretRequired",
     },
     {
       key: "apiKey",
       credential: AgentCredential.API_KEY,
-      label: "OpenAI API key (api.agents.read)",
+      label: "integrations.agent.credential.openAiApiKey",
+      show: "integrations.agent.credential.openAiApiKeyShow",
+      required: "integrations.agent.credential.openAiApiKeyRequired",
     },
   ],
   [AgentVendor.DEVIN]: [
     {
       key: "apiToken",
       credential: AgentCredential.API_TOKEN,
-      label: "API token",
+      label: "integrations.agent.credential.apiToken",
+      show: "integrations.agent.credential.apiTokenShow",
+      required: "integrations.agent.credential.apiTokenRequired",
     },
     {
       key: "outpostToken",
       credential: AgentCredential.OUTPOST_TOKEN,
-      label: "Outpost token",
+      label: "integrations.agent.credential.outpostToken",
+      show: "integrations.agent.credential.outpostTokenShow",
+      required: "integrations.agent.credential.outpostTokenRequired",
     },
   ],
 };
@@ -655,12 +725,18 @@ export function vendorCredentials(
   }
 }
 
-/** The vendor setting (pool or outpost name) of a vendor, if it has one. */
-function settingLabel(vendor: AgentVendor): string | undefined {
-  if (vendor === AgentVendor.CURSOR) return "Cursor self-hosted pool name";
-  if (vendor === AgentVendor.DEVIN) return "Devin outpost name";
+/**
+ * The catalog key of the vendor setting (pool or outpost name) of a vendor,
+ * if it has one.
+ */
+function settingLabel(vendor: AgentVendor): MessageKey | undefined {
+  if (vendor === AgentVendor.CURSOR) return "integrations.agent.cursorPool";
+  if (vendor === AgentVendor.DEVIN) return "integrations.agent.devinOutpost";
   return undefined;
 }
+
+/** The OpenAI API key scope that the Codex integration needs. */
+const OPENAI_API_KEY_SCOPE = "api.agents.read";
 
 function settingValue(i: AgentIntegration): string {
   if (i.settings.case === "cursor") return i.settings.value.poolName;
@@ -669,6 +745,8 @@ function settingValue(i: AgentIntegration): string {
 }
 
 function AgentIntegrationsSection({ admin }: { admin: boolean }) {
+  const i18n = useI18n();
+  const { t, rich } = i18n;
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const { integrations, hasNextPage, isLoadingMore, query } =
@@ -685,82 +763,99 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
   return (
     <section className="section" aria-labelledby="agents-title">
       <div className="section-header">
-        <h2 id="agents-title">Agent integrations</h2>
+        <h2 id="agents-title">{t("integrations.agent.title")}</h2>
         {admin ? (
           <Button
             variant={ButtonVariant.Secondary}
             onClick={() => setEditing("new")}
           >
-            Create agent integration
+            {t("integrations.agent.create")}
           </Button>
         ) : null}
       </div>
-      <p className="muted">
-        An agent integration holds the account or pool of one coding-agent
-        vendor. Agent session runner profiles name one integration.
-      </p>
-      <QueryBoundary query={query} loading="Loading agent integrations">
+      <p className="muted">{t("integrations.agent.description")}</p>
+      <QueryBoundary query={query} loading={t("profiles.loadingIntegrations")}>
         {() => (
           <>
             {isLoadingMore ? (
-              <Loading label="Loading agent integrations" />
+              <Loading label={t("profiles.loadingIntegrations")} />
             ) : null}
             {integrations.length === 0 && !hasNextPage ? (
-              <Empty title="No agent integrations">
+              <Empty title={t("integrations.agent.empty.title")}>
                 {admin
-                  ? "Create an integration for Claude Code, Cursor, OpenAI Codex or Devin to run their sessions, or connect GitHub above."
-                  : "Ask an admin to create an agent integration."}
+                  ? t("integrations.agent.empty.admin")
+                  : t("integrations.agent.empty.member")}
               </Empty>
             ) : integrations.length > 0 ? (
-              <ul className="list" aria-label="Agent integrations">
-                {integrations.map((i) => (
-                  <li key={i.agentIntegrationId} className="list-row">
-                    <div className="list-main">
-                      <span className="list-title">
-                        {i.name} · {labels.vendor[i.vendor]}
-                      </span>
-                      {settingLabel(i.vendor) !== undefined ? (
-                        <span className="muted">
-                          {settingLabel(i.vendor)}: {settingValue(i)}
+              <ul className="list" aria-label={t("integrations.agent.title")}>
+                {integrations.map((i) => {
+                  const settingKey = settingLabel(i.vendor);
+                  return (
+                    <li key={i.agentIntegrationId} className="list-row">
+                      <div className="list-main">
+                        <span className="list-title">
+                          {i.name} · {vendorName(i.vendor, t)}
                         </span>
-                      ) : null}
-                      {i.credentials.map((c) => (
-                        <span className="muted" key={c.credential}>
-                          {labels.credential[c.credential]}:{" "}
-                          {credentialText(c.credentialSet, c.credentialSetAt)}
-                        </span>
-                      ))}
-                      {i.vendor === AgentVendor.OPENAI_CODEX &&
-                      i.webhookUrl !== "" ? (
-                        <span>
-                          Webhook URL to register in the OpenAI project:{" "}
-                          <CopyValue
-                            label={`webhook URL of ${i.name}`}
-                            value={i.webhookUrl}
-                          />
-                        </span>
-                      ) : null}
-                    </div>
-                    {admin ? (
-                      <div className="list-actions">
-                        <Button
-                          variant={ButtonVariant.Secondary}
-                          size={ButtonSize.Small}
-                          onClick={() => setEditing(i)}
-                        >
-                          Edit
-                        </Button>
-                        <Button
-                          variant={ButtonVariant.Danger}
-                          size={ButtonSize.Small}
-                          onClick={() => setDeleting(i)}
-                        >
-                          Delete
-                        </Button>
+                        {settingKey !== undefined ? (
+                          <span className="muted">
+                            {t("integrations.agent.settingValue", {
+                              label: t(settingKey),
+                              value: settingValue(i),
+                            })}
+                          </span>
+                        ) : null}
+                        {i.credentials.map((c) => (
+                          <span className="muted" key={c.credential}>
+                            {t("integrations.agent.credentialState", {
+                              credential: t(labels.credential[c.credential]),
+                              state: credentialText(
+                                c.credentialSet,
+                                c.credentialSetAt,
+                                i18n,
+                              ),
+                            })}
+                          </span>
+                        ))}
+                        {i.vendor === AgentVendor.OPENAI_CODEX &&
+                        i.webhookUrl !== "" ? (
+                          <span>
+                            {rich("integrations.agent.webhookUrl", {
+                              value: (
+                                <CopyValue
+                                  label={t(
+                                    "integrations.agent.webhookUrlLabel",
+                                    {
+                                      name: i.name,
+                                    },
+                                  )}
+                                  value={i.webhookUrl}
+                                />
+                              ),
+                            })}
+                          </span>
+                        ) : null}
                       </div>
-                    ) : null}
-                  </li>
-                ))}
+                      {admin ? (
+                        <div className="list-actions">
+                          <Button
+                            variant={ButtonVariant.Secondary}
+                            size={ButtonSize.Small}
+                            onClick={() => setEditing(i)}
+                          >
+                            {t("profiles.edit")}
+                          </Button>
+                          <Button
+                            variant={ButtonVariant.Danger}
+                            size={ButtonSize.Small}
+                            onClick={() => setDeleting(i)}
+                          >
+                            {t("common.delete")}
+                          </Button>
+                        </div>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             ) : null}
           </>
@@ -775,9 +870,15 @@ function AgentIntegrationsSection({ admin }: { admin: boolean }) {
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
-        title={`Delete ${deleting?.name ?? "this integration"}?`}
-        description="SandRun deletes the stored credentials. An integration that a runner profile names cannot be deleted; delete the profile first."
-        confirmLabel="Delete integration"
+        title={
+          deleting === undefined
+            ? t("integrations.agent.deleteDialog.titleUnnamed")
+            : t("integrations.agent.deleteDialog.title", {
+                name: deleting.name,
+              })
+        }
+        description={t("integrations.agent.deleteDialog.description")}
+        confirmLabel={t("integrations.agent.deleteDialog.confirm")}
         onConfirm={() =>
           remove.mutateAsync({
             organizationId,
@@ -796,6 +897,8 @@ function IntegrationDialog({
   integration: AgentIntegration | undefined;
   onClose: () => void;
 }) {
+  const i18n = useI18n();
+  const { t } = i18n;
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () =>
@@ -846,27 +949,39 @@ function IntegrationDialog({
         }
       }}
       title={
-        creating ? "Create an agent integration" : `Edit ${integration.name}`
+        creating
+          ? t("integrations.agent.dialog.createTitle")
+          : t("profiles.dialog.editTitle", { name: integration.name })
       }
       description={
         creating
-          ? "SandRun stores the credentials encrypted and never shows them again."
-          : "Leave a credential empty to keep the stored value. A new value replaces it; SandRun never shows it again."
+          ? t("integrations.agent.dialog.createDescription")
+          : t("integrations.agent.dialog.editDescription")
       }
-      submitLabel={creating ? "Create integration" : "Save changes"}
+      submitLabel={
+        creating
+          ? t("integrations.agent.dialog.createSubmit")
+          : t("common.saveChanges")
+      }
       onSubmit={async (opening) => {
         const found: Record<string, string> = {};
         const trimmedName = name.trim();
         if (!isNameLengthValid(trimmedName, AGENT_INTEGRATION_NAME_LIMIT)) {
-          found.name = `Enter a name of 1 to ${AGENT_INTEGRATION_NAME_LIMIT} characters.`;
+          found.name = t("integrations.agent.dialog.nameInvalid", {
+            max: AGENT_INTEGRATION_NAME_LIMIT,
+          });
         }
         if (label !== undefined && setting.trim() === "") {
-          found.setting = `Enter the ${label.toLowerCase()}.`;
+          found.setting = t(
+            vendor === AgentVendor.CURSOR
+              ? "integrations.agent.cursorPoolRequired"
+              : "integrations.agent.devinOutpostRequired",
+          );
         }
         if (creating) {
           for (const f of fields) {
             if ((secrets[f.key] ?? "") === "") {
-              found[f.key] = `Enter the ${f.label.toLowerCase()}.`;
+              found[f.key] = t(f.required);
             }
           }
         }
@@ -915,7 +1030,7 @@ function IntegrationDialog({
     >
       {creating ? (
         <Select
-          label="Vendor"
+          label={t("integrations.agent.dialog.vendor")}
           value={String(vendor)}
           onValueChange={(v) => {
             if (!v) return;
@@ -926,15 +1041,19 @@ function IntegrationDialog({
         >
           {VENDORS.map((v) => (
             <SelectOption key={v} value={String(v)}>
-              {labels.vendor[v]}
+              {vendorName(v, t)}
             </SelectOption>
           ))}
         </Select>
       ) : (
-        <p className="muted">Vendor: {labels.vendor[vendor]}</p>
+        <p className="muted">
+          {t("integrations.agent.dialog.vendorValue", {
+            vendor: vendorName(vendor, t),
+          })}
+        </p>
       )}
       <TextField
-        label="Name"
+        label={t("profiles.dialog.name")}
         value={name}
         onValueChange={(v) => {
           setName(v);
@@ -946,7 +1065,7 @@ function IntegrationDialog({
       />
       {label !== undefined ? (
         <TextField
-          label={label}
+          label={t(label)}
           value={setting}
           onValueChange={(v) => {
             setSetting(v);
@@ -963,12 +1082,18 @@ function IntegrationDialog({
         return (
           <PasswordInput
             key={f.key}
-            label={f.label}
-            toggleLabel={`Show ${f.label.toLowerCase()}`}
+            label={t(f.label, { scope: OPENAI_API_KEY_SCOPE })}
+            toggleLabel={t(f.show)}
             description={
               state === undefined
                 ? undefined
-                : `${credentialText(state.credentialSet, state.credentialSetAt)}. Enter a new value to replace it.`
+                : t("integrations.agent.dialog.replaceHint", {
+                    state: credentialText(
+                      state.credentialSet,
+                      state.credentialSetAt,
+                      i18n,
+                    ),
+                  })
             }
             value={secrets[f.key] ?? ""}
             onValueChange={(v: string) => {

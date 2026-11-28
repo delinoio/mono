@@ -33,6 +33,7 @@ import {
   ConfirmDialog,
   Detail,
   ErrorNotice,
+  ListNoun,
   MorePagesNotice,
   PageHeader,
   QueryBoundary,
@@ -40,9 +41,11 @@ import {
   isTerminalError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { useMembers } from "../members.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
+import { enumText } from "../text.ts";
 import { BillingSection } from "./billing-settings.tsx";
 
 const MODES = [
@@ -58,15 +61,19 @@ const MODES = [
  */
 export function SettingsPage() {
   const { organizationId, name, role } = useOrg();
+  const i18n = useI18n();
+  const { t } = i18n;
   return (
     <>
-      <PageHeader title="Settings" />
+      <PageHeader title={t("settings.title")} />
       <dl className="details">
-        <Detail term="Organization">{name}</Detail>
-        <Detail term="Organization ID">
+        <Detail term={t("settings.organization")}>{name}</Detail>
+        <Detail term={t("settings.organizationId")}>
           <code>{organizationId}</code>
         </Detail>
-        <Detail term="Your role">{labels.role[role]}</Detail>
+        <Detail term={t("settings.yourRole")}>
+          {enumText(i18n, labels.role, role)}
+        </Detail>
       </dl>
       <AgentPolicy />
       {can(role, Permission.ViewBilling) ? <BillingSection /> : null}
@@ -77,6 +84,8 @@ export function SettingsPage() {
 
 function AgentPolicy() {
   const { organizationId, role } = useOrg();
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const queryClient = useQueryClient();
   const transport = useTransport();
   const policy = useQuery(DeviceService.method.getAgentVersionPolicy, {
@@ -121,7 +130,7 @@ function AgentPolicy() {
     event.preventDefault();
     if (saving.current) return;
     if (isPin && pinnedVersion === "") {
-      setVersionError("Enter the agent version to pin, for example 1.4.2.");
+      setVersionError(t("agentPolicy.versionRequired", { example: "1.4.2" }));
       return;
     }
     saving.current = true;
@@ -133,10 +142,10 @@ function AgentPolicy() {
       });
       setDraft({});
       setVersionError(undefined);
-      toast.success("The agent version policy is saved.");
+      toast.success(t("agentPolicy.saved"));
     } catch (error) {
       // The draft stays as the user left it and the form is usable again.
-      toastError(error);
+      toastError(error, i18n);
     } finally {
       saving.current = false;
     }
@@ -144,15 +153,13 @@ function AgentPolicy() {
 
   return (
     <section className="section" aria-labelledby="policy-title">
-      <h2 id="policy-title">Agent version policy</h2>
-      <p className="muted">
-        Decides which agent version the devices of this organization install.
-      </p>
-      <QueryBoundary query={policy} loading="Loading the agent version policy">
+      <h2 id="policy-title">{t("agentPolicy.title")}</h2>
+      <p className="muted">{t("agentPolicy.description")}</p>
+      <QueryBoundary query={policy} loading={t("agentPolicy.loading")}>
         {() => (
           <form className="form" onSubmit={save}>
             <SegmentedControl
-              aria-label="Update mode"
+              aria-label={t("agentPolicy.mode")}
               value={String(mode)}
               onValueChange={(value) => {
                 const selectedMode = MODES.find(
@@ -166,13 +173,13 @@ function AgentPolicy() {
             >
               {MODES.map((m) => (
                 <SegmentedControlItem key={m} value={String(m)}>
-                  {labels.policyMode[m]}
+                  {enumText(i18n, labels.policyMode, m)}
                 </SegmentedControlItem>
               ))}
             </SegmentedControl>
             {isPin ? (
               <TextField
-                label="Pinned version"
+                label={t("agentPolicy.pinnedVersion")}
                 value={version}
                 onValueChange={(v) => {
                   setDraft((draft) => ({ ...draft, version: v }));
@@ -184,17 +191,19 @@ function AgentPolicy() {
             ) : null}
             {current?.updateTime ? (
               <p className="muted">
-                Last changed {formatTime(current.updateTime)}
+                {t("agentPolicy.lastChanged", {
+                  time: formatTime(current.updateTime, lang),
+                })}
               </p>
             ) : null}
             {editable ? (
               <div className="actions">
                 <Button type="submit" disabled={pending}>
-                  Save policy
+                  {t("agentPolicy.save")}
                 </Button>
               </div>
             ) : (
-              <p className="muted">Only admins can change the policy.</p>
+              <p className="muted">{t("agentPolicy.adminsOnly")}</p>
             )}
           </form>
         )}
@@ -205,6 +214,7 @@ function AgentPolicy() {
 
 function OwnerActions() {
   const { organizationId, name } = useOrg();
+  const { t } = useI18n();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   // Read every page: the new owner can be a member that sorts after the
@@ -241,10 +251,8 @@ function OwnerActions() {
   return (
     <>
       <section className="section" aria-labelledby="transfer-title">
-        <h2 id="transfer-title">Transfer ownership</h2>
-        <p className="muted">
-          The new owner gets every permission. You become an admin.
-        </p>
+        <h2 id="transfer-title">{t("ownership.title")}</h2>
+        <p className="muted">{t("ownership.description")}</p>
         {terminalMembersError ? (
           <ErrorNotice
             error={members.error}
@@ -254,8 +262,8 @@ function OwnerActions() {
           <>
             <div className="inline-form">
               <Select
-                label="New owner"
-                placeholder="Choose a member"
+                label={t("ownership.newOwner")}
+                placeholder={t("ownership.chooseMember")}
                 value={target}
                 onValueChange={setTarget}
               >
@@ -270,31 +278,29 @@ function OwnerActions() {
                 disabled={target === null}
                 onClick={() => setConfirmTransfer(true)}
               >
-                Transfer
+                {t("ownership.transfer")}
               </Button>
             </div>
-            <MorePagesNotice noun="members" pages={members} />
+            <MorePagesNotice noun={ListNoun.Members} pages={members} />
           </>
         )}
       </section>
       <section className="section danger-zone" aria-labelledby="delete-title">
-        <h2 id="delete-title">Delete organization</h2>
-        <p className="muted">
-          Ends every sandbox and removes every device, API key and member.
-        </p>
+        <h2 id="delete-title">{t("deleteOrganization.title")}</h2>
+        <p className="muted">{t("deleteOrganization.description")}</p>
         <Button
           variant={ButtonVariant.Danger}
           onClick={() => setConfirmDelete(true)}
         >
-          Delete organization
+          {t("deleteOrganization.title")}
         </Button>
       </section>
       <ConfirmDialog
         open={confirmTransfer}
         onOpenChange={setConfirmTransfer}
-        title={`Make ${targetName} the owner?`}
-        description="You become an admin. Only the new owner can give ownership back. The transfer removes the billing link, so the organization is blocked until the new owner links a billing account."
-        confirmLabel="Transfer ownership"
+        title={t("ownership.dialog.title", { name: targetName })}
+        description={t("ownership.dialog.description")}
+        confirmLabel={t("ownership.title")}
         onConfirm={async () => {
           if (terminalMembersError || target === null) return;
           await transfer.mutateAsync({
@@ -306,9 +312,9 @@ function OwnerActions() {
       <ConfirmDialog
         open={confirmDelete}
         onOpenChange={setConfirmDelete}
-        title={`Delete ${name}?`}
-        description="Every sandbox ends and every device is removed. This cannot be undone."
-        confirmLabel="Delete organization"
+        title={t("deleteOrganization.dialog.title", { name })}
+        description={t("deleteOrganization.dialog.description")}
+        confirmLabel={t("deleteOrganization.title")}
         onConfirm={async (opening) => {
           await remove.mutateAsync({ organizationId });
           // Only the opening that asked for the deletion redirects; after a

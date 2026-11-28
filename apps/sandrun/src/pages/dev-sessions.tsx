@@ -23,10 +23,12 @@ import {
 } from "../components/ui.tsx";
 import {
   formatTime,
+  guestOsName,
   labels,
   memberName,
   TERMINAL_REQUEST_STATES,
 } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { useMembers } from "../members.ts";
 import { canDeleteDevSession } from "../roles.ts";
 import { Link, orgPath, RouteId } from "../router.tsx";
@@ -45,6 +47,7 @@ export enum OwnerFilter {
  * the SDKs.
  */
 export function DevSessionsPage() {
+  const { lang, t, rich } = useI18n();
   const { organizationId, role, userId } = useOrg();
   const queryClient = useQueryClient();
   const [owner, setOwner] = useState<OwnerFilter>(OwnerFilter.Everyone);
@@ -80,51 +83,62 @@ export function DevSessionsPage() {
   return (
     <>
       <PageHeader
-        title="Dev sessions"
-        description="A dev session is a sandbox of one user for builds and tests on another guest OS. Run commands and copy files with the SandRun CLI, the SandRun MCP server or the SDKs; the console shows no commands, output or files."
+        title={t("devSessions.title")}
+        description={t("devSessions.description")}
       />
       <div className="filters">
         <Select
-          label="Owner"
+          label={t("devSessions.filter.owner")}
           value={owner}
           onValueChange={(v) =>
             setOwner((v as OwnerFilter) ?? OwnerFilter.Everyone)
           }
         >
-          <SelectOption value={OwnerFilter.Everyone}>Everyone</SelectOption>
-          <SelectOption value={OwnerFilter.Mine}>Only mine</SelectOption>
+          <SelectOption value={OwnerFilter.Everyone}>
+            {t("devSessions.filter.everyone")}
+          </SelectOption>
+          <SelectOption value={OwnerFilter.Mine}>
+            {t("devSessions.filter.mine")}
+          </SelectOption>
         </Select>
         <Checkbox
-          label="Show ended dev sessions"
+          label={t("devSessions.filter.showEnded")}
           checked={includeEnded}
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
-      <QueryBoundary query={list} loading="Loading dev sessions">
+      <QueryBoundary query={list} loading={t("devSessions.loading")}>
         {(data) => {
           const sessions = data.pages.flatMap((p) => p.devSessions);
           return sessions.length === 0 ? (
-            <SetupEmpty organizationId={organizationId} title="No dev sessions">
-              Create a dev session with <code>sandrun session create</code> or
-              the SandRun MCP server, with a dev session runner profile.{" "}
-              <Link to={orgPath(RouteId.ApiKeys, organizationId)}>
-                Create a personal API key
-              </Link>{" "}
-              for a coding agent.
+            <SetupEmpty
+              organizationId={organizationId}
+              title={t("devSessions.empty.title")}
+            >
+              {rich("devSessions.empty.description", {
+                command: <code>sandrun session create</code>,
+              })}{" "}
+              {rich("devSessions.empty.apiKey", {
+                link: (
+                  <Link to={orgPath(RouteId.ApiKeys, organizationId)}>
+                    {t("devSessions.empty.apiKeyLink")}
+                  </Link>
+                ),
+              })}
             </SetupEmpty>
           ) : (
             <div className="table-wrap">
-              <table className="table" aria-label="Dev sessions">
+              <table className="table" aria-label={t("devSessions.title")}>
                 <thead>
                   <tr>
-                    <th scope="col">Dev session</th>
-                    <th scope="col">Owner</th>
-                    <th scope="col">Profile</th>
-                    <th scope="col">Guest OS</th>
-                    <th scope="col">State</th>
-                    <th scope="col">End reason</th>
-                    <th scope="col">Queued</th>
-                    <th scope="col">Actions</th>
+                    <th scope="col">{t("devSessions.column.session")}</th>
+                    <th scope="col">{t("devSessions.column.owner")}</th>
+                    <th scope="col">{t("common.column.profile")}</th>
+                    <th scope="col">{t("common.column.guestOs")}</th>
+                    <th scope="col">{t("common.column.state")}</th>
+                    <th scope="col">{t("common.column.endReason")}</th>
+                    <th scope="col">{t("common.column.queued")}</th>
+                    <th scope="col">{t("common.column.actions")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -139,7 +153,7 @@ export function DevSessionsPage() {
                         <td>
                           {memberName(names, s.ownerUserId)}
                           {s.ownerUserId === userId ? (
-                            <span className="muted"> (you)</span>
+                            <span className="muted"> {t("common.you")}</span>
                           ) : null}
                         </td>
                         <td>
@@ -147,17 +161,19 @@ export function DevSessionsPage() {
                             <ShortId id={s.runnerProfileId} />
                           )}
                         </td>
-                        <td>{labels.guestOs[s.guestOs]}</td>
+                        <td>{guestOsName(s.guestOs, t)}</td>
                         <td>
                           <StateBadge
-                            text={labels.requestState[s.state]}
+                            text={t(labels.requestState[s.state])}
                             tone={requestStateTone(s.state)}
                           />
                         </td>
                         <td>
-                          {ended ? labels.requestEndReason[s.endReason] : "—"}
+                          {ended
+                            ? t(labels.requestEndReason[s.endReason])
+                            : "—"}
                         </td>
-                        <td>{formatTime(s.queuedAt)}</td>
+                        <td>{formatTime(s.queuedAt, lang)}</td>
                         <td>
                           {!ended && canDeleteDevSession(role, userId, s) ? (
                             <Button
@@ -165,7 +181,7 @@ export function DevSessionsPage() {
                               size={ButtonSize.Small}
                               onClick={() => setDeleting(s)}
                             >
-                              Delete
+                              {t("common.delete")}
                             </Button>
                           ) : null}
                         </td>
@@ -182,9 +198,9 @@ export function DevSessionsPage() {
       <ConfirmDialog
         open={deleting !== undefined}
         onOpenChange={(open) => !open && setDeleting(undefined)}
-        title="Delete this dev session?"
-        description="A queued dev session is canceled. A starting or running one ends after SandRun deletes its sandbox; running commands and files in it are lost. This cannot be undone."
-        confirmLabel="Delete dev session"
+        title={t("devSessions.deleteDialog.title")}
+        description={t("devSessions.deleteDialog.description")}
+        confirmLabel={t("devSessions.deleteDialog.confirm")}
         onConfirm={() =>
           remove.mutateAsync({
             organizationId,

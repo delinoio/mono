@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+// Keep the site stylesheets first, as before the `Link` override, so the
+// order of the theme and Rspress styles does not change.
 import "./index.css";
 import "./nav-focus.css";
+import { forwardRef, type ComponentProps } from "react";
+import { useLang } from "@rspress/core/runtime";
+import { Link as BaseLink } from "@rspress/core/theme-original";
+import { localizeCrossSiteHref } from "./cross-site-link";
 
 export * from "@rspress/core/theme-original";
 
@@ -15,3 +21,22 @@ export * from "@rspress/core/theme-original";
 export function Search() {
   return null;
 }
+
+// Links to Delino Docs keep the language of the current page. The default
+// theme renders navigation items, home hero actions and Markdown links
+// through this export, so it covers the links of translated pages, whose
+// frontmatter keeps the English URL unchanged.
+export const Link = forwardRef<
+  HTMLAnchorElement,
+  ComponentProps<typeof BaseLink>
+>(({ href, ...props }, ref) => {
+  const lang = useLang();
+  return (
+    <BaseLink
+      {...props}
+      href={href === undefined ? undefined : localizeCrossSiteHref(href, lang)}
+      ref={ref}
+    />
+  );
+});
+Link.displayName = "Link";

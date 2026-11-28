@@ -29,6 +29,7 @@ import {
 } from "react";
 import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
+import { type Translate, useI18n } from "../i18n.ts";
 import { useRouter } from "../router.tsx";
 
 export function PageHeader({
@@ -52,12 +53,13 @@ export function PageHeader({
 }
 
 /** Shows a failed action in a toast. */
-export function toastError(error: unknown): void {
-  toast.error(errorMessage(error));
+export function toastError(error: unknown, t: Translate): void {
+  toast.error(errorMessage(error, t));
 }
 
 /** Reports direct action failures while keeping successful page data visible. */
 export function useActionSignInNotice() {
+  const { t } = useI18n();
   const { isCurrentVisit } = useRouter();
   const [failure, setFailure] = useState<{
     visit: typeof isCurrentVisit;
@@ -69,7 +71,7 @@ export function useActionSignInNotice() {
       if (isCurrentVisit()) setFailure({ visit: isCurrentVisit, error });
       return;
     }
-    toastError(error);
+    toastError(error, t);
   }
 
   return {
@@ -80,9 +82,14 @@ export function useActionSignInNotice() {
 }
 
 /** A loading placeholder for a list. */
-export function Loading({ label = "Loading" }: { label?: string }) {
+export function Loading({ label }: { label?: string }) {
+  const { t } = useI18n();
   return (
-    <div className="loading" role="status" aria-label={label}>
+    <div
+      className="loading"
+      role="status"
+      aria-label={label ?? t("common.loading")}
+    >
       <Skeleton height="56px" />
       <Skeleton height="56px" />
       <Skeleton height="56px" />
@@ -92,14 +99,15 @@ export function Loading({ label = "Loading" }: { label?: string }) {
 
 export function SignInAction({ variant }: { variant?: ButtonVariant }) {
   const auth = useAuth();
+  const { t } = useI18n();
   return (
     <>
       <Button type="button" variant={variant} onClick={() => auth.signIn()}>
-        Sign in with Delino
+        {t("signIn.action")}
       </Button>
       {auth.signInFailed ? (
         <p className="sign-in-failure" role="alert">
-          Sign-in did not start. Check your connection and try again.
+          {t("signIn.failed")}
         </p>
       ) : null}
     </>
@@ -116,27 +124,26 @@ export function ErrorNotice({
   error: unknown;
   onRetry?: () => void;
 }) {
+  const { t } = useI18n();
   if (error instanceof ConnectError && error.code === Code.Unauthenticated) {
     return (
       <div className="notice notice-error">
-        <p role="alert">{errorMessage(error)}</p>
+        <p role="alert">{errorMessage(error, t)}</p>
         <SignInAction variant={ButtonVariant.Secondary} />
       </div>
     );
   }
+  const message = errorMessage(error, t, title === undefined ? undefined : "");
   return (
     <div className="notice notice-error" role="alert">
-      <p>
-        {title ? `${title} ` : null}
-        {errorMessage(error, title === undefined ? undefined : "")}
-      </p>
+      <p>{title ? t("errors.titled", { title, message }) : message}</p>
       {onRetry ? (
         <Button
           type="button"
           variant={ButtonVariant.Secondary}
           onClick={onRetry}
         >
-          Try again
+          {t("common.tryAgain")}
         </Button>
       ) : null}
     </div>
@@ -174,11 +181,13 @@ export function RefreshFailedNotice({
 }: {
   query: BoundaryQuery<unknown>;
 }) {
+  const { t } = useI18n();
   return (
     <div className="notice notice-error" role="alert">
       <p>
-        The last refresh failed, so this page may be out of date.{" "}
-        {errorMessage(query.error)}
+        {t("errors.refreshFailed", {
+          message: errorMessage(query.error, t),
+        })}
       </p>
       <Button
         type="button"
@@ -186,7 +195,7 @@ export function RefreshFailedNotice({
         disabled={query.isFetching}
         onClick={() => void query.refetch()}
       >
-        Try again
+        {t("common.tryAgain")}
       </Button>
     </div>
   );
@@ -241,6 +250,7 @@ export function ListPagination({
     fetchNextPage: (options: { cancelRefetch: boolean }) => unknown;
   };
 }) {
+  const { t } = useI18n();
   if (!query.hasNextPage || showsFullError(query)) return null;
 
   const loadMore = () => void query.fetchNextPage({ cancelRefetch: false });
@@ -253,7 +263,7 @@ export function ListPagination({
       disabled={query.isFetching}
       onClick={loadMore}
     >
-      Show more
+      {t("common.showMore")}
     </Button>
   );
 }
@@ -301,13 +311,14 @@ export function SecretDialog({
   hint?: ReactNode;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const copy = async () => {
     if (secret === undefined) return;
     try {
       await navigator.clipboard.writeText(secret);
-      toast.success("Copied");
+      toast.success(t("common.copied"));
     } catch {
-      toast.error("Copy failed. Select the text and copy it.");
+      toast.error(t("common.copyFailed"));
     }
   };
   return (
@@ -319,10 +330,7 @@ export function SecretDialog({
     >
       <DialogContent>
         <DialogTitle>{title}</DialogTitle>
-        <DialogDescription>
-          It appears only once. Copy it now and keep it somewhere safe; SandRun
-          cannot show it again.
-        </DialogDescription>
+        <DialogDescription>{t("secretDialog.description")}</DialogDescription>
         <div className="secret">
           <span className="secret-label">{label}</span>
           <code className="secret-value" aria-label={label}>
@@ -331,8 +339,8 @@ export function SecretDialog({
         </div>
         {hint ? <p className="muted">{hint}</p> : null}
         <DialogActions>
-          <DialogClose>Done</DialogClose>
-          <Button onClick={copy}>Copy</Button>
+          <DialogClose>{t("common.done")}</DialogClose>
+          <Button onClick={copy}>{t("common.copy")}</Button>
         </DialogActions>
       </DialogContent>
     </Dialog>
@@ -383,6 +391,7 @@ export function ConfirmDialog({
   onConfirm: (opening: DialogOpening) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useI18n();
   const [error, setError] = useState<unknown>();
   const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
@@ -424,7 +433,7 @@ export function ConfirmDialog({
         <AlertDialogDescription>{description}</AlertDialogDescription>
         {error !== undefined ? <ErrorNotice error={error} /> : null}
         <AlertDialogActions>
-          <AlertDialogClose>Cancel</AlertDialogClose>
+          <AlertDialogClose>{t("common.cancel")}</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
             disabled={pending}
@@ -463,6 +472,7 @@ export function FormDialog({
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
+  const { t } = useI18n();
   const [error, setError] = useState<unknown>();
   const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
@@ -507,7 +517,7 @@ export function FormDialog({
           {children}
           {error !== undefined ? <ErrorNotice error={error} /> : null}
           <DialogActions>
-            <DialogClose>Cancel</DialogClose>
+            <DialogClose>{t("common.cancel")}</DialogClose>
             <Button type="submit" disabled={pending || submitDisabled}>
               {submitLabel}
             </Button>
@@ -544,27 +554,28 @@ export function ShortId({ id }: { id: string }) {
 }
 
 /** Copies a value to the clipboard and reports the result in a toast. */
-export async function copyText(value: string): Promise<void> {
+export async function copyText(value: string, t: Translate): Promise<void> {
   try {
     await navigator.clipboard.writeText(value);
-    toast.success("Copied");
+    toast.success(t("common.copied"));
   } catch {
-    toast.error("Copy failed. Select the text and copy it.");
+    toast.error(t("common.copyFailed"));
   }
 }
 
 /** A value to copy, such as a `runs-on` label or a webhook URL. */
 export function CopyValue({ label, value }: { label: string; value: string }) {
+  const { t } = useI18n();
   return (
     <span className="copy-value">
       <code aria-label={label}>{value}</code>
       <Button
         variant={ButtonVariant.Secondary}
         size={ButtonSize.Small}
-        onClick={() => void copyText(value)}
-        aria-label={`Copy ${label}`}
+        onClick={() => void copyText(value, t)}
+        aria-label={t("common.copyValue", { label })}
       >
-        Copy
+        {t("common.copy")}
       </Button>
     </span>
   );

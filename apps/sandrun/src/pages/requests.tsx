@@ -34,6 +34,7 @@ import {
   queueWaitMs,
   TERMINAL_REQUEST_STATES,
 } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { can, Permission } from "../roles.ts";
 
 const ALL = "all";
@@ -71,6 +72,8 @@ export function requestSource(r: Request): string {
 
 /** Route `requests`: requests with filters; cancel for `admin`. */
 export function RequestsPage() {
+  const i18n = useI18n();
+  const { lang, t } = i18n;
   const { organizationId, role } = useOrg();
   const queryClient = useQueryClient();
   const [kind, setKind] = useState<string>(ALL);
@@ -111,31 +114,35 @@ export function RequestsPage() {
   return (
     <>
       <PageHeader
-        title="Requests"
-        description="Each request is one GitHub Actions job, agent session or dev session. Waiting requests come first, in queue order."
+        title={t("requests.title")}
+        description={t("requests.description")}
       />
       <div className="filters">
         <Select
-          label="Kind"
+          label={t("common.column.kind")}
           value={kind}
           onValueChange={(v) => setKind(v ?? ALL)}
         >
-          <SelectOption value={ALL}>All kinds</SelectOption>
+          <SelectOption value={ALL}>
+            {t("requests.filter.allKinds")}
+          </SelectOption>
           {KINDS.map((k) => (
             <SelectOption key={k} value={String(k)}>
-              {labels.workloadKind[k]}
+              {t(labels.workloadKind[k])}
             </SelectOption>
           ))}
         </Select>
         <Select
-          label="State"
+          label={t("common.column.state")}
           value={state}
           onValueChange={(v) => setState(v ?? ALL)}
         >
-          <SelectOption value={ALL}>All states</SelectOption>
+          <SelectOption value={ALL}>
+            {t("common.filter.allStates")}
+          </SelectOption>
           {STATES.map((s) => (
             <SelectOption key={s} value={String(s)}>
-              {labels.requestState[s]}
+              {t(labels.requestState[s])}
             </SelectOption>
           ))}
         </Select>
@@ -145,13 +152,13 @@ export function RequestsPage() {
           onValueChange={setProfileId}
         />
         <Checkbox
-          label="Show ended requests"
+          label={t("requests.filter.showEnded")}
           checked={includeEnded}
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
       <RunnerProfileNotice query={profiles} />
-      <QueryBoundary query={list} loading="Loading requests">
+      <QueryBoundary query={list} loading={t("requests.loading")}>
         {(data) => {
           const requests = new Map<string, Request>();
           // A change in queue order can repeat a request at a page boundary.
@@ -165,27 +172,27 @@ export function RequestsPage() {
           return requests.size === 0 ? (
             <SetupEmpty
               organizationId={organizationId}
-              title="No requests match"
+              title={t("requests.empty.title")}
             >
-              Requests appear when GitHub queues a job with a SandRun label, a
-              vendor asks for an agent session or a member creates a dev
-              session.
+              {t("requests.empty.description")}
             </SetupEmpty>
           ) : (
             <div className="table-wrap">
-              <table className="table" aria-label="Requests">
+              <table className="table" aria-label={t("requests.title")}>
                 <thead>
                   <tr>
-                    <th scope="col">Request</th>
-                    <th scope="col">Kind</th>
-                    <th scope="col">Profile</th>
-                    <th scope="col">Source</th>
-                    <th scope="col">State</th>
-                    <th scope="col">End reason</th>
-                    <th scope="col">Priority</th>
-                    <th scope="col">Queue wait</th>
-                    <th scope="col">Queued</th>
-                    {admin ? <th scope="col">Actions</th> : null}
+                    <th scope="col">{t("common.column.request")}</th>
+                    <th scope="col">{t("common.column.kind")}</th>
+                    <th scope="col">{t("common.column.profile")}</th>
+                    <th scope="col">{t("requests.column.source")}</th>
+                    <th scope="col">{t("common.column.state")}</th>
+                    <th scope="col">{t("common.column.endReason")}</th>
+                    <th scope="col">{t("common.column.priority")}</th>
+                    <th scope="col">{t("requests.column.queueWait")}</th>
+                    <th scope="col">{t("common.column.queued")}</th>
+                    {admin ? (
+                      <th scope="col">{t("common.column.actions")}</th>
+                    ) : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -196,7 +203,7 @@ export function RequestsPage() {
                         <td>
                           <ShortId id={r.requestId} />
                         </td>
-                        <td>{labels.workloadKind[r.kind]}</td>
+                        <td>{t(labels.workloadKind[r.kind])}</td>
                         <td>
                           {profileNames?.get(r.runnerProfileId) ?? (
                             <ShortId id={r.runnerProfileId} />
@@ -205,18 +212,20 @@ export function RequestsPage() {
                         <td className="wrap">{requestSource(r) || "—"}</td>
                         <td>
                           <StateBadge
-                            text={labels.requestState[r.state]}
+                            text={t(labels.requestState[r.state])}
                             tone={requestStateTone(r.state)}
                           />
                         </td>
                         <td>
                           {TERMINAL_REQUEST_STATES.has(r.state)
-                            ? labels.requestEndReason[r.endReason]
+                            ? t(labels.requestEndReason[r.endReason])
                             : "—"}
                         </td>
-                        <td>{labels.priority[r.priority]}</td>
-                        <td>{wait === undefined ? "—" : formatSpan(wait)}</td>
-                        <td>{formatTime(r.queuedAt)}</td>
+                        <td>{t(labels.priority[r.priority])}</td>
+                        <td>
+                          {wait === undefined ? "—" : formatSpan(wait, i18n)}
+                        </td>
+                        <td>{formatTime(r.queuedAt, lang)}</td>
                         {admin ? (
                           <td>
                             {r.state === RequestState.QUEUED ? (
@@ -225,7 +234,7 @@ export function RequestsPage() {
                                 size={ButtonSize.Small}
                                 onClick={() => setCanceling(r)}
                               >
-                                Cancel
+                                {t("common.cancel")}
                               </Button>
                             ) : null}
                           </td>
@@ -243,9 +252,9 @@ export function RequestsPage() {
       <ConfirmDialog
         open={canceling !== undefined}
         onOpenChange={(open) => !open && setCanceling(undefined)}
-        title="Cancel this request?"
-        description="The request ends with Canceled and never gets a runner. A GitHub job stays queued in GitHub until GitHub cancels it."
-        confirmLabel="Cancel request"
+        title={t("requests.cancelDialog.title")}
+        description={t("requests.cancelDialog.description")}
+        confirmLabel={t("requests.cancelDialog.confirm")}
         onConfirm={() =>
           cancel.mutateAsync({
             organizationId,

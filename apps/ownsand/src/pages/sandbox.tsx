@@ -32,9 +32,11 @@ import {
   ShortId,
   toastError,
 } from "../components/ui.tsx";
-import { formatDuration, formatMib, formatTime, labels } from "../format.ts";
+import { formatDuration, formatTime, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
-import { LabelList } from "./sandboxes.tsx";
+import { enumText } from "../text.ts";
+import { LabelList, resourcesText } from "./sandboxes.tsx";
 
 /**
  * The source of a sandbox. A template shows its name when `ListTemplates`
@@ -42,29 +44,32 @@ import { LabelList } from "./sandboxes.tsx";
  * template is deleted or beyond the first page, the row shows the short ID,
  * so the row never waits for or reports the lookup.
  */
-function sourceText(s: Sandbox, templates: readonly Template[]): ReactNode {
+function sourceText(
+  s: Sandbox,
+  templates: readonly Template[],
+  i18n: ReturnType<typeof useI18n>,
+): ReactNode {
   const src = s.source?.source;
   switch (src?.case) {
     case "baseImage":
-      return `${labels.baseImage[src.value]} base image`;
+      return i18n.t("sandboxes.source.baseImage", {
+        image: enumText(i18n, labels.baseImage, src.value),
+      });
     case "snapshotId":
-      return (
-        <>
-          Snapshot <ShortId id={src.value} />
-        </>
-      );
+      return i18n.rich("sandbox.source.snapshot", {
+        id: <ShortId id={src.value} />,
+      });
     case "templateId": {
       const id = src.value;
       const template = templates.find((t) => t.templateId === id);
-      return template === undefined ? (
-        <>
-          Template <ShortId id={id} />
-        </>
-      ) : (
-        <>
-          Template <span title={id}>{template.name}</span>
-        </>
-      );
+      return i18n.rich("sandbox.source.template", {
+        template:
+          template === undefined ? (
+            <ShortId id={id} />
+          ) : (
+            <span title={id}>{template.name}</span>
+          ),
+      });
     }
     default:
       return "—";
@@ -74,6 +79,8 @@ function sourceText(s: Sandbox, templates: readonly Template[]): ReactNode {
 /** Route `sandbox`: one sandbox with pause, resume, snapshot and delete. */
 export function SandboxPage({ sandboxId }: { sandboxId: string }) {
   const { organizationId } = useOrg();
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const queryClient = useQueryClient();
   const query = useQuery(
     SandboxService.method.getSandbox,
@@ -134,7 +141,7 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
     }
   }, [polledState, queryClient]);
 
-  if (query.isPending) return <Loading label="Loading the sandbox" />;
+  if (query.isPending) return <Loading label={t("sandbox.loading")} />;
   if (query.data === undefined || showsFullError(query))
     return (
       <ErrorNotice error={query.error} onRetry={() => void query.refetch()} />
@@ -150,7 +157,7 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
     try {
       notify(await run());
     } catch (error) {
-      toastError(error);
+      toastError(error, i18n);
     }
   };
   const ids = { organizationId, sandboxId };
@@ -159,7 +166,7 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
     <>
       {query.error ? <RefreshFailedNotice query={query} /> : null}
       <PageHeader
-        title="Sandbox"
+        title={t("sandbox.title")}
         description={<ShortId id={s.sandboxId} />}
         action={
           <div className="actions">
@@ -171,17 +178,15 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
                     () => pause.mutateAsync(ids),
                     ({ sandbox }) => {
                       if (sandbox?.state === SandboxState.PAUSED) {
-                        toast.success("The sandbox is paused.");
+                        toast.success(t("sandbox.paused"));
                       } else {
-                        toast.info(
-                          "Pause requested. Check the sandbox status.",
-                        );
+                        toast.info(t("sandbox.pauseRequested"));
                       }
                     },
                   )
                 }
               >
-                Pause
+                {t("sandbox.pause")}
               </Button>
             ) : null}
             {s.state === SandboxState.PAUSED ? (
@@ -191,17 +196,15 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
                     () => resume.mutateAsync(ids),
                     ({ sandbox }) => {
                       if (sandbox?.state === SandboxState.RUNNING) {
-                        toast.success("The sandbox is running.");
+                        toast.success(t("sandbox.running"));
                       } else {
-                        toast.info(
-                          "Resume requested. Check the sandbox status.",
-                        );
+                        toast.info(t("sandbox.resumeRequested"));
                       }
                     },
                   )
                 }
               >
-                Resume
+                {t("sandbox.resume")}
               </Button>
             ) : null}
             {s.state === SandboxState.RUNNING ||
@@ -215,11 +218,11 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
                 onClick={() =>
                   act(
                     () => snapshot.mutateAsync(ids),
-                    () => toast.success("The snapshot is being created."),
+                    () => toast.success(t("sandbox.snapshotStarted")),
                   )
                 }
               >
-                Take snapshot
+                {t("sandbox.takeSnapshot")}
               </Button>
             ) : null}
             {!ended ? (
@@ -227,23 +230,25 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
                 variant={ButtonVariant.Danger}
                 onClick={() => setConfirmDelete(true)}
               >
-                Delete
+                {t("common.delete")}
               </Button>
             ) : null}
           </div>
         }
       />
       <dl className="details">
-        <Detail term="State">
+        <Detail term={t("sandbox.details.state")}>
           <SandboxStateBadge
             state={s.state}
             lastKnownState={s.lastKnownState}
           />
         </Detail>
         {s.endReason !== undefined ? (
-          <Detail term="End reason">{labels.endReason[s.endReason]}</Detail>
+          <Detail term={t("sandbox.details.endReason")}>
+            {enumText(i18n, labels.endReason, s.endReason)}
+          </Detail>
         ) : null}
-        <Detail term="Device">
+        <Detail term={t("sandbox.details.device")}>
           <Link
             to={routePath({
               id: RouteId.Device,
@@ -254,38 +259,47 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
             {device?.name ?? s.deviceId}
           </Link>
         </Detail>
-        <Detail term="Source">
-          {sourceText(s, templates.data?.templates ?? [])}
+        <Detail term={t("sandbox.details.source")}>
+          {sourceText(s, templates.data?.templates ?? [], i18n)}
         </Detail>
-        <Detail term="Resources">
-          {s.resources
-            ? `${s.resources.vcpuCount} vCPU · ${formatMib(s.resources.memoryMib)} memory · ${s.resources.diskGib} GiB disk`
-            : "—"}
+        <Detail term={t("sandbox.details.resources")}>
+          {resourcesText(s.resources, i18n, "sandbox.resourcesValue")}
         </Detail>
-        <Detail term="Guest">
-          {labels.guestOs[s.guestOs]} on {labels.hostOs[s.hostOs]}{" "}
-          {labels.arch[s.arch]}
+        <Detail term={t("sandbox.details.guest")}>
+          {t("sandbox.guestValue", {
+            guest: enumText(i18n, labels.guestOs, s.guestOs),
+            host: enumText(i18n, labels.hostOs, s.hostOs),
+            arch: enumText(i18n, labels.arch, s.arch),
+          })}
         </Detail>
-        <Detail term="Network">{labels.network[s.network?.mode ?? 0]}</Detail>
-        <Detail term="Idle TTL">{formatDuration(s.idleTtl)}</Detail>
-        <Detail term="Maximum TTL">{formatDuration(s.maxTtl)}</Detail>
-        <Detail term="Idle deadline">
-          {ended ? "—" : formatTime(s.idleDeadline)}
+        <Detail term={t("sandbox.details.network")}>
+          {enumText(i18n, labels.network, s.network?.mode ?? 0)}
         </Detail>
-        <Detail term="Maximum deadline">
-          {ended ? "—" : formatTime(s.maxDeadline)}
+        <Detail term={t("sandbox.details.idleTtl")}>
+          {formatDuration(s.idleTtl, i18n)}
         </Detail>
-        <Detail term="Created">{formatTime(s.createTime)}</Detail>
-        <Detail term="Labels">
+        <Detail term={t("sandbox.details.maxTtl")}>
+          {formatDuration(s.maxTtl, i18n)}
+        </Detail>
+        <Detail term={t("sandbox.details.idleDeadline")}>
+          {ended ? "—" : formatTime(s.idleDeadline, lang)}
+        </Detail>
+        <Detail term={t("sandbox.details.maxDeadline")}>
+          {ended ? "—" : formatTime(s.maxDeadline, lang)}
+        </Detail>
+        <Detail term={t("sandbox.details.created")}>
+          {formatTime(s.createTime, lang)}
+        </Detail>
+        <Detail term={t("sandbox.details.labels")}>
           <LabelList labels={s.labels} />
         </Detail>
       </dl>
       <ConfirmDialog
         open={confirmDelete}
         onOpenChange={setConfirmDelete}
-        title="Delete this sandbox?"
-        description="The sandbox and its disk are deleted on the device. Snapshots of it stay."
-        confirmLabel="Delete sandbox"
+        title={t("sandbox.deleteDialog.title")}
+        description={t("sandbox.deleteDialog.description")}
+        confirmLabel={t("sandbox.deleteDialog.confirm")}
         onConfirm={() => remove.mutateAsync(ids)}
       />
     </>

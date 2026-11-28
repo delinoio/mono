@@ -79,8 +79,11 @@ h2 {
   top: 0;
   z-index: 10;
   display: flex;
+  /* Translated labels and the language menu can be wider than one row at
+     any viewport width; wrap them instead of widening the page. */
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
+  gap: 8px 16px;
   padding: 12px var(--app-gap);
   background: var(--dui-color-surface);
   border-bottom: 1px solid var(--dui-color-neutral-hover);
@@ -109,8 +112,10 @@ h2 {
 
 .topbar-links {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
+  justify-content: flex-end;
+  gap: 8px 16px;
   margin-inline-start: auto;
 }
 
@@ -512,10 +517,6 @@ h2 {
     white-space: nowrap;
   }
 
-  .topbar {
-    flex-wrap: wrap;
-  }
-
   .org-switcher {
     order: 3;
     width: 100%;
@@ -588,4 +589,24 @@ h2 {
   align-items: center;
   gap: 8px;
   overflow-wrap: anywhere;
+}
+
+/* The language menu of the top bar. Its visible label is redundant next to
+   the language names; keep it for assistive technology only. */
+.language-select {
+  min-width: 160px;
+}
+
+.language-select .dui-text-field-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The signed-out top bar holds only the language menu, at the end. */
+.topbar-signed-out {
+  justify-content: flex-end;
 }

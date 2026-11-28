@@ -15,6 +15,7 @@ import { createContext, type ReactNode, useContext } from "react";
 import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL, OWNSAND_CONSOLE_URL } from "../config.ts";
 import { labels } from "../format.ts";
+import { type MessageKey, useI18n } from "../i18n.ts";
 import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import {
@@ -24,6 +25,7 @@ import {
   RouteId,
   useRouter,
 } from "../router.tsx";
+import { LanguageSelect } from "./language-select.tsx";
 import {
   ErrorNotice,
   Loading,
@@ -52,57 +54,57 @@ export function useOrg(): OrgContextValue {
 
 const SECTIONS: {
   id: OrgRouteId;
-  title: string;
+  title: MessageKey;
   permission: Permission;
 }[] = [
   {
     id: RouteId.Overview,
-    title: "Overview",
+    title: "nav.overview",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.Requests,
-    title: "Requests",
+    title: "nav.requests",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.Runners,
-    title: "Runners",
+    title: "nav.runners",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.Profiles,
-    title: "Runner profiles",
+    title: "nav.profiles",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.Integrations,
-    title: "Integrations",
+    title: "nav.integrations",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.DevSessions,
-    title: "Dev sessions",
+    title: "nav.devSessions",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.Members,
-    title: "Members",
+    title: "nav.members",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.ApiKeys,
-    title: "API keys",
+    title: "nav.apiKeys",
     permission: Permission.ManageOwnApiKeys,
   },
   {
     id: RouteId.Audit,
-    title: "Audit events",
+    title: "nav.audit",
     permission: Permission.ReadOrganization,
   },
   {
     id: RouteId.Settings,
-    title: "Settings",
+    title: "nav.settings",
     permission: Permission.ChangeSettings,
   },
 ];
@@ -125,6 +127,7 @@ export function canOpenSection(role: Role | undefined, id: RouteId): boolean {
 /** The top bar: product name, organization switcher and account links. */
 export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
+  const { t } = useI18n();
   const { route, navigate } = useRouter();
   const orgs = useOrganizations(organizationId !== undefined);
   const section: OrgRouteId =
@@ -140,7 +143,7 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
         <>
           {orgs.error ? <RefreshFailedNotice query={orgs} /> : null}
           <Select
-            label="Organization"
+            label={t("topBar.organization")}
             value={organizationId}
             onValueChange={(value) => {
               if (value === null) return;
@@ -164,21 +167,36 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
         SandRun
       </Link>
       {switcher ? <div className="org-switcher">{switcher}</div> : null}
-      <nav className="topbar-links" aria-label="Account">
+      <nav className="topbar-links" aria-label={t("topBar.account")}>
+        <LanguageSelect />
         <a href={OWNSAND_CONSOLE_URL} target="_blank" rel="noreferrer">
-          OwnSand console
+          {t("topBar.ownSandConsole")}
         </a>
         <a href={ACCOUNTS_URL} target="_blank" rel="noreferrer">
-          Account settings
+          {t("topBar.accountSettings")}
         </a>
         <Button
           variant={ButtonVariant.Secondary}
           size={ButtonSize.Small}
           onClick={() => auth.signOut()}
         >
-          Sign out
+          {t("topBar.signOut")}
         </Button>
       </nav>
+    </header>
+  );
+}
+
+/**
+ * The top bar of the pages before sign-in: only the language menu, so the
+ * signed-out pages can switch the language too.
+ */
+export function SignedOutTopBar() {
+  return (
+    <header className="topbar topbar-signed-out">
+      <div className="topbar-links">
+        <LanguageSelect />
+      </div>
     </header>
   );
 }
@@ -192,21 +210,22 @@ export function InvalidLinkBanner({
 }: {
   organizationId: string;
 }) {
+  const { t } = useI18n();
   const link = useQuery(OwnSandLinkService.method.getOwnSandLink, {
     organizationId,
   });
   if (link.data?.link?.state !== OwnSandLinkState.INVALID) return null;
   return (
-    <section className="link-banner" role="alert" aria-label="OwnSand link">
-      <h2>Dispatch has stopped</h2>
-      <p>
-        OwnSand rejected the API key of the OwnSand link, so SandRun starts no
-        runners. Queued requests wait until their maximum queue wait ends.
-        Replace the API key to start dispatch again.
-      </p>
+    <section
+      className="link-banner"
+      role="alert"
+      aria-label={t("linkBanner.label")}
+    >
+      <h2>{t("linkBanner.title")}</h2>
+      <p>{t("linkBanner.description")}</p>
       <div className="link-banner-actions">
         <Link to={orgPath(RouteId.Integrations, organizationId)}>
-          Go to integrations
+          {t("common.goToIntegrations")}
         </Link>
       </div>
     </section>
@@ -223,6 +242,7 @@ export function OrgShell({
 }) {
   const { route } = useRouter();
   const auth = useAuth();
+  const { t } = useI18n();
   const org = useQuery(OrganizationService.method.getOrganization, {
     organizationId,
   });
@@ -234,7 +254,7 @@ export function OrgShell({
       </main>
     );
   } else if (org.data === undefined) {
-    body = <Loading label="Loading the organization" />;
+    body = <Loading label={t("orgShell.loading")} />;
   } else {
     const organization = org.data.organization!;
     const role = organization.callerRole;
@@ -249,10 +269,13 @@ export function OrgShell({
         }}
       >
         <div className="org-layout">
-          <nav className="sidenav" aria-label="Organization">
+          <nav className="sidenav" aria-label={t("orgShell.navigation")}>
             <p className="sidenav-org">
               {organization.name}
-              <span className="muted"> · {labels.role[role]}</span>
+              <span className="muted">
+                {" "}
+                {t("orgShell.role", { role: t(labels.role[role]) })}
+              </span>
             </p>
             <ul>
               {visibleSections(role).map((s) => (
@@ -261,7 +284,7 @@ export function OrgShell({
                     to={orgPath(s.id, organizationId)}
                     aria-current={route.id === s.id ? "page" : undefined}
                   >
-                    {s.title}
+                    {t(s.title)}
                   </Link>
                 </li>
               ))}
@@ -274,9 +297,9 @@ export function OrgShell({
               children
             ) : (
               <div className="notice notice-error" role="alert">
-                <p>You do not have permission to open this page.</p>
+                <p>{t("orgShell.noPermission")}</p>
                 <Link to={orgPath(RouteId.Overview, organizationId)}>
-                  Go to the overview
+                  {t("orgShell.goToOverview")}
                 </Link>
               </div>
             )}

@@ -8,6 +8,7 @@ import {
   useAuth,
 } from "../auth.tsx";
 import { Loading, SignInFailureNotice } from "../components/ui.tsx";
+import { useI18n } from "../i18n.ts";
 import { pendingInvitation } from "../invitation.ts";
 import { RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -52,15 +53,16 @@ function UnreadableSignInSession() {
 
 function SignInRecovery() {
   const auth = useAuth();
+  const { t } = useI18n();
   return (
     <main className="content content-narrow">
       <div className="notice notice-error" role="alert">
-        <p>The sign-in could not be completed. Sign in again.</p>
+        <p>{t("auth.callbackFailed")}</p>
         <Button
           variant={ButtonVariant.Secondary}
           onClick={() => void auth.signIn()}
         >
-          Sign in with Delino
+          {t("auth.signInWithDelino")}
         </Button>
       </div>
       <SignInFailureNotice />
@@ -70,6 +72,7 @@ function SignInRecovery() {
 
 function CompleteSignIn({ pending }: { pending: boolean }) {
   const { navigate } = useRouter();
+  const { t } = useI18n();
   const { isLoading, error } = useHandleSignInCallback(() => {
     navigate(afterSignInPath(), { replace: true });
   });
@@ -92,5 +95,5 @@ function CompleteSignIn({ pending }: { pending: boolean }) {
   if (error) {
     return <SignInRecovery />;
   }
-  return isLoading ? <Loading label="Signing in" /> : null;
+  return isLoading ? <Loading label={t("auth.signingIn")} /> : null;
 }

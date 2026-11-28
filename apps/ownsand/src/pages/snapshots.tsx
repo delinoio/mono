@@ -21,6 +21,7 @@ import {
   Empty,
   ErrorNotice,
   FormDialog,
+  ListNoun,
   PageHeader,
   QueryBoundary,
   ShortId,
@@ -29,6 +30,7 @@ import {
   toastError,
 } from "../components/ui.tsx";
 import { formatBytes, formatTime, labels } from "../format.ts";
+import { useI18n } from "../i18n.ts";
 import { cancelUncachedList } from "../pagination.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
 import {
@@ -36,10 +38,13 @@ import {
   useSnapshots,
   useTemplates,
 } from "../snapshot-lists.ts";
+import { enumText, type MessageKey } from "../text.ts";
 
 /** Route `snapshots`: snapshots, their export, and templates. */
 export function SnapshotsPage() {
   const { organizationId } = useOrg();
+  const i18n = useI18n();
+  const { t, lang } = i18n;
   const queryClient = useQueryClient();
   const transport = useTransport();
   const refresh = () => invalidateServices(queryClient, SnapshotService);
@@ -86,17 +91,20 @@ export function SnapshotsPage() {
   return (
     <>
       <PageHeader
-        title="Snapshots"
-        description="Snapshots stay on their device. Export one to use it on other devices with the same OS and architecture."
+        title={t("snapshots.title")}
+        description={t("snapshots.description")}
       />
-      <QueryBoundary query={snapshots.boundary} loading="Loading snapshots">
+      <QueryBoundary
+        query={snapshots.boundary}
+        loading={t("snapshots.loading")}
+      >
         {() =>
           snapshots.rows.length === 0 ? (
-            <Empty title="No snapshots">
-              Take a snapshot from a running or paused sandbox.
+            <Empty title={t("snapshots.empty.title")}>
+              {t("snapshots.empty.description")}
             </Empty>
           ) : (
-            <ul className="list" aria-label="Snapshots">
+            <ul className="list" aria-label={t("snapshots.list")}>
               {snapshots.rows.map((s) => {
                 const exportable =
                   s.state === SnapshotState.READY &&
@@ -106,23 +114,38 @@ export function SnapshotsPage() {
                   <li key={s.snapshotId} className="list-row">
                     <div className="list-main">
                       <span className="list-title">
-                        Snapshot <ShortId id={s.snapshotId} /> ·{" "}
-                        {labels.snapshotState[s.state]} ·{" "}
-                        {labels.exportState[s.exportState]}
+                        {i18n.rich("snapshots.rowTitle", {
+                          id: <ShortId id={s.snapshotId} />,
+                          state: enumText(i18n, labels.snapshotState, s.state),
+                          exportState: enumText(
+                            i18n,
+                            labels.exportState,
+                            s.exportState,
+                          ),
+                        })}
                       </span>
                       <span className="muted">
-                        {labels.guestOs[s.guestOs]} · {formatBytes(s.sizeBytes)}
-                        {s.hasMemoryState ? " · with memory state" : ""} · from{" "}
-                        <Link
-                          to={routePath({
-                            id: RouteId.Sandbox,
-                            organizationId,
-                            sandboxId: s.sourceSandboxId,
-                          })}
-                        >
-                          <ShortId id={s.sourceSandboxId} />
-                        </Link>{" "}
-                        · {formatTime(s.createTime)}
+                        {i18n.rich(
+                          s.hasMemoryState
+                            ? "snapshots.rowDetailsWithMemory"
+                            : "snapshots.rowDetails",
+                          {
+                            os: enumText(i18n, labels.guestOs, s.guestOs),
+                            size: formatBytes(s.sizeBytes, lang),
+                            sandbox: (
+                              <Link
+                                to={routePath({
+                                  id: RouteId.Sandbox,
+                                  organizationId,
+                                  sandboxId: s.sourceSandboxId,
+                                })}
+                              >
+                                <ShortId id={s.sourceSandboxId} />
+                              </Link>
+                            ),
+                            time: formatTime(s.createTime, lang),
+                          },
+                        )}
                       </span>
                     </div>
                     <div className="list-actions">
@@ -130,39 +153,45 @@ export function SnapshotsPage() {
                         <Button
                           variant={ButtonVariant.Secondary}
                           size={ButtonSize.Small}
-                          aria-label={`Export snapshot ${shortIdText(s.snapshotId)}`}
+                          aria-label={t("snapshots.exportNamed", {
+                            id: shortIdText(s.snapshotId),
+                          })}
                           onClick={async () => {
                             try {
                               await exportSnapshot.mutateAsync({
                                 organizationId,
                                 snapshotId: s.snapshotId,
                               });
-                              toast.success("The export started.");
+                              toast.success(t("snapshots.exportStarted"));
                             } catch (error) {
-                              toastError(error);
+                              toastError(error, i18n);
                             }
                           }}
                         >
-                          Export
+                          {t("snapshots.export")}
                         </Button>
                       ) : null}
                       {s.state === SnapshotState.READY ? (
                         <Button
                           variant={ButtonVariant.Secondary}
                           size={ButtonSize.Small}
-                          aria-label={`Make template from snapshot ${shortIdText(s.snapshotId)}`}
+                          aria-label={t("snapshots.makeTemplateNamed", {
+                            id: shortIdText(s.snapshotId),
+                          })}
                           onClick={() => setTemplateFrom(s)}
                         >
-                          Make template
+                          {t("snapshots.makeTemplate")}
                         </Button>
                       ) : null}
                       <Button
                         variant={ButtonVariant.Danger}
                         size={ButtonSize.Small}
-                        aria-label={`Delete snapshot ${shortIdText(s.snapshotId)}`}
+                        aria-label={t("snapshots.deleteNamed", {
+                          id: shortIdText(s.snapshotId),
+                        })}
                         onClick={() => setDeletingSnapshot(s)}
                       >
-                        Delete
+                        {t("common.delete")}
                       </Button>
                     </div>
                   </li>
@@ -172,33 +201,41 @@ export function SnapshotsPage() {
           )
         }
       </QueryBoundary>
-      <ShowMore noun="snapshots" list={snapshots} />
+      <ShowMore noun={ListNoun.Snapshots} list={snapshots} />
       <section className="section" aria-labelledby="templates-title">
-        <h2 id="templates-title">Templates</h2>
-        <QueryBoundary query={templates.boundary} loading="Loading templates">
+        <h2 id="templates-title">{t("templates.title")}</h2>
+        <QueryBoundary
+          query={templates.boundary}
+          loading={t("templates.loading")}
+        >
           {() =>
             templates.rows.length === 0 ? (
-              <Empty title="No templates">
-                A template gives a snapshot a name to create sandboxes from.
+              <Empty title={t("templates.empty.title")}>
+                {t("templates.empty.description")}
               </Empty>
             ) : (
-              <ul className="list" aria-label="Templates">
-                {templates.rows.map((t) => (
-                  <li key={t.templateId} className="list-row">
+              <ul className="list" aria-label={t("templates.list")}>
+                {templates.rows.map((template) => (
+                  <li key={template.templateId} className="list-row">
                     <div className="list-main">
-                      <span className="list-title">{t.name}</span>
+                      <span className="list-title">{template.name}</span>
                       <span className="muted">
-                        From snapshot <ShortId id={t.snapshotId} /> ·{" "}
-                        {formatTime(t.createTime)}
+                        {i18n.rich("templates.rowDetails", {
+                          snapshot: <ShortId id={template.snapshotId} />,
+                          time: formatTime(template.createTime, lang),
+                        })}
                       </span>
                     </div>
                     <Button
                       variant={ButtonVariant.Danger}
                       size={ButtonSize.Small}
-                      aria-label={`Delete template ${t.name} from snapshot ${shortIdText(t.snapshotId)}`}
-                      onClick={() => setDeletingTemplate(t)}
+                      aria-label={t("templates.deleteNamed", {
+                        name: template.name,
+                        id: shortIdText(template.snapshotId),
+                      })}
+                      onClick={() => setDeletingTemplate(template)}
                     >
-                      Delete
+                      {t("common.delete")}
                     </Button>
                   </li>
                 ))}
@@ -206,7 +243,7 @@ export function SnapshotsPage() {
             )
           }
         </QueryBoundary>
-        <ShowMore noun="templates" list={templates} />
+        <ShowMore noun={ListNoun.Templates} list={templates} />
       </section>
       <FormDialog
         open={templateFrom !== undefined}
@@ -216,8 +253,8 @@ export function SnapshotsPage() {
             setTemplateName("");
           }
         }}
-        title="Make a template"
-        submitLabel="Create template"
+        title={t("templates.createDialog.title")}
+        submitLabel={t("templates.createDialog.submit")}
         onSubmit={async (opening) => {
           await createTemplate.mutateAsync({
             organizationId,
@@ -232,7 +269,7 @@ export function SnapshotsPage() {
         }}
       >
         <TextField
-          label="Template name"
+          label={t("templates.createDialog.name")}
           value={templateName}
           onValueChange={setTemplateName}
           autoFocus
@@ -243,9 +280,11 @@ export function SnapshotsPage() {
       <ConfirmDialog
         open={deletingSnapshot !== undefined}
         onOpenChange={(open) => !open && setDeletingSnapshot(undefined)}
-        title={`Delete the snapshot ${deletingSnapshot ? shortIdText(deletingSnapshot.snapshotId) : ""}?`}
-        description="Delete its templates first. Sandboxes made from it keep running."
-        confirmLabel="Delete snapshot"
+        title={t("snapshots.deleteDialog.title", {
+          id: deletingSnapshot ? shortIdText(deletingSnapshot.snapshotId) : "",
+        })}
+        description={t("snapshots.deleteDialog.description")}
+        confirmLabel={t("snapshots.deleteDialog.confirm")}
         onConfirm={() =>
           deleteSnapshot.mutateAsync({
             organizationId,
@@ -256,9 +295,11 @@ export function SnapshotsPage() {
       <ConfirmDialog
         open={deletingTemplate !== undefined}
         onOpenChange={(open) => !open && setDeletingTemplate(undefined)}
-        title={`Delete the template ${deletingTemplate?.name ?? ""}?`}
-        description="Its snapshot stays."
-        confirmLabel="Delete template"
+        title={t("templates.deleteDialog.title", {
+          name: deletingTemplate?.name ?? "",
+        })}
+        description={t("templates.deleteDialog.description")}
+        confirmLabel={t("templates.deleteDialog.confirm")}
         onConfirm={() =>
           deleteTemplate.mutateAsync({
             organizationId,
@@ -270,13 +311,20 @@ export function SnapshotsPage() {
   );
 }
 
+/** The accessible names of the Show more buttons of the two lists. */
+const SHOW_MORE_LABELS = {
+  [ListNoun.Snapshots]: "snapshots.showMore",
+  [ListNoun.Templates]: "templates.showMore",
+} as const satisfies Partial<Record<ListNoun, MessageKey>>;
+
 function ShowMore({
   noun,
   list,
 }: {
-  noun: "snapshots" | "templates";
+  noun: keyof typeof SHOW_MORE_LABELS;
   list: ReturnType<typeof useSnapshots> | ReturnType<typeof useTemplates>;
 }) {
+  const { t } = useI18n();
   const { boundary, pages, fetchNextPage } = list;
   if (!pages.isIncomplete || isTerminalError(boundary.error)) return null;
 
@@ -290,11 +338,11 @@ function ShowMore({
       ) : null}
       <Button
         variant={ButtonVariant.Secondary}
-        aria-label={`Show more ${noun}`}
+        aria-label={t(SHOW_MORE_LABELS[noun])}
         disabled={boundary.isFetching}
         onClick={() => void fetchNextPage({ cancelRefetch: false })}
       >
-        Show more
+        {t("common.showMore")}
       </Button>
     </>
   );

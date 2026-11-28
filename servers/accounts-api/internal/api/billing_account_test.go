@@ -548,12 +548,14 @@ func TestInvitationRules(t *testing.T) {
 	// Newest first, pending only, paginated.
 	second := invite(t, owner, accountID, "second@example.com", roleAdmin)
 	third := invite(t, owner, accountID, "third@example.com", roleViewer)
+	want := []string{third.GetInvitationId(), second.GetInvitationId(), first.GetInvitationId()}
 	var ids []string
 	token := ""
-	for {
+	seenTokens := make(map[string]struct{})
+	for page := 1; page <= len(want); page++ {
 		resp, err := owner.Client.ListInvitations(ctx(), connect.NewRequest(&accountsv1.ListInvitationsRequest{BillingAccountId: accountID, PageSize: 1, PageToken: token}))
 		if err != nil {
-			t.Fatalf("ListInvitations: %v", err)
+			t.Fatalf("ListInvitations page %d: %v", page, err)
 		}
 		for _, inv := range resp.Msg.GetInvitations() {
 			ids = append(ids, inv.GetInvitationId())
@@ -561,8 +563,14 @@ func TestInvitationRules(t *testing.T) {
 		if token = resp.Msg.GetNextPageToken(); token == "" {
 			break
 		}
+		if _, seen := seenTokens[token]; seen {
+			t.Fatalf("ListInvitations page %d returned a repeated continuation token", page)
+		}
+		if page == len(want) {
+			t.Fatalf("ListInvitations page %d returned a continuation token at the page limit", page)
+		}
+		seenTokens[token] = struct{}{}
 	}
-	want := []string{third.GetInvitationId(), second.GetInvitationId(), first.GetInvitationId()}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Fatalf("ListInvitations = %v, want %v", ids, want)
 	}
@@ -896,10 +904,11 @@ func TestMembers(t *testing.T) {
 	// Pages of one return the same order.
 	var paged []string
 	token := ""
-	for {
+	seenTokens := make(map[string]struct{})
+	for page := 1; page <= len(want); page++ {
 		resp, err := f.Owner.Client.ListMembers(ctx(), connect.NewRequest(&accountsv1.ListMembersRequest{BillingAccountId: f.AccountID, PageSize: 1, PageToken: token}))
 		if err != nil {
-			t.Fatalf("ListMembers page: %v", err)
+			t.Fatalf("ListMembers page %d: %v", page, err)
 		}
 		for _, m := range resp.Msg.GetMembers() {
 			paged = append(paged, m.GetUserId())
@@ -907,6 +916,13 @@ func TestMembers(t *testing.T) {
 		if token = resp.Msg.GetNextPageToken(); token == "" {
 			break
 		}
+		if _, seen := seenTokens[token]; seen {
+			t.Fatalf("ListMembers page %d returned a repeated continuation token", page)
+		}
+		if page == len(want) {
+			t.Fatalf("ListMembers page %d returned a continuation token at the page limit", page)
+		}
+		seenTokens[token] = struct{}{}
 		// The token belongs to this billing account and this RPC.
 		_, err = f.Owner.Client.ListInvitations(ctx(), connect.NewRequest(&accountsv1.ListInvitationsRequest{BillingAccountId: f.AccountID, PageToken: token}))
 		wantCode(t, err, connect.CodeInvalidArgument)
