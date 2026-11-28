@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -94,6 +95,88 @@ func TestPrintFieldsEscapesControlCharacters(t *testing.T) {
 	}
 }
 
+func TestPrintTableAlignsDisplayCells(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows [][]string
+		want string
+	}{
+		{
+			name: "ASCII",
+			rows: [][]string{{"1", "AAAAAA", "owner"}, {"2", "B", "admin"}},
+			want: "ID  NAME    ROLE\n1   AAAAAA  owner\n2   B       admin\n",
+		},
+		{
+			name: "ASCII with missing cells",
+			rows: [][]string{{"1", "A", "owner"}, {"2", "no role"}, {"3", "BBBBBB", "member"}},
+			want: "ID  NAME  ROLE\n1   A     owner\n2   no role\n3   BBBBBB  member\n",
+		},
+		{
+			name: "wide and combining characters",
+			rows: [][]string{
+				{"1", "AAAAAA", "owner"},
+				{"2", "한국어", "member"},
+				{"3", "漢字", "admin"},
+				{"4", "ＡＢ", "member"},
+				{"5", "B", "admin"},
+				{"6", "cafe\u0301", "member"},
+			},
+			want: "ID  NAME    ROLE\n" +
+				"1   AAAAAA  owner\n" +
+				"2   한국어  member\n" +
+				"3   漢字    admin\n" +
+				"4   ＡＢ    member\n" +
+				"5   B       admin\n" +
+				"6   cafe\u0301    member\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			a := &app{}
+			if err := a.printTable(&buf, []string{"ID", "NAME", "ROLE"}, tc.rows); err != nil {
+				t.Fatal(err)
+			}
+			if got := buf.String(); got != tc.want {
+				t.Fatalf("table = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPrintTableAlignsWideHeader(t *testing.T) {
+	var buf bytes.Buffer
+	a := &app{}
+	if err := a.printTable(&buf, []string{"名前", "ROLE"}, [][]string{{"Amy", "owner"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := buf.String(), "名前  ROLE\nAmy   owner\n"; got != want {
+		t.Fatalf("table = %q, want %q", got, want)
+	}
+}
+
+type tableErrorWriter struct {
+	writes int
+	err    error
+}
+
+func (w *tableErrorWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 {
+		return len(p), nil
+	}
+	return 0, w.err
+}
+
+func TestPrintTableReturnsWriteError(t *testing.T) {
+	writeErr := errors.New("table write failed")
+	w := &tableErrorWriter{err: writeErr}
+	a := &app{}
+	err := a.printTable(w, []string{"NAME", "ROLE"}, [][]string{{"漢字", "owner"}, {"Amy", "member"}})
+	if err != writeErr || w.writes != 2 {
+		t.Fatalf("printTable returned %v after %d writes, want %v after 2 writes", err, w.writes, writeErr)
+	}
+}
+
 func TestPrintTableEscapesCells(t *testing.T) {
 	var buf bytes.Buffer
 	a := &app{}
@@ -103,7 +186,7 @@ func TestPrintTableEscapesCells(t *testing.T) {
 	}
 	want := "ID  NA\\tME          Z\\xff\n" +
 		"1   a\\nb\\tc\\x1b[0m  x\n" +
-		"2   plain 한국어       y\n"
+		"2   plain 한국어    y\n"
 	if got := buf.String(); got != want {
 		t.Fatalf("table = %q, want %q", got, want)
 	}
