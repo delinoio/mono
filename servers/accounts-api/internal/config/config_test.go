@@ -346,9 +346,9 @@ func TestLoadBillingDefaults(t *testing.T) {
 func TestLoadBillingOverrides(t *testing.T) {
 	cfg, err := Load(lookupFrom(map[string]string{
 		EnvRunMigrations:           "false",
-		EnvLogtoIssuer:             "https://tenant.logto.app/oidc/",
+		EnvLogtoIssuer:             "\t https://tenant.example.test:443/oidc/ \r",
 		EnvLogtoAudience:           "https://accounts.api.example",
-		EnvLogtoManagementEndpoint: "https://tenant.logto.app/",
+		EnvLogtoManagementEndpoint: " http://127.0.0.1:8080/ ",
 		EnvCORSOrigins:             " https://accounts.delino.io , http://127.0.0.1:13100,",
 		EnvWebOrigin:               "http://127.0.0.1:13100",
 	}))
@@ -358,10 +358,10 @@ func TestLoadBillingOverrides(t *testing.T) {
 	if cfg.RunMigrations {
 		t.Error("RunMigrations = true, want false")
 	}
-	if cfg.LogtoIssuer != "https://tenant.logto.app/oidc" {
+	if cfg.LogtoIssuer != "https://tenant.example.test:443/oidc" {
 		t.Errorf("LogtoIssuer = %q", cfg.LogtoIssuer)
 	}
-	if cfg.LogtoManagementEndpoint != "https://tenant.logto.app" {
+	if cfg.LogtoManagementEndpoint != "http://127.0.0.1:8080" {
 		t.Errorf("LogtoManagementEndpoint = %q", cfg.LogtoManagementEndpoint)
 	}
 	if cfg.LogtoAudience != "https://accounts.api.example" {
@@ -446,6 +446,13 @@ func TestLoadRejectsInvalidURLAndOriginHosts(t *testing.T) {
 		"issuer https port only":             {EnvLogtoIssuer, "https://:443/oidc"},
 		"issuer http port only":              {EnvLogtoIssuer, "http://:80"},
 		"management port only":               {EnvLogtoManagementEndpoint, "https://:443"},
+		"issuer no-break space":              {EnvLogtoIssuer, "https://tenant\u00a0.example.test/oidc"},
+		"issuer ideographic space":           {EnvLogtoIssuer, "https://tenant\u3000.example.test/oidc"},
+		"issuer escaped space":               {EnvLogtoIssuer, "https://tenant%C2%A0.example.test/oidc"},
+		"management no-break space":          {EnvLogtoManagementEndpoint, "https://tenant\u00a0.example.test"},
+		"management ideographic space":       {EnvLogtoManagementEndpoint, "https://tenant\u3000.example.test"},
+		"management escaped space":           {EnvLogtoManagementEndpoint, "https://tenant%C2%A0.example.test"},
+		"management resource escaped space":  {EnvLogtoManagementResource, "https://tenant%C2%A0.example.test/api"},
 		"cors port only":                     {EnvCORSOrigins, "https://:443"},
 		"cors port only in a list":           {EnvCORSOrigins, "https://valid.example, https://:443"},
 		"web origin port only":               {EnvWebOrigin, "https://:443"},
