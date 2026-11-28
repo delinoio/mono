@@ -1108,7 +1108,7 @@ type fakeAgent struct {
 	startTime *timestamppb.Timestamp
 	execChunk int
 	files     map[string][]byte
-	reads     map[string][]byte
+	reads     map[string]fakeReadSnapshot
 	writes    map[string]*fakeWrite
 	readChunk int
 
@@ -1126,6 +1126,11 @@ type fakeAgent struct {
 	writeReqs      []*ownsandv1.WriteFileRequest
 	readReqs       []*ownsandv1.ReadFileRequest
 	execReqs       []*ownsandv1.ExecRequest
+}
+
+type fakeReadSnapshot struct {
+	path string
+	data []byte
 }
 
 type fakeWrite struct {
@@ -1147,7 +1152,7 @@ func newFakeAgent() *fakeAgent {
 	return &fakeAgent{
 		execs:     map[string]*fakeExec{},
 		files:     map[string][]byte{},
-		reads:     map[string][]byte{},
+		reads:     map[string]fakeReadSnapshot{},
 		writes:    map[string]*fakeWrite{},
 		execChunk: datapath.MaxExecOutputChunkSize,
 		readChunk: datapath.MaxFileChunkSize,
@@ -1280,28 +1285,33 @@ func (a *fakeAgent) readRequests() []*ownsandv1.ReadFileRequest {
 
 func (a *fakeAgent) serveRead(req *ownsandv1.ReadFileRequest, send func(*ownsandv1.FileReadEvent) error) error {
 	a.recordRead(req)
+	readID, path := req.GetReadId(), req.GetPath()
 	a.mu.Lock()
-	snap, ok := a.reads[req.GetReadId()]
+	snap, ok := a.reads[readID]
 	if !ok {
-		src, exists := a.files[req.GetPath()]
+		src, exists := a.files[path]
 		if !exists {
 			a.mu.Unlock()
 			return connect.NewError(connect.CodeNotFound, errors.New("no such file"))
 		}
-		snap = append([]byte(nil), src...)
-		a.reads[req.GetReadId()] = snap
+		snap = fakeReadSnapshot{path: path, data: append([]byte(nil), src...)}
+		a.reads[readID] = snap
+	} else if path != snap.path {
+		a.mu.Unlock()
+		return connect.NewError(connect.CodePermissionDenied, errors.New("request does not match the recorded operation"))
 	}
 	chunk := a.readChunk
 	endSizeDelta := a.endSizeDelta
 	a.mu.Unlock()
-	for off := req.GetOffset(); off < int64(len(snap)); {
-		end := min(off+int64(chunk), int64(len(snap)))
-		if err := send(&ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_Chunk{Chunk: &ownsandv1.FileChunk{Offset: off, Data: snap[off:end]}}}); err != nil {
+	data := snap.data
+	for off := req.GetOffset(); off < int64(len(data)); {
+		end := min(off+int64(chunk), int64(len(data)))
+		if err := send(&ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_Chunk{Chunk: &ownsandv1.FileChunk{Offset: off, Data: data[off:end]}}}); err != nil {
 			return err
 		}
 		off = end
 	}
-	return send(&ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_End{End: &ownsandv1.FileReadEnd{SizeBytes: int64(len(snap)) + endSizeDelta}}})
+	return send(&ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_End{End: &ownsandv1.FileReadEnd{SizeBytes: int64(len(data)) + endSizeDelta}}})
 }
 
 func (a *fakeAgent) write(req *ownsandv1.WriteFileRequest, grantDigest []byte) (*ownsandv1.WriteFileResponse, error) {

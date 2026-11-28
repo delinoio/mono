@@ -95,6 +95,61 @@ func TestReadFileFinalSizeMismatch(t *testing.T) {
 	}
 }
 
+func TestFakeReadRejectsChangedPath(t *testing.T) {
+	t.Parallel()
+	agent := newFakeAgent()
+	agent.setFile("/a", []byte("abcde"))
+	agent.setFile("/b", []byte("vwxyz"))
+	salt := randomBytes(t, relaybinding.SaltSize)
+
+	read := func(id, path string, offset int64) ([]*ownsandv1.FileReadEvent, error) {
+		var events []*ownsandv1.FileReadEvent
+		err := agent.serveRead(&ownsandv1.ReadFileRequest{
+			SandboxId:   "sandbox",
+			ReadId:      id,
+			Path:        path,
+			Offset:      offset,
+			BindingSalt: salt,
+		}, func(event *ownsandv1.FileReadEvent) error {
+			events = append(events, event)
+			return nil
+		})
+		return events, err
+	}
+	checkRead := func(id, path string, offset int64, want string) {
+		t.Helper()
+		events, err := read(id, path, offset)
+		if err != nil {
+			t.Fatalf("read %s at offset %d: %v", path, offset, err)
+		}
+		if len(events) != 2 {
+			t.Fatalf("read %s at offset %d: got %d events, want a chunk and an end event", path, offset, len(events))
+		}
+		chunk := events[0].GetChunk()
+		if chunk.GetOffset() != offset || string(chunk.GetData()) != want {
+			t.Errorf("read %s at offset %d: got chunk at offset %d with data %q, want %q", path, offset, chunk.GetOffset(), chunk.GetData(), want)
+		}
+		if size := events[1].GetEnd().GetSizeBytes(); size != 5 {
+			t.Errorf("read %s at offset %d: got end size %d, want 5", path, offset, size)
+		}
+	}
+
+	checkRead("first", "/a", 0, "abcde")
+	events, err := read("first", "/b", 2)
+	var connectErr *connect.Error
+	const wantMessage = "request does not match the recorded operation"
+	if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodePermissionDenied || connectErr.Message() != wantMessage {
+		t.Errorf("changed path: got %v, want permission_denied with message %q", err, wantMessage)
+	}
+	if len(events) != 0 {
+		t.Errorf("changed path: got %d events, want none", len(events))
+	}
+
+	agent.setFile("/a", []byte("12345"))
+	checkRead("first", "/a", 2, "cde")
+	checkRead("second", "/b", 2, "xyz")
+}
+
 func TestReadFileResumesWithSameReadID(t *testing.T) {
 	t.Parallel()
 	cases := map[string]func(cp *fakeCP){
