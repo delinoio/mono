@@ -57,7 +57,7 @@ func TestRulesetLinkAcceptsAreScopedPerTap(t *testing.T) {
 	}
 	// An invalid assignment renders none either.
 	invalid := Ruleset(v4, v6, []TapGateway{{Tap: a.Tap, Gateway: a.Gateway}, {Tap: "", Gateway: a.Gateway, Guest: a.Guest}})
-	if strings.Contains(invalid, "sport 68") || strings.Contains(invalid, "icmpv6") {
+	if strings.Contains(invalid, "sport 68") || strings.Contains(invalid, "sport 546") || strings.Contains(invalid, "icmpv6") {
 		t.Errorf("link accept from an invalid assignment:\n%s", invalid)
 	}
 }
