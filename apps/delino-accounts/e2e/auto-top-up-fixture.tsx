@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import "delino-ui/styles.css";
 import "../src/index.css";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
   CreditService,
   type UpdateAutoTopUpSettingsRequest,
@@ -29,11 +29,45 @@ const updateMethod = "UpdateAutoTopUpSettings";
 const readMethod = "GetAutoTopUpSettings";
 let update: ReturnType<typeof deferNextCall> | undefined;
 let confirmation: ReturnType<typeof deferNextCall> | undefined;
+let saveResponse: Promise<void> | undefined;
+let releaseSaveResponse: (() => void) | undefined;
+const transport: Transport = {
+  ...api.transport,
+  async unary(method, ...args) {
+    const response = api.transport.unary(method, ...args);
+    if (
+      method.parent.typeName === CreditService.typeName &&
+      method.name === updateMethod
+    ) {
+      const gate = saveResponse;
+      saveResponse = undefined;
+      // Let the fake API apply the settings before holding the response.
+      const saved = await response;
+      await gate;
+      return saved;
+    }
+    return response;
+  },
+};
 
 const fixture = {
   holdSave(holdConfirmation = false) {
     update = deferNextCall(api, updateMethod);
-    if (holdConfirmation) confirmation = deferNextCall(api, readMethod);
+    if (holdConfirmation) this.holdConfirmation();
+    return this.readCount();
+  },
+  holdSaveResponse() {
+    saveResponse = new Promise<void>((resolve) => {
+      releaseSaveResponse = resolve;
+    });
+    return null;
+  },
+  releaseSaveResponse() {
+    releaseSaveResponse?.();
+    return null;
+  },
+  holdConfirmation() {
+    confirmation = deferNextCall(api, readMethod);
     return this.readCount();
   },
   releaseSave() {
@@ -50,6 +84,9 @@ const fixture = {
   },
   readCount() {
     return api.calls.filter(({ method }) => method === readMethod).length;
+  },
+  savedAmount() {
+    return account.autoTopUp.amountUsdMicros?.toString();
   },
   saves() {
     return api.calls
@@ -74,8 +111,11 @@ const fixture = {
     await invalidateServices(queryClient, CreditService);
     return null;
   },
-  async refreshAmount() {
-    account.autoTopUp = { ...account.autoTopUp, amountUsdMicros: 40_000_000n };
+  async refreshAmount(amountUsdMicros = 40_000_000) {
+    account.autoTopUp = {
+      ...account.autoTopUp,
+      amountUsdMicros: BigInt(amountUsdMicros),
+    };
     await invalidateServices(queryClient, CreditService);
     return null;
   },
@@ -108,7 +148,7 @@ createRoot(document.getElementById("root")!).render(
           logto: undefined,
           paddle: undefined,
         }}
-        transport={api.transport}
+        transport={transport}
         queryClient={queryClient}
         checkout={undefined}
       />
