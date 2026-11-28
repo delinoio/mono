@@ -242,7 +242,7 @@ func runServers(ctx context.Context, stop func(), srv *http.Server, listener net
 	defer cancel()
 	metricsDone := make(chan error, 1)
 	go func() {
-		err := metricsSrv.Serve(metricsListener)
+		err := serveListener(metricsSrv, metricsListener)
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
@@ -294,6 +294,44 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 	}
 }
 
+type acceptErrorListener struct {
+	net.Listener
+	mu       sync.Mutex
+	firstErr error
+}
+
+func (l *acceptErrorListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return conn, err
+	}
+	// Match the temporary errors that net/http retries in its Accept loop.
+	if ne, ok := err.(net.Error); ok && ne.Temporary() {
+		return conn, err
+	}
+	l.mu.Lock()
+	if l.firstErr == nil {
+		l.firstErr = err
+	}
+	l.mu.Unlock()
+	return conn, err
+}
+
+// serveListener preserves a permanent Accept error when net/http reports
+// ErrServerClosed because Shutdown or Close started before Accept returned.
+func serveListener(srv *http.Server, listener net.Listener) error {
+	l := &acceptErrorListener{Listener: listener}
+	err := srv.Serve(l)
+	if errors.Is(err, http.ErrServerClosed) {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if l.firstErr != nil {
+			return l.firstErr
+		}
+	}
+	return err
+}
+
 // serve runs srv until Serve fails or ctx ends, then drains it within
 // timeout. beforeDrain runs first, so the instance releases the lease and
 // stops the lease components before the drain.
@@ -305,7 +343,7 @@ func serve(ctx context.Context, stop func(), srv *http.Server, listener net.List
 		return nil
 	}
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- srv.Serve(listener) }()
+	go func() { serveDone <- serveListener(srv, listener) }()
 	var serveErr error
 	select {
 	case serveErr = <-serveDone:
