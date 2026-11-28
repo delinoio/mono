@@ -77,18 +77,23 @@ func TestRunServersSkipsPreCanceledStartup(t *testing.T) {
 
 func TestRunServersClosesActivePublicConnectionAtDrainDeadline(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		acceptErr error
+		name         string
+		acceptErr    error
+		cancelBefore bool
 	}{
 		{name: "shutdown signal"},
 		{name: "public listener failure", acceptErr: errPublicAccept},
+		{name: "signal before public listener failure returns", acceptErr: errPublicAccept, cancelBefore: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			publicListener := newTestListener(t)
 			listener := publicListener
-			if tc.acceptErr != nil {
+			acceptFailed := make(chan struct{})
+			if tc.cancelBefore {
+				listener = newSignalAcceptListener(publicListener, tc.acceptErr, func() { close(acceptFailed) })
+			} else if tc.acceptErr != nil {
 				listener = acceptErrorOnCloseListener{Listener: publicListener, err: tc.acceptErr}
 			}
 			requestStarted := make(chan struct{})
@@ -132,7 +137,14 @@ func TestRunServersClosesActivePublicConnectionAtDrainDeadline(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if tc.acceptErr == nil {
+			if tc.cancelBefore {
+				select {
+				case <-acceptFailed:
+				case <-time.After(handlerStartTimeout):
+					t.Fatal("listener did not select the permanent Accept error")
+				}
+			}
+			if tc.acceptErr == nil || tc.cancelBefore {
 				cancel()
 			} else if err := publicListener.Close(); err != nil {
 				t.Fatalf("fail public listener: %v", err)

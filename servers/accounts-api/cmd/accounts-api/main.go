@@ -347,14 +347,36 @@ func serve(ctx context.Context, stop func(), srv *http.Server, listener net.List
 	defer cancelBase()
 	srv.BaseContext = func(net.Listener) context.Context { return baseCtx }
 
-	// Log requests that net/http rejects before the handler runs; see
-	// newServer.
-	observed := server.ObserveListener(listener, logger)
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- srv.Serve(observed)
-	}()
+	public := &publicListener{Listener: listener}
+	// Log requests that net/http rejects before the handler runs. See newServer.
+	observed := server.ObserveListener(public, logger)
+	serveErr := runAsync(func() error {
+		err := srv.Serve(observed)
+		// During shutdown, net/http can return ErrServerClosed in place of
+		// the Accept error. Use the original cause only in that case.
+		if err == http.ErrServerClosed && public.terminalErr != nil {
+			return public.terminalErr
+		}
+		return err
+	})
 	return awaitServe(ctx, stop, srv, serveErr, logger, timeout)
+}
+
+type publicListener struct {
+	net.Listener
+	// Serve calls Accept serially and reads terminalErr after Serve returns.
+	terminalErr error
+}
+
+func (l *publicListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		// Match net/http's retry rule for the error returned directly by Accept.
+		if temporary, ok := err.(net.Error); !ok || !temporary.Temporary() {
+			l.terminalErr = err
+		}
+	}
+	return conn, err
 }
 
 // awaitServe waits for the Serve result on serveErr or for ctx to be done. It
