@@ -567,23 +567,144 @@ describe("exec helper", () => {
     },
   );
 
-  test("propagates an error thrown by the consumer after a terminal event", async () => {
-    const consumerError = new ConnectError(
-      "consumer failed",
-      Code.PermissionDenied,
-    );
-    const caller = execCaller(async function* () {
-      try {
-        yield response(exited(0));
-      } finally {
-        throw new ConnectError("cleanup failed", Code.Unavailable);
-      }
-    });
-    const events = execDevSession(caller, execInput);
-    expect((await events.next()).value).toMatchObject({
+  test.each<{
+    source: "initial" | "attach";
+    event: EventInit;
+    kind: ExecEventKind;
+    consumerError: unknown;
+    cleanupRejects?: boolean;
+    abortOnClose?: boolean;
+  }>([
+    {
+      source: "initial",
+      event: started,
+      kind: ExecEventKind.Started,
+      consumerError: new Error("consumer failed"),
+    },
+    {
+      source: "initial",
+      event: out(0, "x"),
+      kind: ExecEventKind.Stdout,
+      consumerError: undefined,
+      cleanupRejects: true,
+    },
+    {
+      source: "attach",
+      event: err(0, "x"),
+      kind: ExecEventKind.Stderr,
+      consumerError: { message: "consumer failed" },
+    },
+    {
+      source: "attach",
+      event: truncated(1n, 1n),
+      kind: ExecEventKind.OutputLost,
+      consumerError: Symbol("consumer failed"),
+    },
+    {
+      source: "initial",
+      event: exited(0),
       kind: ExecEventKind.Exited,
+      consumerError: new ConnectError("consumer failed", Code.Unavailable),
+    },
+    {
+      source: "attach",
+      event: exited(0),
+      kind: ExecEventKind.Exited,
+      consumerError: new ConnectError("consumer failed", Code.Unavailable),
+      cleanupRejects: true,
+    },
+    {
+      source: "initial",
+      event: {
+        case: "failed",
+        value: {
+          reason: ExecFailureReason.PROGRAM_NOT_FOUND,
+          message: "no such program",
+        },
+      },
+      kind: ExecEventKind.Failed,
+      consumerError: new Error("consumer failed"),
+      abortOnClose: true,
+    },
+    {
+      source: "attach",
+      event: { case: "sandboxEnded", value: { reason: "MAX_TTL" } },
+      kind: ExecEventKind.SandboxEnded,
+      consumerError: "consumer failed",
+    },
+  ])(
+    "propagates a consumer throw at $kind from the $source stream",
+    async ({
+      source,
+      event,
+      kind,
+      consumerError,
+      cleanupRejects,
+      abortOnClose,
+    }) => {
+      const abort = new AbortController();
+      const clock = new RecordingClock();
+      let closes = 0;
+      async function* activeStream<T>(wrap: (event: EventInit) => T) {
+        try {
+          yield wrap(event);
+        } finally {
+          closes++;
+          if (abortOnClose) {
+            abort.abort(new Error("stop following"));
+          }
+          if (cleanupRejects) {
+            throw new ConnectError("cleanup failed", Code.Unavailable);
+          }
+        }
+      }
+      const attach = rs.fn(() =>
+        activeStream((event) =>
+          create(AttachDevSessionExecResponseSchema, { event: { event } }),
+        ),
+      );
+      const caller: ExecCaller = {
+        async *execDevSession() {
+          if (source === "initial") {
+            yield* activeStream(response);
+          }
+        },
+        attachDevSessionExec: attach,
+      };
+      const events = execDevSession(
+        caller,
+        { ...execInput, signal: abort.signal },
+        { clock },
+      );
+      if (source === "attach") {
+        expect((await events.next()).value).toMatchObject({
+          kind: ExecEventKind.Reattached,
+          cause: undefined,
+        });
+      }
+      expect((await events.next()).value).toMatchObject({ kind });
+      await expect(events.throw(consumerError)).rejects.toBe(consumerError);
+      expect(await events.next()).toEqual({ done: true, value: undefined });
+      expect(closes).toBe(1);
+      expect(attach).toHaveBeenCalledTimes(source === "attach" ? 1 : 0);
+      expect(clock.sleeps).toEqual([]);
+    },
+  );
+
+  test("propagates a consumer throw at Reattached before starting the attach", async () => {
+    const upstreamError = new ConnectError("stream failed", Code.Unavailable);
+    const consumerError = new Error("consumer failed");
+    const caller = scriptedExecCaller([upstreamError], []);
+    const clock = new RecordingClock();
+    const events = execDevSession(caller, execInput, { clock });
+    expect((await events.next()).value).toMatchObject({
+      kind: ExecEventKind.Reattached,
+      cause: upstreamError,
     });
     await expect(events.throw(consumerError)).rejects.toBe(consumerError);
+    expect(await events.next()).toEqual({ done: true, value: undefined });
+    expect(caller.attachDevSessionExec).not.toHaveBeenCalled();
+    expect(clock.sleeps).toEqual([1000]);
   });
 
   test.each<{ event: EventInit; outcome: ExecOutcome }>([
