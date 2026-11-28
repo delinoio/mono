@@ -169,8 +169,7 @@ func (a *app) tokenSource() (sandrun.TokenSource, error) {
 		return creds.AccessToken != "" && time.Until(creds.AccessTokenExpiry) > refreshMargin
 	}
 	// A removed or replaced session makes this source permanently stale.
-	adopt := func() (bool, error) {
-		stored, err := st.Load()
+	adopt := func(stored *credstore.Credentials, err error) (bool, error) {
 		switch {
 		case errors.Is(err, credstore.ErrNotFound):
 			staleErr = errors.New("the stored credentials were removed (signed out); run 'sandrun login' to sign in again")
@@ -201,7 +200,7 @@ func (a *app) tokenSource() (sandrun.TokenSource, error) {
 		if fresh() {
 			return creds.AccessToken, nil
 		}
-		if _, err := adopt(); err != nil {
+		if _, err := adopt(st.Load()); err != nil {
 			return "", err
 		}
 		for attempt := 1; ; attempt++ {
@@ -217,7 +216,7 @@ func (a *app) tokenSource() (sandrun.TokenSource, error) {
 			if err != nil {
 				var oe *logto.Error
 				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code() == logto.InvalidGrant {
-					rotated, adoptErr := adopt()
+					rotated, adoptErr := adopt(st.Load())
 					if adoptErr != nil {
 						return "", adoptErr
 					}
@@ -225,7 +224,7 @@ func (a *app) tokenSource() (sandrun.TokenSource, error) {
 						// The issuer may reject the spent token before the
 						// other process has published its replacement.
 						a.logger.Debug("SandRun waits for another process to publish the rotated Logto refresh token")
-						rotated, adoptErr = awaitRefreshRotation(ctx, adopt)
+						rotated, adoptErr = awaitRefreshRotation(ctx, st.LoadContext, adopt)
 						if adoptErr != nil {
 							return "", adoptErr
 						}
@@ -255,7 +254,7 @@ func (a *app) tokenSource() (sandrun.TokenSource, error) {
 				return "", staleErr
 			case errors.Is(err, credstore.ErrRotated):
 				a.logger.Debug("SandRun discarded a refreshed Logto token after another process stored a newer one")
-				if _, err := adopt(); err != nil {
+				if _, err := adopt(st.Load()); err != nil {
 					return "", err
 				}
 			default:
@@ -265,21 +264,41 @@ func (a *app) tokenSource() (sandrun.TokenSource, error) {
 	}, nil
 }
 
-func awaitRefreshRotation(ctx context.Context, adopt func() (bool, error)) (bool, error) {
-	deadline := time.NewTimer(refreshAdoptWait)
-	defer deadline.Stop()
+func awaitRefreshRotation(
+	ctx context.Context,
+	load func(context.Context, time.Time) (*credstore.Credentials, error),
+	adopt func(*credstore.Credentials, error) (bool, error),
+) (bool, error) {
+	deadline := time.Now().Add(refreshAdoptWait)
+	expiry := time.NewTimer(time.Until(deadline))
+	defer expiry.Stop()
 	tick := time.NewTicker(refreshAdoptPoll)
 	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return false, fmt.Errorf("wait for the rotated Logto refresh token: %w", ctx.Err())
-		case <-deadline.C:
-			return adopt()
+		case <-expiry.C:
 		case <-tick.C:
-			if rotated, err := adopt(); err != nil || rotated {
-				return rotated, err
-			}
+		}
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf("wait for the rotated Logto refresh token: %w", err)
+		}
+		retryDeadline := deadline
+		final := !time.Now().Before(deadline)
+		if final {
+			retryDeadline = time.Time{}
+		}
+		stored, err := load(ctx, retryDeadline)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, fmt.Errorf("wait for the rotated Logto refresh token: %w", ctxErr)
+		}
+		// A poll that finishes after the adoption window cannot update the
+		// token source. Only the read started at normal expiry can do that.
+		if !final && err == nil && !time.Now().Before(deadline) {
+			return false, nil
+		}
+		if rotated, err := adopt(stored, err); final || err != nil || rotated {
+			return rotated, err
 		}
 	}
 }

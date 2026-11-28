@@ -243,11 +243,13 @@ func TestAwaitRefreshRotationStopsAfterPollOnCancel(t *testing.T) {
 		polls := 0
 		go func() {
 			defer close(done)
-			rotated, err := awaitRefreshRotation(ctx, func() (bool, error) {
+			rotated, err := awaitRefreshRotation(ctx, func(context.Context, time.Time) (*credstore.Credentials, error) {
 				polls++
 				if polls == 1 {
 					close(firstPoll)
 				}
+				return nil, nil
+			}, func(*credstore.Credentials, error) (bool, error) {
 				return false, nil
 			})
 			done <- rotationResult{rotated: rotated, err: err}
@@ -292,6 +294,92 @@ func TestAwaitRefreshRotationStopsAfterPollOnCancel(t *testing.T) {
 			t.Fatalf("waiter polled %d times, want 1", polls)
 		}
 	})
+}
+
+func TestAwaitRefreshRotationFinalRead(t *testing.T) {
+	sharingErr := errors.New("credential file sharing violation")
+	for _, finalErr := range []error{nil, sharingErr} {
+		name := "rotation"
+		if finalErr != nil {
+			name = "sharing violation"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				deadline := time.Now().Add(refreshAdoptWait)
+				finalReads := 0
+				rotated, err := awaitRefreshRotation(t.Context(),
+					func(_ context.Context, retryDeadline time.Time) (*credstore.Credentials, error) {
+						if !time.Now().Before(deadline) {
+							if !retryDeadline.IsZero() {
+								t.Fatalf("final read can retry until %v", retryDeadline)
+							}
+							finalReads++
+							return &credstore.Credentials{RefreshToken: "new"}, finalErr
+						}
+						if !retryDeadline.Equal(deadline) {
+							t.Fatalf("polling retry deadline = %v, want %v", retryDeadline, deadline)
+						}
+						return &credstore.Credentials{RefreshToken: "old"}, nil
+					},
+					func(stored *credstore.Credentials, err error) (bool, error) {
+						return err == nil && stored.RefreshToken == "new", err
+					},
+				)
+				if rotated != (finalErr == nil) || err != finalErr || finalReads != 1 {
+					t.Fatalf("rotation = %v, error = %v, final reads = %d", rotated, err, finalReads)
+				}
+			})
+		})
+	}
+}
+
+func TestAwaitRefreshRotationDropsLatePollResult(t *testing.T) {
+	sharingErr := errors.New("credential file sharing violation")
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+		readErr error
+		wantErr error
+	}{
+		{"caller deadline", 2 * refreshAdoptPoll, sharingErr, context.DeadlineExceeded},
+		{"adoption deadline", 0, nil, nil},
+		{"sharing violation at adoption deadline", 0, sharingErr, sharingErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				if tc.timeout != 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tc.timeout)
+					defer cancel()
+				}
+				reads := 0
+				rotated, err := awaitRefreshRotation(ctx,
+					func(ctx context.Context, retryDeadline time.Time) (*credstore.Credentials, error) {
+						reads++
+						if reads != 1 || retryDeadline.IsZero() {
+							t.Fatal("expected one polling read")
+						}
+						if tc.timeout != 0 {
+							<-ctx.Done()
+						} else {
+							time.Sleep(time.Until(retryDeadline))
+						}
+						return &credstore.Credentials{RefreshToken: "new"}, tc.readErr
+					},
+					func(_ *credstore.Credentials, err error) (bool, error) {
+						if err == nil || tc.wantErr != sharingErr {
+							t.Fatal("applied a result after the deadline")
+						}
+						return false, err
+					},
+				)
+				if rotated || !errors.Is(err, tc.wantErr) || reads != 1 {
+					t.Fatalf("rotation = %v, error = %v, reads = %d", rotated, err, reads)
+				}
+			})
+		})
+	}
 }
 
 func TestTokenSourceRejectsChangedSession(t *testing.T) {

@@ -5,11 +5,13 @@
 package credstore
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unsafe"
 
@@ -193,6 +195,115 @@ func TestReadFileRetriesSharingViolation(t *testing.T) {
 	}
 	if string(got) != string(want) || attempts != 2 {
 		t.Fatalf("want the saved credentials after two reads, got %d reads", attempts)
+	}
+}
+
+func TestReadFileRetryStopsAtFirstLimit(t *testing.T) {
+	sharingErr := &os.PathError{Op: "open", Path: FileName, Err: windows.ERROR_SHARING_VIOLATION}
+	for _, tc := range []struct {
+		name           string
+		callerDeadline time.Duration
+		cancelCaller   bool
+		adoptionBudget time.Duration
+		wantElapsed    time.Duration
+		wantErr        error
+	}{
+		{"cancel", 0, true, time.Minute, time.Millisecond, context.Canceled},
+		{"caller deadline", time.Millisecond, false, time.Minute, time.Millisecond, context.DeadlineExceeded},
+		{"adoption deadline", 0, false, time.Millisecond, time.Millisecond, sharingErr},
+		{"read limit", 0, false, time.Minute, replaceRetryTimeout, sharingErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				if tc.callerDeadline != 0 {
+					var cancelDeadline context.CancelFunc
+					ctx, cancelDeadline = context.WithTimeout(ctx, tc.callerDeadline)
+					defer cancelDeadline()
+				}
+				start := time.Now()
+				attempts := 0
+				_, err := readFileRetry(ctx, start.Add(tc.adoptionBudget), FileName, func(string) ([]byte, error) {
+					attempts++
+					if !time.Now().Before(start.Add(tc.wantElapsed)) {
+						t.Fatal("started a read at or after the retry limit")
+					}
+					if tc.cancelCaller && attempts == 1 {
+						time.AfterFunc(time.Millisecond, cancel)
+					}
+					return nil, sharingErr
+				})
+				if err != tc.wantErr || time.Since(start) != tc.wantElapsed || attempts == 0 {
+					t.Fatalf("read error = %v, elapsed = %v, attempts = %d", err, time.Since(start), attempts)
+				}
+			})
+		})
+	}
+}
+
+func TestReadFileRetryKeepsSharingErrorWhenResultIsLate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		sharingErr := &os.PathError{Op: "open", Path: FileName, Err: windows.ERROR_SHARING_VIOLATION}
+		deadline := time.Now().Add(2 * replaceRetryInterval)
+		attempts := 0
+		data, err := readFileRetry(t.Context(), deadline, FileName, func(string) ([]byte, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, sharingErr
+			}
+			time.Sleep(time.Until(deadline))
+			return []byte("late result"), nil
+		})
+		if data != nil || err != sharingErr || attempts != 2 {
+			t.Fatalf("data = %q, error = %v, attempts = %d", data, err, attempts)
+		}
+	})
+}
+
+func TestWindowsLoadContextSingleAttempt(t *testing.T) {
+	s := savedStore(t)
+	path, err := windows.UTF16PtrFromString(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(path, windows.GENERIC_READ, 0, nil,
+		windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = windows.CloseHandle(handle) }()
+
+	ctx, cancel := context.WithTimeout(t.Context(), replaceRetryTimeout)
+	defer cancel()
+	start := time.Now()
+	_, err = s.LoadContext(ctx, time.Time{})
+	if elapsed := time.Since(start); elapsed >= replaceRetryTimeout/2 {
+		t.Fatalf("single attempt took %v", elapsed)
+	}
+	var readErr *os.PathError
+	if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) || !errors.As(err, &readErr) {
+		t.Fatalf("want a wrapped sharing violation, got %v", err)
+	}
+}
+
+func TestWindowsLoadContextBoundsLockWait(t *testing.T) {
+	s := savedStore(t)
+	unlock, err := s.lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	_, err = s.LoadContext(t.Context(), time.Now().Add(2*lockPollInterval))
+	if !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("want lock timeout, got %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*lockPollInterval)
+	defer cancel()
+	_, err = s.LoadContext(ctx, time.Now().Add(time.Second))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want caller deadline, got %v", err)
 	}
 }
 

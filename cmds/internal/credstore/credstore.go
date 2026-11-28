@@ -8,6 +8,7 @@
 package credstore
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -99,6 +100,20 @@ func (s Store) load(read func(string) ([]byte, error)) (*Credentials, error) {
 		return nil, fmt.Errorf("credstore: the credential file is not valid; run %s logout and %s login", s.Program, s.Program)
 	}
 	return &c, nil
+}
+
+// LoadContext reads stored credentials and respects caller cancellation.
+// On Windows, retryDeadline bounds waits for the store lock and retries
+// after a sharing violation. A zero deadline allows one attempt at each.
+func (s Store) LoadContext(ctx context.Context, retryDeadline time.Time) (*Credentials, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c, err := s.loadContext(ctx, retryDeadline)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return c, err
 }
 
 // Save writes the credentials atomically to a user-only file. It holds the
