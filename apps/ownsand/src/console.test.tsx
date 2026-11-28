@@ -1236,7 +1236,10 @@ describe("confirmation dialog requests", () => {
 
   /** Renders the API keys page with the seeded ci-runner key and a newer deploy-bot key. */
   async function renderKeys(transport: Transport, queryClient?: QueryClient) {
-    await createClient(ApiKeyService, transport).createApiKey({
+    const { apiKey } = await createClient(
+      ApiKeyService,
+      transport,
+    ).createApiKey({
       organizationId: MOCK_IDS.acme,
       name: "deploy-bot",
     });
@@ -1245,6 +1248,7 @@ describe("confirmation dialog requests", () => {
       queryClient,
     });
     await screen.findByText(/ci-runner/);
+    return apiKey;
   }
 
   async function openRevokeOf(name: string) {
@@ -1380,18 +1384,55 @@ describe("confirmation dialog requests", () => {
   });
 
   test("Escape and Cancel still dismiss a confirmation that is pending", async () => {
+    const queryClient = createQueryClient();
     const { transport, calls } = gatedRevokeTransport();
-    await renderKeys(transport);
-    const first = await openRevokeOf("ci-runner");
-    await press(confirmButton(first));
-    await pressEscape(first);
-    expect(screen.queryByRole("alertdialog")).toBeNull();
-    const second = await openRevokeOf("deploy-bot");
-    await press(confirmButton(second));
-    await press(within(second).getByRole("button", { name: "Cancel" }));
-    await settle(60);
-    expect(screen.queryByRole("alertdialog")).toBeNull();
-    expect(calls.length).toBe(2);
+    const ciRunnerId = await seededApiKeyId(transport);
+    const deployBot = await renderKeys(transport, queryClient);
+    const mutationCache = queryClient.getMutationCache();
+    const statusOf = (apiKeyId: string) =>
+      mutationCache.find({
+        predicate: ({ state }) =>
+          (state.variables as { apiKeyId?: string } | undefined)?.apiKeyId ===
+          apiKeyId,
+      })?.state.status;
+
+    try {
+      const first = await openRevokeOf("ci-runner");
+      await press(confirmButton(first));
+      await waitFor(() => {
+        expect(calls[0]?.apiKeyId).toBe(ciRunnerId);
+        expect(statusOf(calls[0].apiKeyId)).toBe("pending");
+      });
+      await pressEscape(first);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(statusOf(calls[0].apiKeyId)).toBe("pending");
+
+      const second = await openRevokeOf("deploy-bot");
+      await press(confirmButton(second));
+      await waitFor(() => {
+        expect(calls).toHaveLength(2);
+        expect(calls[1].apiKeyId).toBe(deployBot?.apiKeyId);
+        expect(statusOf(calls[1].apiKeyId)).toBe("pending");
+      });
+      await press(within(second).getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(statusOf(calls[1].apiKeyId)).toBe("pending");
+    } finally {
+      await act(async () => {
+        for (const call of calls) call.settle();
+      });
+      await waitFor(() => {
+        const mutations = mutationCache.getAll();
+        expect(mutations).toHaveLength(calls.length);
+        for (const mutation of mutations) {
+          expect(mutation.state.status).toBe("success");
+        }
+      });
+    }
+    expect(calls.map(({ apiKeyId }) => apiKeyId)).toEqual([
+      ciRunnerId,
+      deployBot?.apiKeyId,
+    ]);
   });
 });
 
