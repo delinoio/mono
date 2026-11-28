@@ -39,14 +39,14 @@ const rpcTimeout = 10 * time.Second
 
 // failRPCAfterCommit calls rpc in a goroutine with a cancellable context,
 // waits until committed reports the state that the request commits before it
-// blocks on the saturated channel, then cancels the request and requires the
-// RPC to fail. The wait for the committed state polls through the caller's
+// blocks on the saturated channel, then cancels the request and returns the
+// RPC error. The wait for the committed state polls through the caller's
 // own clients, so it does not depend on the request context or on how fast
 // the request authorizes and writes. The channel must be saturated, and its
 // queue-full wait must be longer than the test (committedStateQueueFullWait),
 // so the send is still waiting for room when the cancellation arrives. The
 // cancellation is also registered for cleanup.
-func failRPCAfterCommit(t *testing.T, what string, rpc func(ctx context.Context) error, committed func() bool) {
+func failRPCAfterCommit(t *testing.T, what string, rpc func(ctx context.Context) error, committed func() bool) error {
 	t.Helper()
 	rpcCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -54,14 +54,16 @@ func failRPCAfterCommit(t *testing.T, what string, rpc func(ctx context.Context)
 	go func() { rpcDone <- rpc(rpcCtx) }()
 	testenv.Eventually(t, what+" committed", committed)
 	cancel()
+	var err error
 	select {
-	case err := <-rpcDone:
-		if err == nil {
-			t.Fatalf("%s on a saturated channel succeeded", what)
-		}
+	case err = <-rpcDone:
 	case <-time.After(rpcTimeout):
 		t.Fatalf("%s did not return after its request was canceled", what)
 	}
+	if err == nil {
+		t.Fatalf("%s on a saturated channel succeeded", what)
+	}
+	return err
 }
 
 // exportFailsAfterClaim calls ExportSnapshot on a saturated channel, waits
@@ -69,14 +71,17 @@ func failRPCAfterCommit(t *testing.T, what string, rpc func(ctx context.Context)
 // command send fails before enqueue and the handler reaches its compensation.
 func exportFailsAfterClaim(t *testing.T, c *testenv.Clients, orgID, snapshotID string) {
 	t.Helper()
-	failRPCAfterCommit(t, "ExportSnapshot",
-		func(ctx context.Context) error {
-			_, err := c.Snapshot.ExportSnapshot(ctx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: orgID, SnapshotId: snapshotID}))
-			return err
-		},
-		func() bool {
-			return snapshotExportState(t, c, orgID, snapshotID) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING
-		})
+	exportErrorAfterClaim(t, c, orgID, snapshotID, func(ctx context.Context) error {
+		_, err := c.Snapshot.ExportSnapshot(ctx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: orgID, SnapshotId: snapshotID}))
+		return err
+	})
+}
+
+func exportErrorAfterClaim(t *testing.T, c *testenv.Clients, orgID, snapshotID string, export func(context.Context) error) error {
+	t.Helper()
+	return failRPCAfterCommit(t, "ExportSnapshot", export, func() bool {
+		return snapshotExportState(t, c, orgID, snapshotID) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING
+	})
 }
 
 // saturate stops the agent from reading its channel and fills the transport
