@@ -79,49 +79,6 @@ func (f *stateReportLockFixture) hold(t *testing.T, lockQuery string) (release f
 	}
 }
 
-// waitForLockWait observes the expected statement even when both application
-// connections are busy. One deadline covers the connection, reads and polling.
-func (f *stateReportLockFixture) waitForLockWait(t *testing.T, fragments ...string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	conn, err := pgx.ConnectConfig(ctx, f.env.DB.Pool.Config().ConnConfig)
-	if err != nil {
-		if ctx.Err() != nil {
-			t.Fatalf("connect observer for lock wait on statement containing %q: %v", fragments, ctx.Err())
-		}
-		t.Fatalf("connect observer for lock wait on statement containing %q", fragments)
-	}
-	defer closeStateReportLockConn(t, conn)
-
-	const query = `SELECT EXISTS (
-		SELECT 1 FROM pg_catalog.pg_stat_activity
-		WHERE datname = current_database() AND pid <> pg_backend_pid()
-			AND wait_event_type = 'Lock' AND query LIKE ALL($1::text[])
-	)`
-	patterns := make([]string, len(fragments))
-	for i, fragment := range fragments {
-		patterns[i] = "%" + fragment + "%"
-	}
-
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		var waiting bool
-		if err := conn.QueryRow(ctx, query, patterns).Scan(&waiting); err != nil {
-			t.Fatalf("observe lock wait on statement containing %q: %v", fragments, err)
-		}
-		if waiting {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("observe lock wait on statement containing %q: %v", fragments, ctx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
 // report builds a full state report of the agent's records with a fresh
 // state epoch, so the device row shows whether the report was applied.
 func (f *stateReportLockFixture) report(t *testing.T) *ownsandv1.StateReport {
@@ -245,11 +202,11 @@ func TestStateReportAfterDeviceRemovalWins(t *testing.T) {
 	release := f.hold(t, "SELECT 1 FROM device_sessions WHERE device_id = $1 FOR UPDATE")
 	defer release()
 	removal := f.removeAsync(t)
-	f.waitForLockWait(t, "DELETE FROM device_sessions")
+	waitForLockWaiter(t, f.env, "DELETE FROM device_sessions")
 
 	report := f.report(t)
 	reported := f.reportAsync(t, report)
-	f.waitForLockWait(t, "FROM devices WHERE device_id = $1 FOR UPDATE")
+	waitForLockWaiter(t, f.env, "FROM devices WHERE device_id = $1 FOR UPDATE")
 	release()
 	f.waitRemoval(t, removal)
 
@@ -273,9 +230,9 @@ func TestRemovalAfterStateReportWins(t *testing.T) {
 
 	report := f.report(t)
 	reported := f.reportAsync(t, report)
-	f.waitForLockWait(t, "FROM devices WHERE device_id = $1 FOR UPDATE")
+	waitForLockWaiter(t, f.env, "FROM devices WHERE device_id = $1 FOR UPDATE")
 	removal := f.removeAsync(t)
-	f.waitForLockWait(t, "FROM devices d WHERE", "FOR UPDATE OF d")
+	waitForLockWaiter(t, f.env, "FROM devices d WHERE", "FOR UPDATE OF d")
 	release()
 	f.waitRemoval(t, removal)
 

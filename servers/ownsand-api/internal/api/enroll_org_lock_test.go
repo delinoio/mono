@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -19,35 +18,6 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
-
-// waitForLockWaiter waits until a transaction whose current query contains
-// every fragment waits for a lock. The fragments identify the statement that
-// the test expects the RPC to block on.
-func waitForLockWaiter(t *testing.T, env *testenv.Env, fragments ...string) {
-	t.Helper()
-	ctx := context.Background()
-	query := `SELECT count(*) FROM pg_stat_activity
-		WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock'`
-	args := make([]any, 0, len(fragments))
-	for i, f := range fragments {
-		query += fmt.Sprintf(" AND query LIKE $%d", i+1)
-		args = append(args, "%"+f+"%")
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var waiting int
-		if err := env.DB.Pool.QueryRow(ctx, query, args...).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting >= 1 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no transaction waits for a lock on a statement with %q", fragments)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
 
 // enrollOrgLockFixture is an organization with one pending enrollment token.
 type enrollOrgLockFixture struct {
@@ -130,14 +100,7 @@ func TestEnrollCommitsBeforeOrganizationDeletion(t *testing.T) {
 	if err := env.DB.Pool.QueryRow(ctx, "SELECT enrollment_token_id::text FROM enrollment_tokens WHERE organization_id = $1", f.org.ID).Scan(&tokenID); err != nil {
 		t.Fatal(err)
 	}
-	holder, err := env.DB.Pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holder.Rollback(ctx) }()
-	if _, err := holder.Exec(ctx, "SELECT 1 FROM enrollment_tokens WHERE enrollment_token_id = $1 FOR UPDATE", tokenID); err != nil {
-		t.Fatal(err)
-	}
+	holder := holdFixtureLock(t, env.DB.Pool, "SELECT 1 FROM enrollment_tokens WHERE enrollment_token_id = $1 FOR UPDATE", tokenID)
 
 	type enrolled struct {
 		resp *ownsandv1.EnrollResponse
@@ -159,9 +122,7 @@ func TestEnrollCommitsBeforeOrganizationDeletion(t *testing.T) {
 	// The deletion waits for the organization lock of the Enroll.
 	waitForOrganizationLockWaiters(t, env, 1)
 
-	if err := holder.Rollback(ctx); err != nil {
-		t.Fatal(err)
-	}
+	finishFixtureLock(t, "roll back", holder.Rollback)
 	e := <-enrollDone
 	if e.err != nil {
 		t.Fatalf("enroll that committed first: %v", e.err)
@@ -189,14 +150,7 @@ func TestEnrollAfterOrganizationDeletionCommits(t *testing.T) {
 	ctx := context.Background()
 	f := newEnrollOrgLockFixture(t, env)
 
-	holder, err := env.DB.Pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holder.Rollback(ctx) }()
-	if _, err := holder.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", f.org.ID); err != nil {
-		t.Fatal(err)
-	}
+	holder := holdFixtureLock(t, env.DB.Pool, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", f.org.ID)
 	enrollDone := make(chan error, 1)
 	go func() {
 		_, err := f.enroll()
@@ -208,9 +162,7 @@ func TestEnrollAfterOrganizationDeletionCommits(t *testing.T) {
 	if _, err := holder.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", f.org.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := holder.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	finishFixtureLock(t, "commit", holder.Commit)
 	if err := <-enrollDone; testenv.Code(err) != connect.CodeUnauthenticated {
 		t.Fatalf("enroll after the deletion: %v", err)
 	}

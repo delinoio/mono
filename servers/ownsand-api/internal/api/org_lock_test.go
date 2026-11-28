@@ -6,38 +6,12 @@ import (
 	"context"
 	"sync"
 	"testing"
-	"time"
 
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
-
-// waitForOrganizationLockWaiters waits until count transactions wait for the
-// row lock of an organization. The test holds that lock in its own
-// transaction, so a waiter is an RPC that passed its pre-check and is
-// blocked before the authoritative owner check.
-func waitForOrganizationLockWaiters(t *testing.T, env *testenv.Env, count int) {
-	t.Helper()
-	ctx := context.Background()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var waiting int
-		if err := env.DB.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock'
-			AND query LIKE '%FROM organizations WHERE organization_id%FOR UPDATE%'`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting >= count {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d RPCs wait for the organization lock, want %d", waiting, count)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
 
 type orgCounts struct {
 	organizations, activeDevices, deletionAudits, transferAudits, cleanupJobs int
@@ -82,14 +56,7 @@ func TestDeleteOrganizationAfterOwnershipTransfer(t *testing.T) {
 	org := env.NewOrg("alice")
 	env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 
-	holder, err := env.DB.Pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holder.Rollback(ctx) }()
-	if _, err := holder.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", org.ID); err != nil {
-		t.Fatal(err)
-	}
+	holder := holdFixtureLock(t, env.DB.Pool, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", org.ID)
 	deleted := make(chan error, 1)
 	go func() {
 		_, err := org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org.ID}))
@@ -103,9 +70,7 @@ func TestDeleteOrganizationAfterOwnershipTransfer(t *testing.T) {
 	if _, err := holder.Exec(ctx, "UPDATE memberships SET role = $3 WHERE organization_id = $1 AND user_id = $2", org.ID, org.Member, int16(ownsandv1.Role_ROLE_OWNER)); err != nil {
 		t.Fatal(err)
 	}
-	if err := holder.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	finishFixtureLock(t, "commit", holder.Commit)
 	if err := <-deleted; testenv.Code(err) != connect.CodePermissionDenied {
 		t.Fatalf("deletion by the former owner: %v", err)
 	}
@@ -125,14 +90,7 @@ func TestTransferOwnershipAfterOrganizationDeletion(t *testing.T) {
 	ctx := context.Background()
 	org := env.NewOrg("alice")
 
-	holder, err := env.DB.Pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holder.Rollback(ctx) }()
-	if _, err := holder.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", org.ID); err != nil {
-		t.Fatal(err)
-	}
+	holder := holdFixtureLock(t, env.DB.Pool, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", org.ID)
 	transferred := make(chan error, 1)
 	go func() {
 		_, err := org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: org.ID, UserId: org.Member}))
@@ -143,9 +101,7 @@ func TestTransferOwnershipAfterOrganizationDeletion(t *testing.T) {
 	if _, err := holder.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", org.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := holder.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	finishFixtureLock(t, "commit", holder.Commit)
 	if err := <-transferred; testenv.Code(err) != connect.CodeNotFound {
 		t.Fatalf("transfer after deletion: %v", err)
 	}
