@@ -5,6 +5,7 @@ package api_test
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -54,10 +55,9 @@ func TestExportPartNumbersMustBeContiguous(t *testing.T) {
 		command := ids[i]
 		sendExportResult(agent, command, numbered(tc.numbers...))
 		waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
-		logs := env.Logs.String()
-		if !strings.Contains(logs, `"command_id":"`+command+`"`) || !strings.Contains(logs, `"reason":"invalid_part"`) {
-			t.Fatalf("%s: no export_failed log with reason invalid_part for command %s", tc.name, command)
-		}
+		testenv.Eventually(t, fmt.Sprintf("%s: export_failed log with reason invalid_part for command %s", tc.name, command), func() bool {
+			return hasInvalidPartExportFailure(env.Logs.String(), command)
+		})
 		if _, ok := cleanupJobs(t, env)[attemptPrefixOf(org.ID, snapID, command)]; !ok {
 			t.Fatalf("%s: no clean-up job for the failed attempt: %v", tc.name, cleanupJobs(t, env))
 		}
@@ -98,5 +98,46 @@ func TestExportPartNumbersMustBeContiguous(t *testing.T) {
 		if want := part(int32(i + 1)).GetSha256(); string(h) != string(want) {
 			t.Fatalf("stored part %d has the hash of another part", i+1)
 		}
+	}
+}
+
+func hasInvalidPartExportFailure(logs, commandID string) bool {
+	for line := range strings.SplitSeq(logs, "\n") {
+		var record struct {
+			Message   string `json:"msg"`
+			CommandID string `json:"command_id"`
+			Reason    string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			continue
+		}
+		if record.Message == "export_failed" && record.CommandID == commandID && record.Reason == "invalid_part" {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHasInvalidPartExportFailure(t *testing.T) {
+	t.Parallel()
+
+	const logs = `{"msg":"export_failed","command_id":"attempt-1","reason":"invalid_part"}
+{"msg":"export_started","command_id":"attempt-2"}
+`
+	for _, tc := range []struct {
+		name   string
+		record string
+		want   bool
+	}{
+		{name: "missing failure"},
+		{name: "wrong reason", record: `{"msg":"export_failed","command_id":"attempt-2","reason":"no_parts"}`},
+		{name: "wrong event", record: `{"msg":"export_result_stale","command_id":"attempt-2","reason":"invalid_part"}`},
+		{name: "matching failure", record: `{"msg":"export_failed","command_id":"attempt-2","reason":"invalid_part"}`, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasInvalidPartExportFailure(logs+tc.record, "attempt-2"); got != tc.want {
+				t.Fatalf("hasInvalidPartExportFailure for attempt-2 = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }
