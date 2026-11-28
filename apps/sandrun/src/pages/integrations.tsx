@@ -1075,8 +1075,9 @@ function IntegrationDialog({
           label={t("integrations.agent.dialog.vendor")}
           value={String(vendor)}
           onValueChange={(v) => {
-            if (!v) return;
+            if (!v || v === String(vendor)) return;
             setVendor(Number(v) as AgentVendor);
+            setSetting("");
             setSecrets({});
             setErrors({});
           }}

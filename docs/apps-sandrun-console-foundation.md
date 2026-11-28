@@ -111,6 +111,7 @@ Organization owners, admins and members who sign in with Logto.
 - When the OwnSand link is `INVALID`, every organization route shows a banner that explains that dispatch has stopped and links to `integrations`.
 - The OwnSand API key replacement form targets the OwnSand organization linked when the form opens. If a successful refresh shows that the link is gone or points to another organization, the form clears the key and disables submission. Close the form and start again from Integrations.
 - Credential forms accept a value once and never show it again. After a save, the form shows only that the credential is set and when.
+- In the create agent integration dialog, changing the vendor clears the vendor setting, credentials and validation errors. The integration name stays in the form. A blank Cursor pool name or Devin outpost name shows a field error on submit and prevents the create request.
 - For an `OPENAI_CODEX` integration, the console shows the webhook URL to register in OpenAI.
 - The `integrations` and `profiles` routes share one cached agent integration list for the active organization. The console follows every continuation token and shows integrations as their pages load.
 - When editing an agent-session runner profile, Save stays unavailable until the console loads the vendor of the saved integration. The dialog keeps edits while the list loads or a failed page is retried. If the complete list loads successfully without the saved integration, the dialog explains why Save is unavailable.
