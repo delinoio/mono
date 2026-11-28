@@ -32,22 +32,53 @@ func (f waitBodyReader) Read(p []byte) (int, error) {
 
 func TestWaitDevSessionPollResult(t *testing.T) {
 	const (
-		queued  = sandrunv1.RequestState_REQUEST_STATE_QUEUED
-		running = sandrunv1.RequestState_REQUEST_STATE_RUNNING
-		expired = sandrunv1.RequestState_REQUEST_STATE_EXPIRED
+		empty    = sandrunv1.RequestState_REQUEST_STATE_UNSPECIFIED
+		queued   = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+		running  = sandrunv1.RequestState_REQUEST_STATE_RUNNING
+		expired  = sandrunv1.RequestState_REQUEST_STATE_EXPIRED
+		interval = time.Millisecond
 	)
 
 	for _, tt := range []struct {
-		name      string
-		states    []sandrunv1.RequestState
-		wantState sandrunv1.RequestState
-		wantErr   error
+		name          string
+		states        []sandrunv1.RequestState
+		deadline      time.Duration
+		endDuringRead bool
+		wantState     sandrunv1.RequestState
+		wantErr       error
 	}{
-		{"deadline before running", []sandrunv1.RequestState{queued, running}, queued, context.DeadlineExceeded},
-		{"cancel before terminal", []sandrunv1.RequestState{queued, expired}, queued, context.Canceled},
-		{"cancel during first poll", []sandrunv1.RequestState{running}, 0, context.Canceled},
-		{"running", []sandrunv1.RequestState{queued, running}, running, nil},
-		{"terminal", []sandrunv1.RequestState{expired}, expired, nil},
+		{
+			name: "deadline before running", states: []sandrunv1.RequestState{queued, running},
+			deadline: time.Second, endDuringRead: true, wantState: queued, wantErr: context.DeadlineExceeded,
+		},
+		{
+			name: "cancel before terminal", states: []sandrunv1.RequestState{queued, expired},
+			endDuringRead: true, wantState: queued, wantErr: context.Canceled,
+		},
+		{
+			name: "cancel during first poll", states: []sandrunv1.RequestState{running},
+			endDuringRead: true, wantState: empty, wantErr: context.Canceled,
+		},
+		{
+			name: "deadline after empty poll", states: []sandrunv1.RequestState{queued, empty},
+			deadline: 1500 * time.Microsecond, wantState: queued, wantErr: context.DeadlineExceeded,
+		},
+		{
+			name: "deadline with no accepted session", states: []sandrunv1.RequestState{empty},
+			deadline: 500 * time.Microsecond, wantState: empty, wantErr: context.DeadlineExceeded,
+		},
+		{
+			name: "running after empty poll", states: []sandrunv1.RequestState{queued, empty, running}, wantState: running,
+		},
+		{
+			name: "terminal after empty poll", states: []sandrunv1.RequestState{queued, empty, expired}, wantState: expired,
+		},
+		{
+			name: "running", states: []sandrunv1.RequestState{queued, running}, wantState: running,
+		},
+		{
+			name: "terminal", states: []sandrunv1.RequestState{expired}, wantState: expired,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -57,11 +88,12 @@ func TestWaitDevSessionPollResult(t *testing.T) {
 				case context.Canceled:
 					ctx, cancel = context.WithCancel(ctx)
 				case context.DeadlineExceeded:
-					ctx, cancel = context.WithTimeout(ctx, time.Second)
+					ctx, cancel = context.WithTimeout(ctx, tt.deadline)
 				}
 				defer cancel()
 
 				polls := 0
+				start := time.Now()
 				transport := waitTransport(func(req *http.Request) (*http.Response, error) {
 					defer req.Body.Close()
 					if req.URL.Path != sandrunv1connect.DevSessionServiceGetDevSessionProcedure {
@@ -71,14 +103,19 @@ func TestWaitDevSessionPollResult(t *testing.T) {
 					if polls > len(tt.states) {
 						t.Fatalf("unexpected poll %d", polls)
 					}
-					payload, err := proto.Marshal(&sandrunv1.GetDevSessionResponse{
-						DevSession: &sandrunv1.DevSession{DevSessionId: "session", State: tt.states[polls-1]},
-					})
+					if elapsed, want := time.Since(start), time.Duration(polls-1)*interval; elapsed != want {
+						t.Errorf("poll %d started after %v, want %v", polls, elapsed, want)
+					}
+					reply := &sandrunv1.GetDevSessionResponse{}
+					if state := tt.states[polls-1]; state != empty {
+						reply.DevSession = &sandrunv1.DevSession{DevSessionId: "session", State: state}
+					}
+					payload, err := proto.Marshal(reply)
 					if err != nil {
 						t.Fatal(err)
 					}
 					var body io.Reader = bytes.NewReader(payload)
-					if polls == len(tt.states) && tt.wantErr != nil {
+					if polls == len(tt.states) && tt.endDuringRead {
 						body = waitBodyReader(func(p []byte) (int, error) {
 							if err := req.Context().Err(); err != nil {
 								t.Fatalf("context ended before body read: %v", err)
@@ -114,10 +151,10 @@ func TestWaitDevSessionPollResult(t *testing.T) {
 				session, err := client.WaitDevSession(ctx, sandrun.WaitDevSessionParams{
 					OrganizationID: "org",
 					DevSessionID:   "session",
-					Interval:       time.Millisecond,
+					Interval:       interval,
 				})
 				var want *sandrunv1.DevSession
-				if tt.wantState != 0 {
+				if tt.wantState != empty {
 					want = &sandrunv1.DevSession{DevSessionId: "session", State: tt.wantState}
 				}
 				if !proto.Equal(session, want) || err != tt.wantErr || polls != len(tt.states) {
