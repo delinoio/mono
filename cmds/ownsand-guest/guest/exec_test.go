@@ -427,11 +427,38 @@ func TestExecKeepalive(t *testing.T) {
 	}
 }
 
-func TestCommandEnvOverridesHelperEnv(t *testing.T) {
-	t.Setenv("OWNSAND_GUEST_TEST_VAR", "helper")
-	env := strings.Join(commandEnv(map[string]string{"OWNSAND_GUEST_TEST_VAR": "request"}), "\n")
-	if !strings.Contains(env, "OWNSAND_GUEST_TEST_VAR=request") || strings.Contains(env, "=helper") {
-		t.Fatal("request env did not override the helper env")
+func TestCommandEnvOverridesHelperEnv(t *testing.T) { //nolint:paralleltest // Changes the process environment.
+	// Not parallel: t.Setenv changes the process environment read by commandEnv.
+	const overrideKey = "OWNSAND_GUEST_TEST_VAR"
+	const keepKey = "OWNSAND_GUEST_TEST_KEEP"
+	t.Setenv(overrideKey, "helper")
+	t.Setenv(keepKey, "helper")
+
+	overrideCount := 0
+	keepFound := false
+	for _, entry := range commandEnv(map[string]string{overrideKey: "request"}) {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case overrideKey:
+			overrideCount++
+			if value != "request" {
+				t.Errorf("%s = %q, want %q", key, value, "request")
+			}
+		case keepKey:
+			keepFound = true
+			if value != "helper" {
+				t.Errorf("%s = %q, want %q", key, value, "helper")
+			}
+		}
+	}
+	if overrideCount != 1 {
+		t.Errorf("found %d entries for %s, want 1", overrideCount, overrideKey)
+	}
+	if !keepFound {
+		t.Errorf("missing inherited environment entry for %s", keepKey)
 	}
 }
 
