@@ -204,13 +204,19 @@ describe("compact navigation focus", () => {
     await browser.setViewport({ width: 1281, height: 800 });
     await app.open("/");
 
-    const buttons = await browser.evaluate(() =>
-      Array.from(
-        document.querySelectorAll(".rp-nav-hamburger"),
-        (button) => getComputedStyle(button).display,
-      ),
-    );
-    expect(buttons).toEqual(["none", "none"]);
+    // Poll: the e2e target is the Rsbuild dev server, which renders the page
+    // after `app.open` returns. On a busy CI runner the first read found only
+    // the empty #root and no button.
+    await expect
+      .poll(() =>
+        browser.evaluate(() =>
+          Array.from(
+            document.querySelectorAll(".rp-nav-hamburger"),
+            (button) => getComputedStyle(button).display,
+          ),
+        ),
+      )
+      .toEqual(["none", "none"]);
 
     const header = screen.getByRole("banner");
     for (const name of ["Delino", /^Docs\b/, /^GitHub\b/]) {
