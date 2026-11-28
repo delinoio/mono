@@ -40,8 +40,12 @@ Deduplication works recursively. Impact varies by data type:
 // string[] - duplicates everything
 usernames={['a','b']} sorted={usernames.toSorted()} // sends 4 strings
 
-// object[] - duplicates array structure only
-users={[{id:1},{id:2}]} sorted={users.toSorted()} // sends 2 arrays + 2 unique objects (not 4)
+// object[] - the two arrays share the same two objects
+function UserList() {
+  const users = [{ id: 2 }, { id: 1 }]
+  const sorted = users.toSorted((a, b) => a.id - b.id)
+  return <ClientList users={users} sorted={sorted} />
+}
 ```
 
 **Operations breaking deduplication (create new references):**
