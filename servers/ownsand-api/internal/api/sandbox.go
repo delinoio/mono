@@ -342,7 +342,8 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 		if err != nil {
 			return err
 		}
-		decision, err = scheduler.Place(sreq, devices, now)
+		// Measure pending-idle age after the wait for the device locks.
+		decision, err = scheduler.Place(sreq, devices, h.now())
 		if err != nil {
 			return schedulerCode(err)
 		}
