@@ -378,51 +378,93 @@ func TestSessionToolDeadlines(t *testing.T) {
 }
 
 func TestSessionToolDeadlineDuringClientSetup(t *testing.T) {
+	const watchdog = 2 * time.Second
+	type outcome struct {
+		err        error
+		contextErr error
+	}
 	for _, tc := range []struct {
-		name string
-		end  func(*testing.T, context.Context, <-chan struct{}) (context.Context, context.CancelFunc)
-		code string
+		name       string
+		newContext func(context.Context) (context.Context, context.CancelFunc)
+		contextErr error
+		code       connect.Code
 	}{
 		{
 			name: "earlier caller deadline",
-			end: func(_ *testing.T, parent context.Context, _ <-chan struct{}) (context.Context, context.CancelFunc) {
-				return context.WithTimeout(parent, 100*time.Millisecond)
+			newContext: func(parent context.Context) (context.Context, context.CancelFunc) {
+				return context.WithTimeout(parent, 500*time.Millisecond)
 			},
-			code: "deadline_exceeded:",
+			contextErr: context.DeadlineExceeded,
+			code:       connect.CodeDeadlineExceeded,
 		},
 		{
-			name: "caller cancellation",
-			end: func(t *testing.T, parent context.Context, entered <-chan struct{}) (context.Context, context.CancelFunc) {
-				ctx, cancel := context.WithCancel(parent)
-				go func() {
-					select {
-					case <-entered:
-						cancel()
-					case <-t.Context().Done():
-					}
-				}()
-				return ctx, cancel
-			},
-			code: "canceled:",
+			name:       "caller cancellation",
+			newContext: context.WithCancel,
+			contextErr: context.Canceled,
+			code:       connect.CodeCanceled,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			releaseClient := sync.OnceFunc(func() { close(release) })
+			var setupContextErr error
 			s := New(Config{maxWait: 3 * time.Second, Client: func(ctx context.Context) (*sandrun.Client, error) {
 				defer close(finished)
+				setupContextErr = ctx.Err()
 				close(entered)
 				<-release // Simulate a local file read that ignores cancellation.
 				return nil, ctx.Err()
 			}})
 			t.Cleanup(s.Close)
-			ctx, cancel := tc.end(t, t.Context(), entered)
+			ctx, cancel := tc.newContext(t.Context())
 			defer cancel()
-			_, _, err := withToolDeadline(s.cfg.maxWait, s.getSession)(ctx, nil, sessionArgs{SessionID: "test"})
-			close(release)
-			<-finished
-			if err == nil || !strings.HasPrefix(err.Error(), tc.code) || ctx.Err() == nil {
-				t.Errorf("get_session = %v, caller context = %v, want %s", err, ctx.Err(), tc.code)
+			returned := make(chan outcome, 1)
+			t.Cleanup(func() {
+				releaseClient()
+				timer := time.NewTimer(watchdog)
+				defer timer.Stop()
+				select {
+				case <-returned:
+				case <-timer.C:
+					t.Error("get_session did not exit after client setup was released")
+					return
+				}
+				select {
+				case <-entered:
+					select {
+					case <-finished:
+					case <-timer.C:
+						t.Error("client setup did not exit after release")
+					}
+				default:
+				}
+			})
+			go func() {
+				defer close(returned)
+				_, _, err := withToolDeadline(s.cfg.maxWait, s.getSession)(ctx, nil, sessionArgs{SessionID: "test"})
+				returned <- outcome{err: err, contextErr: ctx.Err()}
+			}()
+			select {
+			case <-entered:
+				if setupContextErr != nil {
+					t.Fatalf("client setup started after caller termination: %v", setupContextErr)
+				}
+			case <-time.After(watchdog):
+				t.Fatal("get_session did not enter client setup")
 			}
+			if tc.contextErr == context.Canceled {
+				cancel()
+			}
+			// Keep setup blocked until the response has been checked.
+			select {
+			case got := <-returned:
+				if got.err == nil || !strings.HasPrefix(got.err.Error(), tc.code.String()+":") || got.contextErr != tc.contextErr {
+					t.Errorf("get_session = %v, caller context = %v, want %s and %v", got.err, got.contextErr, tc.code, tc.contextErr)
+				}
+			case <-time.After(watchdog):
+				t.Fatal("get_session did not return while client setup was blocked")
+			}
+			releaseClient()
 		})
 	}
 }
