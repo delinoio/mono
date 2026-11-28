@@ -729,8 +729,7 @@ func openDownloadTarget(ctx context.Context, to string) (*downloadTarget, error)
 			return nil, err
 		}
 		if info != nil {
-			// Keep the permissions of the file that the download replaces.
-			if err := f.Chmod(info.Mode().Perm()); err != nil {
+			if err := prepareDownloadReplacement(f, info); err != nil {
 				_ = f.Close()
 				_ = os.Remove(tmp)
 				return nil, err
