@@ -66,19 +66,21 @@ describe("snapshot and template rows", () => {
     const secondId = await twoSnapshots();
     const firstShort = shortIdText(MOCK_IDS.snapshot);
     const secondShort = shortIdText(secondId);
-    const rows = within(screen.getByRole("list", { name: "Snapshots" }))
-      .getAllByRole("listitem")
-      .map((li) => namesOf(li));
-    expect(rows.flat()).toEqual(
-      expect.arrayContaining([
-        `Export snapshot ${firstShort}`,
-        `Make template from snapshot ${firstShort}`,
-        `Delete snapshot ${firstShort}`,
-        `Export snapshot ${secondShort}`,
-        `Make template from snapshot ${secondShort}`,
-        `Delete snapshot ${secondShort}`,
-      ]),
-    );
+    const snapshots = within(screen.getByRole("list", { name: "Snapshots" }));
+    for (const shortId of [firstShort, secondShort]) {
+      const row = within(snapshots.getByText(shortId).closest("li")!);
+      expect(
+        row.getByRole("button", { name: `Export snapshot ${shortId}` }),
+      ).toBeTruthy();
+      expect(
+        row.getByRole("button", {
+          name: `Make template from snapshot ${shortId}`,
+        }),
+      ).toBeTruthy();
+      expect(
+        row.getByRole("button", { name: `Delete snapshot ${shortId}` }),
+      ).toBeTruthy();
+    }
     const templates = namesOf(screen.getByRole("list", { name: "Templates" }));
     expect(templates).toEqual([
       `Delete template node-24-toolchain from snapshot ${firstShort}`,
@@ -93,7 +95,7 @@ describe("snapshot and template rows", () => {
       }
     }
     expect(
-      within(screen.getByRole("list", { name: "Snapshots" }))
+      snapshots
         .getAllByRole("button")
         .map((b) => b.textContent)
         .filter((t) => t === "Delete"),
