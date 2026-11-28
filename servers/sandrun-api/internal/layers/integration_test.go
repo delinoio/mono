@@ -225,14 +225,19 @@ func TestAgentIntegrations(t *testing.T) {
 	_, err = w.env.User(w.org.Member).Integration.CreateAgentIntegration(ctx, connect.NewRequest(&sandrunv1.CreateAgentIntegrationRequest{OrganizationId: w.org.ID}))
 	wantCode(t, "member creates", err, connect.CodePermissionDenied)
 
-	// Updates: name and settings, then one credential.
+	// Update the name, Devin settings and one credential with descriptor-valid paths.
 	before := devin.GetCredentials()[1].GetCredentialSetAt().AsTime()
 	w.env.Clock.Advance(time.Second)
-	up, err := admin.Integration.UpdateAgentIntegration(ctx, connect.NewRequest(&sandrunv1.UpdateAgentIntegrationRequest{
+	devinUpdate := &sandrunv1.UpdateAgentIntegrationRequest{
 		OrganizationId: w.org.ID, AgentIntegrationId: devin.GetAgentIntegrationId(), Name: "devin-2",
 		Settings:    &sandrunv1.UpdateAgentIntegrationRequest_Devin{Devin: &sandrunv1.DevinSettings{OutpostName: "outpost-b"}},
 		Credentials: &sandrunv1.UpdateAgentIntegrationRequest_DevinCredentials{DevinCredentials: &sandrunv1.DevinCredentials{OutpostToken: "outpost-token-2"}},
-		UpdateMask:  &fieldmaskpb.FieldMask{Paths: []string{"name", "settings", "credentials"}}}))
+	}
+	devinUpdate.UpdateMask, err = fieldmaskpb.New(devinUpdate, "name", "devin", "devin_credentials")
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, err := admin.Integration.UpdateAgentIntegration(ctx, connect.NewRequest(devinUpdate))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,11 +263,200 @@ func TestAgentIntegrations(t *testing.T) {
 		t.Fatal("audit events")
 	}
 
-	// Key rotation: the re-encryption job reseals every credential.
+	getIntegration := func(t *testing.T, want *sandrunv1.AgentIntegration) {
+		t.Helper()
+		got, err := admin.Integration.GetAgentIntegration(ctx, connect.NewRequest(&sandrunv1.GetAgentIntegrationRequest{
+			OrganizationId: w.org.ID, AgentIntegrationId: want.GetAgentIntegrationId(),
+		}))
+		if err != nil || !proto.Equal(got.Msg.GetIntegration(), want) {
+			t.Fatalf("persisted integration differs from expected state: %v", err)
+		}
+	}
+	getIntegration(t, in)
+	type auditCounts struct{ updates, replacements int }
+	audits := func(t *testing.T) auditCounts {
+		t.Helper()
+		return auditCounts{
+			updates:      countAudit(t, w.env, w.org.ID, sandrunv1.AuditAction_AUDIT_ACTION_AGENT_INTEGRATION_UPDATED),
+			replacements: countAudit(t, w.env, w.org.ID, sandrunv1.AuditAction_AUDIT_ACTION_AGENT_INTEGRATION_CREDENTIALS_REPLACED),
+		}
+	}
+	updateIntegration := func(t *testing.T, req *sandrunv1.UpdateAgentIntegrationRequest, wantDelta auditCounts) *sandrunv1.AgentIntegration {
+		t.Helper()
+		start := audits(t)
+		w.env.Clock.Advance(time.Second)
+		resp, err := admin.Integration.UpdateAgentIntegration(ctx, connect.NewRequest(req))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := auditCounts{updates: start.updates + wantDelta.updates, replacements: start.replacements + wantDelta.replacements}
+		if got := audits(t); got != want {
+			t.Fatalf("audit counts = %+v, want %+v", got, want)
+		}
+		return resp.Msg.GetIntegration()
+	}
+	checkRotation := func(t *testing.T, previous, updated *sandrunv1.AgentIntegration, kind sandrunv1.AgentCredential, value string) {
+		t.Helper()
+		if len(updated.GetCredentials()) != len(previous.GetCredentials()) {
+			t.Fatal("unexpected number of credential states")
+		}
+		found := false
+		for i, state := range updated.GetCredentials() {
+			if state.GetCredential() != kind {
+				if !proto.Equal(state, previous.GetCredentials()[i]) {
+					t.Fatal("an omitted credential changed state")
+				}
+				continue
+			}
+			if !state.GetCredentialSet() || !proto.Equal(state.GetCredentialSetAt(), updated.GetUpdateTime()) ||
+				!state.GetCredentialSetAt().AsTime().After(previous.GetCredentials()[i].GetCredentialSetAt().AsTime()) {
+				t.Fatal("replacement credential timestamp did not advance to the update time")
+			}
+			found = true
+		}
+		if !found {
+			t.Fatal("missing replacement credential state")
+		}
+		got, err := w.l.Integrations.Credential(ctx, w.org.ID, updated.GetAgentIntegrationId(), kind)
+		if err != nil || got != value || strings.Contains(updated.String(), value) {
+			t.Fatalf("unexpected stored credential or response state: %v", err)
+		}
+	}
+	checkRotation(t, devin, in, sandrunv1.AgentCredential_AGENT_CREDENTIAL_OUTPOST_TOKEN, "outpost-token-2")
+
+	const newEnvironmentKey = "test-environment-replacement"
+	for _, tc := range []struct {
+		old                           *sandrunv1.AgentIntegration
+		settingsPath, credentialsPath string
+		req                           *sandrunv1.UpdateAgentIntegrationRequest
+	}{
+		{claude, "claude_code", "claude_code_credentials", &sandrunv1.UpdateAgentIntegrationRequest{
+			Settings: &sandrunv1.UpdateAgentIntegrationRequest_ClaudeCode{ClaudeCode: &sandrunv1.ClaudeCodeSettings{}},
+			Credentials: &sandrunv1.UpdateAgentIntegrationRequest_ClaudeCodeCredentials{
+				ClaudeCodeCredentials: &sandrunv1.ClaudeCodeCredentials{EnvironmentKey: newEnvironmentKey}},
+		}},
+		{codex, "openai_codex", "openai_codex_credentials", &sandrunv1.UpdateAgentIntegrationRequest{
+			Settings: &sandrunv1.UpdateAgentIntegrationRequest_OpenaiCodex{OpenaiCodex: &sandrunv1.OpenAiCodexSettings{}},
+			Credentials: &sandrunv1.UpdateAgentIntegrationRequest_OpenaiCodexCredentials{
+				OpenaiCodexCredentials: &sandrunv1.OpenAiCodexCredentials{EnvironmentKey: newEnvironmentKey}},
+		}},
+	} {
+		t.Run(tc.settingsPath, func(t *testing.T) {
+			req := tc.req
+			req.OrganizationId, req.AgentIntegrationId = w.org.ID, tc.old.GetAgentIntegrationId()
+			mask, err := fieldmaskpb.New(req, tc.settingsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.UpdateMask = mask
+			settingsOnly := updateIntegration(t, req, auditCounts{updates: 1})
+			want := proto.CloneOf(tc.old)
+			want.UpdateTime = settingsOnly.GetUpdateTime()
+			if !proto.Equal(settingsOnly, want) {
+				t.Fatal("settings-only update changed other integration state")
+			}
+
+			req.UpdateMask, err = fieldmaskpb.New(req, tc.credentialsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rotated := updateIntegration(t, req, auditCounts{replacements: 1})
+			checkRotation(t, settingsOnly, rotated, sandrunv1.AgentCredential_AGENT_CREDENTIAL_ENVIRONMENT_KEY, newEnvironmentKey)
+			getIntegration(t, rotated)
+		})
+	}
+
+	// Use fresh Cursor fixtures for each path combination.
+	const newCursorKey = "test-cursor-replacement"
+	cursorCredential := sandrunv1.AgentCredential_AGENT_CREDENTIAL_SERVICE_ACCOUNT_API_KEY
+	cursorSettings := &sandrunv1.UpdateAgentIntegrationRequest_Cursor{Cursor: &sandrunv1.CursorSettings{PoolName: "pool-b"}}
+	cursorCredentials := &sandrunv1.UpdateAgentIntegrationRequest_CursorCredentials{
+		CursorCredentials: &sandrunv1.CursorCredentials{ServiceAccountApiKey: newCursorKey}}
+	for _, tc := range []struct {
+		name  string
+		paths []string
+	}{
+		{"canonical", []string{"cursor", "cursor_credentials"}},
+		{"aliases", []string{"settings", "credentials"}},
+		{"canonical first", []string{"cursor", "cursor_credentials", "settings", "credentials"}},
+		{"aliases first", []string{"settings", "credentials", "cursor", "cursor_credentials"}},
+		{"repeated paths", []string{"cursor", "cursor", "cursor_credentials", "cursor_credentials"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fresh, err := create(&sandrunv1.CreateAgentIntegrationRequest{
+				Vendor: sandrunv1.AgentVendor_AGENT_VENDOR_CURSOR, Name: tc.name,
+				Settings: &sandrunv1.CreateAgentIntegrationRequest_Cursor{Cursor: &sandrunv1.CursorSettings{PoolName: "pool-a"}},
+				Credentials: &sandrunv1.CreateAgentIntegrationRequest_CursorCredentials{
+					CursorCredentials: &sandrunv1.CursorCredentials{ServiceAccountApiKey: "initial-test-key"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := &sandrunv1.UpdateAgentIntegrationRequest{
+				OrganizationId: w.org.ID, AgentIntegrationId: fresh.GetAgentIntegrationId(),
+				Settings: cursorSettings, Credentials: cursorCredentials,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: tc.paths},
+			}
+			if tc.name == "canonical" {
+				req.UpdateMask, err = fieldmaskpb.New(req, tc.paths...)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			updated := updateIntegration(t, req, auditCounts{updates: 1, replacements: 1})
+			if updated.GetCursor().GetPoolName() != "pool-b" {
+				t.Fatal("Cursor pool was not updated")
+			}
+			checkRotation(t, fresh, updated, cursorCredential, newCursorKey)
+			getIntegration(t, updated)
+		})
+	}
+
+	devinSettings := &sandrunv1.UpdateAgentIntegrationRequest_Devin{Devin: &sandrunv1.DevinSettings{OutpostName: "outpost"}}
+	devinCredentials := &sandrunv1.UpdateAgentIntegrationRequest_DevinCredentials{
+		DevinCredentials: &sandrunv1.DevinCredentials{ApiToken: "test-token"}}
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		req   *sandrunv1.UpdateAgentIntegrationRequest
+	}{
+		{"missing settings", []string{"cursor"}, &sandrunv1.UpdateAgentIntegrationRequest{}},
+		{"wrong settings member", []string{"cursor"}, &sandrunv1.UpdateAgentIntegrationRequest{Settings: devinSettings}},
+		{"wrong settings vendor", []string{"devin"}, &sandrunv1.UpdateAgentIntegrationRequest{Settings: devinSettings}},
+		{"alias with wrong settings path", []string{"name", "settings", "devin"}, &sandrunv1.UpdateAgentIntegrationRequest{Settings: cursorSettings}},
+		{"alias with wrong settings member", []string{"settings", "cursor"}, &sandrunv1.UpdateAgentIntegrationRequest{Settings: devinSettings}},
+		{"missing credentials", []string{"cursor_credentials"}, &sandrunv1.UpdateAgentIntegrationRequest{}},
+		{"wrong credential member", []string{"cursor_credentials"}, &sandrunv1.UpdateAgentIntegrationRequest{Credentials: devinCredentials}},
+		{"wrong credential vendor", []string{"devin_credentials"}, &sandrunv1.UpdateAgentIntegrationRequest{Credentials: devinCredentials}},
+		{"alias with wrong credential path", []string{"devin_credentials", "credentials"}, &sandrunv1.UpdateAgentIntegrationRequest{Credentials: cursorCredentials}},
+		{"empty credential values", []string{"cursor_credentials"}, &sandrunv1.UpdateAgentIntegrationRequest{Credentials: &sandrunv1.UpdateAgentIntegrationRequest_CursorCredentials{CursorCredentials: &sandrunv1.CursorCredentials{}}}},
+		{"empty mask", nil, &sandrunv1.UpdateAgentIntegrationRequest{Settings: cursorSettings}},
+		{"nested path", []string{"cursor.pool_name"}, &sandrunv1.UpdateAgentIntegrationRequest{Settings: cursorSettings}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := audits(t)
+			req := tc.req
+			req.OrganizationId, req.AgentIntegrationId = w.org.ID, cursor.GetAgentIntegrationId()
+			req.Name = "rejected rename"
+			req.UpdateMask = &fieldmaskpb.FieldMask{Paths: tc.paths}
+			_, err := admin.Integration.UpdateAgentIntegration(ctx, connect.NewRequest(req))
+			wantCode(t, tc.name, err, connect.CodeInvalidArgument)
+			getIntegration(t, cursor)
+			if got := audits(t); got != start {
+				t.Fatalf("rejected update changed audit counts from %+v to %+v", start, got)
+			}
+		})
+	}
+
+	if v, err := w.l.Integrations.Credential(ctx, w.org.ID, cursor.GetAgentIntegrationId(), cursorCredential); err != nil || v != secretsUsed[1] {
+		t.Fatalf("rejected update changed the stored Cursor credential: %v", err)
+	}
+
+	// Key rotation: the re-encryption job reseals all seven original credentials and five Cursor fixtures.
 	newKey, _ := secrets.GenerateKey("next")
 	ring, _ := secrets.NewKeyring(append([]secrets.Key{newKey}, keyOf(t, w)...)...)
 	changed, err := w.l.Integrations.Reencrypt(ctx, ring)
-	if err != nil || changed != 7 {
+	if err != nil || changed != 12 {
 		t.Fatalf("resealed %d, %v", changed, err)
 	}
 	var left int
