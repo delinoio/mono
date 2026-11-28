@@ -18,6 +18,7 @@ This contract owns both components of [`delidev`](project-delidev.md):
   - `icons/`: app icons for every bundle format, generated with `pnpm --filter delidev tauri icon public/icon.svg -o src-tauri/icons`.
   - `src/`: app shell source and unit tests.
 - `apps/delidev/src-tauri/gen/schemas/`: ignored output that `tauri-build` writes on every build.
+- Tauri mobile init generates the Android and iOS host projects under `apps/delidev/src-tauri/gen/android/` and `apps/delidev/src-tauri/gen/apple/`. Git ignores both directories.
 
 ## Runtime and Language
 
@@ -102,7 +103,14 @@ Run from the repository root:
 - `pnpm exec turbo run typecheck build --filter=delidev`: frontend type check and production build into `apps/delidev/dist/`.
 - `pnpm --filter delidev test`: offline translation check (`delino-i18n check`) and the Tauri wrapper tests.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --workspace --locked`: Rust checks of the root workspace on the host desktop target.
-- `pnpm --filter delidev tauri android init` and `pnpm --filter delidev tauri ios init`: generate the Android and iOS host projects under `src-tauri/gen/`. Then use `tauri android dev`, `tauri android build`, `tauri ios dev` and `tauri ios build`.
+- Run `pnpm --filter delidev tauri android init` or `pnpm --filter delidev tauri ios init` to generate the corresponding host project under `src-tauri/gen/`. On first init, the wrapper installs the committed launcher artwork into that platform's generated project. Then use `tauri android dev`, `tauri android build`, `tauri ios dev` or `tauri ios build`. These commands use the generated project's launcher assets directly.
+
+Repeat init preserves launcher artwork in an existing host. To refresh an existing host, first back up any custom launcher files you want to keep. Use the paths below relative to `apps/delidev/src-tauri/`.
+
+- On Android, copy the files under `icons/android/` into `gen/android/app/src/main/res/` at the same relative paths. Include the density-specific PNGs, adaptive icon XML and background color XML.
+- On iOS, open `gen/apple/Assets.xcassets/AppIcon.appiconset/Contents.json`. Copy the PNGs it names from `icons/ios/` into that app icon set directory. Keep the existing `Contents.json`.
+
+Init fails if the wrapper cannot install the launcher assets. Correct the reported error and apply the same refresh steps to the generated host.
 
 `tauri dev` and `tauri build` for desktop compile the Rust crate with CEF. Physical Android and iOS devices load the development server through the LAN address in `TAURI_DEV_HOST`, which the Tauri CLI sets; `rsbuild.config.ts` binds to that address instead of the loopback address, and `turbo.json` passes `TAURI_DEV_HOST` to the `dev` task. Remove `apps/delidev/dist/` after validation.
 
@@ -110,7 +118,7 @@ The wrapper uses the explicit bundle list when present, including an empty list.
 
 The CEF notice hook reads the CEF version from `Cargo.lock` with LF or CRLF line endings.
 
-CI runs the Rust checks in the `rust-fmt`, `rust-clippy` and `rust-test` jobs of the [workflow contract](repository-workflow-contract.md#validation) on Ubuntu, and clippy and the tests on the macOS and Windows desktop targets in the `rust-platforms` job. CI type-checks and builds the frontend in the `workspace-packages` job of the [workflow contract](repository-workflow-contract.md#validation). CI does not run `tauri build`, mobile builds or the app. The project has no e2e suite yet. The Android and iOS host projects are not generated in the repository yet.
+CI runs the Rust checks in the `rust-fmt`, `rust-clippy` and `rust-test` jobs of the [workflow contract](repository-workflow-contract.md#validation) on Ubuntu, and clippy and the tests on the macOS and Windows desktop targets in the `rust-platforms` job. CI type-checks and builds the frontend in the `workspace-packages` job of the [workflow contract](repository-workflow-contract.md#validation). CI does not run `tauri build`, mobile builds or the app. The project has no e2e suite yet.
 
 ## Dependencies and Integrations
 
