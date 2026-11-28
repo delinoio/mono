@@ -844,6 +844,45 @@ describe("settings", () => {
     expect(await screen.findByText("Settings saved")).toBeTruthy();
   });
 
+  test("compares edits with the latest save, even within one second", async () => {
+    const { transport, calls } = recording(
+      createMockTransport({ agentStepMs: 5 }),
+    );
+    renderConsole(`/orgs/${ACME}/settings/organization`, { transport });
+    const saves = () =>
+      calls.filter((c) => c.method === "UpdateOrganizationSettings");
+    const setDelay = async (minutes: string) => {
+      const delay = await screen.findByRole("textbox", {
+        name: "Pause delay in minutes",
+      });
+      await type(delay, minutes);
+      await act(async () => fireEvent.blur(delay));
+    };
+    const save = async (count: number) => {
+      await click(screen.getByRole("button", { name: "Save settings" }));
+      await waitFor(() => expect(saves()).toHaveLength(count));
+      await waitFor(() =>
+        expect(
+          (
+            screen.getByRole("button", {
+              name: "Save settings",
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(true),
+      );
+    };
+    await setDelay("20");
+    await save(1);
+    await setDelay("40");
+    await save(2);
+    // The server holds 40 minutes, so 20 minutes is a change again.
+    await setDelay("20");
+    await save(3);
+    expect(saves()[2]!.input).toMatchObject({
+      settings: { pauseDelay: { seconds: 1200n } },
+    });
+  });
+
   test("requires a pause delay", async () => {
     renderConsole(`/orgs/${ACME}/settings/organization`);
     const delay = await screen.findByRole("textbox", {

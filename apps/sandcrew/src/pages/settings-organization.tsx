@@ -174,7 +174,9 @@ export function OrganizationSettingsPage() {
       >
         {(data) => (
           <SettingsForm
-            key={String(data.settings?.updateTime?.seconds ?? "")}
+            // Two saves can happen in the same second, so the key uses the
+            // complete update time.
+            key={`${data.settings?.updateTime?.seconds ?? ""}.${data.settings?.updateTime?.nanos ?? ""}`}
             settings={data.settings!}
           />
         )}
