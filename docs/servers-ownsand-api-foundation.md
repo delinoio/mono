@@ -509,7 +509,7 @@ Add each `planned` variable to `.env.example` (name and placeholder only) and to
 
 `LOGTO_ISSUER`, `LOGTO_JWKS_URL`, `LOGTO_TOKEN_ENDPOINT`, `R2_ENDPOINT` and `ACCOUNTS_API_ORIGIN` accept explicit decimal ports from 0 to 65535. A port above 65535 stops startup. The error names the variable and omits its value. Correct any out-of-range port before upgrading.
 
-At startup, the server rejects a percent sign in the decoded hostname of any `CORS_ORIGINS` entry.
+At startup, the server rejects a percent sign or Unicode whitespace in the decoded hostname of any `CORS_ORIGINS` entry. Use Punycode for internationalized hostnames. Correct affected settings before upgrading.
 
 When the server reads an unset, empty or ASCII-whitespace-only `CORS_ORIGINS` value, it uses the default console origin. An explicit list replaces the default, and the server ignores empty entries. If no entries remain after trimming, the server stops before opening a listener and reports `CORS_ORIGINS must list at least one origin`. This includes a list of only commas and spaces or a value of only U+00A0.
 

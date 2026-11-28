@@ -548,6 +548,69 @@ const debianArgs = (command) => [
 ];
 
 test(
+  "restores Debian notices after a caller clears the file map",
+  linuxOnly,
+  (t) => {
+    const { root, run } = fixture(t);
+    const configDir = join(root, "src-tauri");
+    const baseFile = "/usr/share/delidev/base.txt";
+    const platformFile = "/usr/share/delidev/platform.txt";
+    const customFile = "/usr/share/delidev/custom.txt";
+    const licenseFile = "/usr/share/doc/delidev/cef/LICENSE.txt";
+    const creditsFile = "/usr/share/doc/delidev/cef/CREDITS.html";
+    const debConfig = (deb) => JSON.stringify({ bundle: { linux: { deb } } });
+    writeFileSync(
+      join(configDir, "tauri.conf.json"),
+      debConfig({ files: { [baseFile]: "base.txt" }, depends: ["libexample"] }),
+    );
+    writeFileSync(
+      join(configDir, "tauri.linux.conf.json"),
+      debConfig({ files: { [platformFile]: "platform.txt" } }),
+    );
+    const clear = debConfig({ files: null });
+    const custom = debConfig({
+      files: {
+        [customFile]: "custom.txt",
+        [licenseFile]: "custom-license.txt",
+      },
+    });
+
+    for (const command of ["build", "bundle"]) {
+      for (const [callerPatches, deletedFiles] of [
+        [[clear], { [baseFile]: null, [platformFile]: null }],
+        [[clear, custom], {}],
+      ]) {
+        const args = [
+          ...debianArgs(command),
+          ...callerPatches.flatMap((patch) => ["--config", patch]),
+        ];
+        const result = run(...args);
+        assert.equal(result.cli, "patched");
+        assert.deepEqual(result.args.slice(0, -2), args);
+        const patch = JSON.parse(result.args.at(-1));
+        assert.match(patch.build.beforeBundleCommand, /cef-notices\.mjs/);
+        const { files } = patch.bundle.linux.deb;
+        assert.match(files[licenseFile], /delidev-cef-.*\/LICENSE\.txt$/);
+        assert.match(files[creditsFile], /delidev-cef-.*\/CREDITS\.html$/);
+        assert.deepEqual(patch.bundle.linux.deb, {
+          files: {
+            ...deletedFiles,
+            [licenseFile]: files[licenseFile],
+            [creditsFile]: files[creditsFile],
+          },
+        });
+      }
+
+      const ordinary = run(...debianArgs(command), "--config", custom);
+      const defaults = JSON.parse(ordinary.args[2]).bundle.linux.deb.files;
+      assert.deepEqual(Object.keys(defaults), [licenseFile, creditsFile]);
+      assert.equal(ordinary.args.at(-3), custom);
+      assert.equal(JSON.parse(ordinary.args.at(-1)).bundle, undefined);
+    }
+  },
+);
+
+test(
   "cleans Debian notice staging on CLI exit and spawn failure",
   linuxOnly,
   (t) => {

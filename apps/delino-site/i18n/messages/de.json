@@ -34,5 +34,6 @@
   "theme.promptCopyText": "Prompt kopieren",
   "theme.promptCopiedText": "Kopiert",
   "theme.promptExpandText": "Ausklappen",
-  "theme.promptCollapseText": "Einklappen"
+  "theme.promptCollapseText": "Einklappen",
+  "nav.darkMode": "Dunkelmodus"
 }

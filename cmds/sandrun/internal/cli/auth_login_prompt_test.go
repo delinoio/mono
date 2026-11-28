@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,62 @@ func TestLoginReportsSafeOAuthError(t *testing.T) {
 	f.env[EnvLogtoAppID] = "app"
 	if got := f.run("", "login"); got != (result{code: ExitError, stderr: "error: logto: invalid_client\n"}) {
 		t.Fatalf("login = %+v, want a fixed OAuth error", got)
+	}
+}
+
+func TestLoginRejectsInvalidTokenLifetime(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing credentials=%t", existing), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/oidc/device/auth":
+					io.WriteString(w, `{"device_code":"device","user_code":"ABCD","verification_uri":"https://login.example/verify","expires_in":60}`)
+				case r.URL.Path == "/oidc/token" && r.FormValue("grant_type") == "urn:ietf:params:oauth:grant-type:device_code":
+					io.WriteString(w, `{"refresh_token":"device-refresh"}`)
+				case r.URL.Path == "/oidc/token" && r.FormValue("grant_type") == "refresh_token":
+					io.WriteString(w, `{"access_token":"bad-access","refresh_token":"bad-rotation","expires_in":9223372037}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(server.Close)
+			store := credstore.Store{Dir: t.TempDir(), Program: "sandrun"}
+			if existing {
+				if err := store.Save(&credstore.Credentials{RefreshToken: "existing"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(store.Path())
+			if existing && err != nil {
+				t.Fatal(err)
+			}
+
+			vars := map[string]string{
+				EnvConfigDir: store.Dir, EnvLogtoEndpoint: server.URL, EnvLogtoAppID: "app", EnvNoColor: "1",
+			}
+			var stdout, stderr bytes.Buffer
+			status := Run(t.Context(), Env{
+				Args: []string{"login"}, Stdout: &stdout, Stderr: &stderr,
+				LookupEnv: func(key string) (string, bool) {
+					value, ok := vars[key]
+					return value, ok
+				},
+				HTTPClient: server.Client(), LoginPollInterval: time.Millisecond,
+			})
+			const want = "Open https://login.example/verify in a browser and enter the code ABCD to sign in.\n" +
+				"error: logto: invalid token response: expires_in must be an integer in the supported duration range\n"
+			if status != ExitError || stdout.Len() != 0 || stderr.String() != want {
+				t.Errorf("login = %d, stdout %q, stderr %q, want exit %d, empty stdout and stderr %q", status, &stdout, &stderr, ExitError, want)
+			}
+			after, err := os.ReadFile(store.Path())
+			if existing {
+				if err != nil || !bytes.Equal(after, before) {
+					t.Errorf("login changed the existing credential file: %v", err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("credential file after rejected login: %v, want no file", err)
+			}
+		})
 	}
 }
 

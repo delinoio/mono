@@ -2,6 +2,18 @@
 import type { Transport } from "@connectrpc/connect";
 import { GitHubInstallationState } from "@delino/sandrun-protos/v1/common_pb";
 import type { MockTransportOptions } from "../src/mock/mock-api.ts";
+import {
+  DEV_SESSION_REFRESH_FIXTURE,
+  devSessionRefreshFixture,
+} from "./dev-session-refresh-fixture.ts";
+import {
+  INTEGRATION_PERMISSION_FIXTURE,
+  integrationPermissionFixture,
+} from "./integration-permission-fixture.ts";
+import {
+  organizationCreationFixture,
+  ORGANIZATION_CREATION_FIXTURE,
+} from "./organization-creation-fixture.ts";
 import { createMockTransport as createSettingsMock } from "./settings-mock.ts";
 import {
   pagedProfileIntegrations,
@@ -15,6 +27,15 @@ import {
 
 declare global {
   interface Window {
+    sandrunDevSessionReads?: boolean[];
+    sandrunOrganizationCreationFixture?: Omit<
+      ReturnType<typeof organizationCreationFixture>,
+      "transport"
+    >;
+    sandrunIntegrationPermissionFixture?: Omit<
+      ReturnType<typeof integrationPermissionFixture>,
+      "transport"
+    >;
     sandrunProfileIntegrationFixture?: Omit<
       ReturnType<typeof pagedProfileIntegrations>,
       "transport"
@@ -23,6 +44,34 @@ declare global {
 }
 
 export function createMockTransport(options?: MockTransportOptions): Transport {
+  const refreshMode = sessionStorage.getItem(DEV_SESSION_REFRESH_FIXTURE);
+  if (
+    refreshMode === "success" ||
+    refreshMode === "fail-cancel" ||
+    refreshMode === "fail-delete"
+  ) {
+    const { transport, reads } = devSessionRefreshFixture(
+      createSettingsMock(options),
+      refreshMode,
+    );
+    window.sandrunDevSessionReads = reads;
+    return transport;
+  }
+
+  const createMode = sessionStorage.getItem(ORGANIZATION_CREATION_FIXTURE);
+  if (
+    createMode === "hold-list" ||
+    createMode === "hold-create" ||
+    createMode === "fail-create"
+  ) {
+    const { transport, ...fixture } = organizationCreationFixture(
+      createSettingsMock(options),
+      createMode,
+    );
+    window.sandrunOrganizationCreationFixture = fixture;
+    return transport;
+  }
+
   const setup = sessionStorage.getItem(SETUP_GUIDANCE_FIXTURE);
   if (setup === "with-work-source") {
     return linkedSetupTransport(createSettingsMock(options), [
@@ -58,6 +107,16 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
         existingAgentIntegration:
           setup === "failed-github-continuation-with-agent",
       });
+  }
+
+  const permission = sessionStorage.getItem(INTEGRATION_PERMISSION_FIXTURE);
+  if (permission === "linked" || permission === "unlinked") {
+    const { transport, ...fixture } = integrationPermissionFixture(
+      createSettingsMock(options),
+      permission === "unlinked",
+    );
+    window.sandrunIntegrationPermissionFixture = fixture;
+    return transport;
   }
 
   const mode = sessionStorage.getItem(PROFILE_INTEGRATION_FIXTURE);

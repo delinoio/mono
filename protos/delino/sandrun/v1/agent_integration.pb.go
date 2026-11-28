@@ -1190,7 +1190,8 @@ type UpdateAgentIntegrationRequest struct {
 	AgentIntegrationId string                 `protobuf:"bytes,2,opt,name=agent_integration_id,json=agentIntegrationId,proto3" json:"agent_integration_id,omitempty"`
 	// New name, for the mask path `name`.
 	Name string `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	// New settings of the integration's vendor, for the mask path `settings`.
+	// New settings of the integration's vendor. Mask the active member or use
+	// the legacy alias `settings`.
 	//
 	// Types that are valid to be assigned to Settings:
 	//
@@ -1199,8 +1200,9 @@ type UpdateAgentIntegrationRequest struct {
 	//	*UpdateAgentIntegrationRequest_OpenaiCodex
 	//	*UpdateAgentIntegrationRequest_Devin
 	Settings isUpdateAgentIntegrationRequest_Settings `protobuf_oneof:"settings"`
-	// Replacement credentials, for the mask path `credentials`. Only the
-	// non-empty fields replace stored credentials.
+	// Replacement credentials of the integration's vendor. Mask the active member
+	// or use the legacy alias `credentials`. At least one field must be non-empty.
+	// Only non-empty fields replace stored credentials.
 	//
 	// Types that are valid to be assigned to Credentials:
 	//
@@ -1209,7 +1211,9 @@ type UpdateAgentIntegrationRequest struct {
 	//	*UpdateAgentIntegrationRequest_OpenaiCodexCredentials
 	//	*UpdateAgentIntegrationRequest_DevinCredentials
 	Credentials isUpdateAgentIntegrationRequest_Credentials `protobuf_oneof:"credentials"`
-	// `name`, `settings` and `credentials`.
+	// A non-empty mask of top-level paths. Use `name`, the active vendor-specific
+	// settings or credentials member names, or their legacy aliases. Each selected
+	// group is applied once, even if several paths select it.
 	UpdateMask    *fieldmaskpb.FieldMask `protobuf:"bytes,12,opt,name=update_mask,json=updateMask,proto3" json:"update_mask,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

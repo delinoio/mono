@@ -206,7 +206,7 @@ func TestDownloadDestinationHardLinkCaseCollision(t *testing.T) {
 							return errors.ErrUnsupported
 						}}
 						download = func(ctx context.Context, p DownloadParams) (*DownloadResult, error) {
-							return client.download(ctx, p, extractor)
+							return client.download(ctx, p, downloadLimits{file: DownloadFileLimit, total: DownloadTotalLimit}, extractor)
 						}
 					}
 					res, err := download(t.Context(), params)

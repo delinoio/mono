@@ -28,6 +28,8 @@ function Search({ items }: { items: Item[] }) {
 **Correct (input stays snappy, results render when ready):**
 
 ```tsx
+const MemoizedResultsList = memo(ResultsList)
+
 function Search({ items }: { items: Item[] }) {
   const [query, setQuery] = useState('')
   const deferredQuery = useDeferredValue(query)
@@ -41,7 +43,7 @@ function Search({ items }: { items: Item[] }) {
     <>
       <input value={query} onChange={e => setQuery(e.target.value)} />
       <div style={{ opacity: isStale ? 0.7 : 1 }}>
-        <ResultsList results={filtered} />
+        <MemoizedResultsList results={filtered} />
       </div>
     </>
   )
@@ -54,6 +56,6 @@ function Search({ items }: { items: Item[] }) {
 - Expensive visualizations (charts, graphs) reacting to input
 - Any derived state that causes noticeable render delays
 
-**Note:** Wrap the expensive computation in `useMemo` with the deferred value as a dependency, otherwise it still runs on every render.
+With React Compiler disabled, use `memo` at module scope so the list can skip rendering when its `results` prop stays the same. During the urgent update, React updates the input and dims the stale list. Since `items` and `deferredQuery` are unchanged, `useMemo` reuses the filtered array. When `deferredQuery` catches up, the filter produces a new array, the list renders the new results, and the wrapper returns to full opacity.
 
 Reference: [React useDeferredValue](https://react.dev/reference/react/useDeferredValue)

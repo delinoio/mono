@@ -83,6 +83,23 @@ export class DataPathSelector {
     return this.#peerClose.signal;
   }
 
+  /** Observes handle closure while the handle still uses peer-to-peer. */
+  watchPeerClose(onClose: (reason: unknown) => void): (() => void) | undefined {
+    if (this.#onRelay) return;
+    const signal = this.peerCloseSignal;
+    if (signal.aborted) {
+      onClose(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      // Another operation may have moved the handle to relay since this watch
+      // began. The peer close signal still aborts to stop retired sessions.
+      if (!this.#onRelay) onClose(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    return () => signal.removeEventListener("abort", onAbort);
+  }
+
   /**
    * Returns the peer session to use, or undefined for the relay. Concurrent
    * callers share one session setup. The setup has its own abort signal, so

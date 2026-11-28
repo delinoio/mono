@@ -263,6 +263,7 @@ type backgroundRig struct {
 	publicAddr    string
 	logs          *syncBuffer
 	workerStarted chan struct{}
+	workerStopped atomic.Bool
 	result        chan error
 }
 
@@ -270,11 +271,15 @@ type backgroundRig struct {
 // disables the metrics listener like an empty METRICS_ADDR.
 func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) *backgroundRig {
 	t.Helper()
+	return startBackgroundRigWithListener(t, newTestListener(t), serveMetrics)
+}
+
+func startBackgroundRigWithListener(t *testing.T, listener net.Listener, serveMetrics func(context.Context) error) *backgroundRig {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
-	listener := newTestListener(t)
 	rig := &backgroundRig{
 		cancel:        cancel,
 		publicAddr:    listener.Addr().String(),
@@ -285,6 +290,7 @@ func startBackgroundRig(t *testing.T, serveMetrics func(context.Context) error) 
 	worker := func(background context.Context) {
 		close(rig.workerStarted)
 		<-background.Done()
+		rig.workerStopped.Store(true)
 	}
 	srv := newServer(http.NewServeMux(), logger)
 	go func() {
@@ -310,16 +316,6 @@ func (r *backgroundRig) await(t *testing.T) error {
 	}
 }
 
-// publicRefusesConnections reports whether the public listener is closed.
-func (r *backgroundRig) publicRefusesConnections() bool {
-	conn, err := net.DialTimeout("tcp", r.publicAddr, time.Second)
-	if err == nil {
-		_ = conn.Close()
-		return false
-	}
-	return true
-}
-
 // permanentAcceptMetrics serves the metrics handler on a listener whose Accept
 // fails with errMetricsAccept, after the bind has succeeded.
 func permanentAcceptMetrics(t *testing.T) func(context.Context) error {
@@ -340,8 +336,15 @@ func TestRunServersShutsDownOnTerminalMetricsListenerError(t *testing.T) {
 	if !errors.Is(err, errMetricsAccept) {
 		t.Fatalf("runServers error = %v; want the metrics Accept error", err)
 	}
-	if !rig.publicRefusesConnections() {
-		t.Error("public listener still accepts connections after runServers returned")
+	if !rig.workerStopped.Load() {
+		t.Error("runServers returned before the billing worker finished its in-progress work")
+	}
+	dialer := net.Dialer{Timeout: listenerProbeTimeout}
+	refused, err := probeTCPRefusal(rig.publicAddr, dialer.Dial)
+	if err != nil {
+		t.Errorf("after runServers returned: %v", err)
+	} else if !refused {
+		t.Errorf("public listener at %s still accepts connections after runServers returned", rig.publicAddr)
 	}
 	logs := rig.logs.String()
 	for _, want := range []string{"metrics_listener_failed", "server_shutdown_started", "server_shutdown_completed", errMetricsAccept.Error()} {
@@ -410,21 +413,98 @@ func TestRunServersKeepsMetricsErrorWhenShutdownSignalRaces(t *testing.T) {
 	}
 }
 
+type acceptSignalingListener struct {
+	net.Listener
+	entered chan struct{}
+}
+
+func (l acceptSignalingListener) Accept() (net.Conn, error) {
+	close(l.entered)
+	return l.Listener.Accept()
+}
+
+func TestRunServersKeepsPermanentMetricsAcceptErrorDuringShutdown(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		publicErr error
+	}{
+		{name: "shutdown signal"},
+		{name: "public listener failure", publicErr: errPublicAccept},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			public := newTestListener(t)
+			listener := public
+			if tc.publicErr != nil {
+				listener = acceptErrorOnCloseListener{Listener: public, err: tc.publicErr}
+			}
+			// The metrics Accept blocks on the TCP listener until Shutdown
+			// closes it. The fixture then returns the independent error.
+			metricsListener := acceptSignalingListener{
+				Listener: acceptErrorOnCloseListener{Listener: newTestListener(t), err: errMetricsAccept},
+				entered:  make(chan struct{}),
+			}
+			rig := startBackgroundRigWithListener(t, listener, func(ctx context.Context) error {
+				return metrics.Serve(ctx, metricsListener, http.NotFoundHandler(), newTestLogger())
+			})
+			select {
+			case <-metricsListener.entered:
+			case <-time.After(handlerStartTimeout):
+				t.Fatal("metrics listener did not enter Accept")
+			}
+
+			if tc.publicErr == nil {
+				rig.cancel()
+			} else if err := public.Close(); err != nil {
+				t.Fatalf("fail public listener: %v", err)
+			}
+			err := rig.await(t)
+			if !errors.Is(err, errMetricsAccept) {
+				t.Errorf("runServers error = %v, want the metrics Accept error", err)
+			}
+			if tc.publicErr != nil && !errors.Is(err, tc.publicErr) {
+				t.Errorf("runServers error = %v, want the public Accept error too", err)
+			}
+			if !rig.workerStopped.Load() {
+				t.Error("runServers returned before the billing worker finished")
+			}
+			loggedError := false
+			for line := range strings.SplitSeq(rig.logs.String(), "\n") {
+				if strings.Contains(line, "metrics_listener_failed") && strings.Contains(line, errMetricsAccept.Error()) {
+					loggedError = true
+					break
+				}
+			}
+			if !loggedError {
+				t.Errorf("logs lack metrics_listener_failed with the metrics Accept error: %s", rig.logs.String())
+			}
+		})
+	}
+}
+
 // TestRunServersCleanShutdownWithMetricsReturnsNil verifies that a signal
 // shutdown with a healthy metrics listener is not an error: the metrics
 // listener's http.ErrServerClosed outcome is filtered.
 func TestRunServersCleanShutdownWithMetricsReturnsNil(t *testing.T) {
-	listener := newTestListener(t)
+	listener := acceptSignalingListener{
+		Listener: newTestListener(t),
+		entered:  make(chan struct{}),
+	}
 	rig := startBackgroundRig(t, func(ctx context.Context) error {
 		return metrics.Serve(ctx, listener, http.NotFoundHandler(), newTestLogger())
 	})
 
+	select {
+	case <-listener.entered:
+	case <-time.After(handlerStartTimeout):
+		t.Fatal("metrics listener did not enter Accept")
+	}
 	rig.cancel()
 	if err := rig.await(t); err != nil {
 		t.Fatalf("runServers error = %v; want nil after a clean shutdown", err)
 	}
-	if !strings.Contains(rig.logs.String(), "server_shutdown_completed") {
-		t.Errorf("logs lack server_shutdown_completed; logs: %s", rig.logs.String())
+	logs := rig.logs.String()
+	if !strings.Contains(logs, "server_shutdown_completed") || strings.Contains(logs, "metrics_listener_failed") {
+		t.Errorf("want a clean shutdown in the logs: %s", logs)
 	}
 }
 

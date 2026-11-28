@@ -394,6 +394,8 @@ func TestServerShutdownAfterMetricsFailureOrSignal(t *testing.T) {
 			requestStarted := make(chan struct{})
 			releaseRequest := make(chan struct{})
 			requestFinished := make(chan struct{})
+			metricsOpenAtFlushEntry := make(chan bool, 1)
+			releaseFlush := make(chan struct{})
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			public := shutdownTestListener(t)
 			srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -424,13 +426,14 @@ func TestServerShutdownAfterMetricsFailureOrSignal(t *testing.T) {
 					_, _ = io.WriteString(w, "metric 1\n")
 				})}
 			}
+			healthyMetrics := tc.metricsEnabled && tc.order == signalOnly
 			usage := &fakeUsage{drain: func(context.Context) error {
 				select {
 				case <-requestFinished:
 				default:
 					t.Error("usage drain started while a public request was still open")
 				}
-				if tc.metricsEnabled && tc.order == signalOnly {
+				if healthyMetrics {
 					select {
 					case <-failingMetrics.closed:
 						t.Error("healthy metrics listener closed before usage drain")
@@ -439,6 +442,32 @@ func TestServerShutdownAfterMetricsFailureOrSignal(t *testing.T) {
 				}
 				return nil
 			}}
+			if healthyMetrics {
+				usage.flush = func(flushCtx context.Context) error {
+					select {
+					case <-failingMetrics.closed:
+						metricsOpenAtFlushEntry <- false
+						return nil
+					default:
+						metricsOpenAtFlushEntry <- true
+					}
+					select {
+					case <-releaseFlush:
+					case <-failingMetrics.closed:
+					case <-flushCtx.Done():
+						return fmt.Errorf("waiting to release final usage flush: %w", flushCtx.Err())
+					case <-t.Context().Done():
+						return t.Context().Err()
+					}
+					// Release and listener closure can both be ready.
+					select {
+					case <-failingMetrics.closed:
+						return errors.New("healthy metrics listener closed during final usage flush")
+					default:
+						return nil
+					}
+				}
+			}
 			if tc.order == metricsOnly {
 				usage.flushErr = errors.New("final usage flush failed")
 			}
@@ -483,6 +512,12 @@ func TestServerShutdownAfterMetricsFailureOrSignal(t *testing.T) {
 			requireShutdownPending(t, done)
 			close(releaseRequest)
 			requireShutdownResponse(t, resp, "finished")
+			if healthyMetrics {
+				if !waitForShutdownTest(t, metricsOpenAtFlushEntry) {
+					t.Error("healthy metrics listener closed before final usage flush")
+				}
+				close(releaseFlush)
+			}
 			err := waitForShutdownTest(t, done)
 			if tc.order == signalOnly {
 				if err != nil {

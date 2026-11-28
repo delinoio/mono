@@ -197,11 +197,13 @@ type Manager struct {
 	// beforeSnapshotCapture is a test hook called before the manager marks
 	// a capture as started, while the source sandbox command lock is held.
 	beforeSnapshotCapture func()
-	// Snapshot tests can pause admission or publication, or fail removal.
+	// Snapshot tests can pause admission or publication, fail removal, or
+	// observe import lock contention.
 	hookMu                sync.Mutex
 	afterSnapshotLookup   func(id string)
 	beforeSnapshotPublish func(id string)
 	removalHook           func(id string) error
+	importWaiterHook      func(id string)
 	// bg tracks the background sandbox ends (TTL expiries and unexpected
 	// VM exits). Add is called only under mu while closed is false, so
 	// that Close can wait for them.

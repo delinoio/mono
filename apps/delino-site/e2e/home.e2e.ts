@@ -147,7 +147,7 @@ describe("compact navigation focus", () => {
       hovered: trigger.matches(":hover"),
       open: Boolean(
         document.querySelector(
-          ".rp-nav-screen--open, .rp-nav-hamburger__md .rp-hover-group:not(.rp-hover-group--hidden)",
+          '.rp-nav-screen--open, .rp-nav-hamburger__md[aria-expanded="true"]',
         ),
       ),
       dark: document.documentElement.classList.contains("rp-dark"),
@@ -172,7 +172,7 @@ describe("compact navigation focus", () => {
         await app.open("/");
         await browser.mouse.move(10, 200);
 
-        const trigger = screen.getByRole("button", "mobile hamburger");
+        const trigger = screen.getByRole("button", "Menu");
         await expect(trigger).toBeVisible();
         for (let step = 0; step < tabCount; step++) {
           await browser.keyboard.press("Tab");
@@ -225,7 +225,163 @@ describe("compact navigation focus", () => {
       await expect(header.getByRole("link", name)).toBeFocused();
     }
     await browser.keyboard.press("Tab");
+    await expect(header.getByRole("button", "Dark mode")).toBeFocused();
+    await browser.keyboard.press("Tab");
     await expect(screen.getByRole("link", "Read the docs")).toBeFocused();
+  });
+});
+
+describe("appearance switch", () => {
+  async function tabTo(browser: WebFixtures["browser"], selector: string) {
+    for (let step = 0; step < 10; step++) {
+      await browser.keyboard.press("Tab");
+      if (
+        await browser.evaluate(
+          (target) => document.activeElement?.matches(target) ?? false,
+          selector,
+        )
+      )
+        return;
+    }
+    throw new Error(`Tab did not reach ${selector}`);
+  }
+
+  for (const width of [1440, 1024, 375]) {
+    test(`switches appearance with keyboard and pointer at ${width}px`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await browser.setViewport({ width, height: 900 });
+      await browser.emulateMedia({ colorScheme: "light" });
+      await app.open("/");
+
+      const toggle = screen.getByRole("button", "Dark mode");
+      async function tabToToggle() {
+        if (width < 1440) {
+          const trigger = screen.getByRole("button", "Menu");
+          await expect(trigger).toBeVisible();
+          await tabTo(browser, ".rp-nav-hamburger");
+          await expect(trigger).toBeFocused();
+          await browser.keyboard.press("Enter");
+          await expect(trigger).toHaveAttribute("aria-expanded", "true");
+        }
+        await expect(toggle).toBeVisible();
+        await tabTo(browser, ".rp-switch-appearance");
+        await expect(toggle).toBeFocused();
+      }
+
+      async function expectDarkMode(dark: boolean) {
+        await expect(toggle).toHaveAttribute("aria-pressed", String(dark));
+        expect(
+          await browser.evaluate(() =>
+            document.documentElement.classList.contains("rp-dark"),
+          ),
+        ).toBe(dark);
+      }
+
+      await tabToToggle();
+      await expectDarkMode(false);
+      if (width === 375) {
+        expect(
+          await browser.evaluate(() =>
+            Boolean(
+              document
+                .elementFromPoint(10, innerHeight - 10)
+                ?.closest(".rp-nav-screen--open"),
+            ),
+          ),
+        ).toBe(true);
+      }
+      const focus = await browser.evaluate(() => {
+        const active = document.activeElement!;
+        const style = getComputedStyle(active);
+        return {
+          nativeButton: active instanceof HTMLButtonElement,
+          hasInteractiveAncestor: Boolean(
+            active.parentElement?.closest(
+              "button, a[href], input, select, textarea, summary, [tabindex], [contenteditable]",
+            ),
+          ),
+          outlineStyle: style.outlineStyle,
+          outlineWidth: parseFloat(style.outlineWidth),
+        };
+      });
+      expect(focus.nativeButton).toBe(true);
+      expect(focus.hasInteractiveAncestor).toBe(false);
+      expect(focus.outlineStyle).toBe("solid");
+      expect(focus.outlineWidth).toBeGreaterThanOrEqual(2);
+
+      await browser.keyboard.press("Enter");
+      await expectDarkMode(true);
+
+      await browser.reload();
+      await tabToToggle();
+      await expectDarkMode(true);
+
+      await browser.keyboard.press("Space");
+      await expectDarkMode(false);
+
+      await toggle.click();
+      await expectDarkMode(true);
+    });
+  }
+
+  test("follows the dark system preference with no saved choice", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await browser.setViewport({ width: 1440, height: 900 });
+    await browser.emulateMedia({ colorScheme: "dark" });
+    await app.open("/");
+    const toggle = screen.getByRole("button", "Dark mode");
+    await expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+    await browser.emulateMedia({ colorScheme: "light" });
+    await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  });
+
+  test("exposes a localized accessible name in Korean", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await browser.setViewport({ width: 1440, height: 900 });
+    await app.open("/ko/");
+    await expect(screen.getByRole("button", "다크 모드")).toBeVisible();
+  });
+
+  test("keeps the medium popup open while keyboard focus is inside", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await browser.setViewport({ width: 1024, height: 900 });
+    await app.open("/");
+    const trigger = screen.getByRole("button", "Menu");
+    const toggle = screen.getByRole("button", "Dark mode");
+
+    await expect(trigger).toBeVisible();
+    await tabTo(browser, ".rp-nav-hamburger");
+    await browser.keyboard.press("Space");
+    await expect(toggle).toBeVisible();
+    await browser.keyboard.press("Tab");
+    await expect(toggle).toBeFocused();
+    await trigger.hover();
+    await browser.mouse.move(10, 200);
+    await expect(trigger).toHaveAttribute("aria-expanded", "true");
+
+    await browser.keyboard.press("Escape");
+    await expect(trigger).toBeFocused();
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    await trigger.hover();
+    await expect(toggle).toBeVisible();
+    await browser.mouse.move(10, 200);
+    await browser.mouse.down();
+    await browser.mouse.up();
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
 });
 

@@ -14,6 +14,11 @@ func TestValidateAccepts(t *testing.T) {
 		"[::1]:65535",
 		"[fe80::1%eth0]:80",
 		"localhost:80",
+		"123.example.com:80",
+		"1.2.3.example.:443",
+		"1.2.3:80",
+		"1.2.3.4.5:80",
+		"256.0.0.1.:80",
 		"api.example.com.:443",
 		"a-b.c:1",
 	} {
@@ -26,14 +31,17 @@ func TestValidateAccepts(t *testing.T) {
 func TestValidateRejects(t *testing.T) {
 	long := strings.Repeat("a", 64)
 	for value, want := range map[string]string{
-		"127.0.0.1":       "STUN_ADDR must be a host:port address",
-		":70000":          `STUN_ADDR port must be a number from 0 to 65535; got "70000"`,
-		":http":           `STUN_ADDR port must be a number from 0 to 65535; got "http"`,
-		"not a host:80":   `STUN_ADDR host must be a hostname or IP address; got "not a host"`,
-		"-bad.example:80": "STUN_ADDR host must be a hostname or IP address",
-		"bad..example:80": "STUN_ADDR host must be a hostname or IP address",
-		long + ".com:80":  "STUN_ADDR host must be a hostname or IP address",
-		"under_score:80":  "STUN_ADDR host must be a hostname or IP address",
+		"127.0.0.1":        "STUN_ADDR must be a host:port address",
+		":70000":           `STUN_ADDR port must be a number from 0 to 65535; got "70000"`,
+		":http":            `STUN_ADDR port must be a number from 0 to 65535; got "http"`,
+		"not a host:80":    `STUN_ADDR host must be a hostname or IP address; got "not a host"`,
+		"256.0.0.1:8080":   `STUN_ADDR host must be a hostname or IP address; got "256.0.0.1"`,
+		"127.0.0.256:8080": `STUN_ADDR host must be a hostname or IP address; got "127.0.0.256"`,
+		"127.00.0.1:8080":  `STUN_ADDR host must be a hostname or IP address; got "127.00.0.1"`,
+		"-bad.example:80":  "STUN_ADDR host must be a hostname or IP address",
+		"bad..example:80":  "STUN_ADDR host must be a hostname or IP address",
+		long + ".com:80":   "STUN_ADDR host must be a hostname or IP address",
+		"under_score:80":   "STUN_ADDR host must be a hostname or IP address",
 	} {
 		err := Validate("STUN_ADDR", value)
 		if err == nil || !strings.Contains(err.Error(), want) {

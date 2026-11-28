@@ -9,6 +9,7 @@ import {
   RequestState,
   WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
+import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
 import { type Request, WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import { useState } from "react";
 import { invalidateServices, PAGE_SIZE } from "../api.ts";
@@ -107,7 +108,8 @@ export function RequestsPage() {
     },
   );
   const cancel = useMutation(WorkService.method.cancelRequest, {
-    onSuccess: () => invalidateServices(queryClient, WorkService),
+    onSuccess: () =>
+      invalidateServices(queryClient, WorkService, DevSessionService),
   });
   const admin = can(role, Permission.CancelRequests);
   const now = useQueueWaitClock();

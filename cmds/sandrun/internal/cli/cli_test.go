@@ -145,6 +145,74 @@ func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
 	)
 }
 
+func TestExecJSONGroupsMalformedUTF8AcrossChunks(t *testing.T) {
+	for _, kind := range []sandrun.ExecEventKind{sandrun.ExecEventStdout, sandrun.ExecEventStderr} {
+		for _, tc := range []struct {
+			name    string
+			chunks  []string
+			offsets []int64
+			texts   []string
+		}{
+			{"one chunk", []string{"\xff\xfez"}, []int64{0}, []string{"�z"}},
+			{"split run", []string{"\xff", "\xfez"}, []int64{0, 2}, []string{"�", "z"}},
+			{"no new text", []string{"\xff", "\xfe", "z"}, []int64{0, 2}, []string{"�", "z"}},
+			{"literal replacement", []string{"\xff\xef", "\xbf", "\xbd", "\xfe"}, []int64{0, 1, 4}, []string{"�", "�", "�"}},
+			{"invalidated prefix", []string{"\xff\xe2", "\x82", "z"}, []int64{0, 3}, []string{"�", "z"}},
+		} {
+			t.Run(kind.String()+"/"+tc.name, func(t *testing.T) {
+				var output bytes.Buffer
+				w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
+				var offset int64
+				for _, chunk := range tc.chunks {
+					if err := w.event(sandrun.ExecEvent{Kind: kind, Offset: offset, Data: []byte(chunk)}); err != nil {
+						t.Fatal(err)
+					}
+					offset += int64(len(chunk))
+				}
+				var want []execJSONLine
+				for i, data := range tc.texts {
+					want = append(want, execJSONLine{Event: kind.String(), Offset: tc.offsets[i], Data: data})
+				}
+				checkExecJSONLines(t, output.String(), want...)
+			})
+		}
+	}
+}
+
+func TestExecJSONMalformedUTF8ResetsOnlyAffectedStream(t *testing.T) {
+	stdout, stderr := sandrun.ExecEventStdout, sandrun.ExecEventStderr
+	var output bytes.Buffer
+	w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
+	for _, ev := range []sandrun.ExecEvent{
+		{Kind: stdout, Offset: 0, Data: []byte("\xff")},
+		{Kind: stderr, Offset: 0, Data: []byte("\xff")},
+		{Kind: stdout, Offset: 1, Data: []byte("\xfe")},
+		{Kind: sandrun.ExecEventOutputTruncated, MissingStdout: sandrun.ByteRange{From: 2, To: 4}},
+		{Kind: stdout, Offset: 4, Data: []byte("\xfe")},
+		{Kind: stderr, Offset: 1, Data: []byte("\xfez")},
+		{Kind: stdout, Offset: 6, Data: []byte("\xfe")},
+	} {
+		if err := w.event(ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.Kind == sandrun.ExecEventOutputTruncated && (w.stdout.invalidRun || !w.stderr.invalidRun) {
+			t.Fatal("truncation must reset the malformed run for stdout only")
+		}
+	}
+	checkExecJSONLines(t, output.String(),
+		execJSONLine{Event: "stdout", Offset: 0, Data: "�"},
+		execJSONLine{Event: "stderr", Offset: 0, Data: "�"},
+		execJSONLine{
+			Event:         "output_truncated",
+			MissingStdout: &execJSONRange{From: new(int64(2)), To: new(int64(4))},
+			MissingStderr: &execJSONRange{From: new(int64(0)), To: new(int64(0))},
+		},
+		execJSONLine{Event: "stdout", Offset: 4, Data: "�"},
+		execJSONLine{Event: "stderr", Offset: 2, Data: "z"},
+		execJSONLine{Event: "stdout", Offset: 6, Data: "�"},
+	)
+}
+
 func TestExecJSONWritesDistinctTruncationRanges(t *testing.T) {
 	var output bytes.Buffer
 	w := execWriter{a: &app{fmt: FormatJSON, env: Env{Stdout: &output}}}
@@ -170,7 +238,7 @@ func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
 	}{
 		{event: "exited"},
 		{event: "stream_error", err: &sandrun.ExecStreamError{
-			ExecID: "exec", StdoutOffset: 2, StderrOffset: 2, Err: errors.New("stream broke"),
+			ExecID: "exec", StdoutOffset: 3, StderrOffset: 2, Err: errors.New("stream broke"),
 		}},
 	} {
 		t.Run(tc.event, func(t *testing.T) {
@@ -178,14 +246,14 @@ func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
 			a := &app{fmt: FormatJSON, env: Env{Stdout: &output}, logger: slog.Default()}
 			w := execWriter{a: a}
 			for _, ev := range []sandrun.ExecEvent{
-				{Kind: sandrun.ExecEventStdout, ExecID: "exec", Data: []byte("\xe2\x82")},
+				{Kind: sandrun.ExecEventStdout, ExecID: "exec", Data: []byte("\xff\xe2\x82")},
 				{Kind: sandrun.ExecEventStderr, ExecID: "exec", Data: []byte("x\xe2")},
 			} {
 				if err := w.event(ev); err != nil {
 					t.Fatal(err)
 				}
 			}
-			res := &sandrun.ExecResult{Kind: sandrun.ExecResultExited, ExecID: "exec", StdoutOffset: 2, StderrOffset: 2}
+			res := &sandrun.ExecResult{Kind: sandrun.ExecResultExited, ExecID: "exec", StdoutOffset: 3, StderrOffset: 2}
 			err := a.finishExec(context.Background(), "session", &w, res, tc.err)
 			if tc.err != nil {
 				var exit *exitError
@@ -196,8 +264,9 @@ func TestExecJSONFlushesUTF8BeforeResult(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkExecJSONLines(t, output.String(),
-				execJSONLine{Event: "stderr", Offset: 0, Data: "x"},
 				execJSONLine{Event: "stdout", Offset: 0, Data: "�"},
+				execJSONLine{Event: "stderr", Offset: 0, Data: "x"},
+				execJSONLine{Event: "stdout", Offset: 1, Data: "�"},
 				execJSONLine{Event: "stderr", Offset: 1, Data: "�"},
 				execJSONLine{Event: tc.event},
 			)
@@ -339,7 +408,8 @@ func TestSessionExecJSONResumesBufferedUTF8(t *testing.T) {
 		execJSONLine{Event: "stderr", Offset: 0, Data: "ok"},
 		execJSONLine{Event: "stdout", Offset: 0, Data: "a"},
 	)
-	_, hint, ok := strings.Cut(stderr.String(), "Continue with: sandrun ")
+	const detached = "interrupted. Detached from the output stream after the command started. Continue with: sandrun "
+	_, hint, ok := strings.Cut(stderr.String(), detached)
 	if !ok || !strings.HasSuffix(strings.TrimSpace(hint), "--stdout-offset 1 --stderr-offset 2") {
 		t.Fatalf("attach hint = %s", stderr.String())
 	}
@@ -351,6 +421,127 @@ func TestSessionExecJSONResumesBufferedUTF8(t *testing.T) {
 		execJSONLine{Event: "stdout", Offset: 1, Data: "€"},
 		execJSONLine{Event: "exited"},
 	)
+}
+
+func TestExecAttachAfterUnconfirmedStart(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		retained bool
+	}{
+		{name: "no admission"},
+		{name: "retained terminal result", retained: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			f := &unconfirmedExecFixture{
+				cancel: cancel, retained: tc.retained,
+				requested: make(chan string, 1),
+				attached:  make(chan *sandrunv1.AttachDevSessionExecRequest, 1),
+			}
+			_, handler := sandrunv1connect.NewDevSessionServiceHandler(f)
+			srv := httptest.NewUnstartedServer(handler)
+			srv.Config.Protocols = new(http.Protocols)
+			srv.Config.Protocols.SetUnencryptedHTTP2(true)
+			srv.Start()
+			t.Cleanup(srv.Close)
+
+			env := func(key string) (string, bool) {
+				switch key {
+				case EnvAPIKey:
+					return sandruntest.DefaultAPIKey, true
+				case EnvNoColor:
+					return "1", true
+				default:
+					return "", false
+				}
+			}
+			var stdout, stderr bytes.Buffer
+			code := Run(ctx, Env{
+				Args:      []string{"--api-url", srv.URL, "--org", "org", "--output", "text", "session", "exec", "session", "--", "command"},
+				Stdout:    &stdout,
+				Stderr:    &stderr,
+				LookupEnv: env,
+			})
+			var execID string
+			select {
+			case execID = <-f.requested:
+				if execID == "" {
+					t.Fatal("exec request omitted its ID")
+				}
+			default:
+				t.Fatalf("fixture did not receive the exec request: exit %d, stderr %q", code, &stderr)
+			}
+			wantHint := "session attach session " + execID + " --org=org --api-url=" + srv.URL + " --output=text --stdout-offset 0 --stderr-offset 0"
+			const unconfirmed = "interrupted. Command start is unconfirmed. Check with: sandrun "
+			_, hint, ok := strings.Cut(stderr.String(), unconfirmed)
+			if code != ExitInterrupted || stdout.Len() != 0 || !ok || strings.TrimSpace(hint) != wantHint {
+				t.Fatalf("exec = %d, stdout %q, stderr %q, want interrupt and hint %q", code, &stdout, &stderr, wantHint)
+			}
+
+			attachCtx, cancelAttach := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancelAttach()
+			stdout.Reset()
+			stderr.Reset()
+			code = Run(attachCtx, Env{Args: strings.Fields(hint), Stdout: &stdout, Stderr: &stderr, LookupEnv: env})
+			select {
+			case req := <-f.attached:
+				if req.GetExecId() != execID || req.GetStdoutOffset() != 0 || req.GetStderrOffset() != 0 {
+					t.Fatalf("attach request = %v, want exec ID %s and zero offsets", req, execID)
+				}
+			default:
+				t.Fatalf("fixture did not receive the attach request: exit %d, stderr %q", code, &stderr)
+			}
+			if tc.retained {
+				if code != ExitOK || stdout.String() != "retained output" || stderr.Len() != 0 {
+					t.Fatalf("attach = %d, stdout %q, stderr %q, want retained output", code, &stdout, &stderr)
+				}
+			} else if code != ExitDataPath || stdout.Len() != 0 || !strings.Contains(stderr.String(), "not_found: exec is not retained") {
+				t.Fatalf("attach = %d, stdout %q, stderr %q, want not_found", code, &stdout, &stderr)
+			}
+		})
+	}
+}
+
+type unconfirmedExecFixture struct {
+	sandrunv1connect.UnimplementedDevSessionServiceHandler
+	cancel    context.CancelFunc
+	retained  bool
+	requested chan string
+	attached  chan *sandrunv1.AttachDevSessionExecRequest
+}
+
+func (f *unconfirmedExecFixture) ExecDevSession(ctx context.Context, req *connect.Request[sandrunv1.ExecDevSessionRequest], _ *connect.ServerStream[sandrunv1.ExecDevSessionResponse]) error {
+	select {
+	case f.requested <- req.Msg.GetExecId():
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	f.cancel()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *unconfirmedExecFixture) AttachDevSessionExec(ctx context.Context, req *connect.Request[sandrunv1.AttachDevSessionExecRequest], stream *connect.ServerStream[sandrunv1.AttachDevSessionExecResponse]) error {
+	select {
+	case f.attached <- req.Msg:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if !f.retained {
+		return connect.NewError(connect.CodeNotFound, errors.New("exec is not retained"))
+	}
+	output := &sandrunv1.DevSessionExecEvent{Event: &sandrunv1.DevSessionExecEvent_Stdout{
+		Stdout: &sandrunv1.DevSessionExecOutput{Data: []byte("retained output")},
+	}}
+	if err := stream.Send(&sandrunv1.AttachDevSessionExecResponse{Event: output}); err != nil {
+		return err
+	}
+	return stream.Send(&sandrunv1.AttachDevSessionExecResponse{Event: &sandrunv1.DevSessionExecEvent{
+		Event: &sandrunv1.DevSessionExecEvent_Exited{
+			Exited: &sandrunv1.DevSessionExecExited{Status: &sandrunv1.DevSessionExecExited_ExitCode{}},
+		},
+	}})
 }
 
 func TestExecAttachCommandQuotesArguments(t *testing.T) {

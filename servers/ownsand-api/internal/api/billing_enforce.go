@@ -109,6 +109,10 @@ type billingTarget struct {
 
 // Pass runs one suspension and resume pass.
 func (e *BillingEnforcer) Pass(ctx context.Context) error {
+	return e.pass(ctx, nil)
+}
+
+func (e *BillingEnforcer) pass(ctx context.Context, observeTargets func(pause, resume []billingTarget)) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	s := e.s
@@ -134,6 +138,9 @@ func (e *BillingEnforcer) Pass(ctx context.Context) error {
 	if err != nil {
 		s.Logger.WarnContext(ctx, "billing_enforcement_failed", slog.Any("error", err))
 		return err
+	}
+	if observeTargets != nil {
+		observeTargets(pause, resume)
 	}
 	sem := make(chan struct{}, billingEnforceParallel)
 	var wg sync.WaitGroup

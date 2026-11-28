@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -68,9 +70,8 @@ func (f *rotationFixture) save(session, refresh, access string, lifetime time.Du
 	})
 }
 
-func (f *rotationFixture) source(logs io.Writer) sandrun.TokenSource {
-	f.t.Helper()
-	a := &app{
+func (f *rotationFixture) app(logs io.Writer) *app {
+	return &app{
 		env: Env{LookupEnv: func(k string) (string, bool) {
 			if k == EnvConfigDir {
 				return f.store.Dir, true
@@ -79,7 +80,11 @@ func (f *rotationFixture) source(logs io.Writer) sandrun.TokenSource {
 		}},
 		logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
-	source, err := a.tokenSource()
+}
+
+func (f *rotationFixture) source(logs io.Writer) sandrun.TokenSource {
+	f.t.Helper()
+	source, err := f.app(logs).tokenSource()
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -115,6 +120,46 @@ func assertAccessToken(t *testing.T, source sandrun.TokenSource, want string) {
 	t.Helper()
 	if got, err := source(t.Context()); err != nil || got != want {
 		t.Fatalf("access token = %q, error = %v, want %q", got, err, want)
+	}
+}
+
+func TestTokenSourceRejectsInvalidTokenLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		source func(*app) (sandrun.TokenSource, error)
+	}{
+		{"CLI", (*app).tokenSource},
+		{"MCP", (*app).mcpTokenSource},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRotationFixture(t, func(_ *rotationFixture, _ string, attempt int) string {
+				if attempt == 1 {
+					return `{"access_token":"bad-access","refresh_token":"bad-rotation","expires_in":9223372037}`
+				}
+				return tokenResponse("jwt-1", "rt-1", 3600)
+			})
+			before, err := os.ReadFile(f.store.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := tc.source(f.app(io.Discard))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const want = "refresh the Logto token (run 'sandrun login' again if it was revoked): " +
+				"logto: invalid token response: expires_in must be an integer in the supported duration range"
+			if got, err := source(t.Context()); got != "" || err == nil || err.Error() != want {
+				t.Errorf("source() = %q, %v, want an empty token and %q", got, err, want)
+			}
+			after, err := os.ReadFile(f.store.Path())
+			if err != nil || !bytes.Equal(after, before) {
+				t.Errorf("refresh changed the existing credential file: %v", err)
+			}
+			f.assertCalls("rt-0")
+			assertAccessToken(t, source, "jwt-1")
+			f.assertCalls("rt-0", "rt-0")
+			f.assertStored("rt-1", "jwt-1")
+		})
 	}
 }
 

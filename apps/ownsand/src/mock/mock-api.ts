@@ -206,6 +206,7 @@ const HOUR = 3600;
 const NANOS_PER_SECOND = 1_000_000_000n;
 const MAX_ENROLLMENT_TTL_NANOS = BigInt(24 * HOUR) * NANOS_PER_SECOND;
 const MAX_TTL_NANOS = BigInt(MAX_TTL_SECONDS) * NANOS_PER_SECOND;
+const MAX_PINNED_VERSION_BYTES = 64;
 const DAY_MS = 24 * HOUR * 1000;
 /** A non-paying organization becomes suspended 3 days after its block. */
 const SUSPEND_AFTER_MS = 3 * DAY_MS;
@@ -764,18 +765,39 @@ function canonicalizeCreateSandbox(
   });
 }
 
-/** An explicit device is exclusive and its permanent rules precede availability. */
+/**
+ * An explicit device is exclusive and its permanent rules precede availability.
+ * Automatic placement uses the first compatible online device in fixture order.
+ * A compatible offline device makes a failed automatic placement retryable.
+ */
 function placeSandbox(
   devices: Device[],
   placement: Placement | undefined,
   source: ResolvedSandboxSource,
-): Device | undefined {
+): Device {
   const deviceId = placement?.deviceId;
   if (deviceId === undefined || deviceId === "") {
-    return devices.find(
+    const online = devices.find(
       (d) =>
         d.state === DeviceState.ONLINE &&
         placementMismatch(d, placement, source) === undefined,
+    );
+    if (online !== undefined) return online;
+    if (
+      devices.some(
+        (d) =>
+          d.state === DeviceState.OFFLINE &&
+          placementMismatch(d, placement, source) === undefined,
+      )
+    ) {
+      throw new ConnectError(
+        "a compatible device is offline",
+        Code.Unavailable,
+      );
+    }
+    throw new ConnectError(
+      "no device can run this sandbox",
+      Code.FailedPrecondition,
     );
   }
   const device = devices.find(
@@ -1628,7 +1650,9 @@ export function createMockTransport(
         if (
           req.mode === AgentVersionPolicyMode.PIN &&
           (req.pinnedVersion.trim() === "" ||
-            /[ \t\r\n]/.test(req.pinnedVersion))
+            /[ \t\r\n]/.test(req.pinnedVersion) ||
+            new TextEncoder().encode(req.pinnedVersion).byteLength >
+              MAX_PINNED_VERSION_BYTES)
         ) {
           throw new ConnectError(
             "invalid pinned_version: a version is required for PIN",
@@ -1752,12 +1776,6 @@ export function createMockTransport(
           );
         }
         const device = placeSandbox(org.devices, req.placement, source);
-        if (device === undefined) {
-          throw new ConnectError(
-            "no device can run this sandbox",
-            Code.FailedPrecondition,
-          );
-        }
         const createTime = timestampFromMs(nowMs);
         const sandbox = create(SandboxSchema, {
           sandboxId: newMockId(),

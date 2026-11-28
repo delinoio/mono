@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -19,11 +20,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	sandrunv1 "github.com/delinoio/mono/protos/delino/sandrun/v1"
 	"github.com/delinoio/mono/protos/delino/sandrun/v1/sandrunv1connect"
 )
@@ -88,6 +91,81 @@ func writeAcknowledgement(req *sandrunv1.WriteDevSessionFileRequest) *sandrunv1.
 		ack.SizeBytes = ack.Offset + ack.Length
 	}
 	return ack
+}
+
+func TestTransferWriteAllocatesIDAfterPreparingFirstChunk(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dataSize int
+		requests int32
+	}{
+		{name: "short first read", dataSize: 3, requests: 1},
+		{name: "lookahead after full first chunk", dataSize: ChunkSize + 1, requests: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			firstID := make(chan string, 1)
+			c := transferTestClient(t, "", transferHandlers{write: func(_ context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+				if calls.Add(1) == 1 {
+					firstID <- req.Msg.GetWriteId()
+				}
+				return connect.NewResponse(writeAcknowledgement(req.Msg)), nil
+			}})
+			var marker string
+			source := strings.NewReader(strings.Repeat("a", tc.dataSize))
+			reader := archiveReadFunc(func(p []byte) (int, error) {
+				if source.Len() >= len(p) {
+					return source.Read(p)
+				}
+				// The process UUID generator is strictly increasing, even within
+				// one millisecond. Mark the read that makes the first request ready.
+				var err error
+				marker, err = uuidv7.NewString()
+				if err != nil {
+					return 0, err
+				}
+				n, _ := source.Read(p)
+				return n, io.EOF
+			})
+			n, err := c.writeGuestFile(t.Context(), &sandrunv1.DevSession{}, "/test", 0o644, reader, nil)
+			if err != nil || n != int64(tc.dataSize) || calls.Load() != tc.requests {
+				t.Fatalf("upload = %d bytes in %d requests, error %v", n, calls.Load(), err)
+			}
+			id := <-firstID
+			if _, err := uuidv7.Parse(id); err != nil {
+				t.Fatalf("first request has invalid UUID v7 %q: %v", id, err)
+			}
+			if marker == "" || id <= marker {
+				t.Fatalf("first request ID %q must come after source marker %q", id, marker)
+			}
+		})
+	}
+}
+
+func TestTransferWriteSourceErrorBeforeFirstRequest(t *testing.T) {
+	wantErr := errors.New("upload source failed")
+	for _, tc := range []struct {
+		name       string
+		prefixSize int
+	}{
+		{name: "first read"},
+		{name: "lookahead after full first chunk", prefixSize: ChunkSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			c := transferTestClient(t, "", transferHandlers{write: func(_ context.Context, req *connect.Request[sandrunv1.WriteDevSessionFileRequest]) (*connect.Response[sandrunv1.WriteDevSessionFileResponse], error) {
+				calls.Add(1)
+				return connect.NewResponse(writeAcknowledgement(req.Msg)), nil
+			}})
+			source := io.MultiReader(strings.NewReader(strings.Repeat("a", tc.prefixSize)), iotest.ErrReader(wantErr))
+			var progress int
+			n, err := c.writeGuestFile(t.Context(), &sandrunv1.DevSession{}, "/test", 0o644, source, func(int64) { progress++ })
+			if err != wantErr || n != 0 || calls.Load() != 0 || progress != 0 {
+				t.Fatalf("upload = %d bytes in %d requests, %d progress callbacks, error %v, want only %v",
+					n, calls.Load(), progress, err, wantErr)
+			}
+		})
+	}
 }
 
 func TestTransferWriteAcknowledgement(t *testing.T) {
@@ -407,6 +485,38 @@ func TestTransferReadReconnectKeepsIdleBudget(t *testing.T) {
 	requireTransferDeadline(t, ctx, err)
 	if n != 1 || out.String() != "a" || calls.Load() != 2 {
 		t.Fatalf("read %q (%d bytes) in %d requests", out.String(), n, calls.Load())
+	}
+}
+
+func TestReadGuestFileClosesStreamAtLimit(t *testing.T) {
+	var calls atomic.Int32
+	closed := make(chan struct{})
+	c := transferTestClient(t, "", transferHandlers{read: func(ctx context.Context, _ *connect.Request[sandrunv1.ReadDevSessionFileRequest], stream *connect.ServerStream[sandrunv1.ReadDevSessionFileResponse]) error {
+		if calls.Add(1) != 1 {
+			return connect.NewError(connect.CodeInternal, errors.New("retried an oversized read"))
+		}
+		if err := transferTestChunk(stream, 0, "first"); err != nil {
+			return err
+		}
+		if err := transferTestChunk(stream, 5, "extra"); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		close(closed)
+		return ctx.Err()
+	}})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	n, err := c.readGuestFile(ctx, &sandrunv1.DevSession{}, "/test", 9, &out, nil)
+	var limitErr *readLimitError
+	if !errors.As(err, &limitErr) || limitErr.observed != 10 || n != 5 || out.String() != "first" || calls.Load() != 1 {
+		t.Fatalf("read %q (%d bytes) in %d requests: %v", out.String(), n, calls.Load(), err)
+	}
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("the read stream remained open after exceeding the limit")
 	}
 }
 

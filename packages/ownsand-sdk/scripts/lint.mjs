@@ -58,6 +58,11 @@ function importsFromServers(name, source) {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       specifier = node.moduleSpecifier;
     } else if (
+      ts.isImportTypeNode(node) &&
+      ts.isLiteralTypeNode(node.argument)
+    ) {
+      specifier = node.argument.literal;
+    } else if (
       ts.isCallExpression(node) &&
       node.expression.kind === ts.SyntaxKind.ImportKeyword
     ) {

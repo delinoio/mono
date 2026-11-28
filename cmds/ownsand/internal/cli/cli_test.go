@@ -115,6 +115,57 @@ func TestUsageErrors(t *testing.T) {
 	}
 }
 
+func TestUsageErrorsRespectParsedColor(t *testing.T) {
+	const (
+		unknownFlag = "org list: flag provided but not defined: -unknown"
+		badFormat   = `unknown format "yaml" (want text or json)`
+		badBoolean  = `org list: invalid boolean value "invalid" for -no-color: parse error`
+		badSandbox  = "sandbox-id: invalid sandbox-id: must be a canonical UUID v7"
+	)
+	empty, nonempty := "", "1"
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		noColor *string
+		message string
+		color   bool
+	}{
+		{"flag error after opt-out", []string{"org", "list", "--no-color", "--unknown"}, nil, unknownFlag, false},
+		{"format error after opt-out", []string{"org", "list", "--no-color", "--format", "yaml"}, &empty, badFormat, false},
+		{"root opt-out", []string{"--no-color", "org", "list", "--unknown"}, nil, unknownFlag, false},
+		{"nonempty environment", []string{"org", "list", "--no-color=false", "--unknown"}, &nonempty, unknownFlag, false},
+		{"unset environment", []string{"org", "list", "--unknown"}, nil, unknownFlag, true},
+		{"empty environment", []string{"org", "list", "--unknown"}, &empty, unknownFlag, true},
+		{"stop at first flag error", []string{"org", "list", "--unknown", "--no-color"}, nil, unknownFlag, true},
+		{"flag error before format validation", []string{"org", "list", "--no-color", "--format", "yaml", "--unknown"}, nil, unknownFlag, false},
+		{"subcommand overrides root", []string{"--no-color", "org", "list", "--no-color=false", "--unknown"}, nil, unknownFlag, true},
+		{"invalid value keeps prior opt-out", []string{"org", "list", "--no-color", "--no-color=invalid"}, nil, badBoolean, false},
+		{"option terminator", []string{"org", "list", "--", "--no-color"}, nil, "usage: ownsand org list [flags]", true},
+		{"guest argument", []string{"sandbox", "exec", "not-an-id", "echo", "--no-color"}, nil, badSandbox, true},
+		{"root parse error", []string{"--unknown"}, nil, "ownsand: flag provided but not defined: -unknown", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			if tc.noColor != nil {
+				r.env[EnvNoColor] = *tc.noColor
+			}
+			prefix := "error:"
+			if tc.color {
+				prefix = "\x1b[31merror:\x1b[0m"
+			}
+			wantStderr := prefix + " " + tc.message + "\nRun 'ownsand help' for usage.\n"
+			res := r.run(tc.args...)
+			if res.code != ExitUsage || res.stdout != "" || res.stderr != wantStderr {
+				t.Errorf("exit %d, stdout %q, stderr %q; want exit %d, empty stdout, stderr %q",
+					res.code, res.stdout, res.stderr, ExitUsage, wantStderr)
+			}
+			if calls := r.f.callNames(); len(calls) != 0 {
+				t.Errorf("sent RPCs for a usage error: %v", calls)
+			}
+		})
+	}
+}
+
 // TestFileWriteMode checks that file write rejects a zero mode before any RPC
 // and names --mode in the error. It also checks that the relay receives the
 // default and explicit modes.
@@ -159,7 +210,7 @@ func TestFileWriteMode(t *testing.T) {
 // help flag comes before the command (the root flag set reads it there).
 func TestRootHelpPrintsUsage(t *testing.T) {
 	r := newRunner(t)
-	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"--no-color", "--help"}} {
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"--no-color", "--help"}, {"--", "help"}} {
 		res := r.run(args...)
 		if res.code != ExitOK {
 			t.Errorf("%v: exit %d, want %d (stderr %q)", args, res.code, ExitOK, res.stderr)
@@ -169,6 +220,12 @@ func TestRootHelpPrintsUsage(t *testing.T) {
 		}
 		if strings.Contains(res.stdout, "ownsand ownsand") {
 			t.Errorf("%v: stdout repeats the program name: %q", args, res.stdout)
+		}
+	}
+	for _, arg := range []string{"-h", "--help"} {
+		res := r.run("--", arg)
+		if res.code != ExitUsage || res.stdout != "" || !strings.Contains(res.stderr, "unknown command") {
+			t.Errorf("-- %s: %+v, want an unknown command error", arg, res)
 		}
 	}
 	// A subcommand help still lists the subcommand flags.
@@ -535,6 +592,7 @@ type fakeLogto struct {
 	polls                   int
 	refreshes               []string
 	deviceAuthorizationBody string
+	resourceTokenBody       string
 }
 
 func (l *fakeLogto) handler(t *testing.T) http.Handler {
@@ -566,12 +624,55 @@ func (l *fakeLogto) handler(t *testing.T) http.Handler {
 			if r.Form.Get("resource") != DefaultLogtoResource {
 				t.Errorf("refresh without the resource: %v", r.Form)
 			}
+			if l.resourceTokenBody != "" {
+				fmt.Fprint(w, l.resourceTokenBody)
+				return
+			}
 			n := len(l.refreshes)
 			fmt.Fprintf(w, `{"access_token":"jwt-%d","refresh_token":"refresh-%d","expires_in":1}`, n, n+1)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	})
+}
+
+func TestLoginRejectsInvalidTokenLifetime(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing credentials=%t", existing), func(t *testing.T) {
+			r := newRunner(t)
+			delete(r.env, ownsand.EnvAPIKey)
+			lg := &fakeLogto{resourceTokenBody: `{"access_token":"bad-access","refresh_token":"bad-rotation","expires_in":9223372037}`}
+			ls := httptest.NewServer(lg.handler(t))
+			t.Cleanup(ls.Close)
+			r.env[EnvLogtoEndpoint] = ls.URL
+			r.env[EnvLogtoAppID] = "app"
+			store := credstore.Store{Dir: r.env[EnvConfigDir]}
+			if existing {
+				if err := store.Save(&credstore.Credentials{RefreshToken: "existing"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(store.Path())
+			if existing && err != nil {
+				t.Fatal(err)
+			}
+
+			res := r.run("login", "--no-color")
+			const want = "Open https://login.example/device in a browser and enter the code ABCD-EFGH to sign in.\n" +
+				"error: logto: invalid token response: expires_in must be an integer in the supported duration range\n"
+			if res != (result{code: ExitError, stderr: want}) {
+				t.Errorf("login = %+v, want exit %d and stderr %q", res, ExitError, want)
+			}
+			after, err := os.ReadFile(store.Path())
+			if existing {
+				if err != nil || !bytes.Equal(after, before) {
+					t.Errorf("login changed the existing credential file: %v", err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("credential file after rejected login: %v, want no file", err)
+			}
+		})
+	}
 }
 
 func TestLoginStoresUserOnlyCredentialsAndLogout(t *testing.T) {
@@ -656,9 +757,16 @@ func TestLoginAndLogoutRejectOperands(t *testing.T) {
 		{"logout", "--", "extra"},
 		{"login", "extra"},
 		{"login", "--", "extra"},
+		{"--", "logout", "--format", "json"},
+		{"--", "login", "--help"},
+		{"--", "logout", "--"},
 	} {
 		res := r.run(args...)
-		if res.code != ExitUsage || !strings.Contains(res.stderr, "usage: ownsand "+args[0]) {
+		cmd := args[0]
+		if cmd == "--" {
+			cmd = args[1]
+		}
+		if res.code != ExitUsage || res.stdout != "" || !strings.Contains(res.stderr, "usage: ownsand "+cmd) {
 			t.Errorf("%v = %+v, want a usage error", args, res)
 		}
 		after, err := os.ReadFile(path)
@@ -1501,6 +1609,44 @@ func TestListOutputAndColor(t *testing.T) {
 	}
 }
 
+func TestListOutputWithOptionTerminator(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantCode int
+		wantJSON bool
+	}{
+		{"root terminator before global flag", []string{"--", "org", "list", "--format", "json"}, ExitUsage, false},
+		{"root terminator before command flag", []string{"--", "org", "list", "--page-size", "1"}, ExitUsage, false},
+		{"root terminator before help flag", []string{"--", "org", "list", "--help"}, ExitUsage, false},
+		{"literal second dash dash", []string{"--", "org", "list", "--"}, ExitUsage, false},
+		{"command terminator", []string{"org", "list", "--", "--format", "json"}, ExitUsage, false},
+		{"root terminator before command words", []string{"--", "org", "list"}, ExitOK, false},
+		{"global flag before root terminator", []string{"--format", "json", "--", "org", "list"}, ExitOK, true},
+		{"global flag after command words", []string{"org", "list", "--format", "json"}, ExitOK, true},
+		{"dash dash as flag value", []string{"--org", "--", "org", "list", "--format", "json"}, ExitOK, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			res := r.run(tc.args...)
+			if res.code != tc.wantCode {
+				t.Fatalf("%v: got %+v, want exit %d", tc.args, res, tc.wantCode)
+			}
+			calls := r.f.callNames()
+			if tc.wantCode == ExitUsage {
+				if res.stdout != "" || !strings.Contains(res.stderr, "usage: ownsand org list [flags]") || len(calls) != 0 {
+					t.Fatalf("%v: got %+v and RPCs %v, want an org list usage error and no RPCs", tc.args, res, calls)
+				}
+				return
+			}
+			if !strings.Contains(res.stdout, "acme") || json.Valid([]byte(res.stdout)) != tc.wantJSON ||
+				!slices.Equal(calls, []string{"ListOrganizations"}) {
+				t.Fatalf("%v: got %+v and RPCs %v, want org list output (JSON=%t) from one ListOrganizations RPC", tc.args, res, calls, tc.wantJSON)
+			}
+		})
+	}
+}
+
 func TestVerboseLogsNeverContainSecretsOrContent(t *testing.T) {
 	r := newRunner(t)
 	res := r.run("--verbose", "--no-color", "sandbox", "exec", r.f.sb, "--", "echo", "topsecret-arg")
@@ -1545,6 +1691,7 @@ func TestExecArgumentForms(t *testing.T) {
 		{"sandbox", "exec", "--timeout", "1m", r.f.sb, "echo", "-n", "x"},
 		{"sandbox", "exec", r.f.sb, "--env", "A=B", "echo", "-n", "x"},
 		{"--org", r.f.org, "sandbox", "exec", r.f.sb, "--cwd", "/", "--", "echo", "-n", "x"},
+		{"--", "sandbox", "exec", r.f.sb, "--", "echo", "-n", "x"},
 	} {
 		res := r.run(args...)
 		if res.code != 0 || res.stdout != "-n x\n" {

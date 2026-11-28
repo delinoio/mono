@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 type fakeUsage struct {
 	drain    func(ctx context.Context) error
+	flush    func(ctx context.Context) error
 	flushErr error
 	calls    []string
 }
@@ -23,8 +25,13 @@ func (f *fakeUsage) DrainUsage(ctx context.Context) error {
 	return f.drain(ctx)
 }
 
-func (f *fakeUsage) FlushUsageFinal(context.Context) error {
+func (f *fakeUsage) FlushUsageFinal(ctx context.Context) error {
 	f.calls = append(f.calls, "flush")
+	if f.flush != nil {
+		if err := f.flush(ctx); err != nil {
+			return err
+		}
+	}
 	return f.flushErr
 }
 
@@ -48,25 +55,48 @@ func TestFinishUsageFlushesAfterDrain(t *testing.T) {
 // completes ends within its bound, is logged and returned as an error, and
 // that the final flush still runs.
 func TestFinishUsageBoundedWhenHandlerNeverExits(t *testing.T) {
-	f := &fakeUsage{drain: func(ctx context.Context) error {
-		<-ctx.Done() // a handler that never exits
-		return errors.New("1 still running")
-	}}
-	var logs bytes.Buffer
-	start := time.Now()
-	err := finishUsage(f, slog.New(slog.NewJSONHandler(&logs, nil)), 2*time.Second, 50*time.Millisecond)
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("finishUsage took %s, want it bounded by the drain timeout", elapsed)
-	}
-	if !errors.Is(err, errUsageDrainIncomplete) {
-		t.Fatalf("finishUsage = %v, want errUsageDrainIncomplete", err)
-	}
-	if got := strings.Join(f.calls, ","); got != "drain,flush" {
-		t.Errorf("calls = %s, want drain,flush", got)
-	}
-	if !strings.Contains(logs.String(), "usage_drain_incomplete") {
-		t.Errorf("missing usage_drain_incomplete log: %s", logs.String())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		const drainTimeout = 50 * time.Millisecond
+		start := time.Now()
+		f := &fakeUsage{drain: func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("drain context already ended: %v", err)
+			}
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("drain context has no deadline")
+			}
+			if got := deadline.Sub(start); got != drainTimeout {
+				t.Fatalf("drain deadline is %s after start, want %s", got, drainTimeout)
+			}
+
+			timer := time.NewTimer(time.Second)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				if err := ctx.Err(); err != context.DeadlineExceeded {
+					t.Fatalf("drain context ended with %v, want %v", err, context.DeadlineExceeded)
+				}
+				if elapsed := time.Since(start); elapsed != drainTimeout {
+					t.Fatalf("drain context ended after %s, want %s", elapsed, drainTimeout)
+				}
+			case <-timer.C:
+				t.Fatal("drain context remained active for 1s")
+			}
+			return errors.New("1 still running")
+		}}
+		var logs bytes.Buffer
+		err := finishUsage(f, slog.New(slog.NewJSONHandler(&logs, nil)), 2*time.Second, drainTimeout)
+		if !errors.Is(err, errUsageDrainIncomplete) {
+			t.Fatalf("finishUsage = %v, want errUsageDrainIncomplete", err)
+		}
+		if got := strings.Join(f.calls, ","); got != "drain,flush" {
+			t.Errorf("calls = %s, want drain,flush", got)
+		}
+		if !strings.Contains(logs.String(), "usage_drain_incomplete") {
+			t.Errorf("missing usage_drain_incomplete log: %s", logs.String())
+		}
+	})
 }
 
 func TestFinishUsageReturnsFinalFlushError(t *testing.T) {

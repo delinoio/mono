@@ -215,6 +215,43 @@ func TestReadTarAppliesExplicitDirectoryModesAfterExtraction(t *testing.T) {
 	}
 }
 
+func TestReadTarAppliesModesDeepestFirstThroughRootAlias(t *testing.T) {
+	requireSymlinks(t)
+	dst := t.TempDir()
+	t.Cleanup(func() { makeDirsWritable(dst) })
+	archive := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "one/two/parent/", Typeflag: tar.TypeDir, Mode: 0o400}},
+		{hdr: tar.Header{Name: "alias", Typeflag: tar.TypeSymlink, Linkname: "one/two/parent"}},
+		{hdr: tar.Header{Name: "alias/child/", Typeflag: tar.TypeDir, Mode: 0o550}},
+	})
+	if err := ReadTar(archive, dst); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(dst, "one", "two", "parent")
+	requireMode(t, parent, 0o400)
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, filepath.Join(parent, "child"), 0o550)
+}
+
+func TestReadTarAppliesModesDeepestFirstThroughNestedAlias(t *testing.T) {
+	requireSymlinks(t)
+	dst := t.TempDir()
+	t.Cleanup(func() { makeDirsWritable(dst) })
+	archive := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "restricted/", Typeflag: tar.TypeDir, Mode: 0o400}},
+		{hdr: tar.Header{Name: "real/deep/", Typeflag: tar.TypeDir, Mode: 0o700}},
+		{hdr: tar.Header{Name: "restricted/alias", Typeflag: tar.TypeSymlink, Linkname: "../real/deep"}},
+		{hdr: tar.Header{Name: "restricted/alias/child/", Typeflag: tar.TypeDir, Mode: 0o550}},
+	})
+	if err := ReadTar(archive, dst); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, filepath.Join(dst, "restricted"), 0o400)
+	requireMode(t, filepath.Join(dst, "real", "deep", "child"), 0o550)
+}
+
 func TestReadTarUsesLastModeForEquivalentDirectoryNames(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -263,6 +300,26 @@ func TestReadTarKeepsParentComponentsInDirectoryModePaths(t *testing.T) {
 	}
 	requireMode(t, filepath.Join(dst, "real", "child"), 0o711)
 	requireMode(t, filepath.Join(dst, "child"), 0o700)
+}
+
+func TestReadTarCreatesRegularFileParentThroughConfinedDirectoryLink(t *testing.T) {
+	requireSymlinks(t)
+	dst := t.TempDir()
+	archive := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "real/deep/", Typeflag: tar.TypeDir, Mode: 0o700}},
+		{hdr: tar.Header{Name: "alias", Typeflag: tar.TypeSymlink, Linkname: "real/deep"}},
+		{hdr: tar.Header{Name: "alias/../child/file", Typeflag: tar.TypeReg, Mode: 0o640}, data: "contents"},
+	})
+	if err := ReadTar(archive, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "real", "child", "file")); err != nil || string(got) != "contents" {
+		t.Fatalf("extracted file = %q, %v", got, err)
+	}
+	requireMode(t, filepath.Join(dst, "real", "child"), 0o700)
+	if _, err := os.Lstat(filepath.Join(dst, "child")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lexically cleaned parent exists: %v", err)
+	}
 }
 
 func TestReadTarPopulatesThroughConfinedDirectoryLinkUnderUmask(t *testing.T) {

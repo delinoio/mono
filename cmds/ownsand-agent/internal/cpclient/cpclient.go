@@ -90,6 +90,14 @@ func (c *Client) EnrollContext(ctx context.Context) (context.Context, context.Ca
 // because the bidirectional agent channel and relay connection need HTTP/2
 // from end to end.
 func NewHTTPClient(apiURL string, tlsConfig *tls.Config) (*http.Client, error) {
+	// Connect appends procedure paths to the original string. Check it
+	// directly because URL parsing discards a bare fragment delimiter.
+	if delimiter := strings.IndexAny(apiURL, "?#"); delimiter >= 0 {
+		if apiURL[delimiter] == '?' {
+			return nil, errors.New("cpclient: control plane URL must not include a query")
+		}
+		return nil, errors.New("cpclient: control plane URL must not include a fragment")
+	}
 	u, err := url.Parse(apiURL)
 	if err != nil {
 		// The parse error includes the input URL, which may contain credentials.

@@ -49,9 +49,16 @@ func TestSandboxDeleteEventRetriesAfterLookupFailure(t *testing.T) {
 		return realLookup(ctx, orgID, sandboxID)
 	})
 
+	deleteCtx, cancelDelete := context.WithTimeout(ctx, 10*time.Second)
 	deleteDone := make(chan error, 1)
+	deleteWorkerDone := make(chan struct{})
+	defer func() {
+		cancelDelete()
+		<-deleteWorkerDone
+	}()
 	go func() {
-		_, err := c.Sandbox.DeleteSandbox(ctx, connect.NewRequest(&ownsandv1.DeleteSandboxRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
+		defer close(deleteWorkerDone)
+		_, err := c.Sandbox.DeleteSandbox(deleteCtx, connect.NewRequest(&ownsandv1.DeleteSandboxRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
 		deleteDone <- err
 	}()
 	agent.WaitFor("the delete command after the retry", func(e *ownsandv1.AgentEnvelope) bool {

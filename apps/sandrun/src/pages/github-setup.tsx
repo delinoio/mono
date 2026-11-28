@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { Role } from "@delino/sandrun-protos/v1/common_pb";
-import { GitHubService } from "@delino/sandrun-protos/v1/github_pb";
-import { useEffect, useRef, useState } from "react";
+import {
+  GitHubInstallOrganizationMismatchSchema,
+  GitHubService,
+} from "@delino/sandrun-protos/v1/github_pb";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { TopBar } from "../components/shell.tsx";
 import {
@@ -44,6 +48,15 @@ export function GitHubSetupPage({
         )
       : [];
   const [selected, setSelected] = useState<string>();
+  const [organizationMismatches, setOrganizationMismatches] = useState(0);
+  const requiresOrganizationChoice = organizationMismatches > 0;
+  const focusPicker = useCallback((form: HTMLFormElement | null) => {
+    if (form === null) return;
+    const frame = requestAnimationFrame(() => {
+      form.querySelector<HTMLElement>('[role="combobox"]')?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
   const eligibleSelection = adminOrgs.find(
     (org) => org.organizationId === selected,
   )?.organizationId;
@@ -69,7 +82,21 @@ export function GitHubSetupPage({
         state: callback.state,
       },
       {
-        // This callback belongs to the visit that submitted the request.
+        onError: (error) => {
+          const failure = ConnectError.from(error);
+          if (
+            failure.code === Code.InvalidArgument &&
+            failure.findDetails(GitHubInstallOrganizationMismatchSchema)
+              .length > 0
+          ) {
+            setSelected(undefined);
+            // Remount and focus the cleared picker even if the response arrived
+            // before React showed the pending state.
+            setOrganizationMismatches((count) => count + 1);
+            sent.current = false;
+            link.reset();
+          }
+        },
         // Check the address in case the router has yet to render a navigation.
         onSuccess: () => {
           if (parseRoute(window.location.pathname).id === RouteId.GitHubSetup) {
@@ -82,12 +109,14 @@ export function GitHubSetupPage({
     );
   };
 
-  const onlyOrg = adminOrgs.length === 1 ? adminOrgs[0] : undefined;
+  const automaticOrg =
+    !requiresOrganizationChoice && adminOrgs.length === 1
+      ? adminOrgs[0]
+      : undefined;
   useEffect(() => {
-    if (onlyOrg !== undefined) linkTo(onlyOrg.organizationId);
-    // Runs once per organization list; linkTo sends the single-use code at
-    // most once.
-  }, [onlyOrg?.organizationId]);
+    if (automaticOrg !== undefined) linkTo(automaticOrg.organizationId);
+    // After a mismatch, the user must submit the picker explicitly.
+  }, [automaticOrg?.organizationId]);
 
   let body;
   if (callback === undefined) {
@@ -122,17 +151,24 @@ export function GitHubSetupPage({
               </div>
             );
           }
-          if (onlyOrg !== undefined) {
+          if (automaticOrg !== undefined) {
             return <Loading label={t("githubSetup.linking")} />;
           }
           return (
             <form
+              key={organizationMismatches}
               className="form"
+              ref={focusPicker}
               onSubmit={(event) => {
                 event.preventDefault();
                 if (eligibleSelection !== undefined) linkTo(eligibleSelection);
               }}
             >
+              {requiresOrganizationChoice ? (
+                <div className="notice notice-error" role="alert">
+                  {t("githubSetup.organizationMismatch")}
+                </div>
+              ) : null}
               <Select
                 label={t("githubSetup.organization")}
                 value={eligibleSelection ?? null}

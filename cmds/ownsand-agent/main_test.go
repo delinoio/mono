@@ -151,6 +151,16 @@ func TestCLIEnrollRejectsMissingDeviceIDAndRetries(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
+	badArgs := []string{"enroll", "--api-url", cp.URL + "#"}
+	if code := run(badArgs, strings.NewReader(testcp.Token+"\n"), &out, &errb); code != exitError || !strings.Contains(errb.String(), "must not include a fragment") {
+		t.Fatalf("invalid retry: exit %d, stderr %q", code, errb.String())
+	}
+	if got := cp.RequestCount(); got != 1 {
+		t.Fatalf("control plane got %d requests after the invalid retry; want one from the first attempt", got)
+	}
+
+	out.Reset()
+	errb.Reset()
 	if code := run(args, strings.NewReader(testcp.Token+"\n"), &out, &errb); code != exitOK || !strings.Contains(out.String(), "Enrolled device") {
 		t.Fatalf("retry enroll: exit %d, stdout %q, stderr %q", code, out.String(), errb.String())
 	}
@@ -174,23 +184,44 @@ func TestCLIEnrollRejectsMissingDeviceIDAndRetries(t *testing.T) {
 	}
 }
 
-func TestCLIEnrollRejectsHostlessFlagBeforeCreatingIdentity(t *testing.T) {
+func TestCLIEnrollRejectsInvalidURLBeforeCreatingIdentity(t *testing.T) {
 	clearAgentEnv(t)
 	cp := testcp.New(t)
-	dir := t.TempDir()
-	t.Setenv(config.EnvAPIURL, cp.URL)
-	const hostlessURL = "https://:443"
-	var out, errb bytes.Buffer
-	code := run([]string{"enroll", "--state-dir", dir, "--api-url", hostlessURL},
-		strings.NewReader(testcp.Token+"\n"), &out, &errb)
-	if code != exitError || !strings.Contains(errb.String(), "requires a hostname") {
-		t.Fatalf("enroll exit code = %d, stderr = %q; want exit code %d and a hostname error", code, errb.String(), exitError)
-	}
-	if _, err := os.Stat(filepath.Join(dir, store.IdentityFile)); !os.IsNotExist(err) {
-		t.Fatalf("identity file stat error = %v; want file to be absent", err)
-	}
-	if got := len(cp.EnrollPublicKeys()); got != 0 {
-		t.Fatalf("control plane got %d enrollment requests; want zero", got)
+	for _, tc := range []struct {
+		name, flagURL, envURL, reason string
+	}{
+		{"hostless flag", "https://:443", cp.URL, "requires a hostname"},
+		{"query in flag", cp.URL + "?source=setup", cp.URL, "must not include a query"},
+		{"fragment in environment", "", cp.URL + "#setup", "must not include a fragment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv(config.EnvAPIURL, tc.envURL)
+			args := []string{"enroll", "--state-dir", dir}
+			invalidURL := tc.envURL
+			if tc.flagURL != "" {
+				invalidURL = tc.flagURL
+				args = append(args, "--api-url", invalidURL)
+			}
+			before := cp.RequestCount()
+			var out, errb bytes.Buffer
+			code := run(args, strings.NewReader(testcp.Token+"\n"), &out, &errb)
+			if code != exitError || !strings.Contains(errb.String(), tc.reason) ||
+				strings.Contains(errb.String(), invalidURL) || strings.Contains(out.String()+errb.String(), testcp.Token) {
+				t.Fatalf("invalid enrollment: exit %d, stdout %q, stderr %q; want redacted %q error", code, out.String(), errb.String(), tc.reason)
+			}
+			if _, err := os.Stat(filepath.Join(dir, store.IdentityFile)); !os.IsNotExist(err) {
+				t.Fatalf("identity file stat error = %v; want file to be absent", err)
+			}
+			if got := cp.RequestCount() - before; got != 0 {
+				t.Fatalf("control plane got %d requests during invalid enrollment; want zero", got)
+			}
+
+			t.Setenv(config.EnvAPIURL, cp.URL)
+			if code := run([]string{"enroll", "--state-dir", dir}, strings.NewReader(testcp.Token+"\n"), io.Discard, &errb); code != exitOK {
+				t.Fatalf("retry with valid URL: exit %d, stderr %q", code, errb.String())
+			}
+		})
 	}
 }
 
@@ -349,6 +380,63 @@ func TestRunWithInvalidConfiguration(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "invalid OWNSAND_AGENT_LOG_LEVEL") {
 		t.Fatalf("stderr = %q", errb.String())
+	}
+}
+
+func TestRunWithInvalidConfigurationControlPlaneURL(t *testing.T) {
+	clearAgentEnv(t)
+	cp := testcp.New(t)
+	dir := t.TempDir()
+	t.Setenv(config.EnvStateDir, dir)
+	t.Setenv(config.EnvRuntime, "process")
+	t.Setenv(config.EnvGuestBinary, filepath.Join(dir, "missing-guest-binary"))
+	if code := run([]string{"enroll", "--api-url", cp.URL}, strings.NewReader(testcp.Token+"\n"), io.Discard, io.Discard); code != exitOK {
+		t.Fatalf("fixture enrollment: exit %d", code)
+	}
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, saved, override, reason string
+	}{
+		{"saved URL", cp.URL + "#setup", "", "must not include a fragment"},
+		{"environment override", cp.URL, cp.URL + "?source=setup", "must not include a query"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := st.UpdateAgent(func(a *store.AgentState) error {
+				a.APIURL = tc.saved
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(config.EnvAPIURL, tc.override)
+			log, err := os.Create(filepath.Join(t.TempDir(), "agent.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer log.Close()
+			// The service writes structured startup diagnostics to os.Stderr.
+			stderr := os.Stderr
+			os.Stderr = log
+			defer func() { os.Stderr = stderr }()
+			code := run([]string{"run"}, nil, io.Discard, log)
+			data, err := os.ReadFile(log.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := string(data)
+			if code != exitError || !strings.Contains(output, "control plane client failed") ||
+				!strings.Contains(output, tc.reason) || strings.Contains(output, cp.URL) ||
+				strings.Contains(output, testcp.Token) || strings.Contains(output, "sandbox runtime unavailable") ||
+				strings.Contains(output, config.EnvAPIURL) != (tc.override != "") {
+				t.Fatalf("invalid run: exit %d, stderr %q; want redacted %q error", code, output, tc.reason)
+			}
+			if got := cp.RequestCount(); got != 1 {
+				t.Fatalf("control plane got %d requests; want only the fixture enrollment", got)
+			}
+		})
 	}
 }
 
