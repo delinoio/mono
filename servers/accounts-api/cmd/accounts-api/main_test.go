@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -567,44 +568,83 @@ func TestNewServerClosesConnectionWithStalledRequestBody(t *testing.T) {
 
 func TestNewServerClosesIdleKeepAliveConnection(t *testing.T) {
 	const timeout = 300 * time.Millisecond
-	addr, logs := startShortTimeoutServer(t, timeout)
+	const waitLimit = 10 * timeout
+	for _, tc := range []struct {
+		name                   string
+		waitForCloseBeforeRead bool
+	}{
+		{"prompt client read", false},
+		{"client read after server close", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Each subtest serves just one connection on its own listener.
+			var idleAt, closedAt time.Time
+			closed := make(chan struct{})
+			addr, logs, _, _ := startRejectLogServerWithShutdown(t, readHeaderTimeout, timeout, func(srv *http.Server, listener net.Listener) net.Listener {
+				srv.ReadTimeout = timeout
+				productionConnState := srv.ConnState
+				srv.ConnState = func(conn net.Conn, state http.ConnState) {
+					at := time.Now()
+					productionConnState(conn, state)
+					switch state {
+					case http.StateIdle:
+						idleAt = at
+					case http.StateClosed:
+						closedAt = at
+						close(closed)
+					}
+				}
+				return listener
+			})
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	resp, err := http.ReadResponse(reader, nil)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != `{"status":"ok"}` {
-		t.Fatalf("healthz = %d %q, want 200 {\"status\":\"ok\"}", resp.StatusCode, body)
-	}
+			conn, err := net.DialTimeout("tcp", addr, waitLimit)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			if err := conn.SetWriteDeadline(time.Now().Add(waitLimit)); err != nil {
+				t.Fatalf("set write deadline: %v", err)
+			}
+			reader := bufio.NewReader(conn)
+			if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			status, body := readResponse(t, conn, reader)
+			if status != http.StatusOK || strings.TrimSpace(body) != `{"status":"ok"}` {
+				t.Fatalf("healthz = %d %q, want 200 {\"status\":\"ok\"}", status, body)
+			}
 
-	// The connection stays open for another request, then the server closes it.
-	elapsed, _ := expectClosedWithin(t, conn, 10*timeout)
-	if elapsed < timeout/2 {
-		t.Errorf("idle connection closed after %v, want it held until about IdleTimeout %v", elapsed, timeout)
-	}
-
-	var requestLogs int
-	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
-		if strings.Contains(line, `"msg":"http_request"`) {
-			requestLogs++
-		}
-	}
-	if requestLogs != 1 {
-		t.Errorf("http_request records = %d, want 1; logs: %s", requestLogs, logs.String())
+			deadline := time.Now().Add(waitLimit)
+			if err := conn.SetReadDeadline(deadline); err != nil {
+				t.Fatalf("set read deadline: %v", err)
+			}
+			awaitServerClose := func() {
+				select {
+				case <-closed:
+				case <-time.After(time.Until(deadline)):
+					t.Fatalf("server did not report StateClosed within %v", waitLimit)
+				}
+			}
+			if tc.waitForCloseBeforeRead {
+				awaitServerClose()
+			}
+			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("read after health response: %v, want EOF or connection reset", err)
+			}
+			if !tc.waitForCloseBeforeRead {
+				// The client can see EOF before the server runs ConnState.
+				awaitServerClose()
+			}
+			if idleAt.IsZero() {
+				t.Fatal("server did not report StateIdle before StateClosed")
+			}
+			if elapsed := closedAt.Sub(idleAt); elapsed < timeout/2 {
+				t.Errorf("server closed the idle connection after %v, want at least %v", elapsed, timeout/2)
+			}
+			if records := requestRecords(t, logs); len(records) != 1 {
+				t.Errorf("http_request records = %d, want 1; logs: %s", len(records), logs.String())
+			}
+		})
 	}
 }
 
