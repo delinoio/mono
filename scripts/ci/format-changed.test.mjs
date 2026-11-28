@@ -54,9 +54,15 @@ function formatterEnvironment(parentEnv, platform = process.platform) {
   // Isolation removes LEFTHOOK_BIN along with every other LEFTHOOK* variable.
   const env = isolateGitEnvironment({ ...parentEnv }, platform);
   env.LEFTHOOK_BIN = lefthook;
-  delete env.CI;
-  delete env.TURBO_SCM_BASE;
-  delete env.TURBO_SCM_HEAD;
+  // The copy preserves key spelling, but Windows children read these controls
+  // case-insensitively. Delete every matching key before tests opt into a mode.
+  const controls = ["CI", "TURBO_SCM_BASE", "TURBO_SCM_HEAD"];
+  for (const name of Object.keys(env)) {
+    const comparable = platform === "win32" ? name.toUpperCase() : name;
+    if (controls.includes(comparable)) {
+      delete env[name];
+    }
+  }
   let inheritedPath = env.PATH;
   if (platform === "win32") {
     // Node passes the first case-insensitive match in lexical order on Windows.
@@ -191,6 +197,36 @@ test("fixture uses case-sensitive PATH handling on Unix", () => {
       inheritedPath,
     ].join(":"),
   );
+});
+
+test("fixture removes inherited formatter controls using platform-specific name matching", () => {
+  const aliases = {
+    Ci: "true",
+    Turbo_Scm_Base: "base-sentinel",
+    turbo_scm_head: "head-sentinel",
+  };
+  const parentEnv = {
+    PATH: "/fixture/bin",
+    CI_FIXTURE_SENTINEL: "keep",
+    ...aliases,
+    CI: "true",
+    TURBO_SCM_BASE: "uppercase-base",
+    TURBO_SCM_HEAD: "uppercase-head",
+  };
+  for (const platform of ["win32", "linux"]) {
+    const env = formatterEnvironment(parentEnv, platform);
+    for (const name of ["CI", "TURBO_SCM_BASE", "TURBO_SCM_HEAD"]) {
+      assert.equal(Object.hasOwn(env, name), false, `${platform}: ${name}`);
+    }
+    for (const [name, value] of Object.entries(aliases)) {
+      if (platform === "win32") {
+        assert.equal(Object.hasOwn(env, name), false, `${platform}: ${name}`);
+      } else {
+        assert.equal(env[name], value, `${platform}: ${name}`);
+      }
+    }
+    assert.equal(env.CI_FIXTURE_SENTINEL, "keep", platform);
+  }
 });
 
 test("fixture ignores hostile global Git configuration and GIT_* variables", (t) => {
@@ -1888,9 +1924,7 @@ test("authored localization JSON remains eligible for formatting", async (t) => 
 test("CLI rejects incomplete comparisons and CI-wide formatting", (t) => {
   const f = fixture(t);
   const script = join(root, "scripts/ci/format-changed.mjs");
-  const env = { ...process.env, CI: "true" };
-  delete env.TURBO_SCM_BASE;
-  delete env.TURBO_SCM_HEAD;
+  const env = { ...f.env, CI: "true" };
   for (const args of [
     [],
     ["--base", f.base],
