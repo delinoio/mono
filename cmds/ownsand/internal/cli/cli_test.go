@@ -442,6 +442,45 @@ func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
 	if got := lines(res.stdout, &[2]int{3, 5}); res.code != 255 || !slices.Equal(got, want) {
 		t.Fatalf("splitgap: exit %d and events %q, want exit 255 and %q", res.code, got, want)
 	}
+	for _, tt := range []struct {
+		command string
+		want    []string
+	}{
+		{"invalidutf8", []string{"started", "stdout@0:�z�", "stderr@0:�", "output_truncated", "stdout@8:�", "stderr@3:s", "stderr@4:é", "stderr@6:�", "exited"}},
+		{"invalidutf8split", []string{"started", "stdout@0:�", "stderr@0:�", "stdout@2:z", "stdout@3:�", "output_truncated", "stdout@8:�", "stderr@3:s", "stderr@4:é", "stderr@6:�", "exited"}},
+	} {
+		t.Run(tt.command, func(t *testing.T) {
+			res := r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", tt.command)
+			if got := lines(res.stdout, &[2]int{5, 8}); res.code != 255 || !slices.Equal(got, tt.want) {
+				t.Fatalf("exit %d and events %q, want exit 255 and %q", res.code, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExecJSONUTF8Partitions(t *testing.T) {
+	t.Parallel()
+	// Include an encoded U+FFFD and a valid four-byte rune alongside malformed bytes.
+	data := []byte("\xff\xfez\xff�😀\xff\xc3")
+	want := strings.ToValidUTF8(string(data), "�")
+	for breaks := 0; breaks < 1<<(len(data)-1); breaks++ {
+		var decoder utf8Stream
+		var output strings.Builder
+		start := 0
+		for end := 1; end <= len(data); end++ {
+			if end < len(data) && breaks&(1<<(end-1)) == 0 {
+				continue
+			}
+			_, text := decoder.decode(int64(start), data[start:end])
+			output.WriteString(text)
+			start = end
+		}
+		_, tail, _ := decoder.flush()
+		output.WriteString(tail)
+		if got := output.String(); got != want {
+			t.Fatalf("partition %b: got %q, want %q", breaks, got, want)
+		}
+	}
 }
 
 func TestSecretsPrintedOnceOnStdout(t *testing.T) {

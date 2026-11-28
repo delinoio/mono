@@ -261,6 +261,10 @@ func stdout(off int64, s string) *ownsandv1.ExecEvent {
 	return &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: off, Data: []byte(s)}}}
 }
 
+func stderr(off int64, s string) *ownsandv1.ExecEvent {
+	return &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stderr{Stderr: &ownsandv1.ExecOutput{Offset: off, Data: []byte(s)}}}
+}
+
 const (
 	execFailureDiagnostic = "program missing\nline two\t日本語"
 	execDeniedDiagnostic  = "request denied\r\nline two"
@@ -315,6 +319,15 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 		events = append(events, stdout(0, "a\xe2\x82"),
 			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5}}},
 			stdout(5, "\xacz"), exited(0, false))
+	case "invalidutf8":
+		events = append(events, stdout(0, "\xff\xfez\xff\xc3"), stderr(0, "\xff\xfe"),
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 8}}},
+			stdout(8, "\xff\xc3"), stderr(2, "\xfds\xc3"), stderr(5, "\xa9\xc3"), exited(0, false))
+	case "invalidutf8split":
+		// The same byte spans, with more chunk boundaries and an implicit stdout gap.
+		events = append(events, stdout(0, "\xff"), stderr(0, "\xff"), stdout(1, "\xfez"), stderr(1, "\xfe"),
+			stdout(3, "\xff"), stdout(4, "\xc3"), stdout(8, "\xff"), stderr(2, "\xfds\xc3"),
+			stderr(5, "\xa9"), stdout(9, "\xc3"), stderr(6, "\xc3"), exited(0, false))
 	case "trunc":
 		events = append(events, stdout(0, "ab"),
 			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5}}},
