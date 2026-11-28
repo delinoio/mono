@@ -115,6 +115,7 @@ describe("snapshot source lists", () => {
     const state = {
       laterSnapshotError: undefined as Code | undefined,
       laterSnapshotState: SnapshotState.READY,
+      secondPageToken: "",
       tokens: [] as string[],
     };
     const transport: Transport = {
@@ -150,6 +151,7 @@ describe("snapshot source lists", () => {
         if (!request.pageToken || message.snapshots.length === 0) {
           return response;
         }
+        state.secondPageToken = message.nextPageToken;
         const duplicate = {
           ...message.snapshots[0]!,
           state: state.laterSnapshotState,
@@ -180,8 +182,11 @@ describe("snapshot source lists", () => {
       state.laterSnapshotError = undefined;
       fireEvent.click(retry);
       await waitForRows("Snapshots", 2);
-      expect(state.tokens).toEqual(["", state.tokens[1], state.tokens[1]]);
-      expect(state.tokens[1]).not.toBe("");
+      const [, firstPageToken] = state.tokens;
+      const { secondPageToken } = state;
+      expect(state.tokens).toEqual(["", firstPageToken, firstPageToken]);
+      expect(firstPageToken).toBeTruthy();
+      expect(secondPageToken).not.toBe("");
 
       fireEvent.click(showMore());
       await waitFor(() =>
@@ -190,7 +195,12 @@ describe("snapshot source lists", () => {
         ).toBeNull(),
       );
       expect(itemsOf("Snapshots")).toHaveLength(2);
-      expect(state.tokens[3]).not.toBe(state.tokens[1]);
+      expect(state.tokens).toEqual([
+        "",
+        firstPageToken,
+        firstPageToken,
+        secondPageToken,
+      ]);
     },
     2 * WAIT.timeout + 2 * DEFAULT_WAIT_MS + TEST_SETUP_MS,
   );
