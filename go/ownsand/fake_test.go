@@ -8,6 +8,7 @@ package ownsand
 // the tests inspect.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -1150,11 +1151,17 @@ type fakeCompletedWrite struct {
 	response    *ownsandv1.WriteFileResponse
 }
 
-func (w *fakeWrite) stageChunk(offset int64, data []byte) {
+func (w *fakeWrite) stageChunk(offset int64, data []byte) bool {
 	if len(data) == 0 {
-		return
+		return true
 	}
 	end := offset + int64(len(data))
+	for _, r := range w.ranges {
+		lo, hi := max(offset, r.From), min(end, r.To)
+		if lo < hi && !bytes.Equal(w.data[lo:hi], data[lo-offset:hi-offset]) {
+			return false
+		}
+	}
 	if int64(len(w.data)) < end {
 		w.data = append(w.data, make([]byte, end-int64(len(w.data)))...)
 	}
@@ -1172,6 +1179,7 @@ func (w *fakeWrite) stageChunk(offset int64, data []byte) {
 		merged = append(merged, r)
 	}
 	w.ranges = merged
+	return true
 }
 
 func newFakeAgent() *fakeAgent {
@@ -1363,7 +1371,9 @@ func (a *fakeAgent) write(req *ownsandv1.WriteFileRequest, grantDigest []byte) (
 		}
 		return done.response, nil
 	}
-	w.stageChunk(req.GetOffset(), req.GetData())
+	if !w.stageChunk(req.GetOffset(), req.GetData()) {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
+	}
 	res := &ownsandv1.WriteFileResponse{WriteId: req.GetWriteId(), Offset: req.GetOffset(), Length: int64(len(req.GetData()))}
 	if finish != nil {
 		size := finish.GetSizeBytes()

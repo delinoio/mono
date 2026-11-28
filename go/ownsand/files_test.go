@@ -1100,6 +1100,99 @@ func TestWriteFileRetriesAfterLostFinishReply(t *testing.T) {
 	}
 }
 
+func TestFakeWriteOverlap(t *testing.T) {
+	t.Parallel()
+	type chunk struct {
+		offset   int64
+		data     string
+		finish   bool
+		conflict bool
+	}
+	for _, tc := range []struct {
+		name   string
+		chunks []chunk
+		want   string
+	}{
+		{
+			name: "exact replay and conflicts",
+			chunks: []chunk{
+				{offset: 0, data: "abc"},
+				{offset: 0, data: "abc"},
+				{offset: 0, data: "aXc", conflict: true},
+				{offset: 1, data: "XY", finish: true, conflict: true},
+			},
+			want: "abc",
+		},
+		{
+			name: "matching partial overlap",
+			chunks: []chunk{
+				{offset: 0, data: "ab"},
+				{offset: 1, data: "bc"},
+			},
+			want: "abc",
+		},
+		{
+			name: "fill a gap",
+			chunks: []chunk{
+				{offset: 2, data: "c"},
+				{offset: 0, data: "ab"},
+			},
+			want: "abc",
+		},
+		{
+			name: "conflict in a later range",
+			chunks: []chunk{
+				{offset: 0, data: "ab"},
+				{offset: 4, data: "e"},
+				{offset: 1, data: "bcdXf", conflict: true},
+				{offset: 2, data: "cd"},
+			},
+			want: "abcde",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newFakeAgent()
+			writeID := mustID(t)
+			path := "/out"
+			size := int64(len(tc.want))
+			for i, c := range tc.chunks {
+				req := &ownsandv1.WriteFileRequest{WriteId: writeID, Offset: c.offset, Data: []byte(c.data)}
+				if i == 0 {
+					req.Path = path
+				}
+				if c.finish {
+					req.Finish = &ownsandv1.WriteFileFinish{SizeBytes: size}
+				}
+				res, err := agent.write(req, nil)
+				if c.conflict {
+					if connect.CodeOf(err) != connect.CodeFailedPrecondition || res != nil {
+						t.Fatalf("chunk %d: got (%v, %v), want failed_precondition", i, res, err)
+					}
+					if _, ok := agent.file(path); ok {
+						t.Fatalf("chunk %d published the destination", i)
+					}
+					continue
+				}
+				if err != nil || res == nil || res.GetOffset() != c.offset || res.GetLength() != int64(len(c.data)) || res.GetFinished() {
+					t.Fatalf("chunk %d: unexpected acknowledgment (%v, %v)", i, res, err)
+				}
+			}
+			req := &ownsandv1.WriteFileRequest{
+				WriteId: writeID,
+				Offset:  size,
+				Finish:  &ownsandv1.WriteFileFinish{SizeBytes: size},
+			}
+			res, err := agent.write(req, nil)
+			if err != nil || !res.GetFinished() || res.GetSizeBytes() != size {
+				t.Fatalf("finish: unexpected acknowledgment (%v, %v)", res, err)
+			}
+			if data, ok := agent.file(path); !ok || string(data) != tc.want {
+				t.Fatalf("destination = %q, want %q", data, tc.want)
+			}
+		})
+	}
+}
+
 func TestWriteFileRetries(t *testing.T) {
 	t.Parallel()
 	cases := map[string]func(n int) relayAction{
