@@ -169,9 +169,9 @@ export function Slider({
         value={value}
         defaultValue={defaultValue}
         onValueChange={
-          isRange && value === undefined
+          value === undefined
             ? (next, details) => {
-                if (thumbCount(next) < 2) {
+                if (isRangeValue(next) !== isRange) {
                   details.cancel();
                   return;
                 }

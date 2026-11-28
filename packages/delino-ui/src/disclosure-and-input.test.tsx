@@ -705,6 +705,53 @@ describe("Slider", () => {
     });
   });
 
+  test("rejects a controller update that adds values to a single thumb", async () => {
+    const controller = createSliderController();
+    const changes: (number | number[])[] = [];
+    render(
+      <form>
+        <Slider
+          label="Price"
+          name="price"
+          defaultValue={[20]}
+          controller={controller}
+          onValueChange={(value) => changes.push(value)}
+          showValue
+          locale="en-US"
+        />
+      </form>,
+    );
+    const thumb = screen.getByRole<HTMLInputElement>("slider", {
+      name: "Price",
+    });
+    const form = thumb.form!;
+    thumb.focus();
+
+    await act(async () => {
+      expect(controller.setValue([25, 75])).toBe(false);
+    });
+
+    expect(changes).toEqual([]);
+    expect(controller.getValue()).toEqual([20]);
+    expect(screen.getAllByRole("slider")).toEqual([thumb]);
+    expect(document.activeElement).toBe(thumb);
+    expect(thumb.value).toBe("20");
+    expect(screen.getByText("20")).toBeTruthy();
+    expect(new FormData(form).get("price")).toBe("20");
+
+    await act(async () => {
+      expect(controller.setValue([30])).toBe(true);
+    });
+
+    expect(changes).toEqual([[30]]);
+    expect(controller.getValue()).toEqual([30]);
+    expect(screen.getAllByRole("slider")).toEqual([thumb]);
+    expect(document.activeElement).toBe(thumb);
+    expect(thumb.value).toBe("30");
+    expect(screen.getByText("30")).toBeTruthy();
+    expect(new FormData(form).get("price")).toBe("30");
+  });
+
   describe("when a controller changes the range values", () => {
     const thumbs = () =>
       screen.getAllByRole("slider") as unknown as HTMLInputElement[];
