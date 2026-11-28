@@ -961,7 +961,7 @@ func TestNewServerGeneralOptionsBodyIsBounded(t *testing.T) {
 		defer conn.Close()
 		reader := bufio.NewReader(conn)
 		for range 2 {
-			request := "OPTIONS * HTTP/1.1\r\nHost: test\r\nContent-Length: 4096\r\n\r\n" + strings.Repeat("x", bodyLimit)
+			request := fmt.Sprintf("OPTIONS * HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", bodyLimit) + strings.Repeat("x", bodyLimit)
 			if _, err := io.WriteString(conn, request); err != nil {
 				t.Fatalf("write: %v", err)
 			}
@@ -991,7 +991,8 @@ func TestNewServerGeneralOptionsBodyIsBounded(t *testing.T) {
 		}
 		defer conn.Close()
 		// No Connection: close, so only the body limit can end the connection.
-		request := "OPTIONS * HTTP/1.1\r\nHost: test\r\nContent-Length: 6000\r\n\r\n" + strings.Repeat("x", 6000)
+		bodySize := bodyLimit + 1
+		request := fmt.Sprintf("OPTIONS * HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", bodySize) + strings.Repeat("x", bodySize)
 		if _, err := io.WriteString(conn, request); err != nil {
 			t.Fatalf("write: %v", err)
 		}
