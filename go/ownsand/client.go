@@ -96,8 +96,9 @@ type Options struct {
 	// BaseURL is the API origin, for example https://ownsand.api.delino.io
 	// or http://127.0.0.1:18300 for a local control plane. An http:// origin
 	// uses HTTP/2 without TLS (h2c with prior knowledge). An explicit port
-	// must be at most 65535. The origin must not have a path, query marker
-	// ("?"), fragment marker ("#") or user info. Empty means DefaultBaseURL.
+	// must be at most 65535. The path may be empty or a single literal
+	// slash. The origin must not have a query marker ("?"), fragment marker
+	// ("#") or user info. Empty means DefaultBaseURL.
 	BaseURL string
 	// APIKey is an organization API key (osk_...). Set at most one of
 	// APIKey and TokenSource. When both are empty, the client reads
@@ -165,7 +166,6 @@ func New(opts Options) (*Client, error) {
 	if base == "" {
 		base = DefaultBaseURL
 	}
-	base = strings.TrimRight(base, "/")
 	origin, err := url.Parse(base)
 	// Hostname drops the port, so "http://:18300" has a nonempty Host but no
 	// hostname.
@@ -175,7 +175,8 @@ func New(opts Options) (*Client, error) {
 	// url.Parse drops an empty fragment and records a bare "?" only as
 	// ForceQuery, so check the raw string. The Connect clients append the RPC
 	// path to it, which a query marker or fragment would swallow.
-	if strings.ContainsAny(base, "?#") || origin.Path != "" || origin.RawQuery != "" || origin.User != nil || origin.Opaque != "" {
+	path := origin.EscapedPath()
+	if strings.ContainsAny(base, "?#") || (path != "" && path != "/") || origin.RawQuery != "" || origin.User != nil || origin.Opaque != "" {
 		return nil, fmt.Errorf("ownsand: invalid base URL: want an origin without path, query, fragment or user info")
 	}
 	if port := origin.Port(); port != "" {
@@ -183,6 +184,8 @@ func New(opts Options) (*Client, error) {
 			return nil, errInvalidBaseURL
 		}
 	}
+	base = strings.TrimSuffix(base, "/")
+	origin.Path = ""
 
 	var cred credential
 	switch {

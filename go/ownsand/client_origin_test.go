@@ -40,6 +40,28 @@ func TestNewRejectsOutOfRangeOriginPorts(t *testing.T) {
 	}
 }
 
+func TestNewRejectsOriginsWithPathQueryFragmentOrUserInfo(t *testing.T) {
+	t.Parallel()
+	const want = "ownsand: invalid base URL: want an origin without path, query, fragment or user info"
+	for _, baseURL := range []string{
+		"https://example.test//",
+		"https://example.test///",
+		"http://localhost:8080//",
+		"https://example.test/subdir/",
+		"https://example.test/%2F",
+		"https://example.test/?",
+		"https://example.test/#",
+		"https://user@example.test/",
+	} {
+		t.Run(baseURL, func(t *testing.T) {
+			c, err := New(Options{BaseURL: baseURL, APIKey: "osk_x", LookupEnv: envOf(nil)})
+			if c != nil || err == nil || err.Error() != want {
+				t.Fatalf("client is nil = %t, error = %v, want a nil client and %q", c == nil, err, want)
+			}
+		})
+	}
+}
+
 func TestNewAcceptsOriginsWithHostname(t *testing.T) {
 	t.Parallel()
 	for _, good := range []string{
@@ -53,6 +75,7 @@ func TestNewAcceptsOriginsWithHostname(t *testing.T) {
 		"https://example.test:443",
 		"https://example.test:65535",
 		"https://example.test",
+		"https://example.test/",
 		"http://localhost:8080/",
 	} {
 		c, err := New(Options{BaseURL: good, APIKey: "osk_x", LookupEnv: envOf(nil)})
