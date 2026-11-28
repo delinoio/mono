@@ -232,9 +232,12 @@ func TestWithAttachedDiskDetachesAfterUse(t *testing.T) {
 			if (used != "") != tc.wantUse {
 				t.Fatalf("use called with %q, want called = %v", used, tc.wantUse)
 			}
-			attach := f.calls[0]
-			if attach[0] != hdiutilPath || attach[1] != "attach" || attach[len(attach)-1] != "/build/disk.img" {
-				t.Fatalf("attach call = %v", attach)
+			if len(f.calls) == 0 {
+				t.Fatal("missing attach call")
+			}
+			wantAttach := []string{"/usr/bin/hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", "-plist", "/build/disk.img"}
+			if got := f.calls[0]; !reflect.DeepEqual(got, wantAttach) {
+				t.Fatalf("attach call = %q, want %q", got, wantAttach)
 			}
 		})
 	}
