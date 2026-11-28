@@ -5,6 +5,7 @@ package billing
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -229,6 +230,17 @@ func TestAutoTopUpClaimedInTheQueueMonthCountsOnce(t *testing.T) {
 	}
 }
 
+type capChargeTransport struct {
+	beforeCharge func(context.Context)
+}
+
+func (c capChargeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/charge") {
+		c.beforeCharge(req.Context())
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
 func TestFailedAutoTopUpReleasesTheCapOfTheClaimMonth(t *testing.T) {
 	t.Parallel()
 	f, acct := capFixture(t)
@@ -236,18 +248,71 @@ func TestFailedAutoTopUpReleasesTheCapOfTheClaimMonth(t *testing.T) {
 	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
 		t.Fatal("no top-up queued")
 	}
+	var topUpID string
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT top_up_id FROM top_ups WHERE billing_account_id = $1`, acct).
+		Scan(&topUpID); err != nil {
+		t.Fatalf("read queued top-up ID: %v", err)
+	}
+
+	checkTotals := func(ctx context.Context, phase string, december, january int64) {
+		t.Helper()
+		for _, month := range []struct {
+			at   time.Time
+			want int64
+		}{
+			{beforeMonthEnd, december},
+			{afterMonthEnd, january},
+		} {
+			got, err := MonthToDate(ctx, f.db.Pool, acct, month.at)
+			if err != nil {
+				t.Errorf("%s: read %s month to date: %v", phase, month.at.Month(), err)
+			} else if got != month.want {
+				t.Errorf("%s: %s month to date = %d, want %d", phase, month.at.Month(), got, month.want)
+			}
+		}
+	}
+	checkTopUp := func(ctx context.Context, wantStatus TopUpStatus, wantReason FailureReason) {
+		t.Helper()
+		var status TopUpStatus
+		var reason FailureReason
+		var createTime, capTime time.Time
+		if err := f.db.Pool.QueryRow(ctx, `SELECT status, COALESCE(failure_reason, ''), create_time, cap_time
+			FROM top_ups WHERE top_up_id = $1`, topUpID).Scan(&status, &reason, &createTime, &capTime); err != nil {
+			t.Errorf("read %s top-up: %v", wantStatus, err)
+			return
+		}
+		if status != wantStatus || reason != wantReason {
+			t.Errorf("top-up status and reason = %q, %q, want %q, %q", status, reason, wantStatus, wantReason)
+		}
+		if !createTime.Equal(beforeMonthEnd) || !capTime.Equal(afterMonthEnd) {
+			t.Errorf("%s top-up create_time = %v, cap_time = %v, want %v and %v",
+				wantStatus, createTime, capTime, beforeMonthEnd, afterMonthEnd)
+		}
+	}
+
+	checkTotals(ctx(), "queued", 25*usd, 0)
+	observedCharge := false
+	f.s.paddle = paddle.New(paddle.Config{
+		BaseURL: f.paddle.URL,
+		APIKey:  paddletest.APIKey,
+		Client: &http.Client{Transport: capChargeTransport{beforeCharge: func(ctx context.Context) {
+			observedCharge = true
+			// Read from the pool while Paddle has yet to return a response.
+			checkTopUp(ctx, TopUpCharging, "")
+			checkTotals(ctx, "charging", 0, 25*usd)
+			// Give settlement a different timestamp from the claim.
+			f.clock.Advance(30 * time.Second)
+		}}},
+	})
 	f.clock.Set(afterMonthEnd)
 	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "failed:payment_declined" {
-		t.Fatalf("top-ups = %v", got)
+	if !observedCharge {
+		t.Error("the transport did not observe the Paddle charge")
 	}
-	for _, at := range []time.Time{beforeMonthEnd, afterMonthEnd} {
-		if got := f.monthToDate(acct, at); got != 0 {
-			t.Fatalf("month to date at %v = %d, want 0 for a failed top-up", at, got)
-		}
-	}
+	checkTopUp(ctx(), TopUpFailed, FailureDeclined)
+	checkTotals(ctx(), "declined", 0, 0)
 }
 
 func TestPendingAutoTopUpFailsWhenTheClaimMonthCapIsUsed(t *testing.T) {
