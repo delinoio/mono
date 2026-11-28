@@ -202,6 +202,13 @@ jobs:
         image: postgres:17.11-alpine@sha256:e5d2edd28b1f8d40a0a6c0c9cdc545b19b56a0d5d88f94bc11a97d970d4700d0
         env:
           POSTGRES_PASSWORD: ci
+          # The tests run in parallel, and the dbtestslot package sizes its
+          # limit of concurrent Postgres-backed tests from max_connections.
+          # The default of 100 allows 10 such tests at a time, fewer than the
+          # 16 that `go test` runs on the 4-CPU runner (4 test binaries with 4
+          # parallel tests each). initdb -c (Postgres 16 and later) writes the
+          # setting into postgresql.conf.
+          POSTGRES_INITDB_ARGS: -c max_connections=300
         ports:
           - 5432:5432
         options: >-
