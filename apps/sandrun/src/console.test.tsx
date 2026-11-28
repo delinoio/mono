@@ -4312,20 +4312,51 @@ describe("work", () => {
   });
 
   test("canceling a request needs a confirmation", async () => {
-    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`);
-    const table = await screen.findByRole("table", { name: "Requests" });
-    const cancel = within(table).getAllByRole("button", { name: "Cancel" });
-    expect(cancel.length).toBe(3);
-    await click(cancel[0]!);
-    const dialog = await screen.findByRole("alertdialog");
-    await click(within(dialog).getByRole("button", { name: "Cancel request" }));
-    await settle(80);
-    expect(
-      within(screen.getByRole("table", { name: "Requests" })).getAllByRole(
-        "button",
-        { name: "Cancel" },
-      ).length,
-    ).toBe(2);
+    const { transport, calls } = gatedTransport("CancelRequest");
+    renderConsole(`/orgs/${MOCK_IDS.acme}/requests`, { transport });
+    const table = within(
+      await screen.findByRole("table", { name: "Requests" }),
+    );
+    const jobName = /acme-robotics\/firmware · test \(ubuntu\)/;
+    const cancelJob = () =>
+      within(table.getByRole("row", { name: jobName })).getByRole("button", {
+        name: "Cancel",
+      });
+    const dialogName = "Cancel this request?";
+
+    await click(cancelJob());
+    const dialog = within(
+      await screen.findByRole("alertdialog", { name: dialogName }),
+    );
+    expect(calls).toHaveLength(0);
+    expect(cancelJob()).toBeTruthy();
+
+    await click(dialog.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog", { name: dialogName })).toBeNull();
+    expect(calls).toHaveLength(0);
+    expect(cancelJob()).toBeTruthy();
+
+    await click(cancelJob());
+    const reopenedDialog = within(
+      await screen.findByRole("alertdialog", { name: dialogName }),
+    );
+    await click(reopenedDialog.getByRole("button", { name: "Cancel request" }));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toMatchObject({
+      organizationId: MOCK_IDS.acme,
+      requestId: MOCK_IDS.queuedJob,
+    });
+    expect(cancelJob()).toBeTruthy();
+
+    await act(async () => calls[0].settle());
+    await waitFor(() =>
+      expect(table.queryByRole("row", { name: jobName })).toBeNull(),
+    );
+    for (const name of [/sess_codex_4711/, /Dev session/]) {
+      const row = table.getByRole("row", { name });
+      expect(within(row).getByRole("button", { name: "Cancel" })).toBeTruthy();
+    }
+    expect(calls).toHaveLength(1);
   });
 
   describe("request pagination", () => {
