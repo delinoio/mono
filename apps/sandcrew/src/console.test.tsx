@@ -313,6 +313,18 @@ describe("session list", () => {
     });
   });
 
+  test("reloads the list when its first change stream starts", async () => {
+    const { transport, calls } = recording(
+      createMockTransport({ agentStepMs: 5 }),
+    );
+    const lists = () => calls.filter((c) => c.method === "ListSessions").length;
+    renderConsole(`/orgs/${ACME}/sessions`, { transport });
+    await screen.findByRole("list", { name: "Sessions" });
+    // A fresh cached list from an earlier visit is not loaded again, and
+    // WatchSessions does not replay the changes that it missed.
+    await waitFor(() => expect(lists()).toBe(2));
+  });
+
   test("backs off while its change stream fails before a response", async () => {
     const base = createMockTransport({ agentStepMs: 5 });
     let watches = 0;

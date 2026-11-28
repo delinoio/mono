@@ -17,7 +17,7 @@ import {
   SegmentedControl,
   SegmentedControlItem,
 } from "delino-ui/segmented-control";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { invalidateServices, SESSION_PAGE_SIZE } from "../api.ts";
 import {
   scheduledDeletionText,
@@ -68,9 +68,11 @@ export function updateSessionPages(
 /**
  * Keeps the cached session lists of an organization current with
  * WatchSessions while the page is visible. A new session reloads the list.
- * WatchSessions has no replay cursor, so each reopened stream (after a
- * failure, a server rotation or a hidden page) reloads the list once its
- * first response confirms the subscription.
+ * WatchSessions has no replay cursor, so each stream reloads the list once
+ * its first response confirms the subscription: a reopened stream (after a
+ * failure, a server rotation or a hidden page) and also the first one, which
+ * can start from a fresh cached list that missed changes while the page was
+ * closed.
  */
 function useWatchSessions(
   organizationId: string,
@@ -81,14 +83,10 @@ function useWatchSessions(
   const queryClient = useQueryClient();
   const visible = usePageVisible();
   const key = `${organizationId}:${filter}`;
-  const watchedKey = useRef<string>(undefined);
   return useStream(
     async (signal, onLive) => {
       const client = createClient(SessionService, transport);
-      // The first stream of a list starts with the list load; later streams
-      // may have missed changes.
-      let reconciled = watchedKey.current !== key;
-      watchedKey.current = key;
+      let reconciled = false;
       let live = false;
       for await (const response of client.watchSessions(
         { organizationId },
@@ -107,6 +105,8 @@ function useWatchSessions(
               schema: SessionService.method.listSessions,
               cardinality: "infinite",
             }),
+            // A failed load keeps its error and retry until the user acts.
+            predicate: (query) => query.state.data !== undefined,
           });
         }
         const event = response.event;
