@@ -13,6 +13,7 @@ import (
 )
 
 func TestSubscriptionCreditLimitedToPaidAmount(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name           string
 		subtotal       int64
@@ -105,6 +106,7 @@ func TestSubscriptionCreditLimitedToPaidAmount(t *testing.T) {
 }
 
 func TestCustomDataPaymentWithFullDiscountAddsNoCredit(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	payment := paddletest.Transaction(paddletest.TransactionData{
@@ -122,6 +124,7 @@ func TestCustomDataPaymentWithFullDiscountAddsNoCredit(t *testing.T) {
 }
 
 func TestRefundOfReducedSubscriptionCredit(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	txnID := f.checkout(acct)
@@ -138,6 +141,7 @@ func TestRefundOfReducedSubscriptionCredit(t *testing.T) {
 }
 
 func TestSubscriptionCreditSkippedOnReplayStillReconcilesAdjustment(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	const txnID = "txn_existing"

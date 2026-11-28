@@ -106,6 +106,7 @@ func waitForClaimLock(t *testing.T, ctx context.Context, f *fixture, holderPID i
 }
 
 func TestAutoTopUpClaimUsesMonthAfterLocks(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		query string
@@ -168,6 +169,7 @@ func testAutoTopUpClaimUsesMonthAfterLock(t *testing.T, lockQuery string) {
 }
 
 func TestAutoTopUpClaimCutoverSettlesPriorLegacyChargeOnce(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
 		t.Fatal("no top-up queued")
@@ -209,6 +211,7 @@ func TestAutoTopUpClaimCutoverSettlesPriorLegacyChargeOnce(t *testing.T) {
 }
 
 func TestAutoTopUpClaimedInTheQueueMonthCountsOnce(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
 		t.Fatal("no top-up queued")
@@ -227,6 +230,7 @@ func TestAutoTopUpClaimedInTheQueueMonthCountsOnce(t *testing.T) {
 }
 
 func TestFailedAutoTopUpReleasesTheCapOfTheClaimMonth(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	f.paddle.FailCharges(&paddletest.Failure{Status: http.StatusBadRequest, Code: paddle.CodePaymentDeclined})
 	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
@@ -247,6 +251,7 @@ func TestFailedAutoTopUpReleasesTheCapOfTheClaimMonth(t *testing.T) {
 }
 
 func TestPendingAutoTopUpFailsWhenTheClaimMonthCapIsUsed(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	if res := f.deduct(acct, 25*usd); !res.AutoTopUpQueued {
 		t.Fatal("no top-up queued")
@@ -296,6 +301,7 @@ func TestPendingAutoTopUpFailsWhenTheClaimMonthCapIsUsed(t *testing.T) {
 }
 
 func TestMonthToDateFallsBackToCreateTimeWithoutCapTime(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	// A row that exists before the cap time column has no cap time, and a
 	// manual top-up never has one; the first counts by create_time, the
@@ -323,6 +329,7 @@ func TestMonthToDateFallsBackToCreateTimeWithoutCapTime(t *testing.T) {
 }
 
 func TestAutoTopUpTimeoutReservesCapThroughLateCompletion(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		cap         int64
@@ -393,6 +400,7 @@ func TestAutoTopUpTimeoutReservesCapThroughLateCompletion(t *testing.T) {
 }
 
 func TestAutoTopUpClaimRespectsTimeoutWithUnknownOutcome(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		timeoutCap time.Time
@@ -431,6 +439,7 @@ func TestAutoTopUpClaimRespectsTimeoutWithUnknownOutcome(t *testing.T) {
 }
 
 func TestAutoTopUpTimeoutReleasesCapOnVerifiedPaymentFailure(t *testing.T) {
+	t.Parallel()
 	f, acct := capFixture(t)
 	f.clock.Set(afterMonthEnd)
 	f.paddle.FailCharges(&paddletest.Failure{Status: http.StatusBadGateway, Code: "bad_gateway"})

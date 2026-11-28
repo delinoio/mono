@@ -104,6 +104,7 @@ func (c *billingTelemetryCapture) wantGrants(t *testing.T, entries ...LedgerEntr
 }
 
 func TestWebhookCommitFailureDoesNotReportGrant(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	telemetry := f.captureBillingTelemetry()
 	acct := f.account()

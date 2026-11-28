@@ -139,6 +139,7 @@ func (f fixture) person(role string) person {
 }
 
 func TestRoleMatrix(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	const (
 		ok   = connect.Code(0)
@@ -227,6 +228,7 @@ func TestRoleMatrix(t *testing.T) {
 }
 
 func TestCreateGetListBillingAccounts(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	alice := newPerson(env, "alice")
 	bob := newPerson(env, "bob")
@@ -314,6 +316,7 @@ func TestCreateGetListBillingAccounts(t *testing.T) {
 }
 
 func TestInvitationAcceptance(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	invitee := newPerson(env, "invitee")
@@ -430,6 +433,7 @@ func TestInvitationAcceptance(t *testing.T) {
 // "#token=" marker, must not hide or replace the token of the newest
 // invitation.
 func TestInvitationTokenHelperIgnoresOtherEmails(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	invitee := newPerson(env, "invitee")
@@ -477,6 +481,7 @@ func TestInvitationTokenHelperIgnoresOtherEmails(t *testing.T) {
 // the name before the acceptance link, and the helper must still return the
 // token of the link.
 func TestInvitationTokenHelperIgnoresMarkerInAccountName(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	invitee := newPerson(env, "invitee")
@@ -492,6 +497,7 @@ func TestInvitationTokenHelperIgnoresMarkerInAccountName(t *testing.T) {
 }
 
 func TestInvitationRules(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -621,6 +627,7 @@ func invitationRows(t *testing.T, env *testenv.Env, accountID string) []string {
 // sent, so a failed send, which revokes the invitation, leaves the creation
 // record and row and then the revocation with its reason.
 func TestInvitationCreateFailureAuditsCreationThenRevocation(t *testing.T) {
+	t.Parallel()
 	var keys []string
 	var keysMu sync.Mutex
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -703,6 +710,7 @@ func TestInvitationCreateFailureAuditsCreationThenRevocation(t *testing.T) {
 // recovered by inviting again, each invitation ID gets one email, and the
 // recipient of the delivered invitation can accept it.
 func TestInvitationDeliveryAfterCommit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -783,6 +791,7 @@ func TestInvitationDeliveryAfterCommit(t *testing.T) {
 // A transaction that fails to commit the invitation sends no email and creates
 // nothing.
 func TestInvitationCommitFailureSendsNoEmail(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -817,6 +826,7 @@ func TestInvitationCommitFailureSendsNoEmail(t *testing.T) {
 // Handlers that commit write one billing_audit_event record per change, and
 // none for a call that changes nothing or fails.
 func TestAuditEventsLoggedAfterCommit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	rename := func(c person, name string) error {
@@ -864,6 +874,7 @@ func TestAuditEventsLoggedAfterCommit(t *testing.T) {
 }
 
 func TestMembers(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 
@@ -930,6 +941,7 @@ func TestMembers(t *testing.T) {
 }
 
 func TestTransferOwnership(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 
@@ -964,6 +976,7 @@ func TestTransferOwnership(t *testing.T) {
 }
 
 func TestDeleteBillingAccount(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	del := func() error {
@@ -1032,6 +1045,7 @@ func TestDeleteBillingAccount(t *testing.T) {
 }
 
 func TestAuditEvents(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	if _, err := f.Owner.Client.UpdateBillingAccount(ctx(), connect.NewRequest(&accountsv1.UpdateBillingAccountRequest{BillingAccountId: f.AccountID, Name: "Renamed"})); err != nil {
@@ -1087,6 +1101,7 @@ func TestAuditEvents(t *testing.T) {
 }
 
 func TestAuthentication(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	call := func(c accountsv1connect.BillingAccountServiceClient) error {
 		_, err := c.ListBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListBillingAccountsRequest{}))
@@ -1118,6 +1133,7 @@ func TestAuthentication(t *testing.T) {
 }
 
 func TestLogsHoldNoSecrets(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	addr := "secret-person@example.com"
@@ -1136,6 +1152,7 @@ func TestLogsHoldNoSecrets(t *testing.T) {
 }
 
 func TestCORSPreflight(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	req, err := newPreflight(env.URL+accountsv1connect.BillingAccountServiceListBillingAccountsProcedure, testenv.WebOrigin)
 	if err != nil {
@@ -1172,6 +1189,7 @@ func acceptanceRows(t *testing.T, env *testenv.Env, accountID string) (members, 
 // An invitation that expires after the early check, while the Logto lookup is
 // in flight, must be rejected by the check inside the transaction.
 func TestAcceptInvitationExpiresDuringDirectoryLookup(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	invitee := newPerson(env, "invitee")
@@ -1197,6 +1215,7 @@ func TestAcceptInvitationExpiresDuringDirectoryLookup(t *testing.T) {
 // An invitation that expires while the acceptance waits for the billing
 // account lock held by another transaction must be rejected as well.
 func TestAcceptInvitationExpiresWhileWaitingForAccountLock(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	invitee := newPerson(env, "invitee")
@@ -1235,6 +1254,7 @@ func TestAcceptInvitationExpiresWhileWaitingForAccountLock(t *testing.T) {
 // A valid invitation is still accepted when the lookup and the lock wait take
 // time, and the response and rows carry the acceptance time.
 func TestAcceptInvitationBeforeExpiryRecordsAcceptanceTime(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	invitee := newPerson(env, "invitee")

@@ -35,6 +35,7 @@ func TestRunWorkerSkipsPreCanceledStartup(t *testing.T) {
 }
 
 func TestRunOnceRefreshesMetricsWithDueNotifications(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	scrape, org := workerMetricsFixture(t, f)
 	f.s.RunOnce(t.Context())
@@ -94,6 +95,7 @@ func TestRunOnceRefreshesMetricsWithDueNotifications(t *testing.T) {
 }
 
 func TestRunOnceCancellationKeepsNotificationProgressAndStopsLaterTasks(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	scrape, org := workerMetricsFixture(t, f)
 	f.s.RunOnce(t.Context())

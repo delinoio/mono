@@ -20,6 +20,7 @@ import (
 )
 
 func TestNotificationResendRetry(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name        string
 		firstStatus int
@@ -60,6 +61,7 @@ func TestNotificationResendRetry(t *testing.T) {
 }
 
 func TestNotificationResendReceiptRecovery(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		change     string
 		laterFails bool

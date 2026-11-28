@@ -120,6 +120,7 @@ func wantStatuses(t *testing.T, label string, got []string, want ...string) {
 // gets the provider-unavailable answer, and a retry with the same key sends
 // no second charge.
 func TestManualTopUpRecordsUnknownAfterTheCallDeadline(t *testing.T) {
+	t.Parallel()
 	f, acct, _ := outcomeFixture(t, outcomeTestLockHold, outcomeTestOutcomeBudget, "")
 
 	err := f.manualTopUp(acct, topUpKey)
@@ -143,6 +144,7 @@ func TestManualTopUpRecordsUnknownAfterTheCallDeadline(t *testing.T) {
 }
 
 func TestAutoTopUpRecordsUnknownAfterTheCallDeadline(t *testing.T) {
+	t.Parallel()
 	f, acct, _ := outcomeFixture(t, outcomeTestLockHold, outcomeTestOutcomeBudget, "")
 	f.grant(acct, LedgerManualTopUp, 30*usd)
 	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
@@ -169,6 +171,7 @@ func TestAutoTopUpRecordsUnknownAfterTheCallDeadline(t *testing.T) {
 // A webhook that finalized the top-up while the outcome write waited stays
 // authoritative: the conditional update does not overwrite it.
 func TestTopUpOutcomeKeepsAFinalizedTopUp(t *testing.T) {
+	t.Parallel()
 	f, acct, _ := outcomeFixture(t, outcomeTestLockHold, outcomeTestOutcomeBudget, "completed")
 
 	err := f.manualTopUp(acct, topUpKey)
@@ -183,6 +186,7 @@ func TestTopUpOutcomeKeepsAFinalizedTopUp(t *testing.T) {
 // the error is returned instead of the unavailable answer, and the top-up
 // stays charging for the top-up timeout to resolve.
 func TestTopUpOutcomeDeadlineStillReturnsTheDatabaseError(t *testing.T) {
+	t.Parallel()
 	f, acct, lock := outcomeFixture(t, 2*time.Second, 300*time.Millisecond, "")
 
 	err := f.manualTopUp(acct, topUpKey)

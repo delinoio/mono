@@ -93,6 +93,7 @@ func (c *billingTelemetryCapture) wantTopUps(t *testing.T, wantCounts map[topUpM
 }
 
 func TestAutoTopUpTimeoutObservationsRequireCommit(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	telemetry := f.captureBillingTelemetry()
 	acct := f.account()
@@ -149,6 +150,7 @@ func TestAutoTopUpTimeoutObservationsRequireCommit(t *testing.T) {
 }
 
 func TestTopUpCompletionObservationRequiresCommit(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		install string
@@ -228,6 +230,7 @@ func TestTopUpCompletionObservationRequiresCommit(t *testing.T) {
 }
 
 func TestTopUpAttemptSurvivesOutcomeRollback(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	telemetry := f.captureBillingTelemetry()
 	acct := f.account()

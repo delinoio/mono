@@ -27,6 +27,7 @@ func revokeCall(p person, accountID, invitationID string) func() error {
 // billing account lock must be rejected: the pending check uses the time
 // after the lock, so no revoke time or audit event is written.
 func TestRevokeInvitationExpiresWhileWaitingForAccountLock(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
@@ -53,6 +54,7 @@ func TestRevokeInvitationExpiresWhileWaitingForAccountLock(t *testing.T) {
 // A revocation that waits for the lock and still finds the invitation
 // pending stores, audits and returns one time taken after the wait.
 func TestRevokeInvitationAfterLockWaitUsesTimeAfterWait(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
 	accountID := createAccount(t, owner, "Team").GetBillingAccountId()

@@ -43,6 +43,7 @@ func (f *fixture) checkout(accountID string) string {
 }
 
 func TestWebhookSignatureRejection(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	data := paddletest.Transaction(paddletest.TransactionData{
@@ -76,6 +77,7 @@ func TestWebhookSignatureRejection(t *testing.T) {
 }
 
 func TestWebhookSubscriptionPaymentAndReplay(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	txnID := f.checkout(acct)
@@ -150,10 +152,12 @@ func TestWebhookSubscriptionPaymentAndReplay(t *testing.T) {
 }
 
 func TestPaddleWebhookPreservesSuspensionAfterAccountLock(t *testing.T) {
+	t.Parallel()
 	testPaddleWebhookAcrossSuspensionDeadline(t, true)
 }
 
 func TestPaddleWebhookSuspendsAfterAccountLock(t *testing.T) {
+	t.Parallel()
 	testPaddleWebhookAcrossSuspensionDeadline(t, false)
 }
 
@@ -255,6 +259,7 @@ func testPaddleWebhookAcrossSuspensionDeadline(t *testing.T, workerSuspends bool
 }
 
 func TestWebhookRefundAndChargeback(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.webhook(paddle.EventTransactionCompleted, paddletest.Transaction(paddletest.TransactionData{
@@ -324,6 +329,7 @@ func TestWebhookRefundAndChargeback(t *testing.T) {
 }
 
 func TestWebhookFailedRenewalAndChargeFailure(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
@@ -408,6 +414,7 @@ func TestWebhookFailedRenewalAndChargeFailure(t *testing.T) {
 }
 
 func TestEmailDeliveryRetry(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.grant(acct, LedgerManualTopUp, 25*usd)
@@ -447,6 +454,7 @@ func emailsTo(f *fixture, addr string) int {
 // TestEmailDeliveryContinuesAfterRecipientFailure checks first-attempt
 // delivery to later recipients, retry deduplication, and abandonment.
 func TestEmailDeliveryContinuesAfterRecipientFailure(t *testing.T) {
+	t.Parallel()
 	setup := func(t *testing.T) (f *fixture, acct, adminAddr, ownerAddr string) {
 		t.Helper()
 		f = newFixture(t)
@@ -518,6 +526,7 @@ func (sendError) Error() string { return "send failed" }
 var errSendTest error = sendError{}
 
 func TestCloseAccountCancelsSubscription(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
@@ -571,6 +580,7 @@ func (scans emptyTopUpScans) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, dat
 }
 
 func TestWorkerWakeAndStop(t *testing.T) {
+	t.Parallel()
 	scans := make(emptyTopUpScans, 3)
 	cfg, err := pgxpool.ParseConfig(dbtest.NewURL(t))
 	if err != nil {
@@ -635,6 +645,7 @@ func TestWorkerWakeAndStop(t *testing.T) {
 }
 
 func TestLateEventDoesNotReplaceNewCheckout(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	oldSub := f.activate(acct)
@@ -661,6 +672,7 @@ func TestLateEventDoesNotReplaceNewCheckout(t *testing.T) {
 // PENDING, also when its updated_at is after the cancellation, and that the
 // subscription of the checkout transaction still completes it.
 func TestLateActiveEventDoesNotReplaceNewCheckout(t *testing.T) {
+	t.Parallel()
 	for _, status := range []string{
 		paddle.SubscriptionStatusActive, paddle.SubscriptionStatusTrialing,
 		paddle.SubscriptionStatusPastDue, paddle.SubscriptionStatusPaused,
@@ -754,6 +766,7 @@ func (f *fixture) canceledReplacement(acct string, cancelTime time.Time) (oldSub
 // canceled row of B and its update time in place, is recorded as ignored and
 // lets the next StartSubscription create a checkout.
 func TestOlderEntityOfEarlierSubscriptionDoesNotReplaceCanceledSubscription(t *testing.T) {
+	t.Parallel()
 	for _, status := range []string{paddle.SubscriptionStatusActive, paddle.SubscriptionStatusPastDue} {
 		t.Run(status, func(t *testing.T) {
 			f := newFixture(t)
@@ -787,6 +800,7 @@ func TestOlderEntityOfEarlierSubscriptionDoesNotReplaceCanceledSubscription(t *t
 // updated_at is after the cancellation, or equal to it, or missing, still
 // replaces a canceled subscription of a different ID.
 func TestNewerEntityAfterCancellationStillApplies(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(cancelTime time.Time) any{
 		"newer":   func(c time.Time) any { return c.Add(time.Minute) },
 		"equal":   func(c time.Time) any { return c },
@@ -818,6 +832,7 @@ func TestNewerEntityAfterCancellationStillApplies(t *testing.T) {
 // with a later updated_at, and that an older entity of the same ID is still
 // ignored.
 func TestDifferentSubscriptionDoesNotReplaceManageableRow(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		paddleStatus string
 		wantStatus   SubscriptionStatus
@@ -875,6 +890,7 @@ func TestDifferentSubscriptionDoesNotReplaceManageableRow(t *testing.T) {
 // through custom data and so leaves the checkout PENDING, and that the
 // subscription.created event of the checkout transaction completes it.
 func TestUpdateBeforeCreatedActivatesNewCheckout(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	oldSub := f.activate(acct)
@@ -902,6 +918,7 @@ func TestUpdateBeforeCreatedActivatesNewCheckout(t *testing.T) {
 // without a checkout transaction does not accept an entity that matches only
 // through custom data.
 func TestPendingWithoutCheckoutAcceptsFirstEntity(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.tx(func(tx pgx.Tx) error {
@@ -927,6 +944,7 @@ func TestPendingWithoutCheckoutAcceptsFirstEntity(t *testing.T) {
 // IDs the server did not record changes no subscription row, records no
 // subscription and is stored as unmatched.
 func TestCustomDataDoesNotBindSubscription(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"NONE", "CANCELED", "PENDING"} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
@@ -982,6 +1000,7 @@ func TestCustomDataDoesNotBindSubscription(t *testing.T) {
 // matches only through custom data adds its credit once, but neither records
 // nor activates its subscription, and that its failed renewal sends no email.
 func TestCustomDataPaymentOnlyAddsCredit(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	logs := f.captureLogs()
@@ -1025,6 +1044,7 @@ func TestCustomDataPaymentOnlyAddsCredit(t *testing.T) {
 }
 
 func TestLatePaymentOfEarlierSubscriptionKeepsCanceledReplacement(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	org := f.link(acct, "Organization")
@@ -1099,6 +1119,7 @@ func TestLatePaymentOfEarlierSubscriptionKeepsCanceledReplacement(t *testing.T) 
 // alters the pending row of a new checkout, that the credit is still granted
 // once, and that the payment of the checkout transaction activates it.
 func TestLatePaymentOfEarlierSubscriptionKeepsNewCheckout(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	oldSub := f.activate(acct)
@@ -1157,6 +1178,7 @@ func TestLatePaymentOfEarlierSubscriptionKeepsNewCheckout(t *testing.T) {
 // matches only through custom data adds its credit but leaves the pending
 // row PENDING.
 func TestPaymentActivatesPendingRowWithoutCheckoutTransaction(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.tx(func(tx pgx.Tx) error {

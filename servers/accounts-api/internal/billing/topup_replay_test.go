@@ -57,6 +57,7 @@ func (f *fixture) wantCredit(acct string, grants, entries int) {
 }
 
 func TestManualTopUpReplayAfterAcceptedChargeTimedOutSucceeds(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	telemetry := f.captureBillingTelemetry()
 	acct := f.account()
@@ -109,6 +110,7 @@ func TestManualTopUpReplayAfterAcceptedChargeTimedOutSucceeds(t *testing.T) {
 }
 
 func TestManualTopUpReplayAfterUnknownResultStaysUnavailable(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -131,6 +133,7 @@ func TestManualTopUpReplayAfterUnknownResultStaysUnavailable(t *testing.T) {
 // A row that timed out before the provider_accept_time column existed has no
 // evidence of acceptance.
 func TestManualTopUpReplayOfLegacyTimedOutRowIsUnavailable(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	sub := f.activate(acct)
@@ -148,6 +151,7 @@ func TestManualTopUpReplayOfLegacyTimedOutRowIsUnavailable(t *testing.T) {
 }
 
 func TestManualTopUpReplayAfterRejectionIsFailedPrecondition(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -164,6 +168,7 @@ func TestManualTopUpReplayAfterRejectionIsFailedPrecondition(t *testing.T) {
 // A payment that fails after Paddle accepted the charge is a recorded
 // failure, not a timeout: the replay keeps the failed_precondition answer.
 func TestManualTopUpReplayAfterFailedPaymentIsFailedPrecondition(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)
@@ -182,6 +187,7 @@ func TestManualTopUpReplayAfterFailedPaymentIsFailedPrecondition(t *testing.T) {
 }
 
 func TestManualTopUpReplayAfterLegacyChargeTimesOut(t *testing.T) {
+	t.Parallel()
 	for _, status := range []TopUpStatus{TopUpCharged, TopUpUnknown, TopUpCharging} {
 		t.Run(string(status), func(t *testing.T) {
 			f := newFixture(t)

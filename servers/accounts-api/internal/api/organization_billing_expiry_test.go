@@ -19,6 +19,7 @@ import (
 )
 
 func TestGetOrganizationBillingRefreshesExpiredCredit(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		hasTopUp bool
@@ -132,6 +133,7 @@ func TestGetOrganizationBillingRefreshesExpiredCredit(t *testing.T) {
 }
 
 func TestGetOrganizationBillingRechecksLinkAfterLockWait(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		relink bool

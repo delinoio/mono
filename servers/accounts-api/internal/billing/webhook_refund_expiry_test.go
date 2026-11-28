@@ -91,6 +91,7 @@ func (f *fixture) grantExpireTime(transactionID string) time.Time {
 }
 
 func TestPaymentWebhookExpiresCreditBeforePurchase(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		kind          LedgerKind
@@ -228,6 +229,7 @@ func (f *fixture) refundWhileGrantExpires(acct, txn, adjustmentID string, cents 
 // the expired grant: the expiry is an EXPIRY entry before the REFUND entry,
 // and the part of the refund that no usable grant covers becomes debt.
 func TestRefundExpiresGrantDueWhileWaitingForLocks(t *testing.T) {
+	t.Parallel()
 	t.Run("single grant", func(t *testing.T) {
 		f := newFixture(t)
 		acct := f.account()

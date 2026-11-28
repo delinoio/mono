@@ -12,6 +12,7 @@ import (
 )
 
 func TestPaymentWebhookCreditExpiryUsesCapture(t *testing.T) {
+	t.Parallel()
 	capture := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
 	occurred := capture.Add(time.Minute)
 	processed := capture.AddDate(0, 0, 2)
@@ -95,6 +96,7 @@ func TestPaymentWebhookCreditExpiryUsesCapture(t *testing.T) {
 }
 
 func TestPaymentWebhookCreditExpiryFallback(t *testing.T) {
+	t.Parallel()
 	first := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name     string
@@ -133,6 +135,7 @@ func TestPaymentWebhookCreditExpiryFallback(t *testing.T) {
 }
 
 func TestPaymentWebhookExpiresNewlyRecordedCredit(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		debt          int64

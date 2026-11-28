@@ -68,6 +68,7 @@ func linkedOrganizations(t *testing.T, env *testenv.Env, accountID, org string) 
 // billing account, and a retry of the key returns the original result
 // without a second deduction.
 func TestAttributedReportHoldsOrganizationLockUntilCommit(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	other := createAccount(t, f.Owner, "Other").GetBillingAccountId()
@@ -131,6 +132,7 @@ func TestAttributedReportHoldsOrganizationLockUntilCommit(t *testing.T) {
 // is charged to the other billing account once; the first account is not
 // charged.
 func TestAttributedReportFollowsLinkThatCommitsWhileItWaitsForAccountLock(t *testing.T) {
+	t.Parallel()
 	env := testenv.New(t)
 	f := newFixture(t, env)
 	other := createAccount(t, f.Owner, "Other").GetBillingAccountId()

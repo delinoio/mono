@@ -52,6 +52,7 @@ func (f *fixture) patchTransactionRequests() int {
 // cancel, so the deletion must cancel the checkout transaction: Paddle would
 // otherwise collect a payment for it after the deletion.
 func TestCloseAccountCancelsPendingCheckoutTransaction(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	txnID := f.checkout(acct)
@@ -78,6 +79,7 @@ func TestCloseAccountCancelsPendingCheckoutTransaction(t *testing.T) {
 // open Paddle transaction and the credit as they were, and the caller can
 // retry.
 func TestCloseAccountPendingCheckoutProviderFailureChangesNothing(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct {
 		failure *paddletest.Failure
 		raw     string
@@ -135,6 +137,7 @@ func TestCloseAccountPendingCheckoutProviderFailureChangesNothing(t *testing.T) 
 // everything; after the subscription webhook names the subscription, the
 // retry cancels the subscription as for any established subscription.
 func TestCloseAccountPendingCheckoutPaidMeanwhile(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	txnID := f.checkout(acct)
@@ -170,6 +173,7 @@ func TestCloseAccountPendingCheckoutPaidMeanwhile(t *testing.T) {
 // A checkout transaction that Paddle does not know any more, or that Paddle
 // already canceled, counts as closed.
 func TestCloseAccountPendingCheckoutAlreadyClosedAtPaddle(t *testing.T) {
+	t.Parallel()
 	t.Run("not found", func(t *testing.T) {
 		f := newFixture(t)
 		acct := f.account()
@@ -213,6 +217,7 @@ func TestCloseAccountPendingCheckoutAlreadyClosedAtPaddle(t *testing.T) {
 // An account that never started a checkout, and an established
 // subscription, make no checkout transaction call.
 func TestCloseAccountMakesNoCheckoutCallWithoutOpenCheckout(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	empty := f.account()
 	if err := f.closeAccount(empty); err != nil {
@@ -255,6 +260,7 @@ var errLaterWrite = errors.New("a later write of the deletion failed")
 // so the retry must not need a second cancellation, and the credit is
 // forfeited once.
 func TestCloseAccountRetryAfterRollbackReconcilesWithPaddle(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	subID := f.activate(acct)
@@ -313,6 +319,7 @@ func TestCloseAccountRetryAfterRollbackReconcilesWithPaddle(t *testing.T) {
 // the cancellation of a subscription that is not canceled, the deletion fails
 // and changes nothing.
 func TestCloseAccountRetryAfterRollbackNeedsPaddleConfirmation(t *testing.T) {
+	t.Parallel()
 	setup := func(t *testing.T) (*fixture, string, string) {
 		f := newFixture(t)
 		acct := f.account()
@@ -369,6 +376,7 @@ func TestCloseAccountRetryAfterRollbackNeedsPaddleConfirmation(t *testing.T) {
 // retry; a confirmed cancellation and an explicit not-found still complete the
 // deletion.
 func TestCloseAccountRequiresConfirmedCancellation(t *testing.T) {
+	t.Parallel()
 	const canceled = `{"data":{"id":"%ID%","status":"canceled"}}`
 	for name, tc := range map[string]struct {
 		status int
@@ -426,6 +434,7 @@ func TestCloseAccountRequiresConfirmedCancellation(t *testing.T) {
 // An explicit not-found of the subscription at Paddle still completes the
 // deletion.
 func TestCloseAccountCompletesWhenPaddleDoesNotKnowTheSubscription(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.activate(acct)

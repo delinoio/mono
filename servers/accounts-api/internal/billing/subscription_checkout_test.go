@@ -47,6 +47,7 @@ func (f *fixture) createTransactionRequests() int {
 // checkout row and no subscription change, and the caller gets the
 // provider-unavailable answer. The next start call asks Paddle again.
 func TestStartSubscriptionRejectsAnUnusableTransaction(t *testing.T) {
+	t.Parallel()
 	for name, body := range map[string]string{
 		"empty object": `{"data":{}}`,
 		"empty ID":     `{"data":{"id":""}}`,
@@ -86,6 +87,7 @@ func TestStartSubscriptionRejectsAnUnusableTransaction(t *testing.T) {
 }
 
 func TestStartSubscriptionReusesThePendingCheckout(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 
@@ -111,6 +113,7 @@ func TestStartSubscriptionReusesThePendingCheckout(t *testing.T) {
 }
 
 func TestStartSubscriptionReplacesMissingCheckout(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	first, err := f.startCheckout(acct)
@@ -136,6 +139,7 @@ func TestStartSubscriptionReplacesMissingCheckout(t *testing.T) {
 }
 
 func TestStartSubscriptionPreservesUnconfirmedCheckout(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name   string
 		body   string
@@ -183,6 +187,7 @@ func TestStartSubscriptionPreservesUnconfirmedCheckout(t *testing.T) {
 }
 
 func TestStartSubscriptionRejectsExistingSubscription(t *testing.T) {
+	t.Parallel()
 	for _, status := range []SubscriptionStatus{SubscriptionActive, SubscriptionPastDue} {
 		t.Run(string(status), func(t *testing.T) {
 			f := newFixture(t)
@@ -204,6 +209,7 @@ func TestStartSubscriptionRejectsExistingSubscription(t *testing.T) {
 // A null entity in the success answer is not a transaction: the start call
 // fails with the provider-unavailable answer and stores nothing.
 func TestStartSubscriptionRejectsANullTransaction(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	acct := f.account()
 	f.paddle.Respond("POST /transactions", http.StatusCreated, `{"data":null}`)
