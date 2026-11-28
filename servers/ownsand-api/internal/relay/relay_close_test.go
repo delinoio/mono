@@ -219,6 +219,85 @@ func TestPendingCloseCountsAgainstGrantLimit(t *testing.T) {
 	}
 }
 
+func TestFinalFrameHoldsAdmissionSlotsUntilSendCompletes(t *testing.T) {
+	t.Parallel()
+	const (
+		closingGrant = "grant-a"
+		wait         = 5 * time.Second
+	)
+	for _, tc := range []struct {
+		name              string
+		maxStreamsPerConn int
+		retryGrant        string
+	}{
+		{name: "connection limit", maxStreamsPerConn: 1, retryGrant: "grant-b"},
+		{name: "grant limit", maxStreamsPerConn: 2, retryGrant: closingGrant},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limits := closeTestLimits
+			limits.MaxStreamsPerConn = tc.maxStreamsPerConn
+			c := NewConn(context.Background(), "device", 1, limits)
+			open := func(grant string) (*Stream, error) {
+				ctx, cancel := context.WithTimeout(t.Context(), wait)
+				defer cancel()
+				return c.Open(ctx, grant, "sandbox")
+			}
+			s, err := open(closingGrant)
+			if err != nil {
+				t.Fatalf("Open stream to close: %v", err)
+			}
+			closeReturnsPromptly(t, s, true)
+
+			closeEntered := make(chan struct{})
+			closeReleased := make(chan struct{})
+			kindsEntered := make(chan struct{})
+			releaseClose := sync.OnceFunc(func() { close(closeReleased) })
+			var done <-chan error
+			t.Cleanup(func() {
+				releaseClose()
+				c.Close(ErrConnClosed)
+				waitRun(t, done, wait)
+			})
+			done = runConn(c, blockingRecv(c), func(f *ownsandv1.DataFrame) error {
+				switch {
+				case f.GetStreamId() == s.ID && f.GetRelayStreamClose() != nil:
+					close(closeEntered)
+					<-closeReleased
+				case f.GetSupportedFrameKinds() != nil:
+					close(kindsEntered)
+				}
+				return nil
+			})
+
+			select {
+			case <-closeEntered:
+			case <-time.After(wait):
+				t.Fatal("writer did not enter the close send")
+			}
+			select {
+			case <-kindsEntered:
+				t.Fatal("writer sent supported frame kinds before the close frame")
+			default:
+			}
+			if _, err := open(tc.retryGrant); !errors.Is(err, ErrTooManyStreams) {
+				t.Fatalf("Open during the close send = %v, want ErrTooManyStreams", err)
+			}
+
+			releaseClose()
+			// Run queues supported frame kinds behind the close. The writer
+			// accounts for the close before it starts the next send.
+			select {
+			case <-kindsEntered:
+			case <-time.After(wait):
+				t.Fatal("writer did not enter the supported frame kinds send")
+			}
+			if _, err := open(tc.retryGrant); err != nil {
+				t.Fatalf("Open after the close send completed: %v", err)
+			}
+		})
+	}
+}
+
 // TestCloseWithoutFrameReleasesAtOnce covers the agent terminal frame: the
 // RPC closes the stream without a close frame, so nothing is queued and the
 // slots return immediately, even with a full queue.
