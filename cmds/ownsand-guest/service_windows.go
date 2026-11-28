@@ -5,7 +5,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,7 +26,7 @@ const serviceStopTimeout = 20 * time.Second
 // Subcommands of the guest helper on Windows guests. The device agent runs
 // them through the guest helper's own exec.
 const (
-	// subcommandFlushVolumes flushes the file system caches of every fixed
+	// subcommandFlushVolumes flushes the file system caches of every mounted fixed
 	// volume to the disk (the Windows counterpart of `sync`).
 	subcommandFlushVolumes = "flush-volumes"
 )
@@ -92,47 +94,107 @@ func (h *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, 
 	}
 }
 
-// runFlushVolumes flushes every fixed volume with FlushFileBuffers on the
-// volume handle, which writes the cached data of all open files of the
-// volume. It needs administrator rights; the guest helper service runs as
-// LocalSystem, and so do its execs.
+// runFlushVolumes flushes mounted fixed volumes. Flushing a volume requires
+// administrator rights. The guest helper service and its execs run as LocalSystem.
 func runFlushVolumes() int {
-	mask, err := windows.GetLogicalDrives()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "ownsand-guest: list volumes:", err)
-		return 1
+	api := volumeAPI{
+		findFirst:     windows.FindFirstVolume,
+		findNext:      windows.FindNextVolume,
+		findClose:     windows.FindVolumeClose,
+		getMountPaths: windows.GetVolumePathNamesForVolumeName,
+		getDriveType:  windows.GetDriveType,
+		open:          windows.CreateFile,
+		flush:         windows.FlushFileBuffers,
+		close:         windows.CloseHandle,
 	}
-	failed := 0
-	for i := range 26 {
-		if mask&(1<<i) == 0 {
-			continue
-		}
-		root := string(rune('A'+i)) + `:\`
-		rootp, err := windows.UTF16PtrFromString(root)
-		if err != nil || windows.GetDriveType(rootp) != windows.DRIVE_FIXED {
-			continue
-		}
-		if err := flushVolume(strings.TrimSuffix(root, `\`)); err != nil {
-			fmt.Fprintf(os.Stderr, "ownsand-guest: flush %s: %v\n", root, err)
-			failed++
-		}
-	}
-	if failed > 0 {
-		return 1
-	}
-	return 0
+	return api.flushMountedFixedVolumes(os.Stderr)
 }
 
-func flushVolume(drive string) error {
-	p, err := windows.UTF16PtrFromString(`\\.\` + drive)
+type volumeAPI struct {
+	findFirst     func(*uint16, uint32) (windows.Handle, error)
+	findNext      func(windows.Handle, *uint16, uint32) error
+	findClose     func(windows.Handle) error
+	getMountPaths func(*uint16, *uint16, uint32, *uint32) error
+	getDriveType  func(*uint16) uint32
+	open          func(*uint16, uint32, uint32, *windows.SecurityAttributes, uint32, uint32, windows.Handle) (windows.Handle, error)
+	flush         func(windows.Handle) error
+	close         func(windows.Handle) error
+}
+
+func (api volumeAPI) flushMountedFixedVolumes(stderr io.Writer) int {
+	var name [windows.MAX_PATH]uint16
+	handle, err := api.findFirst(&name[0], uint32(len(name)))
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-guest: list volumes:", err)
+		return 1
+	}
+	defer api.findClose(handle)
+
+	code := 0
+	for {
+		guid := windows.UTF16ToString(name[:])
+		fixed, err := api.hasFixedMount(&name[0])
+		if err != nil {
+			fmt.Fprintf(stderr, "ownsand-guest: list mount paths for %s: %v\n", guid, err)
+			code = 1
+		} else if fixed {
+			if err := api.flushVolume(guid); err != nil {
+				fmt.Fprintf(stderr, "ownsand-guest: flush %s: %v\n", guid, err)
+				code = 1
+			}
+		}
+
+		err = api.findNext(handle, &name[0], uint32(len(name)))
+		if err == windows.ERROR_NO_MORE_FILES {
+			return code
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, "ownsand-guest: list volumes:", err)
+			return 1
+		}
+	}
+}
+
+func (api volumeAPI) hasFixedMount(volume *uint16) (bool, error) {
+	paths := make([]uint16, windows.MAX_PATH)
+	for {
+		var length uint32
+		err := api.getMountPaths(volume, &paths[0], uint32(len(paths)), &length)
+		if err == windows.ERROR_MORE_DATA && length > uint32(len(paths)) {
+			paths = make([]uint16, length)
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		paths = paths[:length]
+		break
+	}
+	// Windows returns consecutive NUL-terminated roots with a final empty
+	// string. Pass each root as UTF-16 and keep its trailing backslash.
+	for end := slices.Index(paths, 0); end > 0; end = slices.Index(paths, 0) {
+		if api.getDriveType(&paths[0]) == windows.DRIVE_FIXED {
+			return true, nil
+		}
+		paths = paths[end+1:]
+	}
+	return false, nil
+}
+
+func (api volumeAPI) flushVolume(guid string) error {
+	// CreateFile opens the volume itself when its GUID path has no trailing backslash.
+	p, err := windows.UTF16PtrFromString(strings.TrimSuffix(guid, "\\"))
 	if err != nil {
 		return err
 	}
-	h, err := windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
+	h, err := api.open(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("open volume: %w", err)
 	}
-	defer windows.CloseHandle(h)
-	return windows.FlushFileBuffers(h)
+	defer api.close(h)
+	if err := api.flush(h); err != nil {
+		return fmt.Errorf("FlushFileBuffers: %w", err)
+	}
+	return nil
 }
