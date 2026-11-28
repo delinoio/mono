@@ -609,6 +609,7 @@ func TestCheckOperationID(t *testing.T) {
 		}
 		return id.String()
 	}
+	// Use the documented limits so changes to the admission constants fail this test.
 	cases := []struct {
 		name   string
 		id     string
@@ -616,11 +617,11 @@ func TestCheckOperationID(t *testing.T) {
 		reason AdmissionReason
 	}{
 		{"now", idAt(now), 0, 0},
-		{"just under 15 minutes", idAt(now.Add(-OperationIDMaxAge + time.Millisecond)), 0, 0},
-		{"exactly 15 minutes", idAt(now.Add(-OperationIDMaxAge)), ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, AdmissionReasonExpired},
+		{"just under 15 minutes", idAt(now.Add(-15*time.Minute + time.Millisecond)), 0, 0},
+		{"exactly 15 minutes", idAt(now.Add(-15 * time.Minute)), ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, AdmissionReasonExpired},
 		{"an hour old", idAt(now.Add(-time.Hour)), ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, AdmissionReasonExpired},
-		{"exactly 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture)), 0, 0},
-		{"over 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture + time.Millisecond)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
+		{"exactly 5 minutes ahead", idAt(now.Add(5 * time.Minute)), 0, 0},
+		{"over 5 minutes ahead", idAt(now.Add(5*time.Minute + time.Millisecond)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
 		{"far future saturates the age", idAt(time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
 		{"not a UUID", "exec-1", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
 		{"UUID v4", "0192f4b6-7c3a-4def-8abc-0123456789ab", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
