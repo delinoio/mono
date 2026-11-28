@@ -948,9 +948,19 @@ export function createMockTransport(): Transport {
           "ownsand-e2e-later-snapshot",
           snapshot.snapshotId,
         );
-        if (
-          sessionStorage.getItem("ownsand-e2e-snapshot-exporting") !== "true"
-        ) {
+        const exportPhase = sessionStorage.getItem(
+          "ownsand-e2e-snapshot-export-phase",
+        );
+        if (exportPhase !== "exporting") {
+          const completionTokenKey = "ownsand-e2e-snapshot-completion-token";
+          if (
+            exportPhase === "complete" &&
+            snapshot.exportState === SnapshotExportState.NOT_EXPORTED &&
+            !signal?.aborted &&
+            sessionStorage.getItem(completionTokenKey) === null
+          ) {
+            sessionStorage.setItem(completionTokenKey, pageToken);
+          }
           return response;
         }
         return {

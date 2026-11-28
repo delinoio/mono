@@ -155,7 +155,9 @@ describe("snapshot and template pagination", () => {
   pagedSources(
     "loads management pages independently and refreshes a later snapshot",
     async ({ app, browser, screen, sources }) => {
-      await sources.open("snapshots", { "snapshot-exporting": "true" });
+      await sources.open("snapshots", {
+        "snapshot-export-phase": "exporting",
+      });
       const snapshots = screen
         .getByRole("list", "Snapshots")
         .getByRole("listitem");
@@ -175,22 +177,21 @@ describe("snapshot and template pagination", () => {
       expect((await sources.tokens("ListTemplates")).filter(Boolean)).toEqual(
         [],
       );
-      const snapshotContinuations = (
-        await sources.tokens("ListSnapshots")
-      ).filter(Boolean);
+      const showMoreToken =
+        (await sources.tokens("ListSnapshots")).find(Boolean) ?? "";
+      expect(showMoreToken).toBeTruthy();
 
       await browser.evaluate(() => {
-        sessionStorage.removeItem("ownsand-e2e-snapshot-exporting");
+        sessionStorage.setItem("ownsand-e2e-snapshot-export-phase", "complete");
         return true;
       });
       const exportButton = snapshots
         .last()
         .getByRole("button", "Export snapshot", { exact: false });
       await expect(exportButton).toBeVisible();
-      expect((await sources.tokens("ListSnapshots")).filter(Boolean)).toEqual([
-        ...snapshotContinuations,
-        snapshotContinuations.at(-1),
-      ]);
+      expect(await sources.value("snapshot-completion-token")).toBe(
+        showMoreToken,
+      );
 
       await exportButton.tap();
       await expect(snapshots.last().getByText(/Exported/)).toBeVisible();
