@@ -16,6 +16,8 @@ export default defineConfig({
   // Pages need a DOM for routing, dialogs and focus.
   testEnvironment: "happy-dom",
   include: ["src/**/*.test.{ts,tsx}"],
+  // Testing Library defaults that every test file shares.
+  setupFiles: ["./src/testing/setup.ts"],
   // Workaround: raise the default per-test timeout from 5 s to 30 s. The
   // billing paging tests render 200-row lists in happy-dom, which is slow
   // under CI load: even after the row-counting query fix, the 5 s default
