@@ -7,7 +7,6 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -18,7 +17,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
-import { declaredReleaseInputs } from "./workspace-packages.mjs";
+import {
+  declaredReleaseInputs,
+  namedWorkspaceAlias,
+  readWorkspacePackages,
+} from "./workspace-packages.mjs";
 import {
   MAIN_PUSH_EVENT,
   MAIN_REF,
@@ -1032,38 +1035,72 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
   assert.equal(plan(f.cwd, f.base, f.commit()).e2e, false);
 });
 
-test("the e2e workspace packages equal the workspace dependencies of the apps", () => {
-  // The planner runs without installed dependencies, so it lists the packages
-  // that the apps depend on; this test keeps the list in sync with the
-  // manifests.
-  const manifest = (dir) =>
-    JSON.parse(readFileSync(join(root, dir, "package.json"), "utf8"));
-  const packageDirs = new Map();
-  for (const workspaceRoot of workspaceRoots) {
-    for (const entry of readdirSync(join(root, workspaceRoot), {
-      withFileTypes: true,
-    })) {
-      const dir = `${workspaceRoot}/${entry.name}`;
-      if (entry.isDirectory() && existsSync(join(root, dir, "package.json"))) {
-        packageDirs.set(manifest(dir).name, `${dir}/`);
-      }
-    }
-  }
+function assertE2eWorkspacePackages(packages, plannerPackages) {
+  const packageDirs = new Map(
+    packages.map(({ dir, manifest }) => [manifest.name, `${dir}/`]),
+  );
   const expected = new Set();
-  for (const entry of readdirSync(join(root, "apps"), {
-    withFileTypes: true,
-  })) {
-    if (!entry.isDirectory()) continue;
-    const app = manifest(`apps/${entry.name}`);
+  for (const { dir, manifest: app } of packages) {
+    if (!dir.startsWith("apps/")) continue;
     for (const dependencies of [app.dependencies, app.devDependencies]) {
-      for (const [name, range] of Object.entries(dependencies ?? {})) {
-        if (!String(range).startsWith("workspace:")) continue;
+      for (const [key, spec] of Object.entries(dependencies ?? {})) {
+        if (typeof spec !== "string" || !spec.startsWith("workspace:"))
+          continue;
+        const name =
+          namedWorkspaceAlias(spec.slice("workspace:".length)) ?? key;
         assert.ok(packageDirs.has(name), `${name} is not a workspace package`);
         expected.add(packageDirs.get(name));
       }
     }
   }
-  assert.deepEqual([...e2eWorkspacePackages].sort(), [...expected].sort());
+  assert.deepEqual([...plannerPackages].sort(), [...expected].sort());
+}
+
+test("the e2e workspace packages equal the workspace dependencies of the apps", () => {
+  // The planner lists these paths so it can run without installed dependencies.
+  assertE2eWorkspacePackages(readWorkspacePackages(root), e2eWorkspacePackages);
+});
+
+test("the e2e workspace alias comparison uses target directories", () => {
+  const app = {
+    name: "app",
+    dependencies: {
+      "ui-compat": "workspace:delino-ui@*",
+      "runtime-tools": "workspace:*",
+      "registry-package": "npm:other-package@1.0.0",
+    },
+    devDependencies: {
+      "accounts-client": "workspace:@delino/accounts-protos@^",
+      "test-tools": "workspace:^",
+      "registry-range": "^1.0.0",
+    },
+  };
+  const packages = [
+    { dir: "apps/example", manifest: app },
+    { dir: "packages/delino-ui", manifest: { name: "delino-ui" } },
+    { dir: "packages/runtime", manifest: { name: "runtime-tools" } },
+    { dir: "packages/testing", manifest: { name: "test-tools" } },
+    {
+      dir: "protos/delino/accounts",
+      manifest: { name: "@delino/accounts-protos" },
+    },
+  ];
+  const plannerPackages = [
+    "packages/delino-ui/",
+    "packages/runtime/",
+    "packages/testing/",
+    "protos/delino/accounts/",
+  ];
+  assertE2eWorkspacePackages(packages, plannerPackages);
+
+  assert.throws(
+    () => assertE2eWorkspacePackages(packages.slice(0, -1), plannerPackages),
+    /@delino\/accounts-protos is not a workspace package/,
+  );
+  assert.throws(
+    () => assertE2eWorkspacePackages(packages, plannerPackages.slice(1)),
+    { name: "AssertionError", expected: plannerPackages },
+  );
 });
 
 test("workspace package paths and root task inputs select workspace tasks", async (t) => {
