@@ -759,6 +759,7 @@ Each entry requires a host and permits an optional port. Startup fails if an ent
 - Log every OwnSand call result with the RPC and the Connect code, every GitHub API error with its status, every vendor watch reconnect and every orchestrator restart.
 - When the personal API key prefix limit rejects a failed validation, log `api_key_prefix_rate_limited` at warning level with `key_prefix` and `rpc_id`, at most once per prefix every 10 seconds. Redact `key_prefix` if the display prefix is the entire presented value.
 - Never log credentials, tokens, API key secrets, JIT configurations, work orders, webhook bodies, exec commands that carry credentials, runner output, or dev session command arguments, environment values, output and file contents.
+- If the server exits with an error, it logs one `server_exited` record after cleanup. The record goes to stdout. If OTLP log export initialized, the server queues the record before the final flush. A clean shutdown emits no `server_exited` record.
 - CLI-style output of the development launcher uses ANSI color by default, with the `NO_COLOR` opt-out.
 
 ## Build and Test

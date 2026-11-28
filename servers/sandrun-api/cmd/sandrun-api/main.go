@@ -70,7 +70,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, stop, quiescedV9Upgrade); err != nil {
-		slog.Error("server_exited", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
@@ -80,25 +79,33 @@ func hookMode(args []string) bool {
 	return len(args) > 0 && (filepath.Base(args[0]) == claude.HookName || len(args) > 1 && args[1] == claude.HookName)
 }
 
-func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) error {
+func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) (err error) {
+	logger := slog.Default()
+	var tel *telemetry.Telemetry
+	// Run after worker and database cleanup. Log the exit error before
+	// telemetry shutdown so the collector can receive it.
+	defer func() {
+		if err != nil {
+			logger.Error("server_exited", slog.Any("error", err))
+		}
+		if tel != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+			defer cancel()
+			if shutdownErr := tel.Shutdown(shutdownCtx); shutdownErr != nil {
+				logger.Error("telemetry_shutdown_failed", slog.Any("error", shutdownErr))
+			}
+		}
+	}()
+
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
 		return err
 	}
-	tel, err := telemetry.New(context.Background(), telemetry.Options{ServiceName: "sandrun-api", Level: cfg.LogLevel.SlogLevel()})
+	tel, err = telemetry.New(context.Background(), telemetry.Options{ServiceName: "sandrun-api", Level: cfg.LogLevel.SlogLevel()})
 	if err != nil {
 		return err
 	}
-	// This deferred call runs last, so the OTLP export flushes the records of
-	// the shutdown.
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
-		defer cancel()
-		if err := tel.Shutdown(ctx); err != nil {
-			slog.Error("telemetry_shutdown_failed", slog.Any("error", err))
-		}
-	}()
-	logger := tel.Logger
+	logger = tel.Logger
 	slog.SetDefault(logger)
 
 	database, err := db.Open(ctx, cfg.DatabaseURL)
@@ -107,10 +114,11 @@ func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) e
 	}
 	defer database.Close()
 	if quiescedV9Upgrade {
-		return database.MigrateQuiescedV9(ctx, logger)
+		err = database.MigrateQuiescedV9(ctx, logger)
+		return err
 	}
 	if cfg.RunMigrations {
-		if err := database.Migrate(ctx, logger); err != nil {
+		if err = database.Migrate(ctx, logger); err != nil {
 			return err
 		}
 	}
@@ -153,7 +161,8 @@ func run(ctx context.Context, stop context.CancelFunc, quiescedV9Upgrade bool) e
 		return err
 	}
 
-	return startAndServe(ctx, stop, cfg, tel, a.Handler(), net.Listen, a.Run)
+	err = startAndServe(ctx, stop, cfg, tel, a.Handler(), net.Listen, a.Run)
+	return err
 }
 
 func startAndServe(ctx context.Context, stop func(), cfg config.Config, tel *telemetry.Telemetry, handler http.Handler,
