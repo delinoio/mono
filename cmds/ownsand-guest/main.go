@@ -86,7 +86,6 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (logO
 		return 2
 	}
 	var logOut io.Writer = os.Stderr
-	var notes []func(*slog.Logger)
 	if openLog != nil {
 		out, err := openLog(*stateDir)
 		if err != nil {
@@ -98,13 +97,17 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (logO
 			defer out.Close()
 		}
 		logOut = out.W
-		notes = out.Notes
+		if len(out.Notes) > 0 {
+			// Write setup warnings to the active log before applying the runtime level.
+			handler := slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: slog.LevelWarn})
+			startupLogger := slog.New(handler).With("component", string(runtimelog.Guest))
+			for _, note := range out.Notes {
+				note(startupLogger)
+			}
+		}
 	}
 	logger, shutdown := runtimelog.New(logOut, level, runtimelog.Guest, processors...)
 	defer shutdown()
-	for _, note := range notes {
-		note(logger)
-	}
 	var mode guest.ClockMode
 	switch *clock {
 	case "set":

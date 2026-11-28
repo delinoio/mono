@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,8 +13,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // smallLogLimit is a rotation limit that the tests exceed with a few bytes.
@@ -254,68 +251,93 @@ func checkLogSetupError(t *testing.T, err error, operation logSetupOperation, pa
 // into the active log.
 func TestRunReportsFailedLogRotationInTheActiveLog(t *testing.T) {
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
-	processor := &guestLogProcessor{}
-	stateDir := t.TempDir()
-	writeFile(t, filepath.Join(stateDir, logFile), "old log line\n")
-	_, inner := blockArchive(t, stateDir)
-	sock := filepath.Join(shortSocketDir(t), "g.sock")
+	for _, tc := range []struct {
+		name        string
+		flagLevel   string
+		envLevel    string
+		wantServing bool
+	}{
+		{name: "default", wantServing: true},
+		{name: "info flag", flagLevel: "info", wantServing: true},
+		{name: "error flag", flagLevel: "error"},
+		{name: "error environment", envLevel: "error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envLogLevel, tc.envLevel)
+			processor := &guestLogProcessor{}
+			stateDir := t.TempDir()
+			path := filepath.Join(stateDir, logFile)
+			const oldLog = "old log line\n"
+			writeFile(t, path, oldLog)
+			archive, inner := blockArchive(t, stateDir)
+			sock := filepath.Join(shortSocketDir(t), "g.sock")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	code := make(chan int, 1)
-	go func() {
-		code <- run(ctx, []string{"--listen", "unix://" + sock, "--state-dir", stateDir, "--clock", "ignore"},
-			func(dir string) (logOutput, error) { return openLogFile(dir, smallLogLimit) }, processor)
-	}()
-	t.Cleanup(cancel)
-	waitServing(t, sock)
-	cancel()
-	select {
-	case c := <-code:
-		if c != 0 {
-			t.Fatalf("helper exit code %d, want 0", c)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("helper did not exit")
-	}
-
-	data := readFile(t, filepath.Join(stateDir, logFile))
-	var warnings int
-	for _, record := range logRecords(t, data) {
-		if msg, _ := record["msg"].(string); strings.Contains(msg, "log rotation failed") {
-			warnings++
-			if record["level"] != "WARN" || record["component"] != "ownsand-guest" {
-				t.Fatalf("unexpected warning record: %v", record)
+			args := []string{"--listen", "unix://" + sock, "--state-dir", stateDir, "--clock", "ignore"}
+			if tc.flagLevel != "" {
+				args = append(args, "--log-level", tc.flagLevel)
 			}
-		}
-	}
-	if warnings != 1 {
-		t.Fatalf("got %d rotation warnings, want 1; log %q", warnings, data)
-	}
-	sdkWarnings := 0
-	for _, record := range processor.records {
-		if record.Body().AsString() != "log rotation failed; appending to the active log" {
-			continue
-		}
-		sdkWarnings++
-		fields := make(map[string]attribute.Value)
-		record.WalkAttributes(func(kv attribute.KeyValue) bool {
-			fields[string(kv.Key)] = kv.Value
-			return true
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			code := make(chan int, 1)
+			go func() {
+				code <- run(ctx, args, func(dir string) (logOutput, error) {
+					return openLogFile(dir, smallLogLimit)
+				}, processor)
+			}()
+			waitServing(t, sock)
+			cancel()
+			select {
+			case c := <-code:
+				if c != 0 {
+					t.Fatalf("helper exit code %d, want 0", c)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("helper did not exit")
+			}
+
+			data := readFile(t, path)
+			appended, kept := strings.CutPrefix(data, oldLog)
+			if !kept {
+				t.Fatalf("the active log lost its content: %q", data)
+			}
+			if got := readFile(t, inner); got != "archive content" {
+				t.Fatalf("archive content %q after the failed rotation", got)
+			}
+
+			const rotationMessage = "log rotation failed; appending to the active log"
+			const servingMessage = "guest helper serving"
+			records := logRecords(t, appended)
+			wantCount := 1
+			if tc.wantServing {
+				wantCount++
+			}
+			if len(records) != wantCount {
+				t.Fatalf("got %d records, want %d: %q", len(records), wantCount, appended)
+			}
+			warning := records[0]
+			errorText, _ := warning["error"].(string)
+			if warning["msg"] != rotationMessage || warning["level"] != "WARN" ||
+				warning["component"] != "ownsand-guest" || warning["operation"] != "rotate" ||
+				warning["path"] != path || warning["archive"] != archive ||
+				warning["limit_bytes"] != float64(smallLogLimit) || errorText == "" {
+				t.Fatalf("unexpected first record: %v", warning)
+			}
+			if tc.wantServing && (records[1]["msg"] != servingMessage || records[1]["level"] != "INFO") {
+				t.Fatalf("unexpected second record: %v", records[1])
+			}
+			var sdkServing bool
+			for _, record := range processor.records {
+				switch record.Body().AsString() {
+				case rotationMessage:
+					t.Error("rotation warning reached the Logs SDK")
+				case servingMessage:
+					sdkServing = true
+				}
+			}
+			if sdkServing != tc.wantServing || !processor.closed {
+				t.Fatalf("SDK serving record = %t, want %t, shutdown called = %t", sdkServing, tc.wantServing, processor.closed)
+			}
 		})
-		if record.SeverityText() != "WARN" || len(fields) != 3 ||
-			fields["component"].AsString() != "ownsand-guest" ||
-			fields["operation"].AsString() != "rotate" || fields["limit_bytes"].AsInt64() != smallLogLimit {
-			t.Fatalf("unexpected SDK rotation warning fields: %v", fields)
-		}
-	}
-	if sdkWarnings != 1 || !processor.closed {
-		t.Fatalf("SDK rotation warnings = %d, shutdown called = %t", sdkWarnings, processor.closed)
-	}
-	if !bytes.HasPrefix([]byte(data), []byte("old log line\n")) {
-		t.Fatalf("the active log lost its content: %q", data)
-	}
-	if got := readFile(t, inner); got != "archive content" {
-		t.Fatalf("archive content %q after the failed rotation", got)
 	}
 }
 

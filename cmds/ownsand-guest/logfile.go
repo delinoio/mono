@@ -26,7 +26,7 @@ const (
 // because the logger does not exist before the opener returns.
 type logOutput struct {
 	W io.Writer
-	// Notes run with the logger of the helper right after its creation.
+	// Notes write local startup warnings before runtime logging starts.
 	Notes []func(*slog.Logger)
 	// Close releases W. run calls it after its last log record, when it
 	// returns; nil when W needs no release. Without it the log file handle
