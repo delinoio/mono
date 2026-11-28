@@ -108,6 +108,7 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 ### Subscription checkout
 
 - `StartSubscription` creates the Paddle checkout transaction for the $10/month subscription and sets the billing account ID in its custom data. The response returns the transaction ID for Paddle.js. The subscription becomes `ACTIVE` only after the verified payment webhook.
+- A new checkout requires a Paddle transaction ID, `automatic` collection and a status of `draft`, `ready` or `billed`. If Paddle does not confirm these fields, the call returns retryable `unavailable` without a checkout ID and preserves any existing pending checkout.
 - While the subscription is `PENDING`, `StartSubscription` reuses a verified payable checkout or returns a replacement if Paddle confirms that the original is canceled or missing. An inconclusive lookup or a payment awaiting its verified webhook returns retryable `unavailable` and preserves the pending checkout.
 
 ### Subscription cancellation and resumption

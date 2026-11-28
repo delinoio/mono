@@ -422,10 +422,9 @@ func (c *Client) CreateCheckoutTransaction(ctx context.Context, priceID string, 
 	if err := c.do(ctx, http.MethodPost, "/transactions", body, &txn); err != nil {
 		return txn, err
 	}
-	// A 2xx answer whose transaction has no ID cannot open a checkout and
-	// must not be stored. The answer is as malformed as a body that is not
-	// JSON, so Classify reports an unknown outcome, like the decoder errors.
-	if txn.ID == "" {
+	// A 2xx response alone leaves the checkout unconfirmed. Report an
+	// unknown outcome without including the response body in the error.
+	if !txn.IsPayableCheckout() {
 		return Transaction{}, errors.New("paddle response is not valid")
 	}
 	return txn, nil
@@ -445,6 +444,19 @@ const (
 	TransactionStatusCanceled  = "canceled"
 	TransactionStatusPastDue   = "past_due"
 )
+
+// IsPayableCheckout reports whether the transaction can open in Paddle.js checkout.
+func (t Transaction) IsPayableCheckout() bool {
+	if t.ID == "" || t.CollectionMode != CollectionModeAutomatic {
+		return false
+	}
+	switch t.Status {
+	case TransactionStatusDraft, TransactionStatusReady, TransactionStatusBilled:
+		return true
+	default:
+		return false
+	}
+}
 
 // GetTransaction reads a transaction (`GET /transactions/{id}`).
 func (c *Client) GetTransaction(ctx context.Context, id string) (Transaction, error) {

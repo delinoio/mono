@@ -134,13 +134,13 @@ func TestClientTransactionCancellation(t *testing.T) {
 	}
 }
 
-// A success answer whose transaction has no ID is a malformed answer: the
-// outcome is unknown and no empty transaction is returned.
-func TestClientCheckoutRejectsATransactionWithoutID(t *testing.T) {
+func TestClientCheckoutRejectsAnUnusableTransaction(t *testing.T) {
 	for name, body := range map[string]string{
 		"empty object": `{"data":{}}`,
-		"empty ID":     `{"data":{"id":""}}`,
-		"no ID":        `{"data":{"status":"draft"}}`,
+		"empty ID":     `{"data":{"id":"","status":"draft","collection_mode":"automatic"}}`,
+		"no ID":        `{"data":{"status":"draft","collection_mode":"automatic"}}`,
+		"canceled":     `{"data":{"id":"txn_canceled","status":"canceled","collection_mode":"automatic"}}`,
+		"manual":       `{"data":{"id":"txn_manual","status":"draft","collection_mode":"manual"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			client, fake := newClient(t)

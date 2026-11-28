@@ -328,12 +328,11 @@ func (s *Service) pendingCheckoutPayable(ctx context.Context, accountID, transac
 		switch current.Status {
 		case paddle.TransactionStatusCanceled:
 			return false, nil
-		case paddle.TransactionStatusDraft, paddle.TransactionStatusReady, paddle.TransactionStatusBilled:
-			if current.CollectionMode == paddle.CollectionModeAutomatic {
-				return true, nil
-			}
 		case paddle.TransactionStatusPaid, paddle.TransactionStatusCompleted:
 			return false, unavailable("the checkout payment is being confirmed; try again later")
+		}
+		if current.IsPayableCheckout() {
+			return true, nil
 		}
 	}
 	s.logger.WarnContext(ctx, "billing_checkout_transaction_unconfirmed",

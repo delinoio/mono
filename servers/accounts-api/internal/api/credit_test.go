@@ -169,6 +169,56 @@ func TestCreditRoles(t *testing.T) {
 	wantCode(t, err, connect.CodeInvalidArgument)
 }
 
+func TestStartSubscriptionAuditsOnlyPayableCheckoutCreates(t *testing.T) {
+	t.Parallel()
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	client := env.Credit(owner.ID)
+	for _, tc := range []struct {
+		status         string
+		collectionMode string
+		payable        bool
+	}{
+		{paddle.TransactionStatusCanceled, paddle.CollectionModeAutomatic, false},
+		{paddle.TransactionStatusDraft, "manual", false},
+		{paddle.TransactionStatusDraft, paddle.CollectionModeAutomatic, true},
+		{paddle.TransactionStatusReady, paddle.CollectionModeAutomatic, true},
+		{paddle.TransactionStatusBilled, paddle.CollectionModeAutomatic, true},
+	} {
+		t.Run(tc.status+"/"+tc.collectionMode, func(t *testing.T) {
+			accountID := createAccount(t, owner, "Checkout").GetBillingAccountId()
+			transactionID := env.Paddle.NewID("txn")
+			body := fmt.Sprintf(`{"data":{"id":%q,"status":%q,"collection_mode":%q}}`, transactionID, tc.status, tc.collectionMode)
+			env.Paddle.Respond("POST /transactions", http.StatusCreated, body)
+
+			resp, err := client.StartSubscription(ctx(), connect.NewRequest(&accountsv1.StartSubscriptionRequest{BillingAccountId: accountID}))
+			wantAuditRows := 0
+			if tc.payable {
+				if err != nil || resp.Msg.GetPaddleTransactionId() != transactionID ||
+					resp.Msg.GetSubscription().GetStatus() != accountsv1.SubscriptionStatus_SUBSCRIPTION_STATUS_PENDING {
+					t.Fatalf("StartSubscription = %v, %v; want pending checkout %q", resp, err, transactionID)
+				}
+				sub, err := billing.LoadSubscription(ctx(), env.DB.Pool, accountID, false)
+				if err != nil || sub.Status != billing.SubscriptionPending || sub.CheckoutTransactionID != transactionID {
+					t.Fatalf("stored subscription = %+v, %v; want pending checkout %q", sub, err, transactionID)
+				}
+				wantAuditRows = 1
+			} else if resp != nil || connect.CodeOf(err) != connect.CodeUnavailable {
+				t.Fatalf("StartSubscription = %v, %v; want no response and unavailable", resp, err)
+			}
+
+			var auditRows, checkoutRows int
+			err = env.DB.Pool.QueryRow(ctx(), `SELECT
+				(SELECT count(*) FROM billing_audit_events WHERE billing_account_id = $1 AND kind = $2),
+				(SELECT count(*) FROM paddle_checkouts WHERE billing_account_id = $1)`,
+				accountID, api.AuditSubscriptionStarted).Scan(&auditRows, &checkoutRows)
+			if err != nil || auditRows != wantAuditRows || checkoutRows != wantAuditRows {
+				t.Fatalf("audit rows = %d, checkout rows = %d, error = %v; want %d rows each", auditRows, checkoutRows, err, wantAuditRows)
+			}
+		})
+	}
+}
+
 func TestSubscriptionLifecycle(t *testing.T) {
 	t.Parallel()
 	env := testenv.New(t)
