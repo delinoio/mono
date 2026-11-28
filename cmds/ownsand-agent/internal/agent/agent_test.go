@@ -1042,16 +1042,22 @@ func (f *importFixture) requireRestorable(t *testing.T, id string) {
 // hook synchronously, and httptest.Server.Close waits for active requests,
 // so a blocked handler would otherwise strand the test teardown.
 type getGate struct {
-	id      string
-	mu      sync.Mutex
-	gets    int
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
+	id       string
+	mu       sync.Mutex
+	gets     int
+	started  chan struct{}
+	earlyGET chan struct{}
+	release  chan struct{}
+	once     sync.Once
 }
 
 func newGetGate(id string) *getGate {
-	return &getGate{id: id, started: make(chan struct{}), release: make(chan struct{})}
+	return &getGate{
+		id:       id,
+		started:  make(chan struct{}),
+		earlyGET: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
 }
 
 // newGatedImportFixture creates the fixture whose bucket uses a new gate for
@@ -1070,7 +1076,11 @@ func newGatedImportFixture(t *testing.T, id string, tweak func(*Options)) (*getG
 // Release unblocks the gated download. It is idempotent, and every release
 // of the gate, explicit or from a cleanup, goes through it.
 func (g *getGate) Release() {
-	g.once.Do(func() { close(g.release) })
+	g.once.Do(func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		close(g.release)
+	})
 }
 
 func (g *getGate) hook(r *http.Request) int {
@@ -1080,6 +1090,13 @@ func (g *getGate) hook(r *http.Request) int {
 	g.mu.Lock()
 	g.gets++
 	first := g.gets == 1
+	if g.gets == 2 {
+		select {
+		case <-g.release:
+		default:
+			close(g.earlyGET)
+		}
+	}
 	g.mu.Unlock()
 	if first {
 		close(g.started)
@@ -1095,6 +1112,38 @@ func (g *getGate) count() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.gets
+}
+
+func (f *importFixture) observeImportWaiter(t *testing.T, id string) <-chan struct{} {
+	t.Helper()
+	waiting := make(chan struct{})
+	signal := sync.OnceFunc(func() { close(waiting) })
+	m := f.h.agent.Sandboxes
+	m.SetSnapshotImportWaiterHookForTest(func(waiterID string) {
+		if waiterID == id {
+			signal()
+		}
+	})
+	t.Cleanup(func() { m.SetSnapshotImportWaiterHookForTest(nil) })
+	return waiting
+}
+
+func (g *getGate) releaseAfterWaiter(t *testing.T, waiting <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-g.earlyGET:
+		t.Fatal("a second part GET reached the bucket before gate release")
+	case <-waiting:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the second import to register on the held snapshot import lock")
+	}
+	g.Release()
+	// Catch a GET that arrived between the waiter signal and gate release.
+	select {
+	case <-g.earlyGET:
+		t.Fatal("a second part GET reached the bucket before gate release")
+	default:
+	}
 }
 
 func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
@@ -1116,11 +1165,11 @@ func settle() { time.Sleep(300 * time.Millisecond) }
 func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
 	id, _ := uuidv7.NewString()
 	gate, f := newGatedImportFixture(t, id, nil)
+	waiting := f.observeImportWaiter(t, id)
 	first := f.h.sendCommand(f.stage(t, id, false))
 	waitClosed(t, gate.started, "the first download")
 	second := f.h.sendCommand(f.command(id, false))
-	settle()
-	gate.Release()
+	gate.releaseAfterWaiter(t, waiting)
 	r1, r2 := f.h.result(first), f.h.result(second)
 	for _, r := range []*ownsandv1.AgentCommandResult{r1, r2} {
 		if r.GetError() != nil || r.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
@@ -1143,13 +1192,11 @@ func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
 func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	id, _ := uuidv7.NewString()
 	gate, f := newGatedImportFixture(t, id, nil)
+	waiting := f.observeImportWaiter(t, id)
 	bad := f.h.sendCommand(f.stage(t, id, true))
 	waitClosed(t, gate.started, "the first download")
 	good := f.h.sendCommand(f.command(id, false))
-	// Without the per-snapshot lock the good import publishes the copy while
-	// the bad one still waits at its gate, and the bad one then deletes it.
-	settle()
-	gate.Release()
+	gate.releaseAfterWaiter(t, waiting)
 	badRes, goodRes := f.h.result(bad), f.h.result(good)
 	if badRes.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS {
 		t.Fatalf("bad import = %v", badRes)
@@ -1160,8 +1207,12 @@ func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	f.requireRestorable(t, id)
 	// A later import reuses the copy: even one that would fail its hash check
 	// returns the ready entry and leaves the content alone.
+	gets := gate.count()
 	if res := f.h.command(f.command(id, true)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
 		t.Fatalf("later import = %v", res)
+	}
+	if got := gate.count(); got != gets {
+		t.Fatalf("part downloads after the later import = %d, want %d", got, gets)
 	}
 	f.requireRestorable(t, id)
 }
