@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -174,6 +175,37 @@ func TestJITRegistrationSkipsStartWhenWindowsACLPreparationFails(t *testing.T) {
 		t.Fatalf("JIT configurations = %d, file writes = %d, execs = %d; want no JIT request, file write, or exec other than Windows preparation", jit, writes, execs)
 	}
 	t.Log("SandRun reported a prep failure through the runner RPC after the Windows preparation exec, with no JIT request, file write, or start exec")
+}
+
+func TestJITRegistrationSkipsStartWhenPreparationTimesOutWithZeroExit(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	install := github.InstallCommand(sandrunv1.GuestOs_GUEST_OS_LINUX)
+	w.os.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+		if !slices.Equal(p.Command, install) {
+			return w.progs.exec(ctx, sandboxID, p)
+		}
+		code := int64(0)
+		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code, TimedOut: true}, nil
+	}, w.progs.attach)
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	w.send(t, "workflow_job", job("queued", 501, 9001, sandRunLinux, ""))
+
+	failed := sandrunv1.RunnerState_RUNNER_STATE_FAILED
+	eventually(t, "runner preparation failure", func() bool { return len(w.runnersIn(t, failed)) > 0 })
+	r := w.runnersIn(t, failed)[0]
+	if r.GetEndReason() != sandrunv1.RunnerEndReason_RUNNER_END_REASON_START_FAILED {
+		t.Fatalf("runner end reason = %v, want START_FAILED", r.GetEndReason())
+	}
+	eventually(t, "preparation error and start failure logs for the runner", func() bool {
+		logs := w.env.Logs.String()
+		runner := `"runner_id":"` + r.GetRunnerId() + `"`
+		return strings.Contains(logs, `"msg":"runner_prepare_failed",`+runner+`,"error":"the GitHub Actions runner installation timed out"`) &&
+			strings.Contains(logs, `"msg":"runner_start_failure",`+runner+`,"organization_id":"`+w.org.ID+`","cause":"prepare_failed"`)
+	})
+	if jit, writes, otherExecs := w.gh.Calls("generate_jitconfig"), w.os.Calls("WriteFile"), len(w.progs.all()); jit != 0 || writes != 0 || otherExecs != 0 {
+		t.Fatalf("JIT configurations = %d, file writes = %d, non-install execs = %d; want all zero", jit, writes, otherExecs)
+	}
 }
 
 func TestJobNoEligibleDevice(t *testing.T) {

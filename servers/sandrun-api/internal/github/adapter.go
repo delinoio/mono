@@ -57,11 +57,18 @@ func (a *Adapter) Prepare(ctx context.Context, g *work.Guest) error {
 	if !a.l.Configured() {
 		return errors.New("the GitHub App is not configured")
 	}
-	ctx, cancel := context.WithTimeout(ctx, a.l.timing.PrepareTimeout)
+	// Give OwnSand time to stop the command and deliver the timeout result.
+	ctx, cancel := context.WithTimeout(ctx, a.l.timing.PrepareTimeout+30*time.Second)
 	defer cancel()
 	res, err := g.Exec(ctx, ownsand.ExecParams{ExecID: api.NewID(), Command: InstallCommand(g.Runner.GuestOS), Timeout: a.l.timing.PrepareTimeout})
 	if err != nil {
 		return err
+	}
+	if res == nil {
+		return errors.New("the GitHub Actions runner installation returned no exec result")
+	}
+	if res.TimedOut {
+		return errors.New("the GitHub Actions runner installation timed out")
 	}
 	if res.Kind != ownsand.ExecResultExited || res.ExitCode == nil || *res.ExitCode != 0 {
 		code := int64(-1)

@@ -491,6 +491,7 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
   - `devin`: the official Devin CLI installer.
 - SandRun installs the runner programs on every guest OS that the runner profile allows for its workload kind and vendor: Linux, macOS and Windows.
 - When OwnSand reports that an agent runner preparation step timed out, SandRun treats the step as failed even if the command exits with code zero. SandRun records `prepare_failed` and stops that runner before it can start or become warm.
+- When OwnSand reports that GitHub Actions runner preparation timed out, SandRun treats the preparation as failed even if the command exits with code zero. SandRun records `prepare_failed`, marks the runner `FAILED` with reason `START_FAILED`, and stops before JIT registration, the `.sandrun-jitconfig` write, or runner startup.
 - Version policy (recorded decision):
   - Pinned programs: the GitHub Actions runner, `codex` and Node.js. sandrun-api pins an exact version of each in its source. Renovate updates the pins through a custom manager that the runner implementation adds to `renovate.json`.
   - Unpinned programs: `claude`, Cursor `agent` and `devin`. SandRun installs the version that the official installer gives at installation time. SandRun checks the minimum version only for `claude` (2.1.224). Cursor `agent` and `devin` have no minimum version.
