@@ -607,19 +607,14 @@ const WORKSPACE_GLOB_PATTERN =
 // lists these directories in `workspacePackageDirs`.
 const WORKSPACE_DIR_PATTERN = /^([^*/\s!.][^*/\s!]*(?:\/[^*/\s!.][^*/\s!]*)*)$/;
 
-// Returns the workspace roots listed in the `packages:` block of a
-// pnpm-workspace.yaml text. Accepts the valid YAML spellings of a list entry
-// (single or double quotes, trailing comments). Fails closed: an entry that is
-// not a "<root>/*" glob throws instead of being skipped, so the cross-check
-// below cannot pass while the manifest and `workspaceRoots` differ.
 function workspaceGlobRoots(manifest) {
   return workspaceEntries(manifest).roots;
 }
 
-// Returns the "<root>/*" roots and the single package directories of the
-// `packages:` block.
+// Reads the supported "<root>/*" globs and single package directories from the
+// `packages:` block. Entries can use quotes, trailing comments, or a split line.
 function workspaceEntries(manifest) {
-  const lines = manifest.split("\n");
+  const lines = manifest.split(/\r?\n/);
   const start = lines.findIndex(
     (line) => line.trimEnd() === WORKSPACE_PACKAGES_KEY,
   );
@@ -630,33 +625,54 @@ function workspaceEntries(manifest) {
   );
   const roots = [];
   const dirs = [];
-  for (const line of lines.slice(start + 1)) {
+  const blankOrComment = /^\s*(#.*)?$/;
+  for (let index = start + 1; index < lines.length; index++) {
+    const line = lines[index];
     // Blank and comment-only lines, at any indentation, do not end the block.
-    if (/^\s*(#.*)?$/.test(line)) {
+    if (blankOrComment.test(line)) {
       continue;
     }
     if (/^\S/.test(line)) {
       break;
     }
-    const entryMatch = line.match(/^\s*-\s+(.+)$/);
+    const entryMatch = line.match(/^(\s*)-(?=\s|$)(.*)$/);
     if (!entryMatch) {
       continue;
     }
-    let entry = entryMatch[1].replace(/\s+#.*$/, "").trim();
+    const [, indent, inlineValue] = entryMatch;
+    const split = blankOrComment.test(inlineValue);
+    let value = inlineValue;
+    if (split) {
+      const markerLine = index + 1;
+      do {
+        index++;
+      } while (index < lines.length && blankOrComment.test(lines[index]));
+      value = lines[index] ?? "";
+      if (value.search(/\S/) <= indent.length) {
+        throw new Error(
+          `${WORKSPACE_MANIFEST_NAME}:${markerLine} workspace entry has no scalar after -`,
+        );
+      }
+    }
+    let entry = value.replace(/\s+#.*$/, "").trim();
     const quoted = entry.match(/^(['"])(.*)\1$/);
     if (quoted) {
       entry = quoted[2];
     }
     const globMatch = entry.match(WORKSPACE_GLOB_PATTERN);
     const dirMatch = entry.match(WORKSPACE_DIR_PATTERN);
-    if (globMatch) {
-      roots.push(globMatch[1]);
-    } else if (dirMatch) {
-      dirs.push(dirMatch[1]);
-    } else {
+    // Reject YAML structure that the path patterns could accept as a string.
+    const unsupportedSplitValue =
+      split && !quoted && /^[-?:](?:\s|$)|^[\[\]{}&|>]|:(?:\s|$)/.test(entry);
+    if ((!globMatch && !dirMatch) || unsupportedSplitValue) {
       throw new Error(
         `unsupported ${WORKSPACE_MANIFEST_NAME} workspace entry: ${entry}`,
       );
+    }
+    if (globMatch) {
+      roots.push(globMatch[1]);
+    } else {
+      dirs.push(dirMatch[1]);
     }
   }
   if (roots.length === 0) {
@@ -766,6 +782,53 @@ test("workspace cross-check detects an extra single package directory", () => {
     () => sortedWorkspaceRootsMatch(`${packages}${WORKSPACE_TRAILING_SETTING}`),
     assert.AssertionError,
   );
+});
+
+test("workspace cross-check accepts split roots and single package directories", () => {
+  const inline = workspaceCrossCheckPackages();
+  const split = inline
+    .replace(
+      "  - apps/*",
+      "  - # root\n\n# column-zero comment\n    # indented comment\n    'apps/*' # note",
+    )
+    .replace("  - cmds/ownsand\n", '  -\n    "cmds/ownsand"\n');
+  const manifest = `${split}${WORKSPACE_TRAILING_SETTING}`;
+  assert.deepEqual(workspaceEntries(manifest), workspaceEntries(inline));
+  sortedWorkspaceRootsMatch(manifest);
+  sortedWorkspaceRootsMatch(manifest.replaceAll("\n", "\r\n"));
+});
+
+test("workspace cross-check detects extra split entries", () => {
+  for (const entry of ["tools/*", "cmds/other"]) {
+    const packages = workspaceCrossCheckPackages("  -", `    ${entry}`);
+    assert.throws(
+      () =>
+        sortedWorkspaceRootsMatch(`${packages}${WORKSPACE_TRAILING_SETTING}`),
+      assert.AssertionError,
+    );
+  }
+});
+
+test("workspace cross-check rejects unsupported split entries", () => {
+  for (const entry of ["tools/**", "tools:", "-"]) {
+    const packages = workspaceCrossCheckPackages("  -", `    ${entry}`);
+    assert.throws(
+      () =>
+        sortedWorkspaceRootsMatch(`${packages}${WORKSPACE_TRAILING_SETTING}`),
+      {
+        message: `unsupported ${WORKSPACE_MANIFEST_NAME} workspace entry: ${entry}`,
+      },
+    );
+  }
+});
+
+test("workspace cross-check rejects split entries without an indented scalar", () => {
+  const packages = workspaceCrossCheckPackages("  -", "# no scalar", "");
+  for (const following of ["", WORKSPACE_TRAILING_SETTING, "  - tools/*\n"]) {
+    assert.throws(() => sortedWorkspaceRootsMatch(`${packages}${following}`), {
+      message: /pnpm-workspace\.yaml:\d+ workspace entry has no scalar after -/,
+    });
+  }
 });
 
 test("release-only single workspace packages declare no package tasks", () => {
