@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { isUtf8 } from "node:buffer";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -1333,8 +1337,8 @@ test("explicit comparison silently skips a range-deleted non-UTF-8 path re-creat
   f.git("add", "--all");
   f.git("commit", "--quiet", "-m", "delete the path");
   const head = f.git("rev-parse", "HEAD");
-  writeRaw(f, raw);
-  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  if (!writeRaw(f, raw) || !listsRaw(f, raw))
+    return t.skip(unsupportedFileSystem);
   assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
   const result = spawnSync(
     process.execPath,
@@ -3333,31 +3337,42 @@ test("CLI runs from the root and a subdirectory of a whitespace-terminated repos
 // raw `Buffer` paths and the CLI is started by `/bin/sh`, which changes into it
 // with a glob (the parent holds nothing else). Returns null when the file
 // system cannot hold the name or Git does not report the raw root.
-function nonUtf8CheckoutFixture(t) {
+function nonUtf8CheckoutFixture(
+  t,
+  { rename = renameSync, exec = execFileSync } = {},
+) {
   if (process.platform === "win32") return null;
   const f = fixture(t, true, process.env, "checkout");
   // An unformatted staged file: a formatter run in write mode would change it.
   f.write("staged.ts", "const   value = 1;\n");
   f.git("add", "--", "staged.ts");
-  const renamed = Buffer.concat([Buffer.from(`${f.parent}/`), latin1Name("")]);
-  try {
-    renameSync(f.cwd, renamed);
-  } catch {
+  const directory = realpathSync(f.parent);
+  const raw = latin1Name("");
+  if (tryRawEntry(directory, raw, (path) => rename(f.cwd, path)) === null)
     return null;
-  }
-  const inCheckout = (command, args, extraEnv = {}) =>
-    spawnSync(
-      "/bin/sh",
-      ["-c", 'cd -- caf* && exec "$@"', "sh", command, ...args],
-      { cwd: f.parent, env: { ...f.env, ...extraEnv }, encoding: "utf8" },
-    );
-  const toplevel = inCheckout("git", ["rev-parse", "--show-toplevel"]);
-  const reported = spawnSync(
+  const checkoutArgs = (command, args) => [
+    "-c",
+    'cd -- caf* && exec "$@"',
+    "sh",
+    command,
+    ...args,
+  ];
+  const reported = exec(
     "/bin/sh",
-    ["-c", "cd -- caf* && exec git rev-parse --show-toplevel"],
-    { cwd: f.parent, env: f.env, encoding: "buffer" },
+    checkoutArgs("git", ["rev-parse", "--show-toplevel"]),
+    { cwd: f.parent, env: f.env },
   );
-  if (toplevel.status !== 0 || !reported.stdout.includes(0xe9)) return null;
+  const expected = Buffer.concat([
+    entryPath(directory, raw),
+    Buffer.from("\n"),
+  ]);
+  if (!reported.equals(expected)) return null;
+  const inCheckout = (command, args, extraEnv = {}) =>
+    spawnSync("/bin/sh", checkoutArgs(command, args), {
+      cwd: f.parent,
+      env: { ...f.env, ...extraEnv },
+      encoding: "utf8",
+    });
   return { ...f, inCheckout };
 }
 
@@ -3477,22 +3492,74 @@ test("fixture without a directory name removes its unique directory", (t) => {
 // strings, so the files are written and staged through raw `Buffer` paths.
 const latin1Name = (suffix = ".ts") =>
   Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9]), Buffer.from(suffix)]);
-const rawPath = (f, raw) =>
-  Buffer.concat([Buffer.from(`${f.cwd}/`), Buffer.from(raw)]);
+const entryPath = (directory, name) =>
+  Buffer.concat([Buffer.from(`${directory}/`), Buffer.from(name)]);
+const rawPath = (f, raw) => entryPath(f.cwd, raw);
 
-function writeRaw(f, raw, text = "const   value = 1;\n") {
-  const directory = raw.lastIndexOf(0x2f);
-  if (directory !== -1) {
-    mkdirSync(join(f.cwd, Buffer.from(raw.subarray(0, directory)).toString()), {
-      recursive: true,
-    });
+// EINVAL can describe the operation itself. Try the same operation with an
+// ASCII name in the same directory before treating it as a name rejection.
+// The fixture's parent cleanup also removes any control entry.
+function tryRawEntry(directory, raw, create, closeControl = () => {}) {
+  try {
+    return create(entryPath(directory, raw));
+  } catch (error) {
+    if (error.code === "EILSEQ") return null;
+    if (error.code !== "EINVAL") throw error;
+    let control;
+    try {
+      control = create(entryPath(directory, "ascii-name-control"));
+    } catch {
+      throw error;
+    }
+    closeControl(control);
+    return null;
   }
-  writeFileSync(rawPath(f, raw), text);
+}
+
+function writeRaw(
+  f,
+  raw,
+  text = "const   value = 1;\n",
+  {
+    mkdir = mkdirSync,
+    open = openSync,
+    write = writeFileSync,
+    close = closeSync,
+  } = {},
+) {
+  const separator = raw.lastIndexOf(0x2f);
+  const directory =
+    separator === -1
+      ? f.cwd
+      : join(f.cwd, raw.subarray(0, separator).toString());
+  if (separator !== -1) mkdir(directory, { recursive: true });
+  if (isUtf8(raw)) {
+    write(join(f.cwd, raw.toString()), text);
+    return true;
+  }
+  const fd = tryRawEntry(
+    directory,
+    raw.subarray(separator + 1),
+    (path) => open(path, "w"),
+    close,
+  );
+  if (fd === null) return false;
+  try {
+    write(fd, text);
+  } catch (error) {
+    // Keep the write error if closing the descriptor also fails.
+    try {
+      close(fd);
+    } catch {}
+    throw error;
+  }
+  close(fd);
+  return true;
 }
 
 // Whether `git ls-files -z` lists `raw` byte for byte.
-function listsRaw(f, raw) {
-  const listing = execFileSync("git", ["ls-files", "--others", "-z"], {
+function listsRaw(f, raw, exec = execFileSync) {
+  const listing = exec("git", ["ls-files", "--others", "-z"], {
     cwd: f.cwd,
     env: f.env,
     encoding: "buffer",
@@ -3519,18 +3586,147 @@ function stageRaw(f, ...names) {
 
 // Creates the fixture and writes each raw-named file. Returns null when the
 // file system cannot hold the names.
-function rawNameFixture(t, files) {
+function rawNameFixture(t, files, operations) {
   const f = fixture(t);
-  try {
-    for (const [raw, text] of files) writeRaw(f, raw, text);
-  } catch {
-    return null;
+  for (const [raw, text] of files) {
+    if (!writeRaw(f, raw, text, operations)) return null;
   }
-  if (!files.every(([raw]) => listsRaw(f, raw))) return null;
+  if (!files.every(([raw]) => listsRaw(f, raw, operations?.exec))) return null;
+  return f;
+}
+
+function rawSymlinkFixture(t, raw, lookalike, operations) {
+  const f = fixture(t);
+  const symlink = operations?.symlink ?? symlinkSync;
+  if (tryRawEntry(f.cwd, raw, (path) => symlink("target", path)) === null)
+    return null;
+  if (lookalike) writeRaw(f, lookalike, undefined, operations);
+  if (!listsRaw(f, raw) || (lookalike && !listsRaw(f, lookalike))) return null;
   return f;
 }
 
 const unsupportedFileSystem = "file system cannot hold a non-UTF-8 name";
+
+function failWith(code) {
+  const error = Object.assign(new Error(`fixture failure: ${code}`), { code });
+  const fail = () => {
+    throw error;
+  };
+  return { error, fail };
+}
+
+// Open an ASCII stand-in so later failure injections also run on file systems
+// that reject the raw name before the operation under test.
+function openAsciiStandIn(path, flags) {
+  return openSync(join(dirname(path.toString()), "opened.ts"), flags);
+}
+
+test("raw-name fixture propagates parent, open, write, close and Git errors", (t) => {
+  const nested = Buffer.concat([Buffer.from("nested/"), latin1Name()]);
+  for (const [operation, code] of [
+    ["mkdir", "EIO"],
+    ["open", "ENOSPC"],
+    ["write", "ENOSPC"],
+    ["close", "EINVAL"],
+    ["exec", "EIO"],
+  ]) {
+    const { error, fail } = failWith(code);
+    assert.throws(
+      () =>
+        rawNameFixture(t, [[nested]], {
+          open: openAsciiStandIn,
+          [operation]:
+            operation === "close"
+              ? (fd) => {
+                  closeSync(fd);
+                  fail();
+                }
+              : fail,
+        }),
+      (actual) => actual === error,
+      operation,
+    );
+  }
+});
+
+test("raw-name fixture returns null for EILSEQ or a Git listing with different bytes", (t) => {
+  const raw = latin1Name();
+  assert.equal(
+    rawNameFixture(t, [[raw]], { open: failWith("EILSEQ").fail }),
+    null,
+  );
+  assert.equal(rawNameFixture(t, [[raw]], { open: openAsciiStandIn }), null);
+});
+
+test("raw-name fixture requires a successful ASCII control for EINVAL", (t) => {
+  const raw = latin1Name();
+  const nested = Buffer.concat([Buffer.from("nested/"), raw]);
+  const invalid = failWith("EINVAL");
+  for (const control of [openSync, failWith("EACCES").fail]) {
+    const paths = [];
+    const setup = () =>
+      rawNameFixture(t, [[nested]], {
+        open(path, flags) {
+          paths.push(path);
+          if (path.subarray(-raw.length).equals(raw)) invalid.fail();
+          return control(path, flags);
+        },
+      });
+    if (control === openSync) {
+      assert.equal(setup(), null);
+    } else {
+      assert.throws(setup, (error) => error === invalid.error);
+    }
+    assert.equal(paths.length, 2);
+    assert.equal(dirname(paths[0].toString()), dirname(paths[1].toString()));
+    assert.ok(paths[1].toString().endsWith("/ascii-name-control"));
+  }
+});
+
+test(
+  "raw checkout fixture propagates rename and Git failures",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const denied = failWith("EACCES");
+    assert.throws(
+      () => nonUtf8CheckoutFixture(t, { rename: denied.fail }),
+      (error) => error === denied.error,
+    );
+    const gitFailure = failWith("EIO");
+    const normalizedRename = (from, to) => renameSync(from, to.toString());
+    assert.throws(
+      () =>
+        nonUtf8CheckoutFixture(t, {
+          rename: normalizedRename,
+          exec: gitFailure.fail,
+        }),
+      (error) => error === gitFailure.error,
+    );
+    assert.equal(nonUtf8CheckoutFixture(t, { rename: normalizedRename }), null);
+  },
+);
+
+test(
+  "raw symlink fixture propagates symlink and valid lookalike write failures",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const raw = latin1Name();
+    const denied = failWith("EACCES");
+    assert.throws(
+      () => rawSymlinkFixture(t, raw, undefined, { symlink: denied.fail }),
+      (error) => error === denied.error,
+    );
+    const full = failWith("ENOSPC");
+    assert.throws(
+      () =>
+        rawSymlinkFixture(t, raw, replacementBytes, {
+          symlink: (target, path) => symlinkSync(target, path.toString()),
+          write: full.fail,
+        }),
+      (error) => error === full.error,
+    );
+  },
+);
 
 test("staged selection fails accurately for a staged non-UTF-8 formattable path", (t) => {
   const raw = latin1Name();
@@ -3613,13 +3809,8 @@ test("staged selection keeps non-UTF-8 paths that the exemptions skip silent", (
 test("staged selection skips a non-UTF-8 path that the index records as a symlink", (t) => {
   if (process.platform === "win32") return t.skip("symlinks need privileges");
   const raw = latin1Name();
-  const f = fixture(t);
-  try {
-    symlinkSync("target", rawPath(f, raw));
-  } catch {
-    return t.skip(unsupportedFileSystem);
-  }
-  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  const f = rawSymlinkFixture(t, raw);
+  if (f === null) return t.skip(unsupportedFileSystem);
   stageRaw(f, raw);
   assert.deepEqual(stagedFormatFiles(f.cwd), []);
 });
@@ -3801,13 +3992,8 @@ test("explicit comparison skips a non-UTF-8 gitlink and still rejects a non-UTF-
 test("explicit comparison still skips a valid UTF-8 gitlink and a non-UTF-8 symlink", (t) => {
   if (process.platform === "win32") return t.skip("symlinks need privileges");
   const raw = latin1Name(".md");
-  const f = fixture(t);
-  try {
-    symlinkSync("target", rawPath(f, raw));
-  } catch {
-    return t.skip(unsupportedFileSystem);
-  }
-  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  const f = rawSymlinkFixture(t, raw);
+  if (f === null) return t.skip(unsupportedFileSystem);
   recordRaw(f, gitlinkMode, Buffer.from("submod.md"));
   mkdirSync(join(f.cwd, "submod.md"));
   stageRaw(f, raw);
@@ -3957,12 +4143,8 @@ test("explicit comparison still rejects a non-UTF-8 path that is added beside it
   f.git("commit", "--quiet", "-m", "add the valid name");
   const base = f.git("rev-parse", "HEAD");
   const raw = latin1Name();
-  try {
-    writeRaw(f, raw);
-  } catch {
+  if (!writeRaw(f, raw) || !listsRaw(f, raw))
     return t.skip(unsupportedFileSystem);
-  }
-  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
   stageRaw(f, raw);
   f.git("commit", "--quiet", "-m", "add the non-UTF-8 name");
   const head = f.git("rev-parse", "HEAD");
@@ -3982,15 +4164,8 @@ test("explicit comparison still rejects a non-UTF-8 path that is added beside it
 test("staged selection keeps a valid name whose lossy form equals a recorded symlink or a staged rename", (t) => {
   if (process.platform === "win32") return t.skip("symlinks need privileges");
   const raw = latin1Name();
-  const f = fixture(t);
-  try {
-    symlinkSync("target", rawPath(f, raw));
-    writeRaw(f, replacementBytes);
-  } catch {
-    return t.skip(unsupportedFileSystem);
-  }
-  if (!listsRaw(f, raw) || !listsRaw(f, replacementBytes))
-    return t.skip(unsupportedFileSystem);
+  const f = rawSymlinkFixture(t, raw, replacementBytes);
+  if (f === null) return t.skip(unsupportedFileSystem);
   // The index records the raw name as a symlink, which is exempt. The valid
   // name is a different path and must stay selected.
   stageRaw(f, raw, replacementBytes);
