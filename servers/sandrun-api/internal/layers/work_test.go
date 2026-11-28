@@ -454,6 +454,7 @@ func TestWarmPreparationFailureBacksOffAndReadyRunnerClearsRetry(t *testing.T) {
 }
 
 func TestWarmInFlightRejectionDoesNotBackOffNewProfileRevision(t *testing.T) {
+	t.Parallel()
 	const observationTimeout = 5 * time.Second
 	timing := testenv.FastWorkTiming()
 	timing.CreateTimeout = 15 * time.Second
