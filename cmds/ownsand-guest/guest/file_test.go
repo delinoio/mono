@@ -209,9 +209,39 @@ type gatedSnapshot struct {
 	reads       atomic.Int32
 	started     chan struct{}
 	release     chan struct{}
-	closed      chan struct{}
-	closeOnce   sync.Once
 	releaseOnce sync.Once
+
+	openMu   sync.Mutex
+	openDone chan struct{}
+	stopping bool
+
+	closed    chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newGatedSnapshot() *gatedSnapshot {
+	return &gatedSnapshot{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+}
+
+// openFile admits one worker and records its attempt before opening the file.
+func (g *gatedSnapshot) openFile(path string) (snapshotFile, error) {
+	g.openMu.Lock()
+	if g.stopping || g.openDone != nil {
+		g.openMu.Unlock()
+		return nil, fs.ErrClosed
+	}
+	done := make(chan struct{})
+	g.openDone = done
+	g.openMu.Unlock()
+
+	defer close(done)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	g.snapshotFile = f
+	return g, nil
 }
 
 // open lets the stalled read return. It is safe to call more than once.
@@ -228,25 +258,50 @@ func (g *gatedSnapshot) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (g *gatedSnapshot) Close() error {
-	g.closeOnce.Do(func() { close(g.closed) })
-	return g.snapshotFile.Close()
+	g.closeOnce.Do(func() {
+		g.closeErr = g.snapshotFile.Close()
+		close(g.closed)
+	})
+	return g.closeErr
 }
 
-// gateSnapshots makes the read manager of h open gated snapshot files and
-// returns the gate of the first one. The gate opens when the test ends, on
-// any exit path, so the worker returns and closes the snapshot handle.
-func gateSnapshots(h *harness) *gatedSnapshot {
-	g := &gatedSnapshot{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
-	h.srv.reads.openSnapshot = func(path string) (snapshotFile, error) {
-		f, err := os.Open(path)
-		if err != nil {
-			return nil, err
-		}
-		g.snapshotFile = f
-		return g, nil
+// finish stops new opens and waits for any admitted worker to close its file.
+// The owner calls it after gate cleanup and before removing the state directory.
+func (g *gatedSnapshot) finish(t *testing.T) {
+	t.Helper()
+	g.openMu.Lock()
+	g.stopping = true
+	openDone := g.openDone
+	g.openMu.Unlock()
+	if openDone == nil {
+		return
 	}
+
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-openDone:
+	case <-timer.C:
+		t.Error("timed out waiting for the snapshot open to finish")
+		return
+	}
+	if g.snapshotFile == nil {
+		return
+	}
+	select {
+	case <-g.closed:
+		if g.closeErr != nil {
+			t.Errorf("close snapshot: %v", g.closeErr)
+		}
+	case <-timer.C:
+		t.Error("timed out waiting for the snapshot close to finish")
+	}
+}
+
+// gateSnapshots installs the gate and releases it when the harness test ends.
+func gateSnapshots(h *harness, g *gatedSnapshot) {
+	h.srv.reads.openSnapshot = g.openFile
 	h.t.Cleanup(g.open)
-	return g
 }
 
 // A test that ends without opening the gate must not leave the stalled
@@ -254,11 +309,19 @@ func gateSnapshots(h *harness) *gatedSnapshot {
 // closes its snapshot handle.
 func TestGateSnapshotsOpensOnCleanup(t *testing.T) {
 	t.Parallel()
-	var g *gatedSnapshot
+	// The chunk worker can outlive the harness. Keep both directories alive
+	// until the parent cleanup finishes waiting for its file to close.
+	stateDir := t.TempDir()
+	path := filepath.Join(t.TempDir(), "f")
+	g := newGatedSnapshot()
+	t.Cleanup(func() {
+		g.finish(t)
+		// An explicit open after the subtest cleanup does not panic.
+		g.open()
+	})
 	t.Run("stalled", func(t *testing.T) {
-		h := newHarness(t, nil)
-		g = gateSnapshots(h)
-		path := filepath.Join(t.TempDir(), "f")
+		h := newHarness(t, func(c *Config) { c.StateDir = stateDir })
+		gateSnapshots(h, g)
 		if err := os.WriteFile(path, randomBytes(t, 2<<20+100), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -274,9 +337,69 @@ func TestGateSnapshotsOpensOnCleanup(t *testing.T) {
 		}
 		// The subtest returns without opening the gate.
 	})
+}
+
+type snapshotCloseFunc struct {
+	snapshotFile
+	close func() error
+}
+
+func (f snapshotCloseFunc) Close() error {
+	return f.close()
+}
+
+func TestGatedSnapshotCloseCompletion(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	released := make(chan struct{})
+	release := sync.OnceFunc(func() { close(released) })
+	t.Cleanup(release)
+	wantErr := errors.New("backing close failed")
+	g := newGatedSnapshot()
+	g.snapshotFile = snapshotCloseFunc{close: func() error {
+		close(entered)
+		<-released
+		return wantErr
+	}}
+	result := make(chan error, 1)
+	go func() { result <- g.Close() }()
+	waitStarted(t, entered)
+	select {
+	case <-g.closed:
+		t.Fatal("snapshot signaled close before the backing close finished")
+	default:
+	}
+	release()
 	waitClosed(t, g.closed)
-	// An explicit open after the cleanup does not panic.
-	g.open()
+	if !errors.Is(g.closeErr, wantErr) {
+		t.Fatalf("recorded close error = %v, want %v", g.closeErr, wantErr)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Close returned %v, want %v", err, wantErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Close to return")
+	}
+}
+
+func TestGatedSnapshotOpenCleanup(t *testing.T) {
+	t.Parallel()
+	t.Run("failed-open", func(t *testing.T) {
+		g := newGatedSnapshot()
+		if _, err := g.openFile(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("open error = %v, want %v", err, fs.ErrNotExist)
+		}
+		g.finish(t)
+	})
+	t.Run("late-open", func(t *testing.T) {
+		g := newGatedSnapshot()
+		g.finish(t)
+		if _, err := g.openFile(t.TempDir()); !errors.Is(err, fs.ErrClosed) {
+			t.Fatalf("late open error = %v, want %v", err, fs.ErrClosed)
+		}
+	})
 }
 
 // readEntryOpen returns the number of open calls of a read_id.
@@ -310,9 +433,15 @@ func (h *harness) waitReadCallsEnded(readID string) {
 // continues with the right offset after the read returns.
 func TestReadKeepaliveWhileChunkPending(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
-	g := gateSnapshots(h)
 	path := filepath.Join(t.TempDir(), "f")
+	stateDir := t.TempDir()
+	g := newGatedSnapshot()
+	t.Cleanup(func() { g.finish(t) })
+	h := newHarness(t, func(c *Config) {
+		c.StateDir = stateDir
+		c.KeepaliveInterval = 20 * time.Millisecond
+	})
+	gateSnapshots(h, g)
 	content := randomBytes(t, 2<<20+100)
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatal(err)
@@ -371,9 +500,15 @@ func TestReadKeepaliveWhileChunkPending(t *testing.T) {
 // worker closes its handle when the read returns.
 func TestReadCancelWhileChunkPending(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
-	g := gateSnapshots(h)
 	path := filepath.Join(t.TempDir(), "f")
+	stateDir := t.TempDir()
+	g := newGatedSnapshot()
+	t.Cleanup(func() { g.finish(t) })
+	h := newHarness(t, func(c *Config) {
+		c.StateDir = stateDir
+		c.KeepaliveInterval = 20 * time.Millisecond
+	})
+	gateSnapshots(h, g)
 	if err := os.WriteFile(path, randomBytes(t, 2<<20+100), 0o644); err != nil {
 		t.Fatal(err)
 	}
