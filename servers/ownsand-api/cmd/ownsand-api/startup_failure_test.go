@@ -8,14 +8,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/delinoio/mono/servers/internal/telemetry"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // The errno rules run on every host: the errno values and the platform name
@@ -179,4 +189,186 @@ func TestStartupRejectsMalformedDatabaseURL(t *testing.T) {
 	if bytes.Contains(output, []byte(marker)) || bytes.Contains(exitErr.Stderr, []byte(marker)) {
 		t.Error("startup output contains the synthetic database name")
 	}
+}
+
+const (
+	exitProcessEnv  = "OWNSAND_TEST_EXIT_PROCESS"
+	listenerFailure = "listener failed"
+	usageFailure    = "usage flush failed"
+)
+
+type serverExitLog struct {
+	Message string `json:"msg"`
+	Level   string `json:"level"`
+	Error   string `json:"error"`
+	Reason  string `json:"startup_failure_reason"`
+}
+
+func TestStartupExitOTLP(t *testing.T) {
+	switch mode := os.Getenv(exitProcessEnv); mode {
+	case "main":
+		main()
+		return
+	case "bind", "joined", "success":
+		runFinalizerProcess(t, mode)
+		os.Exit(0)
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const poolError = "DATABASE_URL pool_max_conns must be at least 2"
+	cases := []struct {
+		name       string
+		mode       string
+		env        []string
+		otlp       bool
+		wantExport bool
+		exitCode   int
+		wantError  string
+		wantReason string
+	}{
+		{name: "pool limit", mode: "main", otlp: true, wantExport: true, exitCode: 1, wantError: poolError},
+		{name: "invalid config", mode: "main", env: []string{"LOG_LEVEL=invalid"}, otlp: true, exitCode: 1, wantError: "LOG_LEVEL must be one of debug, info, warn, error"},
+		{name: "telemetry init failure", mode: "main", env: []string{"OTEL_RESOURCE_ATTRIBUTES=missing"}, otlp: true, exitCode: 1, wantError: "error detecting resource: partial resource: missing value: [missing]"},
+		{name: "OTLP disabled", mode: "main", exitCode: 1, wantError: poolError},
+		{name: "classified bind", mode: "bind", otlp: true, wantExport: true, wantError: bindError(syscall.EADDRINUSE).Error(), wantReason: "address_in_use"},
+		{name: "joined cleanup error", mode: "joined", otlp: true, wantExport: true, wantError: listenerFailure + "\n" + usageFailure},
+		{name: "successful result", mode: "success", otlp: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			collector := &exitLogCollector{t: t}
+			server := httptest.NewServer(collector)
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), 2*telemetry.ShutdownTimeout)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestStartupExitOTLP$")
+			cmd.Env = []string{
+				exitProcessEnv + "=" + tc.mode,
+				"DATABASE_URL=postgres://127.0.0.1/ownsand?pool_max_conns=1",
+				"LOGTO_ISSUER=https://example.invalid/oidc",
+				"LOG_LEVEL=error",
+			}
+			if tc.otlp {
+				cmd.Env = append(cmd.Env, telemetry.EnvOTLPLogsEndpoint+"="+server.URL+"/v1/logs")
+			}
+			cmd.Env = append(cmd.Env, tc.env...)
+			stdout, err := cmd.Output()
+			if tc.exitCode == 0 && err != nil {
+				t.Fatalf("child failed: %v; stdout: %s", err, stdout)
+			}
+			if tc.exitCode != 0 {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != tc.exitCode {
+					t.Fatalf("child exit = %v, want exit status %d; stdout: %s", err, tc.exitCode, stdout)
+				}
+			}
+
+			want := serverExitLog{Message: "server_exited", Level: "ERROR", Error: tc.wantError, Reason: tc.wantReason}
+			if tc.wantError == "" {
+				if len(stdout) != 0 {
+					t.Errorf("successful finalization wrote stdout: %s", stdout)
+				}
+			} else {
+				var got serverExitLog
+				if err := json.Unmarshal(stdout, &got); err != nil {
+					t.Fatalf("stdout must contain one JSON record: %v; stdout: %s", err, stdout)
+				}
+				if got != want {
+					t.Errorf("stdout record = %+v, want %+v", got, want)
+				}
+			}
+			collector.mu.Lock()
+			defer collector.mu.Unlock()
+			if tc.wantExport {
+				if len(collector.records) != 1 || collector.records[0] != want {
+					t.Errorf("OTLP exit records = %+v, want one %+v", collector.records, want)
+				}
+			} else if collector.requests != 0 {
+				t.Errorf("OTLP requests = %d, want zero", collector.requests)
+			}
+		})
+	}
+}
+
+func runFinalizerProcess(t *testing.T, mode string) {
+	t.Helper()
+	tel, err := telemetry.New(t.Context(), telemetry.Options{ServiceName: "ownsand-api", Level: slog.LevelError})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	switch mode {
+	case "bind":
+		runErr = classifyBindErrorFor(bindError(syscall.EADDRINUSE), "linux")
+	case "joined":
+		runErr = errors.Join(errors.New(listenerFailure), errors.New(usageFailure))
+	}
+	shutdowns := 0
+	finalizeRun(tel.Logger, runErr, func(ctx context.Context) error {
+		shutdowns++
+		deadline, ok := ctx.Deadline()
+		if remaining := time.Until(deadline); !ok || remaining <= 0 || remaining > telemetry.ShutdownTimeout {
+			t.Fatalf("telemetry shutdown deadline = %v, want a deadline within %v", deadline, telemetry.ShutdownTimeout)
+		}
+		return tel.Shutdown(ctx)
+	})
+	if shutdowns != 1 {
+		t.Fatalf("telemetry shutdown calls = %d, want 1", shutdowns)
+	}
+}
+
+type exitLogCollector struct {
+	t *testing.T
+
+	mu       sync.Mutex
+	requests int
+	records  []serverExitLog
+}
+
+func (c *exitLogCollector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.requests++
+	if r.Method != http.MethodPost || r.URL.Path != "/v1/logs" {
+		c.t.Errorf("unexpected OTLP request: %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected OTLP request", http.StatusBadRequest)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	var req collogspb.ExportLogsServiceRequest
+	if err == nil {
+		err = proto.Unmarshal(body, &req)
+	}
+	if err != nil {
+		c.t.Errorf("cannot read OTLP request: %v", err)
+		http.Error(w, "cannot read OTLP request", http.StatusBadRequest)
+		return
+	}
+	for _, resource := range req.GetResourceLogs() {
+		for _, scope := range resource.GetScopeLogs() {
+			for _, record := range scope.GetLogRecords() {
+				if record.GetBody().GetStringValue() != "server_exited" {
+					continue
+				}
+				if got := record.GetSeverityNumber(); got != logspb.SeverityNumber_SEVERITY_NUMBER_ERROR {
+					c.t.Errorf("OTLP severity = %v, want ERROR", got)
+				}
+				got := serverExitLog{Message: "server_exited", Level: record.GetSeverityText()}
+				for _, attr := range record.GetAttributes() {
+					switch attr.GetKey() {
+					case string(semconv.ExceptionMessageKey):
+						got.Error = attr.GetValue().GetStringValue()
+					case startupFailureReasonKey:
+						got.Reason = attr.GetValue().GetStringValue()
+					}
+				}
+				c.records = append(c.records, got)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/x-protobuf")
+	w.WriteHeader(http.StatusOK)
 }

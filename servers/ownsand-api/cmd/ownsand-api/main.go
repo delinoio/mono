@@ -98,12 +98,17 @@ func finishUsage(a usageFinisher, logger *slog.Logger, flushTimeout, drainTimeou
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if err := run(); err != nil {
-		logServerExited(slog.Default(), err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run() (runErr error) {
+	logger := slog.Default()
+	var shutdownTelemetry func(context.Context) error
+	// Log the final result after application cleanup, while OTLP can still
+	// accept the record and flush it during shutdown.
+	defer func() { finalizeRun(logger, runErr, shutdownTelemetry) }()
+
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
 		return err
@@ -112,16 +117,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// This deferred call runs last, so the OTLP export flushes the records of
-	// the shutdown.
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
-		defer cancel()
-		if err := tel.Shutdown(ctx); err != nil {
-			slog.Error("telemetry_shutdown_failed", slog.Any("error", err))
-		}
-	}()
-	logger := tel.Logger
+	shutdownTelemetry = tel.Shutdown
+	logger = tel.Logger
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -232,6 +229,20 @@ func run() error {
 		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr), slog.Bool("usage_reporting", cfg.Accounts.Enabled),
 		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
 	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait, a, metricsSrv, metricsListener)
+}
+
+func finalizeRun(logger *slog.Logger, runErr error, shutdownTelemetry func(context.Context) error) {
+	if runErr != nil {
+		logServerExited(logger, runErr)
+	}
+	if shutdownTelemetry == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+	defer cancel()
+	if err := shutdownTelemetry(ctx); err != nil {
+		logger.Error("telemetry_shutdown_failed", slog.Any("error", err))
+	}
 }
 
 // runServers drains public HTTP and finishes usage before closing metrics.
