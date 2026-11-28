@@ -71,8 +71,14 @@ func TestProcessPauseWaitsForAllWorkers(t *testing.T) {
 	}
 
 	assertManagedState(t, mgr, target, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	probeCtx, cancelProbe := context.WithTimeout(t.Context(), psTimeout)
+	defer cancelProbe()
 	for _, pid := range []int{target.helper.pid, shell, child} {
-		if state := processState(t, pid); state == "" || state[0] != 'T' {
+		state, err := processState(probeCtx, pid)
+		if err != nil {
+			t.Fatalf("PID %d after stop dispatch: probe failed: %v", pid, err)
+		}
+		if state == "" || state[0] != 'T' {
 			t.Fatalf("PID %d after stop dispatch has state %q, want T", pid, state)
 		}
 	}
