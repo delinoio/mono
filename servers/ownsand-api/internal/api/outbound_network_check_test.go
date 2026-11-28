@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -42,7 +43,7 @@ func TestOutboundNetworkCheckPlacement(t *testing.T) {
 		return dev, agent
 	}
 	failedDev, failedAgent := enroll(false)
-	passedDev, _ := enroll(true)
+	passedDev, passedAgent := enroll(true)
 	create := func(mutate func(*ownsandv1.CreateSandboxRequest)) (*ownsandv1.Sandbox, error) {
 		req := createReq(org.ID)
 		mutate(req)
@@ -52,14 +53,15 @@ func TestOutboundNetworkCheckPlacement(t *testing.T) {
 		}
 		return resp.Msg.GetSandbox(), nil
 	}
-	createCommands := func(a *testenv.FakeAgent) int {
-		n := 0
-		for _, cmd := range a.Commands() {
-			if cmd.GetCreateSandbox() != nil {
-				n++
-			}
+	waitCreate := func(agent *testenv.FakeAgent, sandboxID string, mode ownsandv1.NetworkMode) {
+		t.Helper()
+		cmd := agent.WaitFor(fmt.Sprintf("create command for sandbox %s on device %s", sandboxID, agent.Device.ID), func(e *ownsandv1.AgentEnvelope) bool {
+			cmd := e.GetCommand().GetCreateSandbox()
+			return cmd != nil && cmd.GetSandboxId() == sandboxID
+		}).GetCommand().GetCreateSandbox()
+		if got := cmd.GetNetworkMode(); got != mode {
+			t.Fatalf("create command for sandbox %s has network mode %s, want %s", sandboxID, got, mode)
 		}
-		return n
 	}
 	outbound := func(r *ownsandv1.CreateSandboxRequest) {
 		r.Network = &ownsandv1.Network{Mode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND}
@@ -73,9 +75,11 @@ func TestOutboundNetworkCheckPlacement(t *testing.T) {
 			r.Placement = &ownsandv1.Placement{DeviceId: &id}
 		}
 	}
-	if _, err := create(pin(passedDev.ID)); err != nil {
+	pinned, err := create(pin(passedDev.ID))
+	if err != nil {
 		t.Fatalf("pinned create on the passed device: %v", err)
 	}
+	waitCreate(passedAgent, pinned.GetSandboxId(), ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND)
 	sb, err := create(outbound)
 	if err != nil {
 		t.Fatalf("automatic OUTBOUND create: %v", err)
@@ -83,13 +87,18 @@ func TestOutboundNetworkCheckPlacement(t *testing.T) {
 	if sb.GetDeviceId() != passedDev.ID {
 		t.Fatalf("automatic OUTBOUND create ran on %q, want the passed device %q", sb.GetDeviceId(), passedDev.ID)
 	}
+	waitCreate(passedAgent, sb.GetSandboxId(), ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND)
 
 	// Pinning the failed device is a permanent mismatch and sends no command.
 	if _, err := create(pin(failedDev.ID)); testenv.Code(err) != connect.CodeFailedPrecondition {
 		t.Fatalf("pinned OUTBOUND create on the failed device: %v", err)
 	}
-	if n := createCommands(failedAgent); n != 0 {
-		t.Fatalf("the failed device received %d create commands", n)
+	// The acknowledgement follows any create command already queued on this channel.
+	const rejectionHeartbeat = 1
+	failedAgent.Heartbeat(rejectionHeartbeat)
+	waitHeartbeatAck(failedAgent, rejectionHeartbeat)
+	if n := countCreateCommands(failedAgent); n != 0 {
+		t.Fatalf("the failed device received %d create commands before the NONE request, want 0", n)
 	}
 
 	// A NONE sandbox does not need outbound networking.
@@ -102,6 +111,8 @@ func TestOutboundNetworkCheckPlacement(t *testing.T) {
 	if sb.GetDeviceId() != failedDev.ID {
 		t.Fatalf("NONE create ran on %q, want %q", sb.GetDeviceId(), failedDev.ID)
 	}
+	waitCreate(failedAgent, sb.GetSandboxId(), ownsandv1.NetworkMode_NETWORK_MODE_NONE)
+	waitState(t, c, org.ID, sb.GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 }
 
 func TestWindowsGuestOutboundPlacement(t *testing.T) {
