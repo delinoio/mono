@@ -27,6 +27,8 @@ export const EVENT_PAGE_SIZE = 500;
  * WatchSession from the last sequence it has. The stream reconnects after
  * it ends and stays open only while the page is visible, so the server can
  * suppress notifications for a session that the owner is looking at.
+ * WatchSession replays transcript events but not session changes, so each
+ * reopened stream reloads the session once it caught up.
  */
 export function useSessionTranscript(
   organizationId: string,
@@ -108,9 +110,15 @@ export function useSessionTranscript(
     [queryClient, sessionKey],
   );
 
+  const streamKey = `${organizationId}:${sessionId}`;
+  const watchedKey = useRef<string>(undefined);
   const stream = useStream(
     async (signal, onLive) => {
       const client = createClient(SessionService, transport);
+      // The first stream of a session starts with the session load; later
+      // streams may have missed session changes.
+      const reopened = watchedKey.current === streamKey;
+      watchedKey.current = streamKey;
       for await (const response of client.watchSession(
         { organizationId, sessionId, afterSequence: lastSequence.current },
         { signal },
@@ -125,6 +133,9 @@ export function useSessionTranscript(
             break;
           case "caughtUp":
             onLive();
+            if (reopened) {
+              void queryClient.invalidateQueries({ queryKey: sessionKey });
+            }
             break;
           default:
             break;
@@ -133,7 +144,7 @@ export function useSessionTranscript(
     },
     {
       enabled: enabled && loaded && visible,
-      key: `${organizationId}:${sessionId}`,
+      key: streamKey,
     },
   );
 

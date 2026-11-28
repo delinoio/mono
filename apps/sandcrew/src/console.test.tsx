@@ -3,7 +3,10 @@ import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import { TransportProvider } from "@connectrpc/connect-query";
 import { Role } from "@delino/sandcrew-protos/v1/common_pb";
 import { OrganizationSchema } from "@delino/sandcrew-protos/v1/organization_pb";
-import { TranscriptEventSchema } from "@delino/sandcrew-protos/v1/session_pb";
+import {
+  TranscriptEventSchema,
+  type WatchSessionResponse,
+} from "@delino/sandcrew-protos/v1/session_pb";
 import { create } from "@bufbuild/protobuf";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
@@ -423,6 +426,40 @@ describe("new-session form", () => {
 
 describe("chat view", () => {
   const chatPath = `/orgs/${ACME}/sessions/${MOCK_IDS.activeSession}`;
+
+  test("reloads the session after its stream reconnects", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    const { transport: recorded, calls } = recording(base);
+    let watches = 0;
+    const transport: Transport = {
+      ...recorded,
+      async stream(method, ...rest) {
+        const response = await base.stream(method, ...rest);
+        if (method.name !== "WatchSession" || ++watches > 1) return response;
+        // The first stream fails after it caught up.
+        return {
+          ...response,
+          message: (async function* () {
+            for await (const message of response.message) {
+              yield message;
+              if ((message as WatchSessionResponse).event.case === "caughtUp") {
+                throw new ConnectError("connection reset", Code.Unavailable);
+              }
+            }
+          })(),
+        };
+      },
+    };
+    const gets = () => calls.filter((c) => c.method === "GetSession").length;
+    renderConsole(chatPath, { transport });
+    await screen.findByRole("region", { name: "Transcript" });
+    await waitFor(() => expect(watches).toBe(1));
+    const before = gets();
+    await waitFor(() => expect(watches).toBe(2), { timeout: 3000 });
+    await waitFor(() => expect(gets()).toBeGreaterThan(before), {
+      timeout: 3000,
+    });
+  });
 
   test("shows every kind of transcript event", async () => {
     renderConsole(chatPath);
