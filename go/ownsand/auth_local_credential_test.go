@@ -74,6 +74,7 @@ func localCredExecOnce(s *Sandbox, ctx context.Context) (*ExecResult, error) {
 }
 
 func TestLocalCredentialFailureEndsOperationAndKeepsPeerRouting(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		// failCall is the token source call that fails: 1 is GetIceServers,
@@ -139,6 +140,7 @@ func TestLocalCredentialFailureEndsOperationAndKeepsPeerRouting(t *testing.T) {
 }
 
 func TestLocalCredentialFailureEndsFileOperationWithoutRelay(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	ts := &localCredTokenSource{failFrom: 1, failTo: 1}
 	s := cp.handle(t, localCredClient(t, cp, TransportAuto, ts))
@@ -159,6 +161,7 @@ func TestLocalCredentialFailureEndsFileOperationWithoutRelay(t *testing.T) {
 }
 
 func TestLocalCredentialFailureWithForcedPeerToPeerReturnsTheError(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	ts := &localCredTokenSource{failFrom: 1, failTo: 1}
 	s := cp.handle(t, localCredClient(t, cp, TransportPeerToPeer, ts))
@@ -172,6 +175,7 @@ func TestLocalCredentialFailureWithForcedPeerToPeerReturnsTheError(t *testing.T)
 }
 
 func TestControlPlaneSetupFailureStillFallsBackWithTokenSource(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = func(_ []string, e *fakeExec) { e.finish(exitedEvent(3)) }
 	cp.mu.Lock()
@@ -193,6 +197,7 @@ func TestControlPlaneSetupFailureStillFallsBackWithTokenSource(t *testing.T) {
 }
 
 func TestLocalCredentialFailureAfterCallerCancellationReturnsContextError(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -217,6 +222,7 @@ func TestLocalCredentialFailureAfterCallerCancellationReturnsContextError(t *tes
 }
 
 func TestRelayStreamCredentialEOF(t *testing.T) {
+	t.Parallel()
 	wrappedEOF := fmt.Errorf("read token: %w", io.EOF)
 	for _, tc := range []struct {
 		name         string
@@ -304,6 +310,7 @@ func TestRelayStreamCredentialEOF(t *testing.T) {
 }
 
 func TestLocalTokenDeadlineEndsRelayAuthorization(t *testing.T) {
+	t.Parallel()
 	callbackErr := fmt.Errorf("credential store: %w", context.DeadlineExceeded)
 	for _, tc := range []struct {
 		name      string
@@ -350,6 +357,7 @@ func TestLocalTokenDeadlineEndsRelayAuthorization(t *testing.T) {
 }
 
 func TestLocalTokenDeadlineDuringRelayAuthorizationCancellation(t *testing.T) {
+	t.Parallel()
 	callbackErr := fmt.Errorf("credential store: %w", context.DeadlineExceeded)
 	for _, tc := range []struct {
 		name         string

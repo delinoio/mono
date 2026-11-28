@@ -119,6 +119,7 @@ func checkLines(t *testing.T, res *ExecResult, r *recorder, n int) {
 }
 
 func TestExecGuestTimestamps(t *testing.T) {
+	t.Parallel()
 	start := time.Date(2024, time.January, 1, 0, 0, 0, 123456789, time.UTC)
 	end := time.Date(2024, time.January, 1, 0, 0, 2, 987654321, time.UTC)
 	epoch := time.Unix(0, 0).UTC()
@@ -187,6 +188,7 @@ func TestExecGuestTimestamps(t *testing.T) {
 }
 
 func TestExecPeerToPeer(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(5, 0)
 	s := cp.handle(t, cp.client(t, TransportAuto))
@@ -204,6 +206,7 @@ func TestExecPeerToPeer(t *testing.T) {
 }
 
 func TestExecRelayOnlyWithoutOpenSession(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(5, 0)
 	s := cp.handle(t, cp.client(t, TransportRelay))
@@ -222,6 +225,7 @@ func TestExecRelayOnlyWithoutOpenSession(t *testing.T) {
 }
 
 func TestExecFallsBackToRelayWhenICEFails(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.iceFail = true
 	cp.agent.run = lineRun(3, 0)
@@ -242,6 +246,7 @@ func TestExecFallsBackToRelayWhenICEFails(t *testing.T) {
 }
 
 func TestExecContinuesOnNewSessionAfterSessionEnd(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(6, 20*time.Millisecond)
 	cp.p2pScript = func(n int) p2pAction {
@@ -271,6 +276,7 @@ const quietRotations = 8
 // outlives more session expiries than the failure cap: every session ends
 // after the agent served the continuation and before any output arrives.
 func TestExecQuietSessionExpiriesDoNotHitFailureCap(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	gate := make(chan struct{})
 	cp.agent.run = func(_ []string, e *fakeExec) {
@@ -307,6 +313,7 @@ func TestExecQuietSessionExpiriesDoNotHitFailureCap(t *testing.T) {
 // a data channel that closes without a session-end frame on a forced
 // peer-to-peer handle.
 func TestExecRepeatedSessionFailuresHitFailureCap(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		tr   Transport
@@ -335,6 +342,7 @@ func TestExecRepeatedSessionFailuresHitFailureCap(t *testing.T) {
 }
 
 func TestExecMovesToRelayAfterChannelFailure(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(6, 20*time.Millisecond)
 	cp.p2pScript = func(int) p2pAction { return p2pAction{failAfter: 2} }
@@ -357,6 +365,7 @@ func TestExecMovesToRelayAfterChannelFailure(t *testing.T) {
 }
 
 func TestConcurrentExecsShareOneSession(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(4, 5*time.Millisecond)
 	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
@@ -388,6 +397,7 @@ func TestConcurrentExecsShareOneSession(t *testing.T) {
 }
 
 func TestRelayUnlimitedRotationsReuseGrant(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(12, 5*time.Millisecond)
 	cp.relayScript = func(string, int) relayAction { return relayAction{endAfter: 1} }
@@ -403,6 +413,7 @@ func TestRelayUnlimitedRotationsReuseGrant(t *testing.T) {
 }
 
 func TestRelayRenewsGrantAtRotation(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	// The grant expires before a new stream could end (relay stream limit
 	// plus 30 seconds, scaled), so every rotation renews it.
@@ -430,6 +441,7 @@ func TestRelayRenewsGrantAtRotation(t *testing.T) {
 }
 
 func TestExecRejectsMissingRelayGrantID(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		authCalls int
@@ -463,6 +475,7 @@ func TestExecRejectsMissingRelayGrantID(t *testing.T) {
 }
 
 func TestMalformedRelayRenewalKeepsPreviousGrantID(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.authScript = func(n int, _ *ownsandv1.AuthorizeRelayRequest) authAction {
 		return authAction{missingGrantID: n == 2}
@@ -487,6 +500,7 @@ func TestMalformedRelayRenewalKeepsPreviousGrantID(t *testing.T) {
 }
 
 func TestRelayRecoveryAfterAbruptDisconnect(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(6, 10*time.Millisecond)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -508,6 +522,7 @@ func TestRelayRecoveryAfterAbruptDisconnect(t *testing.T) {
 }
 
 func TestRelayRecoveryRetriesUnavailable(t *testing.T) {
+	t.Parallel()
 	for _, reason := range []ownsandv1.SessionEndReason{
 		ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST,
 		ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID,
@@ -530,6 +545,7 @@ func TestRelayRecoveryRetriesUnavailable(t *testing.T) {
 }
 
 func TestRelayRecoveryWhileUnreachable(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE)
@@ -552,6 +568,7 @@ func TestRelayRecoveryWhileUnreachable(t *testing.T) {
 }
 
 func TestRelayRecoveryWindowEnds(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.relayScript = func(string, int) relayAction {
 		return relayAction{err: grantInvalid()}
@@ -575,6 +592,7 @@ func TestRelayRecoveryWindowEnds(t *testing.T) {
 }
 
 func TestRelayRevokedCredentialEndsAtOnce(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(20, 50*time.Millisecond)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -603,6 +621,7 @@ func TestRelayRevokedCredentialEndsAtOnce(t *testing.T) {
 }
 
 func TestAuthorizeRelayLostResponseReturnsSameGrant(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(2, 0)
 	cp.authScript = func(n int, _ *ownsandv1.AuthorizeRelayRequest) authAction {
@@ -623,6 +642,7 @@ func TestAuthorizeRelayLostResponseReturnsSameGrant(t *testing.T) {
 }
 
 func TestAuthorizeRelayResourceExhaustedWaitsRetryDelay(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(1, 0)
 	var times []time.Time
@@ -642,6 +662,7 @@ func TestAuthorizeRelayResourceExhaustedWaitsRetryDelay(t *testing.T) {
 }
 
 func TestRelayStreamRejectedAtCapacityIsRetried(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(2, 0)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -659,6 +680,7 @@ func TestRelayStreamRejectedAtCapacityIsRetried(t *testing.T) {
 }
 
 func TestStreamWithoutAcceptedIsRetriedWithinRecoveryWindow(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.relayScript = func(string, int) relayAction { return relayAction{noAccept: true} }
 	c := cp.client(t, TransportRelay)
@@ -688,6 +710,7 @@ func TestStreamWithoutAcceptedIsRetriedWithinRecoveryWindow(t *testing.T) {
 }
 
 func TestExecFirstStreamClosedWithoutAcceptedAttachesThenResends(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(2, 0)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -717,6 +740,7 @@ func TestExecFirstStreamClosedWithoutAcceptedAttachesThenResends(t *testing.T) {
 }
 
 func TestExecAttachClosedWithoutAcceptedIsRetried(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 10*time.Millisecond)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -740,6 +764,7 @@ func TestExecAttachClosedWithoutAcceptedIsRetried(t *testing.T) {
 }
 
 func TestStalledStreamIsInterrupted(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(4, 10*time.Millisecond)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -757,6 +782,7 @@ func TestStalledStreamIsInterrupted(t *testing.T) {
 }
 
 func TestAcceptedSilentContinuationsKeepClockPaused(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	// A silent command: the first stream is interrupted, then accepted
 	// continuations rotate cleanly without data for longer than the window.
@@ -789,6 +815,7 @@ func TestAcceptedSilentContinuationsKeepClockPaused(t *testing.T) {
 }
 
 func TestExecPausedWaitsForResume(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	gate := make(chan struct{})
 	cp.agent.run = func(_ []string, e *fakeExec) {
@@ -826,6 +853,7 @@ func TestExecPausedWaitsForResume(t *testing.T) {
 }
 
 func TestExecPausedSandboxEnds(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = func(_ []string, e *fakeExec) { e.write(0, []byte("x\n")) }
 	cp.relayScript = func(method string, n int) relayAction {
@@ -857,6 +885,7 @@ func TestExecPausedSandboxEnds(t *testing.T) {
 }
 
 func TestExecBeforeStartedResendsIdenticalRequestAfterNotFound(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(2, 0)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -899,6 +928,7 @@ func TestExecBeforeStartedResendsIdenticalRequestAfterNotFound(t *testing.T) {
 }
 
 func TestExecPausedBeforeStartedResumesAndSends(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(1, 0)
 	cp.setState(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
@@ -913,6 +943,7 @@ func TestExecPausedBeforeStartedResumesAndSends(t *testing.T) {
 }
 
 func TestAttachNotFoundAfterStartedIsUnknownOutcome(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	wrote := make(chan struct{})
 	// cleared is closed after the fake agent forgot the exec. The relay holds
@@ -1047,6 +1078,7 @@ func TestOutputTruncatedRelay(t *testing.T)      { testTruncation(t, TransportRe
 func TestOutputTruncatedPeerToPeer(t *testing.T) { testTruncation(t, TransportPeerToPeer) }
 
 func TestExecOutputGap(t *testing.T) {
+	t.Parallel()
 	sentinel := errors.New("stop from gap callback")
 	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
 		for _, method := range []string{"Exec", "AttachExec"} {
@@ -1144,6 +1176,7 @@ func testExecOutputGap(t *testing.T, tr Transport, method string, kind ExecEvent
 }
 
 func TestExecFailedAndSignal(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = func(cmd []string, e *fakeExec) {
 		switch cmd[0] {
@@ -1173,6 +1206,7 @@ func TestExecFailedAndSignal(t *testing.T) {
 }
 
 func TestAttachExecWithAttachGrant(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	c := cp.client(t, TransportRelay)
@@ -1194,6 +1228,7 @@ func TestAttachExecWithAttachGrant(t *testing.T) {
 }
 
 func TestNewSaltForEachOperation(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportRelay))
 	runExec(t, s)
@@ -1220,6 +1255,7 @@ func TestNewSaltForEachOperation(t *testing.T) {
 }
 
 func TestElevenOperationsRecoverAtOnce(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(4, 10*time.Millisecond)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -1256,6 +1292,7 @@ func TestElevenOperationsRecoverAtOnce(t *testing.T) {
 }
 
 func TestExecValidationBeforeSend(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportRelay))
 	if _, err := s.Exec(context.Background(), ExecParams{}); err == nil {
@@ -1271,6 +1308,7 @@ func TestExecValidationBeforeSend(t *testing.T) {
 }
 
 func TestLostRenewalResponseReturnsInstalledGrant(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.expiresIn = 900 * time.Millisecond
 	cp.agent.run = lineRun(3, 5*time.Millisecond)
@@ -1288,6 +1326,7 @@ func TestLostRenewalResponseReturnsInstalledGrant(t *testing.T) {
 }
 
 func TestGrantLifetimeUsesExpiresInNotCallerClock(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(4, 5*time.Millisecond)
 	cp.relayScript = func(string, int) relayAction { return relayAction{endAfter: 1} }
@@ -1312,6 +1351,7 @@ func TestGrantLifetimeUsesExpiresInNotCallerClock(t *testing.T) {
 // not match its payload) ends the operation at once on the peer-to-peer
 // path instead of leaving it waiting for another frame.
 func TestInvalidFrameFailsItsStream(t *testing.T) {
+	t.Parallel()
 	frames := map[string]func(uint64, string) *ownsandv1.DataFrame{
 		"unknown kind": func(id uint64, sb string) *ownsandv1.DataFrame {
 			return &ownsandv1.DataFrame{StreamId: id, SandboxId: sb, Kind: ownsandv1.DataFrameKind(99)}
@@ -1351,6 +1391,7 @@ func TestInvalidFrameFailsItsStream(t *testing.T) {
 // fills: the receiver fails the overrun stream, the other operation
 // completes, and the exec continues from its delivered offsets.
 func TestBlockedStreamDoesNotBlockOtherStreams(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	// Small output chunks, so the exec sends far more frames than its
 	// stream queue holds.
@@ -1401,6 +1442,7 @@ func TestBlockedStreamDoesNotBlockOtherStreams(t *testing.T) {
 // retry window ends, both for the first authorization of an operation and
 // inside relay recovery, also for a caller without its own deadline.
 func TestStalledAuthorizeRelayEndsWithTheWindow(t *testing.T) {
+	t.Parallel()
 	cases := map[string]struct {
 		stallFrom int
 		relay     func(method string, n int) relayAction
@@ -1446,6 +1488,7 @@ func TestStalledAuthorizeRelayEndsWithTheWindow(t *testing.T) {
 }
 
 func TestRelayTerminalWireErrorWithCredentialEndsOnce(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.relayScript = func(string, int) relayAction {
 		return relayAction{err: connect.NewError(connect.CodeUnauthenticated, errors.New("rejected "+testAPIKey))}
@@ -1472,6 +1515,7 @@ func TestRelayTerminalWireErrorWithCredentialEndsOnce(t *testing.T) {
 }
 
 func TestRelayUnavailableWithCredentialStillRecovers(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -1519,6 +1563,7 @@ func (cp *fakeCP) heldDurations() []time.Duration {
 }
 
 func TestExecContinuationNotAcceptedEndsAtRecoveryDeadline(t *testing.T) {
+	t.Parallel()
 	for name, act := range map[string]relayAction{
 		"blocked receive": {holdOpen: true},
 		"keepalives only": {keepalivesOnly: true},
@@ -1561,6 +1606,7 @@ func TestExecContinuationNotAcceptedEndsAtRecoveryDeadline(t *testing.T) {
 }
 
 func TestExecContinuationAcceptedBeforeDeadlineStaysOpenPastIt(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -1584,6 +1630,7 @@ func TestExecContinuationAcceptedBeforeDeadlineStaysOpenPastIt(t *testing.T) {
 }
 
 func TestExecInterruptedAfterAcceptanceResumesSavedBudget(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(3, 0)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -1617,6 +1664,7 @@ func TestExecInterruptedAfterAcceptanceResumesSavedBudget(t *testing.T) {
 // caller's cancellation (not a timer started before the exec, and not the
 // recovery deadline) is what ends the held call.
 func TestExecCallerCancellationEndsHeldContinuationEarlier(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(5, 20*time.Millisecond)
 	cp.relayScript = func(method string, n int) relayAction {
@@ -1701,6 +1749,7 @@ func deadlineOperations(t *testing.T) map[string]struct {
 // status ends an exec or a read at once with a DataPathError, on the relay,
 // without a new AuthorizeRelay, and that the exec never runs.
 func TestDeadlineStatusEndsExecAndReadAtOnce(t *testing.T) {
+	t.Parallel()
 	for name, tt := range deadlineOperations(t) {
 		t.Run(name, func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -1748,6 +1797,7 @@ func TestDeadlineStatusEndsExecAndReadAtOnce(t *testing.T) {
 // TestDeadlineStatusEndsExecAndReadAtOnceOnP2P covers the error frames of the
 // peer-to-peer path.
 func TestDeadlineStatusEndsExecAndReadAtOnceOnP2P(t *testing.T) {
+	t.Parallel()
 	for name, tt := range deadlineOperations(t) {
 		if name == "AttachExec" || name == "ReadFileBytes" {
 			// The same loops serve these on the relay test above; one
@@ -1788,6 +1838,7 @@ func TestDeadlineStatusEndsExecAndReadAtOnceOnP2P(t *testing.T) {
 // error is authoritative. The skew is far larger than the caller's timeout,
 // so the order does not depend on the speed of the machine.
 func TestDeadlineStatusNearCallerDeadlineIsTheCallerDeadline(t *testing.T) {
+	t.Parallel()
 	for name, tt := range deadlineOperations(t) {
 		t.Run(name, func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -1838,6 +1889,7 @@ func retireInstalledSession(s *Sandbox) func() {
 // agent served the continuation of every retired session: a retirement is not
 // a failure, like a session end.
 func TestExecQuietSessionRetirementsDoNotHitFailureCap(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	gate := make(chan struct{})
 	cp.agent.run = func(_ []string, e *fakeExec) {
@@ -1877,6 +1929,7 @@ func TestExecQuietSessionRetirementsDoNotHitFailureCap(t *testing.T) {
 // retirement before the agent served the continuation still counts as a
 // failure: six of them in a row end the exec with a data path error.
 func TestExecRepeatedUnservedSessionRetirementsHitFailureCap(t *testing.T) {
+	t.Parallel()
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(1, 0)
 	s := cp.handle(t, cp.client(t, TransportAuto))

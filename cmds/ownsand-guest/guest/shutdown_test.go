@@ -127,6 +127,7 @@ func setShutdownGrace(t *testing.T, d time.Duration) {
 }
 
 func TestRunReturnsPromptlyWhenIdle(t *testing.T) {
+	t.Parallel()
 	rig := startShutdownRig(t)
 	start := time.Now()
 	rig.stop()
@@ -210,6 +211,8 @@ func requireStagingHandleClosed(t *testing.T, staging *os.File) {
 }
 
 func TestRunWriteShutdownLockHandoff(t *testing.T) {
+	// Not parallel: the test replaces package-level variables (renameFile, shutdownGrace)
+	// that other tests read.
 	for _, forced := range []bool{false, true} {
 		name := "within_grace"
 		if forced {
@@ -307,6 +310,7 @@ func TestRunWriteShutdownLockHandoff(t *testing.T) {
 }
 
 func TestWriteSweepRetainsStateDirDuringConcurrentClose(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	dir := h.srv.cfg.StateDir
 	target, req := startPartialWrite(t, h)
@@ -358,6 +362,7 @@ func TestWriteSweepRetainsStateDirDuringConcurrentClose(t *testing.T) {
 }
 
 func TestWriteCloseRejectsNewWork(t *testing.T) {
+	t.Parallel()
 	target := filepath.Join(t.TempDir(), "target")
 	h := newHarness(t, nil)
 	dir := h.srv.cfg.StateDir

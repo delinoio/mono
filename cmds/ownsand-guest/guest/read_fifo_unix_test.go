@@ -44,6 +44,7 @@ func swapForFIFO(t *testing.T, path string) func() {
 // A regular file that is replaced by a FIFO between the stat and the open must
 // not block the open: the snapshot fails with the abort error instead.
 func TestMakeSnapshotAbortsWhenPathSwappedForFIFO(t *testing.T) {
+	t.Parallel()
 	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +81,7 @@ func TestMakeSnapshotAbortsWhenPathSwappedForFIFO(t *testing.T) {
 // The prepare worker must publish the failure, so that ready is closed and a
 // retry of the read_id snapshots again, when the source became a FIFO.
 func TestReadPrepareClosesReadyWhenPathSwappedForFIFO(t *testing.T) {
+	t.Parallel()
 	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

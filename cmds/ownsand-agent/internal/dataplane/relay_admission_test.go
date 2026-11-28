@@ -14,6 +14,7 @@ import (
 )
 
 func TestRelayStreamAdmissionRequiresActiveConnection(t *testing.T) {
+	t.Parallel()
 	ch := newChannel(1)
 	g := &grant{
 		id: newID(t), sandboxID: newID(t), ch: ch, received: time.Now(),

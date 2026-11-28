@@ -11,6 +11,7 @@ import (
 )
 
 func TestNewRejectsSecondServerOnStateDir(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	first, err := New(Config{StateDir: dir})
 	if err != nil {
@@ -52,6 +53,7 @@ func TestNewRejectsSecondServerOnStateDir(t *testing.T) {
 }
 
 func TestNewReleasesStateDirAfterFailedStart(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// A regular file where the write records directory belongs makes the
 	// start fail after the lock was taken.

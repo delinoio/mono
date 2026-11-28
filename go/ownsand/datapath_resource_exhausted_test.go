@@ -21,6 +21,7 @@ func resourceExhaustedStatus() error {
 // with the automatic transport the operation succeeds on the relay and the
 // handle moves to the relay.
 func TestSetupResourceExhaustedMovesToRelay(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)
@@ -49,6 +50,7 @@ func TestSetupResourceExhaustedMovesToRelay(t *testing.T) {
 // forced peer-to-peer handle returns the resource_exhausted status with its
 // code and asks for no relay grant.
 func TestForcedPeerToPeerSetupResourceExhaustedReturnsTheError(t *testing.T) {
+	t.Parallel()
 	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
 		t.Run(string(stage), func(t *testing.T) {
 			cp := newFakeCP(t)

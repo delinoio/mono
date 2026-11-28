@@ -68,6 +68,7 @@ func randomBytes(t *testing.T, n int) []byte {
 }
 
 func TestReadFileChunksAndResume(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	path := filepath.Join(t.TempDir(), "data.bin")
 	content := randomBytes(t, 2<<20+12345)
@@ -106,6 +107,7 @@ func TestReadFileChunksAndResume(t *testing.T) {
 }
 
 func TestReadFileErrors(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	dir := t.TempDir()
 	if _, _, errd := h.readAll(readReq(t, filepath.Join(dir, "missing"))); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
@@ -133,6 +135,7 @@ func TestReadFileErrors(t *testing.T) {
 }
 
 func TestReadCopyDetectsChange(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	path := filepath.Join(t.TempDir(), "f")
 	os.WriteFile(path, []byte("before"), 0o644)
@@ -150,6 +153,7 @@ func TestReadCopyDetectsChange(t *testing.T) {
 }
 
 func TestReadKeepaliveWhilePreparing(t *testing.T) {
+	t.Parallel()
 	// Cleanup releases the gate before stopping the harness, then removes
 	// the source file.
 	path := filepath.Join(t.TempDir(), "f")
@@ -249,6 +253,7 @@ func gateSnapshots(h *harness) *gatedSnapshot {
 // worker blocked: the cleanup of gateSnapshots opens the gate, and the worker
 // closes its snapshot handle.
 func TestGateSnapshotsOpensOnCleanup(t *testing.T) {
+	t.Parallel()
 	var g *gatedSnapshot
 	t.Run("stalled", func(t *testing.T) {
 		h := newHarness(t, nil)
@@ -304,6 +309,7 @@ func (h *harness) waitReadCallsEnded(readID string) {
 // A stalled chunk read must not stop the keepalives, and the stream
 // continues with the right offset after the read returns.
 func TestReadKeepaliveWhileChunkPending(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
 	g := gateSnapshots(h)
 	path := filepath.Join(t.TempDir(), "f")
@@ -364,6 +370,7 @@ func TestReadKeepaliveWhileChunkPending(t *testing.T) {
 // A cancellation ends the call while a chunk read is stalled; the late
 // worker closes its handle when the read returns.
 func TestReadCancelWhileChunkPending(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
 	g := gateSnapshots(h)
 	path := filepath.Join(t.TempDir(), "f")
@@ -404,6 +411,7 @@ func TestReadCancelWhileChunkPending(t *testing.T) {
 }
 
 func TestReadRetention(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	path := filepath.Join(t.TempDir(), "f")
 	os.WriteFile(path, []byte("x"), 0o644)
@@ -439,6 +447,7 @@ func (h *harness) write(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteFileRe
 }
 
 func TestWriteFile(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	dir := t.TempDir()
 	target := filepath.Join(dir, "out.bin")
@@ -514,6 +523,7 @@ func TestWriteFile(t *testing.T) {
 }
 
 func TestWireToFileMode(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		wire uint32
 		want fs.FileMode
@@ -536,6 +546,7 @@ func TestWireToFileMode(t *testing.T) {
 }
 
 func TestWriteSpecialModeBits(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("file modes are ignored on Windows guests")
 	}
@@ -603,6 +614,7 @@ func TestWriteSpecialModeBits(t *testing.T) {
 // guests apply it. Windows guests ignore it: Go's Chmod would set the
 // read-only file attribute there, so the target must stay writable.
 func TestWriteReadOnlyFinishMode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), "out.bin")
 	req := &ownsandv1.WriteFileRequest{
@@ -654,6 +666,7 @@ func TestWriteReadOnlyFinishMode(t *testing.T) {
 // read-only mode then; an unprivileged guest user must still be able to repeat
 // the same finish and get the file with the requested mode.
 func TestWriteFinishRetryAfterRenameFailureKeepsReadOnlyMode(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows guests ignore the finish mode")
 	}
@@ -708,6 +721,7 @@ func TestWriteFinishRetryAfterRenameFailureKeepsReadOnlyMode(t *testing.T) {
 }
 
 func TestWriteEmptyFileAndErrors(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	dir := t.TempDir()
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: filepath.Join(dir, "empty"), BindingSalt: make([]byte, 32), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 0}}
@@ -729,6 +743,7 @@ func TestWriteEmptyFileAndErrors(t *testing.T) {
 }
 
 func TestWriteExpiryRemovesTemporaryFile(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), "f")
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
@@ -754,6 +769,7 @@ func TestWriteExpiryRemovesTemporaryFile(t *testing.T) {
 }
 
 func TestMergeSpan(t *testing.T) {
+	t.Parallel()
 	var r []span
 	for _, s := range []span{{10, 20}, {0, 5}, {5, 10}, {30, 40}, {35, 50}} {
 		r = mergeSpan(r, s)
@@ -813,6 +829,7 @@ func waitStarted(t *testing.T, ch <-chan struct{}) {
 }
 
 func TestReadPreparationGateCleanup(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []struct {
 		name  string
 		setup func(*readManager, func())
@@ -905,6 +922,7 @@ func (m *readManager) hasEntry(readID string) bool {
 // A failure published after the last call ended removes the entry, so the
 // next call for the read_id makes a new snapshot.
 func TestReadFailureAfterLastCallEndedIsForgotten(t *testing.T) {
+	t.Parallel()
 	m, started, release := blockedReadManager(t)
 	path := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
@@ -947,6 +965,7 @@ func TestReadFailureAfterLastCallEndedIsForgotten(t *testing.T) {
 // A call that still waits receives the failure, and the entry goes away when
 // that call ends.
 func TestReadFailureReachesWaitingCall(t *testing.T) {
+	t.Parallel()
 	m, started, release := blockedReadManager(t)
 	path := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
@@ -986,6 +1005,7 @@ func TestReadFailureReachesWaitingCall(t *testing.T) {
 // A snapshot that succeeds after the last call ended stays for the
 // retention time, so a later call reads the original snapshot.
 func TestReadSuccessAfterLastCallEndedIsKept(t *testing.T) {
+	t.Parallel()
 	m, started, release := blockedReadManager(t)
 	path := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
@@ -1077,6 +1097,7 @@ func snapshotFiles(t *testing.T, m *readManager) []string {
 // the worker would create a snapshot file after the sweep that no entry owns.
 // The retention time of the snapshot then starts when it became ready.
 func TestReadSweepKeepsSnapshotInPreparation(t *testing.T) {
+	t.Parallel()
 	m, clock, started, release := preOpenReadManager(t)
 	path := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
@@ -1139,6 +1160,7 @@ func TestReadSweepKeepsSnapshotInPreparation(t *testing.T) {
 // A preparation that fails while a sweep skips it leaves neither an entry nor
 // a file.
 func TestReadSweepKeepsFailingSnapshotInPreparation(t *testing.T) {
+	t.Parallel()
 	m, clock, started, release := preOpenReadManager(t)
 	path := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
@@ -1176,6 +1198,7 @@ func TestReadSweepKeepsFailingSnapshotInPreparation(t *testing.T) {
 // Any file that cannot be retained is removed: if an entry vanished by any
 // other path while its worker still ran, the worker removes the file it made.
 func TestReadSnapshotOfForgottenEntryIsRemoved(t *testing.T) {
+	t.Parallel()
 	m, _, started, release := preOpenReadManager(t)
 	path := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
@@ -1202,6 +1225,7 @@ func TestReadSnapshotOfForgottenEntryIsRemoved(t *testing.T) {
 }
 
 func TestReadCopyZeroSizeProcfs(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS != "linux" {
 		t.Skip("procfs exists only on Linux")
 	}
@@ -1226,6 +1250,7 @@ func TestReadCopyZeroSizeProcfs(t *testing.T) {
 }
 
 func TestReadCopySysfsSizeMismatch(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS != "linux" {
 		t.Skip("sysfs exists only on Linux")
 	}
@@ -1262,6 +1287,7 @@ func TestReadCopySysfsSizeMismatch(t *testing.T) {
 }
 
 func TestReadCopyEmptyFileAndSizeChange(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	h.srv.reads.forceCopy = true
 	empty := filepath.Join(t.TempDir(), "empty")
@@ -1309,6 +1335,7 @@ func writeLongName(t *testing.T, h *harness, dir string, nameLen int) {
 }
 
 func TestWriteLongTargetNames(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	dir := t.TempDir()
 	for _, n := range []int{205, 206, 255} {
@@ -1317,6 +1344,7 @@ func TestWriteLongTargetNames(t *testing.T) {
 }
 
 func TestWriteTempNameNeverEqualsTarget(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	dir := t.TempDir()
 	id := newID(t)
@@ -1350,6 +1378,7 @@ func TestWriteTempNameNeverEqualsTarget(t *testing.T) {
 // temporary name only in letter case names the same file, so the temporary
 // name must differ from the target name under case folding too.
 func TestWriteTempNameDiffersFromTargetUnderCaseFolding(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	id := newID(t)
 	for _, base := range []string{
@@ -1365,6 +1394,7 @@ func TestWriteTempNameDiffersFromTargetUnderCaseFolding(t *testing.T) {
 }
 
 func TestWriteLongWriteIDIsBounded(t *testing.T) {
+	t.Parallel()
 	target := filepath.Join(t.TempDir(), "f")
 	long := strings.Repeat("x", 1000)
 	if n := len(filepath.Base(tempPath(target, long))); n > 255 {
@@ -1373,6 +1403,7 @@ func TestWriteLongWriteIDIsBounded(t *testing.T) {
 }
 
 func TestWriteExpiryOfLongTargetRemovesTemporaryFile(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), strings.Repeat("b", 255))
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
@@ -1393,6 +1424,7 @@ func TestWriteExpiryOfLongTargetRemovesTemporaryFile(t *testing.T) {
 // On Windows, os.Stat keeps only the path and os.SameFile opens it again when
 // it compares, so a swap after the stat would not be seen.
 func TestStatSourceKeepsIdentityAfterPathSwap(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f")
 	other := filepath.Join(dir, "other")
@@ -1428,6 +1460,7 @@ func TestStatSourceKeepsIdentityAfterPathSwap(t *testing.T) {
 // A path swapped to another same-size file between the first stat and the
 // open must abort the snapshot and leave no snapshot file behind.
 func TestReadSnapshotAbortsWhenPathSwappedBeforeOpen(t *testing.T) {
+	t.Parallel()
 	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

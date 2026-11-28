@@ -145,6 +145,7 @@ func newPlaneWithLogger(w *world, timing Timing, logger *slog.Logger) *DataPlane
 }
 
 func TestSessionServesExec(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newPlane(w, Timing{})
 	ch := newChannel(1)
@@ -180,6 +181,7 @@ func TestSessionServesExec(t *testing.T) {
 }
 
 func TestSessionEndRules(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	cases := []struct {
 		name   string
@@ -222,6 +224,7 @@ func TestSessionEndRules(t *testing.T) {
 }
 
 func TestSessionIdleAndLabel(t *testing.T) {
+	t.Parallel()
 	t.Run("quiet session", func(t *testing.T) {
 		w := newWorld(t)
 		dp := newPlane(w, Timing{SessionIdle: time.Second})
@@ -314,6 +317,7 @@ func (s *session) endState() (bool, ownsandv1.SessionEndReason) {
 // session, and the session ends again once both are gone and the idle time
 // has passed.
 func TestSessionIdleEndNeedsQuietAndNoOpenRequest(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	c, s := idleSession(t, w, time.Hour)
 
@@ -357,6 +361,7 @@ func TestSessionIdleEndNeedsQuietAndNoOpenRequest(t *testing.T) {
 // Once the idle transition won, a request cannot register a stream or reach
 // the dispatcher.
 func TestSessionRejectsRequestAfterIdleEnd(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	const streamID = 7
 	frame := datapath.MustNewFrame(streamID, w.sandbox, w.execReq("/bin/true"))
@@ -402,6 +407,7 @@ func TestSessionRejectsRequestAfterIdleEnd(t *testing.T) {
 // The expiry path ends the session unconditionally, also while a request is
 // open and the session is not idle.
 func TestSessionExpiryEndsBusySession(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	_, s := idleSession(t, w, time.Hour)
 	s.mu.Lock()
@@ -417,6 +423,7 @@ func TestSessionExpiryEndsBusySession(t *testing.T) {
 // channel to drain: the end interrupts the waiting send instead of waiting
 // for its lock.
 func TestSessionEndInterruptsBackpressuredSend(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newPlane(w, Timing{})
 	ch := newChannel(1)
@@ -554,6 +561,7 @@ func requireEndedAnswer(t *testing.T, answers <-chan *ownsandv1.SignalingAnswer,
 // A revocation that arrives while the offer gathers candidates ends the
 // session with REVOKED and the offer returns an error answer.
 func TestRevokeDuringOfferGathering(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newGatheringPlane(w, silentSTUN(t))
 	ch := newChannel(1)
@@ -577,6 +585,7 @@ func TestRevokeDuringOfferGathering(t *testing.T) {
 // Close ends a session whose offer gathers candidates: none exists after
 // Close returns.
 func TestCloseDuringOfferGathering(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newGatheringPlane(w, silentSTUN(t))
 	ch := newChannel(1)
@@ -592,6 +601,7 @@ func TestCloseDuringOfferGathering(t *testing.T) {
 // A lost channel cancels its pending offer and closes its peer connection;
 // an offer on a live channel continues and gets its answer.
 func TestChannelLostDuringOfferGathering(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newGatheringPlane(w, silentSTUN(t))
 	lost, live := newChannel(1), newChannel(2)
@@ -628,6 +638,7 @@ func TestChannelLostDuringOfferGathering(t *testing.T) {
 
 // An offer whose channel closes without a ChannelLost call ends too.
 func TestChannelDoneDuringOfferGathering(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newGatheringPlane(w, silentSTUN(t))
 	ch := newChannel(1)
@@ -642,6 +653,7 @@ func TestChannelDoneDuringOfferGathering(t *testing.T) {
 // A channel that closed before the offer started cancels it before it
 // gathers.
 func TestOfferOnClosedChannel(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newPlane(w, Timing{})
 	ch := newChannel(1)
@@ -657,6 +669,7 @@ func TestOfferOnClosedChannel(t *testing.T) {
 
 // A failed answer leaves no session in the map.
 func TestFailedOfferLeavesNoSession(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	dp := newPlane(w, Timing{})
 	ch := newChannel(1)
@@ -702,6 +715,7 @@ func requireExpiredDuringSetup(t *testing.T, dp *DataPlane, id string, started t
 // error answer at its deadline, closes its peer connection and registers no
 // live session. The gathering takes the 5 seconds of the silent STUN server.
 func TestOfferExpiresDuringGathering(t *testing.T) {
+	t.Parallel()
 	const lifetime = 2 * time.Second
 	w := newWorld(t)
 	dp := newGatheringPlane(w, silentSTUN(t))
@@ -714,6 +728,7 @@ func TestOfferExpiresDuringGathering(t *testing.T) {
 
 // The absolute expire_time fallback has the same deadline as expires_in.
 func TestOfferExpireTimeExpiresDuringGathering(t *testing.T) {
+	t.Parallel()
 	const lifetime = 2 * time.Second
 	w := newWorld(t)
 	dp := newGatheringPlane(w, silentSTUN(t))
@@ -730,6 +745,7 @@ func TestOfferExpireTimeExpiresDuringGathering(t *testing.T) {
 // answer. Control case: the answered session still carries an exec and its
 // data channel until then.
 func TestSessionLifetimeIncludesSetup(t *testing.T) {
+	t.Parallel()
 	const lifetime = 7 * time.Second
 	for _, tc := range []struct {
 		name        string

@@ -15,6 +15,7 @@ import (
 
 // TestErrnoMappingOnUnix checks that the POSIX errors keep their mapping.
 func TestErrnoMappingOnUnix(t *testing.T) {
+	t.Parallel()
 	disk := fsError("write", &os.PathError{Op: "write", Path: "/secret", Err: syscall.ENOSPC})
 	if disk.code != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED || disk.msg != "write: no space left on the guest disk" {
 		t.Fatalf("ENOSPC: %v %q", disk.code, disk.msg)

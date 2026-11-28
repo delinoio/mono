@@ -27,6 +27,7 @@ func execReq(t *testing.T, cmd ...string) *ownsandv1.ExecRequest {
 }
 
 func TestExecOutputAndExitCode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	req := execReq(t, "/bin/sh", "-c", `printf out; printf err >&2; echo "$FOO"; pwd; exit 3`)
 	req.Env = map[string]string{"FOO": "bar"}
@@ -54,6 +55,7 @@ func TestExecOutputAndExitCode(t *testing.T) {
 }
 
 func TestExecSignal(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	evs := h.runExec(execReq(t, "/bin/sh", "-c", "kill -KILL $$"))
 	ex := evs[len(evs)-1].GetExited()
@@ -63,6 +65,7 @@ func TestExecSignal(t *testing.T) {
 }
 
 func TestExecLargeOutputChunks(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	evs := h.runExec(execReq(t, "/bin/sh", "-c", "head -c 300000 /dev/zero"))
 	var next int64
@@ -80,6 +83,7 @@ func TestExecLargeOutputChunks(t *testing.T) {
 }
 
 func TestExecStartFailures(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	cases := []struct {
 		req  *ownsandv1.ExecRequest
@@ -104,6 +108,7 @@ func TestExecStartFailures(t *testing.T) {
 }
 
 func TestExecTimeoutTerminatesThenKills(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	req := execReq(t, "/bin/sh", "-c", "sleep 30")
 	req.Timeout = durationpb.New(100 * time.Millisecond)
@@ -160,6 +165,7 @@ func readPidFile(t *testing.T, path string) int {
 }
 
 func TestExecTimeoutKillsGroupAfterParentExits(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	grace := time.Second
 	h.srv.execs.mu.Lock()
@@ -199,6 +205,7 @@ while :; do sleep 0.05; done`
 // gone the group id can be reused by an unrelated process group, so the
 // escalation ends at that point and not at the end of the grace period.
 func TestExecTimeoutDropsKillWhenGroupEmpties(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	h.srv.execs.mu.Lock()
 	h.srv.execs.killGrace = 30 * time.Second
@@ -228,6 +235,7 @@ while :; do sleep 0.05; done`
 }
 
 func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	h.srv.execs.mu.Lock()
 	h.srv.execs.killGrace = 100 * time.Millisecond
@@ -255,6 +263,7 @@ func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
 }
 
 func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	h.srv.execs.mu.Lock()
 	h.srv.execs.killGrace = 100 * time.Millisecond
@@ -283,6 +292,7 @@ func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
 }
 
 func TestExecRunsIndependentlyAndAttach(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	markerPath := filepath.Join(t.TempDir(), "starts")
 	req := execReq(t, "/bin/sh", "-c", `printf 'started\n' >> "$EXEC_MARKER" || exit 1
@@ -341,6 +351,7 @@ printf world`)
 }
 
 func TestExecRetention(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	req := execReq(t, "/bin/true")
 	h.runExec(req)
@@ -361,6 +372,7 @@ func TestExecRetention(t *testing.T) {
 // or until cleanup releases it, so a delayed Serve reader cannot observe an
 // exec that already ended without any idle time.
 func TestExecKeepalive(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 50 * time.Millisecond })
 	release := filepath.Join(t.TempDir(), "release")
 	// Registered after newHarness, so it runs before the harness cleanup that
@@ -427,6 +439,7 @@ func TestCommandEnvOverridesHelperEnv(t *testing.T) {
 // receive limit ends the Serve stream with resource_exhausted at once, also
 // while an exec of that stream still runs, and that the exec keeps running.
 func TestServeOversizeFrameEndsStreamWhileExecRuns(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
 	release := filepath.Join(t.TempDir(), "release")
 	// The exec ends only after the test creates the release file, so a Serve
