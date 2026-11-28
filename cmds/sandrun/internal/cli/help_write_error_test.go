@@ -72,7 +72,6 @@ func TestHelpAndVersionOutput(t *testing.T) {
 	}{
 		{name: "root help", args: []string{"help"}, prefix: "Usage: sandrun [global flags]", suffix: "file of a --*-file flag, never from command-line arguments.\n"},
 		{name: "subcommand help", args: []string{"org", "list", "--help"}, prefix: "Usage: sandrun org list [flags]\n\nFlags:\n", suffix: "write structured debug logs to standard error\n"},
-		{name: "version", args: []string{"version"}, prefix: "sandrun " + Version + "\n", suffix: "sandrun " + Version + "\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -85,6 +84,27 @@ func TestHelpAndVersionOutput(t *testing.T) {
 			}
 		})
 	}
+
+	checkVersion := func(t *testing.T, want string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		code := Run(context.Background(), Env{Args: []string{"version"}, Stdout: &stdout, Stderr: &stderr})
+		if code != ExitOK || stderr.Len() != 0 {
+			t.Fatalf("exit = %d, stderr = %q, want exit %d and empty stderr", code, stderr.String(), ExitOK)
+		}
+		if got := stdout.String(); got != want {
+			t.Errorf("stdout = %q, want %q", got, want)
+		}
+	}
+	t.Run("default version", func(t *testing.T) {
+		checkVersion(t, "dev\n")
+	})
+	t.Run("injected version", func(t *testing.T) {
+		previousVersion := Version
+		t.Cleanup(func() { Version = previousVersion })
+		Version = "0.1.0"
+		checkVersion(t, "0.1.0\n")
+	})
 }
 
 func TestNoArgumentsPrintsUsageToStderr(t *testing.T) {

@@ -334,7 +334,7 @@ func (a *app) run(ctx context.Context, args []string) error {
 	case "help", "-h", "--help":
 		return a.usage(a.env.Stdout)
 	case "version":
-		_, err := fmt.Fprintln(a.env.Stdout, "sandrun "+Version)
+		_, err := fmt.Fprintln(a.env.Stdout, Version)
 		return err
 	}
 	if cmd, ok := singleCommands[group]; ok {
