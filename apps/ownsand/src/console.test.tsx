@@ -8,7 +8,8 @@ import {
   rs,
   test,
 } from "@rstest/core";
-import { create } from "@bufbuild/protobuf";
+import { create as createMessage, isMessage } from "@bufbuild/protobuf";
+import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { StrictMode } from "react";
 import {
   act,
@@ -31,6 +32,7 @@ import {
   type DeviceLimitsInput,
   type Resources,
   SandboxState,
+  SnapshotState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import {
@@ -44,7 +46,10 @@ import {
   ListOrganizationsResponseSchema,
   OrganizationService,
 } from "@delino/ownsand-protos/v1/organization_pb";
-import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
+import {
+  ListSnapshotsResponseSchema,
+  SnapshotSchema,
+} from "@delino/ownsand-protos/v1/snapshot_pb";
 import { focusManager, QueryClient } from "@tanstack/react-query";
 import { toast } from "delino-ui/toast";
 import { Console } from "./App.tsx";
@@ -52,7 +57,6 @@ import { createQueryClient, invalidateServices } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { shortIdText } from "./components/ui.tsx";
-import { formatTime } from "./format.ts";
 import { pendingInvitation } from "./invitation.ts";
 import { RouteId, RouterProvider, useRouter } from "./router.tsx";
 import {
@@ -275,7 +279,7 @@ describe("organizations", () => {
         );
         return {
           ...res,
-          message: create(ListOrganizationsResponseSchema, {
+          message: createMessage(ListOrganizationsResponseSchema, {
             organizations: real.organizations.filter((o) =>
               pages[page - 1]!.includes(o.organizationId),
             ),
@@ -2484,33 +2488,55 @@ describe("sandbox create form resources", () => {
   });
 
   test("labels ready snapshots of the same period with distinct ids and their creation time", async () => {
-    // Snapshots that the mock creates back to back have UUID v7 ids with the
-    // same time prefix; the option label must still tell them apart.
-    const transport = createMockTransport();
-    const snapshots = createClient(SnapshotService, transport);
-    const made = [];
-    for (let i = 0; i < 2; i++) {
-      const res = await snapshots.createSnapshot({
+    const createdAt = new Date("2024-12-07T07:24:00.384Z");
+    const createTime = timestampFromDate(createdAt);
+    const snapshots = [
+      "0193a001-0000-7000-8000-000000001234",
+      "0193a001-0000-7000-8000-000000005678",
+    ].map((snapshotId) =>
+      createMessage(SnapshotSchema, {
+        snapshotId,
         organizationId: MOCK_IDS.acme,
-        sandboxId: MOCK_IDS.runningSandbox,
-      });
-      made.push(res.snapshot!);
-    }
+        state: SnapshotState.READY,
+        createTime,
+      }),
+    );
+    const mock = createMockTransport();
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        const response = await mock.unary(method, ...rest);
+        if (
+          method.name === "ListSnapshots" &&
+          isMessage(response.message, ListSnapshotsResponseSchema)
+        ) {
+          response.message.snapshots.push(...snapshots);
+        }
+        return response;
+      },
+    };
+
     const dialog = await openForm(transport);
     await act(async () => {
       fireEvent.click(within(dialog).getByRole("combobox", { name: "Source" }));
     });
-    const options = (await screen.findAllByRole("option")).filter((o) =>
-      (o.textContent ?? "").startsWith("Snapshot "),
+
+    const time = createdAt.toLocaleString("en", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+    await screen.findByRole("option", {
+      name: `Snapshot 0193a001…1234 · ${time}`,
+    });
+    await screen.findByRole("option", {
+      name: `Snapshot 0193a001…5678 · ${time}`,
+    });
+    expect(
+      screen.getByRole("option", { name: /^Snapshot 0193a000…00b1 · / }),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("option", { name: /^Snapshot / })).toHaveLength(
+      3,
     );
-    const texts = options.map((o) => o.textContent);
-    expect(options).toHaveLength(3);
-    expect(new Set(texts).size).toBe(3);
-    for (const snapshot of made) {
-      expect(texts).toContain(
-        `Snapshot ${shortIdText(snapshot.snapshotId)} · ${formatTime(snapshot.createTime)}`,
-      );
-    }
   });
 
   test("creates a sandbox from the chosen snapshot option", async () => {
