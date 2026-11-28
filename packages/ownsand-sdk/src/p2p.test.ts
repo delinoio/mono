@@ -2017,9 +2017,11 @@ describe("peer-to-peer data path", () => {
 
     test("logs the invalid frame without frame content", async () => {
       const records: LogRecord[] = [];
+      let streamId: bigint | undefined;
       const { h } = p2pSetup(
         (frame, peer) => {
           if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+            streamId = frame.streamId;
             peer.send(execFrame(frame.streamId, UNKNOWN_KIND));
           }
         },
@@ -2034,9 +2036,13 @@ describe("peer-to-peer data path", () => {
         )
         .catch(() => {});
       const logged = records.filter((r) => r.event === LogEvent.InvalidFrame);
-      expect(logged).toHaveLength(1);
-      expect(logged[0]!.sandboxId).toBe(SANDBOX);
-      expect(logged[0]!.reason).toContain("unknown frame kind 99");
+      expect(logged).toStrictEqual([
+        {
+          event: LogEvent.InvalidFrame,
+          sandboxId: SANDBOX,
+          reason: `unknown frame kind 99 on stream ${streamId}`,
+        },
+      ]);
     });
   });
 
