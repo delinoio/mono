@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -375,6 +376,14 @@ func (f *Server) usageLinkLocked(org string, windowStart time.Time) *link {
 	return latest
 }
 
+// addMonthlyUsage caps the sum at the largest int64, as the Accounts API does.
+func addMonthlyUsage(total, increment int64) int64 {
+	if increment > 0 && total > math.MaxInt64-increment {
+		return math.MaxInt64
+	}
+	return total + increment
+}
+
 func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.ReportUsageRequest]) (*connect.Response[accountsv1.ReportUsageResponse], error) {
 	f := h.f
 	if err := f.begin(MethodReportUsage); err != nil {
@@ -392,7 +401,10 @@ func (h handler) ReportUsage(_ context.Context, req *connect.Request[accountsv1.
 		if !duplicate {
 			k := usageKey{org: org, meter: key.meter, month: utcMonth(windowStart)}
 			u := f.usage[k]
-			f.usage[k] = [2]int64{u[0] + r.GetQuantity(), u[1] + r.GetAmountUsdMicros()}
+			f.usage[k] = [2]int64{
+				addMonthlyUsage(u[0], r.GetQuantity()),
+				addMonthlyUsage(u[1], r.GetAmountUsdMicros()),
+			}
 			if l := f.usageLinkLocked(org, windowStart); l != nil {
 				attribution.billingAccountID = l.account
 				a := f.accounts[l.account]
