@@ -14,6 +14,7 @@ import (
 
 type fakeUsage struct {
 	drain    func(ctx context.Context) error
+	flush    func(ctx context.Context) error
 	flushErr error
 	calls    []string
 }
@@ -23,8 +24,13 @@ func (f *fakeUsage) DrainUsage(ctx context.Context) error {
 	return f.drain(ctx)
 }
 
-func (f *fakeUsage) FlushUsageFinal(context.Context) error {
+func (f *fakeUsage) FlushUsageFinal(ctx context.Context) error {
 	f.calls = append(f.calls, "flush")
+	if f.flush != nil {
+		if err := f.flush(ctx); err != nil {
+			return err
+		}
+	}
 	return f.flushErr
 }
 
