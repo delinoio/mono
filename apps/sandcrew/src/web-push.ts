@@ -123,21 +123,25 @@ export async function activeWorker(
 
 /**
  * Turns on Web Push for this browser after the user clicked the button:
- * asks for the browser permission, registers the service worker and
- * subscribes with the VAPID public key. The browser permission prompt
+ * asks for the browser permission, loads the VAPID public key, registers
+ * the service worker and subscribes. The browser permission prompt
  * appears only here, never on page load.
  */
 export async function subscribeToPush(
-  vapidPublicKey: string,
+  loadVapidPublicKey: () => Promise<string>,
   env: PushEnvironment = browserPushEnvironment(),
 ): Promise<PushSubscriptionKeys> {
   if (pushSupport(env) === PushSupport.Unsupported) {
     throw new PushOptInError(PushOptInFailure.Unsupported);
   }
+  // Ask before any network wait: Safari shows the permission prompt only
+  // during the click's transient activation, which a slow request can use
+  // up. So the VAPID key loads after the answer.
   const permission = await env.notification!.requestPermission();
   if (permission !== "granted") {
     throw new PushOptInError(PushOptInFailure.PermissionNotGranted);
   }
+  const vapidPublicKey = await loadVapidPublicKey();
   const registration = await env.serviceWorker!.register(SERVICE_WORKER_URL, {
     scope: "/",
   });

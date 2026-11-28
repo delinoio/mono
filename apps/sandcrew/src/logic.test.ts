@@ -654,12 +654,17 @@ describe("web push", () => {
 
   test("asks for permission, registers the service worker and subscribes", async () => {
     const { env, calls } = fakeEnvironment("default", "granted");
-    const keys = await subscribeToPush(
-      bytesToBase64Url(new Uint8Array(65).buffer),
-      env,
-    );
+    const subscribing = subscribeToPush(async () => {
+      calls.push("load key");
+      return bytesToBase64Url(new Uint8Array(65).buffer);
+    }, env);
+    // The permission request starts in the click's task, before the key
+    // loads: Safari shows the prompt only during transient activation.
+    expect(calls).toEqual(["requestPermission"]);
+    const keys = await subscribing;
     expect(calls).toEqual([
       "requestPermission",
+      "load key",
       "register /sw.js",
       "subscribe 65",
     ]);
@@ -700,7 +705,7 @@ describe("web push", () => {
           }) as unknown as ServiceWorkerRegistration,
       },
     };
-    const subscribing = subscribeToPush("AAAA", env);
+    const subscribing = subscribeToPush(async () => "AAAA", env);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(calls).toEqual([]);
     worker.state = "installed";
@@ -713,7 +718,9 @@ describe("web push", () => {
 
   test("stops when the user does not grant permission", async () => {
     const { env, calls } = fakeEnvironment("default", "denied");
-    const error = await subscribeToPush("AAAA", env).catch((e: unknown) => e);
+    const error = await subscribeToPush(async () => "AAAA", env).catch(
+      (e: unknown) => e,
+    );
     expect(error).toBeInstanceOf(PushOptInError);
     expect((error as PushOptInError).failure).toBe(
       PushOptInFailure.PermissionNotGranted,

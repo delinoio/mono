@@ -290,12 +290,14 @@ function NotificationsSection({
     setError(undefined);
     setOptInMessage(undefined);
     try {
-      const config = await callUnaryMethod(
-        transport,
-        NotificationService.method.getWebPushConfig,
-        {},
-      );
-      const keys = await subscribeToPush(config.vapidPublicKey, env);
+      const keys = await subscribeToPush(async () => {
+        const config = await callUnaryMethod(
+          transport,
+          NotificationService.method.getWebPushConfig,
+          {},
+        );
+        return config.vapidPublicKey;
+      }, env);
       await register.mutateAsync({
         ...keys,
         label: browserLabel(navigator.userAgent).slice(0, 100),
