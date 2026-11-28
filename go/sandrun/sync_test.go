@@ -2519,6 +2519,192 @@ func TestSyncUnchangedTakesLock(t *testing.T) {
 	}
 }
 
+func TestSyncCleanupAfterCallerCancellation(t *testing.T) {
+	guestOS := sandrunv1.GuestOs_GUEST_OS_LINUX
+	if runtime.GOOS == "windows" {
+		guestOS = sandrunv1.GuestOs_GUEST_OS_WINDOWS
+	}
+	for _, tc := range []struct {
+		name        string
+		changed     bool
+		failCleanup bool
+		warnings    []string
+	}{
+		{name: "unchanged"},
+		{name: "changed", changed: true},
+		{name: "unchanged cleanup fails", failCleanup: true, warnings: []string{
+			"the guest could not release the sync lock; the next sync may need force",
+		}},
+		{name: "changed cleanup fails", changed: true, failCleanup: true, warnings: []string{
+			"the guest could not remove the sync archive or release the sync lock; the next sync may need force",
+			"the guest could not remove the pending sync updates; the next sync may upload those files again",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, srv, org := newTestClient(t, "")
+			ds := newSession(t, c, srv, org, guestOS)
+			params := SyncParams{
+				OrganizationID: org, DevSessionID: ds.GetDevSessionId(),
+				LocalDir: newRepo(t, map[string]string{"a.txt": "old"}, nil, ""),
+			}
+			if _, err := c.Sync(t.Context(), params); err != nil {
+				t.Fatal(err)
+			}
+			contents, uploaded, skipped := "old", 0, 1
+			if tc.changed {
+				contents, uploaded, skipped = "new contents", 1, 0
+				if err := os.WriteFile(filepath.Join(params.LocalDir, "a.txt"), []byte(contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			type contextKey struct{}
+			value := new(int)
+			parent, cancel := context.WithTimeout(context.WithValue(t.Context(), contextKey{}, value), 10*time.Second)
+			defer cancel()
+			syncCtx := &cancelAfterTransferCheck{Context: parent, cancel: cancel}
+			workspace := ds.GetWorkspacePath()
+			var progress []TransferProgress
+			var cleanupCalls int
+			params.Progress = func(p TransferProgress) { progress = append(progress, p) }
+			fault := &syncCleanupCancellation{
+				caller: syncCtx, changed: tc.changed, manifestPath: workspace + manifestSuffix,
+				onCleanup: func(ctx context.Context, req *sandrunv1.ExecDevSessionRequest) {
+					cleanupCalls++
+					deadline, ok := ctx.Deadline()
+					callerDeadline, _ := parent.Deadline()
+					if parent.Err() != context.Canceled || ctx.Err() != nil || ctx.Value(contextKey{}) != value ||
+						!ok || !deadline.After(callerDeadline) || time.Until(deadline) > 30*time.Second {
+						t.Errorf("cleanup context: caller error = %v, error = %v, deadline = %v, value = %v",
+							parent.Err(), ctx.Err(), deadline, ctx.Value(contextKey{}))
+					}
+					if len(progress) == 0 || progress[len(progress)-1].Phase == TransferDone {
+						t.Errorf("progress before cleanup = %v", progress)
+					}
+					paths := []string{workspace + lockSuffix}
+					if tc.changed {
+						paths = append(paths, workspace+pendingUpdatesSuffix, req.GetEnv()[guestEnvArchive])
+					}
+					for _, path := range paths {
+						if _, err := os.Stat(path); err != nil {
+							t.Errorf("expected %q before cleanup: %v", path, err)
+						}
+					}
+					if tc.failCleanup {
+						srv.Fail(execProc, connect.NewError(connect.CodePermissionDenied, errors.New("cleanup denied")))
+					}
+				},
+			}
+			c.devSessions = sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, srv.URL,
+				connect.WithInterceptors(&authInterceptor{client: c}, fault))
+			res, err := c.Sync(syncCtx, params)
+			if err != nil || res == nil || res.Uploaded != uploaded || res.Skipped != skipped || res.Deleted != 0 ||
+				(res.BytesSent > 0) != tc.changed || !slices.Equal(res.Warnings, tc.warnings) {
+				t.Fatalf("sync = %+v, %v", res, err)
+			}
+			if cleanupCalls != 1 {
+				t.Fatalf("cleanup calls = %d, want 1", cleanupCalls)
+			}
+			done := TransferProgress{Phase: TransferDone, BytesDone: res.BytesSent, BytesTotal: res.BytesSent}
+			if len(progress) == 0 || progress[len(progress)-1] != done {
+				t.Errorf("progress = %v, want final event %+v", progress, done)
+			}
+			if got := readGuest(t, ds, "a.txt"); got != contents {
+				t.Errorf("guest a.txt = %q, want %q", got, contents)
+			}
+			if got := guestManifest(t, ds).Files["a.txt"].Size; got != int64(len(contents)) {
+				t.Errorf("manifest a.txt size = %d, want %d", got, len(contents))
+			}
+			if tc.failCleanup {
+				return
+			}
+			for _, path := range []string{workspace + lockSuffix, workspace + pendingUpdatesSuffix} {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("stat after cleanup of %q = %v, want not exist", path, err)
+				}
+			}
+			if paths, err := filepath.Glob(workspace + ".sandrun-sync-*"); err != nil || len(paths) != 0 {
+				t.Errorf("temporary sync files after cleanup = %v, %v", paths, err)
+			}
+			c.devSessions = sandrunv1connect.NewDevSessionServiceClient(http.DefaultClient, srv.URL,
+				connect.WithInterceptors(&authInterceptor{client: c}))
+			retry, err := c.Sync(t.Context(), params)
+			if err != nil || retry == nil || retry.Skipped != 1 || len(retry.Warnings) != 0 {
+				t.Fatalf("unforced sync after cleanup = %+v, %v", retry, err)
+			}
+		})
+	}
+}
+
+type cancelAfterTransferCheck struct {
+	context.Context
+	cancel context.CancelFunc
+	armed  atomic.Bool
+}
+
+func (c *cancelAfterTransferCheck) Deadline() (time.Time, bool) {
+	deadline, ok := c.Context.Deadline()
+	// The transfer checks the caller's deadline just after checking Err.
+	// Cancel here so the caller ends after the completed RPC's error check.
+	if c.armed.Swap(false) {
+		c.cancel()
+	}
+	return deadline, ok
+}
+
+type syncCleanupCancellation struct {
+	caller       *cancelAfterTransferCheck
+	changed      bool
+	manifestPath string
+	onCleanup    func(context.Context, *sandrunv1.ExecDevSessionRequest)
+}
+
+func (f *syncCleanupCancellation) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		res, err := next(ctx, req)
+		if write, ok := req.Any().(*sandrunv1.WriteDevSessionFileRequest); ok &&
+			err == nil && write.GetPath() == f.manifestPath && write.GetFinal() && f.changed {
+			f.caller.armed.Store(true)
+		}
+		return res, err
+	}
+}
+
+func (*syncCleanupCancellation) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return next
+}
+
+func (f *syncCleanupCancellation) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		return &syncCleanupCancellationConn{StreamingClientConn: next(ctx, spec), ctx: ctx, fault: f}
+	}
+}
+
+type syncCleanupCancellationConn struct {
+	connect.StreamingClientConn
+	ctx   context.Context
+	fault *syncCleanupCancellation
+}
+
+func (c *syncCleanupCancellationConn) Send(msg any) error {
+	if req, ok := msg.(*sandrunv1.ExecDevSessionRequest); ok {
+		env := req.GetEnv()
+		if env[guestEnvLock] != "" && env[guestEnvForce] == "" {
+			c.fault.onCleanup(c.ctx, req)
+		}
+	}
+	return c.StreamingClientConn.Send(msg)
+}
+
+func (c *syncCleanupCancellationConn) Receive(msg any) error {
+	err := c.StreamingClientConn.Receive(msg)
+	if _, ok := msg.(*sandrunv1.ReadDevSessionFileResponse); ok && !c.fault.changed && connect.CodeOf(err) == connect.CodeNotFound {
+		// The unchanged sync's last read finds no pending updates.
+		c.fault.caller.armed.Store(true)
+	}
+	return err
+}
+
 func TestPOSIXSyncCleanup(t *testing.T) {
 	needPOSIX(t)
 	for _, scenario := range []struct {

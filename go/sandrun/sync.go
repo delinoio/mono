@@ -285,7 +285,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, metadataLimit int64) (*
 	if plan.empty() && !workspaceMissing && len(pending) == 0 {
 		cleanupOnError = false
 		res := plan.res
-		if r, err := c.runGuest(ctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
+		if r, err := c.cleanupSync(ctx, s, cleanupEnv); err != nil || r.exitCode != 0 {
 			res.Warnings = append(res.Warnings, "the guest could not release the sync lock; the next sync may need force")
 		}
 		report(TransferProgress{Phase: TransferDone})
@@ -443,7 +443,7 @@ func (c *Client) sync(ctx context.Context, p SyncParams, metadataLimit int64) (*
 	if len(pending) > 0 {
 		cleanupEnv[guestEnvPendingUpdates] = guestSibling(s, pendingUpdatesSuffix)
 	}
-	cr, err := c.runGuest(ctx, s, opCleanup, cleanupEnv)
+	cr, err := c.cleanupSync(ctx, s, cleanupEnv)
 	if err != nil || (cr.exitCode != 0 && cr.exitCode != exitPendingCleanupFailed) {
 		res.Warnings = append(res.Warnings, "the guest could not remove the sync archive or release the sync lock; the next sync may need force")
 	}
@@ -454,10 +454,14 @@ func (c *Client) sync(ctx context.Context, p SyncParams, metadataLimit int64) (*
 	return res, nil
 }
 
-func (c *Client) cleanupFailedSync(ctx context.Context, s *sandrunv1.DevSession, env map[string]string) {
+func (c *Client) cleanupSync(ctx context.Context, s *sandrunv1.DevSession, env map[string]string) (*guestResult, error) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
-	if r, err := c.runGuest(cleanupCtx, s, opCleanup, env); err != nil || r.exitCode != 0 {
+	return c.runGuest(cleanupCtx, s, opCleanup, env)
+}
+
+func (c *Client) cleanupFailedSync(ctx context.Context, s *sandrunv1.DevSession, env map[string]string) {
+	if r, err := c.cleanupSync(ctx, s, env); err != nil || r.exitCode != 0 {
 		c.logger.DebugContext(ctx, "sandrun sync clean-up failed", "dev_session_id", s.GetDevSessionId(), "code", codeText(err))
 	}
 }
