@@ -3,6 +3,7 @@
 package credstore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -30,11 +31,20 @@ var ErrLockTimeout = errors.New("credstore: timed out waiting for the credential
 // can still be replaced atomically while the lock is held, and the OS
 // releases the lock when the process exits.
 func (s Store) lock() (func(), error) {
+	return s.lockUntil(context.Background(), time.Now().Add(lockTimeout))
+}
+
+func (s Store) lockUntil(ctx context.Context, retryDeadline time.Time) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f, err := openLockFile(filepath.Join(s.Dir, LockFileName))
 	if err != nil {
 		return nil, fmt.Errorf("credstore: open lock file: %w", err)
 	}
-	deadline := time.Now().Add(lockTimeout)
+	if limit := time.Now().Add(lockTimeout); limit.Before(retryDeadline) {
+		retryDeadline = limit
+	}
 	for {
 		ok, err := tryLockFile(f)
 		if err != nil {
@@ -44,14 +54,32 @@ func (s Store) lock() (func(), error) {
 		if ok {
 			break
 		}
-		if time.Now().After(deadline) {
+		if !waitForRetry(ctx, retryDeadline, lockPollInterval) {
 			_ = f.Close()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return nil, ErrLockTimeout
 		}
-		time.Sleep(lockPollInterval)
 	}
 	return func() {
 		_ = unlockFile(f)
 		_ = f.Close()
 	}, nil
+}
+
+// waitForRetry reports whether another attempt can start after the delay.
+func waitForRetry(ctx context.Context, deadline time.Time, delay time.Duration) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	timer := time.NewTimer(min(remaining, delay))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil && time.Now().Before(deadline)
+	}
 }

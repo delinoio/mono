@@ -4,11 +4,19 @@
 
 package credstore
 
-import "os"
+import (
+	"context"
+	"os"
+	"time"
+)
 
 // Load reads the stored credentials.
 func (s Store) Load() (*Credentials, error) {
 	return s.load(readFile)
+}
+
+func (s Store) loadContext(_ context.Context, _ time.Time) (*Credentials, error) {
+	return s.Load()
 }
 
 func readFile(path string) ([]byte, error) {

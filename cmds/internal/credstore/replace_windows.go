@@ -5,6 +5,7 @@
 package credstore
 
 import (
+	"context"
 	"errors"
 	"os"
 	"time"
@@ -27,7 +28,20 @@ func (s Store) Load() (*Credentials, error) {
 }
 
 func (s Store) loadWithLock(read func(string) ([]byte, error)) (*Credentials, error) {
-	unlock, err := s.lock()
+	return s.loadWithLockUntil(context.Background(), time.Now().Add(lockTimeout), read)
+}
+
+func (s Store) loadContext(ctx context.Context, retryDeadline time.Time) (*Credentials, error) {
+	if retryDeadline.IsZero() {
+		return s.loadWithLockUntil(ctx, retryDeadline, os.ReadFile)
+	}
+	return s.loadWithLockUntil(ctx, retryDeadline, func(path string) ([]byte, error) {
+		return readFileRetry(ctx, retryDeadline, path, os.ReadFile)
+	})
+}
+
+func (s Store) loadWithLockUntil(ctx context.Context, retryDeadline time.Time, read func(string) ([]byte, error)) (*Credentials, error) {
+	unlock, err := s.lockUntil(ctx, retryDeadline)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
 	}
@@ -35,6 +49,9 @@ func (s Store) loadWithLock(read func(string) ([]byte, error)) (*Credentials, er
 		return nil, err
 	}
 	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return s.load(read)
 }
 
@@ -45,13 +62,38 @@ func readFile(path string) ([]byte, error) {
 }
 
 func readFileWithRetry(path string, read func(string) ([]byte, error)) ([]byte, error) {
-	deadline := time.Now().Add(replaceRetryTimeout)
+	return readFileRetry(context.Background(), time.Time{}, path, read)
+}
+
+func readFileRetry(ctx context.Context, deadline time.Time, path string, read func(string) ([]byte, error)) ([]byte, error) {
+	retryUntil := time.Now().Add(replaceRetryTimeout)
+	if !deadline.IsZero() && deadline.Before(retryUntil) {
+		retryUntil = deadline
+	}
+	var sharingErr error
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if sharingErr != nil && !time.Now().Before(retryUntil) {
+			return nil, sharingErr
+		}
 		data, err := read(path)
-		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) || time.Now().After(deadline) {
+		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+			// A retry that finishes after the adoption deadline cannot
+			// replace the sharing error that kept the read pending.
+			if sharingErr != nil && !deadline.IsZero() && !time.Now().Before(deadline) {
+				return nil, sharingErr
+			}
 			return data, err
 		}
-		time.Sleep(replaceRetryInterval)
+		sharingErr = err
+		if !waitForRetry(ctx, retryUntil, replaceRetryInterval) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, sharingErr
+		}
 	}
 }
 
