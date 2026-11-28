@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -410,6 +411,54 @@ func TestPollTokenSucceedsBeforeResponseRelativeDeadline(t *testing.T) {
 	}
 	if _, err := cfg.Refresh(ctx, tok.RefreshToken); err != nil {
 		t.Fatalf("the refresh grant after the device grant failed: %v", err)
+	}
+}
+
+func TestRefreshTokenLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		name, lifetime string
+		want           int64
+		invalid        bool
+	}{
+		{name: "omitted"},
+		{name: "zero", lifetime: "0"},
+		{name: "normal", lifetime: "3600", want: 3600},
+		{name: "negative", lifetime: "-1", want: -1},
+		{name: "minimum", lifetime: "-9223372036", want: -9223372036},
+		{name: "maximum", lifetime: "9223372036", want: 9223372036},
+		{name: "below the duration range", lifetime: "-9223372037", invalid: true},
+		{name: "above the duration range", lifetime: "9223372037", invalid: true},
+		{name: "below the int64 range", lifetime: "-9223372036854775809", invalid: true},
+		{name: "above the int64 range", lifetime: "9223372036854775808", invalid: true},
+		{name: "wrong field type", lifetime: `"synthetic-lifetime-marker"`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if strconv.IntSize == 32 && (tc.name == "minimum" || tc.name == "maximum") {
+				t.Skip("duration boundaries do not fit in a 32-bit int")
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, `{"access_token":"synthetic-access-marker","refresh_token":"synthetic-refresh-marker"`)
+				if tc.lifetime != "" {
+					fmt.Fprint(w, `,"expires_in":`, tc.lifetime)
+				}
+				fmt.Fprint(w, "}")
+			}))
+			defer srv.Close()
+
+			tok, err := (Config{Endpoint: srv.URL, AppID: "app", Resource: "resource"}).Refresh(t.Context(), "refresh")
+			if tc.invalid {
+				const want = "logto: invalid token response: expires_in must be an integer in the supported duration range"
+				var oauth *Error
+				if tok != nil || err == nil || err.Error() != want || errors.As(err, &oauth) {
+					t.Fatalf("Refresh() = %v, %v, want nil and %q", tok, err, want)
+				}
+				return
+			}
+			if err != nil || tok == nil || int64(tok.ExpiresIn) != tc.want ||
+				tok.AccessToken != "synthetic-access-marker" || tok.RefreshToken != "synthetic-refresh-marker" {
+				t.Fatalf("Refresh() = %v, %v, want both tokens and expires_in %d", tok, err, tc.want)
+			}
+		})
 	}
 }
 
