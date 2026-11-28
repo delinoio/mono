@@ -267,7 +267,7 @@ func TestReadBeginSettlesPendingRemovalFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-e.ready
+	waitClosed(t, e.ready)
 	if e.err != nil {
 		t.Fatal(e.err)
 	}
