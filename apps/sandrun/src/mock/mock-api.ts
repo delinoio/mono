@@ -2315,6 +2315,16 @@ export function createMockTransport(
           );
         const queued = s.state === RequestState.QUEUED;
         const r = org.requests.find((x) => x.requestId === s.devSessionId);
+        const started =
+          s.state === RequestState.STARTING || s.state === RequestState.RUNNING;
+        const runnerId = s.runnerId || r?.runnerId;
+        const runner =
+          started && runnerId
+            ? org.runners.find(
+                (x) =>
+                  x.runnerId === runnerId && OPEN_RUNNER_STATES.has(x.state),
+              )
+            : undefined;
         const state = queued ? RequestState.CANCELED : RequestState.ENDED;
         const reason = queued
           ? RequestEndReason.CANCELED_BY_USER
@@ -2325,6 +2335,8 @@ export function createMockTransport(
           s.endReason = reason;
           s.endedAt = ts();
         }
+        if (runner !== undefined)
+          endRunner(org, runner, RunnerEndReason.DELETED_BY_USER);
         audit(
           org,
           AuditAction.DEV_SESSION_DELETED,

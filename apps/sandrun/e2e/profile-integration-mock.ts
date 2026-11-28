@@ -3,6 +3,10 @@ import type { Transport } from "@connectrpc/connect";
 import { GitHubInstallationState } from "@delino/sandrun-protos/v1/common_pb";
 import type { MockTransportOptions } from "../src/mock/mock-api.ts";
 import {
+  DEV_SESSION_DELETION_FIXTURE,
+  devSessionDeletionFixtures,
+} from "./dev-session-deletion-fixture.ts";
+import {
   DEV_SESSION_REFRESH_FIXTURE,
   devSessionRefreshFixture,
 } from "./dev-session-refresh-fixture.ts";
@@ -53,6 +57,14 @@ declare global {
 }
 
 export function createMockTransport(options?: MockTransportOptions): Transport {
+  const deletionMode = sessionStorage.getItem(DEV_SESSION_DELETION_FIXTURE);
+  if (deletionMode === "starting" || deletionMode === "running") {
+    return createSettingsMock({
+      ...options,
+      workFixtures: devSessionDeletionFixtures(deletionMode),
+    });
+  }
+
   const refreshMode = sessionStorage.getItem(DEV_SESSION_REFRESH_FIXTURE);
   if (
     refreshMode === "success" ||

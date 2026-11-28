@@ -3,6 +3,11 @@ import { describe, test, type WebFixtures } from "@e2e-dev/web";
 import { expect, type TestFixtures } from "e2e";
 import { Role } from "@delino/sandrun-protos/v1/common_pb";
 import {
+  DELETION_RUNNER_ID,
+  DELETION_SESSION_LABEL,
+  DEV_SESSION_DELETION_FIXTURE,
+} from "./dev-session-deletion-fixture.ts";
+import {
   DEV_SESSION_REFRESH_CASES,
   DEV_SESSION_REFRESH_FIXTURE,
   type DevSessionRefreshMode,
@@ -1381,6 +1386,46 @@ describe("audit", () => {
       "Dev session created",
       "OwnSand link set",
     ]);
+  });
+});
+
+describe("Dev session deletion", () => {
+  test("moves the paired runner from the active list to history", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/");
+    await browser.evaluate((key: string) => {
+      sessionStorage.setItem(key, "running");
+      return null;
+    }, DEV_SESSION_DELETION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("link", "Acme Robotics Owner").tap();
+
+    const runnersLink = screen.getByRole("link", "Runners");
+    const runner = screen
+      .getByRole("table", "Runners")
+      .getByRole("row")
+      .filter({ hasText: DELETION_RUNNER_ID });
+    await runnersLink.tap();
+    await expect(runner.getByRole("cell", "Busy")).toBeVisible();
+
+    await screen.getByRole("link", "Dev sessions").tap();
+    const session = screen
+      .getByRole("table", "Dev sessions")
+      .getByRole("row")
+      .filter({ hasText: DELETION_SESSION_LABEL });
+    await session.getByRole("button", "Delete").tap();
+    const dialog = screen.getByRole("alertdialog", "Delete this dev session?");
+    await dialog.getByRole("button", "Delete dev session").tap();
+    await expect(dialog).toBeHidden();
+    await expect(session).toHaveCount(0);
+
+    await runnersLink.tap();
+    await expect(runner).toHaveCount(0);
+    await screen.getByRole("checkbox", "Show ended runners").tap();
+    await expect(runner.getByRole("cell", "Deleted by user")).toBeVisible();
   });
 });
 
