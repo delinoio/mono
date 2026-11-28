@@ -8,8 +8,8 @@ package cli
 // peer-to-peer path.
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"math"
 	"net/http"
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -61,6 +62,7 @@ type fakeServer struct {
 	// order; writes counts every relay WriteFile request.
 	writeModes []uint32
 	writes     int
+	fileWrites map[string]*fakeRelayWrite
 	// execIDs are the exec IDs of the relay Exec requests, in order.
 	execIDs []string
 	// billing and usage are the BillingService state; usage is served only
@@ -76,6 +78,7 @@ func newFakeServer(t testing.TB) *fakeServer {
 	f := &fakeServer{
 		t: t, org: newID(t), sb: newID(t), dev: newID(t),
 		files: map[string][]byte{}, deviceOvercommitPercent: 150,
+		fileWrites: make(map[string]*fakeRelayWrite),
 	}
 	mux := http.NewServeMux()
 	mux.Handle(ownsandv1connect.NewOrganizationServiceHandler(&fakeOrg{f: f}))
@@ -374,20 +377,85 @@ func (h *fakeRelay) ReadFile(_ context.Context, r *connect.Request[ownsandv1.Rea
 	}})
 }
 
+// fakeRelayWrite holds staging and the finish result under fakeServer.mu.
+type fakeRelayWrite struct {
+	path string
+	// Map only received bytes so sparse offsets do not determine allocation size.
+	data         map[int64]byte
+	end          int64
+	result       *ownsandv1.WriteFileResponse
+	finishMode   uint32
+	finishDigest [sha256.Size]byte
+}
+
 func (h *fakeRelay) WriteFile(_ context.Context, r *connect.Request[ownsandv1.WriteFileRequest]) (*connect.Response[ownsandv1.WriteFileResponse], error) {
 	h.f.mu.Lock()
 	defer h.f.mu.Unlock()
 	h.f.writes++
-	key := "write:" + r.Msg.GetWriteId()
-	if r.Msg.GetPath() != "" {
-		h.f.files[key+":path"] = []byte(r.Msg.GetPath())
-	}
-	h.f.files[key] = append(h.f.files[key], r.Msg.GetData()...)
-	res := &ownsandv1.WriteFileResponse{WriteId: r.Msg.GetWriteId(), Offset: r.Msg.GetOffset(), Length: int64(len(r.Msg.GetData()))}
-	if fin := r.Msg.GetFinish(); fin != nil {
+	req := r.Msg
+	fin := req.GetFinish()
+	if fin != nil {
 		h.f.writeModes = append(h.f.writeModes, fin.GetMode())
-		h.f.files[string(h.f.files[key+":path"])] = bytes.Clone(h.f.files[key])
-		res.Finished, res.SizeBytes = true, fin.GetSizeBytes()
 	}
+	id, path, offset, data := req.GetWriteId(), req.GetPath(), req.GetOffset(), req.GetData()
+	length := int64(len(data))
+	if offset < 0 || offset > math.MaxInt64-length {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid chunk offset"))
+	}
+	write := h.f.fileWrites[id]
+	if write == nil {
+		if path == "" {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("first write request requires a path"))
+		}
+		write = &fakeRelayWrite{path: path, data: make(map[int64]byte)}
+		h.f.fileWrites[id] = write
+	} else if path != "" && path != write.path {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("write ID is bound to another path"))
+	}
+	if result := write.result; result != nil {
+		if fin == nil || fin.GetSizeBytes() != result.GetSizeBytes() || fin.GetMode() != write.finishMode ||
+			offset != result.GetOffset() || length != result.GetLength() || sha256.Sum256(data) != write.finishDigest {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("write already finished with different fields"))
+		}
+		return connect.NewResponse(proto.CloneOf(result)), nil
+	}
+	if err := write.stage(offset, data); err != nil {
+		return nil, err
+	}
+	res := &ownsandv1.WriteFileResponse{WriteId: id, Offset: offset, Length: length}
+	if fin == nil {
+		return connect.NewResponse(res), nil
+	}
+	size := fin.GetSizeBytes()
+	// Each covered offset contributes one byte. The count and largest end
+	// together rule out both gaps and bytes beyond the declared size.
+	if size != int64(len(write.data)) || size != write.end {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("written ranges do not cover exactly [0, size_bytes)"))
+	}
+	published := make([]byte, len(write.data))
+	for offset, b := range write.data {
+		published[offset] = b
+	}
+	h.f.files[write.path] = published
+	write.data = nil
+	res.Finished, res.SizeBytes = true, size
+	write.result = proto.CloneOf(res)
+	write.finishMode, write.finishDigest = fin.GetMode(), sha256.Sum256(data)
 	return connect.NewResponse(res), nil
+}
+
+func (w *fakeRelayWrite) stage(offset int64, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	for i, b := range data {
+		if existing, ok := w.data[offset+int64(i)]; ok && existing != b {
+			return connect.NewError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
+		}
+	}
+	for i, b := range data {
+		w.data[offset+int64(i)] = b
+	}
+	w.end = max(w.end, offset+int64(len(data)))
+	return nil
 }
