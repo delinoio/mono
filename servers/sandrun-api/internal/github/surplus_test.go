@@ -135,6 +135,7 @@ func TestSurplusLeaseRecovery(t *testing.T) {
 }
 
 func TestSurplusRetriesRenamedRunnerRemoval(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	profileID := w.createProfile(t, ghProfile("linux", 1))
@@ -250,6 +251,7 @@ func TestSurplusRetriesRenamedRunnerRemoval(t *testing.T) {
 }
 
 func TestSurplusAcknowledgesBusyRenamedRunner(t *testing.T) {
+	t.Parallel()
 	w := newGHWorld(t, worldOpts{manualDispatch: true})
 	w.link(t, 501, "acme")
 	profileID := w.createProfile(t, ghProfile("linux", 1))

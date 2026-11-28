@@ -42,6 +42,7 @@ func scriptRecoveryLookup(cp *fakeCP, attach, authFailure bool) {
 }
 
 func TestExecRecoveryLookupCancellation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		attach        bool
@@ -227,6 +228,7 @@ func (r *recoveryLookupReply) GetSandbox(ctx context.Context, _ *connect.Request
 }
 
 func TestExecRecoveryLookupIgnoresLateState(t *testing.T) {
+	t.Parallel()
 	for _, state := range []ownsandv1.SandboxState{
 		ownsandv1.SandboxState_SANDBOX_STATE_PAUSED,
 		ownsandv1.SandboxState_SANDBOX_STATE_DELETED,

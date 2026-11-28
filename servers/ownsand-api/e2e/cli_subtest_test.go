@@ -41,6 +41,9 @@ func TestCLISubtestFailures(t *testing.T) {
 		t.Run("sibling", func(t *testing.T) { t.Log(marker) })
 		return
 	}
+	// Only the outer run is parallel: the subprocess branch above calls t.Setenv,
+	// which panics in a test that called t.Parallel.
+	t.Parallel()
 
 	bins := t.TempDir()
 	missing := exec.Command(filepath.Join(bins, "ownsand"), "fixture").Run()

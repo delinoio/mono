@@ -1074,8 +1074,15 @@ func testTruncation(t *testing.T, tr Transport) {
 	}
 }
 
-func TestOutputTruncatedRelay(t *testing.T)      { testTruncation(t, TransportRelay) }
-func TestOutputTruncatedPeerToPeer(t *testing.T) { testTruncation(t, TransportPeerToPeer) }
+func TestOutputTruncatedRelay(t *testing.T) {
+	t.Parallel()
+	testTruncation(t, TransportRelay)
+}
+
+func TestOutputTruncatedPeerToPeer(t *testing.T) {
+	t.Parallel()
+	testTruncation(t, TransportPeerToPeer)
+}
 
 func TestExecOutputGap(t *testing.T) {
 	t.Parallel()

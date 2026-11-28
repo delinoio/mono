@@ -16,6 +16,7 @@ import (
 )
 
 func TestCreateInvitationDuringMembershipChange(t *testing.T) {
+	t.Parallel()
 	for _, change := range []struct {
 		name       string
 		write      string

@@ -270,6 +270,7 @@ func TestWaitForExportVerificationPreservesReadResults(t *testing.T) {
 }
 
 func TestWaitForExportCleanupStopsDuringRetry(t *testing.T) {
+	t.Parallel()
 	const cutoff = 300 * time.Millisecond
 	for _, tc := range []struct {
 		name          string
@@ -310,6 +311,7 @@ func TestWaitForExportCleanupStopsDuringRetry(t *testing.T) {
 }
 
 func TestWaitForExportCleanupRejectsLateEmptyPrefix(t *testing.T) {
+	t.Parallel()
 	const cutoff = 300 * time.Millisecond
 	for _, tc := range []struct {
 		name      string
@@ -333,6 +335,7 @@ func TestWaitForExportCleanupRejectsLateEmptyPrefix(t *testing.T) {
 }
 
 func TestWaitForExportCleanupAcceptsTimelyEmptyPrefix(t *testing.T) {
+	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()
 		parent, cancel := context.WithTimeout(t.Context(), 3*time.Second)

@@ -21,6 +21,7 @@ import (
 )
 
 func TestRunWorkerSkipsPreCanceledStartup(t *testing.T) {
+	t.Parallel()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	service := New(Config{Logger: logger})

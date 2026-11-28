@@ -46,6 +46,7 @@ func (f *fixture) completeReplacementCheckout(txnID string) string {
 }
 
 func TestWebhookFailedRenewalRequiresCurrentSubscription(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	accountID := f.account()
 	oldSub := f.activate(accountID)
@@ -112,6 +113,7 @@ func TestWebhookFailedRenewalRequiresCurrentSubscription(t *testing.T) {
 }
 
 func TestFailedRenewalDeliveryRechecksSubscription(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"before attempt", "during lookup", "between attempts", "legacy"} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
