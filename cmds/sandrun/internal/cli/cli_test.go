@@ -248,6 +248,8 @@ func TestSessionExecAndAttachOutputWriteFailure(t *testing.T) {
 				execArgs := []string{"session", "exec", session.ID, "--", "sh", "-c", "printf out; printf err >&2"}
 				args := execArgs
 				if command == "attach" {
+					f := *f
+					f.t = t
 					f.ok("", execArgs...)
 					requests := f.srv.ExecRequests()
 					args = []string{"session", "attach", session.ID, requests[len(requests)-1].GetExecId()}

@@ -271,7 +271,13 @@ function SubscriptionCard() {
   const [canceling, setCanceling] = useState(false);
   const [startError, setStartError] = useState<unknown>();
   const canPay = can(role, Permission.ManagePayments);
-  const cancelOpen = canPay && canceling;
+  const sub = subscription.data?.subscription;
+  const status = sub?.status ?? SubscriptionStatus.NONE;
+  const current =
+    status === SubscriptionStatus.ACTIVE ||
+    status === SubscriptionStatus.PAST_DUE;
+  const canCancel = canPay && current && sub?.cancelAtPeriodEnd === false;
+  const cancelOpen = canCancel && canceling;
   if (canceling && !cancelOpen) setCanceling(false);
 
   // One controller per mounted view of this billing account. Leaving the
@@ -325,15 +331,10 @@ function SubscriptionCard() {
       </section>
     );
   }
-  const sub = subscription.data.subscription;
-  const status = sub?.status ?? SubscriptionStatus.NONE;
   const price =
     sub !== undefined && sub.priceUsdMicros > 0n
       ? sub.priceUsdMicros
       : DEFAULT_PRICE_USD_MICROS;
-  const current =
-    status === SubscriptionStatus.ACTIVE ||
-    status === SubscriptionStatus.PAST_DUE;
   const startable =
     status === SubscriptionStatus.NONE ||
     status === SubscriptionStatus.CANCELED ||
@@ -386,7 +387,7 @@ function SubscriptionCard() {
               </Button>
             )
           ) : null}
-          {current && !sub!.cancelAtPeriodEnd ? (
+          {canCancel ? (
             <Button
               variant={ButtonVariant.Secondary}
               onClick={() => setCanceling(true)}

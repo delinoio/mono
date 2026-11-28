@@ -287,8 +287,14 @@ func TestRemoveUndelivered(t *testing.T) {
 	}
 	// The authorization_id slot is free: the same ID reserves a new grant.
 	again, existing, err := r.Reserve(req("a", "u", "op"), newID)
-	if err != nil || existing || again.ID == g.ID {
-		t.Fatalf("reserve after removal: %v existing=%v same=%v", err, existing, again.ID == g.ID)
+	if err != nil {
+		t.Fatalf("reserve authorization %q after removal: %v", g.AuthorizationID, err)
+	}
+	if again == nil {
+		t.Fatalf("reserve authorization %q after removal returned a nil grant", g.AuthorizationID)
+	}
+	if existing || again.ID == g.ID {
+		t.Fatalf("reserve authorization %q after removal returned grant %q (existing=%v), want a new grant different from %q", g.AuthorizationID, again.ID, existing, g.ID)
 	}
 	// A second removal of the removed grant changes nothing.
 	if r.RemoveUndelivered(g.ID) || r.Len() != 1 {

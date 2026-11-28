@@ -27,9 +27,11 @@ type fakeDevSessions struct {
 }
 
 func (f *fakeDevSessions) ListDevSessionProfiles(ctx context.Context, req *connect.Request[sandrunv1.ListDevSessionProfilesRequest]) (*connect.Response[sandrunv1.ListDevSessionProfilesResponse], error) {
-	if _, err := f.svc.Authorize(ctx, f.svc.DB.Pool, req.Msg.GetOrganizationId(), authz.ActionUseDevSessions); err != nil {
+	caller, err := f.svc.Authorize(ctx, f.svc.DB.Pool, req.Msg.GetOrganizationId(), authz.ActionUseDevSessions)
+	if err != nil {
 		return nil, err
 	}
+	f.svc.RecordAuthorizedAPIKeyUse(ctx, caller)
 	return connect.NewResponse(&sandrunv1.ListDevSessionProfilesResponse{}), nil
 }
 

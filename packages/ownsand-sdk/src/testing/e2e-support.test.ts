@@ -466,6 +466,53 @@ describe("runCleanup", () => {
     ]);
   });
 
+  test.each([
+    { finishAt: 999, outcome: "success" },
+    { finishAt: 1_000, outcome: "success" },
+    { finishAt: 1_001, outcome: "success" },
+    { finishAt: 999, outcome: "failure" },
+    { finishAt: 1_000, outcome: "failure" },
+  ])(
+    "checks a step's $outcome at $finishAt ms before the timeout callback",
+    async ({ finishAt, outcome }) => {
+      const clock = new VirtualClock();
+      const sleep = clock.sleep.bind(clock);
+      rs.spyOn(clock, "sleep").mockImplementationOnce((ms, signal) =>
+        sleep(ms + 2, signal),
+      );
+      const stepError = new Error("delete failed");
+      const first = rs.fn(async (signal: AbortSignal) => {
+        await sleep(finishAt, signal);
+        if (outcome === "failure") throw stepError;
+      });
+      const next = rs.fn(async (signal: AbortSignal) => {
+        expect(clock.now()).toBe(finishAt);
+        expect(signal.aborted).toBe(false);
+        await sleep(999, signal);
+      });
+
+      const errors = await clock.run(
+        runCleanup([first, next], { stepTimeoutMs: 1_000, clock }),
+      );
+
+      const firstSignal = first.mock.calls[0]?.[0];
+      if (finishAt >= 1_000) {
+        expect(errors).toEqual([
+          new Error("cleanup step timed out after 1000 ms"),
+        ]);
+        expect(firstSignal?.reason).toBe(errors[0]);
+      } else if (outcome === "failure") {
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toBe(stepError);
+      } else {
+        expect(errors).toEqual([]);
+      }
+      expect(next).toHaveBeenCalledOnce();
+      expect(next.mock.calls[0]?.[0]).not.toBe(firstSignal);
+      expect(clock.now()).toBe(finishAt + 999);
+    },
+  );
+
   test("abandons a step that hangs and goes on", async () => {
     const clock = new VirtualClock();
     const ran: string[] = [];

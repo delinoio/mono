@@ -20,6 +20,13 @@ import (
 	"github.com/delinoio/mono/servers/sandrun-api/internal/ownsandclient"
 )
 
+// SetReconcileDriverObserver sets a fixture callback for each selected runner
+// after the reconciler decides whether to register its driver. Set the
+// observer before starting the engine. The callback must not block.
+func (e *Engine) SetReconcileDriverObserver(observe func(runnerID string, registered bool)) {
+	e.observeReconcileDriverDecision = observe
+}
+
 // RunReconciler is the runner reconciler lease component: it starts a
 // driver for every runner that is not ended and keeps them running until ctx
 // ends, then waits for them.
@@ -63,25 +70,29 @@ func (e *Engine) reconcile(ctx context.Context) {
 	}
 	rows.Close()
 	for _, id := range ids {
-		e.ensureDriver(id)
+		registered := e.ensureDriver(id)
+		if e.observeReconcileDriverDecision != nil {
+			e.observeReconcileDriverDecision(id, registered)
+		}
 	}
 }
 
 // ensureDriver starts the driver of a runner when the reconciler runs on
 // this instance (the lease holder) and no driver of the runner runs.
-func (e *Engine) ensureDriver(runnerID string) {
+// It reports registration during the decision, including an existing driver.
+func (e *Engine) ensureDriver(runnerID string) bool {
 	if _, creating := e.initialCreates.Load(runnerID); creating {
-		return
+		return false
 	}
 	e.mu.Lock()
 	ctx, wg := e.runCtx, e.runWG
 	if ctx == nil || ctx.Err() != nil {
 		e.mu.Unlock()
-		return
+		return false
 	}
 	if _, ok := e.drivers[runnerID]; ok {
 		e.mu.Unlock()
-		return
+		return true
 	}
 	kick := make(chan struct{}, 1)
 	e.drivers[runnerID] = kick
@@ -96,6 +107,7 @@ func (e *Engine) ensureDriver(runnerID string) {
 		}()
 		e.drive(ctx, runnerID, kick)
 	}()
+	return true
 }
 
 // drive moves one runner through its lifecycle until it is ended or ctx
