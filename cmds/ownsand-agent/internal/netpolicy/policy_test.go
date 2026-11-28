@@ -44,7 +44,7 @@ func TestFullTunnelVPNPairIsDefault(t *testing.T) {
 		{Prefix: pfx("10.8.0.0/16"), Interface: "tun0"},
 	}
 	v4, v6 := Blocked(routes, nil)
-	if has(v4, "0.0.0.0/1") || has(v4, "128.0.0.0/1") || has(v6, "::/1") {
+	if has(v4, "0.0.0.0/1") || has(v4, "128.0.0.0/1") || has(v6, "::/1") || has(v6, "8000::/1") {
 		t.Fatal("complementary /1 pair blocked")
 	}
 	// A single /1 without its complement is an ordinary route.
