@@ -55,6 +55,11 @@ const KINDS = [
 ];
 const GUEST_OSES = [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS];
 const PRIORITIES = [Priority.HIGH, Priority.NORMAL, Priority.LOW];
+const RESOURCE_FIELDS = [
+  ["vcpuCount", "vCPUs"],
+  ["memoryMib", "Memory (MiB)"],
+  ["diskGib", "Disk (GiB)"],
+] as const;
 const DURATION_FIELDS = [
   ["idleTtlMinutes", "Idle TTL (minutes)"],
   ["maxTtlHours", "Maximum TTL (hours)"],
@@ -455,27 +460,21 @@ function ProfileDialog({
         ) : null}
       </div>
       <div className="field-row">
-        <NumberInput
-          label="vCPUs"
-          value={values.vcpuCount}
-          onValueChange={(v) => set("vcpuCount", v)}
-          min={1}
-          error={errors.vcpuCount}
-        />
-        <NumberInput
-          label="Memory (MiB)"
-          value={values.memoryMib}
-          onValueChange={(v) => set("memoryMib", v)}
-          min={1}
-          error={errors.memoryMib}
-        />
-        <NumberInput
-          label="Disk (GiB)"
-          value={values.diskGib}
-          onValueChange={(v) => set("diskGib", v)}
-          min={1}
-          error={errors.diskGib}
-        />
+        {RESOURCE_FIELDS.map(([field, label]) => (
+          <TextField
+            key={field}
+            label={label}
+            type="number"
+            inputMode="decimal"
+            step="any"
+            defaultValue={String(initial[field] ?? "")}
+            onChange={(event) => {
+              const value = event.currentTarget.valueAsNumber;
+              set(field, Number.isNaN(value) ? null : value);
+            }}
+            error={errors[field]}
+          />
+        ))}
       </div>
       <div className="field-row">
         {DURATION_FIELDS.map(([field, label]) => (
