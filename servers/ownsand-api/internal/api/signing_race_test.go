@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -18,6 +19,15 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
+
+const signerRaceMinPoolConns = 3 // signer, deletion, and observer
+
+func requireRacePoolCapacity(t *testing.T, pool *pgxpool.Pool, want int32) {
+	t.Helper()
+	if got := pool.Config().MaxConns; got < want {
+		t.Fatalf("configured pool_max_conns = %d, fixture requires at least %d connections", got, want)
+	}
+}
 
 // gateStore wraps an in-memory object store and, while armed, holds
 // PresignPut at a barrier before it signs. The signature (and so the URL
@@ -183,9 +193,10 @@ WHERE signer.datname = current_database()
   AND blocked.query LIKE ANY($1)
   AND signer.pid = ANY(pg_blocking_pids(blocked.pid))`
 
-// describeBackends lists the backends of the current database for a failure
-// message.
-func describeBackends(ctx context.Context, env *testenv.Env) string {
+// describeBackends gives the optional diagnostics their own time budget.
+func describeBackends(parent context.Context, env *testenv.Env) string {
+	ctx, cancel := context.WithTimeout(parent, time.Second)
+	defer cancel()
 	rows, err := env.DB.Pool.Query(ctx, `
 SELECT pid, state, COALESCE(wait_event_type, ''), pg_blocking_pids(pid)::text, query
 FROM pg_stat_activity
@@ -229,27 +240,20 @@ func waitDeletionBlocked(t *testing.T, env *testenv.Env, what string, done <-cha
 	for i, s := range statements {
 		patterns[i] = "%" + s + "%"
 	}
-	ctx := context.Background()
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
-	for {
+	for ctx.Err() == nil {
 		rows, err := env.DB.Pool.Query(ctx, blockedOnSignerQuery, patterns)
-		if err != nil {
-			t.Fatalf("%s: observe the lock wait: %v", what, err)
-		}
 		var blocked []int32
-		for rows.Next() {
-			var pid int32
-			if err := rows.Scan(&pid); err != nil {
-				rows.Close()
-				t.Fatalf("%s: scan the lock wait: %v", what, err)
-			}
-			blocked = append(blocked, pid)
+		if err == nil {
+			blocked, err = pgx.CollectRows(rows, pgx.RowTo[int32])
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+		if ctx.Err() != nil {
+			break
+		}
+		if err != nil {
 			t.Fatalf("%s: observe the lock wait: %v", what, err)
 		}
 		if len(blocked) > 0 {
@@ -257,12 +261,12 @@ func waitDeletionBlocked(t *testing.T, env *testenv.Env, what string, done <-cha
 		}
 		select {
 		case err := <-done:
-			t.Fatalf("%s finished while a signer held the snapshot row (err = %v); backends:%s", what, err, describeBackends(ctx, env))
-		case <-timeout.C:
-			t.Fatalf("timed out waiting for %s to block on the signer; backends:%s", what, describeBackends(ctx, env))
+			t.Fatalf("%s finished while a signer held the snapshot row (err = %v); backends:%s", what, err, describeBackends(t.Context(), env))
+		case <-ctx.Done():
 		case <-tick.C:
 		}
 	}
+	t.Fatalf("timed out waiting for %s to block on the signer: %v; backends:%s", what, ctx.Err(), describeBackends(t.Context(), env))
 }
 
 // cleanupJobs returns the final sweep deadline of every clean-up job.
@@ -344,6 +348,7 @@ func assertCleanupKeepsJobUntil(t *testing.T, env *testenv.Env, gate *gateStore,
 func TestSnapshotDeletionWaitsForSigner(t *testing.T) {
 	t.Parallel()
 	env, gate := signingRaceEnv(t)
+	requireRacePoolCapacity(t, env.DB.Pool, signerRaceMinPoolConns)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
 	snapID, agent := exportingSnapshot(t, env, org)
@@ -472,6 +477,7 @@ func TestSignedURLRequestAfterSnapshotDeletion(t *testing.T) {
 func TestOrganizationDeletionWaitsForSigner(t *testing.T) {
 	t.Parallel()
 	env, gate := signingRaceEnv(t)
+	requireRacePoolCapacity(t, env.DB.Pool, signerRaceMinPoolConns)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
 	snapID, agent := exportingSnapshot(t, env, org)

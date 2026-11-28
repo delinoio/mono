@@ -305,20 +305,33 @@ func TestStateReportCreatesNoCopyRow(t *testing.T) {
 	})
 }
 
-// lockWaiters counts the sessions that wait for a lock in the test database.
-func lockWaiters(t *testing.T, env *testenv.Env) int {
-	t.Helper()
-	var n int
-	if err := env.DB.Pool.QueryRow(context.Background(),
-		"SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'").Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
+const copyRecoveryRaceMinPoolConns = 4 // holder, two waiters, and observer
 
 func waitLockWaiters(t *testing.T, env *testenv.Env, want int) {
 	t.Helper()
-	testenv.Eventually(t, "lock waiters", func() bool { return lockWaiters(t, env) >= want })
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for ctx.Err() == nil {
+		var n int
+		err := env.DB.Pool.QueryRow(ctx,
+			"SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'").Scan(&n)
+		if ctx.Err() != nil {
+			break
+		}
+		if err != nil {
+			t.Fatalf("observe at least %d lock waiters: %v", want, err)
+		}
+		if n >= want {
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case <-tick.C:
+		}
+	}
+	t.Fatalf("timed out waiting for at least %d lock waiters: %v", want, ctx.Err())
 }
 
 // TestStateReportCopyRecoveryCommitOrder holds the snapshot row lock from a
@@ -329,6 +342,7 @@ func TestStateReportCopyRecoveryCommitOrder(t *testing.T) {
 	setup := func(t *testing.T) (*testenv.Env, *testenv.Org, *testenv.FakeAgent, string, pgx.Tx, int) {
 		t.Helper()
 		env := testenv.New(t)
+		requireRacePoolCapacity(t, env.DB.Pool, copyRecoveryRaceMinPoolConns)
 		org := env.NewOrg("alice")
 		_, _ = setupAgent(t, env, org, nil)
 		snapID := exportedSnapshot(t, org)
@@ -459,6 +473,7 @@ func waitSnapshotReport(t *testing.T, done <-chan snapshotReportOutcome) snapsho
 func TestStateReportCopyRecoveryWithOrganizationDeletion(t *testing.T) {
 	t.Parallel()
 	env := testenv.New(t)
+	requireRacePoolCapacity(t, env.DB.Pool, copyRecoveryRaceMinPoolConns)
 	ctx := context.Background()
 	org := env.NewOrg("alice")
 	_, _ = setupAgent(t, env, org, nil)
