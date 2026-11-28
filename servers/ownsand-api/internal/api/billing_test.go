@@ -891,17 +891,30 @@ func TestBillingRPCs(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := usage.Msg
-	if u.GetBillingAccountId() != billingAccountA || u.GetBillingAccountName() != "Owned" || u.GetBalanceUsdMicros() != 10_000_000-45 || len(u.GetMeterUsages()) != 4 {
+	if u.GetBillingAccountId() != billingAccountA || u.GetBillingAccountName() != "Owned" || u.GetBalanceUsdMicros() != 10_000_000-45 {
 		t.Fatalf("usage = %v", u)
 	}
-	for i, m := range billing.Meters {
-		mu := u.GetMeterUsages()[i]
+	wantMeters := []ownsandv1.BillingMeter{
+		ownsandv1.BillingMeter_BILLING_METER_RELAY_EGRESS,
+		ownsandv1.BillingMeter_BILLING_METER_R2_STORAGE,
+		ownsandv1.BillingMeter_BILLING_METER_CLASS_A_RPC,
+		ownsandv1.BillingMeter_BILLING_METER_CLASS_B_RPC,
+	}
+	meterUsages := u.GetMeterUsages()
+	if len(meterUsages) != len(wantMeters) {
+		t.Fatalf("meter usage count = %d, want %d", len(meterUsages), len(wantMeters))
+	}
+	for i, m := range wantMeters {
+		mu := meterUsages[i]
+		if mu.GetMeter() != m {
+			t.Fatalf("meter %d = %v, want %v", i, mu.GetMeter(), m)
+		}
 		wantQ, wantA := int64(0), int64(0)
 		if m == ownsandv1.BillingMeter_BILLING_METER_CLASS_A_RPC {
 			wantQ, wantA = 10, 45
 		}
-		if mu.GetMeter() != m || mu.GetQuantity() != wantQ || mu.GetAmountUsdMicros() != wantA {
-			t.Fatalf("meter %d = %v", i, mu)
+		if mu.GetQuantity() != wantQ || mu.GetAmountUsdMicros() != wantA {
+			t.Fatalf("meter %v usage = %v, want quantity %d and amount %d micro-USD", m, mu, wantQ, wantA)
 		}
 	}
 
