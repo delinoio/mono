@@ -54,9 +54,12 @@ type harness struct {
 func newHarness(t *testing.T, mutate func(*Config)) *harness {
 	t.Helper()
 	clock := &fakeClock{now: time.Now()}
-	cfg := Config{StateDir: t.TempDir(), Version: "test", Clock: ClockModeIgnore, Now: clock.Now, KeepaliveInterval: time.Hour, SweepInterval: time.Hour}
+	cfg := Config{Version: "test", Clock: ClockModeIgnore, Now: clock.Now, KeepaliveInterval: time.Hour, SweepInterval: time.Hour}
 	if mutate != nil {
 		mutate(&cfg)
+	}
+	if cfg.StateDir == "" {
+		cfg.StateDir = t.TempDir()
 	}
 	// A caller may pass the state directory of an earlier server.
 	srv, err := newAfterRelease(cfg)
