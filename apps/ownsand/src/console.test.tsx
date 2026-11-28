@@ -4426,7 +4426,8 @@ describe("a failed refetch of loaded data", () => {
       name: "snapshots",
       path: "snapshots",
       method: "ListSnapshots",
-      text: "Templates",
+      listName: "Snapshots",
+      text: shortIdText(MOCK_IDS.snapshot),
     },
     {
       name: "devices",
@@ -4444,7 +4445,8 @@ describe("a failed refetch of loaded data", () => {
       name: "members",
       path: "members",
       method: "ListMembers",
-      text: "Invitations",
+      listName: "Members",
+      text: "Jun Park",
     },
     {
       name: "enrollment tokens",
@@ -4474,7 +4476,14 @@ describe("a failed refetch of loaded data", () => {
         transport,
         queryClient,
       });
-      await screen.findAllByText(page.text, { exact: false });
+      const queryPageContent = () => {
+        if (!page.listName) {
+          return screen.queryAllByText(page.text, { exact: false });
+        }
+        const list = screen.queryByRole("list", { name: page.listName });
+        return list ? within(list).queryAllByText(page.text) : [];
+      };
+      await waitFor(() => expect(queryPageContent().length).toBeGreaterThan(0));
       await settle(60);
 
       state.code = Code.Unavailable;
@@ -4483,9 +4492,7 @@ describe("a failed refetch of loaded data", () => {
       expect(
         (await screen.findAllByText(REFRESH_NOTICE)).length,
       ).toBeGreaterThan(0);
-      expect(
-        screen.getAllByText(page.text, { exact: false }).length,
-      ).toBeGreaterThan(0);
+      expect(queryPageContent().length).toBeGreaterThan(0);
       expect(
         screen.getByRole("navigation", { name: "Organization" }),
       ).toBeTruthy();
@@ -4501,6 +4508,9 @@ describe("a failed refetch of loaded data", () => {
         ).length,
       ).toBeGreaterThan(0);
       expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+      if (page.listName) {
+        expect(queryPageContent()).toHaveLength(0);
+      }
     });
   }
 
