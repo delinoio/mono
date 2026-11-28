@@ -1417,11 +1417,56 @@ describe("member names in Audit and Dev Sessions", () => {
 });
 
 describe("keyboard scrolling in tables", () => {
-  for (const { path, tableName, lastColumn } of [
+  const workTables = [
+    {
+      path: "/requests",
+      tableName: "Requests",
+      state: "Ended",
+      action: "Cancel",
+      empty: "No requests match",
+    },
+    {
+      path: "/runners",
+      tableName: "Runners",
+      state: "Deleted",
+      action: "Delete",
+      empty: "No runners match",
+    },
+    {
+      path: "/dev-sessions",
+      tableName: "Dev sessions",
+      state: "Canceled",
+      action: "Delete",
+      empty: "No dev sessions",
+    },
+  ];
+
+  async function tabToTableRegion(
+    {
+      browser,
+      screen,
+    }: Pick<WebFixtures, "browser"> & Pick<TestFixtures, "screen">,
+    regionName: string,
+  ) {
+    const region = screen.getByRole("region", regionName, { exact: true });
+    // Tab from the page to the region without focusing it programmatically.
+    for (let stop = 0; stop < 40; stop += 1) {
+      await browser.keyboard.press("Tab");
+      const label = await browser.evaluate(
+        () => document.activeElement?.getAttribute("aria-label") ?? null,
+      );
+      if (label === regionName) break;
+    }
+    await expect(region).toBeFocused();
+  }
+
+  for (const scenario of [
     { path: "", tableName: "Waiting requests", lastColumn: "Waiting" },
     { path: "", tableName: "Devices", lastColumn: "SandRun runners" },
     { path: "/audit", tableName: "Audit events", lastColumn: "Subject" },
+    ...workTables.map((table) => ({ ...table, lastColumn: "Actions" })),
   ]) {
+    const { path, tableName, lastColumn } = scenario;
     test(`scrolls the ${tableName} table with the arrow keys at 320 px`, async ({
       app,
       browser,
@@ -1432,25 +1477,44 @@ describe("keyboard scrolling in tables", () => {
       await browser.setViewport({ width: 320, height: 844 });
       await app.open(`/orgs/${ACME}${path}`);
 
+      const table = screen.getByRole("table", tableName, { exact: true });
+      if ("state" in scenario) {
+        if (path === "/dev-sessions") {
+          await table.getByRole("button", "Delete", { exact: true }).tap();
+          const dialog = screen.getByRole(
+            "alertdialog",
+            "Delete this dev session?",
+          );
+          await dialog.getByRole("button", "Delete dev session").tap();
+          await expect(dialog).toBeHidden();
+          await expect(screen.getByText(scenario.empty)).toBeVisible();
+          await screen.getByRole("checkbox", "Show ended dev sessions").tap();
+        } else {
+          await screen.getByRole("combobox", "State").tap();
+          await screen
+            .getByRole("option", scenario.state, { exact: true })
+            .tap();
+        }
+        await expect(
+          table.getByRole("cell", scenario.state, { exact: true }),
+        ).toBeVisible();
+        await expect(table.getByRole("button")).toHaveCount(0);
+      }
+
       const regionName = `${tableName} table`;
       const region = screen.getByRole("region", regionName, { exact: true });
       await expect(region).toHaveAttribute("tabindex", "0");
       await expect(
         region
-          .getByRole("table", tableName)
+          .getByRole("table", tableName, { exact: true })
           .getByRole("columnheader", lastColumn),
       ).toBeVisible();
 
+      await tabToTableRegion({ browser, screen }, regionName);
       const focusedLabel = () =>
         browser.evaluate(
           () => document.activeElement?.getAttribute("aria-label") ?? null,
         );
-      // Tab from the page to the region without focusing it programmatically.
-      for (let stop = 0; stop < 40; stop += 1) {
-        await browser.keyboard.press("Tab");
-        if ((await focusedLabel()) === regionName) break;
-      }
-      await expect(region).toBeFocused();
 
       const metrics = await browser.evaluate(() => {
         const region = document.activeElement!;
@@ -1467,11 +1531,21 @@ describe("keyboard scrolling in tables", () => {
 
       const scrollLeft = () =>
         browser.evaluate(() => document.activeElement?.scrollLeft ?? 0);
+      // Wait for the first native scroll animation to finish before reversing it.
+      await browser.evaluate(() => {
+        const region = document.activeElement!;
+        region.addEventListener(
+          "scrollend",
+          () => region.setAttribute("data-test-scroll-ended", ""),
+          { once: true },
+        );
+        return null;
+      });
       await browser.keyboard.press("ArrowRight");
-      await expect.poll(scrollLeft).toBeGreaterThan(10);
-      const scrolledRight = await scrollLeft();
+      await expect(region).toHaveAttribute("data-test-scroll-ended", "");
+      expect(await scrollLeft()).toBeGreaterThan(10);
       await browser.keyboard.press("ArrowLeft");
-      await expect.poll(scrollLeft).toBeLessThan(scrolledRight);
+      await expect.poll(scrollLeft).toBe(0);
       await expect(region).toBeFocused();
 
       await browser.keyboard.press("Tab");
@@ -1480,6 +1554,43 @@ describe("keyboard scrolling in tables", () => {
       await expect(region).toBeFocused();
       await browser.keyboard.press("Shift+Tab");
       expect(await focusedLabel()).not.toBe(regionName);
+    });
+  }
+
+  for (const { path, tableName, action, empty } of workTables) {
+    test(`tabs from the ${tableName} region to its first row action`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await browser.setViewport({ width: 320, height: 844 });
+      await app.open(`/orgs/${ACME}${path}`);
+
+      const regionName = `${tableName} table`;
+      const region = screen.getByRole("region", regionName, { exact: true });
+      const firstAction = region
+        .getByRole("button", action, { exact: true })
+        .first();
+      await expect(firstAction).toBeVisible();
+      await tabToTableRegion({ browser, screen }, regionName);
+      await browser.keyboard.press("Tab");
+      await expect(firstAction).toBeFocused();
+    });
+
+    test(`omits the ${tableName} region from the empty view`, async ({
+      app,
+      screen,
+    }) => {
+      await app.open("/");
+      await screen.getByRole("button", "Sign in with Delino").tap();
+      await app.open(`/orgs/${GLOBEX}${path}`);
+
+      await expect(screen.getByText(empty, { exact: true })).toBeVisible();
+      await expect(
+        screen.getByRole("region", `${tableName} table`, { exact: true }),
+      ).toHaveCount(0);
     });
   }
 

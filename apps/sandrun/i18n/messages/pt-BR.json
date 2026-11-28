@@ -582,5 +582,8 @@
   "integrations.agent.dialog.nameInvalid": "Digite um nome de 1 a {max} caracteres.",
   "integrations.agent.dialog.vendor": "Fornecedor",
   "integrations.agent.dialog.vendorValue": "Fornecedor: {vendor}",
-  "integrations.agent.dialog.replaceHint": "{state}. Digite um novo valor para substituir o atual."
+  "integrations.agent.dialog.replaceHint": "{state}. Digite um novo valor para substituir o atual.",
+  "devSessions.tableRegion": "Tabela de sessões de desenvolvimento",
+  "runners.tableRegion": "Tabela de executores",
+  "requests.tableRegion": "Tabela de solicitações"
 }

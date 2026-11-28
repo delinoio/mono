@@ -200,7 +200,12 @@ export function RequestsPage() {
               {t("requests.empty.description")}
             </SetupEmpty>
           ) : (
-            <div className="table-wrap">
+            <div
+              className="table-wrap"
+              role="region"
+              aria-label={t("requests.tableRegion")}
+              tabIndex={0}
+            >
               <table className="table" aria-label={t("requests.title")}>
                 <thead>
                   <tr>

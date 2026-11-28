@@ -582,5 +582,8 @@
   "integrations.agent.dialog.nameInvalid": "请输入 1 至 {max} 个字符的名称。",
   "integrations.agent.dialog.vendor": "供应商",
   "integrations.agent.dialog.vendorValue": "供应商：{vendor}",
-  "integrations.agent.dialog.replaceHint": "{state}。输入新值即可替换。"
+  "integrations.agent.dialog.replaceHint": "{state}。输入新值即可替换。",
+  "devSessions.tableRegion": "开发会话表",
+  "runners.tableRegion": "运行器表",
+  "requests.tableRegion": "请求表"
 }

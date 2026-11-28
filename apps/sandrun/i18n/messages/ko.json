@@ -582,5 +582,8 @@
   "integrations.agent.dialog.nameInvalid": "이름은 1~{max}자로 입력하세요.",
   "integrations.agent.dialog.vendor": "공급업체",
   "integrations.agent.dialog.vendorValue": "공급업체: {vendor}",
-  "integrations.agent.dialog.replaceHint": "{state}. 교체하려면 새 값을 입력하세요."
+  "integrations.agent.dialog.replaceHint": "{state}. 교체하려면 새 값을 입력하세요.",
+  "devSessions.tableRegion": "개발 세션 표",
+  "runners.tableRegion": "러너 표",
+  "requests.tableRegion": "요청 표"
 }
