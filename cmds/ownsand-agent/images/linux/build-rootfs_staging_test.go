@@ -58,15 +58,88 @@ func (b *rootfsBuild) requireOutputDirEntries(want ...string) {
 	}
 }
 
-// Sizes that make truncate (not a number) or mkfs.ext4 (a zero-byte file)
-// fail after the root tree is ready, which is where the script used to have
-// already replaced the output.
-var failingSizes = []string{"invalid", "0"}
+var rollbackTools = [...]string{"truncate", "mkfs.ext4"}
+
+// Log each tool only after it sees a regular staged file. In the formatting
+// case, log truncate after the real command has successfully allocated it.
+const stubRollbackTool = `#!/usr/bin/env bash
+set -eu
+tool="${0##*/}"
+staged="${!#}"
+if [[ ! -f "$staged" || -L "$staged" ]]; then
+  printf '%s: expected a regular staged file at %s\n' "$tool" "$staged" >&2
+  exit 1
+fi
+if [[ "$tool" == truncate && "$tool" != "$STUB_FAILURE_TOOL" ]]; then
+  "$STUB_REAL_TRUNCATE" "$@"
+fi
+printf '%s\t%s\n' "$tool" "$staged" >> "$STUB_TOOL_LOG"
+if [[ "$tool" == "$STUB_FAILURE_TOOL" ]]; then
+  exit "$STUB_FAILURE_STATUS"
+fi
+`
+
+func (b *rootfsBuild) requireToolFailure(failTool string) {
+	b.t.Helper()
+	const failureStatus = 42
+	realTruncate, err := exec.LookPath("truncate")
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	bin := filepath.Join(b.dir, "bin")
+	for _, tool := range rollbackTools {
+		if err := os.WriteFile(filepath.Join(bin, tool), []byte(stubRollbackTool), 0o755); err != nil {
+			b.t.Fatal(err)
+		}
+	}
+	logPath := filepath.Join(bin, "rollback-tools.log")
+	out, runErr := b.run(stubApplets,
+		"STUB_REAL_TRUNCATE="+realTruncate,
+		"STUB_TOOL_LOG="+logPath,
+		"STUB_FAILURE_TOOL="+failTool,
+		"STUB_FAILURE_STATUS="+strconv.Itoa(failureStatus),
+	)
+	log, err := os.ReadFile(logPath)
+	if os.IsNotExist(err) {
+		b.t.Fatalf("no truncate invocation recorded before expected %s failure\n%s", failTool, out)
+	}
+	if err != nil {
+		b.t.Fatalf("read tool log: %v\n%s", err, out)
+	}
+	calls := strings.Split(strings.TrimSuffix(string(log), "\n"), "\n")
+	want := rollbackTools[:]
+	if failTool == "truncate" {
+		want = want[:1]
+	}
+	var staged string
+	for i, tool := range want {
+		prefix := tool + "\t"
+		if i >= len(calls) || !strings.HasPrefix(calls[i], prefix) {
+			b.t.Fatalf("missing expected %s invocation at position %d (tool log: %q)\n%s", tool, i+1, log, out)
+		}
+		path := strings.TrimPrefix(calls[i], prefix)
+		if i == 0 {
+			staged = path
+			if filepath.Dir(filepath.Dir(staged)) != filepath.Dir(b.out) || filepath.Base(staged) != filepath.Base(b.out) {
+				b.t.Fatalf("%s received %q, want a staged image beside %q\n%s", tool, staged, b.out, out)
+			}
+		} else if path != staged {
+			b.t.Fatalf("%s received %q, want the image allocated at %q\n%s", tool, path, staged, out)
+		}
+	}
+	if len(calls) != len(want) {
+		b.t.Fatalf("unexpected tool invocations after %s (tool log: %q)\n%s", failTool, log, out)
+	}
+	requireFailure(b.t, out, runErr)
+	if status := runErr.(*exec.ExitError).ExitCode(); status != failureStatus {
+		b.t.Fatalf("exit status = %d, want injected %s failure status %d\n%s", status, failTool, failureStatus, out)
+	}
+}
 
 func TestAllocationOrFormatFailureKeepsAnExistingImage(t *testing.T) {
 	requireMkfs(t)
-	for _, size := range failingSizes {
-		t.Run(size, func(t *testing.T) {
+	for _, tool := range rollbackTools {
+		t.Run(tool, func(t *testing.T) {
 			b := newRootfsBuild(t)
 			if out, err := b.runSized("8"); err != nil {
 				t.Fatalf("the first build failed: %v\n%s", err, out)
@@ -75,8 +148,7 @@ func TestAllocationOrFormatFailureKeepsAnExistingImage(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			out, runErr := b.runSized(size)
-			requireFailure(t, out, runErr)
+			b.requireToolFailure(tool)
 			after, err := os.ReadFile(b.out)
 			if err != nil {
 				t.Fatalf("the earlier image is gone: %v", err)
@@ -91,12 +163,10 @@ func TestAllocationOrFormatFailureKeepsAnExistingImage(t *testing.T) {
 }
 
 func TestAllocationOrFormatFailureCreatesNoImage(t *testing.T) {
-	requireMkfs(t)
-	for _, size := range failingSizes {
-		t.Run(size, func(t *testing.T) {
+	for _, tool := range rollbackTools {
+		t.Run(tool, func(t *testing.T) {
 			b := newRootfsBuild(t)
-			out, err := b.runSized(size)
-			requireFailure(t, out, err)
+			b.requireToolFailure(tool)
 			if _, statErr := os.Stat(b.out); !os.IsNotExist(statErr) {
 				t.Fatalf("the failed build left an output file: %v", statErr)
 			}
