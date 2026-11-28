@@ -172,7 +172,7 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 			if res == createStalled {
 				return nil
 			}
-			if res != createOK {
+			if res != createOK && res != createStoreFailed {
 				break
 			}
 		}
@@ -184,8 +184,9 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 // BindsAtDispatch in each runner pool that its WarmPooler lists. Every
 // request is covered when it runs, so a pool's runners in CREATING,
 // PREPARING or WAITING_FOR_WORK without a request beyond its QUEUED
-// requests are its warm runners. The first unsuccessful create ends fill
-// for this profile and returns its result to the dispatcher.
+// requests are its warm runners. A runner with a failed sandbox ID write
+// still counts toward the warm total. Other failures end fill for this
+// profile and return their result to the dispatcher.
 func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, a Adapter, p *profile.Profile, linkRevision string, queued []*Request, runners []*Runner) createResult {
 	wp, ok := a.(WarmPooler)
 	if !ok {
@@ -210,7 +211,7 @@ func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, 
 		}
 		for ; idle < int(p.WarmCount); idle++ {
 			res := e.createRunner(ctx, client, p, nil, pool, linkRevision)
-			if res != createOK {
+			if res != createOK && res != createStoreFailed {
 				return res
 			}
 		}
@@ -408,6 +409,9 @@ type createResult int
 
 const (
 	createOK createResult = iota
+	// OwnSand returned a sandbox, but its ID could not be stored. The
+	// reservation remains and its driver retries on the normal poll.
+	createStoreFailed
 	createUnavailable
 	createFailed
 	createSkipped
@@ -616,7 +620,9 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 			// The driver repeats CreateSandbox with the same key and gets
 			// the same sandbox.
 			e.svc.Logger.WarnContext(ctx, "runner_sandbox_store_failed", slog.String("runner_id", r.ID), slog.Any("error", uerr))
-		} else if start.expired != nil {
+			return createStoreFailed
+		}
+		if start.expired != nil {
 			e.releaseClaim(ctx, start.expired)
 		}
 		e.ensureDriver(r.ID)

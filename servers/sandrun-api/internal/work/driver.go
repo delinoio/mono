@@ -210,8 +210,8 @@ func (e *Engine) orphaned(ctx context.Context, r *Runner) bool {
 	return true
 }
 
-// stepCreating creates the sandbox (again with the stored request and key
-// when the response was lost) and waits for RUNNING.
+// stepCreating creates the sandbox with the stored request and key and
+// waits for RUNNING. A retry can recover a lost response or a failed ID write.
 func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, r *Runner) time.Duration {
 	if r.SandboxID == "" {
 		// The stored request, not the profile as it is now: OwnSand rejects
@@ -223,12 +223,10 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 			return e.timing.SandboxPoll
 		}
 		sb, err := e.createSandbox(ctx, client, req)
-		switch e.applyCreate(ctx, r, sb, err) {
-		case createOK:
+		if e.applyCreate(ctx, r, sb, err) == createOK {
 			return 0
-		default:
-			return e.timing.SandboxPoll
 		}
+		return e.timing.SandboxPoll
 	}
 	sb, err := client.GetSandbox(ctx, r.SandboxID)
 	switch {
