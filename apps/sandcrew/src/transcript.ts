@@ -16,6 +16,7 @@ import type {
   SessionMode,
   ToolCallContent,
   ToolCallLocation,
+  ToolCallUpdate,
 } from "@delino/sandcrew-protos/v1/bridge_pb";
 import { PermissionMode } from "@delino/sandcrew-protos/v1/common_pb";
 import type { TranscriptEvent } from "@delino/sandcrew-protos/v1/session_pb";
@@ -196,6 +197,39 @@ export function buildTranscript(
     agentInstallFailed: false,
     lastSequence: 0n,
   };
+  // Merges a tool call update into the tool call state. An update for an
+  // unknown tool call adds the tool call at the current position.
+  const applyToolCallUpdate = (update: ToolCallUpdate, key: string) => {
+    let item = toolCalls.get(update.toolCallId);
+    if (item === undefined) {
+      item = {
+        kind: ChatItemKind.ToolCall,
+        key,
+        toolCallId: update.toolCallId,
+        title: "",
+        toolKind: ToolKind.UNSPECIFIED,
+        status: ToolCallStatus.UNSPECIFIED,
+        content: [],
+        locations: [],
+        rawInput: "",
+        rawOutput: "",
+      };
+      items.push(item);
+      toolCalls.set(update.toolCallId, item);
+    }
+    const next: ToolCallItem = {
+      ...item,
+      title: update.title ?? item.title,
+      toolKind: update.kind ?? item.toolKind,
+      status: update.status ?? item.status,
+      content: update.content?.items ?? item.content,
+      locations: update.locations?.items ?? item.locations,
+      rawInput: update.rawInput ?? item.rawInput,
+      rawOutput: update.rawOutput ?? item.rawOutput,
+    };
+    items[items.indexOf(item)] = next;
+    toolCalls.set(update.toolCallId, next);
+  };
   let previous: bigint | undefined;
   for (const event of sorted) {
     if (event.sequence === previous) continue;
@@ -246,39 +280,9 @@ export function buildTranscript(
         toolCalls.set(call.toolCallId, item);
         break;
       }
-      case "toolCallUpdate": {
-        const update = e.value;
-        let item = toolCalls.get(update.toolCallId);
-        if (item === undefined) {
-          item = {
-            kind: ChatItemKind.ToolCall,
-            key,
-            toolCallId: update.toolCallId,
-            title: "",
-            toolKind: ToolKind.UNSPECIFIED,
-            status: ToolCallStatus.UNSPECIFIED,
-            content: [],
-            locations: [],
-            rawInput: "",
-            rawOutput: "",
-          };
-          items.push(item);
-          toolCalls.set(update.toolCallId, item);
-        }
-        const next: ToolCallItem = {
-          ...item,
-          title: update.title ?? item.title,
-          toolKind: update.kind ?? item.toolKind,
-          status: update.status ?? item.status,
-          content: update.content?.items ?? item.content,
-          locations: update.locations?.items ?? item.locations,
-          rawInput: update.rawInput ?? item.rawInput,
-          rawOutput: update.rawOutput ?? item.rawOutput,
-        };
-        items[items.indexOf(item)] = next;
-        toolCalls.set(update.toolCallId, next);
+      case "toolCallUpdate":
+        applyToolCallUpdate(e.value, key);
         break;
-      }
       case "plan": {
         // A plan replaces the previous plan: show only the latest one.
         const old = items.findIndex((i) => i.kind === ChatItemKind.Plan);
@@ -288,6 +292,18 @@ export function buildTranscript(
       }
       case "permissionRequest": {
         const request = e.value;
+        // The agent can send the tool call details only with the request,
+        // without a separate tool call event: show them as the tool call.
+        if (request.toolCall !== undefined) {
+          applyToolCallUpdate(
+            {
+              ...request.toolCall,
+              toolCallId: request.toolCall.toolCallId || request.toolCallId,
+            },
+            // The permission item below uses the event key.
+            `${key}-tool`,
+          );
+        }
         const item: PermissionItem = {
           kind: ChatItemKind.Permission,
           key,

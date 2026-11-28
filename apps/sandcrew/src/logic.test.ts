@@ -303,6 +303,72 @@ describe("transcript", () => {
     expect(isTurnRunning(t)).toBe(true);
   });
 
+  test("shows the tool call details that come only with a permission request", () => {
+    const t = buildTranscript(
+      events({
+        case: "permissionRequest",
+        value: {
+          permissionRequestId: "p1",
+          toolCallId: "t1",
+          options: [
+            {
+              optionId: "a",
+              name: "Allow",
+              kind: PermissionOptionKind.ALLOW_ONCE,
+            },
+          ],
+          toolCall: {
+            toolCallId: "t1",
+            title: "rm -rf build",
+            kind: ToolKind.EXECUTE,
+            status: ToolCallStatus.PENDING,
+            rawInput: '{"command":"rm -rf build"}',
+          },
+        },
+      }),
+    );
+    expect(t.items).toHaveLength(2);
+    expect(t.items[0]).toMatchObject({
+      kind: ChatItemKind.ToolCall,
+      toolCallId: "t1",
+      title: "rm -rf build",
+      toolKind: ToolKind.EXECUTE,
+      rawInput: '{"command":"rm -rf build"}',
+    });
+    expect(t.items[1]).toMatchObject({
+      kind: ChatItemKind.Permission,
+      toolTitle: "rm -rf build",
+    });
+    expect(new Set(t.items.map((i) => i.key)).size).toBe(2);
+    expect(t.pendingPermissionIds).toEqual(["p1"]);
+  });
+
+  test("merges permission request details into an earlier tool call", () => {
+    const t = buildTranscript(
+      events(
+        {
+          case: "toolCall",
+          value: { toolCallId: "t1", title: "Run", rawInput: "{}" },
+        },
+        {
+          case: "permissionRequest",
+          value: {
+            permissionRequestId: "p1",
+            toolCallId: "t1",
+            toolCall: { toolCallId: "t1", title: "rm -rf build" },
+          },
+        },
+      ),
+    );
+    expect(t.items).toHaveLength(2);
+    expect(t.items[0]).toMatchObject({
+      kind: ChatItemKind.ToolCall,
+      title: "rm -rf build",
+      rawInput: "{}",
+    });
+    expect(t.items[1]).toMatchObject({ toolTitle: "rm -rf build" });
+  });
+
   test("records modes, options, errors, exits and unknown updates", () => {
     const t = buildTranscript(
       events(
