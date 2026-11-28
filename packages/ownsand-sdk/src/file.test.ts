@@ -7,7 +7,10 @@ import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
 import type { Clock } from "./clock.ts";
 import { DataPathError, OwnSandValidationError } from "./errors.ts";
 import { Timing } from "./relay/context.ts";
-import { AcceptanceDeadlineError } from "./relay/stream.ts";
+import {
+  AcceptanceDeadlineError,
+  AttemptDeadlineError,
+} from "./relay/stream.ts";
 import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import type { WriteFileRequest } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
@@ -394,7 +397,7 @@ describe("file write", () => {
   // `acquire` returns the kept grant without renewing it.
   const KEPT_GRANT_LATE_MS = Timing.recoveryWindowMs - Timing.backoffInitialMs;
 
-  function acknowledge(req: any) {
+  function acknowledge(req: WriteFileRequest) {
     return {
       writeId: req.writeId,
       offset: req.offset,
@@ -593,6 +596,55 @@ describe("file write", () => {
     expect(writes).toHaveLength(2);
     expect(writes[1]).toEqual(writes[0]);
   });
+
+  test.each([false, true])(
+    "discards a late final acknowledgement (retry: %s)",
+    async (lateRetry) => {
+      let elapsed = 0;
+      const h = setup((clock) => ({
+        clock: {
+          now: () => clock.now() + elapsed,
+          wallNow: () => clock.wallNow(),
+          sleep: (ms, signal) => clock.sleep(ms, signal),
+        },
+      }));
+      const retry = Promise.withResolvers<void>();
+      h.api.unary(RelayService, "WriteFile", async (req, call) => {
+        if (call.index === 0 && lateRetry) {
+          throw new ConnectError("relay call limit", Code.DeadlineExceeded);
+        }
+        if (call.index === (lateRetry ? 1 : 0)) {
+          // Advance past the attempt deadline while the timer stays pending.
+          elapsed += Timing.writeAttemptDeadlineMs + 1;
+        } else {
+          await retry.promise;
+        }
+        return acknowledge(req);
+      });
+      const result = h.client.sandbox(SANDBOX).writeFile("/f", "x");
+      if (lateRetry) {
+        await expect(h.clock.run(result)).rejects.toBeInstanceOf(
+          AttemptDeadlineError,
+        );
+      } else {
+        let completed = false;
+        void result.then(
+          () => (completed = true),
+          () => {},
+        );
+        await h.clock.advance(Timing.backoffInitialMs);
+        expect(completed).toBe(false);
+        expect(h.api.callsOf("WriteFile")).toHaveLength(2);
+        retry.resolve();
+        await expect(h.clock.run(result)).resolves.toMatchObject({
+          sizeBytes: 1n,
+        });
+      }
+      const writes = h.api.callsOf("WriteFile");
+      expect(writes).toHaveLength(2);
+      expect(writes[1]!.request).toEqual(writes[0]!.request);
+    },
+  );
 
   test("cancels an attempt without a response at the SDK-side deadline and retries it", async () => {
     const h = setup();
