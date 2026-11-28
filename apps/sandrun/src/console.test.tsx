@@ -109,6 +109,12 @@ import {
   linkedSetupTransport,
   setupWithGitHubInstallations,
 } from "../e2e/setup-guidance-fixture.ts";
+import {
+  editProfile,
+  ownSessionDelete,
+  workDialogOpenings,
+  workDialogPermissionFixture,
+} from "../e2e/work-dialog-permission-fixture.ts";
 import { invalidateServices, MAX_PAGE_SIZE, PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -1782,6 +1788,151 @@ describe("OwnSand link", () => {
     await click(within(dialog).getByRole("button", { name: "Remove link" }));
     expect(await screen.findByText("OwnSand is not linked")).toBeTruthy();
     expect(removals).toMatchObject([{ organizationId: MOCK_IDS.acme }]);
+  });
+});
+
+describe("work management dialogs and organization role refresh", () => {
+  function renderWorkDialog(
+    opening: (typeof workDialogOpenings)[number],
+    base = createMockTransport(),
+  ) {
+    const fixture = workDialogPermissionFixture(base);
+    const path = `/orgs/${MOCK_IDS.acme}/${opening.page}`;
+    const queryClient = renderConsole(path, { transport: fixture.transport });
+    return {
+      ...fixture,
+      path,
+      async refreshRole(role: Role) {
+        const readCount = fixture.organizationReads.length;
+        fixture.setRole(role);
+        await act(() => invalidateServices(queryClient, OrganizationService));
+        expect(fixture.organizationReads.slice(readCount)).toEqual([role]);
+      },
+    };
+  }
+
+  async function controls(opening: (typeof workDialogOpenings)[number]) {
+    const row = await waitFor(() => {
+      const match = screen
+        .getAllByRole(opening.rowRole)
+        .find((element) => element.textContent?.includes(opening.row));
+      expect(match).toBeDefined();
+      return match!;
+    });
+    const opener =
+      opening.opener === "Create runner profile" ? screen : within(row);
+    return {
+      row,
+      opener,
+      async open() {
+        await click(
+          await opener.findByRole("button", {
+            name: opening.opener,
+          }),
+        );
+        return screen.findByRole(opening.role, { name: opening.title });
+      },
+    };
+  }
+
+  test.each(workDialogOpenings)(
+    "dismisses $title when the caller loses permission",
+    async (opening) => {
+      const { mutations, path, refreshRole } = renderWorkDialog(opening);
+      const { row, opener, open } = await controls(opening);
+      const dialog = await open();
+      const form = within(dialog);
+      if (opening.draftDefault !== undefined) {
+        await type(form.getByLabelText("Name"), "unsent-draft");
+      }
+      const submit = form.getByRole("button", { name: opening.action });
+
+      await refreshRole(Role.MEMBER);
+
+      await waitFor(() => expect(dialog.isConnected).toBe(false));
+      expect(opener.queryByRole("button", { name: opening.opener })).toBeNull();
+      expect(row.isConnected).toBe(true);
+      expect(window.location.pathname).toBe(path);
+      await click(submit);
+      expect(mutations).toEqual([]);
+
+      await refreshRole(Role.ADMIN);
+
+      await opener.findByRole("button", { name: opening.opener });
+      expect(
+        screen.queryByRole(opening.role, { name: opening.title }),
+      ).toBeNull();
+      const reopened = within(await open());
+      if (opening.draftDefault !== undefined) {
+        expect(reopened.getByLabelText("Name")).toHaveProperty(
+          "value",
+          opening.draftDefault,
+        );
+      }
+      expect(mutations).toEqual([]);
+    },
+  );
+
+  test("keeps a profile draft and submits it after an admin refresh", async () => {
+    const { refreshRole, mutations } = renderWorkDialog(editProfile);
+    const { open } = await controls(editProfile);
+    const dialog = await open();
+    const form = within(dialog);
+    const name = form.getByLabelText("Name");
+    await type(name, "linux-build-updated");
+
+    await refreshRole(Role.ADMIN);
+
+    expect(screen.getByRole("dialog", { name: editProfile.title })).toBe(
+      dialog,
+    );
+    expect(name).toHaveProperty("value", "linux-build-updated");
+    await click(form.getByRole("button", { name: editProfile.action }));
+    expect(mutations).toMatchObject([
+      {
+        method: "UpdateRunnerProfile",
+        input: { runnerProfileId: MOCK_IDS.linuxProfile },
+      },
+    ]);
+  });
+
+  test("keeps the caller's dev session confirmation after a downgrade", async () => {
+    const { refreshRole, mutations } = renderWorkDialog(ownSessionDelete);
+    const { open } = await controls(ownSessionDelete);
+    const dialog = await open();
+
+    await refreshRole(Role.MEMBER);
+
+    expect(
+      screen.getByRole("alertdialog", { name: ownSessionDelete.title }),
+    ).toBe(dialog);
+    await click(
+      within(dialog).getByRole("button", { name: ownSessionDelete.action }),
+    );
+    expect(mutations).toMatchObject([
+      {
+        method: "DeleteDevSession",
+        input: { devSessionId: MOCK_IDS.queuedDev },
+      },
+    ]);
+  });
+
+  test("refreshes profiles when a save sent before the downgrade succeeds", async () => {
+    const { transport, calls } = gatedTransport("UpdateRunnerProfile");
+    const { refreshRole } = renderWorkDialog(editProfile, transport);
+    const { open } = await controls(editProfile);
+    const dialog = await open();
+    const form = within(dialog);
+    await type(form.getByLabelText("Name"), "linux-build-updated");
+    await click(form.getByRole("button", { name: editProfile.action }));
+    expect(calls).toHaveLength(1);
+
+    await refreshRole(Role.MEMBER);
+    await waitFor(() => expect(dialog.isConnected).toBe(false));
+    await act(async () => calls[0].settle());
+
+    expect(await screen.findByText(/linux-build-updated ·/)).toBeTruthy();
+    expect(calls).toHaveLength(1);
   });
 });
 

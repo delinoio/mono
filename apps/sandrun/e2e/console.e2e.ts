@@ -16,6 +16,13 @@ import { MOCK_IDS } from "../src/mock/mock-api.ts";
 import { REQUEST_CANCELLATION_FIXTURE } from "./request-cancellation-fixture.ts";
 import { SETUP_GUIDANCE_FIXTURE } from "./setup-guidance-fixture.ts";
 
+import {
+  editProfile,
+  ownSessionDelete,
+  WORK_DIALOG_PERMISSION_FIXTURE,
+  workDialogOpenings,
+} from "./work-dialog-permission-fixture.ts";
+
 // The suite runs the development server with PUBLIC_SANDRUN_MOCK_API=true (see
 // e2e.config.ts): an in-browser fake control plane and a fake signed-in
 // user. These IDs and the secret come from src/mock/mock-api.ts.
@@ -1586,6 +1593,139 @@ describe("requests", () => {
     await screen.getByRole("checkbox", "Show ended requests").tap();
     await expect(table).toContainText("build (ubuntu)");
     await expect(endedRequest).toBeHidden();
+  });
+});
+
+describe("work management dialogs and organization role refresh", () => {
+  async function openWorkDialog(
+    { app, browser, screen }: WebFixtures & Pick<TestFixtures, "screen">,
+    opening: (typeof workDialogOpenings)[number],
+  ) {
+    await app.open("/");
+    await browser.evaluate((key) => {
+      sessionStorage.setItem(key, "enabled");
+      return null;
+    }, WORK_DIALOG_PERMISSION_FIXTURE);
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    const path = `/orgs/${ACME}/${opening.page}`;
+    await app.open(path);
+
+    const row = screen
+      .getByRole(opening.rowRole)
+      .filter({ hasText: opening.row });
+    const opener = (
+      opening.opener === "Create runner profile" ? screen : row
+    ).getByRole("button", opening.opener, { exact: true });
+    const dialog = screen.getByRole(opening.role, opening.title);
+    await opener.tap();
+    await expect(dialog).toBeVisible();
+
+    const refreshRole = async (role: Role) => {
+      const readCount = await browser.evaluate((next) => {
+        const fixture = window.sandrunWorkDialogPermissionFixture!;
+        const count = fixture.organizationReads.length;
+        fixture.setRole(next);
+        // Age the organization query and exercise the tab-focus refresh.
+        const now = Date.now;
+        Date.now = () => now() + 10_001;
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          value: "hidden",
+        });
+        window.dispatchEvent(new Event("visibilitychange"));
+        Reflect.deleteProperty(document, "visibilityState");
+        window.dispatchEvent(new Event("visibilitychange"));
+        return count;
+      }, role);
+      await expect
+        .poll(() =>
+          browser.evaluate(
+            (previous) =>
+              window.sandrunWorkDialogPermissionFixture!.organizationReads.slice(
+                previous,
+              ),
+            readCount,
+          ),
+        )
+        .toEqual([role]);
+    };
+    const mutations = () =>
+      browser.evaluate(() =>
+        window.sandrunWorkDialogPermissionFixture!.mutations.map(
+          ({ method }) => method,
+        ),
+      );
+    return { path, row, opener, dialog, refreshRole, mutations };
+  }
+
+  for (const opening of workDialogOpenings) {
+    test(`dismisses ${opening.title} on downgrade and requires a new opening`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      const { path, row, opener, dialog, refreshRole, mutations } =
+        await openWorkDialog({ app, browser, screen }, opening);
+      const name = dialog.getByLabel("Name", { exact: true });
+      if (opening.draftDefault !== undefined) await name.fill("unsent-draft");
+
+      await refreshRole(Role.MEMBER);
+      await expect(dialog).toHaveCount(0);
+      await expect(opener).toHaveCount(0);
+      await expect(row).toBeVisible();
+      await expect(browser).toHaveURL(path);
+      expect(await mutations()).toEqual([]);
+      await app.screenshot(
+        `work-dialog-member-${opening.page}-${opening.opener.toLowerCase().replaceAll(" ", "-")}`,
+      );
+
+      await refreshRole(Role.ADMIN);
+      await expect(opener).toBeVisible();
+      await expect(dialog).toHaveCount(0);
+      await opener.tap();
+      await expect(dialog).toBeVisible();
+      if (opening.draftDefault !== undefined) {
+        await expect(name).toHaveValue(opening.draftDefault);
+      }
+      expect(await mutations()).toEqual([]);
+    });
+  }
+
+  test("keeps a profile draft across a refresh that preserves permission", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const { dialog, refreshRole, mutations } = await openWorkDialog(
+      { app, browser, screen },
+      editProfile,
+    );
+    const name = dialog.getByLabel("Name", { exact: true });
+    await name.fill("linux-build-updated");
+
+    await refreshRole(Role.ADMIN);
+    await expect(dialog).toBeVisible();
+    await expect(name).toHaveValue("linux-build-updated");
+    await app.screenshot("work-dialog-admin-profile-draft");
+    await dialog.getByRole("button", editProfile.action).tap();
+    await expect.poll(mutations).toEqual(["UpdateRunnerProfile"]);
+  });
+
+  test("keeps the caller's dev session confirmation on downgrade", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    const { dialog, refreshRole, mutations } = await openWorkDialog(
+      { app, browser, screen },
+      ownSessionDelete,
+    );
+
+    await refreshRole(Role.MEMBER);
+    await expect(dialog).toBeVisible();
+    await app.screenshot("work-dialog-member-own-dev-session");
+    await dialog.getByRole("button", ownSessionDelete.action).tap();
+    await expect.poll(mutations).toEqual(["DeleteDevSession"]);
   });
 });
 

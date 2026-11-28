@@ -128,6 +128,9 @@ export function RequestsPage() {
   });
   const admin = can(role, Permission.CancelRequests);
   const now = useQueueWaitClock();
+  if (!admin && canceling !== undefined) {
+    setCanceling(undefined);
+  }
 
   return (
     <>
@@ -277,7 +280,7 @@ export function RequestsPage() {
       </QueryBoundary>
       <ListPagination query={list} />
       <ConfirmDialog
-        open={canceling !== undefined}
+        open={admin && canceling !== undefined}
         onOpenChange={(open) => !open && setCanceling(undefined)}
         title={t("requests.cancelDialog.title")}
         description={t("requests.cancelDialog.description")}
@@ -286,7 +289,7 @@ export function RequestsPage() {
           canceling !== undefined && isCancellationRejected(canceling)
         }
         onConfirm={async (opening) => {
-          if (canceling === undefined) return;
+          if (!admin || canceling === undefined) return;
           const { requestId, startAttempts } = canceling;
           try {
             await cancel.mutateAsync({ organizationId, requestId });

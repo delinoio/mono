@@ -29,9 +29,18 @@ import {
   setupWithGitHubInstallations,
 } from "./setup-guidance-fixture.ts";
 
+import {
+  WORK_DIALOG_PERMISSION_FIXTURE,
+  workDialogPermissionFixture,
+} from "./work-dialog-permission-fixture.ts";
+
 declare global {
   interface Window {
     sandrunDevSessionReads?: boolean[];
+    sandrunWorkDialogPermissionFixture?: Omit<
+      ReturnType<typeof workDialogPermissionFixture>,
+      "transport"
+    >;
     sandrunRequestCancellationFixture?: Omit<
       ReturnType<typeof requestCancellationFixture>,
       "transport"
@@ -122,6 +131,14 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
         existingAgentIntegration:
           setup === "failed-github-continuation-with-agent",
       });
+  }
+
+  if (sessionStorage.getItem(WORK_DIALOG_PERMISSION_FIXTURE) === "enabled") {
+    const { transport, ...fixture } = workDialogPermissionFixture(
+      createSettingsMock(options),
+    );
+    window.sandrunWorkDialogPermissionFixture = fixture;
+    return transport;
   }
 
   const permission = sessionStorage.getItem(INTEGRATION_PERMISSION_FIXTURE);
