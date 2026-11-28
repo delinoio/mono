@@ -81,7 +81,7 @@ export function MembersPage() {
         title={t("members.title")}
         description={t("members.description")}
         action={
-          can(role, Permission.LeaveOrganization) ? (
+          userId && can(role, Permission.LeaveOrganization) ? (
             <Button
               variant={ButtonVariant.Secondary}
               onClick={() => setLeaving(true)}
@@ -185,10 +185,11 @@ export function MembersPage() {
         description={t("members.leaveDialog.description")}
         confirmLabel={t("members.leave")}
         onConfirm={async (opening) => {
-          await removeMember.mutateAsync({
-            organizationId,
-            userId: userId ?? "",
-          });
+          if (!userId) {
+            setLeaving(false);
+            return;
+          }
+          await removeMember.mutateAsync({ organizationId, userId });
           // Refreshing the old route can unmount the confirmation.
           if (opening.isCurrent()) navigate("/");
           await refresh();

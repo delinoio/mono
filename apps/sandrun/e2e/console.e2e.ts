@@ -119,6 +119,134 @@ describe("sign-in", () => {
   });
 });
 
+describe("leave organization with delayed caller identity", () => {
+  const fixture = "/leave-organization-fixture.html";
+  const membersPath = `/orgs/${NORTHWIND}/members`;
+  const action = "Leave organization";
+
+  test("requires a fresh confirmation after the caller ID disappears", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open(fixture);
+
+    const roster = screen.getByRole("list", "Members");
+    const leave = screen.getByRole("button", action);
+    const dialog = screen.getByRole("alertdialog", "Leave this organization?");
+    const confirm = dialog.getByRole("button", action);
+    const body = browser.locator("body");
+    await expect(roster).toContainText("Mina Kim");
+    await expect(leave).toHaveCount(0);
+    await expect(body).toHaveAttribute("data-leave-requests", "0");
+    await app.screenshot("members-without-caller-id");
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "resolved" }),
+      );
+    });
+    await leave.tap();
+    await expect(dialog).toBeVisible();
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "missing" }),
+      );
+    });
+    await confirm.tap();
+
+    await expect(dialog).toBeHidden();
+    await expect(browser).toHaveURL(membersPath);
+    await expect(roster).toContainText("Mina Kim");
+    await expect(leave).toHaveCount(0);
+    await expect(body).toHaveAttribute("data-leave-requests", "0");
+    await expect(body).toHaveAttribute("data-roster-reads", "1");
+    await expect(body).toHaveAttribute("data-organization-reads", "1");
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "resolved" }),
+      );
+    });
+    await expect(leave).toBeVisible();
+    await expect(dialog).toBeHidden();
+    await leave.tap();
+    await confirm.tap();
+    await expect(body).toHaveAttribute("data-leave-requests", "1");
+    await expect(body).toHaveAttribute("data-leave-organization-id", NORTHWIND);
+    await expect(body).toHaveAttribute("data-leave-user-id", "mock-user-owner");
+
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-leave-result", { detail: "unavailable" }),
+      );
+    });
+    await expect(
+      dialog.getByText(
+        "SandRun is not available right now. Try again in a moment.",
+      ),
+    ).toBeVisible();
+    await expect(confirm).toBeEnabled();
+    await app.screenshot("leave-retry-after-failure");
+
+    await confirm.tap();
+    await expect(body).toHaveAttribute("data-leave-requests", "2");
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-leave-result", { detail: "success" }),
+      );
+    });
+
+    await expect(browser).toHaveURL("/");
+    await expect(body).toHaveAttribute("data-organization-reads", "2");
+    await expect(body).toHaveAttribute("data-path-at-organization-read", "/");
+    await expect(screen.getByRole("link", "Acme Robotics Owner")).toBeVisible();
+    await expect(screen.getByRole("link", "Northwind Labs Member")).toHaveCount(
+      0,
+    );
+  });
+
+  test("refreshes after a dismissed Leave without changing the current route", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open(fixture);
+    await expect(screen.getByRole("list", "Members")).toBeVisible();
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-caller", { detail: "resolved" }),
+      );
+    });
+    const leave = screen.getByRole("button", action);
+    const dialog = screen.getByRole("alertdialog", "Leave this organization?");
+    const body = browser.locator("body");
+    await leave.tap();
+    await dialog.getByRole("button", action).tap();
+    await expect(body).toHaveAttribute("data-leave-requests", "1");
+    const historyLength = await browser.evaluate(() => window.history.length);
+
+    await dialog.getByRole("button", "Cancel").tap();
+    await expect(dialog).toBeHidden();
+    await browser.evaluate(() => {
+      return window.dispatchEvent(
+        new CustomEvent("sandrun-e2e-leave-result", { detail: "success" }),
+      );
+    });
+
+    await expect(body).toHaveAttribute("data-organization-reads", "2");
+    await expect(body).toHaveAttribute(
+      "data-path-at-organization-read",
+      membersPath,
+    );
+    await expect(browser).toHaveURL(membersPath);
+    expect(await browser.evaluate(() => window.history.length)).toBe(
+      historyLength,
+    );
+  });
+});
+
 describe("organizations", () => {
   test("keeps the Requests section when switching organizations", async ({
     app,
