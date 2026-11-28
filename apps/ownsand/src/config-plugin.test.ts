@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { RsbuildPlugin } from "@rsbuild/core";
+import type { RsbuildContext, RsbuildPlugin } from "@rsbuild/core";
 import { describe, expect, test } from "@rstest/core";
 import { pluginConsoleConfig } from "./config-plugin.ts";
 
@@ -9,9 +9,13 @@ type EnvironmentConfigHook = (config: { mode: string }) => void;
  * Runs the plugin's `setup` with a fake plugin API and returns the callback
  * it registered with `modifyEnvironmentConfig`.
  */
-function environmentConfigHook(plugin: RsbuildPlugin): EnvironmentConfigHook {
+function environmentConfigHook(
+  plugin: RsbuildPlugin,
+  action: RsbuildContext["action"] = "build",
+): EnvironmentConfigHook {
   let hook: EnvironmentConfigHook | undefined;
   const api = {
+    context: { action },
     modifyEnvironmentConfig(callback: EnvironmentConfigHook) {
       hook = callback;
     },
@@ -27,6 +31,14 @@ const PRODUCTION_DIAGNOSTIC =
   "PUBLIC_OWNSAND_MOCK_API must not be set for a production build";
 
 describe("console configuration plugin", () => {
+  test("allows a production-mode preview when the mock flag is enabled", () => {
+    const hook = environmentConfigHook(
+      pluginConsoleConfig({ PUBLIC_OWNSAND_MOCK_API: "true" }),
+      "preview",
+    );
+    expect(() => hook({ mode: "production" })).not.toThrow();
+  });
+
   test.each(["true", " true ", "\ttrue\n"])(
     "rejects the mock flag %j when the resolved mode is production",
     (value) => {

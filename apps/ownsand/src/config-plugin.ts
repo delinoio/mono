@@ -19,6 +19,11 @@ export function pluginConsoleConfig(env: ConsoleBuildEnv): RsbuildPlugin {
     name: "ownsand:console-config",
     setup(api) {
       api.modifyEnvironmentConfig((config) => {
+        // Preview serves files with their compiled values.
+        if (api.context.action === "preview") {
+          return;
+        }
+
         readConsoleConfig(env, { production: config.mode === "production" });
       });
     },
