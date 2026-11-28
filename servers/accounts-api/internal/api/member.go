@@ -178,7 +178,6 @@ func (h *BillingAccountHandler) UpdateMemberRole(ctx context.Context, req *conne
 	if !ok {
 		return nil, invalidArgument("role must be ADMIN or VIEWER")
 	}
-	now := h.timestamp()
 	var target member
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
@@ -205,6 +204,7 @@ func (h *BillingAccountHandler) UpdateMemberRole(ctx context.Context, req *conne
 		}
 		oldRole := target.Role
 		target.Role = role
+		now := h.timestamp()
 		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditMemberRoleChanged, ActorUserID: userID, TargetUserID: targetID,
 			Details: map[string]string{"old_role": string(oldRole), "new_role": string(role)},
@@ -233,7 +233,6 @@ func (h *BillingAccountHandler) RemoveMember(ctx context.Context, req *connect.R
 	if err != nil {
 		return nil, err
 	}
-	now := h.timestamp()
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
@@ -258,6 +257,7 @@ func (h *BillingAccountHandler) RemoveMember(ctx context.Context, req *connect.R
 			accountID, targetID); err != nil {
 			return err
 		}
+		now := h.timestamp()
 		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditMemberRemoved, ActorUserID: userID, TargetUserID: targetID,
 			Details: map[string]string{"role": string(target.Role)},
@@ -285,7 +285,6 @@ func (h *BillingAccountHandler) TransferOwnership(ctx context.Context, req *conn
 	if err != nil {
 		return nil, err
 	}
-	now := h.timestamp()
 	var account billingAccount
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
@@ -314,6 +313,7 @@ func (h *BillingAccountHandler) TransferOwnership(ctx context.Context, req *conn
 			return err
 		}
 		account.CallerRole = RoleAdmin
+		now := h.timestamp()
 		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditOwnershipTransferred, ActorUserID: userID, TargetUserID: targetID,
 			Details: map[string]string{"new_owner_previous_role": string(target.Role)},
