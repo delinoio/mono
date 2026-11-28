@@ -5,7 +5,11 @@ import {
   FieldError,
   FieldLabel,
 } from "@ui-sdk/react/field";
-import { numberFormatter, parseNumber } from "@ui-sdk/core/number";
+import {
+  isPartialNumber,
+  numberFormatter,
+  parseNumber,
+} from "@ui-sdk/core/number";
 import {
   NumberInputControl,
   NumberInputDecrement,
@@ -13,7 +17,7 @@ import {
   NumberInputIncrement,
   NumberInput as NumberInputRoot,
 } from "@ui-sdk/react/number-input";
-import { useImperativeHandle, useRef } from "react";
+import { useEffect, useImperativeHandle, useRef } from "react";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 import { useFieldAutoFocus } from "./panel-autofocus.ts";
@@ -21,6 +25,8 @@ import { useFieldAutoFocus } from "./panel-autofocus.ts";
 export interface NumberInputDraft {
   /** Whether the text currently contains a fractional value. */
   hasFraction: () => boolean;
+  /** The typed value below `min` when `preserveBelowMin` is enabled. */
+  valueBelowMin: () => number | null;
 }
 
 export type NumberInputProps = Omit<
@@ -50,18 +56,24 @@ export type NumberInputProps = Omit<
    * When supplied, Enter and blur keep fractions for the form to validate.
    */
   draftRef?: React.Ref<NumberInputDraft>;
+  /** With `draftRef`, keeps typed values below `min` for form validation. */
+  preserveBelowMin?: boolean;
 };
 
-function hasFraction(input: HTMLInputElement, locale: string | undefined) {
-  const inputLocale =
+function draftLocale(input: HTMLInputElement, locale: string | undefined) {
+  return (
     locale ??
-    (input.closest("[lang]")?.getAttribute("lang") || navigator.language);
-  const value = parseNumber(input.value, inputLocale);
+    (input.closest("[lang]")?.getAttribute("lang") || navigator.language)
+  );
+}
+
+function hasFraction(input: HTMLInputElement, locale: string) {
+  const value = parseNumber(input.value, locale);
   if (value !== null && !Number.isInteger(value)) return true;
 
   // Parsing can round a fractional draft to an integer. Check the typed
   // digits after the decimal separator before allowing that integer through.
-  const formatter = numberFormatter(inputLocale);
+  const formatter = numberFormatter(locale);
   const separator = formatter
     .formatToParts(0.1)
     .find((part) => part.type === "decimal")?.value;
@@ -69,16 +81,27 @@ function hasFraction(input: HTMLInputElement, locale: string | undefined) {
   const [, fraction] = input.value.split(separator);
   if (!fraction) return false;
   return Boolean(
-    parseNumber(fraction.replaceAll(formatter.format(0), ""), inputLocale),
+    parseNumber(fraction.replaceAll(formatter.format(0), ""), locale),
   );
+}
+
+function valueBelowMin(
+  input: HTMLInputElement,
+  locale: string,
+  min: number | undefined,
+) {
+  if (min === undefined) return null;
+  const value = parseNumber(input.value, locale);
+  return value !== null && value < min ? value : null;
 }
 
 /**
  * A labeled number field with minus and plus buttons, built from UI SDK
  * `Field` and `NumberInput`. Typing, arrow keys and the buttons change the
  * value; Enter or leaving the input clamps it to `min` and `max` and snaps
- * it to `step` unless `draftRef` keeps a typed fraction. An empty
- * input has the value `null`.
+ * it to `step`. Forms can use `draftRef` to keep fractional drafts and
+ * `preserveBelowMin` to keep drafts below `min`. An empty input has the
+ * value `null`.
  */
 export function NumberInput({
   label,
@@ -91,6 +114,7 @@ export function NumberInput({
   className,
   disabled,
   draftRef,
+  preserveBelowMin,
   ...props
 }: NumberInputProps) {
   // A caller `data-autofocus` would be spread onto the non-tabbable root
@@ -121,15 +145,63 @@ export function NumberInput({
     disabled,
   );
   const inputRef = useRef<HTMLInputElement>(null);
+  const { locale, format } = rootProps;
+  const draftMin = draftRef && preserveBelowMin ? rootProps.min : undefined;
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input || draftMin === undefined || draftMin < 0) return;
+
+    // The SDK's native beforeinput listener blocks the minus sign at a
+    // nonnegative minimum. Let valid negative drafts reach its input handler
+    // so the form can report them. Remove when the SDK supports validating
+    // typed values before clamping.
+    const allowNegativeDraft = (event: InputEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        !event.inputType.startsWith("insert") ||
+        event.data === null
+      ) {
+        return;
+      }
+      const start = input.selectionStart ?? input.value.length;
+      const end = input.selectionEnd ?? start;
+      const next =
+        input.value.slice(0, start) + event.data + input.value.slice(end);
+      const inputLocale = draftLocale(input, locale);
+      if (
+        isPartialNumber(next, inputLocale, format) &&
+        !isPartialNumber(next, inputLocale, format, { allowNegative: false })
+      ) {
+        event.stopImmediatePropagation();
+      }
+    };
+    input.addEventListener("beforeinput", allowNegativeDraft, true);
+    return () =>
+      input.removeEventListener("beforeinput", allowNegativeDraft, true);
+  }, [draftMin, format, locale]);
   useImperativeHandle(
     draftRef,
     () => ({
       hasFraction: () =>
         inputRef.current !== null &&
-        hasFraction(inputRef.current, rootProps.locale),
+        hasFraction(inputRef.current, draftLocale(inputRef.current, locale)),
+      valueBelowMin: () => {
+        const input = inputRef.current;
+        return input
+          ? valueBelowMin(input, draftLocale(input, locale), draftMin)
+          : null;
+      },
     }),
-    [rootProps.locale],
+    [draftMin, locale],
   );
+  const keepDraft = (input: HTMLInputElement) => {
+    const inputLocale = draftLocale(input, locale);
+    return (
+      valueBelowMin(input, inputLocale, draftMin) !== null ||
+      hasFraction(input, inputLocale)
+    );
+  };
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -172,8 +244,8 @@ export function NumberInput({
             aria-label={ariaLabel}
             aria-labelledby={ariaLabelledBy}
             data-autofocus={marker}
-            // The UI SDK snaps typed text before the form submits on Enter or
-            // after blur. Skip only those SDK handlers for fractional drafts.
+            // The UI SDK clamps and snaps the draft on Enter or blur. Skip
+            // those handlers when the form needs to validate the draft.
             // The browser still submits on Enter and the SDK still handles steps.
             // Remove when the UI SDK supports validating unsnapped typed values.
             ref={draftRef ? inputRef : undefined}
@@ -185,15 +257,13 @@ export function NumberInput({
                       onKeyDown={(event) => {
                         if (
                           event.key !== "Enter" ||
-                          !hasFraction(event.currentTarget, rootProps.locale)
+                          !keepDraft(event.currentTarget)
                         ) {
                           onKeyDown?.(event);
                         }
                       }}
                       onBlur={(event) => {
-                        if (
-                          !hasFraction(event.currentTarget, rootProps.locale)
-                        ) {
+                        if (!keepDraft(event.currentTarget)) {
                           onBlur?.(event);
                         }
                       }}
