@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,53 +17,36 @@ import (
 
 // Durable cleanup records of unfinished writes.
 //
-// The staging file of a write lives next to its target and is owned by the
-// helper process only in memory. When the helper process exits (a crash, a
-// kill, or a restart by the init process of a Linux guest) the staging file
-// would stay forever, because no sweep knows about it. The helper therefore
-// keeps one small record per staging file in "<state dir>/writes". A record
-// holds the write_id, the staging path, the identity of the staging file and
-// the time of the last accepted chunk. The next helper process loads the
-// records at start and lets the regular sweep expire them after
-// OperationRetention without a chunk, like the writes of the same process.
+// A staging file stays on the destination volume. Before exposing the staging
+// name, the helper records a private reservation and the identity of the
+// file in it. The staging name is a hard link to that file. The reservation
+// keeps the file identity allocated until the staging name is gone.
 //
-// Record lifecycle:
-//  1. The staging file is created exclusively, then its record is written
-//     (temporary file and rename). A crash between the sync and the rename of
-//     this first save leaves only the temporary record. The next start
-//     attempts to promote a complete, valid record and loads it from the
-//     temporary path if promotion fails.
-//  2. Each accepted chunk replaces the record to refresh the time of the last
-//     chunk. A failure only logs: the next chunk or the sweep tries again.
-//  3. A finish removes the record after the rename into place.
-//  4. An expired write removes the staging file first and the record second,
-//     so an interrupted cleanup keeps the record and the next sweep or the
-//     next start tries again.
+// The helper replaces the record after each accepted chunk. These refreshes
+// are best effort. Finish publishes the file before removing the reservation
+// and record. Expiry removes the staging name first, then the reservation
+// and record. The next helper process loads the records and retries cleanup.
 //
-// A write that the helper recovers has no open file and no written ranges, so
-// the helper cannot continue it. A chunk or finish for its write_id fails
-// with not_found until the write expires, like a write whose state is lost.
+// A recovered write can only expire. Its in-memory written ranges were lost,
+// so a chunk or finish for its write_id fails with not_found.
 
 const (
 	writeRecordVersionUnixNano  = 1
 	writeRecordVersionSplitTime = 2
-)
-
-var (
-	minWriteRecordUnixNanoTime = time.Unix(0, math.MinInt64)
-	maxWriteRecordUnixNanoTime = time.Unix(0, math.MaxInt64)
+	writeRecordVersionReserved  = 3
 )
 
 // writeRecord is the JSON content of a record file. The file is sandbox
 // content (it holds a guest path), so the helper never logs it.
 type writeRecord struct {
-	Version        int          `json:"version"`
-	WriteID        string       `json:"write_id"`
-	TmpPath        string       `json:"tmp_path"`
-	Identity       fileIdentity `json:"identity"`
-	LastNano       *int64       `json:"last_chunk_unix_nano,omitempty"`
-	LastSeconds    *int64       `json:"last_chunk_unix_seconds,omitempty"`
-	LastNanosecond *int         `json:"last_chunk_nanosecond,omitempty"`
+	Version        int               `json:"version"`
+	WriteID        string            `json:"write_id"`
+	TmpPath        string            `json:"tmp_path"`
+	Identity       *fileIdentity     `json:"identity,omitempty"`
+	Reservation    *writeReservation `json:"reservation,omitempty"`
+	LastNano       *int64            `json:"last_chunk_unix_nano,omitempty"`
+	LastSeconds    *int64            `json:"last_chunk_unix_seconds,omitempty"`
+	LastNanosecond *int              `json:"last_chunk_nanosecond,omitempty"`
 
 	lastChunk time.Time
 }
@@ -120,20 +102,16 @@ func (m *writeManager) recordPath(writeID string) string {
 // nothing that is in the page cache.
 func saveWriteRecord(e *writeEntry, durable bool) error {
 	path := e.recordPath
-	if path == "" || e.identity == nil {
+	if path == "" || e.reservation == nil {
 		return nil
 	}
-	rec := writeRecord{WriteID: e.id, TmpPath: e.tmp, Identity: *e.identity}
-	if e.lastChunk.Before(minWriteRecordUnixNanoTime) || e.lastChunk.After(maxWriteRecordUnixNanoTime) {
-		rec.Version = writeRecordVersionSplitTime
-		seconds, nanosecond := e.lastChunk.Unix(), e.lastChunk.Nanosecond()
-		rec.LastSeconds = &seconds
-		rec.LastNanosecond = &nanosecond
-	} else {
-		rec.Version = writeRecordVersionUnixNano
-		nano := e.lastChunk.UnixNano()
-		rec.LastNano = &nano
+	rec := writeRecord{
+		WriteID: e.id, TmpPath: e.tmp, Identity: e.identity, Reservation: e.reservation,
+		Version: writeRecordVersionReserved,
 	}
+	seconds, nanosecond := e.lastChunk.Unix(), e.lastChunk.Nanosecond()
+	rec.LastSeconds = &seconds
+	rec.LastNanosecond = &nanosecond
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -180,11 +158,10 @@ func removeWriteRecord(path string) error {
 	return nil
 }
 
-// persistRecord saves the record and logs a failure. A failed record never
-// fails the write: the upload still works, only its cleanup after a helper
-// restart is lost.
-func (m *writeManager) persistRecord(e *writeEntry, durable bool) {
-	if err := saveWriteRecord(e, durable); err != nil {
+// persistRecord refreshes the expiry. If it fails, the previous record
+// still allows cleanup after a helper restart.
+func (m *writeManager) persistRecord(e *writeEntry) {
+	if err := saveWriteRecord(e, false); err != nil {
 		m.logger.Warn("save write record failed", "write_id", e.id, "error", sanitizedError(err))
 	}
 }
@@ -245,40 +222,39 @@ func (m *writeManager) loadRecords() error {
 		default:
 			continue
 		}
-		if _, err := lstatStaging(rec.TmpPath); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				if err := removeWriteRecord(path); err != nil {
-					m.logger.Warn("remove write record failed", "write_id", rec.WriteID, "error", sanitizedError(err))
-					m.entries[rec.WriteID] = &writeEntry{
-						id:         rec.WriteID,
-						gone:       true,
-						recordPath: path,
-						recordOnly: true,
-					}
-				} else {
-					m.logger.Info("drop write record without staging file", "write_id", rec.WriteID)
-				}
-				continue
-			}
-			// Any other error (a transient I/O error, a permission denial) does
-			// not show that the staging file is gone. Keep the record and
-			// register the write, so the sweep retries the cleanup; dropping the
-			// record would orphan a staging file that still exists.
-			m.logger.Warn("write record: staging file lookup failed, keeping the record", "write_id", rec.WriteID, "error", sanitizedError(err))
-		}
 		last := rec.lastChunk
 		if last.After(now) {
 			last = now
 		}
-		identity := rec.Identity
-		m.entries[rec.WriteID] = &writeEntry{
-			id:         rec.WriteID,
-			tmp:        rec.TmpPath,
-			identity:   &identity,
-			lastChunk:  last,
-			recordPath: path,
-			recovered:  true,
+		e := &writeEntry{
+			id:          rec.WriteID,
+			tmp:         rec.TmpPath,
+			identity:    rec.Identity,
+			reservation: rec.Reservation,
+			lastChunk:   last,
+			recordPath:  path,
+			recovered:   true,
 		}
+		if rec.Identity == nil {
+			// The helper had not published any staging name.
+			e.recordOnly = true
+		} else if _, err := lstatStaging(rec.TmpPath); errors.Is(err, fs.ErrNotExist) {
+			e.recordOnly = true
+		} else if err != nil {
+			// A transient error does not show that staging is gone.
+			m.logger.Warn("write record: staging file lookup failed, keeping the record", "write_id", e.id, "error", sanitizedError(err))
+		}
+		if e.recordOnly {
+			if err := m.cleanup(e); err != nil {
+				m.logger.Warn("remove write record failed", "write_id", e.id, "error", sanitizedError(err))
+				e.gone = true
+				m.entries[e.id] = e
+			} else {
+				m.logger.Info("drop write record without staging file", "write_id", e.id)
+			}
+			continue
+		}
+		m.entries[e.id] = e
 		m.logger.Info("write recovered after restart", "write_id", rec.WriteID)
 	}
 	return nil
@@ -286,15 +262,11 @@ func (m *writeManager) loadRecords() error {
 
 // settleTempRecords handles the temporary files of interrupted record saves.
 // A temporary record exists only between the write of a save and its rename.
-// When the canonical record exists, the save replaced an intact record and
-// the temporary file is stale: it is removed. When the canonical record is
-// absent, the interrupted save was the first one of a write (it is durable:
-// the helper syncs it before the rename), so the temporary record is the only
-// record of a staging file that exists. A complete, valid temporary record
-// whose content belongs to its name is promoted to the canonical name, and the
-// normal load checks (staging file lookup, identity at cleanup) apply to it.
-// If promotion fails, keep the temporary file and return its validated record
-// for loading. Remove invalid temporary records without touching staging files.
+// A canonical record takes precedence over its temporary file. Without a
+// canonical record, a complete temporary file might be the only copy of a
+// creation intent or legacy record. Promote it if its write ID matches its
+// name. If promotion fails, return the validated record for loading from the
+// temporary path. When discarding an invalid file, touch only the record.
 func (m *writeManager) settleTempRecords() map[string]writeRecord {
 	items, err := os.ReadDir(m.dir)
 	if err != nil {
@@ -364,7 +336,7 @@ func readWriteRecord(path string) (writeRecord, error) {
 			return rec, errors.New("invalid UnixNano timestamp in write record")
 		}
 		rec.lastChunk = time.Unix(0, *rec.LastNano)
-	case writeRecordVersionSplitTime:
+	case writeRecordVersionSplitTime, writeRecordVersionReserved:
 		if rec.LastNano != nil || rec.LastSeconds == nil || rec.LastNanosecond == nil ||
 			*rec.LastNanosecond < 0 || *rec.LastNanosecond >= int(time.Second) {
 			return rec, errors.New("invalid split timestamp in write record")
@@ -376,6 +348,13 @@ func readWriteRecord(path string) (writeRecord, error) {
 		}
 	default:
 		return rec, errors.New("unsupported record version")
+	}
+	if rec.Version == writeRecordVersionReserved {
+		if rec.Reservation == nil || !rec.Reservation.validFor(rec.TmpPath) {
+			return rec, errors.New("invalid write reservation")
+		}
+	} else if rec.Reservation != nil || rec.Identity == nil {
+		return rec, errors.New("invalid staging identity in write record")
 	}
 	return rec, nil
 }
@@ -391,12 +370,21 @@ func (m *writeManager) cleanup(e *writeEntry) error {
 			return err
 		}
 	}
+	if err := e.removeReservation(); err != nil {
+		return err
+	}
 	return removeWriteRecord(e.recordPath)
 }
 
 // removeStaging removes the staging file of e. A file at the staging path
 // that is not the file the helper created (somebody replaced it) is kept.
 func (m *writeManager) removeStaging(e *writeEntry) error {
+	if e.reservation != nil {
+		owned, err := e.ownsStaging()
+		if err != nil || !owned {
+			return err
+		}
+	}
 	if e.identity != nil {
 		current, err := identityOfPath(e.tmp)
 		switch {

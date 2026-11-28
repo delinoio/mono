@@ -82,12 +82,13 @@ type writeEntry struct {
 	finishedAt time.Time
 	result     *ownsandv1.WriteFileResponse
 	gone       bool
-	// identity is the identity of the staging file that the helper created;
-	// nil when the platform has none, which also means that no record is kept.
+	// identity is nil until the reserved file is identified.
 	identity *fileIdentity
+	// reservation pins the identity until the staging name is retired.
+	reservation *writeReservation
 	// recordPath is the canonical or retained temporary record location.
 	recordPath string
-	// recordOnly marks a startup cleanup whose staging file was already absent.
+	// recordOnly skips staging removal when no stage was created or found.
 	recordOnly bool
 	// recovered marks a write of an earlier helper process: it has a staging
 	// file but no open file and no written ranges, so it can only expire.
@@ -195,25 +196,16 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 	if st, err := os.Lstat(target); err == nil && st.IsDir() {
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: target is a directory")
 	}
-	tmp := tempPath(target, id)
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fsError("write", err)
-	}
 	e := &writeEntry{
 		id:         id,
 		path:       bound,
 		target:     target,
-		tmp:        tmp,
-		file:       f,
+		tmp:        tempPath(target, id),
 		lastChunk:  m.now(),
 		recordPath: m.recordPath(id),
 	}
-	if identity, err := identityOfFile(f); err == nil {
-		e.identity = &identity
-		m.persistRecord(e, true)
-	} else if !errors.Is(err, errors.ErrUnsupported) {
-		m.logger.Warn("read write staging file identity failed", "write_id", id, "error", sanitizedError(err))
+	if err := m.createStaging(e, dir); err != nil {
+		return nil, fsError("write", err)
 	}
 	m.entries[id] = e
 	m.logger.Info("write started", "write_id", id)
@@ -267,7 +259,7 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 	// The record refresh stays before the finish, so a finish error keeps the
 	// refreshed expiry.
 	e.lastChunk = m.now()
-	m.persistRecord(e, false)
+	m.persistRecord(e)
 	resp := &ownsandv1.WriteFileResponse{WriteId: req.GetWriteId(), Offset: req.GetOffset(), Length: int64(len(req.GetData()))}
 	if finish == nil {
 		return resp, nil
@@ -278,10 +270,8 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 	e.finished = true
 	e.finish = fieldsOf(req)
 	e.finishedAt = m.now()
-	// The staging file is the target now. A failure keeps the record, which
-	// the next start drops (its staging file is gone) and the sweep removes
-	// after the retention time.
-	if err := removeWriteRecord(e.recordPath); err != nil {
+	// The next sweep or restart retries cleanup if it fails after publication.
+	if err := m.cleanup(e); err != nil {
 		m.logger.Warn("remove write record failed", "write_id", req.GetWriteId(), "error", sanitizedError(err))
 	}
 	resp.Finished = true

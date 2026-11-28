@@ -68,3 +68,64 @@ func TestWriteRecoveryRecordHandleBlocksPromotionAndCleanup(t *testing.T) {
 		t.Fatalf("records after the handle closed: %v", got)
 	}
 }
+
+func TestWriteRecoveryCreationIntentWithHeldStagingHandle(t *testing.T) { //nolint:paralleltest // Replaces stageLink while interrupting initialization.
+	h := newHarness(t, nil)
+	req := newInterruptedWrite(t, h)
+	intent := interruptBeforeFirstChunk(t, h, req, true)
+	path, err := windows.UTF16PtrFromString(extendedPath(intent.TmpPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h = restart(t, h, nil)
+	assertWriteLostAfterRestart(t, h, req)
+	func() {
+		handle, err := windows.CreateFile(path, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil,
+			windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := windows.CloseHandle(handle); err != nil {
+				t.Error(err)
+			}
+		}()
+		h.clock.Advance(OperationRetention)
+		h.srv.Sweep()
+		if !exists(intent.TmpPath) || !exists(intent.Reservation.file()) || len(recordFiles(t, h)) != 1 {
+			t.Fatal("a handle without delete sharing must leave the staging file and its proof in place")
+		}
+	}()
+	h.srv.Sweep()
+	if exists(intent.TmpPath) || exists(intent.Reservation.Dir) || len(recordFiles(t, h)) != 0 {
+		t.Fatal("cleanup retry did not remove staging and its proof after the handle closed")
+	}
+	if got, err := os.ReadFile(req.GetPath()); err != nil || string(got) != "old" {
+		t.Fatalf("destination = %q, %v", got, err)
+	}
+}
+
+func TestWriteFileInheritsDestinationDACL(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	req := newInterruptedWrite(t, h)
+	sibling := filepath.Join(filepath.Dir(req.GetPath()), "sibling")
+	if err := os.WriteFile(sibling, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req.Finish = &ownsandv1.WriteFileFinish{SizeBytes: int64(len(req.GetData()))}
+	if resp, errd := h.write(req); errd != nil || !resp.GetFinished() {
+		t.Fatalf("finish = %v, %v", resp, errd)
+	}
+	getDACL := func(path string) string {
+		t.Helper()
+		descriptor, err := windows.GetNamedSecurityInfo(extendedPath(path), windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return descriptor.String()
+	}
+	if got, want := getDACL(req.GetPath()), getDACL(sibling); got != want {
+		t.Fatalf("published DACL = %q, want sibling DACL %q", got, want)
+	}
+}
