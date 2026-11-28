@@ -202,6 +202,7 @@ func TestConnectWithoutAcknowledgementFails(t *testing.T) {
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 	fault := initialStateReportFault(t, env)
 	fault.on("40001", 1)
+	testenv.Eventually(t, "the control baseline to be ready", env.App.Service.BaselineReady)
 
 	agent := env.NewFakeAgent(dev)
 	done, rec := connectInBackground(agent, t)
@@ -216,5 +217,8 @@ func TestConnectWithoutAcknowledgementFails(t *testing.T) {
 	}
 	if env.App.Service.Hub.Live(dev.ID) != nil {
 		t.Fatal("the device is live after its first state report failed")
+	}
+	if calls := fault.calls(); calls != 1 {
+		t.Fatalf("the fault was reached %d times, want 1", calls)
 	}
 }
