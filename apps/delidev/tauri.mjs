@@ -2,14 +2,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { constants, tmpdir } from "node:os";
-import { extname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "@tauri-apps/cli";
 import { linuxCefCli } from "./tauri-debian-cli.mjs";
@@ -22,6 +24,92 @@ const forwardedIndex = options.indexOf("--");
 const tauriOptions =
   forwardedIndex === -1 ? options : options.slice(0, forwardedIndex);
 const require = createRequire(import.meta.url);
+const tauriDir = fileURLToPath(new URL("./src-tauri/", import.meta.url));
+
+function freshMobileHost() {
+  if (
+    (command !== "android" && command !== "ios") ||
+    tauriOptions.find((option) => !option.startsWith("-")) !== "init" ||
+    tauriOptions.some(
+      (option) =>
+        option === "--help" ||
+        option === "--version" ||
+        /^-v*[hV]/.test(option),
+    )
+  ) {
+    return;
+  }
+
+  const host = join(tauriDir, "gen", command === "ios" ? "apple" : command);
+  if (!existsSync(host)) return host;
+}
+
+function androidLauncherFiles(host) {
+  const main = join(host, "app", "src", "main");
+  const res = join(main, "res");
+  if (
+    !statSync(join(main, "AndroidManifest.xml")).isFile() ||
+    !statSync(res).isDirectory()
+  ) {
+    throw new Error(`Expected a generated Android project at ${host}`);
+  }
+  const densities = ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"];
+  const pngs = ["ic_launcher", "ic_launcher_round", "ic_launcher_foreground"];
+  return {
+    destination: res,
+    files: [
+      ...densities.flatMap((density) =>
+        pngs.map((name) => join(`mipmap-${density}`, `${name}.png`)),
+      ),
+      join("mipmap-anydpi-v26", "ic_launcher.xml"),
+      join("values", "ic_launcher_background.xml"),
+    ],
+  };
+}
+
+function iosLauncherFiles(host) {
+  const destination = join(host, "Assets.xcassets", "AppIcon.appiconset");
+  const catalog = join(destination, "Contents.json");
+  const { images } = JSON.parse(readFileSync(catalog, "utf8"));
+  const files = images
+    ?.map((image) => image.filename)
+    .filter((filename) => filename !== undefined);
+  if (
+    !files?.length ||
+    files.some(
+      (name) => typeof name !== "string" || !/^[^/\\:]+\.png$/.test(name),
+    )
+  ) {
+    throw new Error(`Expected launcher PNG filenames in ${catalog}`);
+  }
+  return { destination, files: new Set(files) };
+}
+
+function installMobileLauncherIcons(host) {
+  try {
+    const { destination, files } =
+      command === "android"
+        ? androidLauncherFiles(host)
+        : iosLauncherFiles(host);
+    const source = join(tauriDir, "icons", command);
+    // Read every required asset before replacing any stock artwork.
+    const assets = Array.from(files, (file) => ({
+      path: join(destination, file),
+      content: readFileSync(join(source, file)),
+    }));
+    for (const { path, content } of assets) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, content);
+    }
+  } catch (error) {
+    throw new Error(
+      `Failed to install DeliDev launcher icons for ${command}: ${error.message}`,
+      {
+        cause: error,
+      },
+    );
+  }
+}
 
 function requestedBundles(options) {
   let formats;
@@ -121,7 +209,6 @@ function resolveConfig(platformName) {
   const getProbeDir = () =>
     (probeDir ??= mkdtempSync(join(tmpdir(), "delidev-config-")));
   try {
-    const tauriDir = fileURLToPath(new URL("./src-tauri/", import.meta.url));
     const base = ["tauri.conf.json", "tauri.conf.json5", "Tauri.toml"]
       .map((file) => join(tauriDir, file))
       .find(existsSync);
@@ -387,7 +474,9 @@ try {
   } else if (cli) {
     process.exitCode = await runPatchedCli(cli, args, { stdio: "inherit" });
   } else {
+    const host = freshMobileHost();
     await run(args, "pnpm tauri");
+    if (host) installMobileLauncherIcons(host);
   }
 } catch (error) {
   console.error(error.message);

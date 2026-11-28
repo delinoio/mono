@@ -5,6 +5,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { patchCefLinuxDependencies } from "./tauri-debian-cli.mjs";
@@ -135,6 +136,173 @@ console.log(JSON.stringify({ cli: "stock", args }));
 const linuxOnly = { skip: process.platform !== "linux" };
 const unixOnly = { skip: !["darwin", "linux"].includes(process.platform) };
 const embedCef = '{"bundle":{"cef":{"embed":true}}}';
+
+function mobileFixture(t) {
+  const { root, invoke, run } = fixture(t);
+  const tauri = join(root, "src-tauri");
+  const templates = join(root, "templates");
+  const androidMain = join("android", "app", "src", "main");
+  const iconSet = join("apple", "Assets.xcassets", "AppIcon.appiconset");
+  const androidRes = join(tauri, "gen", androidMain, "res");
+  const iosIcons = join(tauri, "gen", iconSet);
+  const iosNames = ["AppIcon-512@2x.png", "AppIcon-20x20@2x-1.png"];
+  const catalog = JSON.stringify({
+    images: [...iosNames.map((filename) => ({ filename })), { idiom: "ipad" }],
+  });
+  const androidLauncher = join("mipmap-mdpi", "ic_launcher.png");
+  const stock = "stock";
+
+  for (const [file, content] of [
+    [
+      join(androidMain, "AndroidManifest.xml"),
+      '<application android:icon="@mipmap/ic_launcher" />',
+    ],
+    [join(androidMain, "res", androidLauncher), stock],
+    [join(androidMain, "res", "values", "strings.xml"), "unrelated resource"],
+    [join(iconSet, "Contents.json"), catalog],
+    ...iosNames.map((name) => [join(iconSet, name), stock]),
+  ]) {
+    const path = join(templates, file);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+  }
+  for (const platform of ["android", "ios"]) {
+    cpSync(
+      new URL(`./src-tauri/icons/${platform}/`, import.meta.url),
+      join(tauri, "icons", platform),
+      { recursive: true },
+    );
+  }
+
+  writeFileSync(
+    join(root, "node_modules", "@tauri-apps", "cli", "index.js"),
+    `const { cpSync, existsSync } = require("node:fs");
+const { join } = require("node:path");
+exports.run = async (args) => {
+  const [platform, action] = args.filter((arg) => !arg.startsWith("-"));
+  const folder = platform === "ios" ? "apple" : platform;
+  const host = join("src-tauri", "gen", folder);
+  if (action === "init" && !args.includes("--help") && !args.includes("-vh") &&
+      !process.env.DELIDEV_TEST_NO_HOST && !existsSync(host)) {
+    await new Promise((resolve) => setImmediate(resolve));
+    cpSync(join("templates", folder), host, { recursive: true });
+    if (process.env.DELIDEV_TEST_FAIL_INIT) throw new Error("Tauri init failed");
+  }
+  console.log(JSON.stringify({ cli: "stock", args }));
+};`,
+  );
+
+  return {
+    tauri,
+    invoke,
+    run,
+    androidRes,
+    androidLauncher,
+    iosIcons,
+    iosNames,
+    catalog,
+    stock,
+  };
+}
+
+test("fresh mobile init installs only the selected host's launcher assets", (t) => {
+  const {
+    tauri,
+    run,
+    androidRes,
+    androidLauncher,
+    iosIcons,
+    iosNames,
+    catalog,
+  } = mobileFixture(t);
+  const android = ["android", "-v", "init", "--ci"];
+  assert.deepEqual(run(...android), { cli: "stock", args: android });
+  assert.equal(existsSync(iosIcons), false);
+
+  const androidSource = join(tauri, "icons", "android");
+  const androidFiles = readdirSync(androidSource, {
+    recursive: true,
+    withFileTypes: true,
+  }).filter((entry) => entry.isFile());
+  assert.equal(androidFiles.length, 17);
+  for (const { name, parentPath } of androidFiles) {
+    const resource = join(basename(parentPath), name);
+    assert.deepEqual(
+      readFileSync(join(androidRes, resource)),
+      readFileSync(join(androidSource, resource)),
+    );
+  }
+  assert.equal(
+    readFileSync(join(androidRes, "values", "strings.xml"), "utf8"),
+    "unrelated resource",
+  );
+  writeFileSync(join(androidRes, androidLauncher), "custom Android artwork");
+  run("android", "init");
+
+  run("ios", "init");
+  assert.equal(
+    readFileSync(join(androidRes, androidLauncher), "utf8"),
+    "custom Android artwork",
+  );
+  assert.deepEqual(
+    readdirSync(iosIcons).sort(),
+    ["Contents.json", ...iosNames].sort(),
+  );
+  assert.equal(readFileSync(join(iosIcons, "Contents.json"), "utf8"), catalog);
+  for (const name of iosNames) {
+    assert.deepEqual(
+      readFileSync(join(iosIcons, name)),
+      readFileSync(join(tauri, "icons", "ios", name)),
+    );
+  }
+  writeFileSync(join(iosIcons, iosNames[0]), "custom iOS artwork");
+  run("ios", "init");
+  assert.equal(
+    readFileSync(join(iosIcons, iosNames[0]), "utf8"),
+    "custom iOS artwork",
+  );
+});
+
+test("mobile help and other subcommands leave launcher assets alone", (t) => {
+  const { tauri, run } = mobileFixture(t);
+  run("android", "init", "--help");
+  run("ios", "init", "-vh");
+  run("android", "dev");
+  assert.equal(existsSync(join(tauri, "gen")), false);
+});
+
+test("failed mobile init leaves the generated stock artwork alone", (t) => {
+  const { invoke, androidRes, androidLauncher, stock } = mobileFixture(t);
+  const result = invoke(["android", "init"], { DELIDEV_TEST_FAIL_INIT: "1" });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Tauri init failed/);
+  assert.equal(readFileSync(join(androidRes, androidLauncher), "utf8"), stock);
+});
+
+test("successful CLI return without a generated mobile host fails init", (t) => {
+  const { tauri, invoke } = mobileFixture(t);
+  const result = invoke(["android", "init"], { DELIDEV_TEST_NO_HOST: "1" });
+  assert.equal(result.status, 1);
+  assert.match(
+    result.stderr,
+    /Failed to install DeliDev launcher icons for android.*AndroidManifest\.xml/,
+  );
+  assert.equal(existsSync(join(tauri, "gen")), false);
+});
+
+test("missing launcher artwork fails init before replacing stock assets", (t) => {
+  const { tauri, invoke, iosIcons, iosNames, stock } = mobileFixture(t);
+  const missing = iosNames[1];
+  rmSync(join(tauri, "icons", "ios", missing));
+  const result = invoke(["ios", "init"]);
+  assert.equal(result.status, 1);
+  assert.match(
+    result.stderr,
+    /Failed to install DeliDev launcher icons for ios/,
+  );
+  assert.ok(result.stderr.includes(missing));
+  assert.equal(readFileSync(join(iosIcons, iosNames[0]), "utf8"), stock);
+});
 
 test("changes only the CEF arm of the pinned Linux dependency mapping", () => {
   const pinned = `    match self {
