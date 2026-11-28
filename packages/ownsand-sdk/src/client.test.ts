@@ -335,11 +335,16 @@ test("direct relay opening failures are safe before the first read", () => {
   const fixture = fileURLToPath(
     new URL("./testing/relay-opening-rejection.ts", import.meta.url),
   );
+  const preload = new URL(
+    "./testing/transpile-relay-opening-fixture.mjs",
+    import.meta.url,
+  );
   execFileSync(
     process.execPath,
     [
       "--unhandled-rejections=strict",
-      "--experimental-transform-types",
+      "--import",
+      preload.href,
       "--test",
       fixture,
     ],
