@@ -357,6 +357,10 @@ func (s *Service) deliver(ctx context.Context, n notification) error {
 				slog.String("reason", "idempotency_payload_conflict"))
 		}
 	}
+	// Recording the final recipient can outlast the delivery context.
+	if failed != nil && ctx.Err() != nil {
+		return s.deferNotification(ctx, n, lastStarted)
+	}
 	return s.settle(ctx, func(ctx context.Context) error {
 		return s.finish(ctx, n, failed, failedRecipients)
 	})
