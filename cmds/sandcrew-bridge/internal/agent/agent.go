@@ -246,8 +246,11 @@ type ACPAgent struct {
 	mu        sync.Mutex
 	sessionID string
 
-	done chan struct{}
-	exit Exit
+	// exited is closed when the process ended; done follows after the
+	// remaining output.
+	exited chan struct{}
+	done   chan struct{}
+	exit   Exit
 }
 
 // ACPOptions configure an ACPAgent.
@@ -269,11 +272,14 @@ func NewACPAgent(process Process, opts ACPOptions) *ACPAgent {
 		logger:       opts.Logger,
 		info:         opts.ClientInfo,
 		authMethodID: opts.AuthMethodID,
+		exited:       make(chan struct{}),
 		done:         make(chan struct{}),
 	}
 	a.conn = acp.NewConn(process.Stdout(), process.Stdin(), connHandler{a})
+	go a.watchConn()
 	go func() {
 		exit := process.Wait()
+		close(a.exited)
 		// Handle the messages that the agent wrote before its exit, so
 		// agent_exited is the last event.
 		select {
@@ -293,6 +299,27 @@ func NewACPAgent(process Process, opts ACPOptions) *ACPAgent {
 		close(a.done)
 	}()
 	return a
+}
+
+// watchConn stops the agent when the ACP connection fails while the
+// process runs, for example after a message larger than the size limit:
+// the stream position is lost, so no later message can be read, and the
+// session would accept prompts that never reach the agent.
+func (a *ACPAgent) watchConn() {
+	<-a.conn.Done()
+	err := a.conn.Err()
+	if err == nil || errors.Is(err, io.EOF) {
+		return
+	}
+	select {
+	case <-a.exited:
+		// The bridge closed stdout after the exit (drainTimeout).
+		return
+	default:
+	}
+	a.logger.Error("the ACP connection failed; stopping the agent", "error_kind", "ACP_PROTOCOL_ERROR", "error", err)
+	a.handler.ProtocolError(fmt.Errorf("agent: the ACP connection failed: %w", err))
+	a.Stop()
 }
 
 // Start implements Agent.

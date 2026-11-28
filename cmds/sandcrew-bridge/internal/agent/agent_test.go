@@ -116,3 +116,58 @@ func TestExecProcessKeepsOutputAfterTheExit(t *testing.T) {
 		t.Fatalf("exit %+v", exit)
 	}
 }
+
+// runningProcess runs until Kill.
+type runningProcess struct {
+	stdin  *io.PipeWriter
+	stdout io.Reader
+	killed chan struct{}
+	once   sync.Once
+}
+
+func (p *runningProcess) Stdin() io.WriteCloser { return p.stdin }
+func (p *runningProcess) Stdout() io.Reader     { return p.stdout }
+func (p *runningProcess) Wait() Exit {
+	<-p.killed
+	return Exit{Code: -1, Signal: "terminated"}
+}
+func (p *runningProcess) Kill() { p.once.Do(func() { close(p.killed) }) }
+
+type repeatReader byte
+
+func (r repeatReader) Read(b []byte) (int, error) {
+	for i := range b {
+		b[i] = byte(r)
+	}
+	return len(b), nil
+}
+
+type errorHandler struct {
+	countingHandler
+	mu     sync.Mutex
+	errors []error
+}
+
+func (h *errorHandler) ProtocolError(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.errors = append(h.errors, err)
+}
+
+func TestAConnectionFailureStopsTheAgent(t *testing.T) {
+	// One message larger than the reader limit.
+	stdout := io.MultiReader(strings.NewReader(`{"jsonrpc":"2.0","method":"session/update","params":"`), io.LimitReader(repeatReader('a'), 65<<20))
+	_, stdin := io.Pipe()
+	process := &runningProcess{stdin: stdin, stdout: stdout, killed: make(chan struct{})}
+	handler := &errorHandler{}
+	a := NewACPAgent(process, ACPOptions{Handler: handler})
+	waitDone(t, a)
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if len(handler.errors) != 1 || !strings.Contains(handler.errors[0].Error(), "ACP connection failed") {
+		t.Fatalf("protocol errors %v, want one connection failure", handler.errors)
+	}
+	if exit := a.Exit(); exit.Signal != "terminated" {
+		t.Fatalf("exit %+v", exit)
+	}
+}
