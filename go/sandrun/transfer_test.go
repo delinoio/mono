@@ -410,6 +410,38 @@ func TestTransferReadReconnectKeepsIdleBudget(t *testing.T) {
 	}
 }
 
+func TestReadGuestFileClosesStreamAtLimit(t *testing.T) {
+	var calls atomic.Int32
+	closed := make(chan struct{})
+	c := transferTestClient(t, "", transferHandlers{read: func(ctx context.Context, _ *connect.Request[sandrunv1.ReadDevSessionFileRequest], stream *connect.ServerStream[sandrunv1.ReadDevSessionFileResponse]) error {
+		if calls.Add(1) != 1 {
+			return connect.NewError(connect.CodeInternal, errors.New("retried an oversized read"))
+		}
+		if err := transferTestChunk(stream, 0, "first"); err != nil {
+			return err
+		}
+		if err := transferTestChunk(stream, 5, "extra"); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		close(closed)
+		return ctx.Err()
+	}})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	n, err := c.readGuestFile(ctx, &sandrunv1.DevSession{}, "/test", 9, &out, nil)
+	var limitErr *readLimitError
+	if !errors.As(err, &limitErr) || limitErr.observed != 10 || n != 5 || out.String() != "first" || calls.Load() != 1 {
+		t.Fatalf("read %q (%d bytes) in %d requests: %v", out.String(), n, calls.Load(), err)
+	}
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("the read stream remained open after exceeding the limit")
+	}
+}
+
 func TestTransferReadEndAndTerminalError(t *testing.T) {
 	for _, code := range []connect.Code{0, connect.CodePermissionDenied} {
 		t.Run(code.String(), func(t *testing.T) {

@@ -495,7 +495,7 @@ func (c *Client) readManifest(ctx context.Context, s *sandrunv1.DevSession, mani
 		if ctx.Err() != nil {
 			return manifest{}, ctx.Err()
 		}
-		var limitError *LimitError
+		var limitError *readLimitError
 		if errors.As(err, &limitError) {
 			return manifest{}, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync guest manifest exceeds the size limit of %d bytes", manifestLimit))
 		}
@@ -519,7 +519,7 @@ func (c *Client) readPendingUpdates(ctx context.Context, s *sandrunv1.DevSession
 		if n == 0 && connect.CodeOf(err) == connect.CodeNotFound {
 			return pending, nil
 		}
-		var limitError *LimitError
+		var limitError *readLimitError
 		if errors.As(err, &limitError) {
 			return nil, localError(connect.CodeFailedPrecondition, fmt.Errorf("sync pending updates exceed the size limit of %d bytes", limit))
 		}
