@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -39,10 +40,7 @@ const (
 // must outlive the server, because cleanups run in last-in-first-out order.
 func startServer(t *testing.T, handler http.Handler) net.Listener {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenLoopback(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -60,6 +58,42 @@ func startServer(t *testing.T, handler http.Handler) net.Listener {
 		}
 	})
 	return listener
+}
+
+func listenLoopback(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+func serveListener(t *testing.T, listener net.Listener, handler http.Handler) (context.CancelFunc, func() error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	var serveErr error
+	go func() {
+		serveErr = metrics.Serve(ctx, listener, handler, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+		close(done)
+	}()
+	await := func() error {
+		t.Helper()
+		select {
+		case <-done:
+			return serveErr
+		case <-time.After(serveStopTimeout):
+			t.Fatalf("Serve did not return within %v", serveStopTimeout)
+			return nil
+		}
+	}
+	t.Cleanup(func() {
+		cancel()
+		await()
+	})
+	return cancel, await
 }
 
 func TestServeAndShutdown(t *testing.T) {
@@ -162,21 +196,148 @@ func (l closeObservedListener) Close() error {
 	return err
 }
 
+// shutdownAcceptListener can accept one scrape before waiting for Shutdown to
+// close the listener. Shutdown sets its flag before Close releases Accept.
+type shutdownAcceptListener struct {
+	net.Listener
+	acceptEntered chan struct{}
+	closed        chan struct{}
+	closeOnce     sync.Once
+	err           error
+	acceptScrape  bool
+}
+
+func (l *shutdownAcceptListener) Accept() (net.Conn, error) {
+	if l.acceptScrape {
+		l.acceptScrape = false
+		return l.Listener.Accept()
+	}
+	close(l.acceptEntered)
+	<-l.closed
+	return nil, l.err
+}
+
+func (l *shutdownAcceptListener) Close() error {
+	err := l.Listener.Close()
+	l.closeOnce.Do(func() { close(l.closed) })
+	return err
+}
+
+var (
+	errPermanentAccept = errors.New("metrics listener permanent accept error")
+	errTemporaryAccept = &net.DNSError{Err: "metrics listener temporary accept error", IsTemporary: true}
+)
+
+func TestServeAcceptErrorDuringShutdown(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		acceptErr error
+		wantErr   error
+	}{
+		{name: "permanent failure", acceptErr: errPermanentAccept, wantErr: errPermanentAccept},
+		{name: "listener closed", acceptErr: net.ErrClosed},
+		{name: "wrapped listener closure", acceptErr: &net.OpError{Op: "accept", Net: "tcp", Err: net.ErrClosed}},
+		{name: "HTTP server closed", acceptErr: http.ErrServerClosed},
+		{name: "temporary failure", acceptErr: errTemporaryAccept},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener := &shutdownAcceptListener{
+				Listener:      listenLoopback(t),
+				acceptEntered: make(chan struct{}),
+				closed:        make(chan struct{}),
+				err:           tc.acceptErr,
+			}
+			cancel, await := serveListener(t, listener, http.NotFoundHandler())
+			select {
+			case <-listener.acceptEntered:
+			case <-time.After(requestTimeout):
+				t.Fatal("metrics listener did not enter Accept")
+			}
+			cancel()
+			err := await()
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Serve error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil && strings.Count(err.Error(), tc.wantErr.Error()) != 1 {
+				t.Fatalf("Serve error = %q, want one occurrence of %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+type acceptFuncListener struct {
+	net.Listener
+	accept func() (net.Conn, error)
+}
+
+func (l acceptFuncListener) Accept() (net.Conn, error) { return l.accept() }
+
+func TestServeReturnsPermanentAcceptErrorBeforeShutdown(t *testing.T) {
+	listener := acceptFuncListener{
+		Listener: listenLoopback(t),
+		accept:   func() (net.Conn, error) { return nil, errPermanentAccept },
+	}
+	_, await := serveListener(t, listener, http.NotFoundHandler())
+	if err := await(); err != errPermanentAccept {
+		t.Fatalf("Serve error = %v, want the original error %v", err, errPermanentAccept)
+	}
+}
+
+func TestServeRetriesTemporaryAcceptError(t *testing.T) {
+	bound := listenLoopback(t)
+	failed := false
+	listener := acceptFuncListener{
+		Listener: bound,
+		accept: func() (net.Conn, error) {
+			if !failed {
+				failed = true
+				return nil, errTemporaryAccept
+			}
+			return bound.Accept()
+		},
+	}
+	cancel, await := serveListener(t, listener, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	client := &http.Client{Timeout: requestTimeout}
+	resp, err := client.Get("http://" + bound.Addr().String() + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want 200", resp.StatusCode)
+	}
+	cancel()
+	if err := await(); err != nil {
+		t.Fatalf("Serve error = %v, want nil after a clean shutdown", err)
+	}
+}
+
 func TestServeDrainsActiveScrape(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		expires bool
+		name      string
+		expires   bool
+		acceptErr error
 	}{
 		{name: "deadline expires", expires: true},
+		{name: "deadline expires with permanent accept failure", expires: true, acceptErr: errPermanentAccept},
 		{name: "scrape finishes during drain"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer listener.Close()
+			t.Parallel()
+			listener := listenLoopback(t)
 			draining := make(chan struct{})
+			var serverListener net.Listener = closeObservedListener{listener, draining}
+			if tc.acceptErr != nil {
+				serverListener = &shutdownAcceptListener{
+					Listener:      serverListener,
+					acceptEntered: make(chan struct{}),
+					closed:        make(chan struct{}),
+					err:           tc.acceptErr,
+					acceptScrape:  true,
+				}
+			}
 			started := make(chan struct{})
 			release := make(chan struct{})
 			releaseHandler := sync.OnceFunc(func() { close(release) })
@@ -186,22 +347,8 @@ func TestServeDrainsActiveScrape(t *testing.T) {
 				<-release
 				_, _ = io.WriteString(w, metricsBody)
 			})
-			ctx, cancel := context.WithCancel(t.Context())
-			done := make(chan struct{})
-			var serveErr error
-			go func() {
-				serveErr = metrics.Serve(ctx, closeObservedListener{listener, draining}, handler, slog.New(slog.NewJSONHandler(io.Discard, nil)))
-				close(done)
-			}()
-			defer func() {
-				releaseHandler()
-				cancel()
-				select {
-				case <-done:
-				case <-time.After(serveStopTimeout):
-					t.Error("metrics Serve did not stop during cleanup")
-				}
-			}()
+			cancel, await := serveListener(t, serverListener, handler)
+			t.Cleanup(releaseHandler)
 
 			conn, err := net.DialTimeout("tcp", listener.Addr().String(), requestTimeout)
 			if err != nil {
@@ -219,6 +366,13 @@ func TestServeDrainsActiveScrape(t *testing.T) {
 			case <-time.After(requestTimeout):
 				t.Fatal("scrape did not enter the handler")
 			}
+			if gated, ok := serverListener.(*shutdownAcceptListener); ok {
+				select {
+				case <-gated.acceptEntered:
+				case <-time.After(requestTimeout):
+					t.Fatal("metrics listener did not enter its second Accept")
+				}
+			}
 
 			cancel()
 			select {
@@ -229,15 +383,14 @@ func TestServeDrainsActiveScrape(t *testing.T) {
 			if !tc.expires {
 				releaseHandler()
 			}
-			select {
-			case <-done:
-			case <-time.After(serveStopTimeout):
-				t.Fatal("metrics Serve did not return after cancellation")
-			}
+			serveErr := await()
 
 			if tc.expires {
 				if !errors.Is(serveErr, context.DeadlineExceeded) {
 					t.Errorf("metrics Serve error = %v, want the drain deadline error", serveErr)
+				}
+				if tc.acceptErr != nil && !errors.Is(serveErr, tc.acceptErr) {
+					t.Errorf("metrics Serve error = %v, want the permanent Accept error too", serveErr)
 				}
 				if err := conn.SetReadDeadline(time.Now().Add(requestTimeout)); err != nil {
 					t.Fatal(err)
