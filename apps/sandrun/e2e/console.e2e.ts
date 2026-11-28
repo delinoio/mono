@@ -3,6 +3,11 @@ import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { Role } from "@delino/sandrun-protos/v1/common_pb";
 import {
+  DEV_SESSION_REFRESH_CASES,
+  DEV_SESSION_REFRESH_FIXTURE,
+  type DevSessionRefreshMode,
+} from "./dev-session-refresh-fixture.ts";
+import {
   INTEGRATION_PERMISSION_FIXTURE,
   integrationOpenings,
 } from "./integration-permission-fixture.ts";
@@ -1256,6 +1261,95 @@ describe("audit", () => {
       "OwnSand link set",
     ]);
   });
+});
+
+describe("Dev session refresh from work", () => {
+  for (const scenario of DEV_SESSION_REFRESH_CASES) {
+    for (const mode of ["success", scenario.failureMode] as const) {
+      test(`refreshes Dev Sessions after ${scenario.page} (${mode})`, async ({
+        app,
+        browser,
+        screen,
+      }) => {
+        await app.open("/");
+        await browser.evaluate(
+          ([key, mode]: [string, DevSessionRefreshMode]) => {
+            sessionStorage.setItem(key, mode);
+            return null;
+          },
+          [DEV_SESSION_REFRESH_FIXTURE, mode],
+        );
+        await screen.getByRole("button", "Sign in with Delino").tap();
+        await screen.getByRole("link", "Acme Robotics Owner").tap();
+        const devSessions = screen.getByRole("link", "Dev sessions");
+        const showEnded = screen.getByRole(
+          "checkbox",
+          "Show ended dev sessions",
+        );
+        const table = screen.getByRole("table", "Dev sessions");
+        const row = table
+          .getByRole("row")
+          .filter({ hasText: scenario.session });
+        const reads = () =>
+          browser.evaluate(() => window.sandrunDevSessionReads ?? []);
+
+        await devSessions.tap();
+        await expect(row.getByRole("cell", scenario.activeState)).toBeVisible();
+        await expect(row.getByRole("button", "Delete")).toBeVisible();
+        const loadedAt = await browser.evaluate(() => performance.now());
+        await showEnded.tap();
+        await expect(table).toContainText("compiler check");
+        const primedReads = await reads();
+        expect(primedReads).toContain(false);
+        expect(primedReads).toContain(true);
+
+        await screen.getByRole("link", scenario.page).tap();
+        const workRow = screen
+          .getByRole("table", scenario.page)
+          .getByRole("row")
+          .filter({ hasText: scenario.workRow });
+        await workRow.getByRole("button", scenario.action).tap();
+        const dialog = screen.getByRole("alertdialog", scenario.dialog);
+        await dialog.getByRole("button", scenario.confirm).tap();
+
+        if (mode !== "success") {
+          await expect(dialog.getByText(scenario.error)).toBeVisible();
+          await expect(
+            dialog.getByRole("button", scenario.confirm),
+          ).toBeEnabled();
+          await app.screenshot(`${scenario.screenshot}-failure`);
+          await dialog.getByRole("button", "Cancel", { exact: true }).tap();
+          await expect(dialog).toBeHidden();
+          await expect(workRow).toBeVisible();
+          await devSessions.tap();
+          await expect(
+            row.getByRole("cell", scenario.activeState),
+          ).toBeVisible();
+          await expect(row.getByRole("button", "Delete")).toBeVisible();
+          expect(await reads()).toEqual(primedReads);
+          return;
+        }
+
+        await expect(dialog).toBeHidden();
+        await expect(workRow).toBeHidden();
+        await devSessions.tap();
+        expect(
+          (await browser.evaluate(() => performance.now())) - loadedAt,
+        ).toBeLessThan(10_000);
+        await expect(row).toHaveCount(0);
+        const defaultRefresh = await reads();
+        expect(defaultRefresh.slice(primedReads.length)).toContain(false);
+        await app.screenshot(`${scenario.screenshot}-default`);
+
+        await showEnded.tap();
+        await expect(row.getByRole("cell", scenario.endedState)).toBeVisible();
+        await expect(row.getByRole("cell", scenario.reason)).toBeVisible();
+        await expect(row.getByRole("button", "Delete")).toHaveCount(0);
+        expect((await reads()).slice(defaultRefresh.length)).toContain(true);
+        await app.screenshot(`${scenario.screenshot}-ended`);
+      });
+    }
+  }
 });
 
 describe("member names in Audit and Dev Sessions", () => {
