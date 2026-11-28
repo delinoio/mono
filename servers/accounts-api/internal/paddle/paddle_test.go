@@ -257,6 +257,38 @@ func TestClientOneTimeCharge(t *testing.T) {
 	}
 }
 
+func TestClientOneTimeChargeResponseIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want paddle.Outcome
+	}{
+		{"omitted ID", `{"data":{}}`, paddle.OutcomeUnknown},
+		{"empty ID", `{"data":{"id":""}}`, paddle.OutcomeUnknown},
+		{"different ID", `{"data":{"id":"sub_other","status":"private_response_detail"}}`, paddle.OutcomeUnknown},
+		{"malformed entity", `{"data":{"id":42}}`, paddle.OutcomeUnknown},
+		{"matching ID", `{"data":{"id":"sub_1","status":"active"}}`, paddle.OutcomeOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, fake := newClient(t)
+			fake.Respond("POST /subscriptions/sub_1/charge", http.StatusOK, tc.body)
+			sub, err := client.CreateOneTimeCharge(context.Background(), "sub_1", paddle.Charge{ProductID: "pro", AmountCents: 2500})
+			if got := paddle.Classify(err); got != tc.want {
+				t.Fatalf("Classify = %v, want %v (error: %v)", got, tc.want, err)
+			}
+			if tc.want == paddle.OutcomeOK {
+				if sub.ID != "sub_1" || sub.Status != paddle.SubscriptionStatusActive {
+					t.Fatalf("charge response = %+v, want active subscription sub_1", sub)
+				}
+				return
+			}
+			if strings.Contains(err.Error(), "sub_other") || strings.Contains(err.Error(), "private_response_detail") {
+				t.Fatalf("error contains response details: %v", err)
+			}
+		})
+	}
+}
+
 func TestClientInvoiceAndAuth(t *testing.T) {
 	client, fake := newClient(t)
 	ctx := context.Background()
