@@ -1188,12 +1188,17 @@ describe("invoices", () => {
         assigned.push(String(url));
       };
       try {
-        if (failure !== undefined) api.failNext.set("GetInvoiceUrl", failure);
         let respond!: () => void;
         api.gates.set(
           "GetInvoiceUrl",
-          new Promise<void>((resolve) => {
-            respond = resolve;
+          new Promise<void>((resolve, reject) => {
+            respond = () => {
+              if (failure === undefined) {
+                resolve();
+              } else {
+                reject(failure);
+              }
+            };
           }),
         );
         await renderAccount(ADMIN, { api });
@@ -1392,21 +1397,26 @@ describe("invoices", () => {
       }
     });
 
-    test("a failed request closes the open tab and shows the error toast", async () => {
+    test("the reserved tab stays open until the request fails", async () => {
+      const unavailableMessage =
+        "Delino Accounts is not available right now. Try again in a moment.";
       const tab = fakeTab();
       const harness = await openInvoiceWith(
         tab,
         new ConnectError("unavailable", Code.Unavailable),
       );
       try {
+        expect(tab.closed).toBe(false);
+        expect(tab.closeCalls).toBe(0);
+        expect(screen.queryByText(unavailableMessage)).toBeNull();
+
+        await harness.respond();
+
+        expect(tab.closed).toBe(true);
         expect(tab.closeCalls).toBe(1);
         expect(tab.replaced).toEqual([]);
         expect(harness.assigned).toEqual([]);
-        expect(
-          await screen.findByText(
-            "Delino Accounts is not available right now. Try again in a moment.",
-          ),
-        ).toBeTruthy();
+        expect(await screen.findByText(unavailableMessage)).toBeTruthy();
         const stored = JSON.stringify({
           ...window.sessionStorage,
           ...window.localStorage,
