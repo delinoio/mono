@@ -608,6 +608,39 @@ func TestBalanceOrdersEqualExpiryByID(t *testing.T) {
 	}
 }
 
+func TestRefundPrefersPurchasedGrant(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	acct := f.account()
+	earlier := f.grant(acct, LedgerManualTopUp, 25*usd)
+	f.clock.Advance(time.Hour)
+	refunded := f.grant(acct, LedgerSubscriptionCredit, 10*usd)
+
+	f.tx(func(tx pgx.Tx) error {
+		a, err := lockAccount(ctx(), tx, acct)
+		if err != nil {
+			return err
+		}
+		_, err = f.s.removeCredit(ctx(), tx, a, refunded, "txn_refund", 4*usd, f.s.timestamp())
+		return err
+	})
+
+	if got := f.remaining(earlier); got != 25*usd {
+		t.Errorf("earlier grant remainder = %d, want %d", got, 25*usd)
+	}
+	if got := f.remaining(refunded); got != 6*usd {
+		t.Errorf("refunded grant remainder = %d, want %d", got, 6*usd)
+	}
+	if got := f.balance(acct); got != 31*usd {
+		t.Errorf("account balance = %d, want %d", got, 31*usd)
+	}
+	f.wantLedger(acct,
+		wantEntry{LedgerManualTopUp, 25 * usd, 25 * usd},
+		wantEntry{LedgerSubscriptionCredit, 10 * usd, 35 * usd},
+		wantEntry{LedgerRefund, -4 * usd, 31 * usd},
+	)
+}
+
 func TestRefundMakesBalanceNegative(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -616,8 +649,7 @@ func TestRefundMakesBalanceNegative(t *testing.T) {
 	f.clock.Advance(time.Hour)
 	second := f.grant(acct, LedgerSubscriptionCredit, 10*usd)
 	f.deduct(acct, 20*usd)
-	// The refunded grant gives its rest first, then the other grants, then
-	// the balance goes negative.
+	// The refund exhausts both grants and leaves a negative balance.
 	f.tx(func(tx pgx.Tx) error {
 		a, err := lockAccount(ctx(), tx, acct)
 		if err != nil {
