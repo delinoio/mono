@@ -3181,6 +3181,11 @@ describe("invitations", () => {
     await screen.getByRole("button", "Done").tap();
     await expect(link).toBeHidden();
     await screen.getByRole("button", "Revoke").tap();
+    await expect(
+      screen
+        .getByRole("listitem")
+        .filter({ hasText: "The invitation is revoked." }),
+    ).toBeVisible();
     await expect(screen.getByText("No pending invitations")).toBeVisible();
 
     await app.open(`/orgs/${NORTHWIND}/members`);
@@ -3351,4 +3356,101 @@ describe("routing", () => {
       screen.getByRole("heading", "Page not found", { level: 1 }),
     ).toBeVisible();
   });
+});
+
+describe("stale invitation revoke", () => {
+  for (const failRefresh of [false, true]) {
+    test(
+      failRefresh
+        ? "retries the invitation read after a rejected revoke and failed refresh"
+        : "refreshes pending invitations from page one after a rejected revoke",
+      async ({ app, browser, screen }) => {
+        await app.open("/");
+        await browser.evaluate(() => {
+          sessionStorage.setItem("sandrun-e2e-invitation-revoke", "true");
+          return null;
+        });
+        await screen.getByRole("button", "Sign in with Delino").tap();
+        const globex = screen.getByRole("link", "Globex Admin");
+        await expect(globex).toBeVisible();
+        await app.open(`/orgs/${GLOBEX}`);
+        const members = screen.getByRole("link", "Members");
+        await expect(members).toBeVisible();
+        const staleId = await browser.evaluate(
+          (organizationId) =>
+            window.sandrunInvitationRevokeFixture!.seed(organizationId),
+          GLOBEX,
+        );
+        await members.tap();
+        const list = screen.getByRole("list", "Pending invitations");
+        const stale = list
+          .getByRole("listitem")
+          .filter({ hasText: "Member invitation" });
+        const pending = list
+          .getByRole("listitem")
+          .filter({ hasText: "Admin invitation" });
+        await expect(stale).toBeVisible();
+        await expect(pending).toBeVisible();
+
+        await browser.evaluate(
+          async ({ organizationId, invitationId, failRefresh }) => {
+            await window.sandrunInvitationRevokeFixture!.stale(
+              organizationId,
+              invitationId,
+              failRefresh,
+            );
+            return null;
+          },
+          { organizationId: GLOBEX, invitationId: staleId, failRefresh },
+        );
+        await stale.getByRole("button", "Revoke").tap();
+        await expect(
+          screen
+            .getByRole("listitem")
+            .filter({ hasText: "only a pending invitation can be revoked" }),
+        ).toBeVisible();
+        // Wait for the toast to slide into the viewport before capturing it.
+        await expect
+          .poll(() =>
+            browser.evaluate(() => {
+              const toast = document.querySelector(".dui-toast");
+              return (
+                toast != null &&
+                toast.getBoundingClientRect().bottom <= window.innerHeight
+              );
+            }),
+          )
+          .toBe(true);
+
+        if (failRefresh) {
+          const notice = screen.getByText(/The last refresh failed/);
+          await expect(notice).toBeVisible();
+          await expect(stale).toBeVisible();
+          await app.screenshot("stale-invitation-refresh-failed");
+          await screen.getByRole("button", "Try again").tap();
+          await expect(notice).toBeHidden();
+        }
+        await expect(stale).toBeHidden();
+        await expect(pending).toBeVisible();
+        expect(
+          await browser.evaluate(() => {
+            const { listRequests, revokeRequests } =
+              window.sandrunInvitationRevokeFixture!;
+            return { listRequests, revokeRequests };
+          }),
+        ).toEqual({
+          listRequests: Array.from({ length: failRefresh ? 2 : 1 }, () => ({
+            organizationId: GLOBEX,
+            pageToken: "",
+          })),
+          revokeRequests: [{ organizationId: GLOBEX, invitationId: staleId }],
+        });
+        await app.screenshot(
+          failRefresh
+            ? "stale-invitation-read-retried"
+            : "stale-invitation-removed",
+        );
+      },
+    );
+  }
 });
