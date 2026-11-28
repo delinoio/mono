@@ -8,6 +8,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { Accounts } from "./App.tsx";
 import { LogtoAuthProvider } from "./auth.tsx";
@@ -15,8 +16,8 @@ import { PENDING_INVITATION_KEY } from "./invitation.ts";
 import { TEST_CONFIG } from "./testing/render.tsx";
 
 /**
- * Runs the real Logto SDK without a session against a tenant whose OIDC
- * discovery request fails or succeeds as the test says. `signIn` of the SDK
+ * Runs the real Logto SDK against a tenant whose OIDC discovery request fails
+ * or succeeds as the test says. `signIn` of the SDK
  * never rejects: it stores the failure in its error state and resolves, so
  * these tests check what the page shows, not a rejected promise.
  */
@@ -27,12 +28,16 @@ const TEST_TIMEOUT_MS = 2 * SDK_WAIT_MS + 5_000;
 const TOKEN = "bai_TESTTOKEN";
 const FAILURE_TEXT =
   "Sign-in did not start. Check your connection and try again.";
+const CALLBACK_RECOVERY_TEXT =
+  "The sign-in could not be completed. Sign in again.";
 
 const APP_URL = "http://localhost:3000/";
+const CALLBACK_URL = new URL("/callback", APP_URL).href;
 
 const realFetch = globalThis.fetch;
 let discoveryWorks = false;
 let discoveryRequests = 0;
+let discoveryGate: Promise<void> | undefined;
 
 beforeEach(() => {
   // A started redirect navigates the window to the Logto tenant.
@@ -43,6 +48,7 @@ beforeEach(() => {
   window.localStorage.clear();
   discoveryWorks = false;
   discoveryRequests = 0;
+  discoveryGate = undefined;
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(
       typeof input === "string" || input instanceof URL ? input : input.url,
@@ -51,6 +57,9 @@ beforeEach(() => {
       discoveryRequests++;
       if (!discoveryWorks) {
         throw new TypeError("secret-detail: network down");
+      }
+      if (discoveryGate) {
+        await discoveryGate;
       }
       return Response.json({
         authorization_endpoint: "https://logto.test/oidc/auth",
@@ -178,6 +187,98 @@ describe("sign-in that fails before the redirect", () => {
       expect(window.sessionStorage.getItem(PENDING_INVITATION_KEY)).toBe(TOKEN);
       await waitFor(() => expect(screen.queryByText(FAILURE_TEXT)).toBeNull(), {
         timeout: SDK_WAIT_MS,
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test.each([
+    {
+      recovery: "a failed callback",
+      path: "/callback?error=access_denied&state=s",
+      session: JSON.stringify({
+        redirectUri: CALLBACK_URL,
+        state: "s",
+        codeVerifier: "v",
+      }),
+    },
+    {
+      recovery: "an unreadable session",
+      path: "/callback",
+      session: "{not json",
+    },
+  ])(
+    "$recovery clears the sign-in alert while retry discovery is pending",
+    async ({ path, session }) => {
+      window.sessionStorage.setItem(SIGN_IN_SESSION_KEY, session);
+      renderAt(path);
+
+      const recoveryMessage = await screen.findByText(
+        CALLBACK_RECOVERY_TEXT,
+        {},
+        { timeout: SDK_WAIT_MS },
+      );
+      const recoveryNotice = within(screen.getByRole("main")).getByRole(
+        "alert",
+      );
+      expect(recoveryNotice.contains(recoveryMessage)).toBe(true);
+      const signInButton = () =>
+        within(recoveryNotice).getByRole<HTMLButtonElement>("button", {
+          name: "Sign in with Delino",
+        });
+      expect(signInButton().disabled).toBe(false);
+      expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+      expect(discoveryRequests).toBe(0);
+
+      await click("Sign in with Delino");
+      const alert = await screen.findByText(
+        FAILURE_TEXT,
+        {},
+        { timeout: SDK_WAIT_MS },
+      );
+      expect(alert.getAttribute("role")).toBe("alert");
+      expect(alert.textContent).toBe(FAILURE_TEXT);
+      expect(document.body.textContent).not.toContain("secret-detail");
+      expect(signInButton().disabled).toBe(false);
+      expect(discoveryRequests).toBe(1);
+      expect(window.location.pathname).toBe("/callback");
+      expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBe(session);
+
+      let releaseDiscovery!: () => void;
+      discoveryGate = new Promise<void>((resolve) => {
+        releaseDiscovery = resolve;
+      });
+      discoveryWorks = true;
+      try {
+        await click("Sign in with Delino");
+        await waitFor(() => expect(discoveryRequests).toBe(2), {
+          timeout: SDK_WAIT_MS,
+        });
+        expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+        expect(screen.getByText(CALLBACK_RECOVERY_TEXT)).toBe(recoveryMessage);
+        expect(window.location.pathname).toBe("/callback");
+        expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBe(
+          session,
+        );
+      } finally {
+        await act(async () => {
+          releaseDiscovery();
+        });
+      }
+
+      await waitFor(
+        () =>
+          expect(window.location.origin + window.location.pathname).toBe(
+            "https://logto.test/oidc/auth",
+          ),
+        { timeout: SDK_WAIT_MS },
+      );
+      const replacement = window.sessionStorage.getItem(SIGN_IN_SESSION_KEY);
+      expect(replacement).not.toBe(session);
+      expect(JSON.parse(replacement!)).toMatchObject({
+        redirectUri: CALLBACK_URL,
+        state: expect.stringMatching(/.+/),
+        codeVerifier: expect.stringMatching(/.+/),
       });
     },
     TEST_TIMEOUT_MS,
