@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create } from "@bufbuild/protobuf";
 import { timestampNow } from "@bufbuild/protobuf/wkt";
 import {
   Code,
@@ -10,18 +9,17 @@ import {
 } from "@connectrpc/connect";
 import {
   GuestOs,
-  RequestEndReason,
   RequestState,
-  RunnerEndReason,
   RunnerState,
   WorkloadKind,
 } from "@delino/sandrun-protos/v1/common_pb";
+import { DevSessionService } from "@delino/sandrun-protos/v1/dev_session_pb";
+import { WorkService } from "@delino/sandrun-protos/v1/work_pb";
 import {
-  DevSessionSchema,
-  DevSessionService,
-} from "@delino/sandrun-protos/v1/dev_session_pb";
-import { RunnerSchema, WorkService } from "@delino/sandrun-protos/v1/work_pb";
-import { MOCK_IDS, MOCK_USER } from "../src/mock/mock-api.ts";
+  MOCK_IDS,
+  MOCK_USER,
+  type MockTransportOptions,
+} from "../src/mock/mock-api.ts";
 
 export const DEV_SESSION_REFRESH_FIXTURE = "sandrun-e2e-dev-session-refresh";
 export const DEV_SESSION_REFRESH_CASES = [
@@ -56,47 +54,75 @@ export const DEV_SESSION_REFRESH_CASES = [
 ] as const;
 export type DevSessionRefreshMode = "success" | "fail-cancel" | "fail-delete";
 
+const devSessionId = "0193b000-0000-7000-8000-0000000000e6";
+const runnerId = "0193b000-0000-7000-8000-0000000000f4";
+
+function devSessionRefreshWork(): NonNullable<
+  MockTransportOptions["workFixtures"]
+>[number] {
+  const startedAt = timestampNow();
+  const profile = {
+    runnerProfileId: MOCK_IDS.devProfile,
+    guestOs: GuestOs.WINDOWS,
+  };
+  return {
+    organizationId: MOCK_IDS.acme,
+    requests: [
+      {
+        ...profile,
+        requestId: devSessionId,
+        runnerId,
+        ownerUserId: MOCK_USER,
+        kind: WorkloadKind.DEV_SESSION,
+        state: RequestState.RUNNING,
+        queuedAt: startedAt,
+        startedAt,
+      },
+    ],
+    runners: [
+      {
+        ...profile,
+        runnerId,
+        requestId: devSessionId,
+        kind: WorkloadKind.DEV_SESSION,
+        state: RunnerState.BUSY,
+        createdAt: startedAt,
+      },
+    ],
+    devSessions: [
+      {
+        ...profile,
+        devSessionId,
+        runnerId,
+        runnerProfileName: "windows-dev",
+        ownerUserId: MOCK_USER,
+        label: DEV_SESSION_REFRESH_CASES[1].session,
+        state: RequestState.RUNNING,
+        queuedAt: startedAt,
+        startedAt,
+      },
+    ],
+  };
+}
+
 export function devSessionRefreshFixture(
-  mock: Transport,
+  createMock: (options?: MockTransportOptions) => Transport,
   mode: DevSessionRefreshMode,
+  options?: MockTransportOptions,
 ) {
+  const mock = createMock({
+    ...options,
+    workFixtures: [...(options?.workFixtures ?? []), devSessionRefreshWork()],
+  });
   const work = createClient(WorkService, mock);
   const sessions = createClient(DevSessionService, mock);
   const reads: boolean[] = [];
-  const session = create(DevSessionSchema, {
-    devSessionId: "0193b000-0000-7000-8000-0000000000e6",
-    organizationId: MOCK_IDS.acme,
-    runnerProfileId: MOCK_IDS.devProfile,
-    runnerProfileName: "windows-dev",
-    ownerUserId: MOCK_USER,
-    label: DEV_SESSION_REFRESH_CASES[1].session,
-    runnerId: "0193b000-0000-7000-8000-0000000000f4",
-    guestOs: GuestOs.WINDOWS,
-    state: RequestState.RUNNING,
-    endReason: RequestEndReason.UNSPECIFIED,
-    queuedAt: timestampNow(),
-    startedAt: timestampNow(),
-  });
-  const runner = create(RunnerSchema, {
-    runnerId: session.runnerId,
-    requestId: session.devSessionId,
-    organizationId: session.organizationId,
-    runnerProfileId: session.runnerProfileId,
-    kind: WorkloadKind.DEV_SESSION,
-    guestOs: session.guestOs,
-    state: RunnerState.BUSY,
-    endReason: RunnerEndReason.UNSPECIFIED,
-    createdAt: session.startedAt,
-  });
   const fixture = createRouterTransport((router) => {
     router.service(DevSessionService, {
       async listDevSessions(req) {
         const response = await sessions.listDevSessions(req);
-        if (req.organizationId === session.organizationId) {
+        if (req.organizationId === MOCK_IDS.acme) {
           reads.push(req.includeEnded);
-          if (req.includeEnded || session.state === RequestState.RUNNING) {
-            response.devSessions.push({ ...session });
-          }
         }
         return response;
       },
@@ -111,44 +137,20 @@ export function devSessionRefreshFixture(
         }
         return work.cancelRequest(req);
       },
-      async listRunners(req) {
-        const response = await work.listRunners(req);
-        if (
-          req.organizationId === runner.organizationId &&
-          (req.includeEnded || runner.state === RunnerState.BUSY)
-        ) {
-          response.runners.push({ ...runner });
-        }
-        return response;
-      },
       deleteRunner(req) {
-        if (req.runnerId !== runner.runnerId) return work.deleteRunner(req);
-        if (mode === "fail-delete") {
+        if (mode === "fail-delete" && req.runnerId === runnerId) {
           throw new ConnectError(
             "Fixture rejected deletion.",
             Code.FailedPrecondition,
           );
         }
-        // User deletion ends the linked dev-session request on the server.
-        const endedAt = timestampNow();
-        Object.assign(session, {
-          state: RequestState.ENDED,
-          endReason: RequestEndReason.SESSION_DELETED,
-          endedAt,
-        });
-        Object.assign(runner, {
-          state: RunnerState.DELETED,
-          endReason: RunnerEndReason.DELETED_BY_USER,
-          endedAt,
-        });
-        return { runner };
+        return work.deleteRunner(req);
       },
     });
   });
   const methods = new Set([
     DevSessionService.method.listDevSessions.name,
     WorkService.method.cancelRequest.name,
-    WorkService.method.listRunners.name,
     WorkService.method.deleteRunner.name,
   ]);
   const transport: Transport = {

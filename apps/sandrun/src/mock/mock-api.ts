@@ -2070,6 +2070,30 @@ export function createMockTransport(
           return { runner: r };
         }
         endRunner(org, r, RunnerEndReason.DELETED_BY_USER);
+        const request =
+          r.requestId === ""
+            ? undefined
+            : org.requests.find((x) => x.requestId === r.requestId);
+        if (
+          request !== undefined &&
+          !TERMINAL_REQUEST_STATES.has(request.state)
+        ) {
+          if (request.kind === WorkloadKind.DEV_SESSION) {
+            endRequest(
+              org,
+              request,
+              RequestState.ENDED,
+              RequestEndReason.SESSION_DELETED,
+            );
+          } else if (request.kind === WorkloadKind.AGENT_SESSION) {
+            endRequest(
+              org,
+              request,
+              RequestState.FAILED,
+              RequestEndReason.RUNNER_LOST,
+            );
+          }
+        }
         audit(
           org,
           AuditAction.RUNNER_DELETED,

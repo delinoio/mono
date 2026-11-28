@@ -59,8 +59,9 @@ export function createMockTransport(options?: MockTransportOptions): Transport {
     refreshMode === "fail-delete"
   ) {
     const { transport, reads } = devSessionRefreshFixture(
-      createSettingsMock(options),
+      createSettingsMock,
       refreshMode,
+      options,
     );
     window.sandrunDevSessionReads = reads;
     return transport;
