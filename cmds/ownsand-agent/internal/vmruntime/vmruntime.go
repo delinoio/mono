@@ -94,6 +94,8 @@ type HostCleaner interface {
 
 // Capabilities are the runtime facts of the capability report.
 type Capabilities struct {
+	// Deferred means the sample is incomplete and must not replace the last report.
+	Deferred             bool
 	GuestOSes            []ownsandv1.GuestOs
 	BaseImages           []ownsandv1.BaseImage
 	MacOSGuestsSupported bool

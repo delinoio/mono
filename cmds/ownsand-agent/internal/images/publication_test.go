@@ -70,3 +70,106 @@ func TestRecoverDefersWhilePublicationHasReaders(t *testing.T) {
 		t.Fatalf("Recover after both readers release = %v, %v", res, err)
 	}
 }
+
+func TestTryWithBaseImageDuringMacOSPublication(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), MacOSDir)
+	writeCapabilityImage(t, dir, "previous")
+	writeCapabilityImage(t, BuildDir(dir), "replacement")
+
+	build, err := TryLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer build.releaseAndLog()
+
+	paused, resume := make(chan struct{}), make(chan struct{})
+	rename = func(src, dst string) error {
+		err := os.Rename(src, dst)
+		if err == nil && src == dir && dst == OldDir(dir) {
+			close(paused)
+			<-resume
+		}
+		return err
+	}
+	defer func() { rename = os.Rename }()
+
+	finished := make(chan error, 1)
+	go func() {
+		finished <- Install(t.Context(), dir, ownsandv1.GuestOs_GUEST_OS_MACOS)
+	}()
+	select {
+	case <-paused:
+	case err := <-finished:
+		t.Fatalf("install finished before publication paused: %v", err)
+	}
+	var model []byte
+	read := func() error {
+		var err error
+		model, err = os.ReadFile(filepath.Join(dir, MacOSHardwareModel))
+		return err
+	}
+	probe := make(chan error, 1)
+	go func() { probe <- TryWithBaseImage(dir, read) }()
+	select {
+	case err := <-probe:
+		if !errors.Is(err, ErrLocked) || model != nil {
+			t.Errorf("probe between publication renames = %v, model = %q", err, model)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("probe waited for the publisher")
+		close(resume)
+		<-finished
+		<-probe
+		return
+	}
+	close(resume)
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	if err := TryWithBaseImage(dir, read); err != nil || string(model) != "replacement" {
+		t.Fatalf("probe after publication = %v, model = %q", err, model)
+	}
+}
+
+func TestTryWithBaseImageRecoversMacOSBackup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), MacOSDir)
+	writeCapabilityImage(t, OldDir(dir), "previous")
+	build, err := TryLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var model []byte
+	read := func() error {
+		var err error
+		model, err = os.ReadFile(filepath.Join(dir, MacOSHardwareModel))
+		return err
+	}
+	if err := TryWithBaseImage(dir, read); !errors.Is(err, ErrLocked) || model != nil {
+		t.Errorf("probe while recovery needs a busy build lock = %v, model = %q", err, model)
+	}
+	build.releaseAndLog()
+	if err := TryWithBaseImage(dir, read); err != nil || string(model) != "previous" {
+		t.Fatalf("probe after interrupted install = %v, model = %q", err, model)
+	}
+	if err := os.Remove(filepath.Join(dir, MacOSHardwareModel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := TryWithBaseImage(dir, read); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("probe of incomplete image with no backup = %v", err)
+	}
+}
+
+func writeCapabilityImage(t *testing.T, dir, model string) {
+	t.Helper()
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteMetadata(dir, Metadata{GuestOS: ownsandv1.GuestOs_GUEST_OS_MACOS}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{MacOSDisk, MacOSAuxStorage, MacOSHardwareModel} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(model), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

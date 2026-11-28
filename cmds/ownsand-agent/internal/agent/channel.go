@@ -96,6 +96,16 @@ func (a *Agent) runChannel(ctx context.Context) error {
 	}
 	a.logger.Info("authenticated", "device_id", a.DeviceID(), "credential_expires_in_s", int64(res.Session.ExpiresIn.Seconds()))
 
+	free, _ := a.opts.FreeDisk()
+	report := a.capabilityReport(ctx, free)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if report == nil {
+		// Retry through channelLoop's cancellable reconnect backoff.
+		return errors.New("initial capability sample deferred")
+	}
+
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream := a.cp.Agent.Channel(cctx)
@@ -139,17 +149,17 @@ func (a *Agent) runChannel(ctx context.Context) error {
 		}
 	}()
 
-	c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: a.capabilityReport(ctx)}})
+	c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: report}})
 	a.mu.Lock()
 	a.reportSeq++
 	seq := a.reportSeq
 	a.mu.Unlock()
-	c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: a.Sandboxes.StateReport(seq, a.rt.Capabilities(ctx).BaseImages)}})
+	c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: a.Sandboxes.StateReport(seq, report.GetCapabilities().GetBuiltBaseImages())}})
 	a.dataPath.ChannelOpened(c)
 	a.setConnected(ctx, true)
 	a.logger.Info("agent channel connected", "generation", c.gen)
 
-	go a.heartbeats(cctx, c, cancel)
+	go a.heartbeats(cctx, c, cancel, report.GetCapabilities().GetFreeDiskBytes())
 
 	for {
 		resp, err := stream.Receive()
@@ -171,13 +181,13 @@ func (a *Agent) runChannel(ctx context.Context) error {
 }
 
 // heartbeats sends a heartbeat every interval, reports capabilities when
-// the free disk needs it, and closes the channel when no acknowledgement
-// arrived on it within the acknowledgement timeout.
-func (a *Agent) heartbeats(ctx context.Context, c *conn, cancel context.CancelFunc) {
+// a refresh is due, and closes the channel when no acknowledgement arrives
+// within the acknowledgement timeout.
+func (a *Agent) heartbeats(ctx context.Context, c *conn, cancel context.CancelFunc, lastFree int64) {
 	t := time.NewTicker(a.opts.HeartbeatInterval)
 	defer t.Stop()
 	lastCap := time.Now()
-	lastFree, _ := a.opts.FreeDisk()
+	refreshDue := false
 	var seq uint64
 	for {
 		select {
@@ -205,9 +215,14 @@ func (a *Agent) heartbeats(ctx context.Context, c *conn, cancel context.CancelFu
 			Sequence: seq, UpdateState: state, UpdateTargetVersion: target,
 		}}})
 		free, _ := a.opts.FreeDisk()
-		if time.Since(lastCap) >= CapabilityInterval || abs(free-lastFree) > capabilityDiskDelta {
-			lastCap, lastFree = time.Now(), free
-			c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: a.capabilityReport(ctx)}})
+		refreshDue = refreshDue || time.Since(lastCap) >= CapabilityInterval || abs(free-lastFree) > capabilityDiskDelta
+		if refreshDue {
+			report := a.capabilityReport(ctx, free)
+			if report == nil {
+				continue
+			}
+			c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: report}})
+			lastCap, lastFree, refreshDue = time.Now(), free, false
 		}
 	}
 }
@@ -219,10 +234,13 @@ func abs(v int64) int64 {
 	return v
 }
 
-func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityReport {
+// capabilityReport returns nil when the runtime defers the sample.
+func (a *Agent) capabilityReport(ctx context.Context, free int64) *ownsandv1.CapabilityReport {
 	caps := a.rt.Capabilities(ctx)
+	if caps.Deferred || ctx.Err() != nil {
+		return nil
+	}
 	caps.MacOSHardwareModels = a.macOSHardwareModels(caps.MacOSHardwareModels)
-	free, _ := a.opts.FreeDisk()
 	report := &ownsandv1.CapabilityReport{
 		HostOs:               sysinfo.HostOS(),
 		Arch:                 sysinfo.Arch(),
