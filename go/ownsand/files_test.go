@@ -1674,6 +1674,110 @@ func TestFileWriteChunksAcrossCalls(t *testing.T) {
 	}
 }
 
+func TestFakeRejectsIncompleteWrite(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		stagedData string
+		offset     int64
+		data       string
+		size       int64
+	}{
+		{name: "leading gap", offset: 2, data: "C", size: 3},
+		{name: "empty chunk adds no coverage", offset: 3, size: 3},
+		{name: "staged bytes beyond size", stagedData: "ABC", offset: 2, size: 2},
+		{name: "finish data beyond size", data: "ABC", size: 2},
+		{name: "nonempty write with zero size", stagedData: "A"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newFakeAgent()
+			id := mustID(t)
+			const path = "/out"
+			if tc.stagedData != "" {
+				if _, err := a.write(&ownsandv1.WriteFileRequest{WriteId: id, Path: path, Data: []byte(tc.stagedData)}, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res, err := a.write(&ownsandv1.WriteFileRequest{
+				WriteId: id,
+				Path:    path,
+				Offset:  tc.offset,
+				Data:    []byte(tc.data),
+				Finish:  &ownsandv1.WriteFileFinish{SizeBytes: tc.size, Mode: 0o600},
+			}, nil)
+			if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition {
+				t.Fatalf("finish = (%v, %v), want (nil, failed_precondition)", res, err)
+			}
+			if _, ok := a.file(path); ok {
+				t.Fatal("rejected write published a file")
+			}
+			if a.writes[id].done != nil {
+				t.Fatal("rejected write cached a completed result")
+			}
+		})
+	}
+}
+
+func TestFakeResumesIncompleteWrite(t *testing.T) {
+	t.Parallel()
+	a := newFakeAgent()
+	id := mustID(t)
+	const path = "/out"
+	a.setFile(path, []byte("old"))
+	if _, err := a.write(&ownsandv1.WriteFileRequest{WriteId: id, Path: path, Data: []byte("A")}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	finish := &ownsandv1.WriteFileFinish{SizeBytes: 3, Mode: 0o600}
+	res, err := a.write(&ownsandv1.WriteFileRequest{WriteId: id, Offset: 2, Data: []byte("C"), Finish: finish}, nil)
+	if res != nil || connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("finish with gap = (%v, %v), want (nil, failed_precondition)", res, err)
+	}
+	if got, _ := a.file(path); string(got) != "old" || a.writes[id].done != nil {
+		t.Fatalf("rejected finish left file %q and cached result %v, want old file and no result", got, a.writes[id].done)
+	}
+
+	if _, err := a.write(&ownsandv1.WriteFileRequest{WriteId: id, Offset: 1, Data: []byte{0}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Retry without resending the last byte to check that the failed finish staged it.
+	res, err = a.write(&ownsandv1.WriteFileRequest{WriteId: id, Offset: 3, Finish: finish}, nil)
+	if err != nil || !res.GetFinished() || res.GetSizeBytes() != 3 {
+		t.Fatalf("finish after filling gap = (%v, %v)", res, err)
+	}
+	if got, _ := a.file(path); !bytes.Equal(got, []byte{'A', 0, 'C'}) {
+		t.Fatalf("file = %q, want A\x00C", got)
+	}
+}
+
+func TestFakeEmptyChunkWrite(t *testing.T) {
+	t.Parallel()
+	for _, data := range []string{"", "ABC"} {
+		t.Run(fmt.Sprintf("size %d", len(data)), func(t *testing.T) {
+			a := newFakeAgent()
+			id := mustID(t)
+			const path = "/out"
+			if _, err := a.write(&ownsandv1.WriteFileRequest{WriteId: id, Path: path, Offset: 9}, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := a.write(&ownsandv1.WriteFileRequest{WriteId: id, Data: []byte(data)}, nil); err != nil {
+				t.Fatal(err)
+			}
+			res, err := a.write(&ownsandv1.WriteFileRequest{
+				WriteId: id,
+				Offset:  7,
+				Finish:  &ownsandv1.WriteFileFinish{SizeBytes: int64(len(data)), Mode: 0o600},
+			}, nil)
+			if err != nil || !res.GetFinished() || res.GetSizeBytes() != int64(len(data)) {
+				t.Fatalf("finish = (%v, %v), want a completed write of %d bytes", res, err, len(data))
+			}
+			if got, ok := a.file(path); !ok || string(got) != data {
+				t.Fatalf("file = (%q, %t), want (%q, true)", got, ok, data)
+			}
+		})
+	}
+}
+
 func TestFileWriteFinishChecksDeclaredSize(t *testing.T) {
 	t.Parallel()
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {

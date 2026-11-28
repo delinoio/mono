@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1110,6 +1111,7 @@ type fakeWrite struct {
 	path   string
 	digest []byte
 	data   []byte
+	ranges []ByteRange // Sorted, disjoint ranges of staged bytes.
 	done   *fakeCompletedWrite
 }
 
@@ -1119,6 +1121,30 @@ type fakeCompletedWrite struct {
 	chunkOffset int64
 	chunkDigest [sha256.Size]byte
 	response    *ownsandv1.WriteFileResponse
+}
+
+func (w *fakeWrite) stageChunk(offset int64, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	end := offset + int64(len(data))
+	if int64(len(w.data)) < end {
+		w.data = append(w.data, make([]byte, end-int64(len(w.data)))...)
+	}
+	copy(w.data[offset:end], data)
+
+	ranges := append(w.ranges, ByteRange{From: offset, To: end})
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].From < ranges[j].From })
+	merged := ranges[:1]
+	for _, r := range ranges[1:] {
+		last := &merged[len(merged)-1]
+		if r.From <= last.To {
+			last.To = max(last.To, r.To)
+			continue
+		}
+		merged = append(merged, r)
+	}
+	w.ranges = merged
 }
 
 func newFakeAgent() *fakeAgent {
@@ -1305,14 +1331,13 @@ func (a *fakeAgent) write(req *ownsandv1.WriteFileRequest, grantDigest []byte) (
 		}
 		return done.response, nil
 	}
-	end := req.GetOffset() + int64(len(req.GetData()))
-	if int64(len(w.data)) < end {
-		w.data = append(w.data, make([]byte, end-int64(len(w.data)))...)
-	}
-	copy(w.data[req.GetOffset():], req.GetData())
+	w.stageChunk(req.GetOffset(), req.GetData())
 	res := &ownsandv1.WriteFileResponse{WriteId: req.GetWriteId(), Offset: req.GetOffset(), Length: int64(len(req.GetData()))}
 	if finish != nil {
-		if finish.GetSizeBytes() != int64(len(w.data)) {
+		size := finish.GetSizeBytes()
+		covered := (size == 0 && len(w.ranges) == 0) ||
+			(len(w.ranges) == 1 && w.ranges[0] == (ByteRange{From: 0, To: size}))
+		if !covered {
 			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("ranges do not cover the size"))
 		}
 		a.files[w.path] = append([]byte(nil), w.data...)
