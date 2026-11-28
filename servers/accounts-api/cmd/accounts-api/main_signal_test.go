@@ -33,6 +33,10 @@ const (
 	signalHelperHealthy        = "healthy"
 	signalHelperMetricsFailure = "metrics-failure"
 	signalHelperPublicFailure  = "public-failure"
+	signalHelperSignalFailure  = "signal-public-failure"
+	signalHelperSignalDeadline = "signal-public-failure-deadline"
+	signalHelperWrappedClose   = "wrapped-close"
+	signalHelperTemporaryError = "temporary-accept-error"
 	// helperDrainTimeout is the drain timeout of the helper. It is far above
 	// every limit the parent test waits for, so an exit that waits for the drain
 	// to time out is distinguishable from a prompt one.
@@ -45,11 +49,15 @@ var errPublicAccept = errors.New("public accept failed permanently")
 // binary into it. It serves /ping, /slow?ms=<n> (a handler that blocks for n
 // milliseconds) and /hold (a handler that blocks until the parent releases it
 // over the helper's stdin), prints "listening <addr>", "slow_started" and
-// "hold_started" lines, and exits with runServers' result. In either listener
-// failure mode, the first byte fails Accept and the third lets the worker finish.
+// "hold_started" lines, and exits with runServers' result. The failure-first
+// modes use the first control byte to fail Accept and the third to finish the
+// worker. The other modes use one byte to release the held request.
 func TestSignalHelperProcess(t *testing.T) {
 	mode := os.Getenv(signalHelperEnv)
-	if mode != signalHelperHealthy && mode != signalHelperMetricsFailure && mode != signalHelperPublicFailure {
+	switch mode {
+	case signalHelperHealthy, signalHelperMetricsFailure, signalHelperPublicFailure,
+		signalHelperSignalFailure, signalHelperSignalDeadline, signalHelperWrappedClose, signalHelperTemporaryError:
+	default:
 		t.Skip("helper process for the signal tests")
 	}
 
@@ -59,7 +67,8 @@ func TestSignalHelperProcess(t *testing.T) {
 	releaseRequest := make(chan struct{})
 	worker := func(ctx context.Context) { <-ctx.Done() }
 	timeout := helperDrainTimeout
-	if mode != signalHelperHealthy {
+	switch mode {
+	case signalHelperMetricsFailure, signalHelperPublicFailure:
 		failListener := make(chan struct{})
 		finishWorker := make(chan struct{})
 		if mode == signalHelperMetricsFailure {
@@ -80,7 +89,19 @@ func TestSignalHelperProcess(t *testing.T) {
 			logger.Info("worker_finished")
 		}
 		go releaseOnControlInput(failListener, releaseRequest, finishWorker)
-	} else {
+	default:
+		switch mode {
+		case signalHelperSignalFailure, signalHelperSignalDeadline:
+			listener = newSignalAcceptListener(listener, errPublicAccept, func() { fmt.Println("public_accept_failed") })
+		case signalHelperWrappedClose:
+			err := fmt.Errorf("public listener closed: %w", net.ErrClosed)
+			listener = acceptErrorOnCloseListener{Listener: listener, err: err}
+		case signalHelperTemporaryError:
+			listener = &temporaryAcceptListener{Listener: listener}
+		}
+		if mode == signalHelperSignalDeadline {
+			timeout = time.Second
+		}
 		go releaseOnControlInput(releaseRequest)
 	}
 
@@ -132,6 +153,51 @@ func releaseOnControlInput(gates ...chan struct{}) {
 type gatedMetricsListener struct {
 	net.Listener
 	fail <-chan struct{}
+}
+
+// signalAcceptListener selects the injected error on the second Accept and
+// holds it until Shutdown closes the loopback listener.
+type signalAcceptListener struct {
+	net.Listener
+	err      error
+	onFailed func()
+	closed   chan struct{}
+	accepted bool
+}
+
+func newSignalAcceptListener(listener net.Listener, err error, onFailed func()) *signalAcceptListener {
+	return &signalAcceptListener{Listener: listener, err: err, onFailed: onFailed, closed: make(chan struct{})}
+}
+
+func (l *signalAcceptListener) Accept() (net.Conn, error) {
+	if !l.accepted {
+		conn, err := l.Listener.Accept()
+		l.accepted = err == nil
+		return conn, err
+	}
+	err := l.err
+	l.onFailed()
+	<-l.closed
+	return nil, err
+}
+
+func (l *signalAcceptListener) Close() error {
+	err := l.Listener.Close()
+	close(l.closed)
+	return err
+}
+
+type temporaryAcceptListener struct {
+	net.Listener
+	failed bool
+}
+
+func (l *temporaryAcceptListener) Accept() (net.Conn, error) {
+	if !l.failed {
+		l.failed = true
+		return nil, &net.DNSError{Err: "temporary accept failure", IsTemporary: true}
+	}
+	return l.Listener.Accept()
 }
 
 func (l gatedMetricsListener) Accept() (net.Conn, error) {
@@ -462,8 +528,75 @@ func TestServePublicListenerFailureDrainsProcess(t *testing.T) {
 			}
 			h.waitForLine(`"msg":"worker_finished"`)
 			exitLog := h.waitForLine(`"msg":"server_exited"`)
-			if !strings.Contains(exitLog, errPublicAccept.Error()) {
-				t.Fatalf("exit log lacks the original public listener error: %s", exitLog)
+			if strings.Count(exitLog, errPublicAccept.Error()) != 1 {
+				t.Fatalf("exit log must contain the original public listener error once: %s", exitLog)
+			}
+		})
+	}
+}
+
+func TestServePublicListenerDuringSignalDrain(t *testing.T) {
+	for _, tc := range []struct {
+		mode     string
+		wantExit int
+	}{
+		{mode: signalHelperSignalFailure, wantExit: 1},
+		{mode: signalHelperHealthy},
+		{mode: signalHelperWrappedClose},
+		{mode: signalHelperTemporaryError},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			h := startHelperProcess(t, tc.mode)
+			request := runAsync(func() error {
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+h.addr+"/hold", nil)
+				if err != nil {
+					return err
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return err
+				}
+				if resp.StatusCode != http.StatusOK || string(body) != "completed" {
+					return fmt.Errorf("GET /hold = %d %q, want 200 completed", resp.StatusCode, body)
+				}
+				return nil
+			})
+			h.waitForLine("hold_started")
+			if tc.mode == signalHelperSignalFailure {
+				h.waitForLine("public_accept_failed")
+			}
+
+			h.signal(syscall.SIGTERM)
+			h.waitForLine("server_shutdown_started")
+			h.waitForListenerClosure()
+			h.release()
+			select {
+			case err := <-request:
+				if err != nil {
+					t.Fatalf("in-flight request failed: %v; output:\n%s", err, h.out.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("held request did not finish after release; output:\n%s", h.out.String())
+			}
+
+			ws := h.wait(5 * time.Second)
+			if !ws.Exited() || ws.ExitStatus() != tc.wantExit {
+				t.Fatalf("wait status = %v, want exit status %d; output:\n%s", ws, tc.wantExit, h.out.String())
+			}
+			if tc.wantExit == 0 {
+				if strings.Contains(h.out.String(), `"msg":"server_exited"`) {
+					t.Fatalf("clean shutdown logged server_exited; output:\n%s", h.out.String())
+				}
+				return
+			}
+			exitLog := h.waitForLine(`"msg":"server_exited"`)
+			if strings.Count(exitLog, errPublicAccept.Error()) != 1 {
+				t.Fatalf("exit log must contain the original public listener error once: %s", exitLog)
 			}
 		})
 	}
