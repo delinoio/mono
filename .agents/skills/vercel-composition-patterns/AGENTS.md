@@ -351,7 +351,7 @@ function Channel({ channelId }: { channelId: string }) {
 
 ```tsx
 // Local state for ephemeral forms
-function ForwardMessageProvider({ children }) {
+function ForwardMessageProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState(initialState)
   const forwardMessage = useForwardMessage()
   const inputRef = useRef<TextInput>(null)
@@ -368,7 +368,13 @@ function ForwardMessageProvider({ children }) {
 }
 
 // Global synced state for channels
-function ChannelProvider({ channelId, children }) {
+function ChannelProvider({
+  channelId,
+  children,
+}: {
+  channelId: string
+  children: React.ReactNode
+}) {
   const { state, update, submit } = useGlobalChannel(channelId)
   const inputRef = useRef<TextInput>(null)
 
