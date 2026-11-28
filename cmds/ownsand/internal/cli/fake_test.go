@@ -54,7 +54,9 @@ type fakeServer struct {
 	// limit is the last limits input of ReplaceDeviceLimits; its optional
 	// fields keep the presence that the CLI sent.
 	limit *ownsandv1.DeviceLimitsInput
-	creat []*ownsandv1.CreateSandboxRequest
+	// deviceOvercommitPercent is the stored percentage that GetDevice returns.
+	deviceOvercommitPercent int32
+	creat                   []*ownsandv1.CreateSandboxRequest
 	// writeModes are the modes of the relay WriteFile finish requests, in
 	// order; writes counts every relay WriteFile request.
 	writeModes []uint32
@@ -71,7 +73,10 @@ type fakeServer struct {
 }
 
 func newFakeServer(t testing.TB) *fakeServer {
-	f := &fakeServer{t: t, org: newID(t), sb: newID(t), dev: newID(t), files: map[string][]byte{}}
+	f := &fakeServer{
+		t: t, org: newID(t), sb: newID(t), dev: newID(t),
+		files: map[string][]byte{}, deviceOvercommitPercent: 150,
+	}
 	mux := http.NewServeMux()
 	mux.Handle(ownsandv1connect.NewOrganizationServiceHandler(&fakeOrg{f: f}))
 	mux.Handle(ownsandv1connect.NewMemberServiceHandler(&fakeMember{f: f}))
@@ -172,7 +177,10 @@ type fakeDevices struct {
 }
 
 func (h *fakeDevices) GetDevice(context.Context, *connect.Request[ownsandv1.GetDeviceRequest]) (*connect.Response[ownsandv1.GetDeviceResponse], error) {
-	limits := &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 1, DiskGib: 1, VcpuOvercommitPercent: 150}
+	h.f.mu.Lock()
+	percent := h.f.deviceOvercommitPercent
+	h.f.mu.Unlock()
+	limits := &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 1, DiskGib: 1, VcpuOvercommitPercent: percent}
 	return connect.NewResponse(&ownsandv1.GetDeviceResponse{Device: h.deviceWithLimits(limits)}), nil
 }
 
