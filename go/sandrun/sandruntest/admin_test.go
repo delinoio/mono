@@ -73,6 +73,7 @@ func TestListRequestsFilters(t *testing.T) {
 	const (
 		job     = sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB
 		agent   = sandrunv1.WorkloadKind_WORKLOAD_KIND_AGENT_SESSION
+		normal  = sandrunv1.Priority_PRIORITY_NORMAL
 		queued  = sandrunv1.RequestState_REQUEST_STATE_QUEUED
 		start   = sandrunv1.RequestState_REQUEST_STATE_STARTING
 		running = sandrunv1.RequestState_REQUEST_STATE_RUNNING
@@ -82,12 +83,14 @@ func TestListRequestsFilters(t *testing.T) {
 	t.Cleanup(s.Close)
 	org := s.AddOrganization("first").GetOrganizationId()
 	other := s.AddOrganization("second").GetOrganizationId()
+	earlier := timestamppb.New(time.Unix(100, 0))
+	later := timestamppb.New(time.Unix(200, 0))
 	for _, r := range []*sandrunv1.Request{
 		{RequestId: "other-org", OrganizationId: other, RunnerProfileId: firstListProfile, Kind: job, State: ended},
-		{RequestId: "second-job", OrganizationId: org, RunnerProfileId: secondListProfile, Kind: job, State: running},
-		{RequestId: "first-agent", OrganizationId: org, RunnerProfileId: firstListProfile, Kind: agent, State: start},
-		{RequestId: "second-agent", OrganizationId: org, RunnerProfileId: secondListProfile, Kind: agent, State: queued},
-		{RequestId: "first-job", OrganizationId: org, RunnerProfileId: firstListProfile, Kind: job, State: ended},
+		{RequestId: "second-job", OrganizationId: org, RunnerProfileId: secondListProfile, Kind: job, State: running, Priority: normal, QueuedAt: earlier},
+		{RequestId: "first-agent", OrganizationId: org, RunnerProfileId: firstListProfile, Kind: agent, State: start, Priority: normal, QueuedAt: later},
+		{RequestId: "second-agent", OrganizationId: org, RunnerProfileId: secondListProfile, Kind: agent, State: queued, Priority: normal, QueuedAt: later},
+		{RequestId: "first-job", OrganizationId: org, RunnerProfileId: firstListProfile, Kind: job, State: ended, EndedAt: later},
 		{RequestId: "unspecified", OrganizationId: org, RunnerProfileId: secondListProfile, Kind: agent},
 	} {
 		s.AddRequest(r)
@@ -131,6 +134,71 @@ func TestListRequestsFilters(t *testing.T) {
 		for _, includeEnded := range []bool{false, true} {
 			_, err := client.ListRequests(t.Context(), listTestRequest(&sandrunv1.ListRequestsRequest{OrganizationId: org, States: states, IncludeEnded: includeEnded}))
 			assertInvalidListFilter(t, err, "invalid states: must be a defined RequestState value")
+		}
+	}
+}
+
+func TestListRequestsOrderAcrossPages(t *testing.T) {
+	t.Parallel()
+	const (
+		queued   = sandrunv1.RequestState_REQUEST_STATE_QUEUED
+		starting = sandrunv1.RequestState_REQUEST_STATE_STARTING
+		running  = sandrunv1.RequestState_REQUEST_STATE_RUNNING
+		ended    = sandrunv1.RequestState_REQUEST_STATE_ENDED
+		canceled = sandrunv1.RequestState_REQUEST_STATE_CANCELED
+		expired  = sandrunv1.RequestState_REQUEST_STATE_EXPIRED
+		failed   = sandrunv1.RequestState_REQUEST_STATE_FAILED
+		high     = sandrunv1.Priority_PRIORITY_HIGH
+		normal   = sandrunv1.Priority_PRIORITY_NORMAL
+	)
+	s := New()
+	t.Cleanup(s.Close)
+	org := s.AddOrganization("queue").GetOrganizationId()
+	earlier := timestamppb.New(time.Unix(100, 0))
+	later := timestamppb.New(time.Unix(100, 1))
+	// Seed in reverse of the production query order.
+	for _, r := range []*sandrunv1.Request{
+		{RequestId: "ended-old", State: ended, EndedAt: earlier},
+		{RequestId: "ended-b", State: canceled, EndedAt: later},
+		{RequestId: "ended-a", State: expired, EndedAt: later},
+		{RequestId: "no-end", State: failed},
+		{RequestId: "unknown-b", State: 99, Priority: high, QueuedAt: earlier},
+		{RequestId: "unknown-a", State: sandrunv1.RequestState_REQUEST_STATE_UNSPECIFIED},
+		{RequestId: "normal", State: queued, Priority: normal, QueuedAt: earlier},
+		{RequestId: "no-queue", State: queued, Priority: high},
+		{RequestId: "high-later", State: running, Priority: high, QueuedAt: later},
+		{RequestId: "high-b", State: starting, Priority: high, QueuedAt: earlier},
+		{RequestId: "high-a", State: queued, Priority: high, QueuedAt: earlier},
+	} {
+		r.OrganizationId = org
+		r.RunnerProfileId = firstListProfile
+		r.Kind = sandrunv1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB
+		s.AddRequest(r)
+	}
+
+	client := sandrunv1connect.NewWorkServiceClient(http.DefaultClient, s.URL)
+	want := []string{
+		"high-a", "high-b", "high-later", "no-queue", "normal",
+		"unknown-a", "unknown-b", "no-end", "ended-a", "ended-b", "ended-old",
+	}
+	var token string
+	for i, id := range want {
+		res, err := client.ListRequests(t.Context(), listTestRequest(&sandrunv1.ListRequestsRequest{
+			OrganizationId: org,
+			IncludeEnded:   true,
+			PageSize:       1,
+			PageToken:      token,
+		}))
+		if err != nil {
+			t.Fatalf("page %d: %v", i+1, err)
+		}
+		rows := res.Msg.GetRequests()
+		if len(rows) != 1 || rows[0].GetRequestId() != id {
+			t.Fatalf("page %d: got %v, want request %q", i+1, rows, id)
+		}
+		token = res.Msg.GetNextPageToken()
+		if (token == "") != (i == len(want)-1) {
+			t.Fatalf("page %d returned unexpected next token %q", i+1, token)
 		}
 	}
 }
