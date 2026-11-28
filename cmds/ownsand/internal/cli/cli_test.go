@@ -159,7 +159,7 @@ func TestFileWriteMode(t *testing.T) {
 // help flag comes before the command (the root flag set reads it there).
 func TestRootHelpPrintsUsage(t *testing.T) {
 	r := newRunner(t)
-	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"--no-color", "--help"}} {
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"--no-color", "--help"}, {"--", "help"}} {
 		res := r.run(args...)
 		if res.code != ExitOK {
 			t.Errorf("%v: exit %d, want %d (stderr %q)", args, res.code, ExitOK, res.stderr)
@@ -169,6 +169,12 @@ func TestRootHelpPrintsUsage(t *testing.T) {
 		}
 		if strings.Contains(res.stdout, "ownsand ownsand") {
 			t.Errorf("%v: stdout repeats the program name: %q", args, res.stdout)
+		}
+	}
+	for _, arg := range []string{"-h", "--help"} {
+		res := r.run("--", arg)
+		if res.code != ExitUsage || res.stdout != "" || !strings.Contains(res.stderr, "unknown command") {
+			t.Errorf("-- %s: %+v, want an unknown command error", arg, res)
 		}
 	}
 	// A subcommand help still lists the subcommand flags.
@@ -656,9 +662,16 @@ func TestLoginAndLogoutRejectOperands(t *testing.T) {
 		{"logout", "--", "extra"},
 		{"login", "extra"},
 		{"login", "--", "extra"},
+		{"--", "logout", "--format", "json"},
+		{"--", "login", "--help"},
+		{"--", "logout", "--"},
 	} {
 		res := r.run(args...)
-		if res.code != ExitUsage || !strings.Contains(res.stderr, "usage: ownsand "+args[0]) {
+		cmd := args[0]
+		if cmd == "--" {
+			cmd = args[1]
+		}
+		if res.code != ExitUsage || res.stdout != "" || !strings.Contains(res.stderr, "usage: ownsand "+cmd) {
 			t.Errorf("%v = %+v, want a usage error", args, res)
 		}
 		after, err := os.ReadFile(path)
@@ -1501,6 +1514,44 @@ func TestListOutputAndColor(t *testing.T) {
 	}
 }
 
+func TestListOutputWithOptionTerminator(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantCode int
+		wantJSON bool
+	}{
+		{"root terminator before global flag", []string{"--", "org", "list", "--format", "json"}, ExitUsage, false},
+		{"root terminator before command flag", []string{"--", "org", "list", "--page-size", "1"}, ExitUsage, false},
+		{"root terminator before help flag", []string{"--", "org", "list", "--help"}, ExitUsage, false},
+		{"literal second dash dash", []string{"--", "org", "list", "--"}, ExitUsage, false},
+		{"command terminator", []string{"org", "list", "--", "--format", "json"}, ExitUsage, false},
+		{"root terminator before command words", []string{"--", "org", "list"}, ExitOK, false},
+		{"global flag before root terminator", []string{"--format", "json", "--", "org", "list"}, ExitOK, true},
+		{"global flag after command words", []string{"org", "list", "--format", "json"}, ExitOK, true},
+		{"dash dash as flag value", []string{"--org", "--", "org", "list", "--format", "json"}, ExitOK, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			res := r.run(tc.args...)
+			if res.code != tc.wantCode {
+				t.Fatalf("%v: got %+v, want exit %d", tc.args, res, tc.wantCode)
+			}
+			calls := r.f.callNames()
+			if tc.wantCode == ExitUsage {
+				if res.stdout != "" || !strings.Contains(res.stderr, "usage: ownsand org list [flags]") || len(calls) != 0 {
+					t.Fatalf("%v: got %+v and RPCs %v, want an org list usage error and no RPCs", tc.args, res, calls)
+				}
+				return
+			}
+			if !strings.Contains(res.stdout, "acme") || json.Valid([]byte(res.stdout)) != tc.wantJSON ||
+				!slices.Equal(calls, []string{"ListOrganizations"}) {
+				t.Fatalf("%v: got %+v and RPCs %v, want org list output (JSON=%t) from one ListOrganizations RPC", tc.args, res, calls, tc.wantJSON)
+			}
+		})
+	}
+}
+
 func TestVerboseLogsNeverContainSecretsOrContent(t *testing.T) {
 	r := newRunner(t)
 	res := r.run("--verbose", "--no-color", "sandbox", "exec", r.f.sb, "--", "echo", "topsecret-arg")
@@ -1545,6 +1596,7 @@ func TestExecArgumentForms(t *testing.T) {
 		{"sandbox", "exec", "--timeout", "1m", r.f.sb, "echo", "-n", "x"},
 		{"sandbox", "exec", r.f.sb, "--env", "A=B", "echo", "-n", "x"},
 		{"--org", r.f.org, "sandbox", "exec", r.f.sb, "--cwd", "/", "--", "echo", "-n", "x"},
+		{"--", "sandbox", "exec", r.f.sb, "--", "echo", "-n", "x"},
 	} {
 		res := r.run(args...)
 		if res.code != 0 || res.stdout != "-n x\n" {
