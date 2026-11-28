@@ -268,7 +268,7 @@ func TestCloseWithWritableQueueSendsOneClose(t *testing.T) {
 }
 
 // TestCloseAfterConnectionClosedQueuesNothing checks that closing a stream of
-// a closed connection leaks no reservation.
+// a closed connection releases its reservation and leaves only the open frame.
 func TestCloseAfterConnectionClosedQueuesNothing(t *testing.T) {
 	c := NewConn(context.Background(), "device", 1, closeTestLimits)
 	s, err := c.Open(context.Background(), "grant-a", "sandbox")
@@ -279,5 +279,12 @@ func TestCloseAfterConnectionClosedQueuesNothing(t *testing.T) {
 	s.Close(true)
 	if got := pendingFinals(c); got != 0 {
 		t.Fatalf("pending finals = %d, want 0", got)
+	}
+	if got := len(c.out); got != 1 {
+		t.Fatalf("queued frames = %d, want 1", got)
+	}
+	frame := drainOut(c)[0]
+	if frame.GetStreamId() != s.ID || frame.GetRelayStreamOpen() == nil {
+		t.Fatalf("queued frame = %v, want the open frame for stream %d", frame, s.ID)
 	}
 }
