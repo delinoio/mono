@@ -249,6 +249,15 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   } | null>(null);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const device = query.data?.device;
+  const showError = query.data === undefined || showsFullError(query);
+  const admin =
+    !showError &&
+    device !== undefined &&
+    can(role, Permission.ManageDevices) &&
+    device.state !== DeviceState.REMOVED;
+  if (!admin && confirmRemove) {
+    setConfirmRemove(false);
+  }
   // `update.isPending` lasts until the refetch that follows the save has
   // settled (the mutation awaits `onSuccess`), so it also covers the moment
   // when the saved limits are read back. The fields are disabled for that
@@ -259,13 +268,11 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   const pending = update.isPending;
 
   if (query.isPending) return <Loading label={t("device.loading")} />;
-  if (query.data === undefined || showsFullError(query))
+  if (showError)
     return (
       <ErrorNotice error={query.error} onRetry={() => void query.refetch()} />
     );
   const d = device!;
-  const admin =
-    can(role, Permission.ManageDevices) && d.state !== DeviceState.REMOVED;
   // The shown value of each field is its edit, else the cached limit.
   // Memory and disk are the digits of the stored int64 limits: a number
   // cannot hold a value above 2^53 exactly, so saving another limit would
@@ -467,7 +474,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
         </section>
       ) : null}
       <ConfirmDialog
-        open={confirmRemove}
+        open={admin && confirmRemove}
         onOpenChange={setConfirmRemove}
         title={
           d.name
@@ -477,10 +484,10 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
         description={t("device.remove.dialogDescription")}
         confirmLabel={t("device.remove.button")}
         onConfirm={async (opening) => {
+          if (!admin) return;
           await remove.mutateAsync({ organizationId, deviceId });
-          // The redirect belongs to the opening that asked for the removal.
-          // After a dismissal the user is on another page, which stays. The
-          // mutation's own invalidation has already run.
+          // Keep the current route if the dialog has closed. The mutation
+          // has already started the cache refresh.
           if (opening.isCurrent()) {
             navigate(routePath({ id: RouteId.Devices, organizationId }));
           }
