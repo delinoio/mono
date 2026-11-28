@@ -5,6 +5,7 @@ package accountstest
 import (
 	"context"
 	"errors"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,6 +100,104 @@ func TestGetOrganizationBillingCountsOnlyTheCurrentMonth(t *testing.T) {
 	}
 	if q, a, _ := usage(); q != 3 || a != 30 {
 		t.Fatalf("April usage after duplicate = %d, %d; want 3, 30", q, a)
+	}
+}
+
+func TestGetOrganizationBillingSaturatesMonthlyUsage(t *testing.T) {
+	t.Parallel()
+
+	const (
+		org            = "org-1"
+		user           = "user-1"
+		account        = "ba-1"
+		initialBalance = 10_000_000
+		service        = accountsv1.ServiceId_SERVICE_ID_OWNSAND
+		meter          = accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC
+		otherMeter     = accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC
+		unusedMeter    = accountsv1.Meter_METER_OWNSAND_RELAY_EGRESS
+	)
+	type usage struct{ quantity, amount int64 }
+	for _, tc := range []struct {
+		name        string
+		first       usage
+		second      usage
+		want        usage
+		wantBalance int64
+	}{
+		{"quantity overflow", usage{math.MaxInt64, 10}, usage{1, 20}, usage{math.MaxInt64, 30}, initialBalance - 30},
+		{"amount overflow", usage{2, math.MaxInt64}, usage{3, 1}, usage{5, math.MaxInt64}, initialBalance - math.MaxInt64 - 1},
+		{"exact limit", usage{math.MaxInt64 - 1, math.MaxInt64 - 1}, usage{1, 1}, usage{math.MaxInt64, math.MaxInt64}, initialBalance - math.MaxInt64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC)
+			var minute atomic.Int64
+			f := New(t, func() time.Time { return start.Add(time.Duration(minute.Load()) * time.Minute) })
+			f.AddAccount(account, "Account", map[string]accountsv1.BillingAccountRole{user: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+			c := f.Client()
+			ctx := t.Context()
+			if _, err := c.LinkOrganization(ctx, connect.NewRequest(&accountsv1.LinkOrganizationRequest{
+				BillingAccountId: account, OrganizationId: org, OrganizationName: "Org", UserId: user,
+			})); err != nil {
+				t.Fatal(err)
+			}
+			minute.Store(15)
+			firstWindow := start.Add(5 * time.Minute)
+			secondWindow := start.Add(10 * time.Minute)
+			report := func(m accountsv1.Meter, window time.Time, value usage, duplicate bool) {
+				t.Helper()
+				ts := timestamppb.New(window)
+				resp, err := c.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: []*accountsv1.UsageReport{{
+					Service: service, OrganizationId: org, Meter: m, WindowStart: ts, Quantity: value.quantity, AmountUsdMicros: value.amount,
+				}}}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := &accountsv1.UsageReportResult{
+					Service: service, OrganizationId: org, Meter: m, WindowStart: ts, BillingAccountId: account, Duplicate: duplicate,
+				}
+				if results := resp.Msg.GetResults(); len(results) != 1 || !proto.Equal(results[0], want) {
+					t.Fatalf("ReportUsage results = %v, want [%v]", results, want)
+				}
+			}
+			checkBilling := func(wantBalance int64, wantOther usage) {
+				t.Helper()
+				resp, err := c.GetOrganizationBilling(ctx, connect.NewRequest(&accountsv1.GetOrganizationBillingRequest{OrganizationId: org}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := resp.Msg.GetBalanceUsdMicros(); got != wantBalance {
+					t.Errorf("balance = %d, want %d", got, wantBalance)
+				}
+				gotUsages := make(map[accountsv1.Meter]usage)
+				for _, u := range resp.Msg.GetMeterUsages() {
+					gotUsages[u.GetMeter()] = usage{u.GetQuantity(), u.GetAmountUsdMicros()}
+				}
+				for m, want := range map[accountsv1.Meter]usage{meter: tc.want, otherMeter: wantOther, unusedMeter: {}} {
+					if got, ok := gotUsages[m]; !ok || got != want {
+						t.Errorf("usage for %s = %+v (present: %t), want %+v", m, got, ok, want)
+					}
+				}
+			}
+
+			report(meter, firstWindow, tc.first, false)
+			report(meter, secondWindow, tc.second, false)
+			checkBilling(tc.wantBalance, usage{})
+
+			report(meter, secondWindow, tc.second, true)
+			checkBilling(tc.wantBalance, usage{})
+
+			other := usage{7, 9}
+			report(otherMeter, firstWindow, other, false)
+			checkBilling(tc.wantBalance-other.amount, other)
+		})
+	}
+}
+
+func TestAddMonthlyUsageWithNegativeTotal(t *testing.T) {
+	t.Parallel()
+
+	if got := addMonthlyUsage(math.MinInt64, math.MaxInt64); got != -1 {
+		t.Errorf("addMonthlyUsage(math.MinInt64, math.MaxInt64) = %d, want -1", got)
 	}
 }
 
