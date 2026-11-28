@@ -24,6 +24,9 @@ import (
 // verifier.
 type Control struct {
 	S *Service
+	// ExportVerifyTicks overrides the verifier ticker for tests. Set it
+	// before Run. A nil channel uses the default ticker.
+	ExportVerifyTicks <-chan time.Time
 
 	kick chan struct{}
 

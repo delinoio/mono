@@ -76,13 +76,20 @@ type exportVerifyJob struct {
 
 // runExportVerifier verifies the exports while the instance holds the lease.
 func (c *Control) runExportVerifier(ctx context.Context) {
-	t := time.NewTicker(c.S.exportVerifyPoll())
-	defer t.Stop()
+	ticks := c.ExportVerifyTicks
+	if ticks == nil {
+		ticker := time.NewTicker(c.S.exportVerifyPoll())
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case _, ok := <-ticks:
+			if !ok {
+				return
+			}
 		}
 		if c.held() {
 			c.RunExportVerifyOnce(ctx)
