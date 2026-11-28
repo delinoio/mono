@@ -3,18 +3,33 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"runtime"
+	"slices"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/config"
 	"github.com/delinoio/mono/servers/internal/telemetry"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	collectorpb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -22,14 +37,12 @@ const (
 	otelServiceName        = "OTEL_SERVICE_NAME"
 )
 
-// setRunEnv sets the configuration that lets run start without external
+// runEnv returns the configuration that lets run start without external
 // services. The database pool opens lazily and RUN_MIGRATIONS=false skips the
-// migrations. The fake dispatcher keeps billing work from contacting the
-// database. Empty OpenTelemetry settings keep resource detection and export
+// migrations. Empty OpenTelemetry settings keep resource detection and export
 // independent of the test process environment.
-func setRunEnv(t *testing.T, metricsAddr string) {
-	t.Helper()
-	env := map[string]string{
+func runEnv(metricsAddr string) map[string]string {
+	return map[string]string{
 		"DATABASE_URL":                 "postgres://accounts@127.0.0.1:1/accounts?connect_timeout=1",
 		"RUN_MIGRATIONS":               "false",
 		"ADDR":                         "127.0.0.1:0",
@@ -53,7 +66,11 @@ func setRunEnv(t *testing.T, metricsAddr string) {
 		telemetry.EnvOTLPMetricsEndpoint: "",
 		telemetry.EnvOTLPLogsEndpoint:    "",
 	}
-	for name, value := range env {
+}
+
+func setRunEnv(t *testing.T, metricsAddr string) {
+	t.Helper()
+	for name, value := range runEnv(metricsAddr) {
 		t.Setenv(name, value)
 	}
 }
@@ -162,4 +179,195 @@ func assertRunMetricsBindError(t *testing.T) {
 	if dispatches != 0 {
 		t.Errorf("billing worker dispatches = %d; want 0 after a metrics listen error", dispatches)
 	}
+}
+
+type exitRecord struct {
+	Message string `json:"msg"`
+	Level   string `json:"level"`
+	Error   string `json:"error"`
+}
+
+func TestMainExitLogs(t *testing.T) {
+	const childEnv = "ACCOUNTS_API_TEST_MAIN_EXIT_LOGS"
+	if os.Getenv(childEnv) == "1" {
+		main()
+		os.Exit(0)
+	}
+
+	held := newTestListener(t)
+	addr := held.Addr().String()
+	// Get the native bind error text because it differs between platforms.
+	collision, err := net.Listen("tcp", addr)
+	if err == nil {
+		_ = collision.Close()
+		t.Fatal("second listener bound the occupied address")
+	}
+	bindError := err.Error()
+
+	for _, tc := range []struct {
+		name, addr, level, wantError string
+		configureOTLP, wantExport    bool
+	}{
+		{name: "bind failure", addr: addr, level: "error", wantError: bindError, configureOTLP: true, wantExport: true},
+		{name: "invalid config", addr: addr, level: "bogus", wantError: `LOG_LEVEL must be one of debug, info, warn, error; got "bogus"`, configureOTLP: true},
+		{name: "OTLP disabled", addr: addr, level: "error", wantError: bindError},
+		{name: "clean shutdown", addr: "127.0.0.1:0", level: "info", configureOTLP: true, wantExport: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanShutdown := tc.wantError == ""
+			if cleanShutdown && runtime.GOOS == "windows" {
+				t.Skip("sending SIGTERM to a subprocess requires POSIX signals")
+			}
+
+			collector := &exitLogCollector{t: t}
+			receiver := httptest.NewServer(collector)
+			defer receiver.Close()
+
+			env := runEnv("")
+			env["ADDR"] = tc.addr
+			env[config.EnvLogLevel] = tc.level
+			if tc.configureOTLP {
+				env[telemetry.EnvOTLPLogsEndpoint] = receiver.URL + "/v1/logs"
+			}
+			env[childEnv] = "1"
+
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestMainExitLogs$")
+			// Use only the fixture environment, so inherited OTEL settings,
+			// proxies, and service credentials cannot affect the subprocess.
+			cmd.Env = make([]string, 0, len(env))
+			for name, value := range env {
+				cmd.Env = append(cmd.Env, name+"="+value)
+			}
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if cmd.ProcessState == nil {
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+				}
+			}()
+
+			var stdoutExits []exitRecord
+			sentSignal := false
+			scanner := bufio.NewScanner(stdout)
+			for scanner.Scan() {
+				var record exitRecord
+				if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+					t.Fatalf("invalid JSON log %q: %v", scanner.Text(), err)
+				}
+				switch record.Message {
+				case "server_exited":
+					stdoutExits = append(stdoutExits, record)
+				case "server_started":
+					if cleanShutdown && !sentSignal {
+						if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+							t.Fatal(err)
+						}
+						sentSignal = true
+					}
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatal(err)
+			}
+			err = cmd.Wait()
+			wantStatus := 1
+			var wantExits []exitRecord
+			if cleanShutdown {
+				wantStatus = 0
+				if !sentSignal {
+					t.Error("process did not log server_started before exiting")
+				}
+			} else {
+				wantExits = []exitRecord{{Message: "server_exited", Level: "ERROR", Error: tc.wantError}}
+			}
+			if status := cmd.ProcessState.ExitCode(); status != wantStatus {
+				t.Errorf("exit status = %d, want %d (wait error: %v, stderr: %s)", status, wantStatus, err, &stderr)
+			}
+			if !slices.Equal(stdoutExits, wantExits) {
+				t.Errorf("stdout exit records = %+v, want %+v", stdoutExits, wantExits)
+			}
+
+			collector.mu.Lock()
+			defer collector.mu.Unlock()
+			if tc.wantExport {
+				if !slices.Equal(collector.exits, wantExits) {
+					t.Errorf("OTLP exit records = %+v, want %+v", collector.exits, wantExits)
+				}
+				if cleanShutdown && !collector.sawStartup {
+					t.Error("collector did not receive server_started")
+				}
+			} else if collector.requests != 0 {
+				t.Errorf("OTLP requests = %d, want zero", collector.requests)
+			}
+		})
+	}
+}
+
+type exitLogCollector struct {
+	t *testing.T
+
+	mu         sync.Mutex
+	requests   int
+	exits      []exitRecord
+	sawStartup bool
+}
+
+func (c *exitLogCollector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.requests++
+	if r.Method != http.MethodPost || r.URL.Path != "/v1/logs" {
+		c.t.Errorf("unexpected OTLP request: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	var req collectorpb.ExportLogsServiceRequest
+	if err == nil {
+		err = proto.Unmarshal(body, &req)
+	}
+	if err != nil {
+		c.t.Errorf("cannot read OTLP request: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	for _, resource := range req.GetResourceLogs() {
+		for _, scope := range resource.GetScopeLogs() {
+			for _, record := range scope.GetLogRecords() {
+				switch message := record.GetBody().GetStringValue(); message {
+				case "server_started":
+					c.sawStartup = true
+				case "server_exited":
+					if severity := record.GetSeverityNumber(); severity != logspb.SeverityNumber_SEVERITY_NUMBER_ERROR {
+						c.t.Errorf("OTLP exit severity = %v, want ERROR", severity)
+					}
+					exit := exitRecord{Message: message, Level: record.GetSeverityText()}
+					for _, attr := range record.GetAttributes() {
+						if attr.GetKey() == string(semconv.ExceptionMessageKey) {
+							exit.Error = attr.GetValue().GetStringValue()
+						}
+					}
+					c.exits = append(c.exits, exit)
+				}
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/x-protobuf")
+	w.WriteHeader(http.StatusOK)
 }
