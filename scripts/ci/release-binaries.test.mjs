@@ -2383,6 +2383,7 @@ test("publish-binaries stores the signed manifests before the first R2 upload", 
   const upload = index("release-binaries.sh upload-manifests");
   assert.ok(sign >= 0 && sign < saveAt);
   assert.ok(saveAt < upload);
+  assert.match(save, /^ {10}path: \$\{\{ runner\.temp \}\}\/manifests$/m);
   // Only `upload-manifests` writes to the bucket.
   assert.equal(
     steps.filter((step) => step.includes("upload-manifests")).length,
