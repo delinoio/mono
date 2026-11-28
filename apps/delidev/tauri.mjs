@@ -184,7 +184,7 @@ function resolveBundleConfig() {
     (!target || (target.includes("-linux-") && !target.includes("android")))
   ) {
     platformName = "linux";
-    noticeFormats = ["deb"];
+    noticeFormats = ["deb", "rpm", "appimage"];
   } else if (
     process.platform === "darwin" &&
     (!target || target.endsWith("-apple-darwin"))
@@ -221,6 +221,9 @@ function resolveBundleConfig() {
           .filter((target) => typeof target === "string")
           .map((target) => target.toLowerCase()));
   if (!includesFormat(selectedFormats, supportedFormats)) return;
+  const formats = supportedFormats.filter((format) =>
+    selectedFormats.includes(format),
+  );
   const embedsCef = bundle?.cef?.embed !== false;
   const stageNotices =
     embedsCef && includesFormat(selectedFormats, noticeFormats);
@@ -228,7 +231,13 @@ function resolveBundleConfig() {
   const usePatchedCli =
     platformName === "linux" &&
     (embedsCef || includesFormat(selectedFormats, ["deb", "rpm"]));
-  return { ...resolved, platformName, stageNotices, usePatchedCli };
+  return {
+    ...resolved,
+    platformName,
+    formats,
+    stageNotices,
+    usePatchedCli,
+  };
 }
 
 function shellQuote(value) {
@@ -281,7 +290,7 @@ async function runPatchedCli(cli, args, options) {
 }
 
 async function runNoticeBuild(
-  { config, baseConfig, overrides, configIndex, platformName },
+  { config, baseConfig, overrides, configIndex, platformName, formats },
   cli,
 ) {
   // Tauri reads its file mappings before Cargo downloads CEF. Stage the files
@@ -302,12 +311,10 @@ async function runNoticeBuild(
       writeFileSync(hookPath, `${stage} && exec sh -c ${shellQuote(custom)}\n`);
       script = `exec sh ${shellQuote(hookPath)}`;
     }
-    const docDir =
-      platformName === "linux" ? "/usr/share/doc/delidev/cef" : "Resources/cef";
-    const files = {
+    const noticeFiles = (docDir) => ({
       [`${docDir}/LICENSE.txt`]: join(noticeDir, "LICENSE.txt"),
       [`${docDir}/CREDITS.html`]: join(noticeDir, "CREDITS.html"),
-    };
+    });
     const composedHook =
       hook?.cwd === undefined ? script : { script, cwd: hook.cwd };
     const additions = { build: { [key]: composedHook } };
@@ -317,7 +324,22 @@ async function runNoticeBuild(
       const macKey = Object.hasOwn(config?.bundle ?? {}, "macos")
         ? "macos"
         : "macOS";
-      additions.bundle = { [macKey]: { files } };
+      additions.bundle = {
+        [macKey]: { files: noticeFiles("Resources/cef") },
+      };
+    } else {
+      const linux = {};
+      if (formats.includes("rpm")) {
+        linux.rpm = {
+          files: noticeFiles("/usr/share/doc/delidev/cef"),
+        };
+      }
+      if (formats.includes("appimage")) {
+        linux.appimage = {
+          files: noticeFiles("usr/share/doc/delidev/cef"),
+        };
+      }
+      if (Object.keys(linux).length > 0) additions.bundle = { linux };
     }
     const patch = preserveClears(baseConfig, overrides, additions);
     args.splice(
@@ -326,10 +348,14 @@ async function runNoticeBuild(
       "--config",
       JSON.stringify(patch),
     );
-    if (platformName === "linux") {
+    if (formats.includes("deb")) {
       // Preserve the precedence of the Debian file mapping.
       const fileConfig = JSON.stringify({
-        bundle: { linux: { deb: { files } } },
+        bundle: {
+          linux: {
+            deb: { files: noticeFiles("/usr/share/doc/delidev/cef") },
+          },
+        },
       });
       args.splice(commandIndex + 1, 0, "--config", fileConfig);
     }

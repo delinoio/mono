@@ -208,21 +208,63 @@ test(
 );
 
 test(
-  "uses the backport without staging Debian notices for RPM and AppImage",
+  "maps staged notices only into the selected embedded Linux bundles",
   linuxOnly,
   (t) => {
-    const { run } = fixture(t);
+    const { run, staging } = fixture(t);
+    const docDir = "usr/share/doc/delidev/cef";
     for (const command of ["build", "bundle"]) {
-      for (const selection of [
-        ["--bundles", "rpm"],
-        ["--bundles=appimage"],
-        ["-brpm,appimage"],
-        ["--bundles", "rpm", "appimage"],
-        ["--config", '{"bundle":{"targets":"rpm"}}'],
-        ["--config", '{"bundle":{"targets":["appimage"]}}'],
+      for (const [selection, formats] of [
+        [["--bundles", "rpm"], ["rpm"]],
+        [["--bundles=appimage"], ["appimage"]],
+        [["-brpm,appimage"], ["rpm", "appimage"]],
+        [
+          ["--bundles", "rpm", "appimage"],
+          ["rpm", "appimage"],
+        ],
+        [["--config", '{"bundle":{"targets":"rpm"}}'], ["rpm"]],
+        [["--config", '{"bundle":{"targets":["appimage"]}}'], ["appimage"]],
+        [
+          ["--config", '{"bundle":{"targets":null}}'],
+          ["deb", "rpm", "appimage"],
+        ],
       ]) {
         const args = [command, "--config", embedCef, ...selection];
-        assert.deepEqual(run(...args), { cli: "patched", args });
+        const result = run(...args);
+        assert.equal(result.cli, "patched");
+        const patch = JSON.parse(
+          result.args[result.args.lastIndexOf("--config") + 1],
+        );
+        assert.match(
+          patch.build?.beforeBundleCommand ?? "",
+          /cef-notices\.mjs/,
+        );
+        const linux = patch.bundle.linux;
+        assert.deepEqual(
+          Object.keys(linux),
+          formats.filter((format) => format !== "deb"),
+        );
+        if (formats.includes("deb")) {
+          const deb = JSON.parse(result.args[2]).bundle.linux.deb;
+          assert.deepEqual(deb.files, {
+            [`/${docDir}/LICENSE.txt`]: Object.values(linux.rpm.files)[0],
+            [`/${docDir}/CREDITS.html`]: Object.values(linux.rpm.files)[1],
+          });
+        } else {
+          assert.deepEqual(result.args.slice(0, 3), args.slice(0, 3));
+        }
+        const sources = [];
+        for (const format of Object.keys(linux)) {
+          const dir = format === "rpm" ? `/${docDir}` : docDir;
+          const { files } = linux[format];
+          assert.deepEqual(Object.keys(files), [
+            `${dir}/LICENSE.txt`,
+            `${dir}/CREDITS.html`,
+          ]);
+          sources.push(Object.values(files));
+        }
+        for (const paths of sources) assert.deepEqual(paths, sources[0]);
+        assert.deepEqual(readdirSync(staging), []);
       }
     }
   },
