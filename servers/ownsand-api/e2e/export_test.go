@@ -36,12 +36,17 @@ func waitExported(ctx context.Context, t *testing.T, c *ownsand.Client, id strin
 	}
 }
 
+func (s *stack) exportAttemptsPrefix(snapID string) string {
+	return "organizations/" + s.orgID + "/snapshots/" + snapID + "/attempts/"
+}
+
 // exportAttempts returns the exported parts of a snapshot by attempt ID: the
 // size of each object by its part number.
 func (s *stack) exportAttempts(snapID string) map[string]map[int]int {
 	attempts := map[string]map[int]int{}
-	for k, size := range s.objects.sizes("organizations/" + s.orgID + "/snapshots/" + snapID + "/attempts/") {
-		_, rest, _ := strings.Cut(k, "/attempts/")
+	prefix := s.exportAttemptsPrefix(snapID)
+	for k, size := range s.objects.sizes(prefix) {
+		rest := strings.TrimPrefix(k, prefix)
 		attempt, part, _ := strings.Cut(rest, "/")
 		n, err := strconv.Atoi(part)
 		if err != nil {

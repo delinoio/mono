@@ -32,11 +32,13 @@ type fakeS3 struct {
 	mu  sync.Mutex
 	// objects maps keys (without the bucket) to their content.
 	objects map[string][]byte
+	// objectGets records every object GET, including requests for missing keys.
+	objectGets []string
 	// gate, while set, holds every PUT before it stores the object, so a
-	// test can interrupt an export mid-transfer. putHeld is signaled once
-	// for each held PUT.
+	// test can interrupt an export mid-transfer. putHeld receives the key
+	// of each held PUT.
 	gate    chan struct{}
-	putHeld chan struct{}
+	putHeld chan string
 }
 
 // holdPuts makes every PUT wait until releasePuts or until the client
@@ -44,7 +46,7 @@ type fakeS3 struct {
 func (f *fakeS3) holdPuts() {
 	f.mu.Lock()
 	f.gate = make(chan struct{})
-	f.putHeld = make(chan struct{}, 64)
+	f.putHeld = make(chan string, 64)
 	f.mu.Unlock()
 }
 
@@ -58,16 +60,18 @@ func (f *fakeS3) releasePuts() {
 	f.mu.Unlock()
 }
 
-// waitPutHeld waits until a PUT is held.
-func (f *fakeS3) waitPutHeld(t *testing.T) {
+// waitPutHeld returns the key of a held PUT before it stores the object.
+func (f *fakeS3) waitPutHeld(t *testing.T) string {
 	t.Helper()
 	f.mu.Lock()
 	held := f.putHeld
 	f.mu.Unlock()
 	select {
-	case <-held:
+	case key := <-held:
+		return key
 	case <-time.After(60 * time.Second):
 		t.Fatal("no part upload reached the object store")
+		return ""
 	}
 }
 
@@ -105,6 +109,18 @@ func (f *fakeS3) keys(prefix string) []string {
 	return out
 }
 
+func (f *fakeS3) getPosition() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.objectGets)
+}
+
+func (f *fakeS3) getsSince(position int) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.objectGets[position:])
+}
+
 func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if q.Get("X-Amz-Signature") == "" && !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
@@ -123,7 +139,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		gate, held := f.gate, f.putHeld
 		f.mu.Unlock()
 		if gate != nil {
-			held <- struct{}{}
+			held <- key
 			select {
 			case <-gate:
 			case <-r.Context().Done():
@@ -141,6 +157,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodGet && key != "":
 		f.mu.Lock()
+		f.objectGets = append(f.objectGets, key)
 		data, ok := f.objects[key]
 		f.mu.Unlock()
 		if !ok {
@@ -261,7 +278,9 @@ func TestFakeS3ListObjectsV2ConcurrentPut(t *testing.T) {
 		go func() {
 			putDone <- putFakeS3Object(client, f, key, "abc")
 		}()
-		f.waitPutHeld(t)
+		if got := f.waitPutHeld(t); got != key {
+			t.Fatalf("held PUT key = %q, want %q", got, key)
+		}
 		// Release the pending PUT as the client sends the listing request.
 		ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{
 			WroteRequest: func(httptrace.WroteRequestInfo) { f.releasePuts() },
@@ -278,5 +297,68 @@ func TestFakeS3ListObjectsV2ConcurrentPut(t *testing.T) {
 		if got := listFakeS3Objects(t, t.Context(), client, f, prefix); !slices.Equal(got, want) {
 			t.Fatalf("list %q after PUT: entries = %v, want %v", prefix, got, want)
 		}
+	}
+}
+
+func TestFakeS3ImportPartGets(t *testing.T) {
+	t.Parallel()
+	f := newFakeS3(t)
+	client := &http.Client{Timeout: 10 * time.Second}
+	retry := []string{"retry/1", "retry/2"}
+	abandoned := []string{"abandoned/1", "abandoned/2"}
+	for _, key := range retry {
+		if err := putFakeS3Object(client, f, key, "same bytes"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	getPart := func(key string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, f.url+"/"+fakeBucket+"/"+key+"?X-Amz-Signature=test", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status %s", key, res.Status)
+		}
+	}
+
+	// The trace starts after this GET and excludes the bucket listing and
+	// the late writes from the abandoned attempt.
+	getPart(retry[0])
+	position := f.getPosition()
+	for _, key := range abandoned {
+		if err := putFakeS3Object(client, f, key, "same bytes"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listFakeS3Objects(t, t.Context(), client, f, "")
+	for _, tc := range []struct {
+		name    string
+		gets    []string
+		wantErr bool
+	}{
+		{name: "empty", wantErr: true},
+		{name: "retry only with repeats", gets: []string{retry[0], retry[1], retry[0]}},
+		{name: "abandoned only", gets: abandoned, wantErr: true},
+		{name: "mixed", gets: []string{retry[0], retry[1], abandoned[1]}, wantErr: true},
+		{name: "missing retry part", gets: []string{retry[0], retry[0]}, wantErr: true},
+	} {
+		for _, key := range tc.gets {
+			getPart(key)
+		}
+		got := f.getsSince(position)
+		if !slices.Equal(got, tc.gets) {
+			t.Fatalf("%s: object GET trace = %v, want %v", tc.name, got, tc.gets)
+		}
+		if err := checkImportPartGets(got, retry); (err != nil) != tc.wantErr {
+			t.Errorf("%s: checkImportPartGets returned %v, want error %v", tc.name, err, tc.wantErr)
+		}
+		position = f.getPosition()
 	}
 }
