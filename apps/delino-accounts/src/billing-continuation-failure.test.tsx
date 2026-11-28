@@ -263,6 +263,10 @@ for (const entry of lists) {
       if (entry.list !== undefined) {
         expect(screen.queryByRole("list", { name: entry.list })).toBeNull();
       }
+      if (entry.method === "ListUsageSummary") {
+        expect(screen.queryByLabelText("Usage total")).toBeNull();
+        expect(screen.queryByText("No usage in this month")).toBeNull();
+      }
     });
   });
 }
