@@ -389,7 +389,9 @@ function GitHubSection({ admin }: { admin: boolean }) {
         externalNavigation.assign(res.url);
       }
     } catch (error) {
-      reportActionError(error);
+      if (mounted.current && isCurrentVisit()) {
+        reportActionError(error);
+      }
     }
   };
 
