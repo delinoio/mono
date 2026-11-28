@@ -109,23 +109,35 @@ describe.each(FLOWS)("$name secret dialog", (flow) => {
 
   test("activating Copy copies the secret and keeps the dialog open", async () => {
     const written: string[] = [];
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: {
-        writeText: async (text: string) => {
-          written.push(text);
+    const originalClipboard = Object.getOwnPropertyDescriptor(
+      navigator,
+      "clipboard",
+    );
+    try {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: async (text: string) => {
+            written.push(text);
+          },
         },
-      },
-    });
-    const dialog = await start();
-    const secret = within(dialog).getByLabelText(/./, {
-      selector: "code",
-    }).textContent;
-    const copy = within(dialog).getByRole("button", { name: "Copy" });
-    await click(copy);
-    expect(written).toEqual([secret]);
-    expect(screen.getByRole("dialog")).toBeTruthy();
-    expect(document.activeElement).toBe(copy);
+      });
+      const dialog = await start();
+      const secret = within(dialog).getByLabelText(/./, {
+        selector: "code",
+      }).textContent;
+      const copy = within(dialog).getByRole("button", { name: "Copy" });
+      await click(copy);
+      expect(written).toEqual([secret]);
+      expect(screen.getByRole("dialog")).toBeTruthy();
+      expect(document.activeElement).toBe(copy);
+    } finally {
+      if (originalClipboard) {
+        Object.defineProperty(navigator, "clipboard", originalClipboard);
+      } else {
+        Reflect.deleteProperty(navigator, "clipboard");
+      }
+    }
   });
 
   test("Done closes the dialog", async () => {
