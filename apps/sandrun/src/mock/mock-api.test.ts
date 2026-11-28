@@ -1822,15 +1822,18 @@ test("creating an integration without credentials preserves the integration list
 test.each(["claude-team", "claude-renamed"])(
   "an integration can update its name to %s",
   async (name) => {
-    const integrations = createClient(
-      AgentIntegrationService,
-      createMockTransport(),
-    );
+    const transport = createMockTransport();
+    const integrations = createClient(AgentIntegrationService, transport);
+    const audit = createClient(AuditService, transport);
+    const organizationId = MOCK_IDS.acme;
     const id = {
-      organizationId: MOCK_IDS.acme,
+      organizationId,
       agentIntegrationId: MOCK_IDS.claudeIntegration,
     };
     const before = structuredClone(await integrations.getAgentIntegration(id));
+    const auditBefore = structuredClone(
+      await audit.listAuditEvents({ organizationId }),
+    );
     const { integration } = await integrations.updateAgentIntegration({
       ...id,
       name,
@@ -1844,6 +1847,14 @@ test.each(["claude-team", "claude-renamed"])(
     expect((await integrations.getAgentIntegration(id)).integration).toEqual(
       integration,
     );
+    const {
+      events: [updated, ...previousEvents],
+    } = await audit.listAuditEvents({ organizationId });
+    expect(updated).toMatchObject({
+      action: AuditAction.AGENT_INTEGRATION_UPDATED,
+      targetId: id.agentIntegrationId,
+    });
+    expect(previousEvents).toEqual(auditBefore.events);
   },
 );
 
@@ -1911,6 +1922,26 @@ test("a rejected combined update preserves the integration and its audit history
       auditBefore,
     );
 
+    for (const edit of [
+      update,
+      { ...id, updateMask: { paths: ["credentials"] } },
+    ]) {
+      await expect(
+        integrations.updateAgentIntegration({
+          ...edit,
+          credentials: { case: "cursorCredentials", value: {} },
+        }),
+      ).rejects.toMatchObject({
+        code: Code.InvalidArgument,
+        rawMessage:
+          "invalid credentials: set at least one credential to replace",
+      });
+      expect(await integrations.getAgentIntegration(id)).toEqual(before);
+      expect(await audit.listAuditEvents({ organizationId })).toEqual(
+        auditBefore,
+      );
+    }
+
     const saved = await integrations.updateAgentIntegration({
       ...update,
       credentials: {
@@ -1950,6 +1981,63 @@ test("a rejected combined update preserves the integration and its audit history
       action: AuditAction.AGENT_INTEGRATION_CREDENTIALS_REPLACED,
     });
     expect(previousEvents).toEqual(auditBefore.events);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("a partial credential replacement preserves omitted credential metadata", async () => {
+  const createdAt = Date.UTC(2026, 0, 1);
+  const replacementAt = Date.UTC(2026, 0, 2, 0, 0, 0, 123);
+  const clock = rs.spyOn(Date, "now").mockReturnValue(createdAt);
+  try {
+    const transport = createMockTransport();
+    const integrations = createClient(AgentIntegrationService, transport);
+    const audit = createClient(AuditService, transport);
+    const organizationId = MOCK_IDS.acme;
+    const id = {
+      organizationId,
+      agentIntegrationId: MOCK_IDS.codexIntegration,
+    };
+    const { integration: before } = structuredClone(
+      await integrations.getAgentIntegration(id),
+    );
+    if (before === undefined) throw new Error("Expected an integration");
+
+    clock.mockReturnValue(replacementAt);
+    const { integration } = await integrations.updateAgentIntegration({
+      ...id,
+      credentials: {
+        case: "openaiCodexCredentials",
+        value: { apiKey: "synthetic-codex-replacement" },
+      },
+      updateMask: { paths: ["credentials"] },
+    });
+
+    const replacementTime = timestampFromMs(replacementAt);
+    expect(integration).toEqual({
+      ...before,
+      updateTime: replacementTime,
+      credentials: before.credentials.map((state) =>
+        state.credential === AgentCredential.API_KEY
+          ? { ...state, credentialSetAt: replacementTime }
+          : state,
+      ),
+    });
+    expect((await integrations.getAgentIntegration(id)).integration).toEqual(
+      integration,
+    );
+    const { events } = await audit.listAuditEvents({ organizationId });
+    const replacements = events.filter(
+      (event) =>
+        event.action === AuditAction.AGENT_INTEGRATION_CREDENTIALS_REPLACED,
+    );
+    expect(replacements).toEqual([
+      expect.objectContaining({
+        targetId: id.agentIntegrationId,
+        createTime: replacementTime,
+      }),
+    ]);
   } finally {
     clock.mockRestore();
   }
