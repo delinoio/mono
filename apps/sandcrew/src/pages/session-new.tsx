@@ -39,7 +39,7 @@ const AGENT_DEFAULT = "";
 /** Route `SESSION_NEW`: the new-session form. */
 export function SessionNewPage() {
   const { organizationId, role, userId } = useOrg();
-  const { navigate } = useRouter();
+  const { navigate, isCurrentVisit } = useRouter();
   const i18n = useI18n();
   const { t } = i18n;
   const queryClient = useQueryClient();
@@ -94,6 +94,9 @@ export function SessionNewPage() {
     }
     setErrors(nextErrors);
     if (nextErrors.message || nextErrors.label) return;
+    // The user can leave the form while the session starts; the redirect
+    // then must not pull them away from the page they went to.
+    const stillHere = isCurrentVisit;
     try {
       const res = await create.mutateAsync({
         organizationId,
@@ -107,7 +110,9 @@ export function SessionNewPage() {
           .filter(([, valueId]) => valueId !== AGENT_DEFAULT)
           .map(([configOptionId, valueId]) => ({ configOptionId, valueId })),
       });
-      navigate(sessionPath(organizationId, res.session!.sessionId));
+      if (stillHere()) {
+        navigate(sessionPath(organizationId, res.session!.sessionId));
+      }
     } catch {
       // The form shows the mutation error.
     }

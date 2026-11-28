@@ -348,6 +348,36 @@ describe("session list", () => {
 });
 
 describe("new-session form", () => {
+  test("stays on another page when a session starts after the user left", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { transport, calls } = recording({
+      ...base,
+      async unary(method, ...rest) {
+        if (method.name === "CreateSession") await held;
+        return base.unary(method, ...rest);
+      },
+    });
+    renderConsole(`/orgs/${ACME}/sessions/new`, { transport });
+    await type(
+      await screen.findByRole("textbox", { name: "First message" }),
+      "Clone the repository",
+    );
+    await click(screen.getByRole("button", { name: "Start session" }));
+    await click(screen.getByRole("link", { name: "Settings" }));
+    const settingsPath = window.location.pathname;
+    expect(settingsPath).toBe(`/orgs/${ACME}/settings`);
+    await act(async () => release());
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === "CreateSession")).toBe(true),
+    );
+    await settle();
+    expect(window.location.pathname).toBe(settingsPath);
+  });
+
   test("shows a credential load failure and recovers on retry", async () => {
     const base = createMockTransport({ agentStepMs: 5 });
     let failures = 1;
