@@ -253,30 +253,91 @@ func startHelperProcess(t *testing.T, mode string) *helperProcess {
 	return h
 }
 
-// waitForLine returns the first output line that contains substr.
+// findCompleteLine returns the first newline-terminated line that contains substr.
+func findCompleteLine(output, substr string) (string, bool) {
+	for {
+		line, rest, complete := strings.Cut(output, "\n")
+		if !complete {
+			return "", false
+		}
+		if strings.Contains(line, substr) {
+			return line, true
+		}
+		output = rest
+	}
+}
+
+// waitForLine returns the first complete output line that contains substr.
 func (h *helperProcess) waitForLine(substr string) string {
 	h.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		for _, line := range strings.Split(h.out.String(), "\n") {
-			if strings.Contains(line, substr) {
-				return line
-			}
+		if line, ok := findCompleteLine(h.out.String(), substr); ok {
+			return line
 		}
 		select {
 		case <-h.exited:
-			// The output is complete once the process has exited.
-			for _, line := range strings.Split(h.out.String(), "\n") {
-				if strings.Contains(line, substr) {
-					return line
-				}
+			// cmd.Wait has finished copying the child's output.
+			output := h.out.String()
+			if line, ok := findCompleteLine(output, substr); ok {
+				return line
 			}
-			h.t.Fatalf("helper exited before printing a line containing %q; output:\n%s", substr, h.out.String())
+			h.t.Fatalf("helper exited before printing a line containing %q; output:\n%s", substr, output)
 		case <-time.After(10 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
 			h.t.Fatalf("timed out waiting for a line containing %q; output so far:\n%s", substr, h.out.String())
 		}
+	}
+}
+
+func TestFindCompleteLineWaitsForNewline(t *testing.T) {
+	t.Parallel()
+	var out syncBuffer
+	for _, fragment := range []string{"listening 127.0.0.1:345", "67"} {
+		_, _ = out.Write([]byte(fragment))
+		if line, ok := findCompleteLine(out.String(), "listening "); ok {
+			t.Fatalf("matched unterminated readiness line %q", line)
+		}
+	}
+	_, _ = out.Write([]byte("\n"))
+	if line, ok := findCompleteLine(out.String(), "listening "); !ok || line != "listening 127.0.0.1:34567" {
+		t.Fatalf("readiness match = %q, %t, want the complete listener address", line, ok)
+	}
+}
+
+func TestFindCompleteLineSnapshots(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		output string
+		marker string
+		want   string
+	}{
+		{
+			name:   "first readiness line before unfinished output",
+			output: "listening 127.0.0.1:34567\nlistening 127.0.0.1:45678\nunfinished",
+			marker: "listening ",
+			want:   "listening 127.0.0.1:34567",
+		},
+		{
+			name:   "complete exit marker in final output",
+			output: "listening 127.0.0.1:34567\n{\"msg\":\"server_exited\"}\n",
+			marker: `"msg":"server_exited"`,
+			want:   `{"msg":"server_exited"}`,
+		},
+		{
+			name:   "unterminated readiness line in final output",
+			output: "listening 127.0.0.1:345",
+			marker: "listening ",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line, ok := findCompleteLine(tc.output, tc.marker)
+			if line != tc.want || ok != (tc.want != "") {
+				t.Fatalf("match = %q, %t, want %q, %t", line, ok, tc.want, tc.want != "")
+			}
+		})
 	}
 }
 
