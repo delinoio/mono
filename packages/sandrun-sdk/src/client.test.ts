@@ -13,7 +13,12 @@ import {
   guardedFetch,
   resolveApiOrigin,
 } from "./connection.ts";
-import { connectCodeOf, SandRunConfigError, SandRunError } from "./errors.ts";
+import {
+  connectCodeOf,
+  isRetryableStreamError,
+  SandRunConfigError,
+  SandRunError,
+} from "./errors.ts";
 import { FAKE_ORIGIN, fakeServer } from "./testing/fake-server.ts";
 
 const ORG = "0193a000-0000-7000-8000-000000000001";
@@ -419,6 +424,66 @@ describe("error mapping", () => {
           "original token: [redacted]",
         );
       }
+    },
+  );
+
+  test.each(["unary", "stream"])(
+    "redacts aggregate transport diagnostics during a %s call",
+    async (kind) => {
+      const token = "secret-aggregate-token";
+      const original = ` \t${token}\r\n`;
+      const failure = new AggregateError(
+        [
+          new Error(`dial failed with Bearer ${token}`),
+          `original: ${original}`,
+        ],
+        "fetch failed",
+      );
+      const client = new SandRunClient({
+        origin: FAKE_ORIGIN,
+        token: original,
+        fetch: async () => {
+          if (kind === "unary") {
+            throw new TypeError("fetch failed", { cause: failure });
+          }
+          const body = new ReadableStream({
+            pull(controller) {
+              controller.error(failure);
+            },
+          });
+          return new Response(body, {
+            headers: { "content-type": "application/connect+proto" },
+          });
+        },
+      });
+      const call =
+        kind === "unary"
+          ? client.organizations.getOrganization({ organizationId: ORG })
+          : client.work
+              .watchQueue({ organizationId: ORG })
+              [Symbol.asyncIterator]()
+              .next();
+      const error = (await call.catch(
+        (caught: unknown) => caught,
+      )) as ConnectError;
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(connectCodeOf(error)).toBe(Code.Unknown);
+      expect(isRetryableStreamError(error)).toBe(true);
+
+      const cause = error.cause as Error;
+      if (kind === "unary") {
+        expect(cause).toBeInstanceOf(TypeError);
+      }
+      const aggregate = (
+        kind === "unary" ? cause.cause : cause
+      ) as AggregateError;
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.errors).toHaveLength(2);
+      const [dial, echo] = aggregate.errors;
+      expect(dial).toBeInstanceOf(Error);
+      expect(dial.message).toBe("dial failed with Bearer [redacted]");
+      expect(dial.stack).not.toContain(token);
+      expect(echo).toBe("original: [redacted]");
     },
   );
 
