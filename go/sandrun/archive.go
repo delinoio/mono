@@ -167,7 +167,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 			}
 		case tar.TypeReg:
 			entry := archiveFileName{local: name, archive: hdr.Name}
-			key := foldCase(name)
+			key := foldNormalizedCase(name)
 			names := fileNames[key]
 			var previous int
 			if err := e.writeFile(st, name, hdr.Size, func() error {
@@ -191,7 +191,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 				return st, fmt.Errorf("sandrun: the archive entry %s is a symbolic link that points outside the destination", filepath.ToSlash(name))
 			}
 			entry := archiveFileName{local: name, archive: hdr.Name, modeType: fs.ModeSymlink}
-			key := foldCase(name)
+			key := foldNormalizedCase(name)
 			names := fileNames[key]
 			previous, err := checkArchiveNameCollision(root, entry, names)
 			if err != nil {
@@ -219,7 +219,7 @@ func (e archiveExtractor) extractArchive(ctx context.Context, r io.Reader, dir s
 				return st, fmt.Errorf("sandrun: the archive entry %s is a hard link to a path outside the archive", filepath.ToSlash(name))
 			}
 			entry := archiveFileName{local: name, archive: hdr.Name}
-			key := foldCase(name)
+			key := foldNormalizedCase(name)
 			names := fileNames[key]
 			previous, err := checkArchiveNameCollision(root, entry, names)
 			if err != nil {
@@ -303,7 +303,7 @@ func (names archiveDirectoryNames) claim(root *os.Root, name, component string, 
 			continue // A later entry can replace an empty directory or a symbolic link to its parent.
 		}
 		if filepath.Base(previous) != component {
-			return &archiveCaseCollision{earlier: filepath.ToSlash(previous), later: filepath.ToSlash(name)}
+			return &archiveNameCollision{earlier: filepath.ToSlash(previous), later: filepath.ToSlash(name)}
 		}
 		// A symbolic link can lead to the same directory with the same
 		// final component. Keep the original claim in that case.
@@ -332,9 +332,9 @@ func rememberArchiveFileName(names []archiveFileName, previous int, entry archiv
 	return append(names, entry)
 }
 
-// A case-folded match is only a candidate. Use Lstat to identify the staged
-// entry itself, including a symbolic link. Return its record index so an
-// allowed replacement can update the archive name and type in the record.
+// A normalized, case-folded match is only a candidate. Use Lstat to identify
+// the staged entry itself, including a symbolic link. Return its record index
+// so an allowed replacement can update the archive name and type.
 // Check entry names before parent aliases so an entry collision reports the
 // full archive names.
 func checkArchiveNameCollision(root *os.Root, entry archiveFileName, names []archiveFileName) (int, error) {
@@ -373,9 +373,9 @@ func checkArchiveNameCollision(root *os.Root, entry archiveFileName, names []arc
 		}
 
 		regularPair := entry.modeType == 0 && previous.modeType == 0
-		mixedCasePair := entry.modeType != previous.modeType && entry.local != previous.local
-		if (regularPair || mixedCasePair) && normalizedArchiveName(entry.archive) != normalizedArchiveName(previous.archive) {
-			return -1, &archiveCaseCollision{earlier: previous.archive, later: entry.archive}
+		mixedPair := entry.modeType != previous.modeType && entry.local != previous.local
+		if (regularPair || mixedPair) && normalizedArchiveName(entry.archive) != normalizedArchiveName(previous.archive) {
+			return -1, &archiveNameCollision{earlier: previous.archive, later: entry.archive}
 		}
 		return i, nil
 	}
@@ -420,13 +420,13 @@ func sameArchiveDirectoryEntry(root *os.Root, a, b string) (bool, error) {
 	return !firstExists || !secondExists, nil
 }
 
-type archiveCaseCollision struct {
+type archiveNameCollision struct {
 	earlier string
 	later   string
 }
 
-func (e *archiveCaseCollision) Error() string {
-	return fmt.Sprintf("sandrun: the archive entries %q and %q conflict on the destination filesystem", e.earlier, e.later)
+func (e *archiveNameCollision) Error() string {
+	return fmt.Sprintf("sandrun: the archive entries %+q and %+q conflict on the destination filesystem", e.earlier, e.later)
 }
 
 // entryName returns the local form of a tar entry name. ok is false for the
