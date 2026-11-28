@@ -4,9 +4,10 @@
 //
 // It builds the server into a temporary directory and runs the binary. Each
 // phase runs under a supervisor on POSIX and starts directly on Windows.
-// The launcher forwards SIGINT, SIGTERM and SIGQUIT to the active phase,
-// waits for it to exit and removes the build output. A signal before the
-// server starts stops the launcher without starting the server.
+// The launcher records SIGINT, SIGTERM and SIGQUIT and forwards them to
+// the active phase, except for SIGINT that the Windows console delivers.
+// The launcher waits for the active phase to exit, then removes the build
+// output. A signal before the server starts prevents server startup.
 //
 // The server needs Postgres and SANDRUN_SECRET_KEYS. A value that is empty or
 // consists only of ASCII white space counts as unset for DATABASE_URL,
@@ -261,7 +262,12 @@ function run(phase, command, args, env) {
       });
       forwardSignal = send;
     } else {
-      forwardSignal = (signal) => child.kill(signal);
+      forwardSignal = (signal) => {
+        // The Windows console delivers Ctrl-C to the direct child. Node's
+        // kill(SIGINT) would terminate it before its handler could finish.
+        if (!useSupervisor && signal === ForwardedSignal.Interrupt) return;
+        child.kill(signal);
+      };
     }
     child.once("error", (error) => {
       forwardSignal = null;
