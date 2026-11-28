@@ -348,6 +348,38 @@ describe("session list", () => {
 });
 
 describe("new-session form", () => {
+  test("shows a credential load failure and recovers on retry", async () => {
+    const base = createMockTransport({ agentStepMs: 5 });
+    let failures = 1;
+    const transport: Transport = {
+      ...base,
+      async unary(method, ...rest) {
+        if (method.name === "ListVendorCredentials" && failures > 0) {
+          failures--;
+          throw new ConnectError("unavailable", Code.Unavailable);
+        }
+        return base.unary(method, ...rest);
+      },
+    };
+    renderConsole(`/orgs/${ACME}/sessions/new`, { transport });
+    await screen.findByRole("textbox", { name: "First message" });
+    await click(await screen.findByRole("button", { name: "Try again" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull(),
+    );
+    await type(
+      screen.getByRole("textbox", { name: "First message" }),
+      "Clone the repository",
+    );
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Start session",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+
   test("focuses the first message and starts a session with the selected secret", async () => {
     const { transport, calls } = recording(
       createMockTransport({ agentStepMs: 5 }),

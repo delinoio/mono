@@ -159,18 +159,27 @@ export function SessionNewPage() {
                   </SelectOption>
                 ))}
               </Select>
-              {credentials.data !== undefined && !hasCredential ? (
-                <div className="notice notice-warning" role="alert">
-                  <p>
-                    {t("newSession.noCredential", {
-                      vendor: vendorName(vendor, t),
-                    })}
-                  </p>
-                  <Link to={orgPath(RouteId.SettingsUser, organizationId)}>
-                    {t("newSession.addCredential")}
-                  </Link>
-                </div>
-              ) : null}
+              {/* A failed credential read is not a missing credential: show
+                  the failure and its retry instead of the notice. */}
+              <QueryBoundary
+                query={credentials}
+                loading={t("credentials.loading")}
+              >
+                {() =>
+                  hasCredential ? null : (
+                    <div className="notice notice-warning" role="alert">
+                      <p>
+                        {t("newSession.noCredential", {
+                          vendor: vendorName(vendor, t),
+                        })}
+                      </p>
+                      <Link to={orgPath(RouteId.SettingsUser, organizationId)}>
+                        {t("newSession.addCredential")}
+                      </Link>
+                    </div>
+                  )
+                }
+              </QueryBoundary>
               <Select
                 label={t("newSession.runnerProfile")}
                 description={
