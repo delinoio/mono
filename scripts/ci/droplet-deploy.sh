@@ -20,9 +20,10 @@
 #
 # Steps: read a fresh deployment identifier, pull the image by digest, start a
 # new container next to the running one under its own unique network alias (it
-# does not join the alias of the running one), wait until `GET /healthz` returns a success status, write the
-# reverse proxy route to the new alias and reload the proxy, and only then
-# stop the old container. The proxy route selects the old container until the
+# does not join the alias of the running one), wait until `GET /healthz`
+# returns a success status, then take the proxy lock and check readiness
+# again before writing the reverse proxy route and reloading the proxy.
+# Stop the old container after the reload. The proxy route selects it until the
 # reload succeeds, so a container that is starting or unhealthy never receives
 # a request. A failure before the proxy reload removes the new container, so
 # the old one keeps serving. After the reload the replacement is the deployed
@@ -47,8 +48,8 @@
 # containers stopped, so only the replacement can hold the UDP ports.
 #
 # On `SIGTERM`, `SIGINT` or `SIGHUP`, the script cleans up an HTTP-only
-# replacement from launch through proxy-lock acquisition. For UDP, the same
-# handler runs from the first stop through proxy-lock acquisition and also
+# replacement from launch through the readiness check under the proxy lock.
+# For UDP, the same handler runs from the first stop through that check and also
 # restarts the stopped containers. The handler holds the service lock and
 # exits with 128 plus the signal number. Bash runs the trap after the
 # foreground command returns. A Docker stop, `curl` or `flock` can wait
@@ -104,6 +105,8 @@
 #   DROPLET_HEALTH_TIMEOUT  whole decimal seconds to wait for the health check,
 #                           from 0 to 9223372036 (unset or empty: 120).
 #                           Inspections, probes and retries share this deadline.
+#                           The check under the proxy lock has one attempt and
+#                           a separate deadline capped at five seconds.
 #   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL. Accounts API
 #                           defaults to 60 and SandRun API defaults to 80 for
 #                           outgoing containers and failed replacements.
@@ -339,9 +342,10 @@ main() {
   # (only for a service with UDP ports), and starts again when the
   # replacement fails.
   local -a stopped=()
+  local proxy_lock_fd=""
   if (( ${#publish[@]} == 0 )); then
-    # The name check above passed. Clean up this replacement if a signal
-    # arrives during launch, the health check or the proxy lock wait.
+    # The name check passed. Clean up the replacement if a signal arrives
+    # before the route switch.
     trap 'interrupted TERM "$new" "$replacement_stop_timeout"' TERM
     trap 'interrupted INT "$new" "$replacement_stop_timeout"' INT
     trap 'interrupted HUP "$new" "$replacement_stop_timeout"' HUP
@@ -418,21 +422,28 @@ main() {
   fi
 
   # Deployments and provisioning share the proxy lock because each switch
-  # applies the whole Caddyfile. Take it after the service lock. Keep the
-  # pre-switch traps active while waiting for it.
-  local pending_signal="" route_result=1 proxy_lock_fd=""
+  # applies the whole Caddyfile. Take it after the service lock. The startup
+  # result can go stale while waiting for this lock, so check once more while
+  # the pre-switch traps and the SandRun fence cancellation are still active.
+  local pending_signal="" route_result=1 failure="the route of $service was not switched"
   if acquire_proxy_lock "$root/state/.proxy.lock" "$proxy_lock_timeout" "$service" proxy_lock_fd; then
-    trap 'pending_signal=TERM' TERM
-    trap 'pending_signal=INT' INT
-    trap 'pending_signal=HUP' HUP
-    route_result=0
-    # From the first possible route write, retain the fence unless Caddy's
-    # result proves that the replacement did not take over.
-    if [[ -n "$sandrun_cancel" ]]; then trap - EXIT; fi
-    write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol" "$deployment_id" ||
-      route_result=$?
-    if [[ -n "$sandrun_cancel" && "$route_result" == 1 ]]; then trap "$sandrun_cancel" EXIT; fi
+    local recheck_timeout=$((health_timeout < 5 ? health_timeout : 5))
+    if wait_healthy "$new" "$network" "$port" "$recheck_timeout" once; then
+      trap 'pending_signal=TERM' TERM
+      trap 'pending_signal=INT' INT
+      trap 'pending_signal=HUP' HUP
+      route_result=0
+      # From the first possible route write, retain the fence unless Caddy's
+      # result proves that the replacement did not take over.
+      if [[ -n "$sandrun_cancel" ]]; then trap - EXIT; fi
+      write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol" "$deployment_id" ||
+        route_result=$?
+      if [[ -n "$sandrun_cancel" && "$route_result" == 1 ]]; then trap "$sandrun_cancel" EXIT; fi
+    else
+      failure="$new did not pass the health check before the route switch"
+    fi
     exec {proxy_lock_fd}>&-
+    proxy_lock_fd=""
   fi
   if (( route_result != 0 && route_result != 1 )); then
     fail "the route switch for $service is unresolved. Retained $new and the previous containers, the installed route and its backups. Image state and container cleanup were skipped. Retry the deployment or rollback after Caddy's admin API is available."
@@ -441,9 +452,9 @@ main() {
     discard_replacement "$new" "$replacement_stop_timeout"
     if (( ${#stopped[@]} > 0 )); then
       restart_previous "${stopped[@]}"
-      fail "the route of $service was not switched; the previous containers were started again."
+      fail "$failure; the previous containers were started again."
     fi
-    fail "the route of $service was not switched; $previous_serving."
+    fail "$failure; $previous_serving."
   fi
 
   # The proxy routes to the replacement now, so it is the deployed image.
@@ -790,8 +801,9 @@ signal_number() {
 
 # Handles signals before the route switch. The arguments are the signal name,
 # the replacement, its stop timeout and, for UDP, the containers that were
-# running. The handler ignores further signals while it discards the
-# replacement and restarts any previous containers passed by the caller.
+# running. The handler releases the proxy lock if held. It ignores further
+# signals while it discards the replacement and restarts any previous
+# containers passed by the caller.
 # Starting a container that already runs is a no-op, so recovery also works
 # partway through the UDP stop loop. The handler exits with 128 plus the
 # signal number.
@@ -799,6 +811,7 @@ interrupted() {
   local name="$1" replacement="$2" stop_timeout="$3"
   shift 3
   trap '' TERM INT HUP
+  if [[ -n "$proxy_lock_fd" ]]; then exec {proxy_lock_fd}>&-; fi
   echo "::error::received SIG$name before the route of the service switched; cleaning up the replacement $replacement." >&2
   discard_replacement "$replacement" "$stop_timeout"
   restart_previous "$@"
@@ -892,11 +905,12 @@ run_with_health_limit() {
 
 # Waits for a 2xx response to GET /healthz before one shared deadline.
 # The probe connects directly to the bridge address and bypasses host proxies.
-# Inspections and retry pauses also use the remaining time. The probe retries
-# redirects, other non-2xx responses and transport failures. A container that
-# is no longer running fails immediately.
+# Inspections and retry pauses also use the remaining time. The startup wait
+# retries redirects, other non-2xx responses and transport failures. With
+# `once`, a failed attempt ends the check. A container that is no longer
+# running fails immediately in either case.
 wait_healthy() {
-  local container="$1" network="$2" port="$3" timeout="$4"
+  local container="$1" network="$2" port="$3" timeout="$4" mode="${5:-startup}"
   local deadline remaining status address code probe_budget
   deadline="$(health_clock)" || return 1
   deadline=$((deadline + timeout * 100))
@@ -913,13 +927,14 @@ wait_healthy() {
     health_budget || break
     if [[ -n "$address" ]]; then
       probe_budget=$((remaining < 500 ? remaining : 500))
-      if code="$(run_with_health_limit "$probe_budget" curl --silent --show-error --noproxy '*' --output /dev/null \
+      if code="$(run_with_health_limit "$probe_budget" curl --disable --silent --show-error --noproxy '*' --output /dev/null \
         --write-out '%{http_code}' --max-time 5 "http://$address:$port/healthz" 2> /dev/null)" &&
         health_budget && [[ "$code" =~ ^2[0-9]{2}$ ]]; then
         echo "$container passed the health check."
         return 0
       fi
     fi
+    [[ "$mode" == startup ]] || break
     health_budget || break
     run_with_health_limit "$remaining" sleep 2 2> /dev/null || break
   done
@@ -935,7 +950,9 @@ wait_healthy() {
 # caller evaluates this function as an `if` condition, so every step checks
 # its own status. Changes no route file.
 acquire_proxy_lock() {
-  local lock_file="$1" timeout="$2" service="$3" fd
+  local lock_file="$1" timeout="$2" service="$3"
+  # Give the pre-switch signal handler access to the descriptor during flock.
+  local -n fd="$4"
   if ! { exec {fd}> "$lock_file"; } 2> /dev/null; then
     echo "::error::could not open the proxy lock file $lock_file." >&2
     return 1
@@ -943,9 +960,9 @@ acquire_proxy_lock() {
   if ! flock --wait "$timeout" "$fd"; then
     echo "::error::another deployment held the proxy lock $lock_file for $timeout seconds; the route of $service was not changed. Run the deployment again when it has finished." >&2
     exec {fd}>&-
+    fd=""
     return 1
   fi
-  printf -v "$4" '%s' "$fd"
 }
 
 # Caddy's loopback API is available inside the pinned proxy container. Bound
